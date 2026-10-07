@@ -648,6 +648,16 @@ export interface AdapterConfig {
    */
   role?: string | null;
   /**
+   * The source schemas and tables a `type = "manual"` discovery adapter returns, listed in config instead of fetched from an API.
+   *
+   * ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+   *
+   * [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
+   *
+   * Required (non-empty) on a `manual` adapter and refused on every other type; see [`validate_manual_adapters`].
+   */
+  schemas?: ManualSchemaConfig[];
+  /**
    * Optional distributed cache-stampede lock (Fivetran-only).
    *
    * On a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior).
@@ -813,6 +823,27 @@ export interface RetryConfig {
    * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * One source schema of a `type = "manual"` discovery adapter, with the tables in it, listed in `rocky.toml` for teams whose source has no discovery API (a Databricks or Snowflake source with no Fivetran in front).
+ *
+ * ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+ *
+ * [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items", "returns"]
+ *
+ * [[adapter.local_discovery.schemas]] name = "raw__customers" tables = ["customers", "addresses"] ```
+ *
+ * The load-time rules (non-empty list, valid identifiers, no duplicates) live in `config::validate_manual_adapters`, so `rocky validate` and every executing command refuse the same configs.
+ */
+export interface ManualSchemaConfig {
+  /**
+   * Source schema name. Matched against the pipeline's `schema_pattern.prefix` exactly as a discovered schema would be.
+   */
+  name: string;
+  /**
+   * Tables in the schema.
+   */
+  tables: string[];
 }
 /**
  * Distributed cache-stampede protection config for the Fivetran adapter (Layer 1).

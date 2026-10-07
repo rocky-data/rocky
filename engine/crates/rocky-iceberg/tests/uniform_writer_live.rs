@@ -287,7 +287,8 @@ fn connector_from_env() -> Option<DatabricksConnector> {
 
 /// End-to-end Phase 1 round trip: write a content-addressed Parquet via
 /// `write_batch`, trigger MSCK via `sync_iceberg_metadata`, and confirm:
-///   - `SELECT COUNT(*)` via Photon bumped by the number of rows written
+///   - `SELECT COUNT(*)` via Photon equals the number of rows written (each
+///     write replaces the table, #2269)
 ///   - at least one `*.metadata.json` file appears under `metadata/`
 ///     (proving MSCK regenerated the Iceberg side of UniForm)
 ///
@@ -389,10 +390,10 @@ async fn round_trip_phase1_compatible_sandbox() {
         .and_then(|s| s.parse().ok())
         .or_else(|| count_after.rows[0][0].as_i64())
         .expect("parse count as i64");
+    // Replace semantics (#2269): the live table equals this write only.
     assert_eq!(
-        n_after,
-        n_before + 3,
-        "Photon count must bump by 3 (before={n_before}, after={n_after})"
+        n_after, 3,
+        "Photon count must equal the 3 rows written (before={n_before}, after={n_after})"
     );
 
     // Verify a `metadata/*.metadata.json` exists after MSCK.

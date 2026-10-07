@@ -2674,17 +2674,39 @@ pub trait TypeMapper: Send + Sync {
 // Batch checks
 // ---------------------------------------------------------------------------
 
-/// Result of a batch row count query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RowCountResult {
-    pub table: TableRef,
-    pub count: u64,
+/// What a batch query read for one table (#1928).
+///
+/// Every table a batch method answers for gets one of these, so the reason a
+/// table could not be read travels with the result instead of only reaching
+/// the adapter's log. A table missing from the result entirely is still
+/// reported not evaluated by the caller, with a generic reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BatchReading<T> {
+    /// The warehouse answered, and the answer read as `T`. For freshness a
+    /// SQL `NULL` maximum is readable data (`max_timestamp: None`), not this
+    /// method's failure.
+    Readable(T),
+    /// The warehouse answered for this table, but the answer could not be
+    /// read. The string says why, in words an operator can act on.
+    Unreadable(String),
 }
 
-/// Result of a batch freshness query.
+/// One table's answer from a batch query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FreshnessResult {
+pub struct BatchTableResult<T> {
     pub table: TableRef,
+    pub reading: BatchReading<T>,
+}
+
+/// Result of a batch row count query: `COUNT(*)` per table.
+pub type RowCountResult = BatchTableResult<u64>;
+
+/// Result of a batch freshness query.
+pub type FreshnessResult = BatchTableResult<Freshness>;
+
+/// What a freshness query measures for one table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Freshness {
     /// `MAX(<timestamp_column>)`. `None` is a SQL NULL, which the warehouse
     /// answers both for an empty table and for a non-empty table whose
     /// timestamp column holds no value; `row_count` is what tells them apart.
@@ -2743,14 +2765,16 @@ pub trait BatchCheckAdapter: Send + Sync {
     ///
     /// Called only when [`supports_row_counts`](Self::supports_row_counts)
     /// returns `true`. An `Err` from here is a query that failed, never
-    /// "unimplemented".
+    /// "unimplemented". A table whose cell could not be read is returned as
+    /// [`BatchReading::Unreadable`] with the reason, not left out.
     async fn batch_row_counts(&self, tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>>;
 
     /// Execute freshness queries for multiple tables in a single batch.
     ///
     /// Called only when [`supports_freshness`](Self::supports_freshness)
     /// returns `true`. An `Err` from here is a query that failed, never
-    /// "unimplemented".
+    /// "unimplemented". A table whose cells could not be read is returned as
+    /// [`BatchReading::Unreadable`] with the reason, not left out.
     async fn batch_freshness(
         &self,
         tables: &[TableRef],

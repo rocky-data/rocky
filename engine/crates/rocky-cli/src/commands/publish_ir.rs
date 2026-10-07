@@ -154,6 +154,7 @@ pub fn run_publish_ir(
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
         preserve_authored_sql: false,
+        external_dependencies: Default::default(),
     };
 
     let result = compile::compile(&config)?;

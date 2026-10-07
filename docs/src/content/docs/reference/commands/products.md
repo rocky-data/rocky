@@ -69,6 +69,8 @@ If the marker says it did **not** commit, recovery restores the previous generat
 - A `.ff-prev` backup exists that the journal does not record. Rocky will not restore a backup it did not create, and fails with `commit-unexpected-backup` naming the file to inspect.
 - A new file is in place that recovery cannot read to identify. It is left alone, with `commit-io`.
 
+A restore reads every recorded `.ff-prev` backup before it changes anything. It writes the bytes it read to a new file, syncs it, and renames that file over the final. It never renames the backup itself into place. On Unix a backup that is a symlink or has a second hard link is refused with `commit-io`, and nothing is restored. A crash during a restore leaves the backup and the journal, so the next run repeats it.
+
 On Unix, `product compile` also refuses a directory it writes into that is itself a symlink, for example `models -> models_real`, with `commit-io` ("taking directory custody for the commit failed"). This holds even when the link points inside the project. Replace the link with the real directory.
 
 If an approval exists, compile re-verifies the snapshot's bytes against the approval digest before doing anything. A mismatch is tamper, and nothing proceeds.

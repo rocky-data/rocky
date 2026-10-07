@@ -508,6 +508,7 @@ impl RockyLsp {
             // Diagnostics and symbols map onto the authored text, so keep it
             // rather than the ephemeral-inlined form.
             preserve_authored_sql: true,
+            external_dependencies: Default::default(),
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -1427,6 +1428,7 @@ impl LanguageServer for RockyLsp {
                     // Diagnostics and symbols map onto the authored text, so keep it
                     // rather than the ephemeral-inlined form.
                     preserve_authored_sql: true,
+                    external_dependencies: Default::default(),
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -6418,6 +6420,7 @@ mod tests {
             // Diagnostics and symbols map onto the authored text, so keep it
             // rather than the ephemeral-inlined form.
             preserve_authored_sql: true,
+            external_dependencies: Default::default(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

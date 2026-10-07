@@ -25,7 +25,7 @@ A model references another model that the project does not contain.
 
 1. Check that the referenced model exists under `models/`.
 2. Check that its `name` field matches the file name.
-3. Check the SQL reference itself. Rocky discovers dependencies from SQL table references, and a bare name that matches a model file name becomes a DAG edge.
+3. Check the SQL reference itself. Rocky discovers dependencies from SQL table references, and a bare name becomes a DAG edge to the model whose `[target]` table has that name. If the model's target table is spelled differently from its name, read the target, or see warning `D012`.
 
 ### "Type mismatch on column 'X'"
 

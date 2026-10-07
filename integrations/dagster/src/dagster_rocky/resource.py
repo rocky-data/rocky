@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -331,6 +331,11 @@ def _collect_supplied_run_kwargs(
     if timeout_seconds is not None:
         kwargs["timeout_seconds"] = timeout_seconds
     return kwargs
+
+
+#: Pipes ``extras`` key carrying the declared checks to the engine (#2160).
+#: Must match ``EXTRAS_DECLARED_CHECKS`` in ``engine/crates/rocky-cli/src/pipes.rs``.
+PIPES_DECLARED_CHECKS_EXTRA: str = "rocky_declared_checks"
 
 
 class RockyPipesMessageReader(dg.PipesTempFileMessageReader):
@@ -1148,6 +1153,7 @@ class RockyResource(dg.ConfigurableResource):
         pipes_client: dg.PipesSubprocessClient | None = None,
         asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
         include_keys: set[dg.AssetKey] | None = None,
+        declared_checks: Mapping[str, Sequence[str]] | None = None,
     ) -> dg.PipesClientCompletedInvocation:
         """Full Dagster Pipes execution: structured events streamed via the protocol.
 
@@ -1185,6 +1191,13 @@ class RockyResource(dg.ConfigurableResource):
                 (drops the event).
             include_keys: Optional allowlist of Dagster asset keys; events whose
                 resolved key is not in the set are dropped.
+            declared_checks: Optional map of engine-native asset key
+                (slash-joined, the Pipes wire form) to the check names declared
+                on it. Sent as the ``rocky_declared_checks`` Pipes extra; the
+                engine answers every declared check it did not produce with an
+                explicit ``passed=False`` not-evaluated row naming the cause
+                (#2160). ``None`` sends nothing and the engine reports only
+                what it produced.
         """
         self._maybe_warn_pipes_timeout_ignored(context)
         resolved = self._apply_resolvers(
@@ -1255,11 +1268,16 @@ class RockyResource(dg.ConfigurableResource):
                     ),
                 },
             )
+        # Surface the plan id on the Dagster run as Pipes extras for correlation.
+        extras: dict[str, Any] = {"plan_id": plan_id}
+        if declared_checks is not None:
+            extras[PIPES_DECLARED_CHECKS_EXTRA] = {
+                key: list(names) for key, names in declared_checks.items()
+            }
         return client.run(
             context=context,
             command=self._build_cmd(["apply", plan_id]),
-            # Surface the plan id on the Dagster run as Pipes extras for correlation.
-            extras={"plan_id": plan_id},
+            extras=extras,
         )
 
     def state(self) -> StateResult:

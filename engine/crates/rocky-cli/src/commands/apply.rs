@@ -1322,6 +1322,15 @@ pub enum PolicyGate {
     },
 }
 
+// Counts `model_attributes` calls on this thread, so a test can prove how
+// often a gate loads the models directory (#2270). Thread-local because
+// tests run in parallel; a `#[tokio::test]` runs on one thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MODEL_ATTRIBUTE_LOADS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Build the apply-time [`ModelAttributes`] for every compiled model under
 /// `models_dir`, mirroring `rocky policy check`: `classifications` is the
 /// distinct column-classification set, `layer` is the `layer` tag, and
@@ -1331,6 +1340,9 @@ fn model_attributes(
     models_glob: Option<&str>,
 ) -> Result<BTreeMap<String, ModelAttributes>, String> {
     use rocky_compiler::compile::{self, CompilerConfig};
+
+    #[cfg(test)]
+    MODEL_ATTRIBUTE_LOADS.with(|n| n.set(n.get() + 1));
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -4896,10 +4908,31 @@ async fn run_apply_replication_plan(
         None => {
             let live_snapshot = serde_json::to_value(rocky_cfg)
                 .context("failed to serialize the live config for the plan comparison")?;
-            let differs = live_snapshot != replication_plan.config_snapshot;
-            let changed =
-                changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
-            (differs, changed)
+            if live_snapshot == replication_plan.config_snapshot {
+                (false, Vec::new())
+            } else {
+                // A plan without digests predates #1919: its snapshot may hold
+                // resolved `${VAR}` values where this engine prints `${NAME}`.
+                // If it matches the resolved form, nothing changed but the
+                // form: refuse anyway (fail-closed) and say what is wrong.
+                let live_resolved = rocky_core::env_string::with_env_values_scope(|| {
+                    serde_json::to_value(rocky_cfg)
+                })
+                .context("failed to serialize the live config for the plan comparison")?;
+                if live_resolved == replication_plan.config_snapshot {
+                    bail!(
+                        "re-plan: this plan was written by an older engine. Plan \
+                         '{plan_id}' has no config digests, and its config snapshot holds \
+                         values this engine prints as `${{NAME}}`, so the two cannot be \
+                         compared.\n\
+                         Nothing was written. Re-plan with `rocky plan` and apply the new \
+                         plan_id."
+                    );
+                }
+                let changed =
+                    changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
+                (true, changed)
+            }
         }
     };
     if differs {
@@ -5553,6 +5586,8 @@ pub async fn run_apply_inline_for_run(
     contracts_dir: Option<&Path>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
     actor: &PrincipalRef,
+    // `--refuse-hooks` (#2162): refuse a config that would fire hooks.
+    refuse_hooks: bool,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5562,6 +5597,10 @@ pub async fn run_apply_inline_for_run(
         rocky_core::config::load_rocky_config_fingerprinted(config_path)
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
+    // Checked against the same snapshot the run executes, before any I/O.
+    if refuse_hooks {
+        crate::commands::run::refuse_configured_side_effects(&loaded.config.hooks)?;
+    }
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run_with_explicit_contracts(
         config_path,
@@ -5595,6 +5634,7 @@ pub async fn run_apply_inline_for_run(
         None, // #1460: inline `rocky run`, not a persisted plan
         contracts_dir,
         actor,
+        None,
     )
     .await
     .map(|_| ())
@@ -11274,6 +11314,66 @@ schema_template = "s__{source}"
         assert!(
             !msg.contains(PLANNED) && !msg.contains(APPLIED),
             "the refusal must not print either value: {msg}"
+        );
+        Ok(())
+    }
+
+    /// #1919 follow-up (P1-5): a plan written before #1919 has no digests and a
+    /// snapshot of resolved values. Against this engine's `${NAME}` snapshot it
+    /// can never compare equal, even with nothing changed, so the refusal must
+    /// say "re-plan: older engine", not "config has changed".
+    #[tokio::test]
+    async fn a_pre_1919_plan_refuses_as_written_by_an_older_engine() -> anyhow::Result<()> {
+        const VAR: &str = "ROCKY_T1919_OLD_PLAN_CAT";
+        const VALUE: &str = "rocky_1919_old_plan_catalog";
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        // A `[policy]` scope field is one the snapshot prints as `${NAME}`;
+        // an engine from before the placeholder form stored its value.
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "{REPLICATION_TOML}\n[policy]\nversion = 1\n\n[[policy.rules]]\n\
+                 principal = \"agent\"\ncapability = \"schema_change.additive\"\n\
+                 scope = {{ layer = \"${{{VAR}}}\" }}\neffect = \"allow\"\n"
+            ),
+        )?;
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var(VAR, VALUE) };
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        // The pre-#1919 shape: the resolved snapshot, no digests.
+        rp.config_snapshot =
+            rocky_core::env_string::with_env_values_scope(|| serde_json::to_value(&cfg))?;
+        rp.config_digests = None;
+        assert!(
+            rp.config_snapshot.to_string().contains(VALUE),
+            "PRECONDITION: the old-shape snapshot holds the resolved value"
+        );
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )
+        .await;
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(VAR) };
+        let msg = format!("{:#}", res.expect_err("an old plan must refuse"));
+        assert!(
+            msg.contains("re-plan: this plan was written by an older engine"),
+            "{msg}"
+        );
+        assert!(!msg.contains("config has changed since plan"), "{msg}");
+        assert!(
+            !msg.contains(VALUE),
+            "the refusal must not print the value: {msg}"
         );
         Ok(())
     }

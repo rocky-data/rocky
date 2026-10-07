@@ -150,25 +150,85 @@ pub struct SourceType {
     pub source_type: String,
 }
 
-/// Manual source: a static list of schemas/tables for teams without Fivetran.
+/// One source schema of a `type = "manual"` discovery adapter, with the
+/// tables in it, listed in `rocky.toml` for teams whose source has no
+/// discovery API (a Databricks or Snowflake source with no Fivetran in front).
 ///
 /// ```toml
-/// [source]
+/// [adapter.local_discovery]
 /// type = "manual"
-/// catalog = "my_catalog"
+/// kind = "discovery"
 ///
-/// [[source.schemas]]
-/// name = "raw_orders"
+/// [[adapter.local_discovery.schemas]]
+/// name = "raw__orders"
 /// tables = ["orders", "order_items", "returns"]
 ///
-/// [[source.schemas]]
-/// name = "raw_customers"
+/// [[adapter.local_discovery.schemas]]
+/// name = "raw__customers"
 /// tables = ["customers", "addresses"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The load-time rules (non-empty list, valid identifiers, no duplicates)
+/// live in `config::validate_manual_adapters`, so `rocky validate` and every
+/// executing command refuse the same configs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManualSchemaConfig {
+    /// Source schema name. Matched against the pipeline's
+    /// `schema_pattern.prefix` exactly as a discovered schema would be.
     pub name: String,
+    /// Tables in the schema.
     pub tables: Vec<String>,
+}
+
+/// Discovery adapter for `type = "manual"`: returns the schemas listed in
+/// config, with no network call.
+///
+/// Each listed schema whose name starts with the requested prefix becomes one
+/// [`DiscoveredConnector`], in config order. The connector `id` is the schema
+/// name, `source_type` is `"manual"`, and there is no sync clock
+/// (`last_sync_at: None`), row count, or external object id — so the
+/// cross-source collision check skips these sources, as it does for any
+/// adapter that cannot name the external object.
+#[derive(Debug, Clone)]
+pub struct ManualDiscoveryAdapter {
+    schemas: Vec<ManualSchemaConfig>,
+}
+
+impl ManualDiscoveryAdapter {
+    pub fn new(schemas: Vec<ManualSchemaConfig>) -> Self {
+        Self { schemas }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::DiscoveryAdapter for ManualDiscoveryAdapter {
+    async fn discover(&self, schema_prefix: &str) -> crate::traits::AdapterResult<DiscoveryResult> {
+        // `starts_with`, the same plain-text prefix match the DuckDB and
+        // BigQuery adapters use (#1649).
+        let connectors = self
+            .schemas
+            .iter()
+            .filter(|schema| schema.name.starts_with(schema_prefix))
+            .map(|schema| DiscoveredConnector {
+                id: schema.name.clone(),
+                schema: schema.name.clone(),
+                source_type: "manual".to_string(),
+                last_sync_at: None,
+                tables: schema
+                    .tables
+                    .iter()
+                    .map(|name| DiscoveredTable {
+                        name: name.clone(),
+                        row_count: None,
+                    })
+                    .collect(),
+                metadata: IndexMap::new(),
+                external_object_ids: Vec::new(),
+            })
+            .collect();
+        Ok(DiscoveryResult::ok(connectors))
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +295,72 @@ mod tests {
         assert_eq!(deserialized.metadata.len(), 3);
         assert_eq!(deserialized.metadata["fivetran.service"], "shopify");
         assert!(deserialized.metadata["fivetran.reports"].is_array());
+    }
+
+    #[tokio::test]
+    async fn manual_adapter_returns_listed_schemas_matching_the_prefix() {
+        use crate::traits::DiscoveryAdapter;
+
+        let adapter = ManualDiscoveryAdapter::new(vec![
+            ManualSchemaConfig {
+                name: "raw__orders".into(),
+                tables: vec!["orders".into(), "order_items".into()],
+            },
+            ManualSchemaConfig {
+                name: "other__x".into(),
+                tables: vec!["x".into()],
+            },
+            ManualSchemaConfig {
+                name: "raw__customers".into(),
+                tables: vec!["customers".into()],
+            },
+        ]);
+
+        let result = adapter.discover("raw__").await.unwrap();
+        assert!(result.failed.is_empty());
+        let got: Vec<(&str, Vec<&str>)> = result
+            .connectors
+            .iter()
+            .map(|c| {
+                (
+                    c.schema.as_str(),
+                    c.tables.iter().map(|t| t.name.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("raw__orders", vec!["orders", "order_items"]),
+                ("raw__customers", vec!["customers"]),
+            ]
+        );
+        assert!(result.connectors.iter().all(|c| c.id == c.schema
+            && c.source_type == "manual"
+            && c.last_sync_at.is_none()
+            && c.external_object_ids.is_empty()));
+
+        // `_` is plain text in the prefix, not a wildcard.
+        assert!(
+            adapter
+                .discover("raw_x")
+                .await
+                .unwrap()
+                .connectors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_manual_schema_rejects_unknown_keys() {
+        let err = toml::from_str::<ManualSchemaConfig>(
+            r#"
+            name = "raw__orders"
+            tabels = ["orders"]
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tabels"), "{err}");
     }
 
     #[test]

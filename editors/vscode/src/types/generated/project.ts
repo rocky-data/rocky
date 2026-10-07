@@ -6,6 +6,11 @@
  */
 
 /**
+ * Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).
+ */
+export type RunScopeKind = "production" | "shadow" | "branch" | "unrecorded";
+
+/**
  * The project a sidecar serves, for `GET /api/v1/project`: what the server-rendered dashboard at `/` used to show, as a typed payload.
  *
  * Server-only, no CLI twin. Bounded by construction: names of pipelines and adapters (a handful), counts for models and diagnostics, and the one newest run. The model names are on `GET /api/v1/models` and the DAG.
@@ -82,6 +87,10 @@ export interface ProjectRunOutput {
   finished_at: string;
   models_executed: number;
   run_id: string;
+  /**
+   * Where it wrote (#2201). The last run reported here is the newest production run, or one recorded before runs carried a scope (`unrecorded`); shadow and branch runs are never reported here.
+   */
+  run_scope?: RunScopeKind & string;
   /**
    * RFC 3339.
    */

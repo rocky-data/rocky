@@ -568,8 +568,21 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "manual" => {
-                    // Manual discovery doesn't need an adapter instance;
-                    // it's handled inline from pipeline source config.
+                    // The schemas and tables are listed in config (#1994).
+                    // `validate_manual_adapters` refuses an empty list at
+                    // load; this re-check keeps a registry built from an
+                    // unvalidated config from registering an adapter that
+                    // can never discover a table.
+                    if adapter_cfg.schemas.is_empty() {
+                        bail!(
+                            "adapters.{name}: a manual discovery adapter needs at least one \
+                             [[adapter.{name}.schemas]] block"
+                        );
+                    }
+                    let adapter = Arc::new(rocky_core::source::ManualDiscoveryAdapter::new(
+                        adapter_cfg.schemas.clone(),
+                    ));
+                    discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "snowflake" => {
                     let account = adapter_cfg

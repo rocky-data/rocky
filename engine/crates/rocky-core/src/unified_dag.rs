@@ -100,6 +100,45 @@ pub enum UnifiedDagError {
         claimants: Vec<(String, String)>,
     },
 
+    /// A model's `depends_on` names a label more than one node carries — a
+    /// model, a seed, or a pipeline (#2202). Binding to whichever node was
+    /// built last would be a guess, so it is refused.
+    #[error(
+        "model '{model}' declares depends_on '{dependency}', but that name belongs to {}. \
+         Rocky cannot tell which one '{model}' must run after. Rename one of them so each \
+         name is unique.",
+        .claimants.join(" and ")
+    )]
+    AmbiguousDependsOn {
+        /// The model whose `depends_on` names the shared label.
+        model: String,
+        /// The shared label.
+        dependency: String,
+        /// Every node carrying the label, described by kind, sorted so the
+        /// message is deterministic.
+        claimants: Vec<String>,
+    },
+
+    /// A seed or load pipeline writes a table another producer also writes
+    /// (#2202). [`UnifiedDagError::DuplicatePhysicalTargetAcrossPipelines`]
+    /// covers two models; this covers every pair that includes a seed or a
+    /// load pipeline. See [`build_runtime_dag`].
+    #[error(
+        "{} write the same table on adapter '{adapter}'. Nothing orders one write against \
+         the other, so whichever finishes last decides the table's rows. Give one of them its \
+         own target table, or point it at a different adapter. A `?` marks a part of a target \
+         Rocky does not know; it is treated as possibly the same: declare it in the seed's \
+         sidecar `[target]` or the model's `[target]` to settle it.",
+        .writers.join(" and ")
+    )]
+    DuplicateProducerTarget {
+        /// The adapter both write through.
+        adapter: String,
+        /// Every writer, described with its target, sorted so the message is
+        /// deterministic.
+        writers: Vec<String>,
+    },
+
     /// A model reads a name that more than one producer claims — a model and
     /// a seed or load pipeline share a label — and the read does not name
     /// exactly one of them by its physical target. See [`build_runtime_dag`].
@@ -594,9 +633,11 @@ pub fn build_unified_dag(
     // can wire edges from the *last* node of the upstream pipeline.
     let mut pipeline_node_ids: HashMap<String, Vec<NodeId>> = HashMap::new();
 
-    // Logical-name -> NodeId map for cross-step dependency resolution.
-    // Populated as nodes are created.
-    let mut name_to_node: HashMap<String, NodeId> = HashMap::new();
+    // Logical-name -> every NodeId carrying it, for cross-step dependency
+    // resolution. Populated as nodes are created. A name can belong to more
+    // than one node (a seed and a model, say); a `depends_on` on such a name
+    // is refused rather than bound to whichever was inserted last (#2202).
+    let mut name_to_node: HashMap<String, Vec<NodeId>> = HashMap::new();
 
     // --- Add seed nodes (pipeline-independent) ---
     for seed in seeds {
@@ -607,7 +648,10 @@ pub fn build_unified_dag(
             label: seed.name.clone(),
             pipeline: None,
         });
-        name_to_node.insert(seed.name.clone(), node_id);
+        name_to_node
+            .entry(seed.name.clone())
+            .or_default()
+            .push(node_id);
     }
 
     for (pipeline_name, pipeline_cfg) in &config.pipelines {
@@ -637,7 +681,10 @@ pub fn build_unified_dag(
                 });
 
                 // The Load node is the "output" of a replication pipeline.
-                name_to_node.insert(pipeline_name.clone(), load_id.clone());
+                name_to_node
+                    .entry(pipeline_name.clone())
+                    .or_default()
+                    .push(load_id.clone());
 
                 pipeline_node_ids
                     .entry(pipeline_name.clone())
@@ -696,7 +743,10 @@ pub fn build_unified_dag(
                     label: pipeline_name.clone(),
                     pipeline: Some(pipeline_name.clone()),
                 });
-                name_to_node.insert(pipeline_name.clone(), node_id.clone());
+                name_to_node
+                    .entry(pipeline_name.clone())
+                    .or_default()
+                    .push(node_id.clone());
                 pipeline_node_ids
                     .entry(pipeline_name.clone())
                     .or_default()
@@ -709,7 +759,7 @@ pub fn build_unified_dag(
     // A model's depends_on may reference seeds or other step types by name.
     // Intra-pipeline model deps were already wired in add_transformation_nodes;
     // here we wire cross-step references (seed, replication load, etc.).
-    resolve_cross_step_deps(&all_models, &pipeline_of, &name_to_node, &mut edges);
+    resolve_cross_step_deps(&all_models, &pipeline_of, &name_to_node, &mut edges)?;
 
     // Wire inter-pipeline depends_on edges.
     for (pipeline_name, pipeline_cfg) in &config.pipelines {
@@ -818,16 +868,43 @@ pub fn build_unified_dag(
 /// pipeline received the whole model list — drops that edge entirely and lets
 /// `fct` run alongside the `stg` it reads. Silent wrong ordering, which is worse
 /// than the loud failure this fix replaced.
+///
+/// A name more than one node carries is refused with
+/// [`UnifiedDagError::AmbiguousDependsOn`] before anything is skipped as
+/// already wired: the intra-pipeline pass binds a model name without looking
+/// for a seed or pipeline of the same name, so the check has to come first.
 fn resolve_cross_step_deps(
     models: &[&Model],
     pipeline_of: &HashMap<&str, &str>,
-    name_to_node: &HashMap<String, NodeId>,
+    name_to_node: &HashMap<String, Vec<NodeId>>,
     edges: &mut Vec<UnifiedEdge>,
-) {
+) -> Result<(), UnifiedDagError> {
     for model in models {
         let model_id = NodeId::new("transformation", &model.config.name);
         let own_pipeline = pipeline_of.get(model.config.name.as_str()).copied();
         for dep in &model.config.depends_on {
+            let claimants = name_to_node
+                .get(dep.as_str())
+                .map_or(&[][..], Vec::as_slice);
+            if claimants.len() > 1 {
+                let mut described: Vec<String> = claimants
+                    .iter()
+                    .map(|id| {
+                        let kind = match id.0.split_once(':').map(|(k, _)| k) {
+                            Some("transformation") => "model",
+                            Some("seed") => "seed",
+                            _ => "pipeline",
+                        };
+                        format!("{kind} '{dep}'")
+                    })
+                    .collect();
+                described.sort();
+                return Err(UnifiedDagError::AmbiguousDependsOn {
+                    model: model.config.name.clone(),
+                    dependency: dep.clone(),
+                    claimants: described,
+                });
+            }
             // Already wired intra-pipeline: same owning pipeline, model→model.
             if let Some(dep_pipeline) = pipeline_of.get(dep.as_str())
                 && Some(*dep_pipeline) == own_pipeline
@@ -836,7 +913,7 @@ fn resolve_cross_step_deps(
             }
             // A seed, a replication load, or a model in ANOTHER transformation
             // pipeline — all of which resolve through `name_to_node`.
-            if let Some(dep_node_id) = name_to_node.get(dep.as_str()) {
+            if let [dep_node_id] = claimants {
                 edges.push(UnifiedEdge {
                     from: dep_node_id.clone(),
                     to: model_id.clone(),
@@ -845,6 +922,7 @@ fn resolve_cross_step_deps(
             }
         }
     }
+    Ok(())
 }
 
 /// Expands a transformation pipeline into per-model nodes, seed nodes,
@@ -855,7 +933,7 @@ fn add_transformation_nodes(
     nodes: &mut Vec<UnifiedNode>,
     edges: &mut Vec<UnifiedEdge>,
     pipeline_node_ids: &mut HashMap<String, Vec<NodeId>>,
-    name_to_node: &mut HashMap<String, NodeId>,
+    name_to_node: &mut HashMap<String, Vec<NodeId>>,
 ) {
     // Build a set of model names for resolving depends_on within the pipeline.
     let model_names: HashSet<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
@@ -874,7 +952,10 @@ fn add_transformation_nodes(
             .entry(pipeline_name.to_string())
             .or_default()
             .push(node_id.clone());
-        name_to_node.insert(model_name.clone(), node_id.clone());
+        name_to_node
+            .entry(model_name.clone())
+            .or_default()
+            .push(node_id.clone());
 
         // Intra-pipeline model dependencies.
         for dep in &model.config.depends_on {
@@ -980,13 +1061,18 @@ pub struct RuntimeDag {
 /// guess therefore never displaces an exact edge, and that does not depend on
 /// the order names sort in.
 ///
-/// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]).
+/// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]),
+///    then the **compiler's** model edges (`model_edges`): which model a bare
+///    read reaches, decided by `rocky_compiler::resolve` — the same answer a
+///    plain `rocky run` and `rocky test` act on (#1629).
 /// 2. **Physical reads** — a model reads another model's `[target]` by name:
 ///    exact three-part and two-part reads, then the catalog fallback, then
 ///    bare-name guesses ([`crate::physical_edges::derive_physical_edges`]).
-/// 3. **Label reads** — a model reads a name that is a model's, seed's or
-///    load's label. This is the weakest evidence: it matches the last segment
-///    of the read and ignores its schema and catalog. A label edge that would
+/// 3. **Label reads** — a model reads a name that is a seed's or load's
+///    label. This is the weakest evidence: it matches the last segment of the
+///    read and ignores its schema and catalog. A label that names a model adds
+///    no edge here: model-to-model edges are the compiler's (pass 1), and a
+///    second matcher would disagree with it (#1629). A label edge that would
 ///    close a cycle through a physical edge is skipped and reported. A cycle
 ///    made only of declared and label edges is not skipped — it is a genuine
 ///    cycle, and it keeps its loud refusal.
@@ -1015,7 +1101,38 @@ pub fn build_runtime_dag(
     seed_default_catalog: Option<&str>,
     default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
 ) -> Result<RuntimeDag, UnifiedDagError> {
+    build_runtime_dag_with_model_edges(
+        config,
+        models_by_pipeline,
+        seeds,
+        seed_default_catalog,
+        default_catalog_of,
+        &[],
+    )
+}
+
+/// [`build_runtime_dag`], with the compiler's model edges.
+///
+/// `model_edges` are `(consumer, producer)` model names, as
+/// `rocky_compiler::resolve::derived_model_edges` returns them over every
+/// pipeline's models. An edge naming a model that is not a node of the graph
+/// is ignored. This crate cannot call the compiler, so the caller passes them;
+/// [`build_runtime_dag`] passes none, and then no edge between two models
+/// comes from their SQL except a physical read of a target.
+///
+/// # Errors
+///
+/// Everything [`build_runtime_dag`] refuses.
+pub fn build_runtime_dag_with_model_edges(
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+    seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
+    default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
+    model_edges: &[(String, String)],
+) -> Result<RuntimeDag, UnifiedDagError> {
     let mut dag = build_unified_dag(config, models_by_pipeline, seeds)?;
+    add_model_edges(&mut dag, model_edges);
 
     // The catalog a catalogless `[target]` resolves in is a property of the
     // adapter the target writes through, so it is asked per adapter name.
@@ -1043,10 +1160,17 @@ pub fn build_runtime_dag(
                 .pipelines
                 .get(pipeline.as_str())
                 .map(PipelineConfig::target_adapter);
+            let adapter_type = adapter
+                .and_then(|a| config.adapters.get(a))
+                .map(|a| a.adapter_type.as_str());
             models.iter().map(move |m| {
                 let input = PhysicalEdgeModel::from_model(m).with_effective_catalog(catalog);
-                match adapter {
+                let input = match adapter {
                     Some(adapter) => input.with_adapter(adapter),
+                    None => input,
+                };
+                match adapter_type {
+                    Some(adapter_type) => input.with_adapter_type(adapter_type),
                     None => input,
                 }
             })
@@ -1088,6 +1212,13 @@ pub fn build_runtime_dag(
         &pipeline_catalog,
         &established,
     );
+    reject_duplicate_producer_targets(
+        &dag,
+        config,
+        models_by_pipeline,
+        seed_default_catalog,
+        &targets,
+    )?;
     let labels = infer_label_dependencies(&mut dag, &sql_by_name, &targets, &physical_edges)?;
 
     let mut warnings = labels.warnings();
@@ -1098,6 +1229,39 @@ pub fn build_runtime_dag(
         physical,
         labels,
     })
+}
+
+/// Add the compiler's `(consumer, producer)` model edges to `dag` (#1629).
+/// Both ends must be transformation nodes of the graph; an edge already
+/// present is not added twice.
+fn add_model_edges(dag: &mut UnifiedDag, model_edges: &[(String, String)]) {
+    let models: HashSet<&NodeId> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Transformation)
+        .map(|n| &n.id)
+        .collect();
+    let mut existing: HashSet<(NodeId, NodeId)> = dag
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    let mut added = Vec::new();
+    for (consumer, producer) in model_edges {
+        let from = NodeId::new("transformation", producer);
+        let to = NodeId::new("transformation", consumer);
+        if from == to || !models.contains(&from) || !models.contains(&to) {
+            continue;
+        }
+        if existing.insert((from.clone(), to.clone())) {
+            added.push(UnifiedEdge {
+                from,
+                to,
+                edge_type: EdgeType::DataDependency,
+            });
+        }
+    }
+    dag.edges.extend(added);
 }
 
 /// Where a producing node writes, as far as that is declared or established.
@@ -1183,6 +1347,126 @@ impl ProducerTarget {
             part(&self.table)
         )
     }
+}
+
+/// Refuse a seed or load pipeline that writes the same table as another
+/// producer (#2202).
+///
+/// [`reject_duplicate_physical_targets`] refuses two models of different
+/// pipelines on one table, and E036 two models of one pipeline. Neither sees a
+/// seed or a load pipeline, so a seed and a model writing one table became two
+/// unordered nodes, and whichever finished last decided the rows.
+///
+/// Keyed like the model gate: the adapter **name** plus the folded target. Two
+/// adapter names may alias one warehouse; that collision is missed here, as it
+/// is there. Within one adapter the comparison fails closed: a component one
+/// side does not know (a catalogless target whose catalog the adapter cannot
+/// establish) is treated as possibly equal. Schema and table must be known on
+/// both sides; a load pipeline with no `table` writes tables named after its
+/// files, which the graph cannot see, and is not checked.
+///
+/// A seed writes only when the DAG resolved a pipeline for the seed nodes —
+/// `seed_default_catalog` is `Some` exactly then. Otherwise every seed node
+/// fails at dispatch, before it writes anything, and seeds are skipped here.
+/// When it is resolved, every pipeline shares one adapter, and the seeds write
+/// through it.
+///
+/// Pairs of two models are left to the model gate and E036, so one mistake
+/// keeps one error.
+fn reject_duplicate_producer_targets(
+    dag: &UnifiedDag,
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+    seed_default_catalog: Option<&str>,
+    targets: &HashMap<NodeId, ProducerTarget>,
+) -> Result<(), UnifiedDagError> {
+    let model_adapter: HashMap<&str, &str> = models_by_pipeline
+        .iter()
+        .filter_map(|(pipeline, models)| {
+            let adapter = config.pipelines.get(pipeline.as_str())?.target_adapter();
+            Some(
+                models
+                    .iter()
+                    .map(move |m| (m.config.name.as_str(), adapter)),
+            )
+        })
+        .flatten()
+        .collect();
+    let seed_adapter: Option<&str> = seed_default_catalog.and_then(|_| {
+        let mut adapters = config
+            .pipelines
+            .values()
+            .map(PipelineConfig::target_adapter);
+        let first = adapters.next()?;
+        adapters.all(|a| a == first).then_some(first)
+    });
+
+    // Every producer that writes a known schema and table, with its adapter.
+    let mut writers: Vec<(&UnifiedNode, &str, &ProducerTarget)> = Vec::new();
+    for node in &dag.nodes {
+        let adapter = match node.kind {
+            NodeKind::Transformation => model_adapter.get(node.label.as_str()).copied(),
+            NodeKind::Seed => seed_adapter,
+            NodeKind::Load => match node
+                .pipeline
+                .as_deref()
+                .and_then(|p| config.pipelines.get(p))
+            {
+                Some(PipelineConfig::Load(load)) => Some(load.target.adapter.as_str()),
+                _ => None,
+            },
+            NodeKind::Source
+            | NodeKind::Replication
+            | NodeKind::Quality
+            | NodeKind::Snapshot
+            | NodeKind::Test => None,
+        };
+        let (Some(adapter), Some(target)) = (adapter, targets.get(&node.id)) else {
+            continue;
+        };
+        if target.schema.is_none() || target.table.is_none() {
+            continue;
+        }
+        writers.push((node, adapter, target));
+    }
+
+    for (index, (first, first_adapter, first_target)) in writers.iter().enumerate() {
+        let mut clash: Vec<&(&UnifiedNode, &str, &ProducerTarget)> = writers
+            .iter()
+            .skip(index + 1)
+            .filter(|(second, second_adapter, second_target)| {
+                !(first.kind == NodeKind::Transformation && second.kind == NodeKind::Transformation)
+                    && first_adapter == second_adapter
+                    && first_target.schema == second_target.schema
+                    && first_target.table == second_target.table
+                    && match (&first_target.catalog, &second_target.catalog) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            })
+            .collect();
+        if clash.is_empty() {
+            continue;
+        }
+        clash.push(&writers[index]);
+        let mut described: Vec<String> = clash
+            .iter()
+            .map(|(node, _, target)| {
+                format!(
+                    "{} '{}' (target {})",
+                    producer_kind(node.kind),
+                    node.label,
+                    target.describe()
+                )
+            })
+            .collect();
+        described.sort();
+        return Err(UnifiedDagError::DuplicateProducerTarget {
+            adapter: (*first_adapter).to_string(),
+            writers: described,
+        });
+    }
+    Ok(())
 }
 
 /// The declared target of every node that can produce a table a model reads.
@@ -1288,6 +1572,10 @@ fn producer_targets(
 /// be — or refused. Build order never decides: which node was built last says
 /// nothing about which one a read means (#1629).
 ///
+/// A read that resolves to a MODEL adds no edge here: the compiler binds reads
+/// of models, and its edges joined the graph in pass 1. Models still claim
+/// their labels, so a read that could be a model or a seed is still refused.
+///
 /// `physical` are the `(producer, consumer)` node pairs the physical pass
 /// settled. `targets` holds each producer's declared target. Inferred edges
 /// are de-duplicated against existing ones, so calling this repeatedly is
@@ -1355,8 +1643,8 @@ fn infer_label_dependencies(
             let Some(claimants) = producers.get(label) else {
                 continue;
             };
-            let producer_id = match claimants.as_slice() {
-                [(only, _)] => only,
+            let (producer_id, producer_kind_found) = match claimants.as_slice() {
+                [(only, kind)] => (only, *kind),
                 // Several nodes claim the label: the read must name exactly
                 // one of them by its physical target, and no other claimant
                 // may be able to be the same table. A claimant whose target is
@@ -1398,9 +1686,19 @@ fn infer_label_dependencies(
                             producers: described,
                         });
                     };
-                    *named
+                    let kind = claimants
+                        .iter()
+                        .find(|(id, _)| id == *named)
+                        .map_or(NodeKind::Transformation, |(_, kind)| *kind);
+                    (*named, kind)
                 }
             };
+            // A read of a model is the compiler's to bind (pass 1). Matching
+            // it here by label would be a second matcher that ignores the
+            // model's target, which is #1629.
+            if producer_kind_found == NodeKind::Transformation {
+                continue;
+            }
             // A model never depends on itself.
             if *producer_id != node.id {
                 candidates.insert((node.id.0.clone(), producer_id.0.clone()));
@@ -2336,6 +2634,137 @@ mod tests {
 
         build_unified_dag(&config, &models_by_pipeline, &[])
             .expect("the same triple on two different warehouses is two different tables");
+    }
+
+    /// #2202 item 1, through `build_runtime_dag`: two pipelines on adapters of
+    /// different warehouse types that spell one target are two tables, so
+    /// the runtime graph warns of no collision — under `strict_scheduling` a
+    /// warning is a refusal. Two adapters of ONE type still warn: they may be
+    /// aliases of one metastore.
+    #[test]
+    fn runtime_target_collisions_ignore_adapters_of_different_types() {
+        let snowflake: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "type": "snowflake",
+            "account": "acct",
+        }))
+        .expect("snowflake adapter fixture");
+        let databricks = |host: &str| -> AdapterConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "databricks",
+                "host": host,
+            }))
+            .expect("databricks adapter fixture")
+        };
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "c", "s", "shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "c", "s", "shared")],
+            ),
+        ]);
+        let no_catalog = |_: &AdapterConfig| None;
+        let collision = |w: &String| w.contains("render the same physical target");
+
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("duck")),
+            ("gold", transform_pipeline_on("snow")),
+        ]);
+        config
+            .adapters
+            .insert("duck".into(), duckdb_adapter("c.duckdb"));
+        config.adapters.insert("snow".into(), snowflake);
+        let runtime = build_runtime_dag(&config, &models_by_pipeline, &[], None, &no_catalog)
+            .expect("runtime dag");
+        assert!(
+            !runtime.warnings.iter().any(collision),
+            "{:?}",
+            runtime.warnings
+        );
+
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("east")),
+            ("gold", transform_pipeline_on("west")),
+        ]);
+        config
+            .adapters
+            .insert("east".into(), databricks("e.example"));
+        config
+            .adapters
+            .insert("west".into(), databricks("w.example"));
+        let runtime = build_runtime_dag(&config, &models_by_pipeline, &[], None, &no_catalog)
+            .expect("runtime dag");
+        assert!(
+            runtime.warnings.iter().any(collision),
+            "{:?}",
+            runtime.warnings
+        );
+    }
+
+    /// #2202 item 3: a `depends_on` naming a label a seed and a model share
+    /// is refused, whichever was built last. Before, `name_to_node` kept the
+    /// last insertion and the edge silently bound to the model.
+    #[test]
+    fn depends_on_a_name_a_seed_and_a_model_share_is_refused() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let models_by_pipeline = ModelsByPipeline::from([(
+            "t".to_string(),
+            vec![
+                model_targeting("orders", "c", "silver", "orders"),
+                model("mart", vec!["orders"], vec![]),
+            ],
+        )]);
+        let err = build_unified_dag(&config, &models_by_pipeline, &[seed("orders")])
+            .expect_err("a depends_on on a shared name must refuse");
+        match &err {
+            UnifiedDagError::AmbiguousDependsOn {
+                model,
+                dependency,
+                claimants,
+            } => {
+                assert_eq!(model, "mart");
+                assert_eq!(dependency, "orders");
+                assert_eq!(
+                    claimants,
+                    &vec!["model 'orders'".to_string(), "seed 'orders'".to_string()]
+                );
+            }
+            other => panic!("expected AmbiguousDependsOn, got {other:?}"),
+        }
+
+        // A shared label nobody names in depends_on is still allowed here.
+        let models_by_pipeline = ModelsByPipeline::from([(
+            "t".to_string(),
+            vec![
+                model_targeting("orders", "c", "silver", "orders"),
+                model("mart", vec![], vec![]),
+            ],
+        )]);
+        build_unified_dag(&config, &models_by_pipeline, &[seed("orders")])
+            .expect("a shared label alone is not a depends_on ambiguity");
+    }
+
+    /// #2202 item 3 across step kinds: a load pipeline and a seed sharing a
+    /// name are just as ambiguous to a `depends_on` as a seed and a model.
+    #[test]
+    fn depends_on_a_name_a_seed_and_a_load_pipeline_share_is_refused() {
+        let config = config_with_pipelines(vec![
+            ("t", transform_pipeline(vec![])),
+            ("orders", repl_pipeline(vec![])),
+        ]);
+        let models_by_pipeline = ModelsByPipeline::from([(
+            "t".to_string(),
+            vec![model("mart", vec!["orders"], vec![])],
+        )]);
+        let err = build_unified_dag(&config, &models_by_pipeline, &[seed("orders")])
+            .expect_err("a depends_on on a shared name must refuse");
+        assert!(
+            matches!(&err, UnifiedDagError::AmbiguousDependsOn { claimants, .. }
+                if claimants == &vec!["pipeline 'orders'".to_string(), "seed 'orders'".to_string()]),
+            "{err:?}"
+        );
     }
 
     /// Two **pathless** DuckDB adapters are two databases, not one.
@@ -3330,8 +3759,12 @@ mod tests {
         }
     }
 
+    /// #1629: a read that matches a MODEL's label adds no label edge. Which
+    /// model a read reaches is the compiler's answer, passed in as
+    /// `model_edges`; matching labels here was a second matcher that ignored
+    /// the model's target.
     #[test]
-    fn test_infer_adds_edge_from_sql_ref() {
+    fn a_label_read_of_a_model_adds_no_label_edge() {
         let mut dag = dag_with_models(&[
             ("orders", NodeKind::Transformation),
             ("stg_orders", NodeKind::Transformation),
@@ -3342,7 +3775,27 @@ mod tests {
 
         infer_labels(&mut dag, &sql);
 
-        assert_eq!(dag.edges.len(), 1);
+        assert!(dag.edges.is_empty(), "{:?}", dag.edges);
+    }
+
+    /// The compiler's edges join the graph as given, between model nodes only.
+    #[test]
+    fn compiler_model_edges_join_the_graph() {
+        let mut dag = dag_with_models(&[
+            ("orders", NodeKind::Transformation),
+            ("stg_orders", NodeKind::Transformation),
+            ("countries", NodeKind::Seed),
+        ]);
+        add_model_edges(
+            &mut dag,
+            &[
+                ("stg_orders".to_string(), "orders".to_string()),
+                ("stg_orders".to_string(), "orders".to_string()),
+                ("stg_orders".to_string(), "countries".to_string()),
+                ("stg_orders".to_string(), "missing".to_string()),
+            ],
+        );
+        assert_eq!(dag.edges.len(), 1, "{:?}", dag.edges);
         assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
         assert_eq!(dag.edges[0].to, NodeId::new("transformation", "stg_orders"));
         assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
@@ -3989,12 +4442,11 @@ mod tests {
     /// The repro shape from #1629's body. `customers` reads
     /// `warehouse.silver.rollup` — exactly `rollup`'s target — and `rollup`
     /// bare-reads `customers`, a name that matches only by label (the model
-    /// writes `customers_v2`). The label match is the weakest evidence in the
-    /// graph: it must not displace the exact read, so `rollup` runs first.
-    /// Before, the label edge was laid down first, the exact edge was skipped
-    /// as its cycle-closer, and `run --dag` refused the project.
+    /// writes `customers_v2`). The compiler binds that read to no model, so it
+    /// passes no edge for it, and no label pass guesses one: `rollup` runs
+    /// first on the exact read alone, with nothing skipped or reported.
     #[test]
-    fn an_exact_physical_read_outranks_a_contradicting_label_read() {
+    fn the_1629_repro_orders_by_the_exact_read_and_guesses_nothing() {
         let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
         let by_pipeline = owned_by_sole_transformation(
             &config,
@@ -4011,8 +4463,17 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the exact edge stands and the guess is dropped, not refused");
+        // The compiler binds `rollup`'s bare `customers` to no model.
+        let model_edges: Vec<(String, String)> = Vec::new();
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the exact edge stands");
         assert!(has_edge(
             &runtime.dag,
             "transformation:rollup",
@@ -4027,17 +4488,10 @@ mod tests {
             phase_index(&runtime.dag, "transformation:rollup")
                 < phase_index(&runtime.dag, "transformation:customers")
         );
-        assert_eq!(
-            runtime.labels.skipped_cycle_edges,
-            vec![("rollup".to_string(), "customers".to_string())]
-        );
         assert!(
-            runtime
-                .warnings
-                .iter()
-                .any(|w| w.contains("label-based ordering") && w.contains("'customers'")),
-            "the dropped guess is reported: {:?}",
-            runtime.warnings
+            runtime.labels.skipped_cycle_edges.is_empty(),
+            "no guess was made, so none is dropped: {:?}",
+            runtime.labels
         );
     }
 
@@ -4052,8 +4506,17 @@ mod tests {
         let mut b = model("b", vec![], vec![]);
         b.sql = "SELECT y FROM a".into();
         let by_pipeline = owned_by_sole_transformation(&config, vec![a, b]);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the DAG builds; the cycle is the executor's to refuse");
+        // The compiler binds `b`'s read of `a` (target `a`).
+        let model_edges = [("b".to_string(), "a".to_string())];
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             execution_phases(&runtime.dag).is_err(),
             "a genuine cycle keeps its loud refusal"
@@ -4500,8 +4963,8 @@ mod tests {
     }
 
     /// A catalogless model whose catalog Rocky could not establish could be in
-    /// the catalog a read names, so it is not ruled out — and the read, which
-    /// also names the load's target exactly, is refused. Once the adapter
+    /// the catalog the load writes, so the project is refused as two possible
+    /// writers of one table (#2202; before, the read of it was refused). Once the adapter
     /// establishes the model's catalog as a different one, the model is ruled
     /// out and the read resolves to the load.
     #[test]
@@ -4525,11 +4988,13 @@ mod tests {
             (config, by_pipeline)
         };
 
+        // Since #2202 the possible second WRITER is refused before any read
+        // is resolved: the model could write `prod.bronze.shared` too.
         let (config, by_pipeline) = make();
         assert!(
             matches!(
                 build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog),
-                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+                Err(UnifiedDagError::DuplicateProducerTarget { .. })
             ),
             "the model's catalog is unknown, so it could be `prod`"
         );
@@ -4746,9 +5211,9 @@ mod tests {
         assert!(!report.warnings().is_empty());
     }
 
-    /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
-    /// (as the single-slot heuristic always did) — the guard must not
-    /// downgrade a real SQL cycle into a silent stale-read success.
+    /// Status quo pinned: genuinely reciprocal reads REFUSE loudly — the
+    /// guard must not downgrade a real SQL cycle into a silent stale-read
+    /// success. The compiler's edges carry the cycle now (#1629).
     #[test]
     fn mutual_label_reads_still_refuse_loudly() {
         let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
@@ -4758,8 +5223,19 @@ mod tests {
         b.sql = "SELECT y FROM a".into();
         let models = vec![a.clone(), b.clone()];
         let by_pipeline = owned_by_sole_transformation(&config, models);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the DAG builds; the cycle is the executor's to refuse");
+        let model_edges = [
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             runtime.labels.label_collisions.is_empty()
                 && runtime.labels.unparsed.is_empty()

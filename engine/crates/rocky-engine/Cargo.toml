@@ -1,6 +1,6 @@
 [package]
 name = "rocky-engine"
-version = "1.76.0"
+version = "1.77.0"
 description = "Rocky local execution engine: DataFusion-based testing, branching, CI"
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rocky-compiler = { path = "../rocky-compiler" }
 rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
 rocky-duckdb = { path = "../rocky-duckdb", optional = true }
 rocky-sql = { path = "../rocky-sql" }
 serde = { workspace = true }

@@ -167,9 +167,13 @@ pub(crate) fn observe_failed_summary<'a>(
     ))
 }
 
-/// The version of a content-addressed write, taken from the files the
-/// writer committed: the last commit's Delta version and the blake3 of
-/// every file (folded for a partitioned table).
+/// The version of a content-addressed write: the one Delta version whose
+/// snapshot is exactly this output, and the blake3 of every file (folded for
+/// a partitioned table).
+///
+/// The run makes one replace commit (RV1-P1a), so `delta_versions` holds
+/// exactly one entry: that commit, or the current head when the output was
+/// already live and no commit was written.
 pub(crate) fn content_addressed_output_version(
     model_ir: &ModelIr,
     summary: &ContentAddressedRunSummary,
@@ -186,11 +190,7 @@ pub(crate) fn content_addressed_output_version(
     };
     OutputVersion::content_addressed(
         table_name(&table),
-        summary
-            .written_files
-            .iter()
-            .map(|f| f.commit_version)
-            .collect(),
+        vec![summary.commit_version],
         summary
             .written_files
             .iter()
@@ -707,9 +707,9 @@ mod tests {
             );
             let models = [(
                 "ti",
-                "SELECT CAST(TIMESTAMP '2026-01-01 12:00:00' AS DATE) AS order_date \
-                 WHERE TIMESTAMP '2026-01-01 12:00:00' >= @start_date \
-                 AND TIMESTAMP '2026-01-01 12:00:00' < @end_date\n",
+                "SELECT order_date \
+                 FROM (SELECT CAST(TIMESTAMP '2026-01-01 12:00:00' AS DATE) AS order_date) AS src \
+                 WHERE order_date >= @start_date AND order_date < @end_date\n",
                 toml.as_str(),
             )];
             let adapter = "[adapter]\ntype = \"test-fail-write\"\npath = \"observe-version\"\n";

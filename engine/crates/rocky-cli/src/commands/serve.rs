@@ -426,13 +426,17 @@ pub(crate) fn config_posture(config_path: Option<&Path>) -> rocky_server::state:
     match rocky_core::config::load_optional_project_config(config_path) {
         Ok(Some(config)) => ConfigLabels {
             state_backend: Some(config.state.backend),
-            // The requested mode: the explicit setting, or the backend default
-            // when unset. No probe runs here — this is a label read, not a
-            // writer — so a store that turns out not to honour conditional
-            // writes is reported by `rocky doctor`, not by this field.
-            concurrency_control: Some(
-                rocky_core::state_sync::requested_concurrency_control(&config.state).0,
-            ),
+            // The resolved mode, as far as it resolves without I/O: `cas` only
+            // when it is requested (explicitly or as the backend default) AND
+            // the backend can do it; an explicit `cas` on `local` or `valkey`
+            // runs as `off`, so it reports `off`. No probe runs here — this is
+            // a label read at startup, not a writer — so a store that turns out
+            // not to honour conditional writes is reported by `rocky doctor`.
+            concurrency_control: Some(if rocky_core::state_sync::cas_effective(&config.state) {
+                rocky_core::config::ConcurrencyControl::Cas
+            } else {
+                rocky_core::config::ConcurrencyControl::Off
+            }),
             config_status: ConfigStatus::Loaded,
         },
         Ok(None) => ConfigLabels {
@@ -1219,6 +1223,29 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    /// P3-8: the label reports the mode the writers resolve to, not the
+    /// request. An explicit `cas` on a backend with no conditional-write tier
+    /// runs as `off`, so it reports `off`.
+    #[test]
+    fn an_explicit_cas_without_a_cas_tier_reports_off() {
+        use rocky_core::config::ConcurrencyControl;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target]\nadapter = \"default\"\n\n\
+             [state]\nbackend = \"local\"\nconcurrency_control = \"cas\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config_posture(Some(&config)).concurrency_control,
+            Some(ConcurrencyControl::Off)
+        );
     }
 
     /// Neither set → loopback-only mode, exactly as before.

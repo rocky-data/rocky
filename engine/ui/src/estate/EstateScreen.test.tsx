@@ -5,6 +5,7 @@ import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import type { ModelListOutput } from "@rocky-types/model_list";
 import type { ProjectOutput } from "@rocky-types/project";
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
@@ -51,6 +52,15 @@ const emptySchedule: ScheduleStatusOutput = {
   timezone: "UTC",
 };
 
+const emptySpool: ScheduleSpoolOutput = {
+  command: "state-schedule-spool",
+  counts: { pending: 0, skipped: 0, corrupt: 0 },
+  pending: [],
+  skipped: [],
+  spool_path: "/tmp/playground/.rocky/pending-demands",
+  version: "0",
+};
+
 const detail = (name: string): ModelDetailOutput => ({
   name,
   file_path: `models/${name}.sql`,
@@ -73,6 +83,7 @@ function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
     models: async () => partModels,
     runs: async () => capturedHistory,
     schedule: async () => emptySchedule,
+    spool: async () => emptySpool,
     detail: async (name) => detail(name),
     ...overrides,
   };
@@ -107,7 +118,7 @@ describe("EstateScreen", () => {
       ["Project", "GET /api/v1/project"],
       ["DAG", "GET /api/v1/dag + GET /api/v1/models"],
       ["Runs", "GET /api/v1/runs"],
-      ["Schedule", "GET /api/v1/schedule"],
+      ["Schedule", "GET /api/v1/schedule + GET /api/v1/schedule/spool"],
     ]) {
       const h = screen.getByRole("heading", { name: heading });
       expect(h).toHaveAttribute("title", route);
@@ -195,6 +206,50 @@ describe("EstateScreen", () => {
     expect(within(core).getByText("0 * * * *")).toBeInTheDocument();
     expect(within(table).getByText(/config error: cron does not parse/)).toBeInTheDocument();
     expect(screen.getByText("free")).toBeInTheDocument();
+  });
+
+  // #1900: the claims snapshot cannot see a demand still in the spool, so the
+  // panel reads the spool too and shows what is waiting.
+  it("shows the webhook demands waiting in the spool", async () => {
+    const spool: ScheduleSpoolOutput = {
+      ...emptySpool,
+      counts: { pending: 3, skipped: 1, corrupt: 2 },
+    };
+    render(<EstateScreen loaders={loaders({ spool: async () => spool })} refreshMs={0} now={NOW} />);
+    const group = await screen.findByRole("group", { name: "Waiting webhook demands" });
+    for (const [label, value] of [
+      ["waiting demands", "3"],
+      ["unreadable demands", "1"],
+      ["quarantined", "2"],
+    ]) {
+      const card = within(group).getByText(label).parentElement as HTMLElement;
+      expect(within(card).getByText(value)).toBeInTheDocument();
+    }
+  });
+
+  // A spool the server cannot read is that error on the panel, never 0
+  // waiting — the #1710/#1752/#1731 bug class. The claims still render.
+  it("shows a refused spool read as the refusal, never as zero waiting", async () => {
+    const refused = new ApiError(500, {
+      code: "spool_unreadable",
+      message: "the spool directory could not be read",
+      remediation_hint: "inspect the spool directory's permissions",
+    });
+    render(
+      <EstateScreen
+        loaders={loaders({
+          spool: async () => {
+            throw refused;
+          },
+        })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    expect(await screen.findByText("spool_unreadable")).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Waiting webhook demands" })).toBeNull();
+    expect(screen.queryByText("waiting demands")).toBeNull();
+    expect(await screen.findByText("No schedules configured")).toBeInTheDocument();
   });
 
   it("shows a refused producer's envelope in its own panel while the others render", async () => {

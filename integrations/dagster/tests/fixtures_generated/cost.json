@@ -17,5 +17,6 @@
       "duration_ms": 0,
       "cost_usd": 0.0
     }
-  ]
+  ],
+  "run_scope": "production"
 }

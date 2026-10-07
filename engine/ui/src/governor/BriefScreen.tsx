@@ -139,7 +139,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         title="Agent activity"
         availability={activity.availability}
         note={activity.note}
-        summary={`${activity.total} decisions: ${activity.allow} allow, ${activity.require_review} require review, ${activity.deny} deny`}
+        summary={`${activity.total} policy evaluations: ${activity.allow} allow, ${activity.require_review} require review, ${activity.deny} deny`}
       >
         <div className="space-y-2">
           <Rows
@@ -155,12 +155,16 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
           />
           <Rows
             ariaLabel="Decisions"
-            columns={["when", "principal", "capability", "model", "effect", "rule", "decision", "reason"]}
+            columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "decision", "reason"]}
             rows={activity.decisions.map((entry) => [
               formatInstant(entry.timestamp, now),
               entry.principal,
               entry.capability,
               entry.model,
+              // The counters above count evaluations only (#2043); a freeze,
+              // unfreeze or verification row is listed with its kind so its
+              // recorded effect never reads as a policy verdict.
+              entry.kind,
               entry.effect,
               entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
               entry.decision_ref,

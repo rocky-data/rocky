@@ -34,6 +34,12 @@ If neither variable is set, the adapter fails with `no authentication method ava
 The service-account key holds an RSA private key. On Unix, Rocky emits a warning when the file at `GOOGLE_APPLICATION_CREDENTIALS` is group- or world-readable — `chmod 600` (or `0400`) it.
 :::
 
+## Load contracts and `NUMERIC`
+
+BigQuery reports a default-precision decimal column by its bare name. `rocky load` checks a load contract against that report. On BigQuery it reads a bare `NUMERIC` as `NUMERIC(38, 9)`, the documented default. A contract that declares `NUMERIC(38,9)` or wider passes. A narrower one, such as `NUMERIC(10,2)`, fails with `required_column_type`.
+
+A bare `BIGNUMERIC` is still refused with `unverifiable_landed_type`. Its default range has no exact `(precision, scale)` form. Other warehouses do not get this reading.
+
 ## See also
 
 - [`[adapter.NAME]`](/reference/configuration/#adaptername) — fields shared by every adapter type, including the retry policy.

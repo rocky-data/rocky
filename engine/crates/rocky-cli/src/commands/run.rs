@@ -22,8 +22,9 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
 use rocky_core::state::{ResumeScope, RunProgress, StateError, StateStore, WatermarkRecoveryTable};
 use rocky_core::traits::{
-    AdapterResult, BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
-    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    AdapterResult, BatchCheckAdapter, BatchReading, Freshness as BatchFreshness,
+    FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
+    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 use rocky_ir::*;
 use sqlparser::ast::{ObjectName, SetExpr, Statement, TableFactor};
@@ -133,7 +134,7 @@ fn record_pruned(
         asset_key: pruned.asset_key,
         source_schema: pruned.source_schema,
         table_name: pruned.table_name,
-        reason: "unchanged_since_last_copy".to_string(),
+        reason: PRUNED_UNCHANGED_REASON.to_string(),
     });
 }
 
@@ -1059,6 +1060,14 @@ pub struct DeferOptions {
     /// selection is exactly what `--defer` defers *around*. A selection of one
     /// model is passed as `--model` instead, so that path stays unchanged.
     pub selected_models: Option<BTreeSet<String>>,
+    /// Names a model's `depends_on` may list that the caller resolved outside
+    /// this run's models: the seeds and load pipelines of the `rocky run
+    /// --dag` graph, which ordered this sub-run after them (#2138). Passed to
+    /// the compile as [`rocky_compiler::compile::CompilerConfig::external_dependencies`].
+    /// Unrelated to `--defer` (nothing is rewritten); it rides here because
+    /// this is the one options value every sub-run already carries to the
+    /// compile. Empty outside `--dag`.
+    pub external_dependencies: std::collections::BTreeSet<String>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -1227,6 +1236,63 @@ fn deferred_externalized_edges_for(
 /// reads and unknown read sets retain their existing opt-in containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
+/// The refusals [`run_with_explicit_contracts`] can make from the config and
+/// its flags alone, made before any I/O (#1609): no idempotency claim, state
+/// store, Pipes channel or adapter exists yet when this runs.
+///
+/// Each check is the one the run body makes later — same function, same
+/// message — so a run this lets through meets nothing new there.
+#[allow(clippy::too_many_arguments)]
+fn preflight_run_config(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name_arg: Option<&str>,
+    model_only: bool,
+    resume_requested: bool,
+    run_all: bool,
+    models_dir_override: bool,
+    governed: bool,
+    registry_override: bool,
+) -> Result<()> {
+    refuse_governed_side_effects(governed, &cfg.hooks)?;
+    ensure_resume_supported(
+        resume_requested,
+        !run_all && !models_dir_override,
+        "mixed replication and transformation execution",
+    )?;
+    if model_only {
+        ensure_resume_supported(resume_requested, false, "model-only")?;
+        resolve_model_run_target(cfg, pipeline_name_arg)?;
+        return Ok(());
+    }
+    let (_, pipeline) = registry::resolve_pipeline(cfg, pipeline_name_arg)?;
+    ensure_resume_supported(
+        resume_requested,
+        matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_)),
+        pipeline.pipeline_type_str(),
+    )?;
+    anyhow::ensure!(
+        !registry_override
+            || matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_)),
+        "an adapter registry override reaches only the model-only and replication arms; \
+         the {} arm builds its own registry",
+        pipeline.pipeline_type_str()
+    );
+    Ok(())
+}
+
+/// Drop the dependency edges OF every model in `not_run` from the runtime
+/// graph (#1630). Such a model does not execute, so its reads order nothing;
+/// kept, they can close a cycle that makes the physical-read derivation skip
+/// a true read of the model's own target. Edges ONTO it stay, so its readers
+/// are still withheld.
+fn drop_reads_of_models_that_do_not_run(dag_nodes: &mut [DagNode], not_run: &BTreeSet<String>) {
+    for node in dag_nodes.iter_mut() {
+        if not_run.contains(&node.name) {
+            node.depends_on.clear();
+        }
+    }
+}
+
 fn compile_error_descendant_blocks(
     dag_nodes: &[DagNode],
     failed: &BTreeSet<String>,
@@ -2111,6 +2177,35 @@ pub(crate) fn refuse_governed_side_effects(
     governed: bool,
     hooks: &rocky_core::hooks::HooksConfig,
 ) -> Result<()> {
+    if governed && configures_side_effects(hooks) {
+        anyhow::bail!(
+            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
+             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
+             replication-only apply never reaches it), so a post-plan hook edit would run \
+             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
+        );
+    }
+    Ok(())
+}
+
+/// `rocky run --refuse-hooks`: refuse a run whose config would fire any
+/// `[hook]` shell command or `[hook.webhooks]` request, before any is built or
+/// fired. For a caller that runs a config it does not trust, such as a CI job
+/// running a pull request's `rocky.toml` (#2162). Uses the same count as the
+/// governed refusal, so the two agree on what fires.
+pub fn refuse_configured_side_effects(hooks: &rocky_core::hooks::HooksConfig) -> Result<()> {
+    if configures_side_effects(hooks) {
+        anyhow::bail!(
+            "refusing `rocky run --refuse-hooks`: the config defines `[hook]` commands or \
+             `[hook.webhooks]` that this run would fire. Remove them, or run without \
+             `--refuse-hooks` only where the config is trusted."
+        );
+    }
+    Ok(())
+}
+
+/// Whether `hooks` configures any shell hook or webhook that would fire.
+fn configures_side_effects(hooks: &rocky_core::hooks::HooksConfig) -> bool {
     use rocky_core::hooks::{HookConfigOrList, HookEvent, WebhookConfigOrList};
     // Count NORMALIZED executable side effects EXACTLY as `HookRegistry::from_config`
     // does (hooks/mod.rs): an entry fires only when its key resolves to a known
@@ -2137,15 +2232,7 @@ pub(crate) fn refuse_governed_side_effects(
             },
         )
     });
-    if governed && (has_shell_hook || has_webhook) {
-        anyhow::bail!(
-            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
-             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
-             replication-only apply never reaches it), so a post-plan hook edit would run \
-             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
-        );
-    }
-    Ok(())
+    has_shell_hook || has_webhook
 }
 
 /// Fold the replication run's remote-state download result into a typed
@@ -3049,6 +3136,7 @@ pub async fn run(
         reviewed_source_state,
         None,
         actor,
+        None,
     )
     .await
 }
@@ -3148,6 +3236,14 @@ pub async fn run_with_explicit_contracts(
     // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
     // custody rows are still evaluated as the `agent` class.
     actor: &rocky_core::config::PrincipalRef,
+    // #1609 (ruled 2026-09-17, shape A): an adapter registry the caller
+    // already holds, used instead of building one from the config. `None`
+    // for every production caller. It reaches the model-only and replication
+    // arms, which build their registry here; the transformation, quality,
+    // snapshot and load arms build their own, so a run that would dispatch to
+    // one of them with an override is refused rather than silently bypassing
+    // it — a test must never pass because a different path did the work.
+    registry_override: Option<&AdapterRegistry>,
 ) -> Result<RunTermination> {
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
@@ -3224,6 +3320,23 @@ pub async fn run_with_explicit_contracts(
             shadow,
         )?;
     }
+    // #1609: refuse every flag the config alone rules out BEFORE any I/O —
+    // the idempotency claim, the state store, the Pipes channel, and the
+    // adapters. Refused later, the claim leaves a `Failed` stamp that skips
+    // the corrected retry under `dedup_on = "any"`, the destination adapter
+    // has already opened (a DuckDB file is created), and the end-of-run
+    // retention sweep runs. The same checks run again where the body needs
+    // their results; here they only refuse.
+    preflight_run_config(
+        &loaded.config,
+        pipeline_name_arg,
+        model_name_filter.is_some() || defer_opts.selected_models.is_some(),
+        resume_run_id.is_some() || resume_latest,
+        run_all,
+        models_dir.is_some(),
+        governed_ctx.is_some(),
+        registry_override.is_some(),
+    )?;
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -3407,7 +3520,14 @@ pub async fn run_with_explicit_contracts(
             None => selected_models.is_some_and(|set| set.contains(name)),
         };
         ensure_resume_supported(resume_requested, false, "model-only")?;
-        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+        let built_registry;
+        let adapter_registry = match registry_override {
+            Some(registry) => registry,
+            None => {
+                built_registry = AdapterRegistry::from_config(rocky_cfg)?;
+                &built_registry
+            }
+        };
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
         // sub-runner drives each transformation node) resolves the model against
         // THAT pipeline's target adapter and schema-creation policy — not the
@@ -4606,7 +4726,14 @@ pub async fn run_with_explicit_contracts(
     let entry_marker_freezes = freeze_fence.active_snapshot().await?;
 
     // Build adapter registry and resolve adapters
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let built_registry;
+    let adapter_registry = match registry_override {
+        Some(registry) => registry,
+        None => {
+            built_registry = AdapterRegistry::from_config(rocky_cfg)?;
+            &built_registry
+        }
+    };
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     // Batch check adapter (optional): present when the warehouse has any
@@ -8265,9 +8392,11 @@ async fn run_batched_checks(
     // for a table that is missing from the measured results, so a measured
     // table never reads a stale reason. BOTH paths record here: the per-table
     // path names the one table whose own query failed, the batch path names
-    // every table the failed leg was handed (#1655). A table that a leg
-    // answered WITHOUT leaving a row for is not recorded — there is no reason
-    // to give, and it is reported as "returned no readable count for this table".
+    // every table the failed leg was handed (#1655), and a leg that answered
+    // but could not read one table records the adapter's reason for it
+    // (#1928). A table that a leg answered WITHOUT leaving a row for is not
+    // recorded — there is no reason to give, and it is reported as "returned
+    // no readable count for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -8295,7 +8424,9 @@ async fn run_batched_checks(
 
     // A failed row-count leg contributes no measurements, and every table
     // it covered gets the reason. Reported by the same code that reports
-    // a per-table failure, so the two paths emit the same check shape.
+    // a per-table failure, so the two paths emit the same check shape. A
+    // leg that answered but could not read one table's count names that
+    // table with the adapter's own reason (#1928).
     fn fold_row_count_leg(
         leg: AdapterResult<Vec<BatchRowCountResult>>,
         refs: &[TableRef],
@@ -8303,7 +8434,20 @@ async fn run_batched_checks(
         failures: &mut HashMap<String, String>,
     ) -> Vec<BatchRowCountResult> {
         match leg {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                for row in &rows {
+                    if let BatchReading::Unreadable(reason) = &row.reading {
+                        warn!(
+                            side,
+                            table = row.table.full_name(),
+                            reason = reason.as_str(),
+                            "the batch row count query could not read this table's count"
+                        );
+                        failures.insert(row.table.full_name(), reason.clone());
+                    }
+                }
+                rows
+            }
             Err(e) => {
                 warn!(
                     side,
@@ -8343,7 +8487,7 @@ async fn run_batched_checks(
                     match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
                         Some(count) => counts.push(BatchRowCountResult {
                             table: br.clone(),
-                            count,
+                            reading: BatchReading::Readable(count),
                         }),
                         None => {
                             warn!(
@@ -8409,16 +8553,20 @@ async fn run_batched_checks(
                         (Some(rows), Some(cell)) if cell.is_null() => {
                             fresh_results.push(BatchFreshnessResult {
                                 table: br.clone(),
-                                max_timestamp: None,
-                                row_count: Some(rows),
+                                reading: BatchReading::Readable(BatchFreshness {
+                                    max_timestamp: None,
+                                    row_count: Some(rows),
+                                }),
                             });
                         }
                         (Some(rows), Some(cell)) => {
                             match cell.as_str().and_then(parse_timestamp_cell) {
                                 Some(ts) => fresh_results.push(BatchFreshnessResult {
                                     table: br.clone(),
-                                    max_timestamp: Some(ts),
-                                    row_count: Some(rows),
+                                    reading: BatchReading::Readable(BatchFreshness {
+                                        max_timestamp: Some(ts),
+                                        row_count: Some(rows),
+                                    }),
                                 }),
                                 None => {
                                     warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
@@ -8511,7 +8659,29 @@ async fn run_batched_checks(
     };
 
     let freshness_results: Vec<BatchFreshnessResult> = match batched_freshness {
-        Some(Ok(rows)) => rows,
+        // A table the leg answered for but could not read is recorded with
+        // the adapter's own reason, in the order the adapter returned it
+        // (#1928). A table that ALSO has a readable row is measured, so it
+        // records no failure and is not reported twice.
+        Some(Ok(rows)) => {
+            for row in &rows {
+                if let BatchReading::Unreadable(reason) = &row.reading {
+                    let readable_twin = rows.iter().any(|other| {
+                        other.table == row.table
+                            && matches!(other.reading, BatchReading::Readable(_))
+                    });
+                    if !readable_twin {
+                        warn!(
+                            table = row.table.full_name(),
+                            reason = reason.as_str(),
+                            "the batch freshness query could not read this table — reporting it as not evaluated"
+                        );
+                        freshness_failures.push((row.table.full_name(), reason.clone()));
+                    }
+                }
+            }
+            rows
+        }
         Some(Err(e)) => {
             warn!(
                 tables = freshness_batch_refs.len(),
@@ -8539,14 +8709,14 @@ async fn run_batched_checks(
     // Measured counts by full table name. A table absent from a map has no
     // measurement: its query failed, returned no readable count, or the batch
     // query left it out.
-    let source_map: HashMap<String, u64> = source_counts
-        .iter()
-        .map(|r| (r.table.full_name(), r.count))
-        .collect();
-    let target_map: HashMap<String, u64> = target_counts
-        .iter()
-        .map(|r| (r.table.full_name(), r.count))
-        .collect();
+    let measured_count = |r: &BatchRowCountResult| match r.reading {
+        BatchReading::Readable(count) => Some((r.table.full_name(), count)),
+        BatchReading::Unreadable(_) => None,
+    };
+    let source_map: HashMap<String, u64> =
+        source_counts.iter().filter_map(measured_count).collect();
+    let target_map: HashMap<String, u64> =
+        target_counts.iter().filter_map(measured_count).collect();
 
     // Process row count results
     if row_count_enabled {
@@ -8767,7 +8937,11 @@ async fn run_batched_checks(
         // before the count existed.
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
-            match freshness_results.iter().find(|fr| fr.table == *tref) {
+            let readable = freshness_results.iter().find_map(|fr| match &fr.reading {
+                BatchReading::Readable(f) if fr.table == *tref => Some(f),
+                _ => None,
+            });
+            match readable {
                 Some(fr) => match (fr.max_timestamp, fr.row_count) {
                     (Some(ts), _) => {
                         let lag = (now - ts).num_seconds().unsigned_abs();
@@ -8784,8 +8958,8 @@ async fn run_batched_checks(
                     )),
                     (None, _) => None,
                 },
-                // Absent from the results and with no recorded reason: the
-                // batch query left this table out.
+                // No readable row and no recorded reason: the batch query
+                // left this table out.
                 None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
                     warn!(
                         table = key.as_str(),
@@ -8799,7 +8973,9 @@ async fn run_batched_checks(
                         ),
                     ))
                 }
-                // Absent, but the per-table path already recorded why.
+                // No readable row, and a reason is already recorded: the
+                // leg failed, the adapter said why it could not read the
+                // table, or the per-table path did.
                 None => None,
             }
         });
@@ -9508,6 +9684,22 @@ async fn auto_sweep_retention_at_end_of_run(
 pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &RunOutput) {
     use serde_json::json;
 
+    // Every (asset key, sanitized check name) this run reported, so the
+    // declared-check pass at the end answers only what nothing else did.
+    let mut reported: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut report = |asset_key: &str,
+                      check_name: &str,
+                      passed: bool,
+                      severity: crate::pipes::PipesCheckSeverity,
+                      metadata: &serde_json::Value| {
+        reported.insert((
+            asset_key.to_string(),
+            crate::pipes::sanitize_check_name(check_name),
+        ));
+        pipes.report_asset_check(asset_key, check_name, passed, severity, metadata);
+    };
+
     // Materializations.
     for mat in &output.materializations {
         let asset_key = mat.asset_key.join("/");
@@ -9553,7 +9745,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 .get("passed")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 &check_name,
                 passed,
@@ -9576,7 +9768,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
         // (#2073, the same shape of bug `check_results` avoids by
         // carrying its own `asset_key`).
         let asset_key = action.asset_key.join("/");
-        pipes.report_asset_check(
+        report(
             &asset_key,
             "drift",
             true,
@@ -9626,7 +9818,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
     for anomaly in &output.anomalies {
         let asset_key = anomaly.asset_key.join("/");
         anomalous_asset_keys.insert(asset_key.clone());
-        pipes.report_asset_check(
+        report(
             &asset_key,
             "row_count_anomaly",
             false,
@@ -9645,7 +9837,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
             continue;
         }
         if evaluation.evaluated {
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 "row_count_anomaly",
                 true,
@@ -9657,7 +9849,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 .not_evaluated_reason
                 .as_deref()
                 .unwrap_or("the engine gave no reason");
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 "row_count_anomaly",
                 false,
@@ -9666,6 +9858,153 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
             );
         }
     }
+
+    if let Some(declared) = pipes.declared_checks() {
+        for row in not_evaluated_declared_checks(output, declared, &reported) {
+            pipes.report_asset_check(
+                &row.asset_key,
+                &row.check_name,
+                false,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({
+                    "status": "not_evaluated",
+                    "rocky/not_evaluated_cause": row.cause.as_str(),
+                    "rocky/reason": row.reason,
+                }),
+            );
+        }
+    }
+}
+
+/// The `excluded_tables` reason a `prune_unchanged` skip records. Read back
+/// by the declared-check pass below, and by dagster-rocky (`component.py`).
+pub(super) const PRUNED_UNCHANGED_REASON: &str = "unchanged_since_last_copy";
+
+/// Why a declared check got no verdict from this run (#2160). Sent on the
+/// Pipes wire as `rocky/not_evaluated_cause` so the integration can map each
+/// cause without guessing from absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NotEvaluatedCause {
+    /// The table failed in this run (it is in `errors`), so no check ran.
+    CopyFailed,
+    /// `prune_unchanged` skipped the table: the source is unchanged since the
+    /// last copy. The integration carries the prior verdict forward.
+    PrunedUnchanged,
+    /// The table was excluded from this run for another reason (see
+    /// `excluded_tables`).
+    Excluded,
+    /// The table was materialized, but this run produced no result for the
+    /// check — it is not enabled for this pipeline, or did not apply.
+    NotProduced,
+    /// The run never reached the table: not discovered under this filter, not
+    /// a replication pipeline, or the run stopped early.
+    NotReached,
+}
+
+impl NotEvaluatedCause {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            NotEvaluatedCause::CopyFailed => "copy_failed",
+            NotEvaluatedCause::PrunedUnchanged => "pruned_unchanged",
+            NotEvaluatedCause::Excluded => "excluded",
+            NotEvaluatedCause::NotProduced => "not_produced",
+            NotEvaluatedCause::NotReached => "not_reached",
+        }
+    }
+}
+
+/// One declared check the run did not answer, with the cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NotEvaluatedCheck {
+    pub asset_key: String,
+    pub check_name: String,
+    pub cause: NotEvaluatedCause,
+    pub reason: String,
+}
+
+/// Every declared `(asset key, check)` that `reported` does not cover, with
+/// why (#2160).
+///
+/// Over Dagster Pipes a declared check with no result fails the whole step,
+/// and a passing placeholder would stamp a pass on a table whose copy failed.
+/// The integration cannot tell those apart on the wire, so the engine — which
+/// knows which tables failed, were pruned or were never reached — answers each
+/// one explicitly. Every row is sent `passed: false`: a check that did not run
+/// is not a check that passed (#1741). The integration turns the
+/// `pruned_unchanged` cause back into the prior verdict, the same as streaming
+/// mode does.
+///
+/// `declared` and `reported` are both keyed on the slash-joined engine-native
+/// asset key and the sanitized check name, the exact strings the wire carries.
+pub(super) fn not_evaluated_declared_checks(
+    output: &RunOutput,
+    declared: &crate::pipes::DeclaredChecks,
+    reported: &std::collections::HashSet<(String, String)>,
+) -> Vec<NotEvaluatedCheck> {
+    use std::collections::{HashMap, HashSet};
+
+    let failed: HashMap<String, &str> = output
+        .errors
+        .iter()
+        .map(|e| (e.asset_key.join("/"), e.error.as_str()))
+        .collect();
+    let excluded: HashMap<String, &str> = output
+        .excluded_tables
+        .iter()
+        .map(|t| (t.asset_key.join("/"), t.reason.as_str()))
+        .collect();
+    let materialized: HashSet<String> = output
+        .materializations
+        .iter()
+        .map(|m| m.asset_key.join("/"))
+        .collect();
+
+    let mut rows = Vec::new();
+    for (asset_key, names) in declared {
+        for check_name in names {
+            if reported.contains(&(asset_key.clone(), check_name.clone())) {
+                continue;
+            }
+            let (cause, reason) = if failed.contains_key(asset_key) {
+                (
+                    NotEvaluatedCause::CopyFailed,
+                    "the table failed in this run, so the check did not run".to_string(),
+                )
+            } else if excluded.get(asset_key) == Some(&PRUNED_UNCHANGED_REASON) {
+                (
+                    NotEvaluatedCause::PrunedUnchanged,
+                    "source unchanged since the last copy (prune_unchanged); \
+                     the check was not re-evaluated"
+                        .to_string(),
+                )
+            } else if let Some(why) = excluded.get(asset_key) {
+                (
+                    NotEvaluatedCause::Excluded,
+                    format!("the table was excluded from this run ({why})"),
+                )
+            } else if materialized.contains(asset_key) {
+                (
+                    NotEvaluatedCause::NotProduced,
+                    format!(
+                        "the table was copied, but rocky produced no {check_name} result \
+                         (the check is not enabled for this pipeline, or did not apply)"
+                    ),
+                )
+            } else {
+                (
+                    NotEvaluatedCause::NotReached,
+                    "rocky did not reach this table in this run".to_string(),
+                )
+            };
+            rows.push(NotEvaluatedCheck {
+                asset_key: asset_key.clone(),
+                check_name: check_name.clone(),
+                cause,
+                reason,
+            });
+        }
+    }
+    rows
 }
 
 /// Compile and execute every model in `models_dir` against the given
@@ -9807,10 +10146,10 @@ fn apply_defer_rewrite(
     // to the deferred model's target — a bare name matching a model name IS that
     // model (`resolve::classify_table_ref`).
     //
-    // Read that scope narrowly: there is no near-miss to report on this path and
-    // therefore no refusal, so the answer is acted on rather than checked. The
-    // note on `qualify_deferred_refs` says what is still assumed and what it
-    // costs.
+    // That answer holds only under the default. Under `TRUE` the same pair
+    // binds, and Rocky cannot observe the setting for this statement, so a
+    // reference whose binding differs between the two readings comes back in
+    // `setting_dependent_refs` and is refused below rather than guessed (#1622).
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -9838,7 +10177,15 @@ fn apply_defer_rewrite(
                 model.config.name,
             )
         })?;
-        model.sql = rewritten;
+        anyhow::ensure!(
+            rewritten.setting_dependent_refs.is_empty(),
+            "`--defer` cannot tell whether reference(s) {:?} in model '{}' read a deferred \
+             upstream or a CTE of the same name. {}",
+            rewritten.setting_dependent_refs,
+            model.config.name,
+            SETTING_DEPENDENT_CTE_REMEDY
+        );
+        model.sql = rewritten.sql;
     }
 
     Ok(())
@@ -10158,6 +10505,16 @@ pub(crate) fn dialect_case_rules(
 /// target quoted while the model wrote the reference bare. An operator following
 /// the generic advice would compare two identical strings and conclude Rocky was
 /// broken (#1282).
+/// Remedy for a reference whose CTE binding depends on Snowflake's
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE` (#1622). Shared by `--defer`, shadow,
+/// branch promote and replay so the four refusals say the same thing.
+pub(crate) const SETTING_DEPENDENT_CTE_REMEDY: &str = "A CTE in scope has the same name except for quoting or case. Under Snowflake's default \
+     QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE the two are different names and the reference reads \
+     the table; under TRUE quoted identifiers fold to upper case too, so the reference reads \
+     the CTE. Rocky cannot observe that setting for the statement it is deciding, and either \
+     guess could read the wrong object, so it refuses. Spell the CTE alias and the reference \
+     alike (both unquoted, or both quoted with the same case), or rename the CTE";
+
 pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules) -> &'static str {
     if rules.unquoted_uppercases {
         return "On this warehouse an UNQUOTED identifier resolves UPPER-CASED, so \
@@ -10205,19 +10562,33 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
 /// whose `[target]` names no catalog (#1629); `rocky run --dag` establishes
 /// the same catalog for the same models, so the two schedulers derive the
 /// same edges.
+///
+/// `not_run` are the models that will not execute (an error diagnostic,
+/// #1630). Their reads order nothing, so they are no reader here and their
+/// own edges are dropped from the runtime graph; kept, they could close a
+/// cycle that makes the derivation skip a TRUE read of their target. They
+/// stay producers, so a reader of their target is ordered — and withheld —
+/// after them.
 fn augment_physical_read_edges(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     contain_failures: bool,
     default_catalog: Option<&str>,
+    not_run: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
+    drop_reads_of_models_that_do_not_run(&mut compile_result.project.dag_nodes, not_run);
     let inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = compile_result
         .project
         .models
         .iter()
         .map(|m| {
-            rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
-                .with_effective_catalog(default_catalog)
+            let mut input = rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
+                .with_effective_catalog(default_catalog);
+            if not_run.contains(&m.config.name) {
+                // A query that reads no table: a producer, never a reader.
+                input.sql = "SELECT 1";
+            }
+            input
         })
         .collect();
     let existing: Vec<(String, String)> = compile_result
@@ -10626,6 +10997,17 @@ fn apply_shadow_rewrite(
                 outcome.case_fold_only_refs,
                 model.config.name,
                 case_near_miss_remedy(case_rules)
+            );
+            // A reference that binds a CTE only under one reading of
+            // QUOTED_IDENTIFIERS_IGNORE_CASE. Rewriting may turn a CTE read
+            // into a shadow-table read; leaving it may read production (#1622).
+            anyhow::ensure!(
+                outcome.setting_dependent_refs.is_empty(),
+                "shadow mode cannot tell whether reference(s) {:?} in model '{}' read a routed \
+                 upstream or a CTE of the same name. {}",
+                outcome.setting_dependent_refs,
+                model.config.name,
+                SETTING_DEPENDENT_CTE_REMEDY
             );
             // Every reference actually redirected is now a read of a table
             // THIS run produces, so it is a real dependency regardless of what
@@ -11705,6 +12087,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
         source_provenance,
+        external_dependencies: defer_opts.external_dependencies.clone(),
         ..Default::default()
     };
 
@@ -12147,14 +12530,59 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
         output.shadow = true;
     } else {
+        // #1630: a model with an error diagnostic does not run, so its own
+        // reads order nothing. Left in the graph, they can close a cycle that
+        // makes the derivation skip a TRUE read of its target as the
+        // cycle-closer — and that reader then runs on the stale table.
         let default_catalog = warehouse.default_catalog();
         augment_physical_read_edges(
             &mut compile_result,
             resilience.contain_failures,
             default_catalog.as_deref(),
+            &compile_failed_models,
             &mut output.scheduling_warnings,
         )?;
         refuse_on_scheduling_warnings(strict_scheduling, &output.scheduling_warnings)?;
+        // A model that reads a failed model's target by its qualified name is
+        // withheld like one that reads it by a compile edge: the table was not
+        // rebuilt. Under `[resilience] contain_failures` the containment
+        // ledger already withholds physical readers from its own layering.
+        if !resilience.contain_failures {
+            let physical_blocks = compile_error_descendant_blocks(
+                &compile_result.project.dag_nodes,
+                &compile_failed_models,
+                &externalized_defer_edges,
+            );
+            for (model, blocked_by) in physical_blocks {
+                if compile_excluded_models.contains(&model) {
+                    continue;
+                }
+                compile_excluded_models.insert(model.clone());
+                let in_scope = model_name_filter.is_none_or(|selected| selected == model)
+                    && model_set.is_none_or(|set| set.contains(&model));
+                if !in_scope {
+                    continue;
+                }
+                if !root_error_in_scope {
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec![model.clone()],
+                        error: format!(
+                            "model '{model}' was withheld because upstream compile failure(s) \
+                             affect: {}",
+                            blocked_by.join(", ")
+                        ),
+                        failure_kind: crate::output::FailureKind::CompileError,
+                        cooldown_seconds: None,
+                    });
+                }
+                output.contained.push(crate::output::ContainedModelOutput {
+                    model,
+                    unblock_hint: super::containment::unblock_hint(&blocked_by, false),
+                    blocked_by,
+                });
+            }
+        }
     }
 
     // #1093: capture governance from the same in-memory model set the
@@ -13845,11 +14273,16 @@ fn latest_execution_with_run_id(
     store: &StateStore,
     model_name: &str,
 ) -> Option<(String, rocky_core::state::ModelExecution)> {
+    // The same production-only baseline the gate's clause (C) reads (#2201):
+    // the two answer one question and must not disagree about which build
+    // that is.
     let runs = store
         .list_runs_matching(1, |run| {
-            run.models_executed
-                .iter()
-                .any(|m| m.model_name == model_name)
+            run.counts_as_production(rocky_core::state::UnrecordedScope::Exclude)
+                && run
+                    .models_executed
+                    .iter()
+                    .any(|m| m.model_name == model_name)
         })
         .ok()?;
     runs.into_iter().find_map(|run| {
@@ -21814,6 +22247,188 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         .map(|_| ())
     }
 
+    /// Drive `run_with_explicit_contracts` with an idempotency key and an
+    /// optional registry override (#1609).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_preflight_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: Option<&str>,
+        model: Option<&str>,
+        registry_override: Option<&AdapterRegistry>,
+    ) -> anyhow::Result<RunTermination> {
+        super::run_with_explicit_contracts(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            pipeline,
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model,
+            None,
+            Some("preflight-key"),
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            registry_override,
+        )
+        .await
+    }
+
+    /// #1609: a run whose flags the config alone rules out is refused before
+    /// ANY I/O — no idempotency claim (so a corrected retry with the same key
+    /// is not skipped as a duplicate), no state store, no destination adapter
+    /// (a DuckDB file would be created). Both shapes reported on the issue.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn config_refusals_land_before_the_claim_the_state_store_and_the_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n\
+                 [pipeline.dq]\ntype = \"quality\"\n\n\
+                 [pipeline.dq.target]\nadapter = \"default\"\n\n\
+                 [[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
+                 table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n\n\
+                 [pipeline.t1]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t1.target]\nadapter = \"default\"\n\n\
+                 [pipeline.t2]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t2.target]\nadapter = \"default\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // `--model <name> --pipeline <a quality pipeline>`.
+        let err = drive_preflight_test_run(&config_path, &state_path, Some("dq"), Some("m"), None)
+            .await
+            .expect_err("a quality pipeline cannot run a model");
+        assert!(
+            err.to_string().contains("not transformation"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+        assert!(!db_path.exists(), "no adapter was opened: {err:#}");
+
+        // A multi-pipeline project run with no `--pipeline`.
+        let err = drive_preflight_test_run(&config_path, &state_path, None, None, None)
+            .await
+            .expect_err("three pipelines and no --pipeline");
+        assert!(
+            err.to_string().contains("multiple pipelines defined"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+        assert!(!db_path.exists(), "no adapter was opened: {err:#}");
+
+        // A registry override the dispatched arm would not use is refused, so
+        // a test can never pass because a different registry did the work.
+        let registry = AdapterRegistry::from_config(
+            &rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .unwrap()
+                .config,
+        )
+        .unwrap();
+        let err =
+            drive_preflight_test_run(&config_path, &state_path, Some("t1"), None, Some(&registry))
+                .await
+                .expect_err("the transformation arm builds its own registry");
+        assert!(
+            err.to_string().contains("registry override"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+    }
+
+    /// #1609: the override IS the registry a model-only run uses. The model
+    /// reads a table that exists only in the override's database; the
+    /// configured database is never opened.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_registry_override_is_the_registry_the_run_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured_db = dir.path().join("configured.duckdb");
+        let override_db = dir.path().join("override.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        let config_text = |db: &std::path::Path| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"default\"\n",
+                db.display()
+            )
+        };
+        std::fs::write(&config_path, config_text(&configured_db)).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT v FROM main.src\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+             schema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let override_config = dir.path().join("override.toml");
+        std::fs::write(&override_config, config_text(&override_db)).unwrap();
+        let registry = AdapterRegistry::from_config(
+            &rocky_core::config::load_rocky_config_fingerprinted(&override_config)
+                .unwrap()
+                .config,
+        )
+        .unwrap();
+        registry
+            .warehouse_adapter("default")
+            .unwrap()
+            .execute_statement("CREATE TABLE main.src AS SELECT 7 AS v")
+            .await
+            .unwrap();
+
+        drive_preflight_test_run(
+            &config_path,
+            &state_path,
+            Some("t"),
+            Some("m"),
+            Some(&registry),
+        )
+        .await
+        .expect("the model reads the override's table");
+        assert!(
+            !configured_db.exists(),
+            "the configured database was never opened"
+        );
+        let rows = registry
+            .warehouse_adapter("default")
+            .unwrap()
+            .execute_query("SELECT v FROM main.m")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1, "{rows:?}");
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn transformation_resume_refuses_before_opening_the_warehouse() {
@@ -23859,6 +24474,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let mut advisory = rocky_core::checks::check_row_count(10, 7);
@@ -23915,6 +24531,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let output = RunOutput {
@@ -24064,6 +24681,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
@@ -24170,6 +24788,174 @@ auto_create_schemas = true
                 "raw_value": "no row count was measured for this table",
                 "type": "__infer__"
             })
+        );
+    }
+
+    /// #2160: over Pipes, every check the orchestrator declared gets a row.
+    /// A declared check the run did not produce is answered with an explicit
+    /// `not_evaluated`, `passed: false` row naming the cause — never left
+    /// silent (Dagster then fails the whole step) and never a pass (the copy
+    /// may have failed). Checks the run did produce are not duplicated.
+    #[test]
+    fn test_emit_pipes_answers_every_declared_check_with_a_cause() {
+        use crate::output::{ExcludedTableOutput, RunOutput, TableCheckOutput, TableErrorOutput};
+        use crate::pipes::PipesEmitter;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_declared.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let declared_names: BTreeSet<String> = ["row_count", "column_match"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let declared: BTreeMap<String, BTreeSet<String>> = [
+            "acme/copied",
+            "acme/failed",
+            "acme/pruned",
+            "acme/excluded",
+            "acme/unreached",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), declared_names.clone()))
+        .collect();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+            declared_checks: Some(declared),
+        };
+
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.materializations = vec![mat_for_manifest(&["acme", "copied"], None)];
+        // `copied` produced row_count but not column_match (not enabled).
+        output.check_results = vec![TableCheckOutput {
+            asset_key: vec!["acme".into(), "copied".into()],
+            checks: vec![rocky_core::checks::check_row_count(10, 10)],
+        }];
+        output.errors = vec![TableErrorOutput {
+            asset_key: vec!["acme".into(), "failed".into()],
+            error: "copy failed".into(),
+            failure_kind: crate::output::FailureKind::QueryRejected,
+            cooldown_seconds: None,
+        }];
+        output.excluded_tables = vec![
+            ExcludedTableOutput {
+                asset_key: vec!["acme".into(), "pruned".into()],
+                source_schema: "src".into(),
+                table_name: "pruned".into(),
+                reason: "unchanged_since_last_copy".into(),
+            },
+            ExcludedTableOutput {
+                asset_key: vec!["acme".into(), "excluded".into()],
+                source_schema: "src".into(),
+                table_name: "excluded".into(),
+                reason: "missing_from_source".into(),
+            },
+        ];
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let checks: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|m| m["method"] == "report_asset_check")
+            .collect();
+
+        // One row per declared (table, check): 5 tables x 2 checks.
+        let mut seen: BTreeMap<(String, String), &serde_json::Value> = BTreeMap::new();
+        for c in &checks {
+            let key = (
+                c["params"]["asset_key"].as_str().unwrap().to_string(),
+                c["params"]["check_name"].as_str().unwrap().to_string(),
+            );
+            assert!(
+                seen.insert(key.clone(), c).is_none(),
+                "duplicate row for {key:?}"
+            );
+        }
+        assert_eq!(seen.len(), 10, "unexpected rows: {content}");
+
+        let raw = |c: &serde_json::Value, k: &str| c["params"]["metadata"][k]["raw_value"].clone();
+        // The produced check is reported once, as the engine measured it.
+        let produced = seen[&("acme/copied".into(), "row_count".into())];
+        assert_eq!(produced["params"]["passed"], true);
+        assert!(
+            produced["params"]["metadata"]
+                .get("rocky/not_evaluated_cause")
+                .is_none()
+        );
+
+        for (asset, check, cause) in [
+            ("acme/copied", "column_match", "not_produced"),
+            ("acme/failed", "row_count", "copy_failed"),
+            ("acme/failed", "column_match", "copy_failed"),
+            ("acme/pruned", "row_count", "pruned_unchanged"),
+            ("acme/excluded", "row_count", "excluded"),
+            ("acme/unreached", "column_match", "not_reached"),
+        ] {
+            let row = seen[&(asset.to_string(), check.to_string())];
+            assert_eq!(
+                row["params"]["passed"], false,
+                "{asset}/{check} must not pass"
+            );
+            assert_eq!(row["params"]["severity"], "WARN");
+            assert_eq!(raw(row, "status"), "not_evaluated");
+            assert_eq!(
+                raw(row, "rocky/not_evaluated_cause"),
+                cause,
+                "{asset}/{check}"
+            );
+            assert!(
+                raw(row, "rocky/reason")
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty())
+            );
+        }
+    }
+
+    /// #2160: without declared checks in the Pipes context (an older
+    /// integration, or a plain `PipesSubprocessClient`), nothing is added —
+    /// the wire is unchanged.
+    #[test]
+    fn test_emit_pipes_without_declared_checks_adds_no_rows() {
+        use crate::output::RunOutput;
+        use crate::pipes::PipesEmitter;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_undeclared.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
+        };
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.materializations = vec![mat_for_manifest(&["acme", "copied"], None)];
+        emit_pipes_events(&emitter, &output);
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            !content.contains("report_asset_check"),
+            "no check rows expected: {content}"
         );
     }
 
@@ -32294,6 +33080,91 @@ backend = "local"
         assert!(super::refuse_governed_side_effects(true, &unknown_event).is_ok());
     }
 
+    /// #2162: `--refuse-hooks` refuses exactly what the governed refusal
+    /// counts — a firing hook — whatever the run's governance.
+    #[test]
+    fn refuse_hooks_refuses_only_hooks_that_fire() {
+        use rocky_core::hooks::{HookConfig, HookConfigOrList, HooksConfig};
+        let hook = |event: &str| HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                event.to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "touch fired".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let err = super::refuse_configured_side_effects(&hook("on_pipeline_start"))
+            .expect_err("a firing hook must be refused");
+        assert!(err.to_string().contains("--refuse-hooks"), "{err}");
+        assert!(super::refuse_configured_side_effects(&hook("on_typo_not_an_event")).is_ok());
+        let empty = HooksConfig {
+            webhooks: Default::default(),
+            hooks: Default::default(),
+        };
+        assert!(super::refuse_configured_side_effects(&empty).is_ok());
+    }
+
+    /// #2162 red team: the refusal's count must match what
+    /// `HookRegistry::from_config` registers, so the two cannot drift.
+    #[test]
+    fn side_effect_count_matches_the_hook_registry() {
+        use rocky_core::hooks::{
+            HookConfig, HookConfigOrList, HookRegistry, HooksConfig, WebhookConfigOrList,
+        };
+        let shell = || HookConfig {
+            command: "touch fired".to_string(),
+            timeout_ms: 1000,
+            on_failure: Default::default(),
+            env: Default::default(),
+        };
+        let with_hook = |key: &str, h: HookConfigOrList| HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(key.to_string(), h)].into_iter().collect(),
+        };
+        let with_webhook = |key: &str, w: WebhookConfigOrList| HooksConfig {
+            webhooks: [(key.to_string(), w)].into_iter().collect(),
+            hooks: Default::default(),
+        };
+        let webhook: rocky_core::hooks::webhook::WebhookConfig =
+            toml::from_str("url = \"http://127.0.0.1:9/never\"").unwrap();
+        let cases = [
+            with_hook("on_pipeline_start", HookConfigOrList::Single(shell())),
+            with_hook(
+                "on_pipeline_start",
+                HookConfigOrList::Multiple(vec![shell()]),
+            ),
+            with_hook("on_pipeline_start", HookConfigOrList::Multiple(vec![])),
+            with_hook("on_typo_not_an_event", HookConfigOrList::Single(shell())),
+            with_webhook(
+                "on_pipeline_complete",
+                WebhookConfigOrList::Single(webhook.clone()),
+            ),
+            with_webhook(
+                "on_pipeline_complete",
+                WebhookConfigOrList::Multiple(vec![]),
+            ),
+            with_webhook("on_typo_not_an_event", WebhookConfigOrList::Single(webhook)),
+            HooksConfig {
+                webhooks: Default::default(),
+                hooks: Default::default(),
+            },
+        ];
+        for (i, hooks) in cases.iter().enumerate() {
+            let registered = HookRegistry::from_config(hooks).total_hook_count() > 0;
+            assert_eq!(
+                super::configures_side_effects(hooks),
+                registered,
+                "case {i}: the refusal and the registry disagree"
+            );
+        }
+    }
+
     /// Run one governed `execute_models` apply under a fixed gate and return the
     /// `Result` — the shared driver for the extras kill-checks below.
     #[cfg(feature = "duckdb")]
@@ -33514,6 +34385,7 @@ backend = "local"
                 enabled: true,
                 defer_to: Some("prod".to_string()),
                 selected_models: None,
+                ..Default::default()
             },
             &rocky_databricks::dialect::DatabricksSqlDialect,
         )
@@ -33677,8 +34549,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![
@@ -33708,8 +34586,14 @@ auto_create_schemas = true
             .expect("compile models");
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("mutual reads must not refuse the run");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("mutual reads must not refuse the run");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["b".to_string()], vec!["a".to_string()]],
@@ -33798,8 +34682,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("db"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("db"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["orders".to_string()], vec!["mart".to_string()]],
@@ -33829,8 +34719,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers.len(),
             1,
@@ -33956,8 +34852,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("prod"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("prod"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(upstreams_of(&compiled, "beta"), vec!["alpha".to_string()]);
         assert!(
             upstreams_of(&compiled, "alpha").is_empty(),
@@ -34570,17 +35472,18 @@ auto_create_schemas = true
     /// wiring rather than the rule: it runs `apply_defer_rewrite` with the real
     /// Snowflake dialect.
     ///
-    /// The behaviour is a change and is disclosed as one. A quoted lowercase CTE
-    /// alias no longer hides an unquoted reference, because Snowflake does not
-    /// bind those two names. The reference is then a table reference, and a bare
-    /// name matching a model name is that model, so `--defer` qualifies it to
-    /// the deferred model's target. There is no refusal on this path — the
-    /// qualifier substitutes on an exact model-name match and reports no
-    /// near-miss — so the scope answer has to be the warehouse's own.
+    /// A quoted lowercase CTE alias and an unquoted reference (or the reverse)
+    /// are two names under Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE
+    /// = FALSE` and one name under `TRUE`. Rocky cannot observe that setting
+    /// for the statement, so since #1622 `--defer` refuses rather than qualify
+    /// the reference to the deferred model's target.
+    ///
+    /// Mutation: drop the `setting_dependent_refs` ensure in
+    /// `apply_defer_rewrite`. Both directions then return `Ok` and fail here.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
-        fn deferred_sql(mart_sql: &str) -> String {
+    fn defer_on_snowflake_refuses_a_setting_dependent_cte_binding() {
+        fn deferred_sql(mart_sql: &str) -> anyhow::Result<String> {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
             std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -34599,41 +35502,103 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: None,
                     selected_models: None,
+                    ..Default::default()
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
-            )
-            .expect("defer rewrite must succeed");
-            compiled
+            )?;
+            Ok(compiled
                 .project
                 .models
                 .iter()
                 .find(|m| m.config.name == "mart")
                 .expect("mart missing")
                 .sql
-                .clone()
+                .clone())
         }
 
-        // Quoted alias, unquoted reference: Snowflake does not bind them, so the
-        // reference is the deferred model and is qualified to its target.
-        let freed = deferred_sql("WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders");
-        assert!(
-            freed.contains("\"main\".\"orders\""),
-            "a quoted alias does not bind an unquoted reference: {freed}"
-        );
+        // Control: no CTE, so the bare model name is qualified.
+        let plain = deferred_sql("SELECT * FROM orders").expect("plain defer");
+        assert!(plain.contains("\"main\".\"orders\""), "{plain}");
 
-        // The other direction, and the one the disclosure has to cover too. The
-        // reference must still spell the model name exactly, because the
-        // deferred lookup is by model name and stays exact — only the ALIAS
-        // differs by case here. Two unquoted spellings are ONE name on
-        // Snowflake, so the CTE hides the reference and nothing is qualified.
-        // Under the previous exact alias comparison they were two names, the
-        // reference was not hidden, and it WAS qualified.
-        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders");
+        // Both quoting directions are refused, naming the setting.
+        for sql in [
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM \"orders\"",
+        ] {
+            let err = deferred_sql(sql).expect_err(sql);
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("CTE of the same name")
+                    && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{sql}: {message}"
+            );
+        }
+
+        // Two unquoted spellings are ONE name on Snowflake under every
+        // setting, so the CTE hides the reference and nothing is qualified or
+        // refused.
+        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders")
+            .expect("an unambiguous CTE binding must not be refused");
         assert!(
             !hidden.contains("\"main\".\"orders\""),
             "an unquoted alias differing only by case is the same name, so it hides the \
              reference: {hidden}"
         );
+    }
+
+    /// #1622 on the shadow path (`--shadow` / `--branch`): a reference whose CTE
+    /// binding depends on `QUOTED_IDENTIFIERS_IGNORE_CASE` refuses the run.
+    ///
+    /// Mutation: drop the `setting_dependent_refs` ensure in
+    /// `apply_shadow_rewrite`. The run then succeeds and this fails.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_on_snowflake_refuses_a_setting_dependent_cte_binding() {
+        fn shadow(mart_sql: &str) -> anyhow::Result<String> {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "MAIN", "ORDERS");
+            write_model_with_target(&models_dir, "mart", mart_sql, "MAIN", "MART");
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                false,
+            )?;
+            Ok(compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone())
+        }
+
+        let routed = shadow("SELECT * FROM MAIN.ORDERS").expect("control routes");
+        assert!(routed.contains("ORDERS_rocky_shadow"), "{routed}");
+
+        for sql in [
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM \"orders\"",
+        ] {
+            let err = shadow(sql).expect_err(sql);
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("CTE of the same name")
+                    && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{sql}: {message}"
+            );
+        }
     }
 
     /// A run that routes a single model rewrites nothing — a model's own
@@ -35909,6 +36874,7 @@ auto_create_schemas = true
             enabled: true,
             defer_to: None,
             selected_models: None,
+            ..Default::default()
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
 
@@ -36753,6 +37719,80 @@ auto_create_schemas = true
         );
     }
 
+    /// #2201: the plain gate's baseline is the latest PRODUCTION build.
+    ///
+    /// Production built predicate A. A shadow run then built predicate B (the
+    /// shadow run is simulated by re-recording run-2 with a shadow scope; the
+    /// gate reads only the record). A production run of B must BUILD — its
+    /// production table still holds A — instead of skipping on the shadow
+    /// build's matching logic hash.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_ignores_a_newer_shadow_build_as_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 5).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 1",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 2",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        let mut shadow = state.get_run("run-2").unwrap().expect("run-2 recorded");
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        state.record_run(&shadow).unwrap();
+
+        let out3 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-3",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out3, "agg"),
+            "a shadow build must not be the production skip baseline"
+        );
+        assert_eq!(
+            decision_for(&out3, "agg"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "model logic changed since last build"
+            )),
+        );
+    }
+
     /// Upstream rowcount changed ⇒ BUILD (rowcount-fallback signal).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
@@ -37572,6 +38612,7 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: Some("prod".to_string()),
                     selected_models: None,
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -37643,6 +38684,7 @@ auto_create_schemas = true
                         enabled: true,
                         defer_to: Some("prod".to_string()),
                         selected_models: None,
+                        ..Default::default()
                     },
                     SkipGateConfig {
                         feature_enabled: false,
@@ -37710,6 +38752,7 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: Some("prod".to_string()),
                     selected_models: None,
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -37902,6 +38945,120 @@ auto_create_schemas = true
                 assert!(!table_exists(&verify, "up").await);
             }
         }
+    }
+
+    /// #1630: a model with an error diagnostic does not run, so its own reads
+    /// must not decide the order. Here `x` fails compile (E056: its bare read
+    /// of `t` is ambiguous) and also bare-reads `y`; `y` reads `x`'s target
+    /// by name. `x`'s edge onto `y` used to make `y`'s true read of `main.x`
+    /// look like a cycle-closer, so it was skipped and `y` built from the
+    /// stale `main.x` left by an earlier run. Now `y` is withheld.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_physical_reader_of_a_failed_model_is_withheld_not_run_on_stale_rows() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("p1630.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                .await
+                .unwrap();
+            // What an earlier run of `x` left behind.
+            s.execute_statement("CREATE TABLE main.x AS SELECT 99 AS id")
+                .await
+                .unwrap();
+        }
+        let write = |name: &str, sql: &str, schema: &str, table: &str| {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                     schema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("w1", "SELECT 1 AS id\n", "main", "t");
+        write("w2", "SELECT 2 AS id\n", "other", "t");
+        write("x", "SELECT t.id FROM t CROSS JOIN y\n", "main", "x");
+        write("y", "SELECT id FROM main.x\n", "main", "y");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+            full_refresh: false,
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-1630",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(adapter);
+        assert!(res.is_ok(), "{:?}", res.as_ref().err());
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["x".to_string()] && e.error.contains("[E056]")),
+            "{:?}",
+            output.errors
+        );
+        assert!(
+            !output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("y")),
+            "`y` must not build from the stale `main.x`: {:?}",
+            output.materializations
+        );
+        assert!(
+            output.contained.iter().any(|c| c.model == "y"),
+            "`y` is reported as withheld: {:?}",
+            output.contained
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(!table_exists(&verify, "y").await);
+        assert!(
+            output.scheduling_warnings.is_empty(),
+            "no true edge was skipped as a cycle-closer: {:?}",
+            output.scheduling_warnings
+        );
     }
 
     /// End to end through `execute_models`: an invalid ephemeral use (here
@@ -39484,6 +40641,144 @@ auto_create_schemas = true
             }
             _ => panic!("expected a skip on the out-of-window prior build"),
         }
+    }
+
+    /// #2201: the column-skip baseline is the latest PRODUCTION build.
+    ///
+    /// A newer shadow build of `fct` (a failed one here, so taking it as the
+    /// baseline forces a build) must not displace the production build the
+    /// gate skips on. And a build whose run carries no recorded scope is not
+    /// a trusted baseline at all: where it wrote is unknown, so the gate
+    /// builds.
+    #[test]
+    fn column_skip_baseline_is_the_latest_production_build() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/fct".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT amount FROM u".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = std::sync::Arc::from("fct");
+        let adapter = "duckdb";
+        let identity = crate::output::recipe_identity_internal(&model_ir, adapter);
+        let target_by_model = build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("amount", "H_AMOUNT")]);
+        let prior_baseline =
+            compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let prior_exec = rocky_core::state::ModelExecution {
+            model_name: "fct".to_string(),
+            started_at: now,
+            finished_at: now,
+            duration_ms: 0,
+            rows_affected: None,
+            status: "success".to_string(),
+            sql_hash: String::new(),
+            skip_hash: None,
+            upstream_freshness: Some(prior_baseline),
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: Some(identity.recipe_hash.clone()),
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: Some(identity.env_hash.clone()),
+            hash_scheme: Some(identity.hash_scheme.clone()),
+            output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+            output_version: None,
+            attempts: Vec::new(),
+        };
+        let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "run-prod",
+            "started_at": now,
+            "finished_at": now,
+            "status": "Success",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "cfg",
+            "run_scope": "production",
+        }))
+        .unwrap();
+        let mut prod_run = prod_run;
+        prod_run.models_executed = vec![prior_exec.clone()];
+        store.record_run(&prod_run).unwrap();
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-prod".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
+
+        let mut shadow = prod_run.clone();
+        shadow.run_id = "run-shadow".to_string();
+        shadow.started_at = now + chrono::Duration::minutes(1);
+        shadow.finished_at = shadow.started_at;
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        shadow.models_executed[0].status = "failed".to_string();
+        store.record_run(&shadow).unwrap();
+
+        let decide = |store: &StateStore| {
+            try_content_addressed_column_skip(
+                true,
+                false,
+                "fct",
+                &model_ir,
+                adapter,
+                Some(store),
+                &target_by_model,
+                &built,
+            )
+        };
+        match decide(&store) {
+            ColumnSkipOutcome::Skip { prior_blake3, .. } => assert_eq!(prior_blake3, "F1HASH"),
+            _ => panic!("the newer shadow build must not displace the production baseline"),
+        }
+
+        // The same production build, recorded before runs carried a scope.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+        let mut legacy = prod_run.clone();
+        legacy.run_scope = None;
+        store.record_run(&legacy).unwrap();
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-prod".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
+        assert!(
+            matches!(decide(&store), ColumnSkipOutcome::Build),
+            "a build of unknown scope is not a trusted skip baseline"
+        );
     }
 
     /// FIX-cluster regression: the column-level skip **fails closed on a
@@ -41789,7 +43084,7 @@ threshold = 0
                 .iter()
                 .map(|t| BatchRowCountResult {
                     table: t.clone(),
-                    count: self.count,
+                    reading: BatchReading::Readable(self.count),
                 })
                 .collect())
         }
@@ -41808,8 +43103,10 @@ threshold = 0
                 .iter()
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
-                    max_timestamp: self.max_timestamp,
-                    row_count: self.freshness_row_count,
+                    reading: BatchReading::Readable(BatchFreshness {
+                        max_timestamp: self.max_timestamp,
+                        row_count: self.freshness_row_count,
+                    }),
                 })
                 .collect())
         }
@@ -41840,6 +43137,100 @@ threshold = 0
                 "source: the batch row count query returned no readable count for this table; \
                  target: the batch row count query returned no readable count for this table"
             ),
+            "{result:?}"
+        );
+    }
+
+    /// A `BatchCheckAdapter` that answers for every table but cannot read
+    /// any of them, and says why (#1928).
+    #[cfg(feature = "duckdb")]
+    struct UnreadableBatchCheck;
+
+    #[cfg(feature = "duckdb")]
+    const UNREADABLE_COUNT: &str = "the row count cell was not a non-negative integer (got null)";
+    #[cfg(feature = "duckdb")]
+    const UNREADABLE_TIMESTAMP: &str = "the freshness timestamp \"yesterday\" would not parse";
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for UnreadableBatchCheck {
+        async fn batch_row_counts(
+            &self,
+            tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            Ok(tables
+                .iter()
+                .map(|t| BatchRowCountResult {
+                    table: t.clone(),
+                    reading: BatchReading::Unreadable(UNREADABLE_COUNT.to_string()),
+                })
+                .collect())
+        }
+
+        async fn batch_freshness(
+            &self,
+            tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            Ok(tables
+                .iter()
+                .map(|t| BatchFreshnessResult {
+                    table: t.clone(),
+                    reading: BatchReading::Unreadable(UNREADABLE_TIMESTAMP.to_string()),
+                })
+                .collect())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// #1928: the check result carries the adapter's reason for an
+    /// unreadable count, not the generic "no readable count" text, and the
+    /// check still gates.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unreadable_batch_row_count_carries_the_adapters_reason() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let (pending, _, _) = fx.run(&inner, Some(&UnreadableBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(format!("source: {UNREADABLE_COUNT}; target: {UNREADABLE_COUNT}").as_str()),
+            "{result:?}"
+        );
+    }
+
+    /// #1928, freshness: an unreadable row is reported once, with the
+    /// adapter's reason, and gates.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unreadable_batch_freshness_carries_the_adapters_reason() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _, _) = fx.run(&inner, Some(&UnreadableBatchCheck), None).await;
+        // `the_result` also asserts the table is reported exactly once.
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(UNREADABLE_TIMESTAMP),
             "{result:?}"
         );
     }
@@ -42674,7 +44065,7 @@ threshold = 0
                 .iter()
                 .map(|t| BatchRowCountResult {
                     table: t.clone(),
-                    count: BATCHED_COUNT,
+                    reading: BatchReading::Readable(BATCHED_COUNT),
                 })
                 .collect())
         }
@@ -42695,8 +44086,10 @@ threshold = 0
                 .iter()
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
-                    max_timestamp: Some(Utc::now()),
-                    row_count: Some(1),
+                    reading: BatchReading::Readable(BatchFreshness {
+                        max_timestamp: Some(Utc::now()),
+                        row_count: Some(1),
+                    }),
                 })
                 .collect())
         }

@@ -28,6 +28,11 @@ fail() { echo "FAIL: $1"; exit 1; }
 MUT="${MUTATE:-0}"
 mut() { [ "$MUT" = "$1" ]; }
 
+# Every rocky call shares one state store OUTSIDE models/. `rocky fulfill`
+# refuses a store the drafting worker may write, and the default one lives in
+# models/ (#2169). Relative, so each scratch copy below gets its own store.
+rocky() { command rocky --state-path .rocky/state.redb "$@"; }
+
 # --- Fail-fast: the binary must carry the fulfillment verbs (E1/E2). ---
 command -v rocky >/dev/null 2>&1 || fail "0 (rocky not on PATH — see README: build the engine and add engine/target/release to PATH)"
 rocky product --help >/dev/null 2>&1 || fail "0 (this rocky has no 'product' command — build from a worktree that carries FF-WP-E1/E2; see README)"
@@ -37,7 +42,7 @@ command -v duckdb >/dev/null 2>&1 || fail "0 (duckdb CLI is required to seed and
 
 # --- Truly cold start: wipe generated state (keep only committed inputs). ---
 rm -rf products .rocky wh.duckdb
-rm -f  models/.rocky-state.redb models/.rocky-state.redb.lock .rocky-state.redb .rocky-state.redb.lock
+rm -f  models/.rocky-state.redb models/.rocky-state.redb.lock .rocky-state.redb .rocky-state.redb.lock  # pre-#2169 locations
 rm -f  "models/${PRODUCT}.sql" "models/${PRODUCT}.toml" "models/${PRODUCT}.contract.toml"
 # Wipe the ephemeral goldens but PRESERVE the committed live evidence bundle
 # (expected/live/), which run-live.sh banks and which must survive a replay run.

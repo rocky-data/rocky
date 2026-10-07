@@ -698,13 +698,12 @@ fn mkfifo(path: &Path) {
 /// # What is asserted, and what deliberately is not
 ///
 /// The assertion is *promptness*, within the same run-scaled budget the sibling
-/// tests use. The exit code is asserted only as one of two known values. A
-/// mid-iteration drop also leaks the run's `RemoteStateSession` (its `Drop`
-/// tripwire at `rocky-core/src/state_sync.rs`), which is a `debug_assert!` — a
-/// panic here, a `warn!` in the shipped release binary. So requiring `success()`
-/// would assert the build profile rather than the shutdown, while accepting any
-/// code would bless an unrelated failure. The release binary was measured
-/// separately at exit 0.
+/// tests use, AND a clean exit 0. A mid-iteration drop used to leak the run's
+/// `RemoteStateSession` into its `Drop` tripwire (`rocky-core/src/state_sync.rs`)
+/// — a `debug_assert!` panic (exit 101) in this build, a silently skipped
+/// terminal upload in the release binary (#1603). The watch loop now drops the
+/// iteration under an armed `DroppedSessionSink` and settles the session, so
+/// this debug build exits 0 too; exit 101 here means the hand-over regressed.
 #[test]
 fn run_watch_exits_on_a_signal_during_an_iteration() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -848,17 +847,18 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
         }
     };
 
-    // Two codes, and only two. `0` is the documented contract and what the
-    // release binary returns. `101` is this build profile's `RemoteStateSession`
-    // tripwire (see the doc comment): a `debug_assert!` that fires because the
-    // dropped iteration never finalized its session. Accepting any exit code —
-    // `status.code().is_some()` — would also bless a config error or an adapter
-    // failure, which would say nothing about shutdown.
-    let code = status.code();
+    // Exit 0, the documented signal contract (#1603). Before the dropped
+    // iteration's `RemoteStateSession` was settled, this debug build exited 101
+    // on the session's `debug_assert!` tripwire, and the test had to accept it.
     assert!(
-        matches!(code, Some(0 | 101)),
-        "expected exit 0 (the documented signal contract) or 101 (this profile's \
-         RemoteStateSession debug tripwire); got {status:?}.\nstderr:\n{transcript}"
+        status.success(),
+        "expected exit 0 (the documented signal contract); exit 101 means the dropped \
+         iteration's RemoteStateSession tripped instead of being settled (#1603). \
+         Got {status:?}.\nstderr:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("dropped without finalize/abandon"),
+        "the dropped iteration's state session must be settled, not tripped.\nstderr:\n{transcript}"
     );
 
     // The signal arm is what ended the process.

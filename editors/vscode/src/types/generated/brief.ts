@@ -42,6 +42,12 @@ export type PolicyCapability =
  */
 export type PolicyEffect = "allow" | "require_review" | "deny";
 /**
+ * What kind of event a ledger row records, so a reader can tell a policy evaluation from the other rows the policy-decision ledger holds.
+ *
+ * Mirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).
+ */
+export type BriefDecisionKind = "evaluation" | "verify_after_custody" | "freeze" | "unfreeze";
+/**
  * How the digest window was resolved.
  */
 export type BriefSinceMode = "last" | "24h" | "7d";
@@ -94,6 +100,10 @@ export interface BriefOutput {
    */
   quality: BriefQualitySection;
   /**
+   * Which of the window's runs the digest counted (#2201). A brief reports on production: shadow and branch runs are left out of every run-derived section. Runs recorded before runs carried a scope are counted, so a pre-upgrade failure is never hidden.
+   */
+  run_scope?: ProductionRunScope;
+  /**
    * Pipeline runs in the window, with the ones needing attention listed.
    */
   runs: BriefRunsSection;
@@ -114,32 +124,49 @@ export interface BriefOutput {
 }
 /**
  * Agent-activity section — the policy-decision ledger rolled up by principal.
+ *
+ * The counters count policy EVALUATIONS only (#2043). The ledger also holds freeze and unfreeze rows (an operator's act, recorded as `deny` / `allow`) and post-apply verification rows (whose `effect` is a check verdict), and none of those is a policy decision. Every row in the window is still listed in `decisions`, with its `kind`, so `total` can be smaller than the length of `decisions`.
  */
 export interface BriefAgentActivitySection {
+  /**
+   * Evaluations that allowed the plan.
+   */
   allow: number;
   availability: SectionAvailability;
   /**
-   * One roll-up per acting principal (`human` / `agent`).
+   * One roll-up of evaluations per acting principal (`human` / `agent`).
    */
   by_principal: BriefPrincipalActivity[];
   /**
-   * Every decision in the window, newest first, each fully cited.
+   * Every ledger row in the window, newest first, each fully cited and labelled with its `kind` — evaluations and the rows the counters skip.
    */
   decisions: BriefDecisionEntry[];
+  /**
+   * Evaluations that denied the plan.
+   */
   deny: number;
   note?: string | null;
+  /**
+   * Evaluations that required review.
+   */
   require_review: number;
+  /**
+   * Policy evaluations in the window. Not the length of `decisions`: freeze, unfreeze and verification rows are listed but not counted.
+   */
   total: number;
   [k: string]: unknown;
 }
 /**
- * Per-principal decision counts inside [`BriefAgentActivitySection`].
+ * Per-principal evaluation counts inside [`BriefAgentActivitySection`]. Like the section's own counters, these count policy evaluations only.
  */
 export interface BriefPrincipalActivity {
   allow: number;
   deny: number;
   principal: PolicyPrincipal;
   require_review: number;
+  /**
+   * Policy evaluations by this principal in the window.
+   */
   total: number;
   [k: string]: unknown;
 }
@@ -155,6 +182,10 @@ export interface BriefDecisionEntry {
    */
   decision_ref: string;
   effect: PolicyEffect;
+  /**
+   * What kind of row this is. Only `evaluation` rows carry a policy verdict in `effect`, and only they are counted by the agent-activity counters.
+   */
+  kind: BriefDecisionKind;
   /**
    * The model the decision was about.
    */
@@ -383,6 +414,30 @@ export interface BriefQualityEntry {
   observed_at: string;
   row_count: number;
   run_id: string;
+  [k: string]: unknown;
+}
+/**
+ * Which runs a report about production counted (#2201).
+ *
+ * Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+ */
+export interface ProductionRunScope {
+  /**
+   * Shadow and branch runs the report left out.
+   */
+  excluded_runs: number;
+  /**
+   * Runs recorded as production that the report read.
+   */
+  production_runs: number;
+  /**
+   * Runs with no recorded scope that the report read.
+   */
+  unrecorded_runs: number;
+  /**
+   * `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+   */
+  unrecorded_runs_counted: boolean;
   [k: string]: unknown;
 }
 /**

@@ -803,19 +803,47 @@ pub(crate) async fn discover_branch_targets_for_plan(
     // reads of a config that could — in principle — change between them.
     let planned =
         discover_branch_targets(config_path, record, filter, Some(&resolved_pipeline_name)).await?;
+    let ordered = order_planned_promotes(dialect, planned)?;
+    Ok((resolved_pipeline_name, ordered))
+}
 
-    let selected: std::collections::HashMap<_, _> = planned
+/// Build each target's promote statement and order the targets so every
+/// statement runs after the promoted targets it reads (#2237).
+///
+/// The edges come from what each generated statement reads, not from the
+/// models' transformation dependencies:
+///
+/// ```text
+///   table step   CREATE OR REPLACE TABLE prod.t AS SELECT * FROM branch.t
+///                reads its branch snapshot only, so no edge to another target
+///   model view   CREATE OR REPLACE VIEW prod.v AS <model SQL, upstreams bound
+///                to production>   reads exactly the upstreams it binds
+/// ```
+///
+/// A `full_refresh` model `t` that reads `v` in its transformation SQL is
+/// copied from its branch snapshot, and that copy never reads `v`. Taking the
+/// model edge `t → v` as well as the view's `v → t` refused a valid plan as a
+/// cycle.
+///
+/// Edges match on the dialect's physical identity (`TargetIdentity` under
+/// [`super::run::dialect_case_rules`]), the same identity the view binding
+/// used. Snowflake's `"Orders"` and `"orders"` are two objects, so a view
+/// reading the other one is not a self-cycle. The case-folded
+/// `CollisionIdentity` stays where it belongs: the duplicate-target refusal,
+/// where folding too much refuses and folding too little overwrites.
+///
+/// A statement that reads its own target, or targets that read each other,
+/// still refuse as a cycle.
+fn order_planned_promotes(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    planned: Vec<PlannedPromote>,
+) -> Result<Vec<PlannedPromoteWithSql>> {
+    use rocky_sql::defer::TargetIdentity;
+    let rules = super::run::dialect_case_rules(dialect)?;
+    let identity = |t: &TargetRef| TargetIdentity::of(&t.catalog, &t.schema, &t.table, rules);
+    let selected: std::collections::HashMap<TargetIdentity, String> = planned
         .iter()
-        .map(|p| {
-            (
-                rocky_sql::defer::CollisionIdentity::of(
-                    &p.prod.catalog,
-                    &p.prod.schema,
-                    &p.prod.table,
-                ),
-                p.prod.full_name(),
-            )
-        })
+        .map(|p| (identity(&p.prod), p.prod.full_name()))
         .collect();
     let mut nodes = Vec::new();
     let mut targets = planned
@@ -839,19 +867,19 @@ pub(crate) async fn discover_branch_targets_for_plan(
                 )
             };
             assert_generated_promote_target(dialect, p.kind, &p.prod, &statement)?;
+            // What the statement just built reads: a model view reads the
+            // production upstreams it bound, every other step its branch
+            // source.
+            let reads: Vec<&TargetRef> = if p.model_ir.is_some() {
+                production_upstreams.iter().collect()
+            } else {
+                vec![&p.branch_source]
+            };
             nodes.push(rocky_ir::dag::DagNode {
                 name: p.prod.full_name(),
-                depends_on: p
-                    .dependencies
-                    .iter()
-                    .chain(production_upstreams.iter())
-                    .filter_map(|upstream| {
-                        selected.get(&rocky_sql::defer::CollisionIdentity::of(
-                            &upstream.catalog,
-                            &upstream.schema,
-                            &upstream.table,
-                        ))
-                    })
+                depends_on: reads
+                    .into_iter()
+                    .filter_map(|read| selected.get(&identity(read)))
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
@@ -859,13 +887,7 @@ pub(crate) async fn discover_branch_targets_for_plan(
             });
             let production_upstreams = production_upstreams
                 .into_iter()
-                .filter(|upstream| {
-                    !selected.contains_key(&rocky_sql::defer::CollisionIdentity::of(
-                        &upstream.catalog,
-                        &upstream.schema,
-                        &upstream.table,
-                    ))
-                })
+                .filter(|upstream| !selected.contains_key(&identity(upstream)))
                 .collect();
             let pre_drop_statement = promote_pre_drop_sql(dialect, &p.prod, p.kind)?;
             Ok(PlannedPromoteWithSql {
@@ -895,7 +917,7 @@ pub(crate) async fn discover_branch_targets_for_plan(
             .with_context(|| format!("promote target '{name}' disappeared while ordering"))?;
         ordered.push(targets.remove(index));
     }
-    Ok((resolved_pipeline_name, ordered))
+    Ok(ordered)
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -1400,7 +1422,6 @@ struct PlannedPromote {
     strategy: String,
     model_ir: Option<ModelIr>,
     upstreams: Vec<TargetRef>,
-    dependencies: Vec<TargetRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1587,6 +1608,14 @@ fn production_view_sql(
         ir.name,
         rewritten.ambiguous_refs,
         rewritten.case_fold_only_refs
+    );
+    anyhow::ensure!(
+        rewritten.setting_dependent_refs.is_empty(),
+        "cannot bind production upstreams for view '{}': cannot tell whether reference(s) {:?} \
+         read an upstream or a CTE of the same name. {}",
+        ir.name,
+        rewritten.setting_dependent_refs,
+        super::run::SETTING_DEPENDENT_CTE_REMEDY
     );
     let mut production_ir = ir.clone();
     production_ir.sql = rewritten.sql;
@@ -1788,7 +1817,6 @@ async fn discover_replication_branch_targets(
                 strategy: pipeline.strategy.clone(),
                 model_ir: None,
                 upstreams: Vec::new(),
-                dependencies: Vec::new(),
             });
         }
     }
@@ -1930,28 +1958,6 @@ fn plan_transformation_from_models(
         } else {
             None
         };
-        let dependencies = compiled
-            .project
-            .dag_nodes
-            .iter()
-            .find(|node| node.name == *model_name)
-            .with_context(|| format!("model '{model_name}' has no dependency node"))?
-            .depends_on
-            .iter()
-            .map(|name| {
-                compiled
-                    .project
-                    .models
-                    .iter()
-                    .find(|model| model.config.name == *name)
-                    .map(|model| TargetRef {
-                        catalog: model.config.target.catalog.clone(),
-                        schema: model.config.target.schema.clone(),
-                        table: model.config.target.table.clone(),
-                    })
-                    .with_context(|| format!("dependency '{name}' of '{model_name}' has no model"))
-            })
-            .collect::<Result<Vec<_>>>()?;
         planned.push(PlannedPromote {
             prod,
             branch_source,
@@ -1963,7 +1969,6 @@ fn plan_transformation_from_models(
             .to_string(),
             model_ir,
             upstreams: upstreams.clone(),
-            dependencies,
         });
     }
 
@@ -4897,6 +4902,61 @@ adapter = "default"
         );
     }
 
+    /// #1622 on `branch promote`: binding a promoted view to its production
+    /// upstreams refuses a reference whose CTE binding depends on Snowflake's
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE`, in both quoting directions.
+    ///
+    /// Mutation: drop the `setting_dependent_refs` ensure in
+    /// `production_view_sql`. Both directions then return `Ok` and fail here.
+    #[test]
+    fn promote_view_refuses_a_setting_dependent_cte_binding() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(&models, "view", "WAREHOUSE", "MARTS", "V", "SELECT 1 AS id");
+        std::fs::write(
+            models.join("view.toml"),
+            "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \
+             \"WAREHOUSE\"\nschema = \"MARTS\"\ntable = \"V\"\n",
+        )
+        .unwrap();
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        let base = planned[0].model_ir.as_ref().unwrap();
+        let upstreams = [TargetRef {
+            catalog: "WAREHOUSE".to_string(),
+            schema: "MAIN".to_string(),
+            table: "ORDERS".to_string(),
+        }];
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let bind = |sql: &str| {
+            let mut ir = base.clone();
+            ir.sql = sql.to_string();
+            production_view_sql(&dialect, &ir, &upstreams)
+        };
+
+        let (control, used) = bind("SELECT * FROM orders").expect("control binds");
+        assert_eq!(used.len(), 1, "{control}");
+
+        for sql in [
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM \"orders\"",
+        ] {
+            let message = format!("{:#}", bind(sql).expect_err(sql));
+            assert!(
+                message.contains("CTE of the same name")
+                    && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{sql}: {message}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn promote_rejects_qualified_view_cycle_before_plan() {
         let tmp = TempDir::new().unwrap();
@@ -4926,6 +4986,154 @@ adapter = "default"
                 .await
                 .unwrap_err();
         assert!(format!("{error:#}").contains("cyclic production dependencies"));
+    }
+
+    fn plan_step(p: PlannedPromoteWithSql) -> crate::output::PromoteTargetPlan {
+        crate::output::PromoteTargetPlan {
+            target: p.target,
+            source: p.source,
+            target_catalog: p.target_catalog,
+            target_schema: p.target_schema,
+            target_table: p.target_table,
+            source_catalog: p.source_catalog,
+            source_schema: p.source_schema,
+            source_table: p.source_table,
+            strategy: p.strategy,
+            statement: p.statement,
+            pre_drop_statement: p.pre_drop_statement,
+            production_upstreams: p
+                .production_upstreams
+                .into_iter()
+                .map(|u| crate::output::PromoteUpstream {
+                    catalog: u.catalog,
+                    schema: u.schema,
+                    table: u.table,
+                })
+                .collect(),
+        }
+    }
+
+    /// #2237, mixed table and view: `t` (`full_refresh`) reads bare `v`, and
+    /// view `v` reads production `t` by its qualified name. Promotion copies
+    /// `t` from its branch snapshot, a statement that never reads `v`, so the
+    /// only edge is `v → t`. Taking the model edge `t → v` as well refused
+    /// this as a cycle.
+    #[tokio::test]
+    async fn promote_orders_a_table_whose_model_reads_a_view_that_reads_it() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(&config_path, format!(
+            "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n",
+            db.display()
+        )).unwrap();
+        write_transformation_model(&models, "t", "warehouse", "marts", "t", "SELECT id FROM v");
+        write_transformation_model(
+            &models,
+            "v",
+            "warehouse",
+            "marts",
+            "v",
+            "SELECT id FROM warehouse.marts.t",
+        );
+        std::fs::write(
+            models.join("v.toml"),
+            "name = \"v\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"v\"\n",
+        )
+        .unwrap();
+
+        let (_, planned) =
+            discover_branch_targets_for_plan(&config_path, &sample_record("fix"), None, None)
+                .await
+                .expect("a table step never reads the view, so this is not a cycle");
+        assert_eq!(
+            planned
+                .iter()
+                .map(|p| p.target_table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t", "v"],
+            "the view reads production `t`, so `t` is replaced first"
+        );
+        assert!(planned[0].statement.contains("\"branch__fix\".\"t\""));
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix",
+            "CREATE TABLE branch__fix.t AS SELECT 7 AS id",
+            "CREATE VIEW branch__fix.v AS SELECT id FROM branch__fix.t",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".into(),
+        };
+        let steps: Vec<_> = planned.into_iter().map(plan_step).collect();
+        let (_, ok) = run_promote_apply(&loaded, &steps, None).await.unwrap();
+        assert!(ok);
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM warehouse.marts.v")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("7"));
+    }
+
+    /// #2237, case-distinct Snowflake names: the view targeting `DB.S.Orders`
+    /// reads the model target `DB.S.orders` through a quoted reference. On
+    /// Snowflake those are two objects. With only the view selected, `orders`
+    /// is a production upstream to preflight, not the view itself; the
+    /// case-folded lookup turned it into a self-cycle.
+    #[test]
+    fn promote_snowflake_view_reading_a_case_distinct_target_is_not_a_self_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(&models, "orders", "DB", "S", "orders", "SELECT 1 AS id");
+        write_transformation_model(
+            &models,
+            "orders_upper",
+            "DB",
+            "S",
+            "Orders",
+            "SELECT id FROM \"DB\".\"S\".\"orders\"",
+        );
+        std::fs::write(
+            models.join("orders_upper.toml"),
+            "name = \"orders_upper\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"DB\"\nschema = \"S\"\ntable = \"Orders\"\n",
+        )
+        .unwrap();
+        let loaded = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned =
+            plan_transformation_from_models(loaded, &sample_record("fix"), Some("table=Orders"))
+                .unwrap();
+        assert_eq!(planned.len(), 1);
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let ordered = order_planned_promotes(&dialect, planned)
+            .expect("`orders` and `Orders` are two Snowflake objects, not a self-cycle");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].target_table, "Orders");
+        assert_eq!(
+            ordered[0]
+                .production_upstreams
+                .iter()
+                .map(TargetRef::full_name)
+                .collect::<Vec<_>>(),
+            vec!["DB.S.orders"],
+            "the distinct `orders` is preflighted as a production upstream"
+        );
     }
 
     /// Issue #2024's DuckDB sequence: production has two orders, the branch

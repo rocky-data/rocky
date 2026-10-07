@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.69.0] — 2026-10-07
+
+Pairs with engine 1.77.0 and `rocky-sdk` 0.18.0.
 
 ### Added
 
@@ -13,9 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pipes mode no longer fails the step when a declared check gets no result from Rocky. `RockyResource` sends its declared checks to the engine (`rocky_declared_checks` in the Pipes extras) and maps the engine's not-evaluated rows to failing warnings; a pruned table keeps its previous result. An engine older than this change sends no rows, and the check reports no verdict, never a pass. (#2160)
 - **DAG assets skip ephemeral models.** `build_dag_specs` / `build_dag_multi_assets` no longer create an asset for a `type = "ephemeral"` transformation node, which `rocky run --model` refuses with `E038`. A consumer's dependency and column lineage on an ephemeral model map to that model's own upstreams.
 - **Derived-model assets skip ephemeral models.** With `surface_derived_models = true`, `build_model_specs` no longer creates an asset for a `type = "ephemeral"` model from `rocky compile`. A consumer depends on the ephemeral model's own upstreams instead, transitively, as in the DAG assets.
 - **Chained models in one DAG multi-asset run in dependency order.** `build_dag_multi_assets` ran and yielded the selected models in set order. When two chained transformation models shared a group, Dagster could raise `DagsterInvariantViolationError` (an asset yielded before its dependency), and the downstream model could run against stale data. The group now runs its models in a stable topological order.
+
+### Changed
+
+- **The `rocky-sdk` floor rises to `>=0.18.0`**: `RockyResource.package_list()` calls `RockyClient.package_list`, which 0.17.0 does not have.
 
 ## [1.68.0] — 2026-10-03
 

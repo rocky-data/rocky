@@ -43,7 +43,7 @@ warehouse, or when the runner has no direct object-store access.
       │  blake3 hash of those bytes derives the file name
       ▼
   files uploaded under storage_prefix, e.g. s3://bucket/path/<table>/
-      │  one commit referencing the new files
+      │  one replace commit: remove the old files, add the new ones
       ▼
   _delta_log commit
       │  sync_iceberg_metadata()
@@ -58,6 +58,70 @@ The writer's `discover()` step reads the bootstrap Delta commit. That is where i
 picks up the table's schema, its partition spec, and its rowTracking
 configuration. Later writes adapt to schema changes applied to the underlying
 Delta table between runs, such as an added column or a widened type.
+
+## How each run replaces the table
+
+Each run replaces the table. After a run, readers see that run's rows only.
+Rows from earlier runs are not visible.
+
+Rocky makes one Delta commit per run. The commit removes every live file that
+is not in the new output. It adds every new file that is not live yet.
+
+```
+  run 1 ─▶ v1: add A                live = {A}
+  run 2 ─▶ v2: remove A, add B      live = {B}
+  run 3 (same output as run 2) ─▶ no commit, live = {B}
+```
+
+- **A partitioned model also makes one commit.** All partition groups land in
+  that commit, so readers never see half a run.
+- **An unchanged file stays.** A file with the same content keeps the same
+  name. Rocky neither removes it nor adds it again.
+- **An unchanged output writes no commit.** The run records the current table
+  version as its output version.
+
+Earlier versions stay in the Delta log. You can still read them with
+`VERSION AS OF`. Their files are now eligible for your `VACUUM`. After a
+`VACUUM`, the old versions are gone for good. `rocky gc` holds a replaced
+file until `delta.deletedFileRetentionDuration` (default 7 days) has passed
+since its removal.
+
+A replace is not an append, so it affects streaming readers:
+
+- **A Delta streaming reader fails on the first replace.** A `readStream` of
+  the table stops at a commit that removes data. Set `skipChangeCommits` on
+  the reader, or read the table as a batch.
+- **Each run replays the whole Delta log.** Rocky reads every JSON commit to
+  find the live files. The cost of that read grows with the number of commits.
+
+### A Delta checkpoint makes the write refuse
+
+Rocky reads only the JSON commits in `_delta_log`. It does not read Delta
+checkpoints. A checkpoint is a Parquet summary of the log that another engine
+writes, for example Databricks after its own commits. With a checkpoint, Rocky
+cannot see every live file, so a replace could leave old rows visible.
+
+So when `_delta_log` holds `_last_checkpoint` or a `*.checkpoint.parquet` file,
+the write refuses. The error names the table and the checkpoint. Tables that
+only Rocky writes never get a checkpoint.
+
+To recover:
+
+1. Drop the table.
+2. Create it again on an empty `storage_prefix`.
+3. Run the model again. Rocky writes the whole output in one commit.
+
+### Other refusals
+
+Rocky also refuses the write, and writes no commit, in these cases:
+
+| Case | Why |
+|---|---|
+| `delta.appendOnly = true` | A replace must remove files. The error gives the `ALTER TABLE` that turns it off. |
+| A Delta feature turned on after the table was created, such as deletion vectors, in-commit timestamps, change data feed, v2 checkpoints, clustering or `CHECK` constraints | The writer does not implement the feature, so a commit could corrupt the table. Rocky checks the latest protocol and table properties, not only the first commit. |
+| Coordinated or catalog-managed commits (any file under `_delta_log/_staged_commits/`) | A direct commit would bypass the commit coordinator. |
+| A Delta action Rocky does not know | Rocky cannot replay the log with confidence. |
+| The schema, partitioning or protocol changed during the write | The prepared files no longer match the table. Run the model again. |
 
 ## Configuration
 

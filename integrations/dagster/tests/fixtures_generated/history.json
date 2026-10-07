@@ -21,7 +21,8 @@
           }
         }
       ],
-      "pipeline": "playground"
+      "pipeline": "playground",
+      "run_scope": "production"
     },
     {
       "run_id": "run-SENTINEL",
@@ -42,7 +43,8 @@
           }
         }
       ],
-      "pipeline": "playground"
+      "pipeline": "playground",
+      "run_scope": "production"
     }
   ],
   "count": 2

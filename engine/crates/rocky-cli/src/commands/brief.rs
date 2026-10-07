@@ -33,6 +33,7 @@ use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_
 use rocky_core::policy;
 use rocky_core::state::{
     DagChange, PolicyDecisionRecord, QualitySnapshot, RunRecord, RunStatus, RunTrigger, StateStore,
+    UnrecordedScope,
 };
 
 use crate::commands::apply::ai_plan_is_reviewed;
@@ -40,11 +41,11 @@ use crate::commands::audit::plan_file_path;
 use crate::commands::review::select_outstanding;
 use crate::output::{
     BriefActiveFreeze, BriefAgentActivitySection, BriefAutonomySection, BriefBudgetStatus,
-    BriefCostSection, BriefDecisionEntry, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
-    BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
-    BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
-    BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry, BriefSchedulerSection,
-    BriefSinceMode, SectionAvailability, print_json,
+    BriefCostSection, BriefDecisionEntry, BriefDecisionKind, BriefDegradedRule, BriefDriftEntry,
+    BriefDriftSection, BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry,
+    BriefFreshnessSection, BriefOutput, BriefPrincipalActivity, BriefQualityEntry,
+    BriefQualitySection, BriefRunCost, BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry,
+    BriefSchedulerSection, BriefSinceMode, ProductionRunScope, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -231,14 +232,27 @@ pub fn compute_brief(
     let decisions = store
         .list_policy_decisions()
         .context("failed to read the policy-decision ledger")?;
-    let runs = store
-        .list_runs(MAX_HISTORY_SCAN)
+    // A brief reports on production (#2201): shadow and branch runs wrote
+    // elsewhere and are left out. Runs recorded before runs carried a scope
+    // ARE counted — the brief exists to surface what happened, and dropping
+    // them could hide a production failure. `run_scope` in the output says
+    // how many of each the window held. The filter runs inside the scan, so a
+    // burst of shadow runs cannot push production runs past the cap.
+    let (counted_runs, run_scope) =
+        ProductionRunScope::read(&store, MAX_HISTORY_SCAN, UnrecordedScope::Count, |r| {
+            in_window(r.started_at, since_ts)
+        })
         .context("failed to read the run ledger")?;
-
-    let windowed_runs: Vec<&RunRecord> = runs
-        .iter()
-        .filter(|r| in_window(r.started_at, since_ts))
-        .collect();
+    let windowed_runs: Vec<&RunRecord> = counted_runs.iter().collect();
+    // Quality snapshots carry the run that wrote them; one from a shadow or
+    // branch run measured a non-production table.
+    let non_production = store
+        .list_runs_matching(MAX_HISTORY_SCAN, |r| {
+            !r.counts_as_production(UnrecordedScope::Count)
+        })
+        .context("failed to read the run ledger")?;
+    let non_production_runs: BTreeSet<&str> =
+        non_production.iter().map(|r| r.run_id.as_str()).collect();
     let mut windowed_decisions: Vec<&PolicyDecisionRecord> = decisions
         .iter()
         .filter(|d| in_window(d.timestamp, since_ts))
@@ -259,7 +273,8 @@ pub fn compute_brief(
     let escalations = build_escalations(root, &all_decisions_newest_first);
     let runs_section = build_runs(&windowed_runs);
     let drift = build_drift(&store, since_ts);
-    let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
+    let (freshness, quality) =
+        build_freshness_and_quality(&store, &windowed_runs, &non_production_runs, since_ts);
     let cost = build_cost(cfg.as_ref(), &windowed_runs);
     // Autonomy state is a *current-state* projection: each budget uses its own
     // window and freezes are current, so it reads the full ledger, not the
@@ -308,6 +323,7 @@ pub fn compute_brief(
         cost,
         autonomy,
         scheduler,
+        run_scope,
     })
 }
 
@@ -334,6 +350,7 @@ fn decision_entry(d: &PolicyDecisionRecord) -> BriefDecisionEntry {
         capability: d.capability,
         model: d.model.clone(),
         effect: d.effect,
+        kind: d.kind().into(),
         rule_id: d.rule_id,
         reason: d.reason.clone(),
     }
@@ -353,11 +370,19 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
         };
     }
 
-    let (mut allow, mut require_review, mut deny) = (0u64, 0u64, 0u64);
+    let (mut total, mut allow, mut require_review, mut deny) = (0u64, 0u64, 0u64, 0u64);
     // Per-principal counts `[total, allow, review, deny]`, keyed by a rank
     // so the digest lists human before agent deterministically.
     let mut per_principal: BTreeMap<u8, [u64; 4]> = BTreeMap::new();
-    for d in decisions {
+    // The counters are named after policy effects, so only policy
+    // EVALUATIONS fit them (#2043). A freeze is recorded as `deny`, an
+    // unfreeze as `allow`, and a verification row's `effect` is a check
+    // verdict: counting those by effect is the #1921 defect the trust
+    // scorecard already fixed. They stay in the `decisions` list below,
+    // labelled with their kind — a failed post-apply verification is the row
+    // a governor most needs to see.
+    for d in decisions.iter().filter(|d| d.is_evaluation()) {
+        total += 1;
         let bucket = per_principal
             .entry(principal_rank(d.principal))
             .or_default();
@@ -392,7 +417,7 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
     BriefAgentActivitySection {
         availability: SectionAvailability::Available,
         note: None,
-        total: decisions.len() as u64,
+        total,
         allow,
         require_review,
         deny,
@@ -551,6 +576,7 @@ fn build_drift(store: &StateStore, since_ts: Option<DateTime<Utc>>) -> BriefDrif
 fn build_freshness_and_quality(
     store: &StateStore,
     runs: &[&RunRecord],
+    non_production_runs: &BTreeSet<&str>,
     since_ts: Option<DateTime<Utc>>,
 ) -> (BriefFreshnessSection, BriefQualitySection) {
     // Distinct model names seen in the window, in a stable order.
@@ -565,9 +591,14 @@ fn build_freshness_and_quality(
     let mut snapshots: Vec<QualitySnapshot> = Vec::new();
     let mut query_failed = false;
     for name in &model_names {
-        match store.get_quality_trend(name, 1) {
-            Ok(mut trend) => {
-                if let Some(snap) = trend.pop()
+        // The newest snapshot a production run wrote. The read loads every
+        // snapshot of the model before it truncates, so no cap is saved by
+        // asking for fewer.
+        match store.get_quality_trend(name, usize::MAX) {
+            Ok(trend) => {
+                if let Some(snap) = trend
+                    .into_iter()
+                    .find(|s| !non_production_runs.contains(s.run_id.as_str()))
                     && in_window(snap.timestamp, since_ts)
                 {
                     snapshots.push(snap);
@@ -1130,6 +1161,10 @@ fn empty_brief(
             incident_count: 0,
             latest_incident: None,
         },
+        run_scope: ProductionRunScope {
+            unrecorded_runs_counted: true,
+            ..ProductionRunScope::default()
+        },
     }
 }
 
@@ -1231,6 +1266,7 @@ fn build_scheduler(
     let sched_runs = match store.list_runs_matching(scan_cap, |r| {
         matches!(r.trigger, RunTrigger::Schedule | RunTrigger::Webhook)
             && in_window(r.started_at, since_ts)
+            && r.counts_as_production(UnrecordedScope::Count)
     }) {
         Ok(runs) => runs,
         Err(e) => {
@@ -1398,7 +1434,7 @@ fn render_markdown(out: &BriefOutput) -> String {
     match out.agent_activity.availability {
         SectionAvailability::Available => {
             s.push_str(&format!(
-                "{} decision(s): {} allow · {} review · {} deny\n",
+                "{} policy evaluation(s): {} allow · {} review · {} deny\n",
                 out.agent_activity.total,
                 out.agent_activity.allow,
                 out.agent_activity.require_review,
@@ -1416,13 +1452,24 @@ fn render_markdown(out: &BriefOutput) -> String {
             }
             s.push_str("\nDecisions:\n");
             for d in &out.agent_activity.decisions {
+                // An evaluation prints its policy verdict. Any other row
+                // prints its KIND, with the recorded effect beside it, so a
+                // freeze never reads as a DENY (#2043).
+                let verdict = match d.kind {
+                    BriefDecisionKind::Evaluation => plain(&d.effect).to_uppercase(),
+                    BriefDecisionKind::VerifyAfterCustody
+                    | BriefDecisionKind::Freeze
+                    | BriefDecisionKind::Unfreeze => {
+                        format!("{} [effect {}]", plain(&d.kind), plain(&d.effect))
+                    }
+                };
                 s.push_str(&format!(
                     "- {}  {}/{} `{}` {} ({}) — plan {}\n",
                     d.timestamp,
                     plain(&d.principal),
                     plain(&d.capability),
                     d.model,
-                    plain(&d.effect).to_uppercase(),
+                    verdict,
                     rule_label(d.rule_id),
                     short(&d.plan_id),
                 ));
@@ -1436,6 +1483,9 @@ fn render_markdown(out: &BriefOutput) -> String {
 
     // Runs.
     s.push_str("\n## Runs\n");
+    if let Some(note) = out.run_scope.note() {
+        s.push_str(&format!("({note})\n"));
+    }
     match out.runs.availability {
         SectionAvailability::Available => {
             s.push_str(&format!(
@@ -1846,6 +1896,89 @@ mod tests {
         assert_eq!(agent.deny, 1);
     }
 
+    /// #2043: the counters count policy EVALUATIONS only. A freeze is
+    /// recorded as `deny`, an unfreeze as `allow`, and a failed post-apply
+    /// verification as `deny`; none is a policy decision, so none moves a
+    /// counter. All of them stay in the list, labelled with their kind.
+    #[test]
+    fn agent_activity_counts_evaluations_only_and_lists_every_row_with_its_kind() {
+        let evaluation = decision(9, PolicyPrincipal::Agent, PolicyEffect::Allow, "a", None);
+        let mut freeze = decision(10, PolicyPrincipal::Human, PolicyEffect::Deny, "b", None);
+        freeze.plan_id = format!("{}models/b", rocky_core::policy::FREEZE_PLAN_PREFIX);
+        let mut unfreeze = decision(11, PolicyPrincipal::Human, PolicyEffect::Allow, "b", None);
+        unfreeze.plan_id = format!("{}models/b", rocky_core::policy::UNFREEZE_PLAN_PREFIX);
+        let mut verification = decision(12, PolicyPrincipal::Agent, PolicyEffect::Deny, "c", None);
+        verification.verify_after = vec!["not_null_id".to_string()];
+        let rows = [evaluation, freeze, unfreeze, verification];
+        let refs: Vec<&PolicyDecisionRecord> = rows.iter().collect();
+
+        let section = build_agent_activity(&refs);
+
+        assert_eq!(section.availability, SectionAvailability::Available);
+        assert_eq!(section.total, 1, "only the evaluation is counted");
+        assert_eq!(section.allow, 1);
+        assert_eq!(section.require_review, 0);
+        assert_eq!(
+            section.deny, 0,
+            "no freeze or failed check is a policy deny"
+        );
+        assert_eq!(
+            section.by_principal.len(),
+            1,
+            "the human only froze and unfroze"
+        );
+        assert_eq!(section.by_principal[0].principal, PolicyPrincipal::Agent);
+        assert_eq!(section.by_principal[0].total, 1);
+        assert_eq!(section.by_principal[0].deny, 0);
+        let kinds: Vec<BriefDecisionKind> = section.decisions.iter().map(|d| d.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BriefDecisionKind::Evaluation,
+                BriefDecisionKind::Freeze,
+                BriefDecisionKind::Unfreeze,
+                BriefDecisionKind::VerifyAfterCustody,
+            ],
+            "every row is listed, labelled with its kind"
+        );
+    }
+
+    /// The text brief prints the KIND on a row that is not an evaluation, so
+    /// a freeze never reads as `DENY` (#2043, decided 2026-09-30).
+    #[test]
+    fn text_brief_labels_non_evaluation_rows_by_kind() {
+        let evaluation = decision(9, PolicyPrincipal::Agent, PolicyEffect::Deny, "a", None);
+        let mut freeze = decision(10, PolicyPrincipal::Human, PolicyEffect::Deny, "b", None);
+        freeze.plan_id = format!("{}models/b", rocky_core::policy::FREEZE_PLAN_PREFIX);
+        let rows = [evaluation, freeze];
+        let refs: Vec<&PolicyDecisionRecord> = rows.iter().collect();
+        let section = build_agent_activity(&refs);
+        let mut out = empty_brief(ts(12), BriefSince::Hours24, None, "not wired");
+        out.agent_activity = section;
+
+        let text = render_markdown(&out);
+
+        let lines: Vec<&str> = text.lines().collect();
+        let eval_line = lines
+            .iter()
+            .find(|l| l.contains("`a`"))
+            .expect("evaluation row");
+        let freeze_line = lines
+            .iter()
+            .find(|l| l.contains("`b`"))
+            .expect("freeze row");
+        assert!(eval_line.contains(" DENY "), "{eval_line}");
+        assert!(
+            freeze_line.contains("freeze [effect deny]"),
+            "{freeze_line}"
+        );
+        assert!(!freeze_line.contains("DENY"), "{freeze_line}");
+        assert!(
+            text.contains("1 policy evaluation(s): 0 allow · 0 review · 1 deny"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn agent_activity_empty_is_no_data() {
         let section = build_agent_activity(&[]);
@@ -2049,6 +2182,7 @@ mod tests {
                 incident_count: 0,
                 latest_incident: None,
             },
+            run_scope: ProductionRunScope::default(),
         };
         let md = render_markdown(&out);
         assert!(md.starts_with("# Rocky estate brief"));
@@ -2631,6 +2765,106 @@ mod tests {
         assert!(
             !note.contains("no rocky.toml"),
             "a present-but-broken config must not be reported as an absent one: {note}"
+        );
+    }
+
+    /// #2201: the quality section reports the newest snapshot a PRODUCTION
+    /// run wrote, not a newer one a shadow run wrote against its own table.
+    #[test]
+    fn brief_quality_reads_production_snapshots_only() {
+        use rocky_core::state::RunScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = root.join("state.redb");
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let prod = run("prod", RunStatus::Success, vec![exec("m", "success")]);
+        store.record_run(&prod).unwrap();
+        let mut shadow = run("shadow", RunStatus::Success, vec![exec("m", "success")]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        for (run_id, hour, rows) in [("prod", 2, 10u64), ("shadow", 3, 99)] {
+            store
+                .record_quality(
+                    &serde_json::from_value(serde_json::json!({
+                        "timestamp": ts(hour).to_rfc3339(),
+                        "run_id": run_id,
+                        "model_name": "m",
+                        "metrics": {"row_count": rows, "null_rates": {}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let out = compute_brief(
+            root,
+            &state_path,
+            &root.join("rocky.toml"),
+            BriefSince::Days7,
+            ts(10),
+        )
+        .unwrap();
+        assert_eq!(out.quality.models.len(), 1, "{:?}", out.quality);
+        assert_eq!(out.quality.models[0].run_id, "prod");
+        assert_eq!(out.quality.models[0].row_count, 10);
+    }
+
+    /// #2201: the digest reports on production. A failed shadow run and a
+    /// failed branch run are left out of the runs section, a pre-#2200 run
+    /// with no scope is counted, and `run_scope` says so.
+    #[test]
+    fn brief_counts_production_runs_only() {
+        use rocky_core::state::RunScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = root.join("state.redb");
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        store
+            .record_run(&run("prod-ok", RunStatus::Success, vec![]))
+            .unwrap();
+        let mut shadow = run("shadow-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        let mut branch = run("branch-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        branch.run_scope = Some(RunScope::Branch { name: "b".into() });
+        store.record_run(&branch).unwrap();
+        let mut legacy = run("legacy-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        legacy.run_scope = None;
+        store.record_run(&legacy).unwrap();
+        drop(store);
+
+        let out = compute_brief(
+            root,
+            &state_path,
+            &root.join("rocky.toml"),
+            BriefSince::Days7,
+            ts(10),
+        )
+        .unwrap();
+        assert_eq!(out.runs.total, 2, "{:?}", out.runs);
+        assert_eq!(out.runs.failed, 1);
+        let attention: Vec<&str> = out
+            .runs
+            .attention
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect();
+        assert_eq!(attention, vec!["legacy-bad"]);
+        assert_eq!(
+            out.run_scope,
+            ProductionRunScope {
+                unrecorded_runs_counted: true,
+                production_runs: 1,
+                unrecorded_runs: 1,
+                excluded_runs: 2,
+            }
+        );
+        let md = render_markdown(&out);
+        assert!(
+            md.contains("2 shadow/branch run(s) left out")
+                && md.contains("1 run(s) with no recorded scope counted as production"),
+            "{md}"
         );
     }
 

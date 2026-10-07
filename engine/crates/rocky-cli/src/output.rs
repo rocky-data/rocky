@@ -2674,6 +2674,127 @@ pub(crate) fn markdown_with_findings(
     out
 }
 
+/// Where a recorded run wrote its results, as `rocky history` and
+/// `rocky cost` report it (#2201).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunScopeKind {
+    /// Wrote production targets.
+    Production,
+    /// `rocky run --shadow` / `--shadow-schema`: wrote shadow targets.
+    Shadow,
+    /// `rocky run --branch <name>`: wrote a named Rocky branch.
+    Branch,
+    /// Recorded before runs carried a scope (#2200). Where it wrote is unknown.
+    /// Also what a reader of an older payload without the field sees.
+    #[default]
+    Unrecorded,
+}
+
+impl RunScopeKind {
+    /// The scope of `run`. A record with no scope that names a Rocky branch
+    /// is a branch run: that field predates the scope.
+    #[must_use]
+    pub fn of(run: &rocky_core::state::RunRecord) -> Self {
+        use rocky_core::state::RunScope;
+        match &run.run_scope {
+            Some(RunScope::Production) => Self::Production,
+            Some(RunScope::Shadow { .. }) => Self::Shadow,
+            Some(RunScope::Branch { .. }) => Self::Branch,
+            None if run.rocky_branch.is_some() => Self::Branch,
+            None => Self::Unrecorded,
+        }
+    }
+
+    /// The lowercase label the JSON uses, for table output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Shadow => "shadow",
+            Self::Branch => "branch",
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+}
+
+/// Which runs a report about production counted (#2201).
+///
+/// Shadow and branch runs are never counted. Runs recorded before runs
+/// carried a scope are counted or not per report, and
+/// `unrecorded_runs_counted` says which.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductionRunScope {
+    /// `true` when runs with no recorded scope count as production in this
+    /// report. Their write target is unknown.
+    pub unrecorded_runs_counted: bool,
+    /// Runs recorded as production that the report read.
+    pub production_runs: u64,
+    /// Runs with no recorded scope that the report read.
+    pub unrecorded_runs: u64,
+    /// Shadow and branch runs the report left out.
+    pub excluded_runs: u64,
+}
+
+impl ProductionRunScope {
+    /// Read up to `cap` runs a production report counts, newest first, with
+    /// the tally — the scope filter runs INSIDE the scan, before the cap.
+    ///
+    /// Filtering a capped page afterwards would let a burst of shadow or
+    /// branch runs push every production run out of the page, and the report
+    /// would show nothing. `keep` narrows both sides (a time window, say).
+    /// `excluded_runs` counts at most `cap` left-out runs.
+    pub fn read(
+        store: &rocky_core::state::StateStore,
+        cap: usize,
+        unrecorded: rocky_core::state::UnrecordedScope,
+        keep: impl Fn(&rocky_core::state::RunRecord) -> bool,
+    ) -> Result<(Vec<rocky_core::state::RunRecord>, Self), rocky_core::state::StateError> {
+        use rocky_core::state::ProductionScope;
+        let counted =
+            store.list_runs_matching(cap, |r| keep(r) && r.counts_as_production(unrecorded))?;
+        let left_out =
+            store.list_runs_matching(cap, |r| keep(r) && !r.counts_as_production(unrecorded))?;
+        let mut tally = Self {
+            unrecorded_runs_counted: unrecorded == rocky_core::state::UnrecordedScope::Count,
+            ..Self::default()
+        };
+        for run in counted.iter().chain(&left_out) {
+            match run.production_scope() {
+                ProductionScope::Production => tally.production_runs += 1,
+                ProductionScope::Unrecorded => tally.unrecorded_runs += 1,
+                ProductionScope::NotProduction => tally.excluded_runs += 1,
+            }
+        }
+        Ok((counted, tally))
+    }
+
+    /// One plain sentence for table output, or `None` when every run read
+    /// was a recorded production run.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.excluded_runs > 0 {
+            parts.push(format!(
+                "{} shadow/branch run(s) left out",
+                self.excluded_runs
+            ));
+        }
+        if self.unrecorded_runs > 0 {
+            let how = if self.unrecorded_runs_counted {
+                "counted as production"
+            } else {
+                "left out"
+            };
+            parts.push(format!(
+                "{} run(s) with no recorded scope {how}",
+                self.unrecorded_runs
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("production runs only: {}", parts.join("; ")))
+    }
+}
+
 /// JSON output for `rocky optimize`.
 ///
 /// `recommendations` is empty when no run history exists; `message` is
@@ -2686,6 +2807,11 @@ pub struct OptimizeOutput {
     pub total_models_analyzed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Which runs the recommendations were computed from. Shadow and branch
+    /// runs are left out; runs with no recorded scope are counted, so history
+    /// from before #2200 still informs the averages (#2201).
+    #[serde(default)]
+    pub run_scope: ProductionRunScope,
 }
 
 /// One materialization-strategy recommendation. Mirrors
@@ -2720,6 +2846,7 @@ impl OptimizeOutput {
             recommendations,
             total_models_analyzed: count,
             message: None,
+            run_scope: ProductionRunScope::default(),
         }
     }
 
@@ -2730,6 +2857,7 @@ impl OptimizeOutput {
             recommendations: vec![],
             total_models_analyzed: 0,
             message: Some(message.into()),
+            run_scope: ProductionRunScope::default(),
         }
     }
 }
@@ -2958,6 +3086,12 @@ pub struct RunHistoryRecord {
     /// emitted when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rocky_branch: Option<String>,
+    /// Where the run wrote: `production`, `shadow`, `branch`, or
+    /// `unrecorded` for a run recorded before runs carried a scope (#2201).
+    /// Always emitted, like [`Self::pipeline`], because readers that report
+    /// on production count only `production` runs.
+    #[serde(default)]
+    pub run_scope: RunScopeKind,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -3159,6 +3293,12 @@ pub struct MetricsOutput {
     pub column_trend: Vec<ColumnTrendPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Quality snapshots skipped, while reading the newest ones, because a
+    /// shadow or branch run wrote them (#2201): they measured a
+    /// non-production table. A snapshot whose run carries no recorded scope,
+    /// or whose run record is gone, is kept. Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded_non_production_snapshots: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3669,6 +3809,12 @@ pub struct CatalogOutput {
     /// metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_id: Option<String>,
+    /// Which runs the run-history enrichment read (#2201). Shadow and branch
+    /// runs never set `last_run_id` or an asset's `last_materialized_at`;
+    /// runs recorded before runs carried a scope do. Absent when the state
+    /// store could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_scope: Option<ProductionRunScope>,
     pub assets: Vec<CatalogAsset>,
     pub edges: Vec<CatalogEdge>,
     pub stats: CatalogStats,
@@ -6365,6 +6511,25 @@ pub struct DagNodeOutput {
     /// Upstream node IDs (derived from DAG edges).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Whether the serving process's current compile covers this node, i.e.
+    /// whether `GET /api/v1/models/{label}` can serve it (#2011).
+    ///
+    /// Set only by `GET /api/v1/dag`, and only on `transformation` nodes.
+    /// The DAG reads every transformation pipeline's own models directory;
+    /// `rocky serve` compiles one. A node the compile did not cover is
+    /// `false`, so a client can draw it without offering a detail link that
+    /// answers 404. Also `false` while the server holds no compile result
+    /// (the compile failed or has not finished): the detail route cannot
+    /// serve the model then either.
+    ///
+    /// The two reads are not one snapshot: the graph is read from disk when
+    /// the route is asked, the compile is the last one `serve` published. A
+    /// model added a moment ago can be `false` until the next compile.
+    ///
+    /// Absent from `rocky dag`, which has no separate compile to compare
+    /// against, and from every non-transformation node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<bool>,
 }
 
 /// Partition shape metadata for time-interval nodes.
@@ -7020,13 +7185,13 @@ pub struct SettingsOutput {
     /// `[state] backend`, as read on the first request to this route. `null`
     /// when there was no readable config — `config_status` says which.
     pub state_backend: Option<rocky_core::config::StateBackend>,
-    /// `[state] concurrency_control`, read at the same moment as
-    /// `state_backend`: the explicit setting, or the backend default when it is
-    /// unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and
-    /// `valkey`). This is the requested mode — the writers' startup
-    /// conditional-write probe is not run for it, so `rocky doctor` is where a
-    /// store that falls back to `off` shows up. `null` on the same condition as
-    /// `state_backend`.
+    /// `[state] concurrency_control` as the writers resolve it, read at the
+    /// same moment as `state_backend`: `cas` when it is requested (explicitly,
+    /// or as the default on `s3`, `gcs` and `tiered`) and the backend can do
+    /// it; otherwise `off`, so an explicit `cas` on `local` or `valkey` reports
+    /// `off`. The writers' startup conditional-write probe is not run for it,
+    /// so `rocky doctor` is where a store that falls back to `off` after the
+    /// probe shows up. `null` on the same condition as `state_backend`.
     pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
     /// What happened when `rocky.toml` was read.
     ///
@@ -9311,6 +9476,12 @@ pub enum AuditSubjectKind {
     /// ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a
     /// plan file).
     Plan,
+    /// A `product:<name>` subject whose `products/<name>.toml` spec loads
+    /// (#2003). Resolved through the spec's one output model, the same join
+    /// `rocky audit --product <name>` scopes the ledger by: the decisions whose
+    /// graph keys name that model, the runs that executed it, its blast
+    /// radius.
+    Product,
 }
 
 /// JSON output for `rocky audit --for <table|run|plan>` — the custody chain.
@@ -9731,6 +9902,12 @@ pub struct BriefOutput {
     /// The resident scheduler: runtime holds, consecutive failures,
     /// scheduler-triggered runs in the window, and incident bundles.
     pub scheduler: BriefSchedulerSection,
+    /// Which of the window's runs the digest counted (#2201). A brief
+    /// reports on production: shadow and branch runs are left out of every
+    /// run-derived section. Runs recorded before runs carried a scope are
+    /// counted, so a pre-upgrade failure is never hidden.
+    #[serde(default)]
+    pub run_scope: ProductionRunScope,
 }
 
 /// Scheduler section — a *current-state* projection over the schedule cursors
@@ -9819,29 +9996,74 @@ pub struct BriefActiveFreeze {
 }
 
 /// Agent-activity section — the policy-decision ledger rolled up by principal.
+///
+/// The counters count policy EVALUATIONS only (#2043). The ledger also holds
+/// freeze and unfreeze rows (an operator's act, recorded as `deny` / `allow`)
+/// and post-apply verification rows (whose `effect` is a check verdict), and
+/// none of those is a policy decision. Every row in the window is still
+/// listed in `decisions`, with its `kind`, so `total` can be smaller than the
+/// length of `decisions`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BriefAgentActivitySection {
     pub availability: SectionAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Policy evaluations in the window. Not the length of `decisions`:
+    /// freeze, unfreeze and verification rows are listed but not counted.
     pub total: u64,
+    /// Evaluations that allowed the plan.
     pub allow: u64,
+    /// Evaluations that required review.
     pub require_review: u64,
+    /// Evaluations that denied the plan.
     pub deny: u64,
-    /// One roll-up per acting principal (`human` / `agent`).
+    /// One roll-up of evaluations per acting principal (`human` / `agent`).
     pub by_principal: Vec<BriefPrincipalActivity>,
-    /// Every decision in the window, newest first, each fully cited.
+    /// Every ledger row in the window, newest first, each fully cited and
+    /// labelled with its `kind` — evaluations and the rows the counters skip.
     pub decisions: Vec<BriefDecisionEntry>,
 }
 
-/// Per-principal decision counts inside [`BriefAgentActivitySection`].
+/// Per-principal evaluation counts inside [`BriefAgentActivitySection`].
+/// Like the section's own counters, these count policy evaluations only.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BriefPrincipalActivity {
     pub principal: rocky_core::config::PolicyPrincipal,
+    /// Policy evaluations by this principal in the window.
     pub total: u64,
     pub allow: u64,
     pub require_review: u64,
     pub deny: u64,
+}
+
+/// What kind of event a ledger row records, so a reader can tell a policy
+/// evaluation from the other rows the policy-decision ledger holds.
+///
+/// Mirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefDecisionKind {
+    /// A policy gate evaluated a plan. `effect` is the policy verdict.
+    Evaluation,
+    /// A post-apply verification row. `effect` says whether the named checks
+    /// passed; it is not a policy verdict.
+    VerifyAfterCustody,
+    /// An operator froze a scope. Recorded with `effect = deny`.
+    Freeze,
+    /// An operator lifted a freeze. Recorded with `effect = allow`.
+    Unfreeze,
+}
+
+impl From<rocky_core::state::DecisionKind> for BriefDecisionKind {
+    fn from(kind: rocky_core::state::DecisionKind) -> Self {
+        use rocky_core::state::DecisionKind;
+        match kind {
+            DecisionKind::Evaluation => BriefDecisionKind::Evaluation,
+            DecisionKind::VerifyAfterCustody => BriefDecisionKind::VerifyAfterCustody,
+            DecisionKind::Freeze => BriefDecisionKind::Freeze,
+            DecisionKind::Unfreeze => BriefDecisionKind::Unfreeze,
+        }
+    }
 }
 
 /// One recorded policy decision, cited for the digest.
@@ -9864,6 +10086,10 @@ pub struct BriefDecisionEntry {
     /// The model the decision was about.
     pub model: String,
     pub effect: rocky_core::config::PolicyEffect,
+    /// What kind of row this is. Only `evaluation` rows carry a policy
+    /// verdict in `effect`, and only they are counted by the agent-activity
+    /// counters.
+    pub kind: BriefDecisionKind,
     /// Index of the winning `[[policy.rules]]` entry, or `null` for the
     /// default posture.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10861,6 +11087,13 @@ pub struct CostOutput {
     /// grouping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<CostGroup>>,
+    /// Where the reported run wrote (#2201). `rocky cost latest` reports the
+    /// newest production run: shadow and branch runs are skipped, and a run
+    /// recorded before runs carried a scope is eligible and reads
+    /// `unrecorded` here. An explicit run id reports that run, whatever its
+    /// scope.
+    #[serde(default)]
+    pub run_scope: RunScopeKind,
 }
 
 /// One grouped row in [`CostOutput::groups`], emitted when `rocky cost`
@@ -11858,6 +12091,11 @@ pub struct ProjectRunOutput {
     pub models_executed: u64,
     /// What started it (`Manual`, `Schedule`, `Webhook`, …).
     pub trigger: String,
+    /// Where it wrote (#2201). The last run reported here is the newest
+    /// production run, or one recorded before runs carried a scope
+    /// (`unrecorded`); shadow and branch runs are never reported here.
+    #[serde(default)]
+    pub run_scope: RunScopeKind,
 }
 
 /// The compiled model list for `GET /api/v1/models`.

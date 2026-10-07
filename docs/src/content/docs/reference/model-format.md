@@ -847,7 +847,7 @@ table = "fct_daily_activity"
 
 An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
 
-The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). A placeholder that is only in a comment, a string or the `SELECT` list counts as missing. So does a filter that misses some emitted rows: an unfiltered `UNION ALL` branch, a filter in a CTE the output never reads, or a filter inside a scalar subquery in the `SELECT` list. See [Time interval](/concepts/time-interval/#sql-placeholders). Each run replaces its selected partitions instead of appending the full result again.
+The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). A placeholder that is only in a comment, a string or the `SELECT` list counts as missing. So does one that does not bound a column in an `AND`-joined comparison, such as `ts >= @start_date OR 1 = 1` or `NOT (ts >= @start_date)`. So does a filter that misses some emitted rows: an unfiltered `UNION ALL` branch, a filter in a CTE the output never reads, or a filter inside a scalar subquery in the `SELECT` list. See [Time interval](/concepts/time-interval/#sql-placeholders). Each run replaces its selected partitions instead of appending the full result again.
 
 **SQL** (`models/fct_hourly_events.sql`):
 

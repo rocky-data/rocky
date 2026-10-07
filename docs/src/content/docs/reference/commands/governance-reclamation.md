@@ -161,7 +161,7 @@ rocky brief --since 7d --output json
 Read-only. Rocky composes the brief from typed queries over the state store and the decision ledger. The digest covers:
 
 - decisions awaiting review, ranked;
-- agent activity by principal;
+- agent activity by principal. The counts are policy evaluations only. Freeze, unfreeze, and post-apply verification rows are listed with their `kind` but not counted, so a freeze never shows as a deny;
 - runs, drift, freshness, quality, and cost;
 - the resident scheduler's posture: paused pipelines, consecutive-failure streaks, scheduler-spawned runs in the window, and the incident-bundle spool.
 

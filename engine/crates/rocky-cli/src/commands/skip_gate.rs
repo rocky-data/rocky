@@ -286,7 +286,16 @@ impl<'a> SkipGate<'a> {
         // which must itself be a success. We never scan past it for an older
         // success: a more recent failure must force a rebuild (the latest
         // build attempt is the authoritative baseline).
-        let prior = match store.get_model_history(&model.config.name, 1) {
+        //
+        // The latest PRODUCTION execution (#2201). The gate only runs on
+        // production runs, so its baseline must be a production build: a
+        // shadow or branch build of the same SQL wrote another table, and
+        // skipping on it would leave the production table stale. A run
+        // recorded before runs carried a scope is not trusted either — where
+        // it wrote is unknown, and a build is always safe.
+        let prior = match store.get_model_history_matching(&model.config.name, 1, |run| {
+            run.counts_as_production(rocky_core::state::UnrecordedScope::Exclude)
+        }) {
             Ok(mut history) => history.pop(),
             Err(_) => return build(GateReason::NoPriorBuild),
         };
@@ -380,6 +389,20 @@ impl<'a> SkipGate<'a> {
         prior: &ModelExecution,
         current_sigs: &[UpstreamSig],
     ) -> bool {
+        // A declared dependency on something that is not a model of this
+        // project — a seed or load pipeline the `--dag` graph resolved
+        // (#2138) — carries no signature the gate can compare, and the
+        // compile drops it from the model graph, so the recursion below
+        // never sees it. Its table may have just been reloaded: fail closed.
+        if model
+            .config
+            .depends_on
+            .iter()
+            .any(|dep| !self.depends_on.contains_key(dep))
+        {
+            return false;
+        }
+
         // Recursion: any upstream Rocky model built this run ⇒ changed input.
         if let Some(deps) = self.depends_on.get(&model.config.name) {
             for dep in deps {
@@ -585,6 +608,62 @@ async fn query_row_count(warehouse: &dyn WarehouseAdapter, table_ref: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2138 × skip gate (red-team finding): under `--dag` a model's
+    /// `depends_on` may name a seed the compile drops from the model graph.
+    /// The seed may have just reloaded and carries no signature, so the gate
+    /// must not treat the model's inputs as unchanged. Control: the same
+    /// model without that dependency, against the same empty baseline, is
+    /// unchanged.
+    #[test]
+    fn a_declared_dependency_outside_the_project_is_never_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path();
+        std::fs::write(models.join("stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("stg.toml"),
+            "name = \"stg\"\ndepends_on = [\"countries\"]\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("plain.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("plain.toml"),
+            "name = \"plain\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"plain\"\n",
+        )
+        .unwrap();
+        let compiled = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models.to_path_buf(),
+            external_dependencies: std::collections::BTreeSet::from(["countries".to_string()]),
+            ..Default::default()
+        })
+        .expect("the external name is accepted");
+        let gate = SkipGate::new(
+            super::super::run::SkipGateConfig {
+                feature_enabled: true,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+                full_refresh: false,
+            },
+            &compiled.project,
+        );
+        let prior: ModelExecution = serde_json::from_value(serde_json::json!({
+            "model_name": "stg",
+            "started_at": "2026-05-01T00:00:00Z",
+            "finished_at": "2026-05-01T00:00:00Z",
+            "duration_ms": 1,
+            "rows_affected": null,
+            "status": "success",
+            "sql_hash": "h",
+            "upstream_freshness": [],
+        }))
+        .unwrap();
+        let stg = compiled.project.model("stg").unwrap();
+        let plain = compiled.project.model("plain").unwrap();
+        assert!(!gate.upstream_unchanged(stg, &prior, &[]));
+        assert!(gate.upstream_unchanged(plain, &prior, &[]));
+    }
 
     /// Every `GateReason` carries a stable, distinct log token and a
     /// non-empty human message. Guards against a silent reason-table drift

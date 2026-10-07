@@ -115,6 +115,15 @@
         "run_id": {
           "type": "string"
         },
+        "run_scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunScopeKind"
+            }
+          ],
+          "default": "unrecorded",
+          "description": "Where the run wrote: `production`, `shadow`, `branch`, or `unrecorded` for a run recorded before runs carried a scope (#2201). Always emitted, like [`Self::pipeline`], because readers that report on production count only `production` runs."
+        },
         "session_source": {
           "description": "Session origin — `\"cli\"`, `\"dagster\"`, `\"lsp\"`, or `\"http_api\"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.",
           "type": [
@@ -205,6 +214,39 @@
         "status"
       ],
       "type": "object"
+    },
+    "RunScopeKind": {
+      "description": "Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).",
+      "oneOf": [
+        {
+          "description": "Wrote production targets.",
+          "enum": [
+            "production"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`rocky run --shadow` / `--shadow-schema`: wrote shadow targets.",
+          "enum": [
+            "shadow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`rocky run --branch <name>`: wrote a named Rocky branch.",
+          "enum": [
+            "branch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Recorded before runs carried a scope (#2200). Where it wrote is unknown. Also what a reader of an older payload without the field sees.",
+          "enum": [
+            "unrecorded"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "UnrecordedRunEvidence": {
       "description": "What left an [`UnrecordedRunRecord`] in the ledger (#1884).",
