@@ -584,21 +584,39 @@ impl ServerState {
         // task on this worker thread (HTTP handlers, the file watcher,
         // the LSP). Move it to the blocking pool. Mirrors the pattern at
         // `lsp.rs:468` (PR #263).
-        let compile_result =
-            match tokio::task::spawn_blocking(move || rocky_compiler::compile::compile(&config))
-                .await
-            {
-                Ok(r) => r,
-                Err(join_err) => {
-                    warn!(error = %join_err, "compile task join failed");
-                    let reason = format!("the compile task did not complete: {join_err}");
-                    self.publish_failure(reason.clone()).await;
-                    return RecompileOutcome {
-                        config_error: config_unreadable,
-                        compile_error: Some(reason),
-                    };
-                }
-            };
+        //
+        // The per-model-target checks of `rocky compile` run in the same
+        // task: they load each pipeline's model set from disk.
+        let gate_config = project_config.clone();
+        let gate_config_path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("rocky.toml"));
+        let compile_result = match tokio::task::spawn_blocking(move || {
+            let mut result = rocky_compiler::compile::compile(&config)?;
+            if let Some(project) = &gate_config {
+                crate::project_gates::apply_project_gates(
+                    &mut result,
+                    project,
+                    &gate_config_path,
+                    crate::project_gates::ModelSqlForm::Inlined,
+                );
+            }
+            Ok::<_, rocky_compiler::compile::CompileError>(result)
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(join_err) => {
+                warn!(error = %join_err, "compile task join failed");
+                let reason = format!("the compile task did not complete: {join_err}");
+                self.publish_failure(reason.clone()).await;
+                return RecompileOutcome {
+                    config_error: config_unreadable,
+                    compile_error: Some(reason),
+                };
+            }
+        };
 
         #[cfg(test)]
         {

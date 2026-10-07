@@ -24,6 +24,7 @@
 pub mod auth;
 pub mod jobs;
 pub mod lsp;
+pub mod project_gates;
 pub(crate) mod schema_cache_throttle;
 pub mod state;
 pub mod ui;

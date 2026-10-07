@@ -653,6 +653,10 @@ fn build_serve_state(
         config_labels: std::sync::OnceLock::new(),
     };
 
+    // Before the state starts its first compile: `serve` shows the same
+    // per-model-target checks `rocky compile` does.
+    rocky_server::project_gates::install_project_gates(super::apply_model_target_gates);
+
     Ok(rocky_server::state::ServerState::with_auth_and_webhook(
         models_dir.to_path_buf(),
         models_dir_is_explicit,
@@ -1333,6 +1337,69 @@ mod tests {
             state.settings.config_labels.get().is_none(),
             "build_serve_state read the config; that read sits on the path to bind"
         );
+    }
+
+    /// `rocky serve` judges each model against the warehouse of the pipeline
+    /// that loads it, as `rocky compile` does. Two pipelines load a merge
+    /// model each; only the one on ClickHouse (no upsert, E053) is refused.
+    /// Goes through `build_serve_state`, so it also covers the installation of
+    /// the checks, and reads the diagnostics the API serves from.
+    #[tokio::test]
+    async fn serve_resolves_per_pipeline_model_targets_like_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write_merge_model = |sub: &str, name: &str| {
+            let models = root.join("models").join(sub);
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"s\"\n",
+            )
+            .unwrap();
+        };
+        write_merge_model("ch", "on_clickhouse");
+        write_merge_model("duck", "on_duckdb");
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.ch]\ntype = \"clickhouse\"\nhost = \"localhost\"\n\n\
+             [adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [pipeline.a]\ntype = \"transformation\"\nmodels = \"models/ch/**\"\n\
+             target = { adapter = \"ch\" }\n\n\
+             [pipeline.b]\ntype = \"transformation\"\nmodels = \"models/duck/**\"\n\
+             target = { adapter = \"local\" }\n",
+        )
+        .unwrap();
+
+        let state = build_serve_state(
+            &root.join("models"),
+            false,
+            None,
+            Some(&config),
+            "127.0.0.1",
+            Some("s3cret".to_string()),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("builds");
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compiled");
+        let refused: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E053")
+            .map(|d| d.model.as_str())
+            .collect();
+        assert_eq!(refused, vec!["on_clickhouse"], "{:?}", result.diagnostics);
     }
 
     /// **The producer-to-consumer wire for the settings snapshot.** The route
