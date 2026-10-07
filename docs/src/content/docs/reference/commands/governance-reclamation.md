@@ -50,6 +50,8 @@ Every check fails closed. Any doubt keeps the artifact.
 
 A `gc` plan is **unconditionally review-gated**: `rocky apply <plan-id>` refuses it until `rocky review <plan-id> --approve` records a sign-off, and at apply time every eviction is re-verified against the live ledger. An entry that is no longer derivable (for example, a new reference appeared since plan time) is refused, with the failing checks reported.
 
+A `gc` plan is gated as an `agent` whoever applies it, so a `deny` or `require_review` rule scoped to `agent` and `gc` also applies to an interactive `rocky gc`. This keeps an unattended gc (a cron job or a daemon with no `ROCKY_PRINCIPAL`) under the same rules.
+
 Eviction is ledger-only: a durable restore tombstone is written and the ledger row retired in one transaction. No physical byte-delete follows. Reclaiming the bytes safely needs a protocol-aware VACUUM (retention windows plus TOCTOU-safe deletion against concurrent re-adds), which is future work, so `[gc] physical_delete = true` is a hard error rather than a silent no-op.
 
 ### What restore can and cannot undo

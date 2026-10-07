@@ -877,7 +877,8 @@ fn gc_plan_scope_summary(plan: &GcPlan) -> String {
 /// enforce against that stored stamp: the gc apply gate evaluates the
 /// most-restrictive of the *apply-time* runtime principal and the plan-kind
 /// default, so an agent applier (`ROCKY_PRINCIPAL=agent rocky apply`) makes an
-/// agent-scoped `deny agent gc` rule fire, while a human applier vouches. The
+/// agent-scoped `deny agent gc` rule fire. A `Gc` plan is also agent by KIND, so the rule
+/// fires even with no `ROCKY_PRINCIPAL`. The
 /// review gate is unconditional regardless.
 pub fn run_gc_plan(
     state_path: &Path,
@@ -1920,8 +1921,8 @@ pub(crate) async fn run_gc_apply_in_with(
         let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
         bail!(
             "policy DENIES gc plan '{plan_id}': model '{model}'{rule} — {reason}. \
-             A deny cannot be satisfied by review; re-scope the reclamation or have a \
-             human apply it."
+             A deny cannot be satisfied by review; re-scope the reclamation or change the rule. \
+             A gc plan is gated as an agent whoever applies it."
         );
     }
 
@@ -3250,6 +3251,47 @@ auto_create_schemas = true
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// #2284: a `deny agent gc` rule refuses a gc plan even when nobody set
+    /// `ROCKY_PRINCIPAL` (an unattended cron or daemon gc). The runtime
+    /// principal here is `Human`, the floor; the plan KIND forces `agent`.
+    /// Before the fix a gc plan defaulted to `human` and the rule never matched.
+    #[tokio::test]
+    async fn deny_agent_gc_refuses_an_unstamped_gc_plan_with_no_principal() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            crate::plan_store::write_plan(dir.path(), PlanKind::Gc, &plan).unwrap()
+        };
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"gc\"\neffect = \"deny\"\nscope = { any = true }\n",
+        )
+        .unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
+
+        let err = run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect_err("a deny agent gc rule must refuse an unattended gc");
+        assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(store.list_tombstones().unwrap().is_empty());
     }
 
     /// S1 (#1089): with a REMOTE `[state]` backend, `gc apply` brackets the
@@ -4750,7 +4792,7 @@ auto_create_schemas = true
                                 models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),
-                                principal: PolicyPrincipal::Human,
+                                principal: PolicyPrincipal::Agent,
                                 capability: PolicyCapability::Apply,
                                 model: "any".to_string(),
                                 effect: rocky_core::config::PolicyEffect::Deny,
@@ -4970,7 +5012,7 @@ auto_create_schemas = true
                         &self.provider,
                         &rocky_core::freeze_marker::FreezeMarker {
                             freeze_id: "mid-transition".to_string(),
-                            principal: PolicyPrincipal::Human,
+                            principal: PolicyPrincipal::Agent,
                             scope: "any".to_string(),
                             reason: "landed during eviction".to_string(),
                             created_at: Utc::now(),
