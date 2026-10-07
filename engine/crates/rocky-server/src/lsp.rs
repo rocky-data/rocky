@@ -1453,8 +1453,7 @@ impl LanguageServer for RockyLsp {
 
                 if let Some(mut result) = new_result {
                     apply_project_gates(&config.models_dir, &mut result);
-                    Self::publish_compile_diagnostics(&client, &published_files, &result)
-                        .await;
+                    Self::publish_compile_diagnostics(&client, &published_files, &result).await;
 
                     *compile_result.write().await = Some(result);
                 }
@@ -4559,7 +4558,9 @@ fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
                 out.pop();
             }
             other => out.push(other.as_os_str()),
