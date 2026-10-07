@@ -8,7 +8,9 @@ name: rocky-ai-review
 #
 # Repository setup (see .github/SECURITY_ENVIRONMENTS.md):
 #   * ANTHROPIC_API_KEY is an environment secret, not a repository secret.
-#   * credentialed-pr-review requires a reviewer before secrets are released.
+#   * credentialed-pr-review must require a reviewer before secrets are released.
+#     This is repository configuration, not code: GitHub creates a missing
+#     environment with no protection, so check the settings, not this file.
 
 on:
   pull_request_target:

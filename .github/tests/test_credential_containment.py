@@ -2434,7 +2434,7 @@ class WorkflowPolicyTests(unittest.TestCase):
 
         environment_policy = self.read(".github/SECURITY_ENVIRONMENTS.md")
         self.assertEqual(environment_policy.count("Require at least one trusted reviewer"), 2)
-        self.assertEqual(environment_policy.count("prevent self-review"), 2)
+        self.assertEqual(environment_policy.count("self-review cannot be prevented"), 2)
 
 
 if __name__ == "__main__":
