@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.68.0"
+version = "1.69.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -52,7 +52,10 @@ dependencies = [
     # 0.17.0: `resource.py` imports ReconcileWatermarkOutput and calls
     # `RockyClient.reconcile_watermark`; neither exists in 0.16.0.
     # Release rocky-sdk 0.17.0 BEFORE dagster-rocky 1.68.0.
-    "rocky-sdk>=0.17.0",
+    # 0.18.0: `RockyResource.package_list()` calls `RockyClient.package_list`,
+    # which 0.17.0 does not have.
+    # Release rocky-sdk 0.18.0 BEFORE dagster-rocky 1.69.0.
+    "rocky-sdk>=0.18.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
