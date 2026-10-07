@@ -2100,46 +2100,19 @@ mod tests {
             (wr, obj_path)
         }
 
-        /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc's eviction set is strictly
-        /// larger than restore's recovery set).
+        /// Pins the subset relation: gc's eligible set is a subset of what
+        /// restore can recover (issue #2283).
         ///
-        /// **Current behavior:** an artifact produced by a *multi-input*
-        /// recipe whose every upstream is a content hash has a `strong` input
-        /// closure, so gc's [`check_recipe_recorded`] passes it and it becomes
-        /// eligible for eviction. `restore_one` then refuses that very same
-        /// artifact, because it rejects any recipe with recorded upstreams:
-        /// re-deriving a multi-input recipe from the recorded upstream bytes
-        /// needs DAG re-derivation that is not yet implemented. This test
-        /// drives BOTH sides against ONE artifact and asserts the asymmetry.
-        ///
-        /// **Why this is wrong:** gc's own check detail advertises "every
-        /// upstream is a content hash", explicitly contemplating multi-input
-        /// recipes, and `rocky gc` told users evictions were "always restorable
-        /// from the recorded recipe". They are not — restore covers only the
-        /// zero-upstream, non-partitioned case. The tombstone is durable and
-        /// the custody state still retains the recipe (the canonical `ModelIr`
-        /// and recorded upstreams live in the `ProvenanceRecord` the tombstone
-        /// references), so nothing is destroyed, but the recovery route a user
-        /// is pointed at does not work for these artifacts, and re-running the
-        /// pipeline is not a substitute: it recomputes from current upstreams,
-        /// which need not reproduce the evicted bytes.
-        /// This PR corrects the misleading text; it does not close the gap.
-        ///
-        /// **Expected to invert when the gap is closed — but which half inverts
-        /// depends on the fix.** Two mutually exclusive fixes are possible, and
-        /// choosing between them is an owner decision:
-        /// - Narrow gc's eligibility predicate to reject recorded upstreams (a
-        ///   behavior change to a public surface): the `build_candidate`
-        ///   admission assertion above breaks — gc no longer admits the
-        ///   multi-input recipe — while `restore_one` keeps refusing (its
-        ///   behavior is unchanged).
-        /// - Build multi-input restore (DAG re-derivation from the recorded
-        ///   upstream bytes): the `restore_one` refusal assertion below breaks —
-        ///   restore now succeeds — while gc keeps admitting.
-        /// Either way this test must be revisited and renamed; it does not
-        /// self-adjust.
+        /// An artifact produced by a *multi-input* recipe (two content-hashed
+        /// upstreams, a `strong` closure) used to pass gc's admission while
+        /// `restore_one` refused it, so gc could evict what restore could not
+        /// bring back. gc now refuses any recipe with recorded upstreams
+        /// (`check_recipe_recorded`), until multi-input restore exists. This
+        /// test drives BOTH sides against ONE artifact: gc must NOT admit it,
+        /// and restore refuses it for the multi-input reason. If multi-input
+        /// restore lands, relax gc's check and update this test together.
         #[tokio::test]
-        async fn gc_admits_multi_input_recipe_that_restore_refuses_known_gap() {
+        async fn gc_admission_is_a_subset_of_restore_recovery() {
             let dir = TempDir::new().unwrap();
             let root = dir.path();
             let state_path = root.join("state.redb");
@@ -2215,12 +2188,8 @@ mod tests {
                     .unwrap();
             }
 
-            // --- gc side: this artifact passes the FULL 6-check gc admission
-            // (`build_candidate`), not merely the recipe-recorded check — so the
-            // eviction set `rocky gc` actually approves genuinely includes a
-            // multi-input artifact that `restore_one` refuses below. A new
-            // production check that rejected upstream-bearing recipes would flip
-            // `derivable` to false here and fail this assertion.
+            // --- gc side: the FULL 6-check admission (`build_candidate`) rejects
+            // this artifact because it has recorded upstreams.
             //
             // Drive the REAL `classify_model` — the exact verdict `rocky gc`
             // reuses — rather than a hand-fabricated classification. With both
@@ -2272,18 +2241,22 @@ mod tests {
                 "the full admission is six checks"
             );
             assert!(
-                candidate.checks.iter().all(|c| c.passed),
-                "KNOWN GAP: gc's full 6-check admission marks a multi-input recipe derivable \
-                 (eligible for eviction): {:?}",
+                !candidate.derivable,
+                "gc must NOT admit a multi-input recipe restore cannot rebuild: {:?}",
                 candidate.checks
             );
+            let recorded = candidate
+                .checks
+                .iter()
+                .find(|c| c.check == "recipe_recorded")
+                .expect("recipe_recorded check present");
             assert!(
-                candidate.derivable,
-                "the multi-input artifact is admitted for eviction: {:?}",
-                candidate.checks
+                !recorded.passed && recorded.detail.contains("recorded upstream"),
+                "the multi-input refusal comes from check_recipe_recorded: {recorded:?}"
             );
 
-            // Evict it, exactly as an approved gc apply would.
+            // Force the eviction anyway (as a stale or hand-built plan would)
+            // so the restore side is exercised against the same artifact.
             let tomb = TombstoneRecord {
                 size_bytes: wr.size_bytes,
                 commit_version: wr.commit_version,
@@ -2329,8 +2302,8 @@ mod tests {
 
             let RestoreOneOutcome::Refused(refused) = outcome else {
                 panic!(
-                    "KNOWN GAP pin is stale: restore no longer refuses multi-input recipes. If \
-                     multi-input restore has landed, invert this test rather than deleting it."
+                    "restore no longer refuses multi-input recipes. If multi-input restore has \
+                     landed, relax gc's check_recipe_recorded and update this test."
                 );
             };
             assert!(

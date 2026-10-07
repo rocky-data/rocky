@@ -67,18 +67,11 @@
 //! `ModelIr` that will not deserialize, an unreachable object store or table
 //! state, a re-derivation whose blake3 differs from the tombstoned hash, a path
 //! outside the storage prefix, or a lost race on atomic ledger reinstatement).
-//! The eviction checks below admit multi-input recipes (a `strong` closure over
-//! several content-hashed upstreams still passes [`check_recipe_recorded`]), so
-//! gc can evict artifacts restore cannot yet rebuild. The tombstone is still
-//! durable, and the custody state still retains the recipe — the canonical
-//! `ModelIr` and recorded upstreams live in the `ProvenanceRecord` the
-//! tombstone's `(run_id, model_name)` points at, not in the tombstone itself —
-//! but for a multi-input artifact that recipe has no route back to the evicted
-//! bytes today. Re-running the pipeline is not that route: it recomputes from
-//! *current* upstreams, and a recipe is only bit-reproducible against the
-//! inputs it recorded — if any upstream has moved on the re-run yields
-//! different bytes, a new artifact at the same logical path. Until multi-input
-//! restore lands, those exact bytes may be unrecoverable.
+//! So [`check_recipe_recorded`] refuses any artifact whose recipe has recorded
+//! upstreams: a multi-input artifact is **not evicted** until multi-input
+//! restore lands. Re-running the pipeline is not a route back: it recomputes
+//! from *current* upstreams, and a recipe is only bit-reproducible against the
+//! inputs it recorded.
 //!
 //! # Reachability
 //!
@@ -130,27 +123,32 @@ type AdapterCost = (String, WarehouseType, f64, f64);
 /// Check 1 — recipe recorded with a strong (non-weak) input closure.
 ///
 /// A provenance record must exist *and* its input closure must be `strong`
-/// (every upstream is a content hash). A `heuristic` closure means at least
+/// (every upstream is a content hash, and none are recorded). A `heuristic` closure means at least
 /// one input is a mutable-source freshness signal whose data may have moved
 /// on — such a table is not derivable.
 ///
-/// **Known gap (asymmetry with `rocky restore`).** A `strong` closure over
-/// *several* content-hashed upstreams passes this check, but `restore` refuses
-/// any recipe with recorded upstreams (multi-input rebuild needs DAG
-/// re-derivation, not yet implemented). So this check's pass set is strictly
-/// larger than restore's recovery set. Pinned by
-/// `gc_admits_multi_input_recipe_that_restore_refuses_known_gap` in
-/// `commands/restore.rs`. Narrowing this predicate is a behavior change
-/// pending a design decision.
+/// It also requires **no recorded upstreams**. `rocky restore` rebuilds only a
+/// zero-upstream recipe (multi-input rebuild needs DAG re-derivation, not yet
+/// implemented), so gc must not evict what restore cannot bring back. This
+/// keeps gc's eligible set a subset of restore's recovery set; pinned by
+/// `gc_admission_is_a_subset_of_restore_recovery` in `commands/restore.rs`.
+/// Relax this only together with multi-input restore.
 pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
     let strong = class.proof_class.as_deref() == Some("strong");
-    let passed = class.has_provenance && strong;
+    let multi_input = !class.inputs.is_empty();
+    let passed = class.has_provenance && strong && !multi_input;
     let detail = if !class.has_provenance {
         "no provenance record — the producing run was not content-addressed, so the recipe was \
          never captured"
             .to_string()
+    } else if multi_input {
+        format!(
+            "recipe reads {} recorded upstream(s) — `rocky restore` cannot rebuild a multi-input \
+             recipe yet, so this artifact is not evicted",
+            class.inputs.len()
+        )
     } else if strong {
-        "recipe + strong input closure recorded (every upstream is a content hash)".to_string()
+        "recipe recorded with no upstreams and a strong input closure — restorable".to_string()
     } else {
         format!(
             "input closure is weak (proof_class={}) — derived from a mutable source whose inputs \
@@ -2208,6 +2206,20 @@ auto_create_schemas = true
         let c = check_recipe_recorded(&m);
         assert!(!c.passed);
         assert!(c.detail.contains("no provenance"));
+    }
+
+    #[test]
+    fn recipe_recorded_refuses_recorded_upstreams() {
+        let mut m = model("x");
+        m.inputs.push(crate::output::ReplayCheckInputOutput {
+            upstream_key: "tgt.raw.customers".to_string(),
+            kind: "content".to_string(),
+            resolvable: true,
+            reason: None,
+        });
+        let c = check_recipe_recorded(&m);
+        assert!(!c.passed, "restore cannot rebuild a multi-input recipe");
+        assert!(c.detail.contains("recorded upstream"));
     }
 
     #[test]

@@ -37,7 +37,7 @@ rocky gc --derivable
 
 An artifact is *derivable* only when all six checks pass.
 
-1. Its recipe identity was recorded.
+1. Its recipe identity was recorded, with a strong input closure and no recorded upstreams. An artifact built from other tables (a multi-input recipe) is not evicted yet, because `rocky restore` cannot rebuild it.
 2. The recipe's provenance records this artifact's exact output hash. The recipe must be bound to these specific bytes, not to a sibling output and not to a re-materialization at a new hash.
 3. The ledger's replay-check verdict says the artifact is replayable and deterministic.
 4. Nothing references it.
@@ -58,7 +58,7 @@ Eviction is ledger-only: a durable restore tombstone is written and the ledger r
 
 `rocky restore` rebuilds an evicted artifact from the recipe its tombstone references. It refuses unless the recomputed content hash matches the tombstoned one.
 
-Restore covers less than gc evicts. It attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstream. A recipe with any recorded upstream is refused outright, because re-deriving a multi-input DAG is a later phase.
+Restore covers the same set gc evicts, or more. gc only evicts a recipe with no recorded upstreams. Restore attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstream. A recipe with any recorded upstream is refused outright, because re-deriving a multi-input DAG is a later phase. For that reason gc does not evict such an artifact until multi-input restore exists.
 
 Even a supported recipe can refuse. Any of these stops it:
 
