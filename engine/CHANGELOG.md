@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.77.0] — 2026-10-07
+
+This release carries 30 breaking changes, each marked **Breaking:** below. Read three first:
+
+- The state store moves to schema v31. An engine at 1.76.0 or older cannot use a v31 store, so there is no downgrade. Upgrade every process that shares a state store together.
+- An unset `[state] concurrency_control` now defaults to `"cas"` on `s3`, `gcs` and `tiered`.
+- The first compare-and-swap upload writes a `cas-required` marker. A writer set to `"off"` then refuses that store.
 
 ### Added
 
@@ -39,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Experimental:** `rocky plan --intent refactor` checks that a change keeps each changed model's output. On a DuckDB target, Rocky builds each changed model from `--base` and from the working tree in one transaction, and compares the schema and the rows exactly. The output gains `intent_check` with a `match`, `mismatch` or `unverified` verdict per model. The verdict is report-only: it relaxes no gate, and the verdict never changes the exit code. The plan records `intent`; a plan without `--intent` keeps its bytes and `plan_id`. `rocky-sql` gains `determinism::contains_volatile_builtin` and `contains_unordered_limit`, and its volatile list adds DuckDB spellings such as `get_current_timestamp`, `today` and `uuidv7`, plus `age`, `current_setting`, `getenv` and `version`.
 - Every policy decision records a principal id: a name for who acted, beside the `human` / `agent` class. Set it with the new global `--principal-id <ID>` flag or `ROCKY_PRINCIPAL_ID`. `rocky mcp` defaults to `mcp-<profile>`; everything else defaults to `unnamed`. An id uses lowercase letters, digits, `.`, `_` and `-`, at most 63 bytes, and no `@`; `unnamed`, `unrecorded` and the `mcp-` prefix are reserved. An invalid value is an error; an empty `ROCKY_PRINCIPAL_ID` counts as unset. A ledger row whose id this binary cannot parse reads as `unrecorded`, never as an unreadable ledger. Rocky never reads `$USER` or a CI variable for it. The id is self-asserted and no gate reads it. `rocky audit` gains `--actor <ID>` and `--since <WHEN>` (`YYYY-MM-DD`, RFC 3339, or `<N>d` / `<N>h`), also on `GET /api/v1/audit?actor=&since=`. Audit entries gain `principal_id`, `principal_id_source` and `principal_id_verified` (always `false`). `AuditOutput` gains `filter` and `unattributed_skipped`, and review-queue entries gain `principal_id`. The ledger field is additive, so the state schema stays at v31; a row from an older binary reads as `unrecorded`. (RV4-P1)
 - `rocky-core` gains `cas_vacuum::delete_unreferenced_artifacts`, which deletes a content-addressed file only after no ledger row references its hash. No command calls it yet. `[gc] physical_delete = true` is still an error.
+- **Experimental:** `rocky compile --dbt-project <DIR>` compiles a dbt project in place (attach mode). It reads `<DIR>/target/manifest.json` and `run_results.json` on every run and writes nothing under `<DIR>`. It refuses what `rocky import-dbt` refuses, with the same reasons, and refuses any manifest schema other than `v12` by name.
+- `rocky profile <model> --sample N` returns up to N distinct non-null values per column, as `sample_values`. N is at most 100. Rocky picks the values by a hash of each value, so a re-run on unchanged data returns the same values. Unlike `observed_values`, it covers high-cardinality columns. DuckDB only, like the rest of `rocky profile`. Without `--sample` the output is unchanged.
+- **`type = "manual"` is a working discovery adapter.** List its tables in config with `[[adapter.NAME.schemas]] name = "..." tables = [...]`. `rocky plan`, `rocky run` and `rocky discover` now use it; before, they failed with `no discovery adapter named '<name>'`. `rocky validate` reports `V057` for an invalid list (see Changed) and warns `V058` when no listed schema parses under a pipeline's `schema_pattern`, so `plan` would build nothing. The prefix match is case-sensitive. (#1994)
 
 ### Changed
 
@@ -111,12 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Readers that report on or act for production count production runs only. `rocky brief`, `rocky cost` (latest run), `rocky optimize`, `rocky catalog`, `rocky metrics`, `rocky freshness` (state-store builds), `rocky backfill --from-last-run`, the HTTP API project `last_run` and the schedule reconciler leave shadow and branch runs out. A run with no recorded scope and a `rocky_branch` is a branch run. Runs recorded before #2200 (no scope) still count in the reports. The schedule reconciler ignores them, so each freshness pipeline may run once more than needed after upgrade. `--skip-unchanged` does not trust them as a baseline, so each model rebuilds once after upgrade. `rocky history` shows `run_scope` (`production`, `shadow`, `branch` or `unrecorded`). `BriefOutput`, `CostOutput`, `OptimizeOutput`, `CatalogOutput` and `HistoryOutput` gain a `run_scope` field, and `MetricsOutput` gains `excluded_non_production_snapshots`. (#2201)
 - A model whose `depends_on` names a seed or load pipeline now runs under `rocky run --dag`. Each model's sub-run compiled models only and refused the name as an unknown dependency. `--skip-unchanged` always builds such a model, because the external name carries no signature. A misspelled `depends_on` still fails. (#2138)
 - `rocky branch promote` no longer refuses two valid plans as dependency cycles. Step order now comes from what each generated statement reads, matched on the warehouse's physical identifier rules. A `full_refresh` model and a view that reads it by its qualified name, and a Snowflake view reading a distinct differently-cased target, now promote. Real cycles, such as two views reading each other, still refuse. (#2237)
-
-### Added
-
-- **Experimental:** `rocky compile --dbt-project <DIR>` compiles a dbt project in place (attach mode). It reads `<DIR>/target/manifest.json` and `run_results.json` on every run and writes nothing under `<DIR>`. It refuses what `rocky import-dbt` refuses, with the same reasons, and refuses any manifest schema other than `v12` by name.
-- `rocky profile <model> --sample N` returns up to N distinct non-null values per column, as `sample_values`. N is at most 100. Rocky picks the values by a hash of each value, so a re-run on unchanged data returns the same values. Unlike `observed_values`, it covers high-cardinality columns. DuckDB only, like the rest of `rocky profile`. Without `--sample` the output is unchanged.
-- **`type = "manual"` is a working discovery adapter.** List its tables in config with `[[adapter.NAME.schemas]] name = "..." tables = [...]`. `rocky plan`, `rocky run` and `rocky discover` now use it; before, they failed with `no discovery adapter named '<name>'`. `rocky validate` reports `V057` for an invalid list (see Changed) and warns `V058` when no listed schema parses under a pipeline's `schema_pattern`, so `plan` would build nothing. The prefix match is case-sensitive. (#1994)
 
 ## [1.76.0] — 2026-10-03
 

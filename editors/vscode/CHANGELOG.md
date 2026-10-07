@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.44.0] — 2026-10-07
+
+Pairs with engine 1.77.0.
+
+### Added
+
+- **Rocky: Check Source Freshness** (`rocky.freshness`) runs `rocky freshness` and shows the report, including when a check fails.
+- A `where-in` snippet for the DSL list filter: `where <column> in [...]` or `not in [...]`.
+
+### Changed
+
+- Generated types and the `rocky.toml` schema follow engine 1.77.0, including the `package_*` and `freshness` outputs.
+- The model inspector colours the `snapshot` strategy.
+- Dependencies: dev tooling minor bumps (eslint, mocha, vitest, typescript-eslint, `@types/node`).
+
 ## [1.43.0] — 2026-10-03
 
 Pairs with engine 1.76.0.
