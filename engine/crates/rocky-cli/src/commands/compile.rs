@@ -663,20 +663,23 @@ fn compile_inner(
 /// three steps ([`apply_adapter_gates`], [`apply_operand_gates`],
 /// [`apply_inlined_sql_gates`]) itself, at its own points in a longer
 /// pipeline, so a model is judged against the same warehouses everywhere.
-/// E054 is skipped on [`ModelSqlForm::Authored`] SQL: it judges the inlined
-/// statement.
+/// E054 runs on both SQL forms. On [`ModelSqlForm::Authored`] SQL it can miss
+/// a CTE that only inlining adds, but it never reports one the inlined
+/// statement would not: inlining keeps every authored CTE.
+///
+/// `has_errors` is recomputed at the end. The callers read the flag, not the
+/// diagnostics, to decide whether the project compiled.
 pub fn apply_model_target_gates(
     result: &mut compile::CompileResult,
     config: &rocky_config::RockyConfig,
     config_path: &Path,
-    sql: ModelSqlForm,
+    _sql: ModelSqlForm,
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
     apply_operand_gates(result, Some(config), Some(&targets), None);
-    if sql == ModelSqlForm::Inlined {
-        apply_inlined_sql_gates(result, &targets);
-    }
+    apply_inlined_sql_gates(result, &targets);
+    result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
 
 /// E044 -> W044 on PostgreSQL, E051, E049 and E053, judged against the

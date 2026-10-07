@@ -1400,6 +1400,8 @@ mod tests {
             .map(|d| d.model.as_str())
             .collect();
         assert_eq!(refused, vec!["on_clickhouse"], "{:?}", result.diagnostics);
+        // `/project` reports the flag, not the diagnostics: an added E053 must set it.
+        assert!(result.has_errors, "{:?}", result.diagnostics);
     }
 
     /// **The producer-to-consumer wire for the settings snapshot.** The route
