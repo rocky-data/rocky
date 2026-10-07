@@ -1279,6 +1279,14 @@ enum Command {
         #[arg(long)]
         full_refresh: bool,
 
+        /// Refuse the run when the config defines any `[hook]` command or
+        /// `[hook.webhooks]` entry that would fire, before anything fires.
+        /// For CI jobs that run a config they do not trust, such as a pull
+        /// request's `rocky.toml`; the `rocky-preview` action passes it by
+        /// default. Not supported with `--watch`. Default OFF.
+        #[arg(long, conflicts_with = "watch")]
+        refuse_hooks: bool,
+
         /// Per-run variable substituted into model SQL. Repeatable:
         /// `--var region=us --var since=2024-01-01`.
         ///
@@ -4385,6 +4393,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             no_reuse,
             no_prune,
             full_refresh,
+            refuse_hooks,
             var,
             assume_fresh_state,
         } => {
@@ -4658,6 +4667,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         || format!("failed to load config from {}", cli.config.display()),
                     )?,
                 );
+                if refuse_hooks {
+                    rocky_cli::commands::refuse_configured_side_effects(&loaded.config.hooks)?;
+                }
                 let run_future = rocky_cli::commands::run_with_dag(
                     &cli.config,
                     loaded,
@@ -4716,6 +4728,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     assume_fresh_state,
                     contracts.as_deref(),
                     &actor,
+                    refuse_hooks,
                 )
                 .await
             }

@@ -234,8 +234,8 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is a no-
 
 `rocky preview` ships a composite GitHub Action. It runs all three commands on every push to a pull request. It upserts a single Markdown comment for the prune/copy/skip plan, the structural diff, and the cost delta. The action lives at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview). It is drop-in for any repo with a `rocky.toml` and a `models/` directory.
 
-:::caution[The action does not run the branch yet]
-The action runs `preview create`, `preview diff`, and `preview cost`. It never runs `rocky run --branch <name>`. So `preview diff` and `preview cost` have no branch run to compare, and their sections of the comment come back empty. Only the plan section carries data. [#2162](https://github.com/rocky-data/rocky/issues/2162) tracks this.
+:::caution[The action runs the pull request's config]
+The action runs `preview create`, then `rocky run --branch <name> --models <dir>`, then `preview diff` and `preview cost`. The branch run executes the pull request's `rocky.toml` and SQL. By default the action passes `rocky run --refuse-hooks`, so a config that defines `[hook]` commands or `[hook.webhooks]` refuses the branch run instead of firing them. Set `allow_hooks: true` only for a trusted config. Do not give the preview job secrets that a fork's pull request can reach: the config also controls the SQL and the `${VAR}` values it reads. `--refuse-hooks` needs engine 1.77.0 or later.
 :::
 
 ### Setting up the GitHub Action
@@ -278,10 +278,11 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 |---|---|---|
 | `base_ref` | (required) | Git ref to compare against. Typically `${{ github.event.pull_request.base.ref }}`. |
 | `branch_name` | `pr_<PR number>_<head ref slug>` | Preview branch name passed to `rocky preview create --name`. The action maps characters outside `[A-Za-z0-9_]` to underscores and truncates the name to 64 characters. The default PR number prevents different PRs with equivalent slugs from sharing a schema. If you override this input, choose a unique name. |
-| `models_dir` | `models` | Directory containing model files. Passed to `rocky preview create --models`. |
+| `models_dir` | `models` | Directory containing model files. Passed to `rocky preview create --models` and `rocky run --models`. |
 | `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.74.0` or `engine-v1.74.0`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
+| `allow_hooks` | `false` | When `true`, the branch run fires the `[hook]` commands and `[hook.webhooks]` that the pull request's `rocky.toml` defines. The default passes `rocky run --refuse-hooks`, so such a config refuses the branch run. |
 | `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory: failures still post a section in the comment. |
 | `github_token` | empty | Token used to upsert the PR comment. Pass `${{ github.token }}` from a `pull_request` workflow. Without it, the action renders the comment body but skips the upsert. |
 

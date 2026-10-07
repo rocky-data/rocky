@@ -51,6 +51,19 @@ inputs:
       the PR check pass — preview is advisory.
     required: false
     default: 'false'
+  allow_hooks:
+    description: >-
+      When `true`, the branch run fires the `[hook]` commands and
+      `[hook.webhooks]` that the pull request's `rocky.toml` defines. The
+      default (`false`) passes `rocky run --refuse-hooks`, so a config that
+      defines any refuses the branch run instead. Set `true` only when the
+      config is trusted: hooks run shell commands with the job's environment.
+      Running a pull request's config in a job that holds secrets is unsafe
+      even with this flag off, because the config also controls the SQL and
+      the `${VAR}` values it reads. `--refuse-hooks` needs engine 1.77.0 or
+      later; an older `rocky_version` fails the branch run.
+    required: false
+    default: 'false'
   github_token:
     description: >-
       Token used to read the PR and upsert the comment when this action runs
@@ -150,6 +163,7 @@ runs:
         ROCKY_PREVIEW_BRANCH_RAW: ${{ inputs.branch_name }}
         ROCKY_PREVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
         ROCKY_PREVIEW_MODELS_DIR: ${{ inputs.models_dir }}
+        ROCKY_PREVIEW_ALLOW_HOOKS: ${{ inputs.allow_hooks }}
         ROCKY_PREVIEW_WORKING_DIR: ${{ inputs.working_directory }}
         ROCKY_PREVIEW_NORMALIZER: ${{ github.action_path }}/normalize_json.py
         ROCKY_PREVIEW_NAMER: ${{ github.action_path }}/name.sh
@@ -197,6 +211,12 @@ runs:
         : > "$WORK/run_failed"
         : > "$WORK/run_skipped"
         PRUNE_FOR_RUN="$(jq -r '.prune_set | length' "$WORK/create.json" 2>/dev/null || echo 0)"
+        # The pull request's config is untrusted: refuse its hooks and
+        # webhooks unless the caller opted in with `allow_hooks: true`.
+        RUN_HOOK_ARGS=(--refuse-hooks)
+        if [ "$ROCKY_PREVIEW_ALLOW_HOOKS" = "true" ]; then
+          RUN_HOOK_ARGS=()
+        fi
         if [ -s "$WORK/create_failed" ] || [ -z "$BRANCH_NAME" ]; then
           echo "preview create did not register a branch" > "$WORK/run_skipped"
         elif [ "$PRUNE_FOR_RUN" = "0" ]; then
@@ -205,7 +225,7 @@ runs:
         # cost read the recorded run from the state store), and every JSON
         # payload this action does read goes through the normalizer.
         elif ! rocky run --branch "$BRANCH_NAME" --models "$ROCKY_PREVIEW_MODELS_DIR" \
-            > "$WORK/run.log" 2> "$WORK/run.err"; then
+            ${RUN_HOOK_ARGS[@]+"${RUN_HOOK_ARGS[@]}"} > "$WORK/run.log" 2> "$WORK/run.err"; then
           echo failed > "$WORK/run_failed"
         fi
 

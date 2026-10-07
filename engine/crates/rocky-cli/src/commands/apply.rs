@@ -5586,6 +5586,8 @@ pub async fn run_apply_inline_for_run(
     contracts_dir: Option<&Path>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
     actor: &PrincipalRef,
+    // `--refuse-hooks` (#2162): refuse a config that would fire hooks.
+    refuse_hooks: bool,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5595,6 +5597,10 @@ pub async fn run_apply_inline_for_run(
         rocky_core::config::load_rocky_config_fingerprinted(config_path)
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
+    // Checked against the same snapshot the run executes, before any I/O.
+    if refuse_hooks {
+        crate::commands::run::refuse_configured_side_effects(&loaded.config.hooks)?;
+    }
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run_with_explicit_contracts(
         config_path,

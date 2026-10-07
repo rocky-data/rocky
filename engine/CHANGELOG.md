@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rocky run --refuse-hooks` refuses a run whose config defines a `[hook]` command or `[hook.webhooks]` entry that would fire, before anything fires. For CI jobs that run an untrusted config. (#2162)
 - MCP `schedule_status` reports waiting webhook demands under `spool`, and fails if the spool cannot be read. The browser UI Schedule panel shows waiting, unreadable and quarantined demand counts. `GET /api/v1/schedule` is unchanged. (#1900)
 - New warning `D013`: a bare read that binds to a model by table name alone, and would close a cycle, is dropped and reported. (#1354)
 - `rocky audit --for product:<name>` and `GET /api/v1/custody/product:<name>` resolve a product through its spec's output model, and answer with `subject_kind: "product"`. A name that is not a bare identifier is not read as a product. A missing spec gives the unresolved model chain; an invalid spec gives `409 product_spec_invalid` (MCP: `invalid_argument`). (#2003)
@@ -75,7 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rocky run --dag` orders model reads by the compiler's edges, not by a second label match. (#1629)
 - `rocky run` withholds a model that reads a failed model's table by its full name, instead of letting it read the stale table. A model with a compile error no longer adds its reads to the run order. (#1630, plain `rocky run` only)
 - `rocky run` refuses flag and config errors before it claims `--idempotency-key` or opens the state store or adapters. (#1609)
-- The `rocky-preview` GitHub Action runs `rocky run --branch <name>` before `preview diff` and `preview cost`, so the PR comment shows a real diff and cost change. (#2162)
+- The `rocky-preview` GitHub Action runs `rocky run --branch <name>` before `preview diff` and `preview cost`, so the PR comment shows a real diff and cost change. The branch run passes `--refuse-hooks` by default, so a pull request's `[hook]` commands and webhooks never fire unless the caller sets `allow_hooks: true`. The flag needs engine 1.77.0 or later; with an older `rocky_version`, the branch run fails. (#2162)
 - Over Dagster Pipes, every check the orchestrator declares now gets a result. A check Rocky did not produce gets a `passed: false` WARN row whose `rocky/not_evaluated_cause` is `copy_failed`, `pruned_unchanged`, `excluded`, `not_produced` or `not_reached`. (#2160)
 - **Breaking (Snowflake):** `rocky run --defer`, `--shadow`/`--branch`, `branch promote` and `rocky replay --execute` refuse a bare reference whose CTE binding depends on `QUOTED_IDENTIFIERS_IGNORE_CASE`, for example `WITH "orders" AS (…) SELECT * FROM orders` where `orders` is also a model or upstream. Before, `--defer` qualified it silently. Spell the alias and the reference alike, or rename the CTE. (#1622)
 - **Breaking (BigQuery):** `rocky load` contract checks read a bare `NUMERIC` as `NUMERIC(38, 9)`, on the landed column and on the contract. A correct default-precision contract now passes. A contract that declares bare `NUMERIC` is compared instead of skipped with a warning, so a landed `FLOAT64` or `BIGNUMERIC(50,10)` now refuses. A bare `BIGNUMERIC` is still refused. (#1856)

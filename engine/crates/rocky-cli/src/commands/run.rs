@@ -2177,6 +2177,35 @@ pub(crate) fn refuse_governed_side_effects(
     governed: bool,
     hooks: &rocky_core::hooks::HooksConfig,
 ) -> Result<()> {
+    if governed && configures_side_effects(hooks) {
+        anyhow::bail!(
+            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
+             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
+             replication-only apply never reaches it), so a post-plan hook edit would run \
+             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
+        );
+    }
+    Ok(())
+}
+
+/// `rocky run --refuse-hooks`: refuse a run whose config would fire any
+/// `[hook]` shell command or `[hook.webhooks]` request, before any is built or
+/// fired. For a caller that runs a config it does not trust, such as a CI job
+/// running a pull request's `rocky.toml` (#2162). Uses the same count as the
+/// governed refusal, so the two agree on what fires.
+pub fn refuse_configured_side_effects(hooks: &rocky_core::hooks::HooksConfig) -> Result<()> {
+    if configures_side_effects(hooks) {
+        anyhow::bail!(
+            "refusing `rocky run --refuse-hooks`: the config defines `[hook]` commands or \
+             `[hook.webhooks]` that this run would fire. Remove them, or run without \
+             `--refuse-hooks` only where the config is trusted."
+        );
+    }
+    Ok(())
+}
+
+/// Whether `hooks` configures any shell hook or webhook that would fire.
+fn configures_side_effects(hooks: &rocky_core::hooks::HooksConfig) -> bool {
     use rocky_core::hooks::{HookConfigOrList, HookEvent, WebhookConfigOrList};
     // Count NORMALIZED executable side effects EXACTLY as `HookRegistry::from_config`
     // does (hooks/mod.rs): an entry fires only when its key resolves to a known
@@ -2203,15 +2232,7 @@ pub(crate) fn refuse_governed_side_effects(
             },
         )
     });
-    if governed && (has_shell_hook || has_webhook) {
-        anyhow::bail!(
-            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
-             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
-             replication-only apply never reaches it), so a post-plan hook edit would run \
-             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
-        );
-    }
-    Ok(())
+    has_shell_hook || has_webhook
 }
 
 /// Fold the replication run's remote-state download result into a typed
@@ -33057,6 +33078,36 @@ backend = "local"
             .collect(),
         };
         assert!(super::refuse_governed_side_effects(true, &unknown_event).is_ok());
+    }
+
+    /// #2162: `--refuse-hooks` refuses exactly what the governed refusal
+    /// counts — a firing hook — whatever the run's governance.
+    #[test]
+    fn refuse_hooks_refuses_only_hooks_that_fire() {
+        use rocky_core::hooks::{HookConfig, HookConfigOrList, HooksConfig};
+        let hook = |event: &str| HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                event.to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "touch fired".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let err = super::refuse_configured_side_effects(&hook("on_pipeline_start"))
+            .expect_err("a firing hook must be refused");
+        assert!(err.to_string().contains("--refuse-hooks"), "{err}");
+        assert!(super::refuse_configured_side_effects(&hook("on_typo_not_an_event")).is_ok());
+        let empty = HooksConfig {
+            webhooks: Default::default(),
+            hooks: Default::default(),
+        };
+        assert!(super::refuse_configured_side_effects(&empty).is_ok());
     }
 
     /// Run one governed `execute_models` apply under a fixed gate and return the
