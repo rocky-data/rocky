@@ -512,16 +512,36 @@ async fn run_apply_run_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
-        (Vec::new(), EmptyTouched::NoOp)
+    //
+    // #2290: a snapshot, load or quality pipeline runs no models but may still
+    // write; its writes are named in `touched` and the compile is skipped.
+    let no_compiled_models = BTreeSet::new();
+    let (touched, empty_touched, modelless) = if let Some((touched, empty_touched)) =
+        modelless_gate_inputs(&loaded.config, &run_plan, &plan)
+    {
+        (touched, empty_touched, true)
     } else {
-        match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
-            Some(models) => (models, EmptyTouched::NoOp),
-            // The compile failed, so the executed set is unknown: refuse.
-            None => (Vec::new(), EmptyTouched::Refuse),
-        }
+        let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+            (Vec::new(), EmptyTouched::NoOp)
+        } else {
+            match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+                Some(models) => (models, EmptyTouched::NoOp),
+                // The compile failed, so the executed set is unknown: refuse.
+                None => (Vec::new(), EmptyTouched::Refuse),
+            }
+        };
+        (
+            touched_models_for_run(&plan, &executable),
+            empty_touched,
+            false,
+        )
     };
-    let touched = touched_models_for_run(&plan, &executable);
+    // The write keys of a model-less pipeline are tables, not compiled models.
+    let subjects = if modelless {
+        GateSubjects::Resolved(&no_compiled_models)
+    } else {
+        GateSubjects::CompiledModels
+    };
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
@@ -542,7 +562,7 @@ async fn run_apply_run_plan(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
-        GateSubjects::CompiledModels,
+        subjects,
     );
     apply_policy_gate(root, plan_id, gate)?;
 
@@ -844,6 +864,77 @@ pub(crate) fn pipeline_is_replication(
     crate::registry::resolve_pipeline(cfg, pipeline_name)
         .map(|(_, p)| matches!(p, rocky_core::config::PipelineConfig::Replication(_)))
         .unwrap_or(false)
+}
+
+/// The writes of a governed `Run` plan whose pipeline executes NO compiled
+/// models but still mutates the warehouse (#2290): a snapshot (its history
+/// table), a load (its target) and a quality pipeline with row quarantine on
+/// (the `__valid` / `__quarantine` tables beside the checked tables).
+///
+/// Returns `None` for replication, transformation and any pipeline that does
+/// not resolve: those keep the model path (and stay strict on a failure).
+/// Otherwise returns the table names the gate must name, plus the meaning of
+/// an empty set. The names are catalog-qualified; a quality table list with no
+/// `table` names its schema. A quality pipeline with quarantine on but no
+/// listed tables has an unknown write set, so it is [`EmptyTouched::Refuse`].
+/// A quality pipeline without quarantine only reads (its run record is state,
+/// not a warehouse write), so its empty set is a genuine [`EmptyTouched::NoOp`].
+fn modelless_pipeline_writes(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name: Option<&str>,
+) -> Option<(BTreeSet<String>, EmptyTouched)> {
+    use rocky_core::config::PipelineConfig;
+    let (_, pipeline) = crate::registry::resolve_pipeline(cfg, pipeline_name).ok()?;
+    match pipeline {
+        PipelineConfig::Snapshot(s) => Some((
+            BTreeSet::from([format!(
+                "{}.{}.{}",
+                s.target.catalog, s.target.schema, s.target.table
+            )]),
+            EmptyTouched::Refuse,
+        )),
+        PipelineConfig::Load(l) => Some((
+            BTreeSet::from([match &l.target.table {
+                Some(table) => format!("{}.{}.{table}", l.target.catalog, l.target.schema),
+                None => format!("{}.{}", l.target.catalog, l.target.schema),
+            }]),
+            EmptyTouched::Refuse,
+        )),
+        PipelineConfig::Quality(q) => {
+            if !q.checks.quarantine.as_ref().is_some_and(|c| c.enabled) {
+                return Some((BTreeSet::new(), EmptyTouched::NoOp));
+            }
+            let tables = q
+                .tables
+                .iter()
+                .map(|t| match &t.table {
+                    Some(table) => format!("{}.{}.{table}", t.catalog, t.schema),
+                    None => format!("{}.{}", t.catalog, t.schema),
+                })
+                .collect();
+            Some((tables, EmptyTouched::Refuse))
+        }
+        PipelineConfig::Replication(_) | PipelineConfig::Transformation(_) => None,
+    }
+}
+
+/// Fold [`modelless_pipeline_writes`] into a gate's inputs. Returns the
+/// `touched` set (each write named under the bare `apply` verb; no model
+/// compile, since such a pipeline's run arm never executes a model) and the
+/// meaning of an empty set.
+fn modelless_gate_inputs(
+    cfg: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+    plan: &PersistedPlan,
+) -> Option<(BTreeMap<String, PolicyCapability>, EmptyTouched)> {
+    let (writes, empty_touched) = modelless_pipeline_writes(cfg, run_plan.pipeline.as_deref())?;
+    let mut touched = touched_models_for_run(plan, &[]);
+    for table in &writes {
+        touched
+            .entry(table.clone())
+            .or_insert(PolicyCapability::Apply);
+    }
+    Some((touched, empty_touched))
 }
 
 /// A governed `Run` plan that, at apply, executes NO compiled models — a
@@ -4353,16 +4444,36 @@ async fn run_apply_ai_authored_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
-        (Vec::new(), EmptyTouched::NoOp)
+    //
+    // #2290: a snapshot, load or quality pipeline runs no models but may still
+    // write; its writes are named in `touched` and the compile is skipped.
+    let no_compiled_models = BTreeSet::new();
+    let (touched, empty_touched, modelless) = if let Some((touched, empty_touched)) =
+        modelless_gate_inputs(&loaded.config, &run_plan, &plan)
+    {
+        (touched, empty_touched, true)
     } else {
-        match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
-            Some(models) => (models, EmptyTouched::NoOp),
-            // The compile failed, so the executed set is unknown: refuse.
-            None => (Vec::new(), EmptyTouched::Refuse),
-        }
+        let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+            (Vec::new(), EmptyTouched::NoOp)
+        } else {
+            match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+                Some(models) => (models, EmptyTouched::NoOp),
+                // The compile failed, so the executed set is unknown: refuse.
+                None => (Vec::new(), EmptyTouched::Refuse),
+            }
+        };
+        (
+            touched_models_for_run(&plan, &executable),
+            empty_touched,
+            false,
+        )
     };
-    let touched = touched_models_for_run(&plan, &executable);
+    // The write keys of a model-less pipeline are tables, not compiled models.
+    let subjects = if modelless {
+        GateSubjects::Resolved(&no_compiled_models)
+    } else {
+        GateSubjects::CompiledModels
+    };
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
@@ -4382,7 +4493,7 @@ async fn run_apply_ai_authored_plan(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
-        GateSubjects::CompiledModels,
+        subjects,
     );
     // #1459: human review is a FLOOR for an AI-authored plan, not a
     // policy-dependent extra. This used to run only under
@@ -12706,6 +12817,173 @@ schema_template = "s__{source}"
             msg.contains("verify_after gate FAILED") && msg.contains("row_count"),
             "duplicate-name AND-aggregation must surface the failure: {msg}"
         );
+    }
+
+    /// #2290: a model-less pipeline that still WRITES (snapshot target, load
+    /// target, quality quarantine tables) used to give an empty `touched` set
+    /// gated as `NoOp`, so a `deny agent apply` rule was skipped. The write
+    /// must be named in the gate; the deny must fire before any warehouse
+    /// statement. A read-only quality pipeline stays a no-op.
+    #[tokio::test]
+    async fn modelless_writing_pipeline_is_denied_by_a_deny_rule() -> anyhow::Result<()> {
+        let cases: [(&str, &str, bool, &str); 4] = [
+            (
+                "snapshot",
+                r#"
+[pipeline.p]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.p.source]
+catalog = "c"
+schema = "s"
+table = "src"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "h"
+table = "hist"
+"#,
+                true,
+                "c.h.hist",
+            ),
+            (
+                "load",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+"#,
+                true,
+                "c.raw",
+            ),
+            (
+                "quality with quarantine",
+                r#"
+[pipeline.p]
+type = "quality"
+
+[pipeline.p.target]
+
+[[pipeline.p.tables]]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.p.checks]
+enabled = true
+
+[pipeline.p.checks.quarantine]
+enabled = true
+"#,
+                true,
+                "c.s.t",
+            ),
+            (
+                "quality read-only",
+                r#"
+[pipeline.p]
+type = "quality"
+
+[pipeline.p.target]
+
+[[pipeline.p.tables]]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.p.checks]
+enabled = true
+"#,
+                false,
+                "c.s.t",
+            ),
+        ];
+        for (label, pipeline, writes, key, kind) in cases.into_iter().flat_map(|(l, p, w, k)| {
+            [PlanKind::AiAuthored, PlanKind::Run]
+                .into_iter()
+                .map(move |kind| (l, p, w, k, kind))
+        }) {
+            let dir = tempfile::tempdir()?;
+            let config = dir.path().join("rocky.toml");
+            // The rule names only the table the pipeline writes. An unrelated
+            // compiled model sits in the models dir and is allowed, so the
+            // deny can fire only if the write itself is named in the gate.
+            let policy = format!(
+                "\n[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n\n\
+                 [[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                 scope = {{ models = [\"{key}\"] }}\neffect = \"deny\"\n"
+            );
+            std::fs::write(
+                &config,
+                format!("[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n{pipeline}{policy}"),
+            )?;
+            let mut rp = minimal_run_plan();
+            rp.pipeline = Some("p".to_string());
+            rp.models = Vec::new();
+            rp.execution_layers = Vec::new();
+            // A models dir with one unrelated model, as in a project that
+            // mixes a snapshot pipeline with transformation models.
+            let models = dir.path().join("models");
+            write_min_model(&models, "other");
+            rp.models_dir = Some(models.to_string_lossy().into_owned());
+            let plan_id = crate::plan_store::write_plan_governed(
+                dir.path(),
+                kind.clone(),
+                &rp,
+                PolicyPrincipal::Agent,
+                crate::plan_store::EmbeddedCapabilities {
+                    models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                    config_identity: Some("reviewed-config".to_string()),
+                    fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+                    reviewed_source_schemas: Some(BTreeMap::new()),
+                    ..Default::default()
+                },
+            )?;
+            super::super::review::write_test_review_marker(dir.path(), &plan_id);
+            let state = dir.path().join("state.redb");
+            let actor = rocky_core::config::PrincipalRef::unnamed();
+            let result = if kind == PlanKind::Run {
+                super::run_apply_run_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    &actor,
+                    true,
+                )
+                .await
+            } else {
+                super::run_apply_ai_authored_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    &actor,
+                    true,
+                )
+                .await
+            };
+            let msg = result.as_ref().err().map(|e| format!("{e:#}"));
+            if writes {
+                let msg = msg.unwrap_or_default();
+                assert!(msg.contains("policy DENIES"), "{label} ({kind:?}): {msg}");
+            } else {
+                let msg = msg.unwrap_or_default();
+                assert!(
+                    !msg.contains("policy DENIES"),
+                    "{label} ({kind:?}): a read-only quality run writes nothing, so no deny applies: {msg}"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
