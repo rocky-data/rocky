@@ -108,9 +108,10 @@ kill_grace_seconds = 15
 TOML
 
 # claude spawns `rocky mcp --profile worker` itself (the driver spawns only the
-# leader). --strict-mcp-config ignores the user's other MCP servers.
+# leader). --strict-mcp-config ignores the user's other MCP servers. The worker
+# gets the loop's --state-path, so its decisions land in the store custody reads.
 cat > "$WORK/mcp-worker.json" <<JSON
-{ "mcpServers": { "rocky": { "command": "$ROCKY_ABS", "args": ["mcp", "--profile", "worker"] } } }
+{ "mcpServers": { "rocky": { "command": "$ROCKY_ABS", "args": ["--state-path", ".rocky/state.redb", "mcp", "--profile", "worker"] } } }
 JSON
 
 cd "$WORK"

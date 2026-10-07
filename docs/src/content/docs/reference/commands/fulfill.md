@@ -148,7 +148,7 @@ Pass the same `--state-path` to every `rocky fulfill`, `rocky fulfill approve-sp
 
 `.rocky/state.redb` is only safe if the worker cannot write `.rocky/`. Pick a path that fits how you deploy.
 
-The worker's own `rocky mcp --profile worker` does not take `--state-path`. Its `draft_model` gate opens the default store read-write to record policy decisions, so a worker run can create `models/.rocky-state.redb`. That store is not the one the gates read. The loop does not read it, and the next `rocky fulfill` without `--state-path` still refuses it.
+The worker's own `rocky mcp --profile worker` records its `draft_model` policy decisions in a state store, so give it the same `--state-path` too. With `type = "replay"` the loop does this for you: it starts the worker as `rocky --state-path <store> mcp --profile worker`. With `type = "subprocess"` your agent starts the MCP server from its own configuration, so add the flag there, before `mcp`: `"args": ["--state-path", ".rocky/state.redb", "mcp", "--profile", "worker"]`. Without it the worker records into the default `models/.rocky-state.redb`, and those decisions are missing from the custody chain and the brief.
 
 A worker that can also write anything in the closed list above is the hostile-local-process case, and nothing here defends against it. If your worker and your runner share a user, treat that as the concession it is.
 

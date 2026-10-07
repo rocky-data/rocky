@@ -109,6 +109,10 @@ pub struct TaskBrief {
     /// Where the transcript file goes
     /// (`.rocky/fulfillment/<name>/transcripts/`).
     pub transcript_dir: PathBuf,
+    /// The loop's state store. The replay driver passes it to the worker's
+    /// `rocky mcp` as `--state-path`, so the worker's decision rows land in
+    /// the store the loop and its custody chain read (#2278).
+    pub state_path: PathBuf,
     /// The task outbox (`.rocky/fulfillment/<name>/outbox/`), cleared by
     /// the driver before dispatch. The elicitation contract: the worker
     /// writes [`OUTBOX_CANDIDATE`] (+ optionally [`OUTBOX_QUESTIONS`])
@@ -827,12 +831,32 @@ impl ReplayDriver {
     }
 }
 
+/// Insert `--state-path <state_path>` after the program, so the worker's
+/// `rocky mcp` records into the loop's store instead of the default
+/// `<models>/.rocky-state.redb` (#2278). The flag is top-level, so it must
+/// precede the `mcp` subcommand. An argv that already names a store is
+/// left as recorded.
+fn with_worker_state_path(mut argv: Vec<String>, state_path: &Path) -> Vec<String> {
+    let names_a_store = argv
+        .iter()
+        .any(|a| a == "--state-path" || a.starts_with("--state-path="));
+    if !names_a_store && !argv.is_empty() {
+        argv.splice(
+            1..1,
+            ["--state-path".to_string(), state_path.display().to_string()],
+        );
+    }
+    argv
+}
+
 /// The session file shape (`[fulfill.driver] type = "replay"`).
 #[derive(Debug, serde::Deserialize)]
 struct ReplaySession {
     /// Overrides the MCP server command (defaults to
     /// `current_exe mcp --profile worker`). Recorded sessions in tests
-    /// point this at the built binary.
+    /// point this at the built binary. It must be a `rocky` invocation: the
+    /// driver inserts `--state-path <loop store>` after `argv[0]` unless the
+    /// recorded argv already carries `--state-path`.
     #[serde(default)]
     mcp_command: Option<Vec<String>>,
     /// Per-task recorded calls, keyed `elicitation` / `drafting` /
@@ -928,6 +952,7 @@ impl AgentDriver for ReplayDriver {
                 ]
             }
         };
+        let argv = with_worker_state_path(argv, &brief.state_path);
 
         let (mut transcript, transcript_path) = create_transcript(brief)?;
         let stderr_file = transcript
@@ -1162,6 +1187,7 @@ mod supervision_tests {
             product: "battery".to_string(),
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
+            state_path: dir.join("state.redb"),
             outbox_dir: dir.join("outbox"),
         }
     }
@@ -1749,6 +1775,7 @@ mod windows_tests {
             product: "p".into(),
             project_root: dir.clone(),
             transcript_dir: dir.join("t"),
+            state_path: dir.join("s.redb"),
             outbox_dir: dir.join("o"),
         };
         let mut on_group = |_group: GroupStamp| Ok(());
@@ -1768,6 +1795,7 @@ mod escape_scope_tests {
             product: "battery".to_string(),
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
+            state_path: dir.join("state.redb"),
             outbox_dir: dir.join("outbox"),
         }
     }
@@ -2094,5 +2122,45 @@ mod escape_scope_tests {
              residual); if the driver can now reach it, the containment story \
              improved — update the docs and this pin deliberately"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_state_path_tests {
+    use super::with_worker_state_path;
+    use std::path::Path;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn the_loop_store_precedes_the_mcp_subcommand() {
+        let out = with_worker_state_path(
+            argv(&["rocky", "mcp", "--profile", "worker"]),
+            Path::new("/p/.rocky/state.redb"),
+        );
+        assert_eq!(
+            out,
+            argv(&[
+                "rocky",
+                "--state-path",
+                "/p/.rocky/state.redb",
+                "mcp",
+                "--profile",
+                "worker"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_recorded_store_is_left_as_recorded() {
+        for recorded in [
+            argv(&["rocky", "--state-path", "x.redb", "mcp"]),
+            argv(&["rocky", "--state-path=x.redb", "mcp"]),
+        ] {
+            let out = with_worker_state_path(recorded.clone(), Path::new("/p/state.redb"));
+            assert_eq!(out, recorded);
+        }
     }
 }

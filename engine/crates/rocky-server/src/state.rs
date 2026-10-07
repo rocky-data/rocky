@@ -311,6 +311,24 @@ pub struct ConfigLabels {
 }
 
 impl ServerState {
+    /// The state store this server reads and writes: the explicit
+    /// `--state-path` when one was given, else the conventional path derived
+    /// from `models_dir`. Every state-backed surface goes through this one
+    /// resolver, so the routes and the resident compile's schema cache cannot
+    /// read two different files (#2279).
+    pub fn resolved_state_path(&self) -> PathBuf {
+        match &self.state_path {
+            Some(explicit) => explicit.clone(),
+            None => {
+                let resolved = rocky_core::state::resolve_state_path(None, &self.models_dir);
+                if let Some(ref w) = resolved.warning {
+                    debug!(target: "rocky::state_path", "{w}");
+                }
+                resolved.path
+            }
+        }
+    }
+
     /// How long the samples route waits before answering `504 sample_timeout`.
     pub fn sample_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
@@ -666,11 +684,11 @@ impl ServerState {
     }
 
     /// Load the schema-cache-backed `source_schemas` map for this
-    /// server's project. Gated on `[cache.schemas] enabled`; resolves the
-    /// state file via [`rocky_core::state::resolve_state_path`] so the
-    /// server observes exactly the same file that `rocky run` writes to
-    /// (unified default — `<models>/.rocky-state.redb` — with the legacy
-    /// CWD fallback for existing projects).
+    /// server's project. Gated on `[cache.schemas] enabled`; reads the
+    /// store from [`Self::resolved_state_path`], so an explicit
+    /// `--state-path` wins, and without one the server observes the same
+    /// file that `rocky run` writes to (unified default —
+    /// `<models>/.rocky-state.redb` — with the legacy CWD fallback).
     ///
     /// `schema_cache_config` comes from the caller's single `rocky.toml`
     /// snapshot rather than a second read of the file. This used to load the
@@ -686,11 +704,7 @@ impl ServerState {
             return HashMap::new();
         }
 
-        let resolved = rocky_core::state::resolve_state_path(None, &self.models_dir);
-        if let Some(ref w) = resolved.warning {
-            debug!(target: "rocky::state_path", "{w}");
-        }
-        let state_path = resolved.path;
+        let state_path = self.resolved_state_path();
         if !state_path.exists() {
             return HashMap::new();
         }
@@ -1181,6 +1195,57 @@ mod tests {
             w004_count(result),
             1,
             "an unmasked, unallowed classification tag must raise W004"
+        );
+    }
+
+    /// #2279: with an explicit `--state-path`, the resident compile reads its
+    /// cached source schemas from that store, not from the default
+    /// `<models>/.rocky-state.redb`.
+    #[tokio::test]
+    async fn the_schema_cache_reads_the_explicit_state_path() {
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+
+        let (dir, models_dir, config_path) = pii_project("[adapter]\ntype = \"duckdb\"\n");
+        let explicit = dir.path().join(".rocky").join("state.redb");
+        std::fs::create_dir_all(explicit.parent().unwrap()).unwrap();
+        {
+            let store = StateStore::open(&explicit).unwrap();
+            store
+                .write_schema_cache_entry(
+                    &schema_cache_key("cat", "staging", "orders"),
+                    &SchemaCacheEntry {
+                        columns: vec![StoredColumn {
+                            name: "id".into(),
+                            data_type: "BIGINT".into(),
+                            nullable: false,
+                        }],
+                        cached_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let state = ServerState::with_auth(
+            models_dir.clone(),
+            None,
+            Some(config_path),
+            None,
+            Vec::new(),
+            Some(explicit.clone()),
+        );
+        assert_eq!(state.resolved_state_path(), explicit);
+        let map = state
+            .load_cached_source_schemas(rocky_core::config::SchemaCacheConfig::default())
+            .await;
+        assert!(
+            !map.is_empty(),
+            "the cache loader ignored --state-path {} and read the default store",
+            explicit.display()
+        );
+        assert!(
+            !models_dir.join(".rocky-state.redb").exists(),
+            "nothing should create the default store when --state-path is set"
         );
     }
 }

@@ -72,6 +72,7 @@ pub async fn serve_stdio(
     config_path: std::path::PathBuf,
     profile: McpProfile,
     actor: rocky_core::config::PrincipalRef,
+    state_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let server = RockyMcpServer::try_new_with_profile(config_path, profile).map_err(|drift| {
         anyhow::anyhow!(
@@ -80,7 +81,7 @@ pub async fn serve_stdio(
              unprojected text would hand a worker the default workflow."
         )
     })?;
-    let server = server.with_actor(actor);
+    let server = server.with_actor(actor).with_state_path(state_path);
     tracing::info!(?profile, actor = %server.actor().id, "starting rocky MCP server over stdio");
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("rocky MCP serve error: {e:?}");

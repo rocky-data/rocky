@@ -1655,6 +1655,8 @@ impl Runner {
             product: self.product.clone(),
             project_root: self.root.clone(),
             transcript_dir: dir.join("transcripts"),
+            // Absolute, so the worker resolves it the same way whatever its cwd.
+            state_path: self.root.join(&self.state_path),
             outbox_dir: dir.join("outbox"),
         };
         let outcome = self.dispatch(record, &*driver, &brief).await;
@@ -1823,6 +1825,8 @@ impl Runner {
             product: self.product.clone(),
             project_root: self.root.clone(),
             transcript_dir: dir.join("transcripts"),
+            // Absolute, so the worker resolves it the same way whatever its cwd.
+            state_path: self.root.join(&self.state_path),
             outbox_dir: dir.join("outbox"),
         };
         Ok(match self.dispatch(record, &*driver, &brief).await {
