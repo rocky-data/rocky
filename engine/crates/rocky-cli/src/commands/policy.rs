@@ -1072,6 +1072,7 @@ pub fn run_policy_freeze(
         }
         let record = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: now,
             plan_id: plan_id.clone(),
@@ -1916,6 +1917,7 @@ max_retries = 0
         let harness = CrossPodHarness::new_s3_like();
         let winner = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: "existing-run-winner".to_string(),

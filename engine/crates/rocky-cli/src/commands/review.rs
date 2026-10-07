@@ -1315,17 +1315,20 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
-    // A `deny` row is left out of the latest-row pick, so it neither queues
-    // nor supersedes. It cannot supersede: the fail-closed path records a
-    // `deny` when the ledger snapshot could not be read — an operational
-    // refusal, not a policy decision about the plan — and the row cannot say
-    // which kind it is. Letting it supersede hid an escalation the policy
-    // still required until someone retried the mutation (#1815, review round
-    // three). A superseded-by-deny escalation stays approvable, which is what
-    // it was before; approval then meets the deny at apply, loudly.
+    // A policy `deny` supersedes an older `require_review`: policy tightened
+    // and the plan re-ran, so approving the old escalation is moot (#1829).
+    // Two kinds of `deny` row are left out of the pick, so they neither queue
+    // nor supersede:
+    //   - a fail-closed deny (`fail_closed`): the gate could not read the
+    //     ledger snapshot, which says nothing about the plan. Letting it
+    //     supersede hid an escalation the policy still required until someone
+    //     retried the mutation (#1815, review round three);
+    //   - a deny that is not an evaluation (freeze or verify-after custody):
+    //     its `deny` is an administrative or verification verdict.
+    // A row written before `fail_closed` existed reads as a policy deny.
     for d in decisions
         .into_iter()
-        .filter(|d| d.effect != PolicyEffect::Deny)
+        .filter(|d| d.effect != PolicyEffect::Deny || (d.is_evaluation() && !d.fail_closed))
     {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
@@ -1339,9 +1342,9 @@ pub(crate) fn select_outstanding<'a>(
     let mut excluded_non_plan: u64 = 0;
     let outstanding = latest
         .into_values()
-        // The LATEST of `require_review` and `allow` per key decides. A
-        // `require_review` that a later `allow` for the same (plan, model)
-        // superseded is history: policy loosened, the plan re-ran, approving
+        // The LATEST of `require_review`, `allow` and a policy `deny` per key
+        // decides. A `require_review` that a later `allow` or policy `deny`
+        // for the same (plan, model) superseded is history: policy loosened, the plan re-ran, approving
         // it is moot. Filtering to `require_review` BEFORE picking the
         // latest kept such rows approvable (#1815, review round two).
         .filter(|d| d.effect == PolicyEffect::RequireReview)
@@ -1435,6 +1438,7 @@ pub(crate) fn record_plan_review_escalation(
     let record = PolicyDecisionRecord {
         // The plan-level writer names its set on purpose.
         keys_recorded: true,
+        fail_closed: false,
         models,
         timestamp: Utc::now(),
         plan_id: plan_id.to_string(),
@@ -2611,6 +2615,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -2752,16 +2757,15 @@ mod tests {
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
     }
 
-    /// The latest of `require_review` and `allow` per (plan, model) decides.
-    /// A `require_review` followed by an `allow` (policy loosened, plan
-    /// re-run) is moot and used to stay in the queue, because the effect
-    /// filter ran before the latest-row pick. A later `deny` does NOT
-    /// supersede: a deny may be the fail-closed refusal of an unreadable
-    /// ledger, which says nothing about the plan, and the row cannot tell
-    /// the two apart — so the escalation stays, as it always did. The
-    /// reverse orders queue: the newest row is the escalation.
+    /// The latest of `require_review`, `allow` and a policy `deny` per
+    /// (plan, model) decides. A later `allow` or policy `deny` supersedes an
+    /// older `require_review`. A later fail-closed `deny` (ledger unreadable)
+    /// does NOT: it says nothing about the plan, so the escalation stays.
+    /// The reverse orders queue: the newest row is the escalation.
     #[test]
-    fn a_later_allow_supersedes_an_older_require_review_but_a_deny_does_not() {
+    fn a_later_allow_or_policy_deny_supersedes_but_a_fail_closed_deny_does_not() {
+        let mut fail_closed_deny = qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply);
+        fail_closed_deny.fail_closed = true;
         let decisions = vec![
             qd(
                 1,
@@ -2784,7 +2788,7 @@ mod tests {
                 PolicyEffect::RequireReview,
                 PolicyCapability::Apply,
             ),
-            qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply),
+            fail_closed_deny,
             qd(
                 1,
                 "planC",
@@ -2807,6 +2811,15 @@ mod tests {
                 PolicyEffect::RequireReview,
                 PolicyCapability::Apply,
             ),
+            // A policy deny after the escalation supersedes it.
+            qd(
+                1,
+                "planE",
+                "v",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(5, "planE", "v", PolicyEffect::Deny, PolicyCapability::Apply),
         ];
         let (out, excluded) = select_outstanding(&decisions, |_| false, |_| true);
         assert_eq!(excluded, 0);
@@ -2815,7 +2828,7 @@ mod tests {
         assert_eq!(
             plans,
             vec!["planB", "planC", "planD"],
-            "an allow supersedes; a deny does not; new escalations queue"
+            "an allow or policy deny supersedes; a fail-closed deny does not; new escalations queue"
         );
     }
 

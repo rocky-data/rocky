@@ -1606,6 +1606,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -1869,6 +1870,7 @@ mod tests {
         let label = "backfill: 2 model(s)";
         let plan_level = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             timestamp: Utc::now(),
             plan_id: "planBF".to_string(),
@@ -1924,6 +1926,7 @@ mod tests {
 
         let decisions = vec![PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "planA".to_string(),
@@ -1966,6 +1969,7 @@ mod tests {
 
         let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: models.into_iter().map(str::to_string).collect(),
             timestamp: Utc.with_ymd_and_hms(2026, 9, 8, 0, 0, 1).unwrap(),
             plan_id: plan_id.to_string(),
@@ -2357,6 +2361,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -2791,6 +2796,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),

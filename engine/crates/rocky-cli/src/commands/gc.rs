@@ -4651,6 +4651,7 @@ auto_create_schemas = true
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
@@ -4789,6 +4790,7 @@ auto_create_schemas = true
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
                                 keys_recorded: false,
+                                fail_closed: false,
                                 models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),

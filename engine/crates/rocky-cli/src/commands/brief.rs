@@ -1772,6 +1772,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: ts(h),
             plan_id: format!("plan-{model}-{h}"),

@@ -2631,11 +2631,16 @@ pub(crate) fn evaluate_apply_policy_core(
             reason.push_str("; ");
             reason.push_str(&suffix);
         }
+        // Set only where the floor itself turns a non-deny into a deny. A
+        // policy `deny` that happens to meet an unreadable ledger stays a
+        // policy verdict.
+        let mut fail_closed = false;
         if snapshot_unreadable
             && principal == PolicyPrincipal::Agent
             && effect != PolicyEffect::Deny
         {
             effect = PolicyEffect::Deny;
+            fail_closed = true;
             reason.push_str(
                 "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
                  refused (fail-closed deny; a review marker cannot satisfy it)",
@@ -2646,6 +2651,7 @@ pub(crate) fn evaluate_apply_policy_core(
             // The gate decided this set on purpose: an empty one says "no
             // compiled model here", and the queue must not re-resolve it.
             keys_recorded: true,
+            fail_closed,
             models: if compiled_model {
                 vec![model.clone()]
             } else {
@@ -4241,6 +4247,7 @@ fn evaluate_verify_after(
     });
     let record = PolicyDecisionRecord {
         keys_recorded: false,
+        fail_closed: false,
         models: Vec::new(),
         timestamp: chrono::Utc::now(),
         plan_id: plan_id.to_string(),
@@ -7448,6 +7455,7 @@ auto_create_schemas = true
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: now,
             plan_id: format!(
@@ -7601,6 +7609,7 @@ default_agent_effect = "require_review"
         // The custody seam downloads first and fails closed on the remote error.
         let record = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: "plan-x".to_string(),
@@ -8844,6 +8853,50 @@ effect = "allow"
             "an unreadable ledger must HARD-REFUSE an agent mutation (deny, not require_review), \
              got {gate:?}"
         );
+        Ok(())
+    }
+
+    /// #1829(3): the writer says which kind of `deny` it wrote. The fail-closed
+    /// floor turning an `allow` into a `deny` sets `fail_closed`; a policy
+    /// `deny` does not, even when the ledger is also unreadable.
+    #[test]
+    fn fail_closed_is_set_by_the_floor_and_not_by_a_policy_deny() -> anyhow::Result<()> {
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let run = |effect: &str| -> anyhow::Result<PolicyDecisionRecord> {
+            let dir = tempfile::tempdir()?;
+            let config = write_config(
+                dir.path(),
+                &format!(
+                    "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                     scope = {{ any = true }}\neffect = \"{effect}\"\n"
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&config)?
+                .policy
+                .expect("policy block");
+            let mut rows = Vec::new();
+            super::evaluate_apply_policy_core(
+                &policy,
+                "plan_x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                &BTreeMap::new(),
+                super::GateSubjects::CompiledModels,
+                &[],
+                &[],
+                true,
+                |r| rows.push(r.clone()),
+            );
+            assert_eq!(rows.len(), 1);
+            Ok(rows.remove(0))
+        };
+        let floor = run("allow")?;
+        assert_eq!(floor.effect, PolicyEffect::Deny);
+        assert!(floor.fail_closed, "the floor's deny is operational");
+        let policy_deny = run("deny")?;
+        assert_eq!(policy_deny.effect, PolicyEffect::Deny);
+        assert!(!policy_deny.fail_closed, "a policy deny is a verdict");
         Ok(())
     }
 
@@ -12717,6 +12770,7 @@ autonomy_budget = { failures = 1, window = "7d" }
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: plan_id.to_string(),

@@ -5163,6 +5163,7 @@ mod tests {
         store
             .record_policy_decision(&PolicyDecisionRecord {
                 keys_recorded: false,
+                fail_closed: false,
                 models: Vec::new(),
                 timestamp: now - chrono::Duration::minutes(30),
                 plan_id: "freeze:global".to_string(),
@@ -5494,6 +5495,7 @@ mod tests {
             .unwrap()
             .record_policy_decision(&PolicyDecisionRecord {
                 keys_recorded: false,
+                fail_closed: false,
                 models: Vec::new(),
                 timestamp: chrono::Utc::now() - chrono::Duration::minutes(5),
                 plan_id: "plan-revenue-daily".to_string(),
@@ -5591,6 +5593,7 @@ mod tests {
         let (root, config, state_path, _) = governor_fixture(dir.path());
         let row = |plan: &str, day: u32, month: u32, who: Option<&str>| PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::Utc
                 .with_ymd_and_hms(2026, month, day, 9, 0, 0)
