@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **State schema v32: environments and an append-only publish history (state only, preview; RV1-P2).** Two new replicated tables, `environments` and `publish_history`. The `rocky-core` API `state_sync::publish_pointers` moves named environment pointers (model to recorded output version) in one transaction that checks the expected head, and refuses a moved head with a typed `PublishConflict`. Over remote state with compare-and-swap, the transaction replays on a fresh download: a blob moved by a run finalize replays and succeeds, and a head moved by another publish is a conflict. A publish refuses a model with no recorded `output_version` or an `unversioned` one. It also refuses a run that did not write production (shadow, branch, or no recorded scope), a run whose status is not `Success` or `PartialFailure`, a run that failed its check gate or `verify_after` gate, and a model whose own execution did not succeed. Partitioned (`time_interval`) and replicated outputs record more than one execution per model name and are refused for now; combining partition versions is an RV1-P3 decision. Over a remote store, a publish needs effective compare-and-swap: with `concurrency_control = "off"` it is refused with `PublishRequiresCas`, because a lost publish would be silent. A pointer whose version a newer binary wrote in an unknown form still reads, and keeps the raw value. Read API: `get_environment`, `list_environments`, `publish_history`. No CLI verb and no output change. Pointers do not pin data yet: `rocky gc`, run retention and Delta `VACUUM` can remove a version an environment points to. **Upgrade:** a v31 store opened for writing is stamped v32 in place and keeps every record; remote state carries forward from the `v31/` key, and the first upload creates `v32/`. A read-only open of a store stamped below v32 reads the new tables as empty. **Rollback:** a v31 engine refuses a v32 store at open (`on_schema_mismatch = "fail"`), or starts a fresh local store and never uploads it (`"recreate"`, the default for `rocky run`); it keeps using the `v31/` remote key, so it does not see environments published by v32.
+
 ## [1.77.0] — 2026-10-07
 
 This release carries 30 breaking changes, each marked **Breaking:** below. Read three first:

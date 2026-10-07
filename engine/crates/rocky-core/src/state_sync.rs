@@ -82,6 +82,22 @@ pub enum StateSyncError {
     CasConflict { key: String },
 
     #[error(
+        "publish conflict on environment {env:?}: expected head {}, found {}; another publish \
+         moved it. Re-read the environment and publish again",
+        .expected.as_deref().unwrap_or("<none: create>"),
+        .found.as_deref().unwrap_or("<none>")
+    )]
+    /// A [`publish_pointers`] attempt found a different environment head than
+    /// the caller expected — on the first attempt or on a replay after a CAS
+    /// conflict. A semantic refusal: the seam aborts without uploading and
+    /// puts the remote winner back locally. Retrying cannot change it.
+    PublishConflict {
+        env: String,
+        expected: Option<String>,
+        found: Option<String>,
+    },
+
+    #[error(
         "ledger-seam compare-and-swap conflict on shared state blob '{key}' after {attempts} \
          attempts: concurrent writers kept advancing it; preserving the remote winner \
          (fail-closed)"
@@ -108,6 +124,18 @@ pub enum StateSyncError {
     /// An unconditional upload found the `cas-required` marker beside the
     /// state object.
     CasRequired { marker: String },
+
+    #[error(
+        "refusing to publish environment pointers through the '{backend}' state store: it does \
+         not use compare-and-swap here, so two concurrent publishes could both report success \
+         and one would be lost without an error. Fix: set [state] concurrency_control = \"cas\" \
+         on a store that honours conditional writes (s3, gcs, or tiered), or publish against a \
+         local state store"
+    )]
+    /// [`publish_pointers`] on a remote backend whose effective
+    /// concurrency control is `off`. A lost publish is silent there, so it is
+    /// refused before any download.
+    PublishRequiresCas { backend: String },
 }
 
 /// State file name within the configured prefix.
@@ -5048,11 +5076,104 @@ fn is_transient(err: &StateSyncError) -> bool {
         // A seam-transition failure is a domain refusal from the caller's
         // closure, not a transport fault — retrying cannot change it.
         | StateSyncError::SeamTransition(_)
+        // A publish conflict is a semantic refusal: the head moved.
+        | StateSyncError::PublishConflict { .. }
         // Configuration refusals: retrying cannot change the store or the
         // marker.
         | StateSyncError::CasUnsupported { .. }
-        | StateSyncError::CasRequired { .. } => false,
+        | StateSyncError::CasRequired { .. }
+        | StateSyncError::PublishRequiresCas { .. } => false,
     }
+}
+
+/// Hook run inside each [`publish_pointers`] attempt, after the local
+/// transaction and before the conditional upload. Test seam only.
+type PublishAttemptHook =
+    Arc<dyn Fn(u32) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Map a local publish error to the seam's error type. A head conflict
+/// becomes the typed [`StateSyncError::PublishConflict`], so it travels the
+/// seam's failure path (restore the remote winner, no upload) as itself.
+fn publish_error(e: crate::state::StateError) -> StateSyncError {
+    match e {
+        crate::state::StateError::PublishConflict {
+            env,
+            expected,
+            found,
+        } => StateSyncError::PublishConflict {
+            env,
+            expected,
+            found,
+        },
+        other => StateSyncError::State(other),
+    }
+}
+
+/// Publish environment pointers against the shared state (RV1-P2).
+///
+/// Runs [`StateStore::publish_pointers`] as one [`LedgerSeamSession`]
+/// transition: download the blob with its generation, run the local
+/// transaction, upload with compare-and-swap. When the blob moved, the WHOLE
+/// transaction replays on the winner (up to three attempts):
+///
+/// ```text
+///   blob moved by an unrelated run finalize ──▶ replay, same head ──▶ Ok
+///   blob moved by another publish           ──▶ replay, new head  ──▶ PublishConflict
+/// ```
+///
+/// On the Local backend it is one local transaction, no remote I/O; the
+/// local writer lock serializes publishes. On a remote backend the effective
+/// concurrency control must be `cas`: under `off` the seam is one download and
+/// one unconditional upload, so two concurrent publishes could both succeed
+/// and one would be lost silently. That case is refused up front.
+///
+/// # Errors
+///
+/// [`StateSyncError::PublishRequiresCas`] on a remote backend without
+/// effective CAS (nothing is downloaded or uploaded);
+/// [`StateSyncError::PublishConflict`] when the head is not the expected
+/// one; [`StateSyncError::State`] wrapping
+/// [`crate::state::StateError::Environment`] for a refused request; plus
+/// every seam error ([`StateSyncError::LedgerSeamConflict`], transport).
+pub async fn publish_pointers(
+    session: &LedgerSeamSession,
+    request: &crate::environments::PublishRequest,
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    if !matches!(session.cfg.backend, StateBackend::Local) {
+        // The same resolution `execute` performs: the backend default for an
+        // unset mode, confirmed by the startup probe.
+        let cfg = resolved_state_config(&session.cfg).await?;
+        if !cas_effective(&cfg) {
+            return Err(StateSyncError::PublishRequiresCas {
+                backend: cfg.backend.to_string(),
+            });
+        }
+    }
+    publish_pointers_with_hook(session, request, None).await
+}
+
+/// The publish transition WITHOUT the CAS guard. Tests use it to show what
+/// the guard prevents.
+async fn publish_pointers_with_hook(
+    session: &LedgerSeamSession,
+    request: &crate::environments::PublishRequest,
+    hook: Option<PublishAttemptHook>,
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    let attempt_number = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    session
+        .execute(move |store, _base| {
+            let request = request.clone();
+            let hook = hook.clone();
+            let n = attempt_number.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                let result = store.publish_pointers(&request);
+                if let Some(hook) = hook {
+                    hook(n).await;
+                }
+                result.map_err(publish_error)
+            })
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -9840,5 +9961,575 @@ mod tests {
             "{key}"
         );
         assert_ne!(cas_probe_key(), key);
+    }
+}
+
+/// RV1-P2: environment publishes through the ledger seam — the cross-pod
+/// race, the lost-update negative control, a run finalize racing a publish,
+/// and the carry-forward across the v31 -> v32 bump.
+#[cfg(test)]
+mod environment_publish_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::PrincipalRef;
+    use crate::environments::{
+        EnvironmentName, EnvironmentRecord, PublishRecord, PublishRequest, PublishSource,
+    };
+    use crate::state::{OutputVersion, run_with_output_versions};
+    use crate::test_harness::CrossPodHarness;
+
+    fn delta(v: u64) -> Option<OutputVersion> {
+        Some(OutputVersion::DeltaObserved {
+            table: "c.s.t".into(),
+            version: v,
+        })
+    }
+
+    fn req(env: &str, expected: Option<&str>, sources: &[(&str, &str)]) -> PublishRequest {
+        PublishRequest {
+            environment: EnvironmentName::parse(env).unwrap(),
+            expected_head: expected.map(str::to_string),
+            sources: sources
+                .iter()
+                .map(|(model, run_id)| PublishSource {
+                    model: (*model).to_string(),
+                    run_id: (*run_id).to_string(),
+                })
+                .collect(),
+            principal: PrincipalRef::unnamed(),
+            plan_id: None,
+        }
+    }
+
+    fn record_seed_runs(store: &StateStore) {
+        store
+            .record_run(&run_with_output_versions(
+                "r1",
+                &[("orders", delta(1)), ("customers", delta(1))],
+            ))
+            .unwrap();
+        store
+            .record_run(&run_with_output_versions("r2", &[("orders", delta(2))]))
+            .unwrap();
+        store
+            .record_run(&run_with_output_versions("r3", &[("customers", delta(3))]))
+            .unwrap();
+    }
+
+    /// Hook that counts attempts and, on attempt 1 only, waits at `barrier`
+    /// — after the local transaction read (and moved) the head, before the
+    /// upload. Both racers therefore read the same head and the same blob
+    /// generation before either uploads.
+    fn barrier_hook(
+        barrier: Arc<tokio::sync::Barrier>,
+        attempts: Arc<AtomicU32>,
+    ) -> PublishAttemptHook {
+        Arc::new(move |n| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let barrier = Arc::clone(&barrier);
+            Box::pin(async move {
+                if n == 1 {
+                    barrier.wait().await;
+                }
+            })
+        })
+    }
+
+    /// Two pods with `cc`, the seed runs on the remote, and `staging#1`
+    /// published (orders from r1) by pod A.
+    async fn bootstrapped(cc: ConcurrencyControl) -> CrossPodHarness {
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(cc);
+        h.pod_b.cfg.concurrency_control = Some(cc);
+        drop(StateStore::open(&h.pod_a.state_path).unwrap());
+        let mut seed = RemoteStateSession::new(
+            &h.pod_a.cfg,
+            &h.pod_a.state_path,
+            FinalizeDurability::Durable,
+            false,
+        );
+        let _ = seed.acquire().await.unwrap();
+        record_seed_runs(&h.open_store(&h.pod_a));
+        seed.finalize().await.unwrap();
+        // The unguarded path, so the `off` negative control can bootstrap.
+        let first = publish_pointers_with_hook(
+            &LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false),
+            &req("staging", None, &[("orders", "r1")]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.publish_id, "staging#1");
+        h
+    }
+
+    /// The remote head and history, read through a fresh download.
+    async fn remote_view(h: &CrossPodHarness) -> (EnvironmentRecord, Vec<PublishRecord>, bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".rocky-state.redb");
+        let _ = download_state(&h.pod_a.cfg, &path, false).await.unwrap();
+        let store = StateStore::open(&path).unwrap();
+        let env = EnvironmentName::parse("staging").unwrap();
+        let head = store
+            .get_environment(&env)
+            .unwrap()
+            .expect("staging exists");
+        let history = store.publish_history(&env).unwrap();
+        let has_r9 = store.get_run("r9").unwrap().is_some();
+        (head, history, has_r9)
+    }
+
+    /// Race two publishes from the same head, one per pod, with the barrier.
+    async fn race(
+        h: &CrossPodHarness,
+        a: PublishRequest,
+        b: PublishRequest,
+    ) -> [(Result<PublishRecord, StateSyncError>, u32); 2] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (att_a, att_b) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let sa = LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false);
+        let sb = LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false);
+        let (ra, rb) = tokio::join!(
+            publish_pointers_with_hook(
+                &sa,
+                &a,
+                Some(barrier_hook(Arc::clone(&barrier), Arc::clone(&att_a)))
+            ),
+            publish_pointers_with_hook(
+                &sb,
+                &b,
+                Some(barrier_hook(Arc::clone(&barrier), Arc::clone(&att_b)))
+            ),
+        );
+        [
+            (ra, att_a.load(Ordering::SeqCst)),
+            (rb, att_b.load(Ordering::SeqCst)),
+        ]
+    }
+
+    /// RV1-P2 exit test. Two pods publish from head `staging#1` at once.
+    /// Exactly one wins; the loser's CAS upload conflicts, its replay reads
+    /// the winner's head, and it is refused with the typed `PublishConflict`
+    /// on attempt 2. The remote holds the winner's pointers and a gap-free
+    /// history.
+    #[tokio::test]
+    async fn concurrent_publishes_from_one_head_one_wins_one_conflicts() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Cas).await;
+        let results = race(
+            &h,
+            req("staging", Some("staging#1"), &[("orders", "r2")]),
+            req("staging", Some("staging#1"), &[("customers", "r3")]),
+        )
+        .await;
+
+        let wins: Vec<_> = results.iter().filter(|(r, _)| r.is_ok()).collect();
+        let losses: Vec<_> = results.iter().filter(|(r, _)| r.is_err()).collect();
+        assert_eq!(wins.len(), 1, "exactly one publish wins: {results:?}");
+        assert_eq!(losses.len(), 1);
+        let (Ok(winner), win_attempts) = wins[0] else {
+            unreachable!()
+        };
+        let (Err(loss), lose_attempts) = losses[0] else {
+            unreachable!()
+        };
+        match loss {
+            StateSyncError::PublishConflict {
+                env,
+                expected,
+                found,
+            } => {
+                assert_eq!(env, "staging");
+                assert_eq!(expected.as_deref(), Some("staging#1"));
+                assert_eq!(found.as_deref(), Some("staging#2"));
+            }
+            other => panic!("expected PublishConflict, got {other:?}"),
+        }
+        assert_eq!(*win_attempts, 1);
+        assert_eq!(*lose_attempts, 2, "the loser replays once and is refused");
+
+        let (head, history, _) = remote_view(&h).await;
+        assert_eq!(head.head_publish_id, "staging#2");
+        // Either racer can win. The head is staging#1's pointers with the
+        // winner's merged over them — and nothing of the loser's.
+        let mut expected = history[0].to.clone();
+        expected.extend(winner.to.clone());
+        assert_eq!(head.pointers, expected, "remote head = staging#1 + winner");
+        let seqs: Vec<u64> = history.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(history[1].prior_publish_id.as_deref(), Some("staging#1"));
+        assert_eq!(&history[1], winner);
+
+        // The loser's LOCAL store holds the remote winner, not its own
+        // refused transaction: same head, same history.
+        let loser_pod = if results[0].0.is_err() {
+            &h.pod_a
+        } else {
+            &h.pod_b
+        };
+        let local = h.open_store(loser_pod);
+        let staging = EnvironmentName::parse("staging").unwrap();
+        assert_eq!(
+            local.get_environment(&staging).unwrap().as_ref(),
+            Some(&head)
+        );
+        assert_eq!(local.publish_history(&staging).unwrap(), history);
+        test_support::clear();
+    }
+
+    /// The guard: a remote backend with `concurrency_control = "off"` refuses
+    /// a publish with the typed error before any download or upload, because
+    /// a lost publish would be silent there (see the negative control below).
+    /// Mutation: drop the guard and the publish succeeds.
+    #[tokio::test]
+    async fn publish_through_a_remote_backend_without_cas_is_refused() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Off).await;
+        let (gets, puts) = (
+            h.faults.count(crate::fault_store::FaultOp::Get),
+            h.faults.put_count_outside("cas-probe/"),
+        );
+        let err = publish_pointers(
+            &LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false),
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, StateSyncError::PublishRequiresCas { backend } if backend == "s3"),
+            "{err:?}"
+        );
+        assert!(!err.to_string().is_empty());
+        assert_eq!(h.faults.count(crate::fault_store::FaultOp::Get), gets);
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "nothing uploaded"
+        );
+        let (head, _, _) = remote_view(&h).await;
+        assert_eq!(head.head_publish_id, "staging#1");
+        test_support::clear();
+    }
+
+    /// A refused publish through the seam (a model the run did not execute,
+    /// and an existing history row) uploads nothing and leaves the local
+    /// store equal to the remote.
+    #[tokio::test]
+    async fn a_refused_publish_through_the_seam_uploads_nothing() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Cas).await;
+        let session = LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false);
+        let staging = EnvironmentName::parse("staging").unwrap();
+
+        let puts = h.faults.put_count_outside("cas-probe/");
+        let err = publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("customers", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StateSyncError::State(crate::state::StateError::Environment(
+                    crate::environments::EnvironmentError::Refused { .. }
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "Refused uploads nothing"
+        );
+        let local = h.open_store(&h.pod_b);
+        assert_eq!(
+            local
+                .get_environment(&staging)
+                .unwrap()
+                .unwrap()
+                .head_publish_id,
+            "staging#1"
+        );
+        drop(local);
+
+        // Plant an orphan history row at seq 2 in the remote blob.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".rocky-state.redb");
+        let _ = download_state(&h.pod_a.cfg, &path, false).await.unwrap();
+        crate::state::insert_orphan_history_row(
+            &path,
+            &crate::environments::history_key(&staging, 2),
+        );
+        let key = "v32/state.redb";
+        assert!(h.provider.exists(key).await.unwrap());
+        h.provider
+            .put(key, Bytes::from(std::fs::read(&path).unwrap()))
+            .await
+            .unwrap();
+
+        let puts = h.faults.put_count_outside("cas-probe/");
+        let err = publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StateSyncError::State(crate::state::StateError::Environment(
+                    crate::environments::EnvironmentError::HistoryRowExists { .. }
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "HistoryRowExists uploads nothing"
+        );
+        let local = h.open_store(&h.pod_b);
+        assert_eq!(
+            local
+                .get_environment(&staging)
+                .unwrap()
+                .unwrap()
+                .head_publish_id,
+            "staging#1"
+        );
+        test_support::clear();
+    }
+
+    /// Negative control: the same race with `concurrency_control = "off"`,
+    /// through the UNGUARDED inner path (the public `publish_pointers` now
+    /// refuses `off`). Both publishes report success and the remote keeps only
+    /// one: an update is lost. The in-store head check alone does not stop the
+    /// blob-level loss, which is why the guard exists. It also proves the race
+    /// above can fail, so its pass is evidence.
+    #[tokio::test]
+    async fn concurrent_publishes_without_cas_lose_an_update() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Off).await;
+        let results = race(
+            &h,
+            req("staging", Some("staging#1"), &[("orders", "r2")]),
+            req("staging", Some("staging#1"), &[("customers", "r3")]),
+        )
+        .await;
+        for (r, attempts) in &results {
+            let record = r
+                .as_ref()
+                .expect("without CAS both publishes report success");
+            assert_eq!(record.publish_id, "staging#2", "both claim seq 2");
+            assert_eq!(*attempts, 1);
+        }
+        let (head, history, _) = remote_view(&h).await;
+        assert_eq!(history.len(), 2, "one of the two seq-2 rows is gone");
+        let orders_moved = head.pointers["orders"].run_id == "r2";
+        let customers_moved = head.pointers.contains_key("customers");
+        assert!(
+            orders_moved != customers_moved,
+            "exactly one publish survived; the other was lost: {head:?}"
+        );
+        test_support::clear();
+    }
+
+    /// An unrelated run finalize moves the blob between the publish's
+    /// download and its upload. The publish's CAS conflicts, the replay finds
+    /// the same head, and the publish SUCCEEDS on attempt 2. The run row
+    /// survives.
+    #[tokio::test]
+    async fn a_run_finalize_racing_a_publish_replays_and_both_survive() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Cas).await;
+
+        let mut run = RemoteStateSession::new(
+            &h.pod_a.cfg,
+            &h.pod_a.state_path,
+            FinalizeDurability::Durable,
+            false,
+        );
+        let _ = run.acquire().await.unwrap();
+        h.open_store(&h.pod_a)
+            .record_run(&run_with_output_versions("r9", &[("orders", delta(9))]))
+            .unwrap();
+        let run = Arc::new(tokio::sync::Mutex::new(Some(run)));
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let hook: PublishAttemptHook = {
+            let run = Arc::clone(&run);
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |n| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let run = Arc::clone(&run);
+                Box::pin(async move {
+                    if n == 1 {
+                        let session = run.lock().await.take().expect("finalize once");
+                        session.finalize().await.expect("the run finalizes first");
+                    }
+                })
+            })
+        };
+        let record = publish_pointers_with_hook(
+            &LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false),
+            &req("staging", Some("staging#1"), &[("customers", "r3")]),
+            Some(hook),
+        )
+        .await
+        .expect("the replay finds the same head and wins");
+        assert_eq!(record.publish_id, "staging#2");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one CAS conflict, one replay"
+        );
+
+        let (head, history, has_r9) = remote_view(&h).await;
+        assert!(has_r9, "the run row survives the publish");
+        assert_eq!(head.head_publish_id, "staging#2");
+        assert_eq!(history.len(), 2);
+        test_support::clear();
+    }
+
+    /// Local backend: one store, no remote. Two sequential publishes from the
+    /// same head: the second is a `PublishConflict` through the seam too.
+    #[tokio::test]
+    async fn local_backend_second_publish_from_the_same_head_conflicts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".rocky-state.redb");
+        record_seed_runs(&StateStore::open(&path).unwrap());
+        let session = LedgerSeamSession::new(&StateConfig::default(), &path, false);
+        publish_pointers(&session, &req("staging", None, &[("orders", "r1")]))
+            .await
+            .unwrap();
+        publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap();
+        let err = publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("customers", "r3")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, StateSyncError::PublishConflict { found: Some(f), .. } if f == "staging#2"),
+            "{err:?}"
+        );
+    }
+
+    /// The bytes of a store a v31 binary wrote, holding run r1 (and r2, r3).
+    fn v31_state_bytes(dir: &Path) -> Vec<u8> {
+        let path = dir.join("seed-v31.redb");
+        record_seed_runs(&StateStore::open(&path).unwrap());
+        crate::state::force_pre_v32_store(&path);
+        std::fs::read(&path).unwrap()
+    }
+
+    /// Carry-forward across the bump. Only `v31/state.redb` exists. The v32
+    /// download restores it (Authoritative, stamped 32, run kept); a publish
+    /// creates `v32/state.redb` with create-if-absent; the v31 key stays
+    /// byte-identical.
+    #[tokio::test]
+    async fn publish_after_the_bump_carries_v31_forward_and_never_writes_it() {
+        use crate::fault_store::PutKind;
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        assert_eq!(crate::state::current_schema_version(), 32);
+        let seed_dir = TempDir::new().unwrap();
+        let v31 = v31_state_bytes(seed_dir.path());
+        let (v31_key, v32_key) = ("v31/state.redb", "v32/state.redb");
+        h.provider
+            .put(v31_key, Bytes::from(v31.clone()))
+            .await
+            .unwrap();
+
+        let authority = h.download(&h.pod_a).await.unwrap();
+        assert_eq!(authority, StateAuthority::Authoritative);
+        // The first read-write open migrates the carried-forward store.
+        assert!(h.open_store(&h.pod_a).get_run("r1").unwrap().is_some());
+        assert_eq!(
+            StateStore::peek_schema_version(&h.pod_a.state_path).unwrap(),
+            Some(32)
+        );
+        assert!(!h.provider.exists(v32_key).await.unwrap());
+
+        let record = publish_pointers(
+            &LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false),
+            &req("staging", None, &[("orders", "r1")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.publish_id, "staging#1");
+        assert!(h.provider.exists(v32_key).await.unwrap());
+        assert_eq!(h.faults.put_count(v32_key, PutKind::Create), 1);
+        assert_eq!(h.faults.put_count(v32_key, PutKind::Unconditional), 0);
+        assert_eq!(
+            h.provider.get(v31_key).await.unwrap().to_vec(),
+            v31,
+            "the v31 key is never written"
+        );
+        let (head, _, _) = remote_view(&h).await;
+        assert_eq!(head.head_publish_id, "staging#1");
+        test_support::clear();
+    }
+
+    /// The FIRST publish right after the bump, from two pods at once. Both
+    /// carry forward with no base and both try create-if-absent; one create
+    /// is refused, and the loser's replay downloads the winner's `v32` key and
+    /// finds the environment, so it is a `PublishConflict`.
+    #[tokio::test]
+    async fn concurrent_first_publish_after_the_bump_one_conflicts() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        h.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        let seed_dir = TempDir::new().unwrap();
+        let v31 = v31_state_bytes(seed_dir.path());
+        h.provider
+            .put("v31/state.redb", Bytes::from(v31.clone()))
+            .await
+            .unwrap();
+
+        let results = race(
+            &h,
+            req("staging", None, &[("orders", "r1")]),
+            req("staging", None, &[("orders", "r2")]),
+        )
+        .await;
+        let wins = results.iter().filter(|(r, _)| r.is_ok()).count();
+        assert_eq!(wins, 1, "{results:?}");
+        let (loss, attempts) = results.iter().find(|(r, _)| r.is_err()).unwrap();
+        assert!(
+            matches!(
+                loss,
+                Err(StateSyncError::PublishConflict { expected: None, found: Some(f), .. })
+                    if f == "staging#1"
+            ),
+            "{loss:?}"
+        );
+        assert_eq!(*attempts, 2);
+        let (head, history, _) = remote_view(&h).await;
+        assert_eq!(head.head_publish_id, "staging#1");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            h.provider.get("v31/state.redb").await.unwrap().to_vec(),
+            v31
+        );
+        test_support::clear();
     }
 }

@@ -21,6 +21,7 @@ pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;
 pub mod env_string;
+pub mod environments;
 pub mod failure_class;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault_store;
