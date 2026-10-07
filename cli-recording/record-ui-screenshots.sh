@@ -82,29 +82,39 @@ PIDS=()
 cleanup() { for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-serve() { # <dir> <port>
-  (cd "$1" && exec rocky serve --ui --token "$TOKEN" --token-scope read-only --port "$2") >"$1/serve.log" 2>&1 &
+serve() { # <dir> <port> [global rocky flag...]
+  local dir="$1" port="$2"
+  shift 2
+  (cd "$dir" && exec rocky "$@" serve --ui --token "$TOKEN" --token-scope read-only --port "$port") >"$dir/serve.log" 2>&1 &
   local child="$!"
   PIDS+=("$child")
   # Probe an authenticated route: /health is token-exempt, so a stale server
   # left on the port by an earlier run would pass a health probe.
   for _ in $(seq 1 50); do
     if ! kill -0 "$child" 2>/dev/null; then
-      echo "FAIL: rocky serve in $1 exited; see $1/serve.log" >&2
+      echo "FAIL: rocky serve in $dir exited; see $dir/serve.log" >&2
       exit 1
     fi
-    curl -fsS -H "$AUTH" "http://127.0.0.1:$2/api/v1/meta" >/dev/null 2>&1 && return 0
+    curl -fsS -H "$AUTH" "http://127.0.0.1:$port/api/v1/meta" >/dev/null 2>&1 && return 0
     sleep 0.2
   done
-  echo "FAIL: rocky serve in $1 did not come up; see $1/serve.log" >&2
+  echo "FAIL: rocky serve in $dir did not come up; see $dir/serve.log" >&2
   exit 1
 }
 serve "$SCRATCH/estate" 18751
 serve "$SCRATCH/review" 18752
-serve "$SCRATCH/governor" 18753
+# The POC keeps its state outside models/ (`rocky fulfill` refuses a store the
+# drafting worker may write), so the server must read that same file. On the
+# default <models>/.rocky-state.redb it renders an empty journal and custody.
+serve "$SCRATCH/governor" 18753 --state-path .rocky/state.redb
 
 PLAN="$(curl -fsS -H "$AUTH" http://127.0.0.1:18752/api/v1/review/queue | jq -r '.pending[0].plan_id // empty')"
 [ -n "$PLAN" ] || { echo "FAIL: the review queue is empty; the review shot needs a pending plan" >&2; exit 1; }
+JOURNAL_ROWS="$(curl -fsS -H "$AUTH" http://127.0.0.1:18753/api/v1/products/revenue_daily/journal | jq -er '.rows | length')"
+[ "$JOURNAL_ROWS" -gt 0 ] || {
+  echo "FAIL: the revenue_daily journal is empty; the governor server is not reading the POC's state" >&2
+  exit 1
+}
 
 # Fail on a leak of the real identity or a local path into any route a shot
 # renders. The body is captured first, so a failed request fails the script
