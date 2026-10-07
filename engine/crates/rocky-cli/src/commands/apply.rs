@@ -512,10 +512,14 @@ async fn run_apply_run_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let executable = if is_replication_only(&loaded.config, &run_plan) {
-        Vec::new()
+    let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+        (Vec::new(), EmptyTouched::NoOp)
     } else {
-        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
+        match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+            Some(models) => (models, EmptyTouched::NoOp),
+            // The compile failed, so the executed set is unknown: refuse.
+            None => (Vec::new(), EmptyTouched::Refuse),
+        }
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
@@ -533,7 +537,7 @@ async fn run_apply_run_plan(
         principal,
         actor,
         &touched,
-        EmptyTouched::NoOp,
+        empty_touched,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -2771,7 +2775,7 @@ fn run_executable_models(
     models_dir: &Path,
     models_glob: Option<&str>,
     run_plan: &RunPlan,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     use rocky_compiler::compile::{self, CompilerConfig};
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -2781,10 +2785,11 @@ fn run_executable_models(
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     };
-    let Ok(result) = result else {
-        return Vec::new();
-    };
-    result
+    // A compile that fails cannot say what the apply will execute. `None`
+    // makes the caller gate with `EmptyTouched::Refuse`: an unknown set is
+    // not an empty one (R12).
+    let result = result.ok()?;
+    let models = result
         .project
         .models
         .iter()
@@ -2795,7 +2800,8 @@ fn run_executable_models(
                 .as_deref()
                 .is_none_or(|target| target == name.as_str())
         })
-        .collect()
+        .collect();
+    Some(models)
 }
 
 /// The `(model, capability)` set the policy plane evaluates for a `Promote`
@@ -4340,10 +4346,14 @@ async fn run_apply_ai_authored_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let executable = if is_replication_only(&loaded.config, &run_plan) {
-        Vec::new()
+    let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+        (Vec::new(), EmptyTouched::NoOp)
     } else {
-        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
+        match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+            Some(models) => (models, EmptyTouched::NoOp),
+            // The compile failed, so the executed set is unknown: refuse.
+            None => (Vec::new(), EmptyTouched::Refuse),
+        }
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
@@ -4360,7 +4370,7 @@ async fn run_apply_ai_authored_plan(
         principal,
         actor,
         &touched,
-        EmptyTouched::NoOp,
+        empty_touched,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -8506,6 +8516,20 @@ effect = "deny"
     /// list is EMPTY but whose models dir compiles real models must still gate
     /// the real models. Pre-fix `touched()` read the empty list → gated nothing
     /// → an agent apply executed every real model UNGATED.
+    /// R12 red team: a compile that fails must not collapse the executed set
+    /// to "empty" (which `NoOp` would allow). It is unknown, so `None`.
+    #[test]
+    fn run_executable_models_is_none_when_the_compile_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        std::fs::write(models_dir.join("orders.toml"), "name = [not toml").unwrap();
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.model = None;
+        assert_eq!(super::run_executable_models(&models_dir, None, &rp), None);
+    }
+
     #[test]
     fn run_executable_models_ignores_the_informational_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -8516,7 +8540,7 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = Vec::new(); // the informational list is EMPTY
         rp.model = None;
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         assert!(
             exec.contains(&"orders".to_string()) && exec.contains(&"customers".to_string()),
             "the executable set must come from the compile, not the empty list: {exec:?}"
@@ -8537,7 +8561,7 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string(), "customers".to_string()]; // over-lists
         rp.model = Some("orders".to_string());
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         assert_eq!(
             exec,
             vec!["orders".to_string()],
@@ -8556,7 +8580,7 @@ effect = "deny"
         rp.model = None;
         let glob = models_dir.join("ord*.sql").to_string_lossy().into_owned();
 
-        let exec = super::run_executable_models(&models_dir, Some(&glob), &rp);
+        let exec = super::run_executable_models(&models_dir, Some(&glob), &rp).expect("compiles");
         assert_eq!(
             exec,
             vec!["orders".to_string()],
@@ -8590,7 +8614,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(!touched.is_empty(), "D1: real models must be gated");
         let gate = super::evaluate_apply_policy(
@@ -8638,7 +8662,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(
             !touched.contains_key("customers"),
