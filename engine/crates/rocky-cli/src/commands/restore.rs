@@ -1244,6 +1244,7 @@ pub(crate) async fn restore_apply_output(
         plan_record.enforcement_principal(runtime_principal),
         actor,
         &touched,
+        crate::commands::apply::EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -1341,6 +1342,7 @@ pub(crate) async fn restore_apply_output(
                 let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
                     Some(&cfg),
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                 ));
@@ -1408,6 +1410,7 @@ pub(crate) async fn restore_apply_output(
                     principal,
                     &actor,
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                     &prior_decisions,
@@ -3664,6 +3667,7 @@ mod tests {
                 let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
                     Some(&cfg),
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     None,
                 ));

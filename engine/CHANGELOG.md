@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rocky serve` reads its schema cache from the `--state-path` store (#2279).** The resident compile behind `/api/v1/project` and `/api/v1/models` loaded cached source schemas from the default store, even when `--state-path` named another. Every server surface now resolves the store through one function.
 - **`rocky lsp` and `rocky serve` judge each model against its own pipeline's warehouse, like `rocky compile`.** They ran only the compiler core, so a project with several pipelines showed different diagnostics in the editor and the API than on the command line. The checks for E042/E043, E044, E049, E051, E053 and E054 now run through the same function in all three. `/project` now sets `has_errors` when one of them is an error. The editor does not yet show E051, which names a function file rather than a model. The standalone `rocky-lsp` binary has no adapters and does not run them; use `rocky lsp`.
 
+### Changed
+
+- **An empty policy-gate subject set no longer allows by default (R12).** The `rocky-cli` gate functions (`evaluate_apply_policy` and its variants) take a new `EmptyTouched` argument. `NoOp` keeps today's `Allow` for a caller whose set lists exactly what it mutates. `Refuse` denies an empty set, so a future caller with no model set cannot skip every `deny` rule. No current command changes behavior.
+
 ## [1.77.0] — 2026-10-07
 
 This release carries 30 breaking changes, each marked **Breaking:** below. Read three first:

@@ -1565,6 +1565,8 @@ async fn gc_seam_regate(
         principal,
         actor,
         touched,
+        // gc's touched set is exactly its evictions: empty evicts nothing.
+        crate::commands::apply::EmptyTouched::NoOp,
         models_dir,
         models_glob,
         prior_decisions,
@@ -1600,6 +1602,7 @@ type RegatePolicy = (
 pub(crate) fn resolve_ledger_seam_regate(
     cfg: Option<&rocky_core::config::RockyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: crate::commands::apply::EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
 ) -> ResolvedRegate {
@@ -1607,6 +1610,7 @@ pub(crate) fn resolve_ledger_seam_regate(
         crate::commands::apply::resolve_policy_and_attrs(
             Some(policy),
             touched,
+            empty_touched,
             models_dir,
             models_glob,
         )
@@ -1632,13 +1636,14 @@ pub(crate) async fn ledger_seam_regate(
     principal: rocky_core::config::PolicyPrincipal,
     actor: &rocky_core::config::PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: crate::commands::apply::EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
     fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
-    let resolved = resolve_ledger_seam_regate(cfg, touched, models_dir, models_glob);
+    let resolved = resolve_ledger_seam_regate(cfg, touched, empty_touched, models_dir, models_glob);
     ledger_seam_regate_resolved(
         verb,
         cfg,
@@ -1901,6 +1906,7 @@ pub(crate) async fn run_gc_apply_in_with(
         plan_record.enforcement_principal(runtime_principal),
         actor,
         &touched,
+        crate::commands::apply::EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,

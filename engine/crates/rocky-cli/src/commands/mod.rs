@@ -106,7 +106,7 @@ pub use ai::{
 };
 pub use ai_contract::run_ai_contract;
 pub use apply::{
-    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_durable,
+    EmptyTouched, PolicyGate, evaluate_apply_policy, evaluate_apply_policy_durable,
     evaluate_apply_policy_with_extra_classifications, evaluate_apply_policy_with_policy,
     marker_freezes_before_gate, run_apply, run_apply_inline_for_run,
 };

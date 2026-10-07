@@ -533,6 +533,7 @@ async fn run_apply_run_plan(
         principal,
         actor,
         &touched,
+        EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -1322,6 +1323,22 @@ pub enum PolicyGate {
     },
 }
 
+/// What an empty `touched` set means to the caller of a policy gate.
+///
+/// An empty set skips every rule, so it must never be reached by accident: a
+/// caller with no model set (a pipeline trigger, say) would otherwise pass an
+/// empty map and bypass every `deny` rule. Each caller of the gate names its
+/// meaning explicitly; there is deliberately no `Default`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyTouched {
+    /// The caller builds `touched` from exactly what it will mutate, so an
+    /// empty set means nothing runs. The gate allows (a genuine no-op).
+    NoOp,
+    /// The caller always has something to gate. An empty set means the
+    /// subjects were lost, so the gate denies (fail-closed).
+    Refuse,
+}
+
 // Counts `model_attributes` calls on this thread, so a test can prove how
 // often a gate loads the models directory (#2270). Thread-local because
 // tests run in parallel; a `#[tokio::test]` runs on one thread.
@@ -1748,6 +1765,7 @@ async fn commit_governed_rule_decision(
                     principal,
                     &actor,
                     &touched,
+                    EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                     GateLedger::Store(fresh_store),
@@ -1793,6 +1811,7 @@ pub async fn evaluate_apply_policy_durable(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1805,6 +1824,7 @@ pub async fn evaluate_apply_policy_durable(
             principal,
             actor,
             touched,
+            empty_touched,
             models_dir,
             None,
             GateLedger::Path(state_path),
@@ -1842,6 +1862,7 @@ pub async fn evaluate_apply_policy_durable(
                     principal,
                     &actor,
                     &touched,
+                    empty_touched,
                     &models_dir,
                     None,
                     GateLedger::Store(fresh_store),
@@ -1905,8 +1926,10 @@ async fn commit_verify_after_custody(
 ///
 /// `touched` maps each governed model to the capability that was reviewed at
 /// propose time (the embedded classification, or `schema_change.breaking` when
-/// the classification was unavailable / fail-closed). An empty map means the
-/// plan executes **no models** — a genuine no-op → `Allow`. A no-change plan
+/// the classification was unavailable / fail-closed). With
+/// [`EmptyTouched::NoOp`] an empty map means the plan executes **no models** —
+/// a genuine no-op → `Allow`; with [`EmptyTouched::Refuse`] it is a `Deny`
+/// (the caller always has something to gate). A no-change plan
 /// that still executes models is NOT empty: `EmbeddedCapabilities::touched`
 /// synthesizes a bare-`apply` entry per planned model, so its execution stays
 /// governed (do not pass an empty map for an executing plan or the gate is
@@ -1918,6 +1941,7 @@ pub fn evaluate_apply_policy(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1938,6 +1962,7 @@ pub fn evaluate_apply_policy(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         state_path,
         marker_freezes,
@@ -1964,6 +1989,7 @@ pub fn evaluate_apply_policy_with_policy(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1974,6 +2000,7 @@ pub fn evaluate_apply_policy_with_policy(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         None,
         state_path,
@@ -1989,6 +2016,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     state_path: &Path,
@@ -2001,6 +2029,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         models_glob,
         GateLedger::Path(state_path),
@@ -2061,6 +2090,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -2076,6 +2106,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         None,
         GateLedger::Path(state_path),
@@ -2120,6 +2151,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     ledger: GateLedger<'_>,
@@ -2128,7 +2160,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     subjects: GateSubjects<'_>,
 ) -> PolicyGate {
     let (policy, attrs_map) =
-        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+        match resolve_policy_and_attrs(policy, touched, empty_touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
@@ -2395,6 +2427,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     ledger: &StateStore,
@@ -2405,7 +2438,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
     // config `run` executed against, not one a mid-run `rocky.toml` swap points at.
     let (policy, attrs_map) =
-        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+        match resolve_policy_and_attrs(policy, touched, empty_touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
@@ -2440,11 +2473,13 @@ pub(crate) fn evaluate_apply_policy_with_store(
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
-/// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy,
-/// `Allow` when `touched` is empty (a genuine no-op executes nothing).
+/// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy;
+/// when `touched` is empty, `Allow` for [`EmptyTouched::NoOp`] (a genuine no-op
+/// executes nothing) and `Deny` for [`EmptyTouched::Refuse`].
 pub(crate) fn resolve_policy_and_attrs(
     policy: Option<&rocky_core::config::PolicyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
 ) -> std::result::Result<
@@ -2457,11 +2492,23 @@ pub(crate) fn resolve_policy_and_attrs(
     let Some(policy) = policy else {
         return Err(PolicyGate::NotConfigured);
     };
-    // An empty touched set means the plan executes no models (a genuine no-op).
-    // A no-change-but-executing plan is never empty here — see the touched-set
-    // synthesis in `EmbeddedCapabilities::touched`.
+    // An empty touched set allows only when the caller vouched that its set
+    // lists exactly what it mutates (`NoOp`: the plan executes nothing). A
+    // no-change-but-executing plan is never empty here — see the touched-set
+    // synthesis in `EmbeddedCapabilities::touched`. Any other caller is refused,
+    // so a caller with no model set cannot skip every `deny` rule by accident.
     if touched.is_empty() {
-        return Err(PolicyGate::Allow);
+        return Err(match empty_touched {
+            EmptyTouched::NoOp => PolicyGate::Allow,
+            EmptyTouched::Refuse => PolicyGate::Deny {
+                model: "*".to_string(),
+                rule_id: None,
+                reason: "fail-closed: the policy gate received an empty touched set from a \
+                         caller that always has something to gate, so no rule could be \
+                         evaluated; the mutation is refused"
+                    .to_string(),
+            },
+        });
     }
     let attrs = match model_attributes(models_dir, models_glob) {
         Ok(attrs) => attrs,
@@ -3416,6 +3463,8 @@ impl GovernedRunContext<'_> {
             self.principal,
             &self.actor,
             &touched,
+            // Never empty: an empty target set returned above.
+            EmptyTouched::Refuse,
             &models_dir,
             models_glob.as_deref(),
             ledger,
@@ -3520,6 +3569,7 @@ pub(crate) fn gate_promote_plan(
         principal,
         actor,
         &touched,
+        EmptyTouched::NoOp,
         &promote_models_dir,
         promote_models_glob.as_deref(),
         state_path,
@@ -3924,6 +3974,7 @@ pub(crate) async fn gate_maintenance_apply(
         plan.enforcement_principal(runtime_principal),
         actor,
         touched,
+        EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -4309,6 +4360,7 @@ async fn run_apply_ai_authored_plan(
         principal,
         actor,
         &touched,
+        EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -4691,6 +4743,7 @@ async fn run_apply_backfill_plan(
             plan.enforcement_principal(runtime_principal),
             actor,
             &touched,
+            EmptyTouched::NoOp,
             models_dir,
             state_path,
             &marker_freezes,
@@ -5902,6 +5955,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             dir.path(),
             &dir.path().join("state.redb"),
             &[],
@@ -5931,6 +5985,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             dir.path(),
             &dir.path().join("state.redb"),
             &[],
@@ -6337,6 +6392,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &targets.touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             None,
             &state,
@@ -7596,6 +7652,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &state,
             &[],
@@ -7612,6 +7669,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &state,
             &[],
@@ -7666,6 +7724,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7684,6 +7743,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7740,6 +7800,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7799,6 +7860,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7818,6 +7880,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7876,6 +7939,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &dir.path().join("state.redb"),
             &[],
@@ -7908,6 +7972,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -7938,6 +8003,7 @@ effect = "deny"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8187,6 +8253,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8222,6 +8289,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8230,6 +8298,87 @@ effect = "deny"
             gate,
             PolicyGate::Allow,
             "an empty touched set executes nothing ⇒ nothing to gate"
+        );
+        Ok(())
+    }
+
+    /// R12: only a caller that vouches its empty set is a no-op reaches the
+    /// empty-set `Allow`. A caller that passes `Refuse` is denied, even under
+    /// a policy that allows every agent apply — an empty map must not skip
+    /// every rule by accident.
+    #[test]
+    fn evaluate_apply_policy_empty_touched_refuse_denies_under_allow_all() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &BTreeMap::new(),
+            super::EmptyTouched::Refuse,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        let PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } = gate
+        else {
+            panic!("an empty set from a Refuse caller must deny, got {gate:?}");
+        };
+        assert_eq!(model, "*");
+        assert_eq!(rule_id, None);
+        assert!(reason.contains("empty touched set"), "reason: {reason}");
+        Ok(())
+    }
+
+    /// R12: the `Refuse` variant changes only the empty case. A `deny` rule
+    /// still denies a non-empty set, by that rule.
+    #[test]
+    fn evaluate_apply_policy_refuse_still_denies_a_non_empty_set_by_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &touched,
+            super::EmptyTouched::Refuse,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        let PolicyGate::Deny { model, rule_id, .. } = gate else {
+            panic!("a deny rule must deny a non-empty set, got {gate:?}");
+        };
+        assert_eq!(model, "m");
+        assert_eq!(
+            rule_id,
+            Some(0),
+            "denied by the rule, not the empty-set guard"
         );
         Ok(())
     }
@@ -8271,6 +8420,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8309,6 +8459,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8341,6 +8492,7 @@ effect = "deny"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8447,6 +8599,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &dir.path().join("state.redb"),
             &[],
@@ -8497,6 +8650,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &dir.path().join("state.redb"),
             &[],
@@ -8555,6 +8709,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8605,6 +8760,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8654,6 +8810,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8703,6 +8860,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8733,6 +8891,7 @@ effect = "allow"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -9068,6 +9227,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &actor,
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             None,
             &state,
@@ -9776,6 +9936,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -9931,6 +10092,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -9990,6 +10152,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -10020,6 +10183,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -12853,6 +13017,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &propose_touched(),
+            super::EmptyTouched::Refuse,
             &root.join("models"),
             state_path,
             &[],
@@ -12989,6 +13154,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &propose_touched(),
+            super::EmptyTouched::Refuse,
             &root.path().join("models"),
             &harness.pod_b.state_path,
             &[],
