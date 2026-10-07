@@ -4426,6 +4426,25 @@ impl RockyMcpServer {
             })
     }
 
+    /// The logical model name (`ModelConfig.name`) of the model whose sidecar
+    /// is `models/<stem>.toml`. A sidecar may set `name` apart from the file
+    /// stem, and the compile filter, the policy gate and the audit ledger all
+    /// select by the logical name (#1829 item 5). Reads the sidecar the draft
+    /// tool has just written (no model-directory load, so no second pass over
+    /// every model). Falls back to the stem when there is no sidecar, no
+    /// string `name`, or the sidecar does not parse: the compile that follows
+    /// reports the real problem.
+    fn logical_model_name(&self, stem: &str) -> String {
+        std::fs::read_to_string(self.models_dir.join(format!("{stem}.toml")))
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+            .and_then(|table| match table.get("name") {
+                Some(toml::Value::String(name)) if !name.is_empty() => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| stem.to_string())
+    }
+
     /// Compile the project scoped to `stem` and reduce it to the lite
     /// [`CompileResult`] the draft tools return inline. Shared by `draft_model`,
     /// `draft_contract`, and `draft_check` — the "compile with the write" step.
@@ -4800,14 +4819,18 @@ impl RockyMcpServer {
 
         // Compile with the write — the contract is validated against the model's
         // inferred schema. A hard compile failure rolls the draft back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
         let decision_id = format!("draft-contract:{}", paths.stem);
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
         match self
-            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
             .await?
         {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
@@ -4982,14 +5005,18 @@ impl RockyMcpServer {
             ));
         }
 
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
         let decision_id = format!("draft-check:{}", paths.stem);
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
         match self
-            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
             .await?
         {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
@@ -5218,16 +5245,20 @@ impl RockyMcpServer {
         }
 
         // Compile with the write — a hard failure rolls the patch back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
         // ⟦RTL-2⟧ the policy gate runs AFTER the write, so the evaluation
         // compiles the model's attributes AS PATCHED from disk — a patch that
         // first ADDS a governed classification is gated by that
         // classification, not by the pre-patch attribute set.
         let decision_id = format!("draft-metadata:{}", paths.stem);
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
         match self
-            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
             .await?
         {
             // NOT grouped with NotConfigured. A config that failed to LOAD may

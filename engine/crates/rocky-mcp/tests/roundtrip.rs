@@ -3321,6 +3321,86 @@ fn metadata_args(json: serde_json::Value) -> serde_json::Map<String, serde_json:
     }
 }
 
+/// #1829 item 5: the draft tools resolve the model by file stem but gate and
+/// record by the LOGICAL name. `payments.sql` is logically `gold_payments`;
+/// another file, `orders.sql`, is logically `payments`. A metadata patch on
+/// stem `payments` must reach the ledger as `gold_payments`, never as the
+/// unrelated `payments` model.
+#[tokio::test]
+async fn draft_tools_record_the_logical_name_not_the_file_stem() {
+    for tool in ["draft_metadata", "draft_contract", "draft_check"] {
+        let dir = TempDir::new().unwrap();
+        write_project_with_policy(
+            dir.path(),
+            &dir.path().join("test.duckdb"),
+            r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+        );
+        let models = dir.path().join("models");
+        // `orders.sql` is logically `payments` (the unrelated model).
+        let orders_sidecar = std::fs::read_to_string(models.join("orders.toml")).unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            orders_sidecar.replace("name = \"orders\"", "name = \"payments\""),
+        )
+        .unwrap();
+        // `payments.sql` is logically `gold_payments`.
+        std::fs::write(
+            models.join("payments.sql"),
+            "SELECT 1 AS id, 'x' AS email\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("payments.toml"),
+            "name = \"gold_payments\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"gold_payments\"\n",
+        )
+        .unwrap();
+
+        let args = match tool {
+            "draft_metadata" => serde_json::json!({
+                "model": "payments",
+                "classifications": { "email": "pii" },
+            }),
+            "draft_contract" => serde_json::json!({
+                "model": "payments",
+                "spec": "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n",
+            }),
+            _ => serde_json::json!({
+                "model": "payments",
+                "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+            }),
+        };
+        let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+        let client = connect(server).await;
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(metadata_args(args)))
+            .await
+            .expect("draft call");
+        assert_eq!(result.is_error, Some(true), "{tool}: the deny rule fires");
+        client.cancel().await.unwrap();
+
+        let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+        let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+        let decisions = store.list_policy_decisions().expect("list decisions");
+        assert!(
+            decisions.iter().any(|d| d.model == "gold_payments"),
+            "{tool}: the ledger row is keyed by the logical name: {decisions:?}"
+        );
+        assert!(
+            !decisions.iter().any(|d| d.model == "payments"),
+            "{tool}: no row is keyed by the file stem of an unrelated model: {decisions:?}"
+        );
+    }
+}
+
 /// Happy path: a structured patch merges `[freshness]` + `[classification]`
 /// into the sidecar via parse-merge, preserving the existing strategy/target,
 /// and the result carries the compile with the write.
