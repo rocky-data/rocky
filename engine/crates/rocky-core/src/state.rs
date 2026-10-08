@@ -8912,9 +8912,175 @@ impl StateStore {
         &self,
         request: &crate::environments::PublishRequest,
     ) -> Result<crate::environments::PublishRecord, StateError> {
+        self.publish_txn(request, PublishKind::StateOnly)
+    }
+
+    /// Start a table publish (RV1-P3): the same checks and the same one
+    /// transaction as [`Self::publish_pointers`], but the head keeps its
+    /// pointers. It moves to a `Started` row and marks the environment
+    /// `publishing`, so every other publish is refused until
+    /// [`Self::finish_table_publish`] records the outcome.
+    ///
+    /// `take_over` lets this publish start from a head whose own table
+    /// publish never finished (its process died). The caller must name that
+    /// head as `expected_head`. Use it only when the other publisher is known
+    /// to be dead: two live publishers would move the same tables.
+    ///
+    /// `check` runs on every resolved pointer inside the transaction, before
+    /// anything is written. It is how the table backend refuses a version it
+    /// cannot publish (for example a version that names no files).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_pointers`], plus
+    /// [`crate::environments::EnvironmentError::PublishInProgress`], and
+    /// [`crate::environments::PublishRefusal::BackendRefused`] when `check`
+    /// refuses a pointer.
+    pub fn begin_table_publish(
+        &self,
+        request: &crate::environments::PublishRequest,
+        take_over: bool,
+        check: &dyn Fn(&crate::environments::EnvPointer) -> Result<(), String>,
+    ) -> Result<crate::environments::PublishRecord, StateError> {
+        self.publish_txn(request, PublishKind::TableStart { take_over, check })
+    }
+
+    /// Record the outcome of the table publish `started` (RV1-P3): one
+    /// `Finished` history row, and a head whose pointers move only for the
+    /// models whose table now serves the version. Clears `publishing`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StateError::PublishConflict`] when the head is not `started`.
+    /// - [`crate::environments::EnvironmentError::FinishMismatch`] when the
+    ///   head is not publishing `started`, the `Started` row is missing, or
+    ///   `moves` does not name every planned model once, in order.
+    ///
+    /// Nothing is written on any error.
+    pub fn finish_table_publish(
+        &self,
+        env: &crate::environments::EnvironmentName,
+        started: &str,
+        moves: &[crate::environments::TableMove],
+        principal: &crate::config::PrincipalRef,
+    ) -> Result<crate::environments::PublishRecord, StateError> {
         use crate::environments::{
-            EnvironmentError, EnvironmentRecord, PublishRecord, PublishScope, history_key,
-            publish_id, resolve_pointer,
+            EnvironmentError, EnvironmentRecord, PublishRecord, PublishScope, TablePublish,
+            history_key, publish_id,
+        };
+        let mismatch = |reason: String| -> StateError {
+            EnvironmentError::FinishMismatch {
+                publish_id: started.to_string(),
+                reason,
+            }
+            .into()
+        };
+        let txn = self.db.begin_write()?;
+        let record = {
+            let mut envs = txn.open_table(ENVIRONMENTS)?;
+            let current: Option<EnvironmentRecord> = match envs.get(env.as_str())? {
+                Some(v) => Some(serde_json::from_slice(v.value())?),
+                None => None,
+            };
+            let found = current.as_ref().map(|c| c.head_publish_id.clone());
+            let Some(current) = current.filter(|c| c.head_publish_id == started) else {
+                return Err(StateError::PublishConflict {
+                    env: env.to_string(),
+                    expected: Some(started.to_string()),
+                    found,
+                });
+            };
+            if current.publishing.as_deref() != Some(started) {
+                return Err(mismatch("the environment is not publishing it".into()));
+            }
+            let mut history = txn.open_table(PUBLISH_HISTORY)?;
+            let start_key = history_key(env, current.seq);
+            let start: PublishRecord = match history.get(start_key.as_str())? {
+                Some(v) => serde_json::from_slice(v.value())?,
+                None => return Err(mismatch(format!("history row {start_key:?} is missing"))),
+            };
+            let Some(TablePublish::Started { planned }) = &start.tables else {
+                return Err(mismatch(
+                    "its history row is not a started table publish".into(),
+                ));
+            };
+            let named: Vec<&str> = moves.iter().map(|m| m.model.as_str()).collect();
+            let planned_ref: Vec<&str> = planned.iter().map(String::as_str).collect();
+            if named != planned_ref {
+                return Err(mismatch(format!(
+                    "the outcome names {named:?}, the plan is {planned_ref:?}"
+                )));
+            }
+
+            let mut to = std::collections::BTreeMap::new();
+            for m in moves.iter().filter(|m| m.outcome.serves_version()) {
+                let pointer = start.to.get(&m.model).ok_or_else(|| {
+                    mismatch(format!("the started row has no pointer for {:?}", m.model))
+                })?;
+                to.insert(m.model.clone(), pointer.clone());
+            }
+            let seq = current
+                .seq
+                .checked_add(1)
+                .ok_or(EnvironmentError::SeqOverflow {
+                    environment: env.to_string(),
+                    seq: current.seq,
+                })?;
+            let mut pointers = current.pointers;
+            let from: std::collections::BTreeMap<_, _> = to
+                .keys()
+                .filter_map(|m| pointers.get(m).map(|p| (m.clone(), p.clone())))
+                .collect();
+            for (model, pointer) in &to {
+                pointers.insert(model.clone(), pointer.clone());
+            }
+            let now = chrono::Utc::now();
+            let id = publish_id(env, seq);
+            let record = PublishRecord {
+                publish_id: id.clone(),
+                environment: env.clone(),
+                seq,
+                prior_publish_id: Some(started.to_string()),
+                principal: principal.clone(),
+                published_at: now,
+                from,
+                to,
+                plan_id: start.plan_id.clone(),
+                scope: PublishScope::DeltaPerTable,
+                tables: Some(TablePublish::Finished {
+                    started: started.to_string(),
+                    moves: moves.to_vec(),
+                }),
+            };
+            let head = EnvironmentRecord {
+                name: env.clone(),
+                seq,
+                head_publish_id: id,
+                pointers,
+                updated_at: now,
+                updated_by: principal.clone(),
+                publishing: None,
+            };
+            let key = history_key(env, seq);
+            if history.get(key.as_str())?.is_some() {
+                return Err(EnvironmentError::HistoryRowExists { key }.into());
+            }
+            history.insert(key.as_str(), serde_json::to_vec(&record)?.as_slice())?;
+            envs.insert(env.as_str(), serde_json::to_vec(&head)?.as_slice())?;
+            record
+        };
+        self.commit_write(txn)?;
+        Ok(record)
+    }
+
+    fn publish_txn(
+        &self,
+        request: &crate::environments::PublishRequest,
+        kind: PublishKind<'_>,
+    ) -> Result<crate::environments::PublishRecord, StateError> {
+        use crate::environments::{
+            EnvironmentError, EnvironmentRecord, PublishRecord, PublishScope, TablePublish,
+            history_key, publish_id, resolve_pointer,
         };
         let env = &request.environment;
         if request.sources.is_empty() {
@@ -8952,6 +9118,25 @@ impl StateStore {
                     found,
                 });
             }
+            // A table publish that has not finished may have moved some
+            // tables. A publish on top of it would make state disagree with
+            // the tables, so only an explicit take-over may start.
+            if let Some(in_progress) = current.as_ref().and_then(|c| c.publishing.clone()) {
+                let take_over = matches!(
+                    kind,
+                    PublishKind::TableStart {
+                        take_over: true,
+                        ..
+                    }
+                );
+                if !take_over {
+                    return Err(EnvironmentError::PublishInProgress {
+                        environment: env.to_string(),
+                        publish_id: in_progress,
+                    }
+                    .into());
+                }
+            }
 
             let runs = txn.open_table(RUN_HISTORY)?;
             let mut to = std::collections::BTreeMap::new();
@@ -8960,13 +9145,17 @@ impl StateStore {
                     Some(v) => Some(serde_json::from_slice(v.value())?),
                     None => None,
                 };
-                let pointer = resolve_pointer(source, run.as_ref()).map_err(|reason| {
-                    EnvironmentError::Refused {
-                        environment: env.to_string(),
-                        model: source.model.clone(),
-                        reason,
-                    }
-                })?;
+                let refused = |reason| EnvironmentError::Refused {
+                    environment: env.to_string(),
+                    model: source.model.clone(),
+                    reason,
+                };
+                let pointer = resolve_pointer(source, run.as_ref()).map_err(refused)?;
+                if let PublishKind::TableStart { check, .. } = kind {
+                    check(&pointer).map_err(|reason| {
+                        refused(crate::environments::PublishRefusal::BackendRefused { reason })
+                    })?;
+                }
                 to.insert(source.model.clone(), pointer);
             }
             drop(runs);
@@ -8985,11 +9174,24 @@ impl StateStore {
                 .keys()
                 .filter_map(|m| pointers.get(m).map(|p| (m.clone(), p.clone())))
                 .collect();
-            for (model, pointer) in &to {
-                pointers.insert(model.clone(), pointer.clone());
-            }
             let now = chrono::Utc::now();
             let id = publish_id(env, seq);
+            let (scope, tables, publishing) = match kind {
+                PublishKind::StateOnly => {
+                    for (model, pointer) in &to {
+                        pointers.insert(model.clone(), pointer.clone());
+                    }
+                    (PublishScope::StateOnly, None, None)
+                }
+                // The head keeps its pointers until the outcome is recorded.
+                PublishKind::TableStart { .. } => (
+                    PublishScope::DeltaPerTable,
+                    Some(TablePublish::Started {
+                        planned: to.keys().cloned().collect(),
+                    }),
+                    Some(id.clone()),
+                ),
+            };
             let record = PublishRecord {
                 publish_id: id.clone(),
                 environment: env.clone(),
@@ -9000,7 +9202,8 @@ impl StateStore {
                 from,
                 to,
                 plan_id: request.plan_id.clone(),
-                scope: PublishScope::StateOnly,
+                scope,
+                tables,
             };
             let head = EnvironmentRecord {
                 name: env.clone(),
@@ -9009,6 +9212,7 @@ impl StateStore {
                 pointers,
                 updated_at: now,
                 updated_by: request.principal.clone(),
+                publishing,
             };
 
             let mut history = txn.open_table(PUBLISH_HISTORY)?;
@@ -9023,6 +9227,18 @@ impl StateStore {
         self.commit_write(txn)?;
         Ok(record)
     }
+}
+
+/// Which publish [`StateStore::publish_txn`] writes.
+#[derive(Clone, Copy)]
+enum PublishKind<'a> {
+    /// RV1-P2: move state pointers only.
+    StateOnly,
+    /// RV1-P3: claim the environment for a table publish.
+    TableStart {
+        take_over: bool,
+        check: &'a dyn Fn(&crate::environments::EnvPointer) -> Result<(), String>,
+    },
 }
 
 /// Test support: make the store at `path` look like one a v31 binary wrote —
