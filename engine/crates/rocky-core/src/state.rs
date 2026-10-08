@@ -972,8 +972,8 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   differently, which is the v31 lesson above.
 ///
 /// - **[`PolicyDecisionRecord::fail_closed`]** (#1829, at v32). Marks a
-///   `deny` written by the fail-closed floor (ledger snapshot unreadable)
-///   rather than by policy. Only the review queue reads it, to let a policy
+///   `deny` written by the fail-closed floor (ledger snapshot unreadable) or
+///   forced by an active freeze, rather than by policy. Only the review queue reads it, to let a policy
 ///   `deny` supersede an older `require_review`; it is not an enforcement
 ///   input, so a binary that ignores it enforces the same. It is omitted when
 ///   `false`, so a row without it is byte-identical to an older row. A row
@@ -7877,13 +7877,17 @@ pub struct PolicyDecisionRecord {
     /// rows were offered for sampling (#1815, review round seven).
     #[serde(default)]
     pub keys_recorded: bool,
-    /// Whether this `deny` is the fail-closed floor and not a policy verdict.
+    /// Whether this `deny` is operational (the fail-closed floor or a freeze)
+    /// and not a policy verdict.
     ///
-    /// `true` only when the gate denied because it could not read the policy
+    /// `true` when the gate denied because it could not read the policy
     /// ledger snapshot, so an active freeze or an exhausted budget would have
-    /// been invisible. That is an operational refusal: it says nothing about
+    /// been invisible, or because an active freeze turned a non-`deny` policy
+    /// effect into `deny`. Both are transient refusals: they say nothing about
     /// whether the plan needs review. `false` for every policy verdict, for
-    /// every non-`deny` row, and for a row written before this field existed.
+    /// every non-`deny` row, and for a row written before this field existed
+    /// (the review queue also recognises a legacy floor row by its reason
+    /// text).
     ///
     /// Read by the review queue only, to decide whether a later `deny`
     /// supersedes an older `require_review` (#1829). No gate reads it, so it

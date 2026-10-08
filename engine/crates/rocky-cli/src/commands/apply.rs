@@ -2607,6 +2607,14 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
 /// not be durably persisted — the autonomy-budget / verify_after pair must be
 /// durable, so the mutation is refused rather than proceeding with an incomplete
 /// budget trail (finding 6).
+/// The fixed text the fail-closed floor in [`evaluate_apply_policy_core`]
+/// writes at the end of its `deny` reason. Unchanged since the floor shipped
+/// (#1084), so the review queue can recognise a floor deny on a ledger row
+/// written before [`PolicyDecisionRecord::fail_closed`] existed, or by an
+/// older binary on a shared ledger. Do not reword it.
+pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
+    "(fail-closed deny; a review marker cannot satisfy it)";
+
 fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &str) -> PolicyGate {
     PolicyGate::Deny {
         model: touched
@@ -2840,10 +2848,15 @@ pub(crate) fn evaluate_apply_policy_core(
             reason.push_str("; ");
             reason.push_str(&suffix);
         }
-        // Set only where the floor itself turns a non-deny into a deny. A
-        // policy `deny` that happens to meet an unreadable ledger stays a
-        // policy verdict.
-        let mut fail_closed = false;
+        // Set only where an operational state, not the policy, turns a
+        // non-deny into a deny: an active freeze (ledger row or marker), or
+        // the floor below. Both are transient and say nothing about whether
+        // the plan needs review, so such a deny must not supersede an older
+        // `require_review` in the queue. A policy `deny` that happens to meet
+        // a freeze or an unreadable ledger stays a policy verdict.
+        let mut fail_closed = decision.effect != PolicyEffect::Deny
+            && effect == PolicyEffect::Deny
+            && matches!(degradation, policy::AutonomyDegradation::Frozen { .. });
         if snapshot_unreadable
             && principal == PolicyPrincipal::Agent
             && effect != PolicyEffect::Deny
@@ -2852,8 +2865,9 @@ pub(crate) fn evaluate_apply_policy_core(
             fail_closed = true;
             reason.push_str(
                 "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
-                 refused (fail-closed deny; a review marker cannot satisfy it)",
+                 refused ",
             );
+            reason.push_str(FAIL_CLOSED_FLOOR_MARKER);
         }
 
         record(&PolicyDecisionRecord {
@@ -9123,6 +9137,60 @@ effect = "allow"
         let floor = run("allow")?;
         assert_eq!(floor.effect, PolicyEffect::Deny);
         assert!(floor.fail_closed, "the floor's deny is operational");
+        let policy_deny = run("deny")?;
+        assert_eq!(policy_deny.effect, PolicyEffect::Deny);
+        assert!(!policy_deny.fail_closed, "a policy deny is a verdict");
+        Ok(())
+    }
+
+    /// A deny forced by an active freeze is operational, like the floor: it
+    /// sets `fail_closed`, so it does not supersede an older escalation in the
+    /// review queue. A policy `deny` that also meets the freeze stays a verdict.
+    #[test]
+    fn a_freeze_deny_is_fail_closed_and_a_policy_deny_under_freeze_is_not() -> anyhow::Result<()> {
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let freeze = rocky_core::freeze_marker::ActiveMarkerFreeze {
+            freeze_id: "f1".to_string(),
+            principal: Some(PolicyPrincipal::Agent),
+            scope: "any".to_string(),
+            reason: "incident".to_string(),
+            created_at: None,
+        };
+        let run = |effect: &str| -> anyhow::Result<PolicyDecisionRecord> {
+            let dir = tempfile::tempdir()?;
+            let config = write_config(
+                dir.path(),
+                &format!(
+                    "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                     scope = {{ any = true }}\neffect = \"{effect}\"\n"
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&config)?
+                .policy
+                .expect("policy block");
+            let mut rows = Vec::new();
+            super::evaluate_apply_policy_core(
+                &policy,
+                "plan_x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                &BTreeMap::new(),
+                super::GateSubjects::CompiledModels,
+                &[],
+                std::slice::from_ref(&freeze),
+                false,
+                |r| rows.push(r.clone()),
+            );
+            assert_eq!(rows.len(), 1);
+            Ok(rows.remove(0))
+        };
+        let frozen = run("allow")?;
+        assert_eq!(frozen.effect, PolicyEffect::Deny);
+        assert!(frozen.fail_closed, "the freeze's deny is operational");
+        let frozen_review = run("require_review")?;
+        assert_eq!(frozen_review.effect, PolicyEffect::Deny);
+        assert!(frozen_review.fail_closed);
         let policy_deny = run("deny")?;
         assert_eq!(policy_deny.effect, PolicyEffect::Deny);
         assert!(!policy_deny.fail_closed, "a policy deny is a verdict");
