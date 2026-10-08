@@ -981,6 +981,18 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   honest default: the older row cannot say. Guarded by
 ///   `test_v32_policy_decision_fail_closed_defaults_false_and_round_trips`.
 ///
+/// - **[`PolicyDecisionRecord::seq`]** (#2293, at v32). The insertion order of
+///   a ledger row, stamped by the store. Only the review queue reads it, to
+///   pick the latest row per `(plan, model)` when the clock stepped back; it is
+///   not an enforcement input, so a binary that ignores it enforces the same.
+///   It is omitted when `0`, so a row without it is byte-identical to an older
+///   row. A row from before the field reads back `0`, which sorts before every
+///   stamped row. Guarded by
+///   `test_v32_policy_decision_seq_is_stamped_in_insertion_order`.
+///
+///   **Gates still order by `timestamp`** (`active_freezes`). A gate that reads
+///   `seq` MUST bump, because an older binary would pick a different freeze.
+///
 /// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
 ///   identity of each model output. Nothing read it in P1b; it was recorded
 ///   only. A v31 binary without the field ignores it and drops nothing it
@@ -7076,16 +7088,31 @@ impl StateStore {
     /// (`rocky apply` / promote), for both `allow` and gate (`require_review`
     /// / `deny`) outcomes. Reads are never recorded — they short-circuit
     /// before evaluation. Idempotent for an identical `(timestamp, plan_id,
-    /// model)` triple (re-recording overwrites the same row).
+    /// model)` triple (re-recording overwrites the same row, with a new
+    /// [`PolicyDecisionRecord::seq`]).
+    ///
+    /// The store stamps `seq`; the value on `decision` is ignored.
     pub fn record_policy_decision(
         &self,
         decision: &PolicyDecisionRecord,
     ) -> Result<(), StateError> {
         let key = policy_decision_key(&decision.timestamp, &decision.plan_id, &decision.model);
-        let bytes = serde_json::to_vec(decision)?;
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(POLICY_DECISIONS)?;
+            // Stamp the insertion sequence inside the write transaction, so
+            // two writers cannot take the same number. The key sorts by
+            // timestamp, so the highest sequence needs a scan of the ledger.
+            let mut max_seq = 0u64;
+            for entry in table.iter()? {
+                let (_key, value) = entry?;
+                if let Ok(probe) = serde_json::from_slice::<PolicyDecisionSeqProbe>(value.value()) {
+                    max_seq = max_seq.max(probe.seq);
+                }
+            }
+            let mut stamped = decision.clone();
+            stamped.seq = max_seq.saturating_add(1);
+            let bytes = serde_json::to_vec(&stamped)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
         self.commit_write(txn)?;
@@ -7938,6 +7965,32 @@ pub struct PolicyDecisionRecord {
         deserialize_with = "deserialize_principal_ref_lenient"
     )]
     pub principal_ref: Option<crate::config::PrincipalRef>,
+    /// Insertion order in this ledger: the store stamps `max + 1` on every
+    /// [`StateStore::record_policy_decision`]. `0` means a row written before
+    /// the field existed, which sorts before every stamped row.
+    ///
+    /// The storage key sorts by `timestamp`, so a clock that stepped back
+    /// makes a newer row look older. The review queue (and the brief that
+    /// reuses it) orders by `(seq, timestamp)` to pick the latest row (#2293).
+    /// `timestamp` stays the display value.
+    ///
+    /// Read by the review queue only. No gate reads it (a gate that did would
+    /// decide differently on an older binary, so it would need a schema bump);
+    /// see "Fields added without a bump" above [`CURRENT_SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "is_zero_seq")]
+    pub seq: u64,
+}
+
+fn is_zero_seq(seq: &u64) -> bool {
+    *seq == 0
+}
+
+/// Reads only [`PolicyDecisionRecord::seq`] from a stored row, so stamping a
+/// new row does not parse every field of every old one.
+#[derive(serde::Deserialize)]
+struct PolicyDecisionSeqProbe {
+    #[serde(default)]
+    seq: u64,
 }
 
 /// Lenient reader for [`PolicyDecisionRecord::principal_ref`]: any value that
@@ -13571,6 +13624,7 @@ mod tests {
 
         let (store, _dir) = temp_store();
         let row = PolicyDecisionRecord {
+            seq: 0,
             timestamp: Utc::now(),
             plan_id: "plan-new".to_string(),
             principal: PolicyPrincipal::Human,
@@ -13593,10 +13647,15 @@ mod tests {
 
         // This build reads its own row back with the actor intact.
         let back = store.list_policy_decisions().unwrap();
-        assert_eq!(back, vec![row.clone()]);
+        let stamped = PolicyDecisionRecord {
+            seq: 1,
+            ..row.clone()
+        };
+        assert_eq!(back, vec![stamped.clone()]);
 
-        // The pre-P1 shape reads the same bytes and ignores the actor.
-        let bytes = serde_json::to_vec(&row).unwrap();
+        // The pre-P1 shape reads the same bytes (with the stamped `seq`) and
+        // ignores the actor.
+        let bytes = serde_json::to_vec(&stamped).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("\"principal_ref\""));
         let old: PreP1PolicyDecisionRecord = serde_json::from_slice(&bytes)
             .expect("a pre-P1 v31 binary must read a row that carries principal_ref");
@@ -16072,6 +16131,7 @@ mod tests {
         let (store, _dir) = temp_store();
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -16090,6 +16150,7 @@ mod tests {
             principal_ref: None,
         };
         let later = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -16110,11 +16171,20 @@ mod tests {
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
         store.record_policy_decision(&earlier).unwrap();
+        // The store stamps the insertion order: `later` went in first.
+        let later_stamped = PolicyDecisionRecord {
+            seq: 1,
+            ..later.clone()
+        };
+        let earlier_stamped = PolicyDecisionRecord {
+            seq: 2,
+            ..earlier.clone()
+        };
 
         let all = store.list_policy_decisions().unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0], earlier, "oldest decision first");
-        assert_eq!(all[1], later);
+        assert_eq!(all[0], earlier_stamped, "oldest decision first");
+        assert_eq!(all[1], later_stamped);
     }
 
     /// A pre-v28 policy decision — one whose blob has no `models` key — must
@@ -16132,6 +16202,7 @@ mod tests {
 
         // A full record serialized with `models` stripped — a v27 blob.
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: vec!["dim_customer".to_string()],
@@ -16180,6 +16251,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: true,
             fail_closed: false,
             models: Vec::new(),
@@ -16221,6 +16293,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let mut record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: true,
             fail_closed: false,
             models: Vec::new(),
@@ -16249,7 +16322,58 @@ mod tests {
         record.fail_closed = true;
         let (store, _dir) = temp_store();
         store.record_policy_decision(&record).unwrap();
+        // The store stamps the insertion sequence; nothing else changes.
+        record.seq = 1;
         assert_eq!(store.list_policy_decisions().unwrap(), vec![record]);
+    }
+
+    /// #2293: the store stamps an insertion sequence, so a row written after
+    /// the clock stepped back is still the later one by `seq` although it sorts
+    /// first by timestamp. A row from before the field reads `0`, and `0` is
+    /// omitted on write. Guards the no-bump decision for `seq`.
+    #[test]
+    fn test_v32_policy_decision_seq_is_stamped_in_insertion_order() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let row = |ts: &str, plan: &str| PolicyDecisionRecord {
+            seq: 0,
+            keys_recorded: true,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: plan.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: String::new(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        };
+        let plain = serde_json::to_value(row("2026-10-08T10:00:00Z", "p")).unwrap();
+        assert!(plain.get("seq").is_none(), "0 is omitted on write");
+        let read: PolicyDecisionRecord = serde_json::from_value(plain).unwrap();
+        assert_eq!(read.seq, 0, "a row from before the field reads 0");
+
+        let (store, _dir) = temp_store();
+        store
+            .record_policy_decision(&row("2026-10-08T10:00:00Z", "first"))
+            .unwrap();
+        // The clock stepped back five minutes.
+        store
+            .record_policy_decision(&row("2026-10-08T09:55:00Z", "second"))
+            .unwrap();
+        let rows = store.list_policy_decisions().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Storage order is still by timestamp ...
+        assert_eq!(rows[0].plan_id, "second");
+        assert_eq!(rows[1].plan_id, "first");
+        // ... and `seq` says which was written last.
+        assert_eq!((rows[0].seq, rows[1].seq), (2, 1));
     }
 
     /// `graph_keys` yields the model set when there is one and the single
@@ -16265,6 +16389,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let base = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -16294,6 +16419,7 @@ mod tests {
         // keeps the audit screen's `subject={entry.model}` custody link
         // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
@@ -16306,6 +16432,7 @@ mod tests {
 
         // An ordinary row: `model` is the graph key and there is no set.
         let ordinary = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -16324,6 +16451,7 @@ mod tests {
 
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -17121,6 +17249,7 @@ mod tests {
             let store = StateStore::open(&path).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
                     models: Vec::new(),

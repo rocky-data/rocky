@@ -6636,6 +6636,7 @@ mod tests {
             let store = StateStore::open(&pod_a).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
                     models: Vec::new(),
@@ -6654,6 +6655,7 @@ mod tests {
                 .unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
                     models: Vec::new(),
@@ -7653,6 +7655,7 @@ mod tests {
 
     fn seam_policy_record(plan_id: &str) -> crate::state::PolicyDecisionRecord {
         crate::state::PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),

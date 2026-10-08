@@ -1071,6 +1071,7 @@ pub fn run_policy_freeze(
             });
         }
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1916,6 +1917,7 @@ max_retries = 0
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let harness = CrossPodHarness::new_s3_like();
         let winner = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1981,7 +1983,11 @@ max_retries = 0
             .unwrap();
         assert_eq!(
             local_rows,
-            vec![winner.clone()],
+            // The store stamped the winner's insertion sequence.
+            vec![PolicyDecisionRecord {
+                seq: 1,
+                ..winner.clone()
+            }],
             "the local state must contain only the remote winner; the losing freeze row must \
              not remain visible"
         );
