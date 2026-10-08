@@ -3984,7 +3984,9 @@ pub async fn run_with_explicit_contracts(
     // (models-dir lookup, freeze fence, state acquire/open/finalize), settles
     // here: one `pipeline_complete` or `pipeline_error` for the
     // `pipeline_start` fired above, then the async webhooks drain (#2317).
-    // The error hook runs while the remote state lock may still be held.
+    // Each arm has finalized or abandoned its remote-state session by now, so the
+    // end hook runs after the lock is released. Still to run after it: the
+    // retention sweep and releasing the idempotency claim.
     if !matches!(
         &pipeline_config,
         rocky_core::config::PipelineConfig::Replication(_)
