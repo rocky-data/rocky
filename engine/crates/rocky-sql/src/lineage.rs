@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CastKind, Expr, GroupByExpr, JoinConstraint, JoinOperator, NamedWindowDefinition,
-    NamedWindowExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value, Visit, Visitor, WindowSpec, WindowType,
+    CastKind, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, NamedWindowDefinition,
+    NamedWindowExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Value, Visit, Visitor, WindowSpec, WindowType,
 };
 use sqlparser::parser::Parser;
 
@@ -94,6 +94,11 @@ pub enum RowSelectionKind {
     WindowPartition,
     /// A window function's `ORDER BY` key.
     WindowOrder,
+    /// A `DISTINCT ON (...)` key: it picks one row per key value.
+    DistinctOn,
+    /// An `ORDER BY` key of a query that also has `LIMIT`, `FETCH` or `TOP`:
+    /// the order decides which rows survive the cut.
+    OrderLimit,
 }
 
 impl fmt::Display for RowSelectionKind {
@@ -106,6 +111,8 @@ impl fmt::Display for RowSelectionKind {
             RowSelectionKind::Qualify => "qualify",
             RowSelectionKind::WindowPartition => "window_partition",
             RowSelectionKind::WindowOrder => "window_order",
+            RowSelectionKind::DistinctOn => "distinct_on",
+            RowSelectionKind::OrderLimit => "order_limit",
         };
         f.write_str(label)
     }
@@ -117,8 +124,8 @@ impl fmt::Display for RowSelectionKind {
 /// Extracted from the top-level `SELECT` only. Not covered (no edge is
 /// recorded): predicates inside a derived table, a `WITH` body or a subquery
 /// expression (`IN (SELECT …)`, `EXISTS`), correlated references, `GROUP BY
-/// ALL`, `NATURAL` joins, `DISTINCT ON`, `ORDER BY … LIMIT` and set
-/// operations. An unqualified column in a multi-table query keeps
+/// ALL`, `NATURAL` joins (the shared columns are known only to the warehouse
+/// catalog) and set operations. An unqualified column in a multi-table query keeps
 /// `source_table = None` because its table cannot be determined statically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RowSelectionLineage {
@@ -369,7 +376,52 @@ fn collect_nested(inner: &LineageResult, out: &mut Vec<String>) {
 fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<LineageResult, String> {
     let ctes = bind_cte_names(query, outer_ctes);
     let nested_sources = walk_cte_bodies(query, outer_ctes);
-    extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)
+    let mut result = extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)?;
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        let edges = extract_order_limit(query, select, &result.source_tables);
+        for edge in edges {
+            if !result.row_selection.contains(&edge) {
+                result.row_selection.push(edge);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// `ORDER BY` keys of a query that also cuts its rows (`LIMIT`, `FETCH`,
+/// `TOP`). Without a cut the order only arranges rows, so no edge is made.
+fn extract_order_limit(
+    query: &Query,
+    select: &Select,
+    source_tables: &[TableReference],
+) -> Vec<RowSelectionLineage> {
+    let cuts = query.limit_clause.is_some() || query.fetch.is_some() || select.top.is_some();
+    let Some(order_by) = &query.order_by else {
+        return Vec::new();
+    };
+    let OrderByKind::Expressions(keys) = &order_by.kind else {
+        return Vec::new();
+    };
+    if !cuts {
+        return Vec::new();
+    }
+    let alias_map = build_alias_map(source_tables);
+    let projection = projection_exprs(&select.projection);
+    let mut out: Vec<RowSelectionLineage> = Vec::new();
+    for key in keys {
+        for (qualifier, column) in refs_with_projection_substitution(&key.expr, &projection, true) {
+            let edge = RowSelectionLineage {
+                source_table: resolve_ref_table(qualifier.as_deref(), &alias_map, source_tables),
+                source_column: column,
+                kind: RowSelectionKind::OrderLimit,
+                target_column: None,
+            };
+            if !out.contains(&edge) {
+                out.push(edge);
+            }
+        }
+    }
+    out
 }
 
 /// Lineage of one query body, with `nested_sources` already gathered from the
@@ -1046,6 +1098,18 @@ fn extract_row_selection(
                 Some(JoinConstraint::Natural | JoinConstraint::None) | None => {}
             }
             preceding.push(right);
+        }
+    }
+
+    // DISTINCT ON (...) keys.
+    if let Some(Distinct::On(keys)) = &select.distinct {
+        let projection = projection_exprs(&select.projection);
+        for key in keys {
+            push(
+                refs_with_projection_substitution(key, &projection, true),
+                RowSelectionKind::DistinctOn,
+                None,
+            );
         }
     }
 
@@ -1838,6 +1902,76 @@ mod tests {
         edges.iter().any(|(t, c, k, tc)| {
             t.as_deref() == table && c == column && *k == kind && tc.as_deref() == target
         })
+    }
+
+    #[test]
+    fn distinct_on_keys_are_row_selection_edges() {
+        let edges = row_sel(
+            "SELECT DISTINCT ON (customer_id) customer_id, amount FROM raw.orders \
+             ORDER BY customer_id, created_at DESC",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::DistinctOn,
+            None
+        ));
+        // No LIMIT: the ORDER BY alone is not a row selection.
+        assert!(!edges.iter().any(|e| e.2 == RowSelectionKind::OrderLimit));
+    }
+
+    #[test]
+    fn order_by_with_limit_keys_are_row_selection_edges() {
+        let edges = row_sel(
+            "SELECT o.order_id, o.amount AS amt FROM raw.orders o \
+             ORDER BY amt DESC, o.created_at LIMIT 10",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "amount",
+            RowSelectionKind::OrderLimit,
+            None
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "created_at",
+            RowSelectionKind::OrderLimit,
+            None
+        ));
+    }
+
+    #[test]
+    fn order_by_without_limit_is_not_a_row_selection() {
+        let edges = row_sel("SELECT order_id FROM raw.orders ORDER BY created_at");
+        assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    #[test]
+    fn order_by_with_fetch_first_is_a_row_selection() {
+        let edges =
+            row_sel("SELECT order_id FROM raw.orders ORDER BY created_at FETCH FIRST 3 ROWS ONLY");
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "created_at",
+            RowSelectionKind::OrderLimit,
+            None
+        ));
+    }
+
+    /// `NATURAL JOIN` keys are the columns both sides share. Only the warehouse
+    /// catalog knows them, so the extractor cannot name them from SQL text.
+    /// Pinned so a future schema-aware pass notices this test.
+    #[test]
+    fn natural_join_keys_are_not_resolvable_from_sql_text() {
+        let edges = row_sel("SELECT a.x FROM raw.a a NATURAL JOIN raw.b b");
+        assert!(
+            !edges.iter().any(|e| e.2 == RowSelectionKind::JoinKey),
+            "{edges:?}"
+        );
     }
 
     #[test]

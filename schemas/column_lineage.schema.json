@@ -40,7 +40,7 @@
       "description": "One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.",
       "properties": {
         "kind": {
-          "description": "`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.",
+          "description": "`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on` or `order_limit`.",
           "type": "string"
         },
         "source": {

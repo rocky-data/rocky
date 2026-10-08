@@ -40,7 +40,7 @@ export interface LineageQualifiedColumn {
  */
 export interface RowSelectionEdgeRecord {
   /**
-   * `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.
+   * `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on` or `order_limit`.
    */
   kind: string;
   /**

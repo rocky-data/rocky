@@ -3620,7 +3620,7 @@ pub struct LineageConsumerImpact {
     pub columns: Vec<String>,
     /// How the consumer reads the column: `value`, or a row-selection kind
     /// (`join_key`, `filter`, `group_by`, `having`, `qualify`,
-    /// `window_partition`, `window_order`).
+    /// `window_partition`, `window_order`, `distinct_on`, `order_limit`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via: Vec<String>,
     /// One-line, human-readable explanation of the classification.
@@ -3725,7 +3725,7 @@ pub struct RowSelectionEdgeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_column: Option<String>,
     /// `join_key`, `filter`, `group_by`, `having`, `qualify`,
-    /// `window_partition` or `window_order`.
+    /// `window_partition`, `window_order`, `distinct_on` or `order_limit`.
     pub kind: String,
 }
 

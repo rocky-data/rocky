@@ -181,7 +181,7 @@
           "$ref": "#/definitions/ConsumerImpactStatus"
         },
         "via": {
-          "description": "How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`).",
+          "description": "How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on`, `order_limit`).",
           "items": {
             "type": "string"
           },
