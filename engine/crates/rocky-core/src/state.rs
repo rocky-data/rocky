@@ -7101,19 +7101,40 @@ impl StateStore {
         {
             let mut table = txn.open_table(POLICY_DECISIONS)?;
             // Stamp the insertion sequence inside the write transaction, so
-            // two writers cannot take the same number. The key sorts by
-            // timestamp, so the highest sequence needs a scan of the ledger.
-            let mut max_seq = 0u64;
-            for entry in table.iter()? {
-                let (_key, value) = entry?;
-                if let Ok(probe) = serde_json::from_slice::<PolicyDecisionSeqProbe>(value.value()) {
-                    max_seq = max_seq.max(probe.seq);
+            // two writers cannot take the same number. The counter lives in
+            // METADATA, which replicates with this table, so a download
+            // replaces both together. It records the row count it saw; a
+            // count that no longer matches means the table changed without
+            // the counter (older binary, partial restore), so the next stamp
+            // re-reads the ledger once instead of trusting a stale number.
+            let mut metadata = txn.open_table(METADATA)?;
+            let rows = table.len()?;
+            let stored = metadata
+                .get(POLICY_DECISION_SEQ_KEY)?
+                .and_then(|v| parse_policy_seq_counter(v.value()));
+            let last_seq = match stored {
+                Some((seq, count)) if count == rows => seq,
+                _ => {
+                    let mut max_seq = 0u64;
+                    for entry in table.iter()? {
+                        let (_key, value) = entry?;
+                        #[cfg(test)]
+                        POLICY_SEQ_ROWS_PARSED.with(|c| c.set(c.get() + 1));
+                        if let Ok(probe) =
+                            serde_json::from_slice::<PolicyDecisionSeqProbe>(value.value())
+                        {
+                            max_seq = max_seq.max(probe.seq);
+                        }
+                    }
+                    max_seq
                 }
-            }
+            };
             let mut stamped = decision.clone();
-            stamped.seq = max_seq.saturating_add(1);
+            stamped.seq = last_seq.saturating_add(1);
             let bytes = serde_json::to_vec(&stamped)?;
             table.insert(key.as_str(), bytes.as_slice())?;
+            let counter = format!("{}:{}", stamped.seq, table.len()?);
+            metadata.insert(POLICY_DECISION_SEQ_KEY, counter.as_str())?;
         }
         self.commit_write(txn)?;
         Ok(())
@@ -7983,6 +8004,21 @@ pub struct PolicyDecisionRecord {
 
 fn is_zero_seq(seq: &u64) -> bool {
     *seq == 0
+}
+
+/// [`METADATA`] key holding `"{last_seq}:{row_count}"` for the
+/// [`POLICY_DECISIONS`] sequence stamp, so a write does not scan the ledger.
+const POLICY_DECISION_SEQ_KEY: &str = "policy_decision_seq";
+
+fn parse_policy_seq_counter(value: &str) -> Option<(u64, u64)> {
+    let (seq, count) = value.split_once(':')?;
+    Some((seq.parse().ok()?, count.parse().ok()?))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Rows parsed by the one-time sequence scan, for the no-rescan test.
+    static POLICY_SEQ_ROWS_PARSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Reads only [`PolicyDecisionRecord::seq`] from a stored row, so stamping a
@@ -16374,6 +16410,75 @@ mod tests {
         assert_eq!(rows[1].plan_id, "first");
         // ... and `seq` says which was written last.
         assert_eq!((rows[0].seq, rows[1].seq), (2, 1));
+    }
+
+    #[test]
+    fn test_policy_decision_seq_counter_does_not_rescan_and_survives_a_download() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let row = |i: u32| PolicyDecisionRecord {
+            seq: 0,
+            keys_recorded: true,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-10-08T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: format!("p{i}"),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: String::new(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        };
+        let seqs = |s: &StateStore| -> Vec<u64> {
+            let mut v: Vec<u64> = s
+                .list_policy_decisions()
+                .unwrap()
+                .iter()
+                .map(|r| r.seq)
+                .collect();
+            v.sort();
+            v
+        };
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.redb");
+        let store = StateStore::open(&path).unwrap();
+        POLICY_SEQ_ROWS_PARSED.with(|c| c.set(0));
+        for i in 0..20 {
+            store.record_policy_decision(&row(i)).unwrap();
+        }
+        // Only the first write (an empty ledger) may scan; later writes read
+        // the counter, so no row is parsed at all.
+        assert_eq!(POLICY_SEQ_ROWS_PARSED.with(std::cell::Cell::get), 0);
+        assert_eq!(seqs(&store), (1..=20).collect::<Vec<u64>>());
+
+        // A download replaces the whole file (table and counter together).
+        drop(store);
+        let other = dir.path().join("b.redb");
+        std::fs::copy(&path, &other).unwrap();
+        let downloaded = StateStore::open(&other).unwrap();
+        downloaded.record_policy_decision(&row(100)).unwrap();
+        assert_eq!(seqs(&downloaded).last(), Some(&21));
+
+        // A counter that fell behind the table (rows added without it) is
+        // caught by the row count and re-read once, never reused.
+        {
+            let txn = downloaded.db.begin_write().unwrap();
+            {
+                let mut m = txn.open_table(METADATA).unwrap();
+                m.insert(POLICY_DECISION_SEQ_KEY, "3:3").unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        downloaded.record_policy_decision(&row(101)).unwrap();
+        assert_eq!(seqs(&downloaded).last(), Some(&22));
+        assert!(POLICY_SEQ_ROWS_PARSED.with(std::cell::Cell::get) >= 21);
     }
 
     /// `graph_keys` yields the model set when there is one and the single
