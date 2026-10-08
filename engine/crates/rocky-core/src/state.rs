@@ -3004,6 +3004,18 @@ pub fn partitioned_output_blake3(file_hashes: &[String]) -> String {
 }
 
 impl OutputVersion {
+    /// The warehouse table this version names, or `None` for an
+    /// unversioned output.
+    #[must_use]
+    pub fn table(&self) -> Option<&str> {
+        match self {
+            Self::ContentAddressed { table, .. }
+            | Self::DeltaObserved { table, .. }
+            | Self::WarehouseJob { table, .. } => Some(table),
+            Self::Unversioned { .. } => None,
+        }
+    }
+
     /// Build [`OutputVersion::ContentAddressed`] from the commit versions and
     /// per-file hashes of one execution. Both are sorted; the versions lose
     /// repeats. `partitioned` selects the whole-output identity: the
@@ -8926,12 +8938,18 @@ impl StateStore {
     /// `publishing`, so every other publish is refused until
     /// [`Self::finish_table_publish`] records the outcome.
     ///
-    /// `take_over` lets this publish start from a head whose own table
-    /// publish never finished (its process died). The caller must name that
-    /// head as `expected_head`. Use it only when the other publisher is known
-    /// to be dead. A live publisher taken over stops before its next table
-    /// move ([`crate::table_publish::publish_tables`] reads the head first),
-    /// so it can still move the one table in flight.
+    /// `options.take_over` lets this publish start from a head whose own
+    /// table publish never finished (its process died). The caller must name
+    /// that head as `expected_head`. Use it only when the other publisher is
+    /// known to be dead. A live publisher taken over stops before its next
+    /// table move ([`crate::table_publish::publish_tables`] reads the head
+    /// first), so it can still move the one table in flight.
+    ///
+    /// A table publish moves the table itself, which every environment that
+    /// holds the model shares. So it refuses when another environment's
+    /// head, or the plan of another environment's unfinished table publish,
+    /// points the same table at a different version, unless
+    /// `options.allow_shared_tables` is set.
     ///
     /// `check` runs on every resolved pointer inside the transaction, before
     /// anything is written. It is how the table backend refuses a version it
@@ -8940,16 +8958,17 @@ impl StateStore {
     /// # Errors
     ///
     /// As [`Self::publish_pointers`], plus
-    /// [`crate::environments::EnvironmentError::PublishInProgress`], and
+    /// [`crate::environments::EnvironmentError::PublishInProgress`],
     /// [`crate::environments::PublishRefusal::BackendRefused`] when `check`
-    /// refuses a pointer.
+    /// refuses a pointer, and
+    /// [`crate::environments::PublishRefusal::TableSharedWithEnvironment`].
     pub fn begin_table_publish(
         &self,
         request: &crate::environments::PublishRequest,
-        take_over: bool,
+        options: crate::environments::TablePublishOptions,
         check: &dyn Fn(&crate::environments::EnvPointer) -> Result<(), String>,
     ) -> Result<crate::environments::PublishRecord, StateError> {
-        self.publish_txn(request, PublishKind::TableStart { take_over, check })
+        self.publish_txn(request, PublishKind::TableStart { options, check })
     }
 
     /// Record the outcome of the table publish `started` (RV1-P3): one
@@ -9131,10 +9150,7 @@ impl StateStore {
             if let Some(in_progress) = current.as_ref().and_then(|c| c.publishing.clone()) {
                 let take_over = matches!(
                     kind,
-                    PublishKind::TableStart {
-                        take_over: true,
-                        ..
-                    }
+                    PublishKind::TableStart { options, .. } if options.take_over
                 );
                 if !take_over {
                     return Err(EnvironmentError::PublishInProgress {
@@ -9166,6 +9182,12 @@ impl StateStore {
                 to.insert(source.model.clone(), pointer);
             }
             drop(runs);
+            if let PublishKind::TableStart { options, .. } = kind
+                && !options.allow_shared_tables
+            {
+                let history = txn.open_table(PUBLISH_HISTORY)?;
+                refuse_shared_tables(&envs, &history, env, &to)?;
+            }
 
             let (seq, prior, mut pointers) = match current {
                 Some(c) => {
@@ -9243,9 +9265,71 @@ enum PublishKind<'a> {
     StateOnly,
     /// RV1-P3: claim the environment for a table publish.
     TableStart {
-        take_over: bool,
+        options: crate::environments::TablePublishOptions,
         check: &'a dyn Fn(&crate::environments::EnvPointer) -> Result<(), String>,
     },
+}
+
+/// Refuse a table publish of `to` into `env` when another environment points
+/// one of its tables at a different version: its head pointers, and the plan
+/// of its unfinished table publish (whose `Started` row is not on its head
+/// pointers yet). Two pointers name the same table when their versions name
+/// the same table; a version this binary cannot read matches by model name.
+fn refuse_shared_tables(
+    envs: &impl ReadableTable<&'static str, &'static [u8]>,
+    history: &impl ReadableTable<&'static str, &'static [u8]>,
+    env: &crate::environments::EnvironmentName,
+    to: &std::collections::BTreeMap<String, crate::environments::EnvPointer>,
+) -> Result<(), StateError> {
+    use crate::environments::{
+        EnvPointer, EnvironmentError, EnvironmentRecord, PublishRecord, PublishRefusal, history_key,
+    };
+    // (environment, publish id, pointer) of every other environment.
+    let mut others: Vec<(String, String, EnvPointer)> = Vec::new();
+    for entry in envs.iter()? {
+        let (key, value) = entry?;
+        if key.value() == env.as_str() {
+            continue;
+        }
+        let other: EnvironmentRecord = serde_json::from_slice(value.value())?;
+        for p in other.pointers.values() {
+            others.push((
+                other.name.to_string(),
+                other.head_publish_id.clone(),
+                p.clone(),
+            ));
+        }
+        if let Some(started) = &other.publishing
+            && let Some(row) = history.get(history_key(&other.name, other.seq).as_str())?
+        {
+            let row: PublishRecord = serde_json::from_slice(row.value())?;
+            for p in row.to.values() {
+                others.push((other.name.to_string(), started.clone(), p.clone()));
+            }
+        }
+    }
+    for (model, pointer) in to {
+        let table = pointer.version.known().and_then(OutputVersion::table);
+        for (other, publish_id, theirs) in &others {
+            let same_table = match (table, theirs.version.known().and_then(OutputVersion::table)) {
+                (Some(ours), Some(their_table)) => ours == their_table,
+                (None, _) | (_, None) => theirs.model == *model,
+            };
+            if same_table && theirs.version != pointer.version {
+                return Err(EnvironmentError::Refused {
+                    environment: env.to_string(),
+                    model: model.clone(),
+                    reason: PublishRefusal::TableSharedWithEnvironment {
+                        other: other.clone(),
+                        publish_id: publish_id.clone(),
+                        table: table.unwrap_or(model.as_str()).to_string(),
+                    },
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Test support: make the store at `path` look like one a v31 binary wrote —

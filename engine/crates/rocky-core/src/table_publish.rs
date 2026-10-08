@@ -44,6 +44,7 @@
 
 use thiserror::Error;
 
+pub use crate::environments::TablePublishOptions;
 use crate::environments::{EnvPointer, PublishRecord, PublishRequest, TableMove, TableMoveOutcome};
 use crate::state_sync::{self, LedgerSeamSession, StateSyncError};
 
@@ -269,12 +270,16 @@ async fn fence(session: &LedgerSeamSession, request: &PublishRequest, started: &
 /// [`TablePublishReport::is_complete`] `false`; the history names every
 /// moved, failed and untried table.
 ///
-/// `take_over` starts from a head whose own table publish never finished.
-/// It is for a **dead** publisher. See
+/// `options.take_over` starts from a head whose own table publish never
+/// finished. It is for a **dead** publisher. See
 /// [`crate::state::StateStore::begin_table_publish`]. Before each table
 /// move, the publish reads the head again (a fence). When another publish
 /// took over, it stops and moves no more tables, so a wrongly taken-over
 /// live publisher can move at most the one table already in flight.
+///
+/// `options.allow_shared_tables` lets the publish move a table that another
+/// environment points at a different version; without it the begin step
+/// refuses ([`crate::environments::PublishRefusal::TableSharedWithEnvironment`]).
 ///
 /// # Errors
 ///
@@ -286,10 +291,10 @@ pub async fn publish_tables(
     session: &LedgerSeamSession,
     request: &PublishRequest,
     backend: &dyn TablePointerBackend,
-    take_over: bool,
+    options: TablePublishOptions,
 ) -> Result<TablePublishReport, TablePublishError> {
     let check = |p: &EnvPointer| backend.check(p);
-    let started = state_sync::begin_table_publish(session, request, take_over, &check)
+    let started = state_sync::begin_table_publish(session, request, options, &check)
         .await
         .map_err(TablePublishError::Begin)?;
 
@@ -514,6 +519,125 @@ mod tests {
     }
 
     const ABC: &[(&str, &str)] = &[("a", "r1"), ("b", "r1"), ("c", "r1")];
+    const NEW: TablePublishOptions = TablePublishOptions {
+        take_over: false,
+        allow_shared_tables: false,
+    };
+    const TAKE_OVER: TablePublishOptions = TablePublishOptions {
+        take_over: true,
+        allow_shared_tables: false,
+    };
+
+    fn named(name: &str, expected: Option<&str>, sources: &[(&str, &str)]) -> PublishRequest {
+        PublishRequest {
+            environment: EnvironmentName::parse(name).unwrap(),
+            ..req(expected, sources)
+        }
+    }
+
+    /// `prod` holds `a` at r1. A table publish of `a` at r2 into `staging`
+    /// would move the same Delta table under `prod`: it is refused, naming
+    /// `prod`, and nothing moves. The same version is allowed, and so is a
+    /// different one with the explicit override.
+    #[tokio::test]
+    async fn a_table_another_environment_points_elsewhere_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let tables = FakeTables::default();
+        publish_tables(&session, &req(None, &[("a", "r1")]), &tables, NEW)
+            .await
+            .unwrap();
+
+        let err = publish_tables(
+            &session,
+            &named("staging", None, &[("a", "r2")]),
+            &tables,
+            NEW,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                    EnvironmentError::Refused {
+                        model,
+                        reason: PublishRefusal::TableSharedWithEnvironment { other, table, .. },
+                        ..
+                    }
+                ))) if model == "a" && other == "prod" && table == "c.s.a"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("\"prod\""), "{err}");
+        assert_eq!(
+            tables.calls(),
+            vec!["a"],
+            "the refused publish moved nothing"
+        );
+        let store = StateStore::open(&path).unwrap();
+        assert!(
+            store
+                .get_environment(&EnvironmentName::parse("staging").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        // The same version as prod: nothing to disagree on.
+        publish_tables(
+            &session,
+            &named("staging", None, &[("a", "r1")]),
+            &tables,
+            NEW,
+        )
+        .await
+        .unwrap();
+        // A different version with the override.
+        let report = publish_tables(
+            &session,
+            &named("staging", Some("staging#2"), &[("a", "r2")]),
+            &tables,
+            TablePublishOptions {
+                allow_shared_tables: true,
+                ..NEW
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.is_complete());
+    }
+
+    /// The plan of another environment's unfinished table publish counts
+    /// too: its `Started` row is not on its head pointers yet.
+    #[tokio::test]
+    async fn an_unfinished_publish_in_another_environment_holds_its_planned_tables() {
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = local(&dir);
+        state_sync::begin_table_publish(&session, &req(None, &[("a", "r1")]), NEW, &|_| Ok(()))
+            .await
+            .unwrap();
+        let err = publish_tables(
+            &session,
+            &named("staging", None, &[("a", "r2")]),
+            &FakeTables::default(),
+            NEW,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                    EnvironmentError::Refused {
+                        reason: PublishRefusal::TableSharedWithEnvironment { other, publish_id, .. },
+                        ..
+                    }
+                ))) if other == "prod" && publish_id == "prod#1"
+            ),
+            "{err:?}"
+        );
+    }
 
     /// Every table moves; history has a Started and a Finished row; the head
     /// holds every pointer and is no longer publishing.
@@ -522,7 +646,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (session, path) = local(&dir);
         let tables = FakeTables::default();
-        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+        let report = publish_tables(&session, &req(None, ABC), &tables, NEW)
             .await
             .unwrap();
 
@@ -557,7 +681,7 @@ mod tests {
 
         // Publishing the same versions again writes no table commit.
         drop(store);
-        let again = publish_tables(&session, &req(Some("prod#2"), ABC), &tables, false)
+        let again = publish_tables(&session, &req(Some("prod#2"), ABC), &tables, NEW)
             .await
             .unwrap();
         assert!(again.is_complete());
@@ -576,7 +700,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (session, path) = local(&dir);
         let tables = FakeTables::failing_on("b");
-        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+        let report = publish_tables(&session, &req(None, ABC), &tables, NEW)
             .await
             .unwrap();
 
@@ -627,7 +751,7 @@ mod tests {
             unknown_on: Some("a".into()),
             ..FakeTables::default()
         };
-        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+        let report = publish_tables(&session, &req(None, ABC), &tables, NEW)
             .await
             .unwrap();
         assert!(!report.is_complete());
@@ -649,7 +773,7 @@ mod tests {
             served: Mutex::new(tables.served()),
             ..FakeTables::default()
         };
-        let retry = publish_tables(&session, &req(Some("prod#2"), ABC), &retry_tables, false)
+        let retry = publish_tables(&session, &req(Some("prod#2"), ABC), &retry_tables, NEW)
             .await
             .unwrap();
         assert!(retry.is_complete());
@@ -669,7 +793,7 @@ mod tests {
             sync_fail_on: Some("a".into()),
             ..FakeTables::default()
         };
-        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+        let report = publish_tables(&session, &req(None, ABC), &tables, NEW)
             .await
             .unwrap();
         assert!(!report.is_complete(), "history must not read as served");
@@ -696,7 +820,7 @@ mod tests {
             refuse: Some("c".into()),
             ..FakeTables::default()
         };
-        let err = publish_tables(&session, &req(None, ABC), &tables, false)
+        let err = publish_tables(&session, &req(None, ABC), &tables, NEW)
             .await
             .unwrap_err();
         assert!(
@@ -726,14 +850,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (session, path) = local(&dir);
         // The "dead" publisher: begin only.
-        let started =
-            state_sync::begin_table_publish(&session, &req(None, ABC), false, &|_| Ok(()))
-                .await
-                .unwrap();
+        let started = state_sync::begin_table_publish(&session, &req(None, ABC), NEW, &|_| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(started.publish_id, "prod#1");
 
         let tables = FakeTables::default();
-        let err = publish_tables(&session, &req(Some("prod#1"), ABC), &tables, false)
+        let err = publish_tables(&session, &req(Some("prod#1"), ABC), &tables, NEW)
             .await
             .unwrap_err();
         assert!(
@@ -760,7 +883,7 @@ mod tests {
         );
         assert!(tables.calls().is_empty());
 
-        let report = publish_tables(&session, &req(Some("prod#1"), ABC), &tables, true)
+        let report = publish_tables(&session, &req(Some("prod#1"), ABC), &tables, TAKE_OVER)
             .await
             .unwrap();
         assert!(report.is_complete());
@@ -796,7 +919,7 @@ mod tests {
                 state_sync::begin_table_publish(
                     &self.session,
                     &req(Some("prod#1"), &[("a", "r2")]),
-                    true,
+                    TAKE_OVER,
                     &|_| Ok(()),
                 )
                 .await
@@ -819,7 +942,7 @@ mod tests {
             session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
             tables: FakeTables::default(),
         };
-        let err = publish_tables(&session, &req(None, ABC), &backend, false)
+        let err = publish_tables(&session, &req(None, ABC), &backend, NEW)
             .await
             .unwrap_err();
         let TablePublishError::Fenced {
@@ -887,8 +1010,8 @@ mod tests {
         let (ta, tb) = (FakeTables::default(), FakeTables::default());
         let (qa, qb) = (req(None, &[("a", "r1")]), req(None, &[("a", "r2")]));
         let (ra, rb) = tokio::join!(
-            publish_tables(&sa, &qa, &ta, false),
-            publish_tables(&sb, &qb, &tb, false),
+            publish_tables(&sa, &qa, &ta, NEW),
+            publish_tables(&sb, &qb, &tb, NEW),
         );
         let (winner, loser_err, loser_tables) = match (ra, rb) {
             (Ok(w), Err(e)) => (w, e, &tb),

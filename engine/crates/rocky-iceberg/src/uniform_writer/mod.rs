@@ -3787,7 +3787,7 @@ mod tests {
             principal: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: None,
         };
-        publish_tables(&session, &request, &publisher, false)
+        publish_tables(&session, &request, &publisher, Default::default())
             .await
             .unwrap()
     }

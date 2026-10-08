@@ -352,6 +352,18 @@ pub struct PublishSource {
     pub run_id: String,
 }
 
+/// How a table publish (RV1-P3) may start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TablePublishOptions {
+    /// Start from a head whose own table publish never finished. Only for a
+    /// publisher known to be dead.
+    pub take_over: bool,
+    /// Publish even when another environment points a model's table at a
+    /// different version. On Delta both environments name the same table,
+    /// so the publish moves it under the other environment too.
+    pub allow_shared_tables: bool,
+}
+
 /// A request to move an environment's pointers.
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
@@ -425,6 +437,19 @@ pub enum PublishRefusal {
     /// model's table to the version. Nothing was written.
     #[error("the table backend cannot publish this version: {reason}")]
     BackendRefused { reason: String },
+    /// Another environment points this model's table at a different version
+    /// (or a version this binary cannot read). A table publish moves the
+    /// table itself, so it would move it under that environment too.
+    #[error(
+        "environment {other:?} ({publish_id}) points table `{table}` at a different version; \
+         a table publish would move it under {other:?} too. Publish with the shared-table \
+         override to move it anyway"
+    )]
+    TableSharedWithEnvironment {
+        other: String,
+        publish_id: String,
+        table: String,
+    },
 }
 
 /// A publish or environment request that is wrong in itself.

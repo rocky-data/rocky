@@ -5193,7 +5193,7 @@ async fn require_publish_cas(session: &LedgerSeamSession) -> Result<(), StateSyn
 pub async fn begin_table_publish(
     session: &LedgerSeamSession,
     request: &crate::environments::PublishRequest,
-    take_over: bool,
+    options: crate::environments::TablePublishOptions,
     check: &(dyn Fn(&crate::environments::EnvPointer) -> Result<(), String> + Sync),
 ) -> Result<crate::environments::PublishRecord, StateSyncError> {
     require_publish_cas(session).await?;
@@ -5202,7 +5202,7 @@ pub async fn begin_table_publish(
             // The store call is synchronous; the future only carries its
             // result, so it borrows nothing from the caller.
             let result = store
-                .begin_table_publish(request, take_over, check)
+                .begin_table_publish(request, options, check)
                 .map_err(publish_error);
             Box::pin(async move { result })
         })
