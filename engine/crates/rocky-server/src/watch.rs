@@ -1,8 +1,9 @@
 //! Filesystem watcher for auto-recompilation.
 //!
-//! Watches the models directory, and the bound `rocky.toml`, for changes and
-//! triggers recompilation. The config matters as much as a model: a pipeline
-//! target change moves the per-model-target checks.
+//! Watches the models directory, the `functions/` directory beside it, and the
+//! bound `rocky.toml`, for changes and triggers recompilation. The config
+//! matters as much as a model: a pipeline target change moves the
+//! per-model-target checks, and a function definition moves E051.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +102,29 @@ pub fn start_watcher(
         })?;
 
     watcher.watch(watch_dir, RecursiveMode::Recursive)?;
+    // UDF definitions live beside the models directory, not in it
+    // (`<models>/../functions/*.toml`, the directory the compiler reads). A
+    // change there moves E051 and the types of UDF calls, so it recompiles
+    // too. A `functions/` directory created after startup is not seen until
+    // the server restarts.
+    if let Some(functions_dir) = rocky_core::functions::functions_dir_for(watch_dir)
+        && functions_dir.is_dir()
+    {
+        let covered = match (functions_dir.canonicalize(), watch_dir.canonicalize()) {
+            (Ok(f), Ok(w)) => f.starts_with(w),
+            _ => false,
+        };
+        if !covered {
+            match watcher.watch(&functions_dir, RecursiveMode::NonRecursive) {
+                Ok(()) => info!(dir = %functions_dir.display(), "watching the functions directory"),
+                Err(e) => warn!(
+                    error = %e,
+                    dir = %functions_dir.display(),
+                    "cannot watch the functions directory"
+                ),
+            }
+        }
+    }
     // The config usually sits next to the models directory, not in it. Watch
     // its directory (not the file: editors replace a file on save, which
     // drops a watch on the old inode) unless the models watch covers it.
@@ -175,6 +199,65 @@ mod tests {
             &[PathBuf::from("/proj/models/m.sql")],
             None
         ));
+    }
+
+    /// A change under `functions/` (beside the models directory, not in it)
+    /// recompiles. The watcher used to watch only the models directory, so
+    /// a broken function definition showed no E051 until a model changed.
+    #[tokio::test]
+    async fn a_change_under_functions_recompiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let models = root.join("models");
+        let functions = root.join("functions");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("dbl.toml"),
+            "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("dbl.sql"), "x * 2\n").unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT dbl(1.0) AS a2").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let state = ServerState::new(models.clone(), None, None);
+        let has_e051 = |state: &ServerState| {
+            let state = state.compile_result.try_read().ok()?;
+            let result = state.as_ref()?;
+            Some(result.diagnostics.iter().any(|d| &*d.code == "E051"))
+        };
+        let wait_for = |want: bool| {
+            let state = state.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while std::time::Instant::now() < deadline {
+                    if has_e051(&state) == Some(want) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+        assert!(wait_for(false).await, "the initial compile is clean");
+
+        let _watcher = start_watcher(state.clone(), &models).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::write(
+            functions.join("dbl.toml"),
+            "returns = \"DOUBLE\"\nbogus = 1\n",
+        )
+        .unwrap();
+        assert!(
+            wait_for(true).await,
+            "editing functions/dbl.toml must recompile and surface E051"
+        );
     }
 
     #[test]
