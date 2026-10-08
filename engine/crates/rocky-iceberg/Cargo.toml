@@ -35,6 +35,10 @@ wiremock = { workspace = true }
 # SqlClient trait. Production wire-up will move to the CLI surface in a
 # follow-up; today this dep is dev-only.
 rocky-databricks = { path = "../rocky-databricks" }
+# The table-publish test records runs with `run_with_output_versions` and
+# publishes through a real local state store.
+rocky-core = { path = "../rocky-core", features = ["test-support"] }
+tempfile = "3"
 
 [lints]
 workspace = true
