@@ -412,7 +412,11 @@ pub fn build_semantic_graph(
             let Some(table) = rs.source_table.as_ref() else {
                 continue;
             };
-            let source_name = alias_to_table.get(table).unwrap_or(table);
+            let source_name = if rs.physical {
+                table
+            } else {
+                alias_to_table.get(table).unwrap_or(table)
+            };
             let edge = RowSelectionEdge {
                 source: QualifiedColumn {
                     model: Arc::from(source_name.as_str()),
@@ -442,6 +446,9 @@ pub fn build_semantic_graph(
 
             // Resolve source table name to a model or external source
             let source_table = col_lineage.source_table.as_ref().and_then(|t| {
+                if col_lineage.physical {
+                    return Some(t.clone());
+                }
                 // If it's an alias, resolve to the real table name
                 alias_to_table.get(t).cloned().or(Some(t.clone()))
             });

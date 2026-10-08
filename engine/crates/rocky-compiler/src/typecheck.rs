@@ -4390,6 +4390,68 @@ mod tests {
         }
     }
 
+    type Cols<'a> = &'a [(&'a str, RockyType, bool)];
+
+    /// Typecheck one model `m` over the given `(name, columns)` sources.
+    fn typecheck_over(sql: &str, tables: &[(&str, Cols)]) -> Vec<(String, RockyType, bool)> {
+        let sources: HashMap<_, _> = tables
+            .iter()
+            .map(|(name, cols)| (name.to_string(), source_schema(cols)))
+            .collect();
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2307: the physical origin a CTE read resolves to is not re-resolved
+    /// through the OUTER query's aliases. `customers AS orders` must not
+    /// capture `orders.n` read through the CTE.
+    #[test]
+    fn an_outer_alias_does_not_capture_a_cte_origin() {
+        let orders: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("n", RockyType::String, false),
+        ];
+        let customers: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("n", RockyType::Int32, true),
+        ];
+        let rows = typecheck_over(
+            "WITH c AS (SELECT n AS x FROM orders) \
+             SELECT c.x FROM c JOIN customers AS orders ON c.x = orders.id",
+            &[("orders", orders), ("customers", customers)],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, RockyType::String, "{rows:?}");
+        assert!(!rows[0].2, "{rows:?}");
+    }
+
+    /// #2307: row-selection edges through a CTE are not captured either.
+    #[test]
+    fn an_outer_alias_does_not_capture_a_cte_row_selection_origin() {
+        let sql = "WITH c AS (SELECT n AS x FROM orders) \
+                   SELECT c.x FROM c JOIN customers AS orders ON c.x = orders.id WHERE c.x > 0";
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let from_customers_n = graph
+            .row_selection_edges
+            .iter()
+            .any(|e| &*e.source.model == "customers" && &*e.source.column == "n");
+        assert!(!from_customers_n, "{:?}", graph.row_selection_edges);
+        assert!(
+            graph
+                .row_selection_edges
+                .iter()
+                .any(|e| &*e.source.model == "orders" && &*e.source.column == "n"),
+            "{:?}",
+            graph.row_selection_edges
+        );
+    }
+
     /// #2307: a CTE with another name leaves the source read alone.
     #[test]
     fn a_non_shadowing_cte_keeps_source_types() {

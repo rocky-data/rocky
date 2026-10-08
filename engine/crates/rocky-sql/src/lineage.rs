@@ -69,6 +69,16 @@ pub struct ColumnLineage {
     pub target_column: String,
     /// How the column is transformed.
     pub transform: TransformKind,
+    /// `source_table` is a physical table name that CTE resolution already
+    /// produced, not a name or alias of the enclosing query's `FROM` clause.
+    /// A consumer must not resolve it through that query's alias map: an
+    /// outer alias spelled like the table would capture it (#2307).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub physical: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Why a column influences which rows (or groups) a model produces.
@@ -142,6 +152,9 @@ pub struct RowSelectionLineage {
     /// means the edge affects every output row of the query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_column: Option<String>,
+    /// See [`ColumnLineage::physical`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub physical: bool,
 }
 
 /// Full lineage result for a SQL statement.
@@ -488,6 +501,7 @@ fn resolve_row_selection(
         CteRead::Origin((t, c, _)) => {
             rs.source_table = Some(t);
             rs.source_column = c;
+            rs.physical = true;
         }
         CteRead::Unknown => rs.source_table = None,
     }
@@ -526,6 +540,7 @@ fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
                 col.transform = compose_transform(&col.transform, &inner);
                 col.source_table = Some(t.clone());
                 col.source_column = c.clone();
+                col.physical = true;
                 origins.push(Some((t, c, col.transform.clone())));
             }
             CteRead::Unknown => {
@@ -652,6 +667,7 @@ fn extract_order_limit(
                     source_column: column.clone(),
                     kind: *kind,
                     target_column: None,
+                    physical: false,
                 };
                 if !out.contains(&edge) {
                     out.push(edge);
@@ -777,12 +793,14 @@ fn extract_table_factor(
                                 source_column: column.clone(),
                                 target_column: target.clone(),
                                 transform: transform.clone(),
+                                physical: false,
                             },
                             None => ColumnLineage {
                                 source_table: None,
                                 source_column: target.clone(),
                                 target_column: target.clone(),
                                 transform: TransformKind::Direct,
+                                physical: false,
                             },
                         })
                         .collect()
@@ -875,6 +893,7 @@ fn source_less_column(target: &str) -> ColumnLineage {
         source_column: String::new(),
         target_column: target.to_string(),
         transform: TransformKind::Expression,
+        physical: false,
     }
 }
 
@@ -981,6 +1000,7 @@ fn extract_expr_lineage(
                 source_column: col_name.clone(),
                 target_column: col_name,
                 transform: TransformKind::Direct,
+                physical: false,
             })
         }
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
@@ -992,6 +1012,7 @@ fn extract_expr_lineage(
                 source_column: col_name.clone(),
                 target_column: col_name,
                 transform: TransformKind::Direct,
+                physical: false,
             })
         }
         Expr::Cast { expr, kind, .. } => {
@@ -1361,6 +1382,7 @@ fn extract_row_selection(
                 source_column: column,
                 kind,
                 target_column: target.map(str::to_string),
+                physical: false,
             };
             if !out.contains(&edge) {
                 out.push(edge);
