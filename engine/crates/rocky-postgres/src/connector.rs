@@ -30,7 +30,7 @@ use crate::config::{Flavor, PgConfig, SslMode};
 use crate::tls::{RustlsConnect, Verification, client_config};
 
 /// Errors from the PostgreSQL / Redshift connector.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum PgError {
     /// Invalid adapter configuration.
     #[error("invalid configuration: {0}")]
@@ -64,6 +64,14 @@ pub enum PgError {
     /// A described table does not exist (or is not visible to this role).
     #[error("table {schema}.{table} not found")]
     NotFound { schema: String, table: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for PgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PgError({self})")
+    }
 }
 
 impl PgError {

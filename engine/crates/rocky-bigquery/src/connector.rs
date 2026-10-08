@@ -25,7 +25,7 @@ use crate::auth::BigQueryAuth;
 use crate::dialect::BigQueryDialect;
 use crate::storage_read::{StorageReadError, StorageTableRef, fetch_arrow_record_batch};
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BigQueryError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
@@ -87,6 +87,14 @@ pub enum BigQueryError {
 
     #[error("Storage Read API error: {0}")]
     StorageRead(#[from] StorageReadError),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for BigQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BigQueryError({self})")
+    }
 }
 
 /// BigQuery warehouse adapter.

@@ -95,7 +95,7 @@ pub enum WriteOutcome {
 /// Variants are intentionally coarse — the caller's only useful handling
 /// is "log + fail open." Finer-grained distinctions live in the inner
 /// error types when callers need to introspect.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CacheError {
     /// Local filesystem I/O failure ([`FileCache`]).
     #[error("cache I/O: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
@@ -121,6 +121,14 @@ pub enum CacheError {
     /// config-load time before any cache I/O is attempted.
     #[error("cache config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CacheError({self})")
+    }
 }
 
 /// Trait every Fivetran state cache backend implements.

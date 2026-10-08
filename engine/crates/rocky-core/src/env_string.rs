@@ -190,8 +190,8 @@ pub fn join_rendered(items: &[EnvString], sep: &str) -> String {
 /// - The registry keeps its 8-byte floor, so a value shorter than
 ///   [`crate::secret_registry::SECRET_LENGTH_FLOOR`] (a Postgres `port`
 ///   such as `5432`) prints as itself.
-/// - Numbers, booleans and object keys are not rewritten. A `${VAR}` there
-///   is already below the floor or is not secret-shaped.
+/// - Booleans are not rewritten. A number or an object key that holds a
+///   resolved value prints as `${NAME}`; a number then prints as a string.
 ///
 /// The JSON schema is the one of the plain map, so generated bindings do not
 /// change. Equality compares the values.
@@ -215,18 +215,48 @@ impl ExtraMap {
         self.0.is_empty()
     }
 
-    /// The map with each resolved `${VAR}` value in a string replaced by
-    /// `${NAME}`. For printing only.
-    fn rendered(&self) -> std::collections::BTreeMap<&str, serde_json::Value> {
+    /// The map with each resolved `${VAR}` value replaced by `${NAME}`, in
+    /// string values, numbers and object keys at any depth. For printing only.
+    fn rendered(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
         self.0
             .iter()
             .map(|(k, v)| {
                 (
-                    k.as_str(),
-                    crate::secret_registry::render_json_string_values(v.clone()),
+                    crate::secret_registry::render_placeholders(k),
+                    render_extra_value(v.clone()),
                 )
             })
             .collect()
+    }
+}
+
+/// [`crate::secret_registry::render_json_placeholders`], plus numbers: a
+/// number whose digits hold a resolved value prints as a string with
+/// `${NAME}` in place of them.
+fn render_extra_value(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Number(n) => {
+            let text = n.to_string();
+            let rendered = crate::secret_registry::render_placeholders(&text);
+            if rendered == text {
+                Value::Number(n)
+            } else {
+                Value::String(rendered)
+            }
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(render_extra_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| {
+                    (
+                        crate::secret_registry::render_placeholders(&k),
+                        render_extra_value(v),
+                    )
+                })
+                .collect(),
+        ),
+        other => crate::secret_registry::render_json_placeholders(other),
     }
 }
 
@@ -432,6 +462,32 @@ mod tests {
         assert_eq!(extra.expose()["keyfile"], serde_json::json!(secret));
         let plain = with_env_values_scope(|| serde_json::to_string(&extra).unwrap());
         assert!(plain.contains(secret), "{plain}");
+    }
+
+    #[test]
+    fn an_extra_map_renders_numeric_leaves_and_keys() {
+        // A 10-digit number clears the 8-byte floor (#1919).
+        register_substitution("ROCKY_EXTRA_ACCOUNT_ID", "4815162342");
+        register_substitution("ROCKY_EXTRA_KEY_NAME", "key-ROCKY-extra-9d31b7");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("account".to_string(), serde_json::json!(4815162342u64));
+        m.insert(
+            "nested".to_string(),
+            serde_json::json!({ "ids": [4815162342u64], "key-ROCKY-extra-9d31b7": 1 }),
+        );
+        m.insert(
+            "key-ROCKY-extra-9d31b7".to_string(),
+            serde_json::json!(true),
+        );
+        let extra = ExtraMap::from(m);
+        let printed = [format!("{extra:?}"), serde_json::to_string(&extra).unwrap()];
+        for p in &printed {
+            assert!(!p.contains("4815162342"), "number leaked in {p}");
+            assert!(!p.contains("key-ROCKY-extra-9d31b7"), "key leaked in {p}");
+            assert!(p.contains("${ROCKY_EXTRA_ACCOUNT_ID}"), "{p}");
+            assert!(p.contains("${ROCKY_EXTRA_KEY_NAME}"), "{p}");
+        }
+        assert_eq!(extra.expose()["account"], serde_json::json!(4815162342u64));
     }
 
     #[test]

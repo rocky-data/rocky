@@ -254,7 +254,7 @@ pub const DEFAULT_MAX_WAKE_SECONDS: u64 = 600;
 /// Coarse-grained on purpose — the budget is fail-open at every call
 /// site, so the caller's only useful response is `warn!` + fall back
 /// to a permissive default.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BudgetError {
     /// Local filesystem I/O error (file backend).
     #[error("ratelimit I/O: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
@@ -269,6 +269,14 @@ pub enum BudgetError {
     /// rather than from a request.
     #[error("ratelimit config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BudgetError({self})")
+    }
 }
 
 /// Cross-process shared rate-limit budget.

@@ -27,7 +27,7 @@ use tracing::{Instrument, Span, debug, field, info_span, warn};
 use crate::auth::Auth;
 
 /// Errors from the Snowflake SQL REST API.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ConnectorError {
     #[error("auth error: {0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -61,6 +61,14 @@ pub enum ConnectorError {
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ConnectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConnectorError({self})")
+    }
 }
 
 /// Configuration for the Snowflake connector.

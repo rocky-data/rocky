@@ -57,7 +57,7 @@ fn poll_delay(attempt: usize) -> Duration {
 }
 
 /// Errors surfaced by the Trino connector.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum TrinoError {
     #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
@@ -109,6 +109,14 @@ pub enum TrinoError {
 
     #[error("Trino spooled Arrow decode error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ArrowDecode(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for TrinoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TrinoError({self})")
+    }
 }
 
 /// Trino [`StandardErrorCode`](https://github.com/trinodb/trino/blob/master/core/trino-spi/src/main/java/io/trino/spi/StandardErrorCode.java)

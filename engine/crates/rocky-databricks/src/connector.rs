@@ -19,7 +19,7 @@ use tracing::{Instrument, Span, debug, field, info_span, warn};
 use crate::auth::Auth;
 
 /// Errors from the Databricks SQL Statement Execution API.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ConnectorError {
     #[error("auth error: {0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -73,6 +73,14 @@ pub enum ConnectorError {
     /// underlying `arrow::error::ArrowError` message.
     #[error("Arrow IPC decode error: {0}")]
     Arrow(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ConnectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConnectorError({self})")
+    }
 }
 
 /// Configuration for the Databricks SQL connector.

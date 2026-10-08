@@ -37,7 +37,7 @@ use crate::config::{Auth, Encrypt, SqlServerConfig};
 type Conn = Client<Compat<TcpStream>>;
 
 /// Errors from the SQL Server connector.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SqlServerError {
     /// Invalid adapter configuration.
     #[error("invalid configuration: {0}")]
@@ -72,6 +72,14 @@ pub enum SqlServerError {
     /// A described table does not exist (or is not visible to this login).
     #[error("table {schema}.{table} not found")]
     NotFound { schema: String, table: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SqlServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SqlServerError({self})")
+    }
 }
 
 /// Error numbers Microsoft documents as transient for Azure SQL Database
