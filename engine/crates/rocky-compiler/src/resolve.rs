@@ -221,8 +221,10 @@ pub fn resolve_dependencies_with_externals(
                         "D011",
                         &model.config.name,
                         format!(
-                            "depends_on declares [{}] but SQL body also references [{}]. \
-                             The auto-derived dependencies will be merged, but consider \
+                            "depends_on declares [{}] but the SQL body also reads bare \
+                             table names that bind to [{}] at compile time. Qualified \
+                             reads are not checked here; they are ordered at run time. \
+                             The bare-name dependencies will be merged, but consider \
                              updating depends_on or removing it to let auto-derivation \
                              handle everything.",
                             model.config.depends_on.join(", "),
