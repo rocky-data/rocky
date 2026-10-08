@@ -1531,9 +1531,10 @@ enum Command {
     /// files you can run directly or hand to a dbt / hand-SQL fallback, so
     /// depending on Rocky is never a one-way door.
     EmitSql {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Default: `models`, or the `--pipeline`'s own
+        /// configured models location when `--pipeline` is given.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Filter to a single model (exact name). Cannot be combined with
         /// `--select`.
         #[arg(long)]
@@ -1553,8 +1554,8 @@ enum Command {
 
         /// Transformation pipeline whose target adapter (and so SQL dialect)
         /// the SQL is emitted for. Required if the project defines more than
-        /// one transformation pipeline. Pair it with `--models` to point at
-        /// that pipeline's models directory.
+        /// one transformation pipeline. Without `--models`, the pipeline's own
+        /// models location is used.
         #[arg(long)]
         pipeline: Option<String>,
     },
@@ -5001,7 +5002,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             };
             rocky_cli::commands::run_emit_sql_with_selection(
                 Some(cli.config.as_path()),
-                &models,
+                models.as_deref(),
                 model.as_deref(),
                 out_dir.as_deref(),
                 &run_vars,

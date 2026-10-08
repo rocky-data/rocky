@@ -752,17 +752,17 @@ Render the SQL each transformation model would produce, without a warehouse conn
 rocky emit-sql                                   # Print SQL for every model to stdout
 rocky emit-sql --out-dir build/sql/              # Write one <model>.sql file per model
 rocky emit-sql --model stg_orders --out-dir sql/ # Emit a single model
-rocky emit-sql --pipeline marts --models marts  # Pick the pipeline in a multi-pipeline project
+rocky emit-sql --pipeline marts                 # Emit one pipeline's models in a multi-pipeline project
 ```
 
 **Flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--models <PATH>` | `models` | Models directory to compile. |
+| `--models <PATH>` | `models` | Models directory to compile. With `--pipeline` and no `--models`, the pipeline's own `models` location is used. |
 | `--model <NAME>` | (all) | Restrict output to a single model by name. |
 | `--out-dir <PATH>` | (stdout) | Write one `<model>.sql` file per model into this directory, in dependency order. When omitted, the concatenated SQL is printed to stdout, also in dependency order. |
-| `--pipeline <NAME>` | (sole transformation pipeline) | Transformation pipeline whose target adapter picks the SQL dialect. Required when the project has more than one transformation pipeline. Pair it with `--models` to point at that pipeline's models directory. |
+| `--pipeline <NAME>` | (sole transformation pipeline) | Transformation pipeline whose target adapter picks the SQL dialect. Required when the project has more than one transformation pipeline. Without `--models`, emits that pipeline's own models. A name that matches no transformation pipeline is an error. |
 
 **Behavior:**
 
