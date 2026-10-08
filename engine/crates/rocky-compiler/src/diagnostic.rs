@@ -460,8 +460,8 @@ pub const W013: &str = "W013";
 ///
 /// The compile still succeeds, but `/api/v1/models` and `/api/v1/dag` show
 /// only `models/`, not the union of every pipeline's models. When `models/`
-/// itself holds no model, `rocky serve` reports `engine_not_ready` with the
-/// load error instead of this warning. Emitted by `rocky serve` only.
+/// itself holds no model, the compile fails with the load error instead
+/// (`engine_not_ready`). Emitted by `rocky serve` only.
 pub const W014: &str = "W014";
 
 /// Imported producer added a column. Surfaced (at info severity) only to

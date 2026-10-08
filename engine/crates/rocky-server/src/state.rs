@@ -630,8 +630,11 @@ impl ServerState {
                 }
                 Some(Err(e)) => {
                     let reason = format!("{e:#}");
-                    // The fallback can fail outright (an absent `models/` is
-                    // "no models found"); the loader error is the real cause.
+                    // The fallback fails outright when `models/` is absent or
+                    // holds no model ("no models found"). Serving nothing with
+                    // the loader error buried in diagnostics would be a `200`
+                    // with `count: 0`, so the loader error fails the compile
+                    // (`engine_not_ready`) instead.
                     let fallback =
                         rocky_compiler::compile::compile(&config).map_err(|_| reason.clone())?;
                     load_error = Some(reason);
@@ -679,18 +682,6 @@ impl ServerState {
         match compile_result {
             Ok((mut result, load_error)) => {
                 if let Some(reason) = load_error {
-                    // Nothing to fall back to: `models/` is absent (the
-                    // compile treats that as empty) or holds no model. Serving
-                    // an empty project with the real error buried in the
-                    // diagnostics would answer `200` with `count: 0`.
-                    if result.project.model_count() == 0 {
-                        warn!(error = %reason, "pipeline models could not be loaded and models/ has none");
-                        self.publish_failure(reason.clone()).await;
-                        return RecompileOutcome {
-                            config_error: config_unreadable,
-                            compile_error: Some(reason),
-                        };
-                    }
                     warn!(error = %reason, "pipeline models could not be loaded; compiling models/ alone");
                     result
                         .diagnostics
