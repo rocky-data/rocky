@@ -69,7 +69,7 @@ These were fixed in-tree after the audit. They are the base this ADR builds on.
 
 The model contract checks nullability one way only. `ContractColumn.nullable = Some(false)` against an inferred nullable column is `E012`. `nullable = true` and an absent `nullable` check nothing.
 
-The gate is only as sound as nullability inference. Per `AGENT_REVIEW.md`, inference follows SQL three-valued logic (3VL): any nullable operand makes a comparison or arithmetic result nullable; `IS NULL` is non-nullable; `CAST` is nullable; `COALESCE` is nullable only when every argument is nullable. Unmodelled expressions fall to `(RockyType::Unknown, true)`.
+The gate is only as sound as nullability inference. Per `AGENT_REVIEW.md`, inference follows SQL three-valued logic (3VL): any nullable operand makes a comparison or arithmetic result nullable; `IS NULL` is non-nullable; `CAST` is nullable (the code is narrower: a plain `CAST` keeps its operand's nullability, and ADR-TYPES settles which rule holds); `COALESCE` is nullable only when every argument is nullable. Unmodelled expressions fall to `(RockyType::Unknown, true)`.
 
 This gives an asymmetry worth naming. For an unmodelled expression, the *type* check is skipped (`I003`, info), but the *nullability* check fails (`E012`, error), because the fallback says nullable. So nullability already fails closed on unresolved expressions, and type does not.
 
@@ -119,7 +119,7 @@ What an unverified type *does* to the exit code at each gate is open. See Open q
 ### 4. Nullability follows 3VL, and over-approximation is the safe direction
 
 - Inference may say "nullable" for a column that never holds NULL. It must never say "non-nullable" for a column that can hold NULL. A wrong non-nullable result is a soundness bug in `typecheck.rs`, and a contract that passes on it is a false guarantee.
-- So `E012` stays fail-closed on unresolved expressions. The fix a user is told to apply is `COALESCE` or a `WHERE ... IS NOT NULL` filter, never a `CAST` (a cast is nullable and takes its type from the target).
+- So `E012` stays fail-closed on unresolved expressions. The fix a user is told to apply is `COALESCE` or a `WHERE ... IS NOT NULL` filter, never a `CAST` (a cast never removes nullability; it only changes the type).
 - `nullable = true` in a contract means "may be NULL". It checks nothing and promises nothing.
 - Struct field nullability is compared as part of §2.
 
@@ -295,7 +295,7 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 
 **Nullability (§4)**
 - `nullable = false` over an unmodelled expression (fallback `(Unknown, true)`) ⇒ `E012`.
-- `nullable = false` over `COALESCE(x, 0)` with `x` nullable ⇒ pass. Over `CAST(x AS ...)` ⇒ `E012`.
+- `nullable = false` over `COALESCE(x, 0)` with `x` nullable ⇒ pass. Over `CAST(x AS ...)` with `x` nullable ⇒ `E012`.
 
 **Classification (§6)**
 - A generated test over every `(RockyType, RockyType)` pair, each with an explicit expected classification. A new `RockyType` variant fails to compile until the table handles it.
