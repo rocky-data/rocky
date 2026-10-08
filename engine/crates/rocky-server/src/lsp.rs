@@ -518,11 +518,13 @@ impl RockyLsp {
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
                 apply_project_gates(&dir_path, &mut result);
-                self.publish_diagnostics(generation, &result).await;
-                *self.compile_result.write().await = Some(result);
+                self.publish_diagnostics(generation, result).await;
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                // A newer compile that failed still outranks an older one
+                // that may yet succeed: that one must not publish over it.
+                self.published_files.compile_failed(generation).await;
                 // The log line above is the only place this failure went.
                 // The editor was left with NOTHING: no diagnostic (none was
                 // built), no message. A models directory that is a dangling
@@ -835,41 +837,55 @@ impl RockyLsp {
         map
     }
 
-    async fn publish_diagnostics(&self, generation: u64, result: &CompileResult) {
-        Self::publish_compile_diagnostics(&self.client, &self.published_files, generation, result)
-            .await;
+    async fn publish_diagnostics(&self, generation: u64, result: CompileResult) -> bool {
+        Self::publish_compile_diagnostics(
+            &self.client,
+            &self.published_files,
+            &self.compile_result,
+            generation,
+            result,
+        )
+        .await
     }
 
-    /// Publish the compile diagnostics, and clear the files that had some at
-    /// the last publication and have none now.
+    /// Publish the compile diagnostics, clear the files that had some at
+    /// the last publication and have none now, and store `result` as the
+    /// current compile result in `store`.
     ///
     /// `generation` is the value [`PublishedDiagnostics::begin_compile`]
-    /// returned when the compile behind `result` started. A publication
-    /// older than the last one sent is dropped: a slow compile that finishes
-    /// after a newer one must not put back a diagnostic the newer one
-    /// cleared. The publication lock is held across the sends, so two
-    /// publications never interleave on the wire.
+    /// returned when the compile behind `result` started. A result older
+    /// than the last one published (or than a newer compile that failed, see
+    /// [`PublishedDiagnostics::compile_failed`]) is dropped and not stored: a
+    /// slow compile that finishes after a newer one must not put back a
+    /// diagnostic the newer one cleared, nor replace its stored result. The
+    /// publication lock is held across the sends and the store, so two
+    /// publications never interleave. Returns whether `result` was used.
     ///
     /// An associated fn because the debounced `didChange` pass runs in a
     /// spawned task that holds clones, not `&self`.
     async fn publish_compile_diagnostics(
         client: &Client,
         published: &PublishedDiagnostics,
+        store: &RwLock<Option<CompileResult>>,
         generation: u64,
-        result: &CompileResult,
-    ) {
+        result: CompileResult,
+    ) -> bool {
         // Only publishers take this lock; no client handler waits on it, so
         // holding it across a send cannot block the handler the send needs.
+        // Handlers that read `store` never take it either, so waiting for
+        // the write below cannot deadlock.
         let mut last = published.state.lock().await;
         if generation < last.generation {
-            return;
+            return false;
         }
-        let (outgoing, now) = plan_publication(&last.files, diagnostics_by_uri(result));
+        let (outgoing, now) = plan_publication(&last.files, diagnostics_by_uri(&result));
         last.files = now;
         last.generation = generation;
         for (uri, diags) in outgoing {
             client.publish_diagnostics(uri, diags, None).await;
         }
+        *store.write().await = Some(result);
+        true
     }
 
     /// Find the model name for a given file URI.
@@ -1465,12 +1481,15 @@ impl LanguageServer for RockyLsp {
                     Self::publish_compile_diagnostics(
                         &client,
                         &published_files,
+                        &compile_result,
                         generation,
-                        &result,
+                        result,
                     )
                     .await;
-
-                    *compile_result.write().await = Some(result);
+                } else {
+                    // A newer compile that failed still outranks an older
+                    // one that may yet succeed.
+                    published_files.compile_failed(generation).await;
                 }
             });
         }
@@ -4684,6 +4703,14 @@ impl PublishedDiagnostics {
     fn begin_compile(&self) -> u64 {
         self.started.fetch_add(1, Ordering::SeqCst) + 1
     }
+
+    /// Record that the compile of `generation` failed. It publishes nothing,
+    /// but it is newer than every compile that started before it, so none
+    /// of those may publish or store its result afterwards.
+    async fn compile_failed(&self, generation: u64) {
+        let mut last = self.state.lock().await;
+        last.generation = last.generation.max(generation);
+    }
 }
 
 /// What to send for one publication: the files with diagnostics now, plus an
@@ -5155,18 +5182,17 @@ mod tests {
         let generations = &service.inner().published_files;
         service
             .inner()
-            .publish_diagnostics(generations.begin_compile(), &result)
+            .publish_diagnostics(generations.begin_compile(), result)
             .await;
         // The pipeline was fixed: the next compile has no diagnostic.
-        result.diagnostics.clear();
         service
             .inner()
-            .publish_diagnostics(generations.begin_compile(), &result)
+            .publish_diagnostics(generations.begin_compile(), compile_function_project(&root))
             .await;
         // A third, still clean, compile sends nothing more.
         service
             .inner()
-            .publish_diagnostics(generations.begin_compile(), &result)
+            .publish_diagnostics(generations.begin_compile(), compile_function_project(&root))
             .await;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5205,12 +5231,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         let clean = compile_function_project(&root);
-        let mut stale = compile_function_project(&root);
-        stale
-            .diagnostics
-            .push(rocky_compiler::diagnostic::Diagnostic::error(
-                "E053", "m", "no MERGE",
-            ));
+        let stale = || {
+            let mut stale = compile_function_project(&root);
+            stale
+                .diagnostics
+                .push(rocky_compiler::diagnostic::Diagnostic::error(
+                    "E053", "m", "no MERGE",
+                ));
+            stale
+        };
 
         let (mut service, mut socket) = LspService::new(|client| RockyLsp {
             client,
@@ -5270,9 +5299,17 @@ mod tests {
         let third = lsp.published_files.begin_compile();
         // Generation 1 shows the diagnostic, generation 3 clears it, and
         // generation 2 — started before 3 — finishes last.
-        lsp.publish_diagnostics(first, &stale).await;
-        lsp.publish_diagnostics(third, &clean).await;
-        lsp.publish_diagnostics(second, &stale).await;
+        assert!(lsp.publish_diagnostics(first, stale()).await);
+        assert!(lsp.publish_diagnostics(third, clean).await);
+        assert!(!lsp.publish_diagnostics(second, stale()).await);
+        // The stale result is not stored over the newer one either: hover,
+        // completion and the next incremental compile read the stored one.
+        let stored = lsp.compile_result.read().await;
+        assert!(
+            stored.as_ref().is_some_and(|r| r.diagnostics.is_empty()),
+            "the stored result is the newer, clean compile"
+        );
+        drop(stored);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
@@ -5295,6 +5332,40 @@ mod tests {
             0,
             "the editor ends clear"
         );
+    }
+
+    /// A newer compile that fails publishes nothing, but an older compile
+    /// that finishes after it must still not publish or store its result:
+    /// the failure is newer information than the older success.
+    #[tokio::test]
+    async fn an_older_compile_does_not_publish_over_a_newer_failed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let older = compile_function_project(&root);
+        let (service, _socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+        let lsp = service.inner();
+        let first = lsp.published_files.begin_compile();
+        let second = lsp.published_files.begin_compile();
+        lsp.published_files.compile_failed(second).await;
+        assert!(
+            !lsp.publish_diagnostics(first, older).await,
+            "the older success is dropped"
+        );
+        assert!(lsp.compile_result.read().await.is_none(), "and not stored");
     }
 
     /// Both LSP compile paths read the project's `rocky.toml` through one
