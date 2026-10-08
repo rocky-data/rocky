@@ -10,7 +10,8 @@
       "name": "total_revenue"
     },
     {
-      "name": "order_count"
+      "name": "order_count",
+      "data_type": "INT64"
     },
     {
       "name": "avg_order_value"

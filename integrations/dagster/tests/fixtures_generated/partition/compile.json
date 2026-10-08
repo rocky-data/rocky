@@ -3,7 +3,20 @@
   "command": "compile",
   "models": 1,
   "execution_layers": 1,
-  "diagnostics": [],
+  "diagnostics": [
+    {
+      "severity": "Info",
+      "code": "I002",
+      "message": "3 column(s) have unknown types \u2014 provide source schemas for full type checking",
+      "span": {
+        "file": "models/fct_daily_orders.sql",
+        "line": 1,
+        "col": 1
+      },
+      "model": "fct_daily_orders",
+      "suggestion": null
+    }
+  ],
   "has_errors": false,
   "compile_timings": {
     "project_load_ms": 0,
