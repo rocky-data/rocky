@@ -123,6 +123,10 @@ pub async fn run_transformation(
     // the legitimate no-op silent-skip. `false` for a bare `rocky run` and for a
     // governed plan with an empty reviewed set — both keep the silent-skip.
     expects_models: bool,
+    // Hook registry built once by `run()`. Threaded so the transformation
+    // route fires `compile_complete` and the per-model events (#2317); `None`
+    // for direct callers that run without hooks.
+    hook_registry: Option<&rocky_core::hooks::HookRegistry>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -172,8 +176,8 @@ pub async fn run_transformation(
                 None, // no model filter in local execution path
                 None, // no backfill model-set scope in local execution path
                 &mut output,
-                None, // run_local doesn't build a HookRegistry
-                None,
+                hook_registry,
+                pipeline_name,
                 schema_cache_cfg,
                 pipeline.target.governance.auto_create_schemas,
                 shadow_config,
@@ -3847,6 +3851,7 @@ auto_create_schemas = true
             None,  // exec_fp_gate
             None,  // freeze_fence
             false, // expects_models
+            None,  // hook_registry
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

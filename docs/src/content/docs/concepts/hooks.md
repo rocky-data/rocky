@@ -96,6 +96,18 @@ Rocky fires 18 events, grouped into six phases:
 The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky writes into the `event` field of the JSON context. When you **reference** an event — as a `[hook.*]` config key or as the `rocky hooks test` argument — prefix it with `on_`: `on_pipeline_start`, `on_budget_breach`, and so on. An unknown/unprefixed key is ignored with a warning rather than firing.
 :::
 
+### Which events fire for which pipeline type
+
+`pipeline_start`, `pipeline_complete` and `pipeline_error` fire for every pipeline type that `rocky run` executes: replication, transformation, quality, snapshot and load. The other events depend on what the pipeline does.
+
+| Event | Replication | Transformation | Quality, snapshot, load |
+|-------|-------------|----------------|-------------------------|
+| `pipeline_start`, `pipeline_complete`, `pipeline_error` | Yes | Yes | Yes |
+| `discover_complete`, table phase, `drift_detected`, check events | Yes | No | No |
+| `compile_complete`, model phase | No | Yes | No |
+
+`pipeline_complete` carries `duration_ms` for every pipeline type. `metadata.table_count` is set for a replication run only. For a transformation run, read the model count from `metadata.model_count` on `compile_complete`.
+
 ## Shell hooks
 
 A shell hook runs a command and pipes the event context to its stdin as JSON:
