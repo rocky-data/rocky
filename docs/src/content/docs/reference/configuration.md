@@ -1539,8 +1539,8 @@ A replication, snapshot, load or quality pipeline writes tables, not models. The
 |----------|--------------------|
 | `replication` | Each target table (and `<table><suffix>` for a suffix shadow run). |
 | `snapshot` | `target.table`, the history table. |
-| `load` | `target.table`. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
-| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
+| `load` | `target.table`, and `<table>__rocky_stg`, the staging table a load with a contract writes first. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
+| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default) and a working table `_quarantine_labels_<token>` (the token is random per run, so the gate sees `_quarantine_labels_`; match it with `_quarantine_labels_*`), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
 | `quality` without quarantine | Nothing. It only reads, so no rule applies. |
 
 These names carry no tags, layer, classifications or contract, so a rule scoped by those keys does not match them. `any = true` does. One exception: a table named like a compiled model of the project takes that model's attributes.
