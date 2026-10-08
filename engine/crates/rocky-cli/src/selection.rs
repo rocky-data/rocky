@@ -46,14 +46,28 @@ pub struct SelectionArgs {
 /// SQL does not parse (`@var(k, 2)` is not SQL), so a graph built without
 /// this step fails for any project that uses `@var` (#2315).
 ///
-/// Substitution diagnostics (a required var with no value) are dropped here:
-/// the graph only needs the SQL to parse, and `compile`/`run` report E028.
+/// Substitution diagnostics (a required var with no value) are not errors
+/// here: the graph only needs the SQL to parse, and `compile`/`run` report
+/// E028. They are added to the error only when the graph then fails to build.
 pub fn project_from_models(
     mut models: Vec<rocky_core::models::Model>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<Project> {
-    let _ = rocky_compiler::compile::substitute_run_vars_into_models(&mut models, run_vars);
-    Project::from_models(models).map_err(|e| anyhow::anyhow!("{e}"))
+    let diagnostics =
+        rocky_compiler::compile::substitute_run_vars_into_models(&mut models, run_vars);
+    Project::from_models(models).map_err(|e| {
+        // A required `@var` with no value became `NULL`, which can break the
+        // parse (`FROM NULL`). Name the real cause rather than only the parser.
+        let causes: Vec<String> = diagnostics
+            .iter()
+            .map(|d| format!("{}: {} ({})", d.code, d.message, d.model))
+            .collect();
+        if causes.is_empty() {
+            anyhow::anyhow!("{e}")
+        } else {
+            anyhow::anyhow!("{e}\n  likely cause:\n  {}", causes.join("\n  "))
+        }
+    })
 }
 
 impl SelectionArgs {
@@ -489,6 +503,72 @@ mod tests {
             got.into_iter().collect::<Vec<_>>(),
             vec!["base".to_string(), "m".to_string()]
         );
+    }
+
+    /// A supplied `--var` that names a table changes the graph edge. This
+    /// tells "run_vars honored" from "run_vars ignored", which a test whose
+    /// result does not depend on the value cannot.
+    #[test]
+    fn graph_selection_follows_a_supplied_var_that_names_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, sql) in [
+            ("base", "SELECT 1 AS id"),
+            ("other", "SELECT 2 AS id"),
+            ("m", "SELECT id FROM @var(src, base)"),
+        ] {
+            std::fs::write(dir.path().join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let select = |vars: rocky_core::run_vars::RunVars| {
+            let args = SelectionArgs {
+                select: vec!["+m".into()],
+                run_vars: vars,
+                ..Default::default()
+            };
+            resolve_in_dir(&args, dir.path(), None, &ctx(dir.path()))
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(select(Default::default()), vec!["base", "m"]);
+        let mut vars = rocky_core::run_vars::RunVars::new();
+        vars.insert("src", "other");
+        assert_eq!(select(vars), vec!["m", "other"]);
+    }
+
+    /// A required `@var` with no value becomes `NULL`; if that breaks the
+    /// parse, the error must name the variable, not only the parser (#2315).
+    #[test]
+    fn graph_failure_from_a_missing_required_var_names_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.sql"),
+            "SELECT id FROM @var(src) x WHERE (\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "name = \"m\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let args = SelectionArgs {
+            select: vec!["m+".into()],
+            ..Default::default()
+        };
+        let outcome = resolve_in_dir(&args, dir.path(), None, &ctx(dir.path()));
+        {
+            let e = outcome.expect_err("FROM NULL does not resolve");
+            let text = format!("{e:#}");
+            assert!(text.contains("E028") && text.contains("src"), "{text}");
+        }
     }
 
     #[test]
