@@ -43,7 +43,10 @@ pub struct ServerState {
     /// Whether [`Self::models_dir`] was named explicitly (`serve --models`) or
     /// is just the conventional default.
     ///
-    /// Only the DAG projection cares. `GET /api/v1/dag` treats an explicit
+    /// The compile and the DAG projection both read it. Without `--models`,
+    /// [`Self::recompile`] compiles every transformation pipeline's own model
+    /// set, the set the DAG draws (#2011); with it, that one directory.
+    /// `GET /api/v1/dag` treats an explicit
     /// directory as a whole-project override, reading every transformation
     /// pipeline from it — the HTTP analogue of `rocky dag --models`. Applying
     /// that override to a *defaulted* path is what reproduced #1261 over HTTP:
@@ -592,8 +595,38 @@ impl ServerState {
             .config_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("rocky.toml"));
+        //
+        // Which models: without an explicit `--models`, every transformation
+        // pipeline's own model set, joined by name — the set `GET
+        // /api/v1/dag` draws and `rocky dag` / `rocky run --dag` load (#2011).
+        // Compiling only `models/` left a pipeline with `models =
+        // "reporting/**"` drawn in the DAG and answered 404 by
+        // `/api/v1/models/{name}`. It is ONE compile over the union, not one
+        // per pipeline: a `depends_on` across pipelines only resolves to the
+        // upstream model when both are in the same compile. An explicit
+        // `--models`, or a project with no transformation pipeline, compiles
+        // that one directory as before.
+        let union_of_pipelines = !self.models_dir_is_explicit;
         let compile_result = match tokio::task::spawn_blocking(move || {
-            let mut result = rocky_compiler::compile::compile(&config)?;
+            let mut result = match gate_config
+                .as_ref()
+                .filter(|project| union_of_pipelines && has_transformation_pipeline(project))
+            {
+                Some(project) => {
+                    // The same refusal `rocky dag` gives, e.g. two files
+                    // sharing a model name in two pipelines' directories.
+                    let loaded = rocky_compiler::models_loader::load_transformation_models(
+                        &gate_config_path,
+                        project,
+                    )
+                    .map_err(|e| format!("{e:#}"))?;
+                    let models =
+                        rocky_compiler::models_loader::union_by_model_name(&loaded.by_pipeline);
+                    rocky_compiler::compile::compile_preloaded_models(models, &config)
+                        .map_err(|e| e.to_string())?
+                }
+                None => rocky_compiler::compile::compile(&config).map_err(|e| e.to_string())?,
+            };
             if let Some(project) = &gate_config {
                 crate::project_gates::apply_project_gates(
                     &mut result,
@@ -602,7 +635,7 @@ impl ServerState {
                     crate::project_gates::ModelSqlForm::Inlined,
                 );
             }
-            Ok::<_, rocky_compiler::compile::CompileError>(result)
+            Ok::<_, String>(result)
         })
         .await
         {
@@ -681,7 +714,7 @@ impl ServerState {
                 // the SPA describing a project whose models cannot be read as
                 // clean.
                 warn!(error = %e, "compilation failed");
-                let reason = e.to_string();
+                let reason = e;
                 self.publish_failure(reason.clone()).await;
                 RecompileOutcome {
                     config_error: config_unreadable,
@@ -782,6 +815,15 @@ impl ServerState {
 
         map
     }
+}
+
+/// Whether `project` declares a transformation pipeline: the pipelines whose
+/// models `recompile` compiles when no `--models` was named.
+fn has_transformation_pipeline(project: &rocky_core::config::RockyConfig) -> bool {
+    project
+        .pipelines
+        .values()
+        .any(|pipeline| pipeline.as_transformation().is_some())
 }
 
 #[cfg(test)]

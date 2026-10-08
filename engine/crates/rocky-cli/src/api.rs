@@ -1357,10 +1357,12 @@ async fn full_dag(
 
 /// Mark each `transformation` node with whether `compile` covers it (#2011).
 ///
-/// The graph walks every transformation pipeline's own models directory;
-/// the server compiles one directory, and `GET /api/v1/models/{name}` reads
-/// that compile. Without the mark the DAG offered nodes the detail route
-/// answers 404 for, and nothing on either route said so. The lookup is the
+/// The graph walks every transformation pipeline's own models directory, and
+/// so does the server's compile unless `--models` named one directory. The two
+/// can still differ: an explicit `--models`, a compile that failed, or a file
+/// changed between the compile and this request. `GET /api/v1/models/{name}`
+/// reads the compile, so without the mark the DAG offered nodes the detail
+/// route answers 404 for, and nothing on either route said so. The lookup is the
 /// one `get_model` makes, so the mark and the route agree by construction.
 /// No compile result means no node is servable: `false`, never omitted.
 fn mark_compiled_nodes(
@@ -6716,26 +6718,12 @@ mod tests {
         assert!(api.contains("\"compiled\": true"), "{api}");
     }
 
-    /// #2011: with `serve` holding the defaulted `models/` directory, the DAG
-    /// walks every transformation pipeline's own root, but the server compiles
-    /// only `models/`. A node from another root is drawn, and the detail
-    /// route answers 404 for it. The DAG must say so on the node — and the
-    /// mark must agree with what `GET /api/v1/models/{name}` answers.
-    #[tokio::test]
-    async fn dag_marks_the_nodes_the_server_compile_does_not_cover() {
+    /// A project with two transformation pipelines: `core` reads `models/`,
+    /// `reporting` reads `reporting/`. One model in each, `stg` and `rpt`.
+    fn two_root_project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         for (sub, model) in [("models", "stg"), ("reporting", "rpt")] {
-            let root = dir.path().join(sub);
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
-            std::fs::write(
-                root.join(format!("{model}.toml")),
-                format!(
-                    "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
-                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
-                ),
-            )
-            .unwrap();
+            write_root_model(&dir.path().join(sub), model);
         }
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
@@ -6747,6 +6735,31 @@ mod tests {
              [pipeline.reporting.target.governance]\nauto_create_schemas = true\n",
         )
         .unwrap();
+        (dir, config_path)
+    }
+
+    /// One full-refresh model named `model` in `root`.
+    fn write_root_model(root: &std::path::Path, model: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            root.join(format!("{model}.toml")),
+            format!(
+                "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// #2011: with `serve` holding the defaulted `models/` directory, the DAG
+    /// walks every transformation pipeline's own root. The server compile now
+    /// reads the same roots, so a model under `reporting/` is drawn, marked
+    /// compiled, listed by `GET /api/v1/models`, and served by
+    /// `GET /api/v1/models/{name}`. It used to answer 404.
+    #[tokio::test]
+    async fn the_server_compiles_every_pipelines_models_without_an_explicit_models_dir() {
+        let (dir, config_path) = two_root_project();
         let models_dir = dir.path().join("models");
         let state_path = pinned_state_path(dir.path());
         let state = pinned_server(models_dir, Some(config_path), &state_path);
@@ -6767,7 +6780,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(mark("stg"), serde_json::json!(true));
-        assert_eq!(mark("rpt"), serde_json::json!(false));
+        assert_eq!(mark("rpt"), serde_json::json!(true));
         // Only transformation nodes carry the mark.
         for node in dag["nodes"].as_array().unwrap() {
             if node["kind"] != "transformation" {
@@ -6775,15 +6788,20 @@ mod tests {
             }
         }
 
-        // The mark agrees with the detail route.
-        let served = reqwest::get(format!("{base}/api/v1/models/stg"))
+        // The list and the detail route agree with the DAG.
+        let list: serde_json::Value = reqwest::get(format!("{base}/api/v1/models"))
+            .await
+            .unwrap()
+            .json()
             .await
             .unwrap();
-        assert_eq!(served.status(), 200);
-        let unserved = reqwest::get(format!("{base}/api/v1/models/rpt"))
-            .await
-            .unwrap();
-        assert_eq!(unserved.status(), 404);
+        assert_eq!(list["count"], 2, "{list}");
+        for name in ["stg", "rpt"] {
+            let served = reqwest::get(format!("{base}/api/v1/models/{name}"))
+                .await
+                .unwrap();
+            assert_eq!(served.status(), 200, "{name}");
+        }
 
         // No compile result: no node is servable, so every mark is false.
         let marked = mark_compiled_nodes(
@@ -6806,6 +6824,100 @@ mod tests {
             .collect();
         assert_eq!(transformation.len(), 2);
         assert!(transformation.iter().all(|n| n.compiled == Some(false)));
+    }
+
+    /// An explicit `--models` still compiles that one directory, and the DAG
+    /// still reads it as a whole-project override (#1261). Here every
+    /// pipeline then reads `models/`, so `rpt` is in neither the compile nor
+    /// the graph.
+    #[tokio::test]
+    async fn an_explicit_models_dir_still_compiles_only_that_directory() {
+        let (dir, config_path) = two_root_project();
+        let state_path = pinned_state_path(dir.path());
+        let state = ServerState::with_auth_and_webhook(
+            dir.path().join("models"),
+            true, // `serve --models models`
+            None,
+            Some(config_path),
+            None,
+            Vec::new(),
+            Some(state_path),
+            None,
+            None,
+            rocky_server::state::SettingsSnapshot::default(),
+        );
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let base = spawn_router(state.clone()).await;
+        let stg = reqwest::get(format!("{base}/api/v1/models/stg"))
+            .await
+            .unwrap();
+        assert_eq!(stg.status(), 200);
+        let rpt = reqwest::get(format!("{base}/api/v1/models/rpt"))
+            .await
+            .unwrap();
+        assert_eq!(rpt.status(), 404);
+    }
+
+    /// The union applies each pipeline's `models` glob, as the DAG does: a
+    /// model in `models/` that the glob does not match is not compiled.
+    #[tokio::test]
+    async fn the_server_compile_applies_each_pipelines_models_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        write_root_model(&dir.path().join("models"), "apple");
+        write_root_model(&dir.path().join("models"), "banana");
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/a*.sql\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(dir.path().join("models"), Some(config_path), &state_path);
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let base = spawn_router(state.clone()).await;
+        let list: serde_json::Value = reqwest::get(format!("{base}/api/v1/models"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list["count"], 1, "{list}");
+        let banana = reqwest::get(format!("{base}/api/v1/models/banana"))
+            .await
+            .unwrap();
+        assert_eq!(banana.status(), 404);
+    }
+
+    /// Two files sharing a model name in two pipelines' directories: the
+    /// server compile refuses with the same error `dag_output` (the function
+    /// behind `rocky dag`) returns for the project, and serves no model list.
+    #[tokio::test]
+    async fn a_duplicate_model_name_across_pipelines_fails_the_compile_like_rocky_dag() {
+        let (dir, config_path) = two_root_project();
+        write_root_model(&dir.path().join("reporting"), "stg");
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(
+            dir.path().join("models"),
+            Some(config_path.clone()),
+            &state_path,
+        );
+        let outcome = state.recompile().await;
+        let compile_error = outcome.compile_error.expect("the compile must fail");
+        let dag_error = dag_output(&config_path, &state_path, None, None, None, false, None)
+            .expect_err("`rocky dag` refuses the same project");
+        assert_eq!(compile_error, format!("{dag_error:#}"));
+        assert!(
+            compile_error.contains("duplicate model name 'stg'"),
+            "{compile_error}"
+        );
+
+        let base = spawn_router(state.clone()).await;
+        let list = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
+        assert_eq!(list.status(), 503);
     }
 
     /// A project whose transformation pipeline declares a **custom** model root,
@@ -6900,9 +7012,10 @@ mod tests {
             compile.as_ref(),
         ));
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
-        // #2011's own shape: the graph names `stg` from `transforms/`; the
-        // server compiled the defaulted `models/`, which does not cover it.
-        assert_eq!(stg["compiled"], false, "{api}");
+        // #2011: the graph names `stg` from `transforms/`, and the server
+        // compiles the pipeline's own root rather than the defaulted
+        // `models/`, which does not exist here.
+        assert_eq!(stg["compiled"], true, "{api}");
         drop(compile);
 
         // A single custom root is still a root the compiler can read, so
