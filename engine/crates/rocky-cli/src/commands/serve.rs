@@ -2421,6 +2421,49 @@ mod tests {
         assert!(!announcement.operator_mode);
         assert!(announcement.address.contains("/login?t="));
     }
+
+    /// **A given token with no scope is operator mode too, and says so.**
+    /// `--ui --token s3cret` on loopback pairs the token as full scope (the
+    /// historical default), so the UI can make changes. The operator-mode
+    /// note must print for it exactly as for a generated token: the note
+    /// follows the scope, not where the token came from. No generated-token
+    /// note, because nothing was generated.
+    #[tokio::test]
+    async fn a_given_full_token_under_ui_prints_the_operator_mode_note() {
+        if serve_token_env_is_set() {
+            return;
+        }
+        for scope in [None, Some("full")] {
+            let (state, origin) = build_ui_matrix_state(UiCase {
+                secret: Some("givensecret"),
+                scope,
+                ..UiCase::local()
+            })
+            .expect("a given full token on loopback is operator mode");
+            assert_eq!(origin, TokenOrigin::Operator);
+            let announcement =
+                ui_announcement(true, "127.0.0.1", 8080, state.auth.as_ref(), origin)
+                    .expect("announced");
+            assert!(announcement.operator_mode, "{scope:?}");
+
+            let ready = rocky_core::schedule::Drain::new();
+            let shutdown = rocky_core::schedule::Drain::new();
+            let out = std::sync::Arc::new(RecordingAnnouncer::default());
+            let handle =
+                announce_when_ready(ready.clone(), shutdown, announcement, out.clone(), None);
+            ready.signal();
+            handle.await.unwrap();
+            let lines = out.0.lock().unwrap();
+            assert_eq!(
+                *lines,
+                [
+                    "out:Rocky UI: http://127.0.0.1:8080/login?t=givensecret".to_string(),
+                    format!("err:{OPERATOR_MODE_NOTE}"),
+                ],
+                "{scope:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

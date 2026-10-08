@@ -750,6 +750,81 @@ mod tests {
         let _layer = build_cors_layer(&[]);
     }
 
+    /// Send a CORS preflight asking to send `X-Rocky-UI` from `origin`
+    /// through [`build_cors_layer`], and return the response headers.
+    async fn preflight_for_x_rocky_ui(allowed: &[String], origin: &str) -> axum::http::HeaderMap {
+        use tower::ServiceExt as _;
+        let app = axum::Router::new()
+            .route("/api/v1/jobs/apply", axum::routing::post(|| async { "ok" }))
+            .layer(build_cors_layer(allowed));
+        let request = axum::http::Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/v1/jobs/apply")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-rocky-ui")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap().headers().clone()
+    }
+
+    /// **A cross-origin page cannot preflight `X-Rocky-UI`.** A cookie write
+    /// needs that header, and a browser sends a custom header cross-origin
+    /// only after a preflight that allows it. So the preflight must never
+    /// allow it:
+    ///
+    /// - no `--allowed-origin`: no `Access-Control-Allow-Origin` and no
+    ///   `Access-Control-Allow-Headers` at all;
+    /// - one allowed origin, asked from another origin: no
+    ///   `Access-Control-Allow-Origin` (so the browser refuses);
+    /// - one allowed origin, asked from that origin: the origin is allowed
+    ///   (that is what the flag is for), but the allowed headers stay
+    ///   `authorization, content-type`, without `x-rocky-ui`, so the browser
+    ///   still refuses to send it. tower-http answers the configured header
+    ///   list whatever is asked, so the list itself is what is pinned.
+    #[tokio::test]
+    async fn cors_preflight_never_allows_x_rocky_ui() {
+        let headers = preflight_for_x_rocky_ui(&[], "https://evil.example").await;
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{headers:?}"
+        );
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none(),
+            "{headers:?}"
+        );
+
+        let allowed = ["https://portal.example.test".to_string()];
+        let headers = preflight_for_x_rocky_ui(&allowed, "https://evil.example").await;
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{headers:?}"
+        );
+
+        let headers = preflight_for_x_rocky_ui(&allowed, "https://portal.example.test").await;
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://portal.example.test"),
+            "{headers:?}"
+        );
+        let allow_headers: Vec<String> = headers
+            .get_all(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .iter()
+            .flat_map(|v| v.to_str().unwrap_or("").split(','))
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
+        assert!(
+            !allow_headers.iter().any(|h| h == "x-rocky-ui" || h == "*"),
+            "{allow_headers:?}"
+        );
+        assert!(
+            allow_headers.contains(&"authorization".to_string()),
+            "{allow_headers:?}"
+        );
+    }
+
     #[test]
     fn cors_layer_drops_invalid_origins() {
         // Invalid origin strings (those containing control chars) should
