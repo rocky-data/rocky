@@ -570,8 +570,10 @@ async fn run_apply_run_plan(
         plan_id,
         &loaded.config,
         config_path,
+        root,
         &run_plan,
         modelless,
+        principal,
     )?;
 
     // Resolve the post-apply verification checks *before* the run plan is moved
@@ -4888,8 +4890,10 @@ async fn run_apply_ai_authored_plan(
         plan_id,
         &loaded.config,
         config_path,
+        root,
         &run_plan,
         modelless,
+        principal,
     )?;
 
     // Resolve the post-apply verification checks before the run plan is moved.
@@ -5024,23 +5028,28 @@ fn reviewed_dag_plan(plan: &PersistedPlan, run_plan: &RunPlan) -> bool {
 }
 
 /// A run plan executes only if the models it would run still match the
-/// fingerprint the plan (and any approval of it) recorded, whoever applies
-/// it. `run` recompiles the models on disk; before this, only an agent's
-/// apply was re-checked (inside `run`), so a person's apply ran models
-/// edited after the plan was made.
+/// fingerprint the plan (and any approval of it) recorded. `run` recompiles
+/// the models on disk; before this, only an agent's apply was re-checked
+/// (inside `run`), so a person's apply ran models edited after the plan was
+/// made. A person's apply compares the models alone; an agent's compares the
+/// models and the config they run under (see
+/// [`super::approval_scope::verify_plan_models_for_apply`]).
 ///
 /// Called after the policy and review gates, so their refusals keep their
 /// precedence, and before any warehouse statement. Skipped where nothing
 /// would be re-checked twice or nothing compiled runs: a reviewed `--dag`
 /// plan ([`verify_reviewed_dag_scope`] already ran), a model-less pipeline
 /// (snapshot, load, quality) and a replication-only plan.
+#[allow(clippy::too_many_arguments)]
 fn verify_plan_models_before_execution(
     plan: &PersistedPlan,
     plan_id: &str,
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,
+    root: &Path,
     run_plan: &RunPlan,
     modelless: bool,
+    principal: PolicyPrincipal,
 ) -> Result<()> {
     if reviewed_dag_plan(plan, run_plan) || modelless || is_replication_only(config, run_plan) {
         return Ok(());
@@ -5050,7 +5059,9 @@ fn verify_plan_models_before_execution(
         plan_id,
         Some(config),
         config_path,
+        root,
         run_plan,
+        principal,
     )
 }
 
@@ -5283,15 +5294,17 @@ async fn run_apply_backfill_plan(
         if set.is_empty() {
             bail!("backfill plan '{plan_id}' names no models to rebuild");
         }
-        // Every principal: the models the backfill rebuilds must still match
-        // the fingerprint its approval covered. `execute_backfill_set`
-        // recompiles them from disk.
+        // The models the backfill rebuilds must still match the fingerprint
+        // its approval covered. `execute_backfill_set` recompiles them from
+        // disk. A backfill is agent-by-kind, so this is the full check.
         super::approval_scope::verify_plan_models_for_apply(
             &plan,
             plan_id,
             cfg.as_ref().map(|l| &l.config),
             config_path,
+            root,
             &run_plan,
+            plan.enforcement_principal(runtime_principal),
         )?;
 
         // A half-open window must never execute: `to_selection` only yields a
@@ -7344,6 +7357,7 @@ mod tests {
             PolicyPrincipal::Agent,
             crate::plan_store::EmbeddedCapabilities {
                 models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                models_only_fingerprint: None,
                 config_identity: Some("reviewed-config".to_string()),
                 fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
                 reviewed_source_schemas: Some(BTreeMap::new()),
@@ -8939,6 +8953,7 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -8979,6 +8994,7 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -9012,6 +9028,7 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -9241,6 +9258,7 @@ effect = "allow"
                 c
             },
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -13712,6 +13730,7 @@ enabled = true
                 PolicyPrincipal::Agent,
                 crate::plan_store::EmbeddedCapabilities {
                     models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                    models_only_fingerprint: None,
                     config_identity: Some("reviewed-config".to_string()),
                     fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
                     reviewed_source_schemas: Some(BTreeMap::new()),

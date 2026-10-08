@@ -2014,6 +2014,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         diff_available: false,
         changed: std::collections::BTreeMap::new(),
         models_fingerprint: None,
+        models_only_fingerprint: None,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
@@ -2088,8 +2089,20 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             resolved_mask: &resolved_mask,
         },
     );
-    let models_fingerprint = match models_fingerprint {
-        Ok(fingerprint) => fingerprint,
+    // The models-only fingerprint a person's apply compares: the same scope
+    // and compile, with no config, governance or execution-control identity
+    // and no mask, so a different environment does not read as a change.
+    let fingerprints = models_fingerprint.and_then(|full| {
+        let models_only = super::approval_scope::scope_models_only_fingerprint(scope, &heads)?;
+        // Both or neither: a plan never carries a models-only fingerprint
+        // its full one could not back.
+        Ok(match full {
+            Some(full) => (Some(full), models_only),
+            None => (None, None),
+        })
+    });
+    let (models_fingerprint, models_only_fingerprint) = match fingerprints {
+        Ok(fingerprints) => fingerprints,
         // A `--dag` run refuses a seeds directory it cannot discover, so the
         // plan carries no fingerprint rather than failing to persist; a
         // review-gated apply then refuses it.
@@ -2120,6 +2133,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
                 diff_available: false,
                 changed: std::collections::BTreeMap::new(),
                 models_fingerprint,
+                models_only_fingerprint,
                 config_identity,
                 fingerprint_version: CURRENT_FINGERPRINT_VERSION,
                 reviewed_source_schemas,
@@ -2151,6 +2165,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         diff_available: true,
         changed,
         models_fingerprint,
+        models_only_fingerprint,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         reviewed_source_schemas,

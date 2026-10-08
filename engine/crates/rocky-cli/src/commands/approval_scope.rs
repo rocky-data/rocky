@@ -454,33 +454,80 @@ pub(crate) fn plan_scope_identities(
     OwnedScopeIdentities::from_config(cfg, binds_mask.then_some(run_plan.env.as_deref()))
 }
 
+/// The fingerprint of a compiled scope over its models alone: no config,
+/// governance or execution-control identity and no mask. Seeds still count
+/// for a `--dag` scope, because the DAG runs them.
+///
+/// A person's apply compares this one. The identities hash adapters and
+/// pipelines with their `${VAR}` values resolved, so the full fingerprint
+/// moves when the same plan is applied from another environment, such as a
+/// `rocky serve` job child, or after an edit to an unrelated pipeline.
+pub(crate) fn scope_models_only_fingerprint(
+    scope: &ApprovalScope,
+    compiled: &[CompiledUnit],
+) -> Result<Option<String>> {
+    let no_mask = BTreeMap::new();
+    scope_fingerprint(
+        scope,
+        compiled,
+        &ScopeIdentities {
+            config: "",
+            governance: "",
+            exec_control: "",
+            resolved_mask: &no_mask,
+        },
+    )
+}
+
 /// The stable code `rocky apply` refuses with when the models a plan
 /// fingerprinted no longer match the models on disk. It is in the error text,
 /// so a failed HTTP apply job's `error` carries it.
 pub(crate) const PLAN_MODELS_CHANGED: &str = "plan_models_changed";
 
-/// Apply-time check, for every principal: a plan that carries a models
-/// fingerprint executes only if the models it would run still produce that
-/// fingerprint.
+/// The stable code an agent's apply refuses with when the plan's models are
+/// unchanged but the config they run under is not (adapters, pipelines,
+/// governance, run settings, or the mask, as resolved in this environment).
+pub(crate) const PLAN_CONFIG_CHANGED: &str = "plan_config_changed";
+
+/// The stable code `rocky apply` refuses with when a plan carries a
+/// fingerprint but not what the check needs to recompute it: a plan written
+/// before the check existed.
+pub(crate) const PLAN_SNAPSHOT_MISSING: &str = "plan_snapshot_missing";
+
+/// Apply-time check: a plan that carries a models fingerprint executes only
+/// if the models it would run still match it.
 ///
 /// `rocky apply` does not replay stored SQL: `run` recompiles the models on
-/// disk. Before this check, a person's apply ran whatever the models had
-/// become since the plan was made and reviewed; only an agent's apply was
-/// re-checked (inside `run`, through the governed context). This recomputes
-/// the fingerprint with the same scope, compile and identities review uses
-/// before it writes an approval ([`plan_scope_identities`],
-/// [`scope_fingerprint`]), seeded from the plan's reviewed source-schema
-/// snapshot.
+/// disk. This recomputes the fingerprint with the scope and compile review
+/// uses, seeded from the plan's reviewed source-schema snapshot.
+///
+/// ```text
+///   principal  compares                       on mismatch
+///   agent      full fingerprint               plan_config_changed if the
+///              (models + config identities)   models alone still match,
+///                                             else plan_models_changed
+///   other      models-only fingerprint        plan_models_changed
+/// ```
+///
+/// An agent's apply is also re-checked inside `run`. A person's is not, so
+/// for a person the models can still change between this check and the
+/// run's own compile.
 ///
 /// A plan with no fingerprint (a legacy plan, or one whose models did not
-/// compile at plan time) is not this check's business: a review-gated apply
-/// already refuses it elsewhere.
+/// compile at plan time) is not checked here: a review-gated apply already
+/// refuses it elsewhere. A plan with a fingerprint but no source-schema
+/// snapshot, or (for a person) no models-only fingerprint, predates this
+/// check and refuses with [`PLAN_SNAPSHOT_MISSING`].
+///
+/// `root` anchors a backfill's relative models directory, as review does.
 pub(crate) fn verify_plan_models_for_apply(
     plan: &crate::plan_store::PersistedPlan,
     plan_id: &str,
     cfg: Option<&RockyConfig>,
     config_path: &Path,
+    root: &Path,
     run_plan: &RunPlan,
+    principal: rocky_core::config::PolicyPrincipal,
 ) -> Result<()> {
     let capabilities = plan.embedded_capabilities();
     let Some(expected) = capabilities.models_fingerprint.as_deref() else {
@@ -489,21 +536,30 @@ pub(crate) fn verify_plan_models_for_apply(
     if capabilities.fingerprint_version == 0 {
         return Ok(());
     }
-    let refuse = |why: &str| {
+    let agent = principal == rocky_core::config::PolicyPrincipal::Agent;
+    let models_changed = |why: &str| {
         anyhow::anyhow!(
             "{PLAN_MODELS_CHANGED}: refusing to apply plan '{plan_id}': models changed since \
              this plan was made; plan again with `rocky plan` (and review the new plan if it \
-             needs approval). {why}. Apply runs the models on disk, so it re-checks them \
-             against the plan first."
+             needs approval). {why}."
         )
     };
-    let source_schemas: HashMap<_, _> = capabilities
-        .reviewed_source_schemas
-        .ok_or_else(|| {
-            refuse("The plan has no reviewed source-schema snapshot to re-check its models with")
-        })?
-        .into_iter()
-        .collect();
+    let snapshot_missing = |what: &str| {
+        anyhow::anyhow!(
+            "{PLAN_SNAPSHOT_MISSING}: refusing to apply plan '{plan_id}': the plan predates the \
+             check apply runs on a plan's models (it has no {what}), so apply cannot tell \
+             whether its models changed. Plan again with `rocky plan` (and review the new \
+             plan if it needs approval)."
+        )
+    };
+    let Some(source_schemas) = capabilities.reviewed_source_schemas else {
+        return Err(snapshot_missing("source-schema snapshot"));
+    };
+    let expected_models_only = capabilities.models_only_fingerprint.as_deref();
+    if !agent && expected_models_only.is_none() {
+        return Err(snapshot_missing("models-only fingerprint"));
+    }
+    let source_schemas: HashMap<_, _> = source_schemas.into_iter().collect();
     let scope = if plan.kind == crate::plan_store::PlanKind::Backfill {
         // A backfill executes its persisted directory, without a glob.
         ApprovalScope {
@@ -515,20 +571,42 @@ pub(crate) fn verify_plan_models_for_apply(
             }],
             seeds_dir: None,
         }
+        .anchored_at(root)
     } else {
         approval_scope(cfg, config_path, run_plan)?
     };
     let compiled = scope
         .compile(&source_schemas, NoModels::Empty)
-        .map_err(|e| refuse(&format!("Its models no longer compile ({e:#})")))?;
+        .map_err(|e| models_changed(&format!("Its models no longer compile ({e:#})")))?;
+    let models_only = scope_models_only_fingerprint(&scope, &compiled)
+        .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
+    let models_match =
+        expected_models_only.is_some() && models_only.as_deref() == expected_models_only;
+    if !agent {
+        if !models_match {
+            return Err(models_changed(
+                "A model it runs was added, removed or changed",
+            ));
+        }
+        return Ok(());
+    }
     let ids = plan_scope_identities(plan, &scope, cfg, run_plan);
     let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
-        .map_err(|e| refuse(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
-    if actual.as_deref() != Some(expected) {
-        return Err(refuse(
-            "A model it runs was added, removed or changed, or the config those models run \
-             under changed",
+        .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
+    if actual.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    if models_match {
+        return Err(anyhow::anyhow!(
+            "{PLAN_CONFIG_CHANGED}: refusing to apply plan '{plan_id}': its models are \
+             unchanged, but the config they run under changed since this plan was made \
+             (adapters, pipelines, governance, run settings or masks, as resolved in this \
+             environment). An agent's apply runs only under the config its plan was made \
+             with; plan again with `rocky plan` in this environment."
         ));
     }
-    Ok(())
+    Err(models_changed(
+        "A model it runs was added, removed or changed, or the config those models run under \
+         changed",
+    ))
 }

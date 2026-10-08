@@ -326,6 +326,15 @@ pub(crate) fn run_backfill_in(
             &exec_control_identity,
             &extras,
         ),
+        // The models alone, as `approval_scope::scope_models_only_fingerprint`
+        // hashes one unit: no identities, and the mask is already empty here.
+        models_only_fingerprint: crate::commands::apply::execution_ir_fingerprint(
+            &compiled.project.models,
+            "",
+            "",
+            "",
+            &extras,
+        ),
         config_identity,
         fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
         reviewed_source_schemas,
