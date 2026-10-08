@@ -63,7 +63,7 @@ The server generates a token only on a loopback host (`127.0.0.1`, `::1` or `loc
 
 ### Sign-in and the session cookie
 
-The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui_<tag>` (the tag differs per server). The cookie is `HttpOnly` and `SameSite=Strict`. It ends when the browser closes. The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
+The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui_<tag>` (the tag differs per server). The cookie is `HttpOnly` and `SameSite=Strict`. It usually ends when the browser closes (browsers that restore sessions can keep it). The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
 
 The cookie holds a keyed hash of the token, not the token. The key is new for each server process, so a restart ends every browser session. The page never holds the token. Its API calls carry the cookie.
 
@@ -123,6 +123,8 @@ rocky review <plan-id> --approve
 
 A plan bound to a data product shows no Apply button. Apply it in a terminal. The spec digest must come from you, not from the plan.
 
+Apply runs the models as they are on disk, not SQL stored in the plan. So it first checks that they still match the plan. If a model was added, removed or edited after the plan was made, or the config it runs under changed, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. This holds for every apply, from the UI or the CLI, by a person or an agent.
+
 ## Products
 
 Products shows each [data product](/reference/commands/products/): its fulfillment loop state, its working spec digest, whether its approval is recorded, and its journal. The journal lists every event the engine recorded for the product, in order.
@@ -164,7 +166,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled, with the reason.
+Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The banner gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 `rocky serve --ui` turns it on by itself when all of these hold:
 
@@ -180,6 +182,7 @@ rocky serve --ui --read-only    # view-only UI
 
 Know these limits:
 
+- **The printed link is a write credential.** In operator mode the `/login?t=` link carries a full-scope token. Anything that captures the server's stdout holds it: `docker logs`, CI logs, terminal scrollback, a log shipper. So does browser history. Use `--read-only` wherever the output is captured or shared.
 - **A server behind a proxy is shared.** With `--allowed-host` or `--allowed-origin`, the server stays read-only. It generates a read-only token. It refuses `--token-scope full`. Writes from the UI need a token for each person.
 - **A tunnel looks local.** An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detected. The server still looks local. Use `--read-only` whenever someone else can reach your port.
 - **A local proxy can look local too.** A reverse proxy on the same machine (nginx, Caddy) that forwards with `Host: 127.0.0.1` passes the host check with no `--allowed-host`, so the server stays in operator mode. Start it with `--read-only`, or name the proxy host with `--allowed-host`, which makes the server read-only.
@@ -189,7 +192,7 @@ Know these limits:
 - **One token does everything.** It can plan, approve and apply, as the CLI user can. Approving in the UI is not a second person's sign-off.
 - **The webhook route has its own secret.** `/api/v1/hooks/trigger/{pipeline}` checks an HMAC signature. It is the one write route outside the Bearer token.
 
-An approval from the UI records the approver source `http_api` and the server's git identity. If the server cannot resolve `git config user.email`, the approve job fails with `approver_identity_unresolved`. Run records from HTTP jobs show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
+An approval from the UI records the approver source `http_api` and the server's git identity. If the server cannot resolve `git config user.email`, or it is literally `unknown`, the approve job fails with `approver_identity_unresolved`. Run records from HTTP jobs show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
 
 ## What the UI cannot do
 
