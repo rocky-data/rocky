@@ -310,7 +310,7 @@ impl BigQueryAdapter {
             statement.kind = kind,
             "rocky.adapter.name" = "bigquery",
             "rocky.statement.kind" = kind,
-            "rocky.warehouse.name" = %self.project_id,
+            "rocky.warehouse.name" = %rocky_core::secret_registry::render_placeholders(&self.project_id),
             "rocky.warehouse.query_id" = field::Empty,
             "rocky.warehouse.bytes_scanned" = field::Empty,
             "rocky.retry.attempt" = field::Empty,
