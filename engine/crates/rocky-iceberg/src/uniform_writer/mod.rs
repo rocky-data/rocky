@@ -49,6 +49,7 @@ pub mod commit;
 pub mod discover;
 pub mod errors;
 pub mod parquet_builder;
+pub mod publish;
 
 pub use errors::{Result, UniformWriterError};
 
@@ -722,6 +723,120 @@ impl UniformWriter {
         self.commit_replace(vec![staged], live, state, modification_time_millis)
             .await?
             .into_single()
+    }
+
+    /// Make the table serve an earlier content-addressed output again
+    /// (RV1-P3 table publish). `files` are the blake3 hashes the output
+    /// recorded ([`rocky_core::state::OutputVersion::ContentAddressed`]).
+    ///
+    /// One replace commit makes the live set exactly those files. Their
+    /// `add` actions are lifted from the commits that added them, so no byte
+    /// is copied or rewritten. When the files are already the live set, no
+    /// commit is written.
+    ///
+    /// ```text
+    ///   v1: add A   v2: remove A, add B   publish(A) ─▶ v3: remove B, add A
+    /// ```
+    ///
+    /// # Scope
+    ///
+    /// Unpartitioned, non-rowTracking tables only, like
+    /// [`Self::commit_pointer_with_state`].
+    ///
+    /// # Errors
+    ///
+    /// - [`UniformWriterError::PartitionedUnsupported`] / `DeltaLog` for a
+    ///   partitioned or rowTracking table, or a malformed hash;
+    /// - [`UniformWriterError::PublishSourceUnavailable`] when no commit of
+    ///   this table added a file, the file was added before the latest
+    ///   schema or partitioning change, or its bytes are gone (for example
+    ///   after a `VACUUM`);
+    /// - every error of the replace commit (checkpoint, append-only, a
+    ///   concurrent shape change, the retry budget).
+    pub async fn restore_content_addressed(
+        &self,
+        files: &[String],
+        state: UniformTableState,
+    ) -> Result<ReplaceOutcome> {
+        if !state.partition_columns.is_empty() {
+            return Err(UniformWriterError::PartitionedUnsupported(
+                state.partition_columns.clone(),
+            ));
+        }
+        if state.row_tracking_enabled {
+            return Err(UniformWriterError::RowTrackingUnsupported);
+        }
+        if files.is_empty() {
+            return Err(UniformWriterError::DeltaLog(
+                "a publish names no output file".to_string(),
+            ));
+        }
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        let unavailable = |detail: String| UniformWriterError::PublishSourceUnavailable {
+            table: self.config.fqtn(),
+            detail,
+        };
+        let live = self.live_set().await?;
+        let modification_time_millis = chrono::Utc::now().timestamp_millis();
+        let mut staged = Vec::with_capacity(files.len());
+        for hash in files {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "`{hash}` is not a blake3 hex hash"
+                )));
+            }
+            let name = format!("{hash}.parquet");
+            let key = discover::canonical_key(&name, self.bucket(), &prefix)
+                .ok_or_else(|| unavailable(format!("`{name}` cannot be resolved")))?;
+            let Some(found) = live.ever_added.get(&key) else {
+                return Err(unavailable(format!(
+                    "no commit in the table's log added `{name}`"
+                )));
+            };
+            if found.version < live.shape_version {
+                return Err(unavailable(format!(
+                    "`{name}` was added at commit {}, before the schema or partitioning changed \
+                     at commit {}",
+                    found.version, live.shape_version
+                )));
+            }
+            match self.store.head(&object_path(&prefix, &name)?).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(unavailable(format!(
+                        "the bytes of `{name}` are gone (a VACUUM can remove the files of a \
+                         replaced version)"
+                    )));
+                }
+                Err(e) => return Err(e.into()),
+            }
+            let add = commit::lift_add_action(&found.add, modification_time_millis)?;
+            let path = add
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let size_bytes = add
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let num_records = add
+                .get("stats")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|s| s.get("numRecords").and_then(serde_json::Value::as_u64))
+                .unwrap_or_default() as usize;
+            staged.push(StagedFile {
+                path,
+                add,
+                blake3_hash: hash.clone(),
+                column_hashes: Vec::new(),
+                num_records,
+                size_bytes,
+            });
+        }
+        self.commit_replace(staged, live, state, modification_time_millis)
+            .await
     }
 
     /// Whether a prior run `R`'s content-addressed file is **still live** in
@@ -3218,6 +3333,8 @@ mod tests {
             protocol: Value::Null,
             metadata: Value::Null,
             row_tracking_domain: None,
+            ever_added: Default::default(),
+            shape_version: 0,
         };
         assert_eq!(live.row_tracking_next_id().unwrap(), 0);
         live.row_tracking_domain = dm(r#"{"rowIdHighWaterMark":-1}"#);
@@ -3276,5 +3393,280 @@ mod tests {
             std::fs::create_dir_all(out.parent().unwrap()).unwrap();
             std::fs::write(out, &bytes).unwrap();
         }
+    }
+
+    // -- table publish (RV1-P3) ----------------------------------------------
+
+    fn table_writer(store: &Arc<InMemory>, prefix: &str, sql: Arc<dyn SqlClient>) -> UniformWriter {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            sql,
+        )
+    }
+
+    /// Two builds, `A` then `B`. Returns their file hashes.
+    async fn two_builds(writer: &UniformWriter) -> (String, String) {
+        let a = writer.write_batch(make_batch(10)).await.unwrap();
+        let b = writer.write_batch(make_batch(20)).await.unwrap();
+        assert_eq!((a.table_version, b.table_version), (1, 2));
+        (a.blake3_hash, b.blake3_hash)
+    }
+
+    async fn object_count(store: &InMemory) -> usize {
+        use futures::TryStreamExt;
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Publishing the earlier output `A` writes one commit that removes `B`
+    /// and adds `A` again, with A's own `add` (no byte copied). Publishing
+    /// it a second time writes nothing.
+    #[tokio::test]
+    async fn restore_makes_an_earlier_output_live_in_one_commit() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, b) = two_builds(&writer).await;
+        let objects_before = object_count(&store).await;
+
+        let state = writer.discover().await.unwrap();
+        let out = writer
+            .restore_content_addressed(std::slice::from_ref(&a), state)
+            .await
+            .unwrap();
+        assert!(out.committed);
+        assert_eq!(out.table_version, 3);
+        assert_eq!(out.removed_paths, vec![format!("{b}.parquet")]);
+        assert_eq!(
+            replay_live_paths(&store, "tbl").await,
+            std::collections::BTreeSet::from([format!("{a}.parquet")])
+        );
+        let lines = commit_lines(&store, "tbl", 3).await;
+        let add = lines.iter().find_map(|l| l.get("add")).unwrap();
+        let first = commit_lines(&store, "tbl", 1).await;
+        let first_add = first.iter().find_map(|l| l.get("add")).unwrap();
+        assert_eq!(add["stats"], first_add["stats"], "A's stats are lifted");
+        assert_eq!(add["size"], first_add["size"]);
+        // Only one new object: the commit. No parquet was written.
+        assert_eq!(object_count(&store).await, objects_before + 1);
+
+        let state = writer.discover().await.unwrap();
+        let again = writer
+            .restore_content_addressed(std::slice::from_ref(&a), state)
+            .await
+            .unwrap();
+        assert!(!again.committed);
+        assert_eq!(again.table_version, 3);
+        assert!(!commit_exists(&store, "tbl", 4).await);
+    }
+
+    /// The bytes of `A` are gone (a VACUUM after the replace): the publish
+    /// refuses and writes no commit. An unknown hash refuses the same way.
+    #[tokio::test]
+    async fn restore_refuses_a_version_whose_bytes_are_gone_or_never_existed() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        store
+            .delete(&object_store::path::Path::from(format!("tbl/{a}.parquet")))
+            .await
+            .unwrap();
+
+        let state = writer.discover().await.unwrap();
+        let err = writer
+            .restore_content_addressed(std::slice::from_ref(&a), state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, UniformWriterError::PublishSourceUnavailable { detail, .. } if detail.contains("are gone")),
+            "{err}"
+        );
+        let state = writer.discover().await.unwrap();
+        let err = writer
+            .restore_content_addressed(&["f".repeat(64)], state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, UniformWriterError::PublishSourceUnavailable { detail, .. } if detail.contains("no commit")),
+            "{err}"
+        );
+        assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    /// A file written before a schema change is not published: its parquet
+    /// and stats follow the old schema.
+    #[tokio::test]
+    async fn restore_refuses_a_file_written_before_a_schema_change() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, b) = two_builds(&writer).await;
+        // Commit 3 changes the schema (a column becomes nullable) and keeps
+        // B live.
+        let v0 = commit_lines(&store, "tbl", 0).await;
+        let mut meta = v0
+            .iter()
+            .find(|l| l.get("metaData").is_some())
+            .unwrap()
+            .clone();
+        let schema = meta["metaData"]["schemaString"].as_str().unwrap().replacen(
+            "\"nullable\":false",
+            "\"nullable\":true",
+            1,
+        );
+        meta["metaData"]["schemaString"] = Value::String(schema);
+        let body = format!("{}\n", serde_json::to_string(&meta).unwrap());
+        store
+            .put(
+                &object_store::path::Path::from("tbl/_delta_log/00000000000000000003.json"),
+                PutPayload::from(Bytes::from(body.into_bytes())),
+            )
+            .await
+            .unwrap();
+
+        let state = writer.discover().await.unwrap();
+        let err = writer
+            .restore_content_addressed(std::slice::from_ref(&a), state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, UniformWriterError::PublishSourceUnavailable { detail, .. } if detail.contains("schema")),
+            "{err}"
+        );
+        assert!(!commit_exists(&store, "tbl", 4).await);
+        // B was added before the change too: refused as well.
+        let state = writer.discover().await.unwrap();
+        assert!(writer.restore_content_addressed(&[b], state).await.is_err());
+    }
+
+    fn content_addressed(hash: &str, version: u64) -> rocky_core::state::OutputVersion {
+        rocky_core::state::OutputVersion::content_addressed(
+            "c.s.t".into(),
+            vec![version],
+            vec![hash.to_string()],
+            false,
+        )
+    }
+
+    /// End to end on the in-memory store and a local state store: publish
+    /// the earlier run's output through `rocky_core::table_publish`. One
+    /// Delta commit moves the table, the Iceberg sync runs once, and the
+    /// publish history records the move with its commit version.
+    #[tokio::test]
+    async fn a_table_publish_moves_the_delta_table_and_records_the_commit() {
+        use rocky_core::environments::{
+            EnvironmentName, PublishRequest, PublishSource, TableMoveOutcome,
+        };
+        use rocky_core::state::StateStore;
+        use rocky_core::table_publish::publish_tables;
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let sql = Arc::new(RecordingSqlClient::default());
+        let writer = table_writer(&store, "tbl", sql.clone());
+        let (a, b) = two_builds(&writer).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".rocky-state.redb");
+        let state = StateStore::open(&path).unwrap();
+        state
+            .record_run(&rocky_core::state::run_with_output_versions(
+                "r1",
+                &[("orders", Some(content_addressed(&a, 1)))],
+            ))
+            .unwrap();
+        state
+            .record_run(&rocky_core::state::run_with_output_versions(
+                "r2",
+                &[("orders", Some(content_addressed(&b, 2)))],
+            ))
+            .unwrap();
+        drop(state);
+        let session = rocky_core::state_sync::LedgerSeamSession::new(
+            &rocky_core::config::StateConfig::default(),
+            &path,
+            false,
+        );
+        let publisher = publish::DeltaTablePublisher::new().with_table(writer);
+        let request = PublishRequest {
+            environment: EnvironmentName::parse("prod").unwrap(),
+            expected_head: None,
+            sources: vec![PublishSource {
+                model: "orders".into(),
+                run_id: "r1".into(),
+            }],
+            principal: rocky_core::config::PrincipalRef::unnamed(),
+            plan_id: None,
+        };
+        let report = publish_tables(&session, &request, &publisher, false)
+            .await
+            .unwrap();
+
+        assert!(report.is_complete());
+        assert_eq!(
+            report.moves()[0].outcome,
+            TableMoveOutcome::Moved {
+                table: "c.s.t".into(),
+                table_version: 3,
+                warning: None
+            }
+        );
+        assert_eq!(
+            replay_live_paths(&store, "tbl").await,
+            std::collections::BTreeSet::from([format!("{a}.parquet")])
+        );
+        assert_eq!(
+            *sql.log.lock().unwrap(),
+            vec!["MSCK REPAIR TABLE c.s.t SYNC METADATA".to_string()]
+        );
+    }
+
+    /// The backend refuses, before anything is written, a version it cannot
+    /// publish: a partitioned output, a `delta_observed` version, and a
+    /// table with no writer.
+    #[test]
+    fn the_delta_publisher_refuses_what_it_cannot_publish() {
+        use rocky_core::environments::{EnvPointer, PointerVersion};
+        use rocky_core::state::OutputVersion;
+        use rocky_core::table_publish::TablePointerBackend;
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let publisher = publish::DeltaTablePublisher::new().with_table(table_writer(
+            &store,
+            "tbl",
+            Arc::new(PanicSqlClient),
+        ));
+        let pointer = |v: OutputVersion| EnvPointer {
+            model: "orders".into(),
+            run_id: "r1".into(),
+            version: PointerVersion::Known(v),
+        };
+        let h = "a".repeat(64);
+        assert!(publisher.check(&pointer(content_addressed(&h, 1))).is_ok());
+        let partitioned =
+            OutputVersion::content_addressed("c.s.t".into(), vec![1], vec![h.clone()], true);
+        let err = publisher.check(&pointer(partitioned)).unwrap_err();
+        assert!(err.contains("partitioned"), "{err}");
+        let observed = OutputVersion::DeltaObserved {
+            table: "c.s.t".into(),
+            version: 1,
+        };
+        let err = publisher.check(&pointer(observed)).unwrap_err();
+        assert!(err.contains("delta_observed"), "{err}");
+        let other = OutputVersion::content_addressed("c.s.other".into(), vec![1], vec![h], false);
+        let err = publisher.check(&pointer(other)).unwrap_err();
+        assert!(err.contains("no Delta table writer"), "{err}");
     }
 }

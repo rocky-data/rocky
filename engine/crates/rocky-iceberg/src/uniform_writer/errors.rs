@@ -85,6 +85,15 @@ pub enum UniformWriterError {
          'false')`, then run the model again."
     )]
     AppendOnlyTable { table: String },
+
+    /// A table publish (RV1-P3) cannot make the table serve an earlier
+    /// output: a file of that output is gone, or was written for another
+    /// schema. Nothing is committed.
+    #[error(
+        "table `{table}` cannot be published at the recorded version: {detail}. No commit was \
+         written. Run the model again to build a version that can be published."
+    )]
+    PublishSourceUnavailable { table: String, detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, UniformWriterError>;
