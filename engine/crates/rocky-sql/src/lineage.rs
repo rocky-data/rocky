@@ -18,8 +18,9 @@ use crate::dialect::DatabricksDialect;
 pub enum TransformKind {
     /// Direct column reference (no transformation).
     Direct,
-    /// Infallible type cast (`CAST(...)` or `expr :: type`). Preserves the
-    /// input's nullability — a non-null input yields a non-null output.
+    /// Plain type cast (`CAST(...)` or `expr :: type`). The edge itself does
+    /// not know the source or target types, so it carries the input's
+    /// nullability; the compiler widens it when the cast can fail (#2299).
     Cast,
     /// Fallible type cast (`TRY_CAST(...)` / `SAFE_CAST(...)`) that returns
     /// `NULL` when the conversion fails. The output is nullable regardless of
