@@ -18,7 +18,9 @@ const capturedFixtures = fileURLToPath(
 );
 
 // Local development against a running `rocky serve`: the API keeps its origin
-// through this proxy, so the same-origin token flow works unchanged. The port
+// through this proxy, so the page's same-origin requests work unchanged.
+// `just ui-dev` runs that server on loopback with no token, so no sign-in is
+// needed; `/login` and the session cookie exist only under `--ui`. The port
 // is read from ONE place — `ROCKY_API` — which `just ui-dev` (the root
 // justfile) sets from its own port, so the recipe and this proxy cannot
 // disagree. By hand, the default matches `rocky serve` on 8080.

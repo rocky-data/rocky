@@ -7,6 +7,7 @@ import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import type { PreviewRowsOutput } from "@rocky-types/preview_rows";
 import statusFixture from "@rocky-fixtures/review_status.json";
 import { ApiError } from "../api";
+import { READ_ONLY_REASON, WriteAccessProvider } from "../operator";
 import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId } from "./PlanDetail";
 
 // The status panel reads a payload captured from the live engine, so a shape
@@ -555,7 +556,7 @@ describe("PlanDetail", () => {
     expect(screen.getByText(/\(narrowing\)/)).toBeTruthy();
     expect(screen.getByText("a breaking schema change needs a human")).toBeTruthy();
     expect(screen.getByText("#2")).toBeTruthy();
-    // Approving is a command to copy, never a control on the page.
+    // The terminal command stays on the page as a secondary hint.
     expect(screen.getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
   });
 
@@ -651,14 +652,22 @@ describe("PlanDetail", () => {
     expect(screen.getByText("refused (404)")).toBeTruthy();
   });
 
-  it("offers no control that could change anything", async () => {
-    const { container } = render(<PlanDetail planId={PLAN} loaders={loaders()} />);
-    await screen.findByText(STATUS.kind);
-    // The sample panel's button is the only one, and it only reads.
-    const buttons = Array.from(container.querySelectorAll("button")).map(
-      (b) => b.textContent ?? "",
+  it("offers no control that can change anything on a read-only page", async () => {
+    const { container } = render(
+      <WriteAccessProvider value={{ kind: "read_only", reason: READ_ONLY_REASON }}>
+        <PlanDetail planId={PLAN} loaders={loaders()} />
+      </WriteAccessProvider>,
     );
-    expect(buttons).toEqual(["Show 20 rows"]);
+    await screen.findByRole("region", { name: "Approval" });
+    // The sample panel's button only reads; the write controls are drawn,
+    // disabled, with the reason.
+    const enabled = Array.from(container.querySelectorAll("button"))
+      .filter((b) => !b.disabled)
+      .map((b) => b.textContent ?? "");
+    expect(enabled).toEqual(["Show 20 rows"]);
+    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    expect(screen.getAllByText(READ_ONLY_REASON).length).toBeGreaterThan(0);
     expect(container.querySelector("form")).toBeNull();
   });
 
