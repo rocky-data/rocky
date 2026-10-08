@@ -85,6 +85,32 @@ jobs:
       - name: cargo check (x86_64-pc-windows-msvc)
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
 
+  windows-spool-probe:
+    name: Windows spool probe (#1903)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    # Evidence only, advisory like every job here. Its own job because
+    # `cargo test -p rocky-core` builds the dev-dependencies, rocky-duckdb
+    # included, and `windows-check` deliberately avoids DuckDB's C++ compile.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned like windows-check. Bump deliberately.
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine
+          # Restore only, matching the other weekly jobs.
+          save-if: false
+      - name: Spool probe (denied directory listing)
+        # Prints what the path-presence classifier and the spool readers return
+        # when `icacls` denies listing a directory. The test asserts nothing
+        # about the classification and fails only if `icacls` itself fails.
+        # Read the output with `--nocapture`.
+        continue-on-error: true
+        run: cargo test -p rocky-core --test spool_probe_windows -- --ignored --nocapture
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
