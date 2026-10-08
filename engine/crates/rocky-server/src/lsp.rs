@@ -913,10 +913,16 @@ impl RockyLsp {
         // clears them.
         let after_failure = generation < last.failed;
         let mut previous = last.files.clone();
-        if !after_failure {
+        let mut current = diagnostics_by_uri(&result);
+        if after_failure {
+            // The failure's E028 files stay as the failure left them: this
+            // older result neither clears nor overwrites their squiggles.
+            previous.retain(|uri| !last.parse_files.contains(uri));
+            current.retain(|uri, _| !last.parse_files.contains(uri));
+        } else {
             previous.extend(last.parse_files.drain());
         }
-        let (outgoing, now) = plan_publication(&previous, diagnostics_by_uri(&result));
+        let (outgoing, now) = plan_publication(&previous, current);
         last.files = now;
         last.generation = generation;
         for (uri, diags) in outgoing {
@@ -5506,6 +5512,14 @@ mod tests {
                 .contains(&bad_uri)
         );
 
+        // The broken file is already tracked from an earlier publish: the
+        // older success must still leave its E028 alone.
+        lsp.published_files
+            .state
+            .lock()
+            .await
+            .files
+            .insert(bad_uri.clone());
         // The older success must not clear the E028 of the newer failure.
         assert!(lsp.publish_diagnostics(older, first_ok).await);
         assert!(
