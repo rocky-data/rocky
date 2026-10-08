@@ -516,6 +516,40 @@ mod tests {
         );
     }
 
+    /// #2307: `--column` traces through CTEs to the source column. The import
+    /// CTE `orders` passes model `orders` through a `SELECT *`; the chain
+    /// `a -> b` renames `orders.id` twice before the output reads it.
+    #[test]
+    fn column_trace_goes_through_ctes_to_the_source_column() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path();
+        write_model(models_dir, "orders", "SELECT id FROM source.raw.orders");
+        write_model(
+            models_dir,
+            "imp",
+            "WITH orders AS (SELECT * FROM orders) SELECT id FROM orders",
+        );
+        write_model(
+            models_dir,
+            "chain",
+            "WITH a AS (SELECT id AS k FROM orders), b AS (SELECT k AS j FROM a) SELECT j FROM b",
+        );
+
+        let result = compile_chain(models_dir);
+        for (model, column) in [("imp", "id"), ("chain", "j")] {
+            let out = column_lineage_output(&result, model, column, false).unwrap();
+            let sources: Vec<(&str, &str)> = out
+                .trace
+                .iter()
+                .map(|e| (e.source.model.as_str(), e.source.column.as_str()))
+                .collect();
+            assert!(
+                sources.contains(&("orders", "id")),
+                "{model}.{column}: expected orders.id in {sources:?}"
+            );
+        }
+    }
+
     /// A leaf column (consumed by nobody) yields an empty consumer set,
     /// which serde then omits via `skip_serializing_if`.
     #[test]

@@ -412,7 +412,11 @@ pub fn build_semantic_graph(
             let Some(table) = rs.source_table.as_ref() else {
                 continue;
             };
-            let source_name = alias_to_table.get(table).unwrap_or(table);
+            let source_name = if rs.physical {
+                table
+            } else {
+                alias_to_table.get(table).unwrap_or(table)
+            };
             let edge = RowSelectionEdge {
                 source: QualifiedColumn {
                     model: Arc::from(source_name.as_str()),
@@ -442,10 +446,16 @@ pub fn build_semantic_graph(
 
             // Resolve source table name to a model or external source
             let source_table = col_lineage.source_table.as_ref().and_then(|t| {
+                if col_lineage.physical {
+                    return Some(t.clone());
+                }
                 // If it's an alias, resolve to the real table name
                 alias_to_table.get(t).cloned().or(Some(t.clone()))
             });
 
+            // A read through a CTE already names the CTE body's physical
+            // origin, or no table at all: lineage never leaves a CTE's name
+            // here for a same-named source or model to capture (#2307).
             if let Some(ref source_name) = source_table {
                 edges.push(LineageEdge {
                     source: QualifiedColumn {
@@ -464,6 +474,76 @@ pub fn build_semantic_graph(
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star {
             for table_ref in &lineage_result.source_tables {
+                // A star over a CTE returns the CTE body's columns, never
+                // those of a source or model that shares its name (#2307).
+                // Lineage has already traced each body column to its physical
+                // origin, and a body that is itself an unresolved `SELECT *`
+                // lists the physical tables it passes through.
+                if table_ref.binding == lineage::TableBinding::Cte {
+                    for col in &table_ref.cte_columns {
+                        if !output_names.insert(col.target_column.clone()) {
+                            continue;
+                        }
+                        output_columns.push(ColumnDef {
+                            name: col.target_column.clone(),
+                        });
+                        if let Some(source) = &col.source_table {
+                            edges.push(LineageEdge {
+                                source: QualifiedColumn {
+                                    model: Arc::from(source.as_str()),
+                                    column: Arc::from(col.source_column.as_str()),
+                                },
+                                target: QualifiedColumn {
+                                    model: model_name_arc.clone(),
+                                    column: Arc::from(col.target_column.as_str()),
+                                },
+                                transform: col.transform.clone(),
+                            });
+                        }
+                    }
+                    for inner_name in &table_ref.derived_sources {
+                        // Same #1631 rule as a direct star: a model's columns
+                        // only when the reader depends on that model.
+                        let reader_depends_on_it = upstream_map
+                            .get(model_name.as_str())
+                            .is_some_and(|deps| deps.iter().any(|dep| dep == inner_name));
+                        let inner_columns: Vec<&str> = if let Some(upstream_schema) = models
+                            .get(inner_name.as_str())
+                            .filter(|_| reader_depends_on_it)
+                        {
+                            upstream_schema
+                                .columns
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect()
+                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                            source_cols.iter().map(|c| c.name.as_str()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let inner_arc: Arc<str> = Arc::from(inner_name.as_str());
+                        for name in inner_columns {
+                            if output_names.insert(name.to_string()) {
+                                let col_arc: Arc<str> = Arc::from(name);
+                                output_columns.push(ColumnDef {
+                                    name: name.to_string(),
+                                });
+                                edges.push(LineageEdge {
+                                    source: QualifiedColumn {
+                                        model: inner_arc.clone(),
+                                        column: col_arc.clone(),
+                                    },
+                                    target: QualifiedColumn {
+                                        model: model_name_arc.clone(),
+                                        column: col_arc,
+                                    },
+                                    transform: TransformKind::Direct,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let table_name = &table_ref.name;
                 let table_name_arc: Arc<str> = Arc::from(table_name.as_str());
                 // A star takes a model's columns only when the reader actually
@@ -888,6 +968,59 @@ mod tests {
         assert!(
             !names.contains(&"model_only_col"),
             "the shadowed model's columns are not what the query returns: {names:?}"
+        );
+    }
+
+    /// #2307: the same shadowing for a source. A star over a CTE must not take
+    /// the columns of an external source that shares the CTE's name.
+    #[test]
+    fn a_star_over_a_cte_does_not_take_the_shadowed_sources_columns() {
+        let models = vec![make_model(
+            "reader",
+            "WITH t AS (SELECT 1 AS cte_only_col) SELECT * FROM t",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let sources = HashMap::from([(
+            "t".to_string(),
+            vec![ColumnInfo {
+                name: "source_only_col".to_string(),
+                data_type: "INT".to_string(),
+                nullable: true,
+            }],
+        )]);
+        let graph = build_semantic_graph(&project, &sources).unwrap();
+        let reader = graph.model_schema("reader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(!names.contains(&"source_only_col"), "{names:?}");
+    }
+
+    /// #2307: a star over an import CTE (`WITH t AS (SELECT * FROM t)`)
+    /// passes the same-named external source through, with an edge per column.
+    #[test]
+    fn a_star_over_an_import_cte_expands_the_sources_columns() {
+        let models = vec![make_model(
+            "reader",
+            "WITH t AS (SELECT * FROM t) SELECT * FROM t",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let sources = HashMap::from([(
+            "t".to_string(),
+            vec![ColumnInfo {
+                name: "source_col".to_string(),
+                data_type: "INT".to_string(),
+                nullable: true,
+            }],
+        )]);
+        let graph = build_semantic_graph(&project, &sources).unwrap();
+        let reader = graph.model_schema("reader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["source_col"]);
+        let trace = graph.trace_column("reader", "source_col");
+        assert!(
+            trace
+                .iter()
+                .any(|e| &*e.source.model == "t" && &*e.source.column == "source_col"),
+            "{trace:?}"
         );
     }
 

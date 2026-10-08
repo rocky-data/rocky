@@ -4371,6 +4371,263 @@ mod tests {
             .collect()
     }
 
+    /// #2307: a CTE named like a source shadows it. The column comes from the
+    /// CTE body (`u.n`, a STRING), never from the same-named source `t` (INT).
+    #[test]
+    fn a_cte_named_like_a_source_does_not_take_the_sources_types() {
+        for sql in [
+            "WITH t AS (SELECT n AS x FROM u) SELECT x FROM t",
+            // Aliased, qualified and nested forms of the same read.
+            "WITH t AS (SELECT n AS x FROM u) SELECT a.x FROM t AS a",
+            "WITH t AS (SELECT n AS x FROM u) SELECT t.x AS x FROM t",
+            "WITH t AS (SELECT n AS x FROM u), w AS (SELECT x FROM t) SELECT x FROM t",
+            // The inner `t` is the source; the outer `t` is the CTE.
+            "WITH t AS (SELECT n AS x FROM t) SELECT x FROM t",
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_ne!(rows[0].1, RockyType::Int32, "{sql}: {rows:?}");
+        }
+    }
+
+    type Cols<'a> = &'a [(&'a str, RockyType, bool)];
+
+    /// Typecheck one model `m` over the given `(name, columns)` sources.
+    fn typecheck_over(sql: &str, tables: &[(&str, Cols)]) -> Vec<(String, RockyType, bool)> {
+        let sources: HashMap<_, _> = tables
+            .iter()
+            .map(|(name, cols)| (name.to_string(), source_schema(cols)))
+            .collect();
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2307: the physical origin a CTE read resolves to is not re-resolved
+    /// through the OUTER query's aliases. `customers AS orders` must not
+    /// capture `orders.n` read through the CTE.
+    #[test]
+    fn an_outer_alias_does_not_capture_a_cte_origin() {
+        let orders: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("n", RockyType::String, false),
+        ];
+        let customers: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("n", RockyType::Int32, true),
+        ];
+        let rows = typecheck_over(
+            "WITH c AS (SELECT n AS x FROM orders) \
+             SELECT c.x FROM c JOIN customers AS orders ON c.x = orders.id",
+            &[("orders", orders), ("customers", customers)],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, RockyType::String, "{rows:?}");
+        assert!(!rows[0].2, "{rows:?}");
+    }
+
+    /// #2307: row-selection edges through a CTE are not captured either.
+    #[test]
+    fn an_outer_alias_does_not_capture_a_cte_row_selection_origin() {
+        let sql = "WITH c AS (SELECT n AS x FROM orders) \
+                   SELECT c.x FROM c JOIN customers AS orders ON c.x = orders.id WHERE c.x > 0";
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let from_customers_n = graph
+            .row_selection_edges
+            .iter()
+            .any(|e| &*e.source.model == "customers" && &*e.source.column == "n");
+        assert!(!from_customers_n, "{:?}", graph.row_selection_edges);
+        assert!(
+            graph
+                .row_selection_edges
+                .iter()
+                .any(|e| &*e.source.model == "orders" && &*e.source.column == "n"),
+            "{:?}",
+            graph.row_selection_edges
+        );
+    }
+
+    /// #2307: a CTE body column from the null-supplying side of an outer join
+    /// is nullable in the model, though the source column is NOT NULL.
+    #[test]
+    fn a_cte_body_outer_join_column_stays_nullable() {
+        let o: &[(&str, RockyType, bool)] = &[("id", RockyType::Int32, false)];
+        let p: &[(&str, RockyType, bool)] = &[
+            ("oid", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+        ];
+        for sql in [
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT y FROM a",
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT a.y FROM a",
+            "WITH a AS (SELECT o.id, p.y AS yy FROM o LEFT JOIN p ON o.id = p.oid), \
+             b AS (SELECT yy FROM a) SELECT yy FROM b",
+        ] {
+            let rows = typecheck_over(sql, &[("o", o), ("p", p)]);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert!(rows[0].2, "{sql}: {rows:?}");
+        }
+        // The preserved side stays NOT NULL.
+        let rows = typecheck_over(
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT id FROM a",
+            &[("o", o), ("p", p)],
+        );
+        assert!(!rows[0].2, "{rows:?}");
+    }
+
+    /// #2307: a recursive CTE's column is nullable when its recursive branch
+    /// can supply NULL, whatever the anchor says.
+    #[test]
+    fn a_recursive_cte_column_is_nullable_when_a_branch_can_be_null() {
+        let o: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+        ];
+        let rows = typecheck_over(
+            "WITH RECURSIVE r AS (SELECT id, id AS v FROM o \
+             UNION ALL SELECT r.id, o.z FROM r JOIN o ON r.id = o.id) SELECT v FROM r",
+            &[("o", o)],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].2, "{rows:?}");
+    }
+
+    /// #2307: a CTE with another name leaves the source read alone.
+    #[test]
+    fn a_non_shadowing_cte_keeps_source_types() {
+        let rows = typecheck_over_t_and_u("WITH c AS (SELECT n FROM u) SELECT x FROM t");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+        let rows = typecheck_over_t_and_u("SELECT x FROM t");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
+    /// #2307: a column read through a CTE takes the type of the CTE body's
+    /// column, traced to the physical table at the end of the chain.
+    #[test]
+    fn a_cte_column_takes_the_type_of_its_body_column() {
+        for (sql, want, nullable) in [
+            // Shadowed name: the body reads `u.n` (STRING), not source `t`.
+            (
+                "WITH t AS (SELECT n AS x FROM u) SELECT x FROM t",
+                RockyType::String,
+                false,
+            ),
+            // Import CTE: `SELECT *` over the same-named source passes through.
+            (
+                "WITH t AS (SELECT * FROM t) SELECT x FROM t",
+                RockyType::Int32,
+                false,
+            ),
+            (
+                "WITH t AS (SELECT * FROM t) SELECT z FROM t",
+                RockyType::Int32,
+                true,
+            ),
+            // A chain of CTEs traces to the physical table at its end.
+            (
+                "WITH a AS (SELECT n AS x FROM u), b AS (SELECT x AS y FROM a) SELECT y FROM b",
+                RockyType::String,
+                false,
+            ),
+            (
+                "WITH a AS (SELECT * FROM t), b AS (SELECT * FROM a) SELECT z FROM b",
+                RockyType::Int32,
+                true,
+            ),
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_eq!(rows[0].1, want, "{sql}: {rows:?}");
+            assert_eq!(rows[0].2, nullable, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2307: a transform inside the CTE body reaches the outer column's
+    /// type; the outer column never copies the pre-transform source type.
+    #[test]
+    fn a_transform_in_a_cte_body_types_the_outer_column() {
+        for (sql, want) in [
+            (
+                "WITH c AS (SELECT CAST(n AS INT) AS x FROM u) SELECT x FROM c",
+                RockyType::Int32,
+            ),
+            (
+                "WITH c AS (SELECT TRY_CAST(n AS INT) AS x FROM u) SELECT x FROM c",
+                RockyType::Int32,
+            ),
+            (
+                "WITH c AS (SELECT SUM(z) AS s FROM u) SELECT s FROM c",
+                RockyType::Int64,
+            ),
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_eq!(rows[0].1, want, "{sql}: {rows:?}");
+            // A cast can fail and a SUM over no rows is NULL.
+            assert!(rows[0].2, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2307: `SELECT *` over an import CTE (`WITH orders AS (SELECT * FROM
+    /// orders)`) expands the upstream model's columns with their types, so a
+    /// `time_column` the upstream projects does not raise E020.
+    #[test]
+    fn a_star_over_an_import_cte_keeps_the_upstream_columns_and_types() {
+        let ti = make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders \
+             WHERE ts >= @start_date AND ts < @end_date",
+        );
+        let models = vec![
+            make_model("orders", "SELECT id, ts FROM source.raw.base"),
+            ti,
+        ];
+        let project = Project::from_models(models).unwrap();
+        let external = HashMap::from([(
+            "source.raw.base".to_string(),
+            vec![
+                rocky_ir::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                },
+                rocky_ir::ColumnInfo {
+                    name: "ts".to_string(),
+                    data_type: "DATE".to_string(),
+                    nullable: false,
+                },
+            ],
+        )]);
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let typed_sources = HashMap::from([(
+            "source.raw.base".to_string(),
+            source_schema(&[
+                ("id", RockyType::Int64, false),
+                ("ts", RockyType::Date, false),
+            ]),
+        )]);
+        let result =
+            typecheck_project_with_models(&graph, &typed_sources, None, &project.models, None);
+        let ti_cols = &result.typed_models["ti"];
+        let ts = ti_cols.iter().find(|c| c.name == "ts");
+        assert_eq!(
+            ts.map(|c| &c.data_type),
+            Some(&RockyType::Date),
+            "{ti_cols:?}"
+        );
+        assert!(ti_cols.iter().any(|c| c.name == "id"), "{ti_cols:?}");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
     /// #2303: a set operation is typed by combining its branches by
     /// position. A column is non-null only when it is non-null in every branch.
     #[test]
