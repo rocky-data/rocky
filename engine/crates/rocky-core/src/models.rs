@@ -2946,6 +2946,65 @@ SELECT 1
         assert_eq!(ir.target.table, "fct_orders_v2");
     }
 
+    /// A derived physical edge is a RUN-time ordering fact, not part of a
+    /// model's logic. It must never enter `skip_hash()`: if it did, adding a
+    /// physical read of another model's table would invalidate the skip key
+    /// (and a content-addressed reuse key built on it) with no change to the
+    /// model's own output.
+    #[test]
+    fn derived_physical_edge_does_not_enter_skip_hash() {
+        use crate::physical_edges::{PhysicalEdgeModel, derive_physical_edges};
+
+        let producer = parse_model_inline(
+            "---toml\nname = \"stg_orders\"\n[target]\ncatalog = \"analytics\"\nschema = \"staging\"\ntable = \"orders\"\n---\nSELECT 1 AS id\n",
+            Path::new("stg_orders.sql"),
+            None,
+        )
+        .unwrap();
+        let mut consumer = parse_model_inline(
+            "---toml\nname = \"fct_orders\"\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"fct_orders\"\n---\nSELECT id FROM analytics.staging.orders\n",
+            Path::new("fct_orders.sql"),
+            None,
+        )
+        .unwrap();
+
+        // The derivation really does produce the edge under test.
+        let inputs = [
+            PhysicalEdgeModel::from_model(&producer),
+            PhysicalEdgeModel::from_model(&consumer),
+        ];
+        let derived = derive_physical_edges(&inputs, &[]);
+        assert_eq!(
+            derived.edges,
+            vec![("fct_orders".to_string(), "stg_orders".to_string())],
+            "fixture must derive the physical edge fct_orders -> stg_orders"
+        );
+
+        let typed = |m: &Model| {
+            let mut ir = m.to_model_ir();
+            ir.typed_columns = vec![rocky_ir::types::TypedColumn {
+                name: "id".into(),
+                data_type: rocky_ir::types::RockyType::Int64,
+                nullable: false,
+            }];
+            ir
+        };
+        let before = typed(&consumer).skip_hash();
+        assert!(before.is_some(), "typed IR must be hashable");
+
+        // Record the derived edge on the consumer the way a declared one is
+        // carried (`depends_on`); the skip key must not move.
+        for (c, p) in &derived.edges {
+            assert_eq!(c, &consumer.config.name);
+            consumer.config.depends_on.push(p.clone());
+        }
+        assert_eq!(
+            before,
+            typed(&consumer).skip_hash(),
+            "a derived physical edge must not change skip_hash"
+        );
+    }
+
     // --- Sidecar format tests ---
 
     #[test]
