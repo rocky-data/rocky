@@ -56,6 +56,23 @@ fn is_same_file(event_path: &Path, config: &Path) -> bool {
     matches!((parent(event_path), parent(config)), (Some(a), Some(b)) if a == b)
 }
 
+/// Send a recompile signal when `res` is an event that should recompile.
+fn handle_event(
+    res: Result<Event, notify::Error>,
+    tx: &mpsc::Sender<()>,
+    config_file: Option<&Path>,
+) {
+    match res {
+        Ok(event) => {
+            if event_triggers_recompile(&event.kind, &event.paths, config_file) {
+                debug!(paths = ?event.paths, "file change detected");
+                let _ = tx.try_send(());
+            }
+        }
+        Err(e) => warn!(error = %e, "watch error"),
+    }
+}
+
 /// Start watching a directory for file changes, and the state's bound
 /// `rocky.toml` too (`ServerState::config_path`).
 /// Returns a handle that keeps the watcher alive.
@@ -89,14 +106,52 @@ pub fn start_watcher(
         }
     });
 
+    let functions_dir = rocky_core::functions::functions_dir_for(watch_dir);
+    // The watcher on a `functions/` directory that appeared (or reappeared)
+    // after startup. The main watcher's handler owns it, so it lives as long
+    // as the watcher the caller holds.
+    let late_functions: Arc<std::sync::Mutex<Option<RecommendedWatcher>>> = Arc::default();
+    let late_slot = late_functions.clone();
+    let functions_for_handler = functions_dir.clone();
+    let tx_for_late = tx.clone();
+    let config_for_late = config_file.clone();
+
     let mut watcher =
         notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
-                if event_triggers_recompile(&event.kind, &event.paths, config_for_filter.as_deref())
+                if let Some(functions) = functions_for_handler.as_deref()
+                    && matches!(event.kind, EventKind::Create(_))
+                    && event.paths.iter().any(|p| is_same_file(p, functions))
                 {
-                    debug!(paths = ?event.paths, "file change detected");
-                    let _ = tx.try_send(());
+                    // The directory was created after startup: watch it now,
+                    // and recompile, since files may already be inside it.
+                    let tx = tx_for_late.clone();
+                    let config = config_for_late.clone();
+                    let made =
+                        notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                            handle_event(res, &tx, config.as_deref());
+                        })
+                        .and_then(|mut w| {
+                            w.watch(functions, RecursiveMode::NonRecursive)?;
+                            Ok(w)
+                        });
+                    match made {
+                        Ok(w) => {
+                            info!(dir = %functions.display(), "watching the functions directory");
+                            if let Ok(mut slot) = late_slot.lock() {
+                                *slot = Some(w);
+                            }
+                            let _ = tx_for_late.try_send(());
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            dir = %functions.display(),
+                            "cannot watch the functions directory"
+                        ),
+                    }
+                    return;
                 }
+                handle_event(Ok(event), &tx, config_for_filter.as_deref());
             }
             Err(e) => warn!(error = %e, "watch error"),
         })?;
@@ -105,23 +160,36 @@ pub fn start_watcher(
     // UDF definitions live beside the models directory, not in it
     // (`<models>/../functions/*.toml`, the directory the compiler reads). A
     // change there moves E051 and the types of UDF calls, so it recompiles
-    // too. A `functions/` directory created after startup is not seen until
-    // the server restarts.
-    if let Some(functions_dir) = rocky_core::functions::functions_dir_for(watch_dir)
-        && functions_dir.is_dir()
-    {
+    // too. When the directory does not exist yet, its parent is watched so
+    // the handler above can start watching it once it appears.
+    if let Some(functions_dir) = functions_dir.as_deref() {
         let covered = match (functions_dir.canonicalize(), watch_dir.canonicalize()) {
             (Ok(f), Ok(w)) => f.starts_with(w),
             _ => false,
         };
         if !covered {
-            match watcher.watch(&functions_dir, RecursiveMode::NonRecursive) {
-                Ok(()) => info!(dir = %functions_dir.display(), "watching the functions directory"),
-                Err(e) => warn!(
+            if functions_dir.is_dir() {
+                match watcher.watch(functions_dir, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        info!(dir = %functions_dir.display(), "watching the functions directory")
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        dir = %functions_dir.display(),
+                        "cannot watch the functions directory"
+                    ),
+                }
+            }
+            // The parent also reports a `functions/` created, or replaced
+            // after a delete, later on.
+            if let Some(parent) = functions_dir.parent()
+                && let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive)
+            {
+                warn!(
                     error = %e,
-                    dir = %functions_dir.display(),
-                    "cannot watch the functions directory"
-                ),
+                    dir = %parent.display(),
+                    "cannot watch for a functions directory appearing"
+                );
             }
         }
     }
@@ -257,6 +325,72 @@ mod tests {
         assert!(
             wait_for(true).await,
             "editing functions/dbl.toml must recompile and surface E051"
+        );
+    }
+
+    /// A `functions/` directory created after the server starts is watched
+    /// from then on (#2292): its creation recompiles, and so does a later
+    /// edit inside it.
+    #[tokio::test]
+    async fn a_functions_directory_created_after_start_is_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let models = root.join("models");
+        let functions = root.join("functions");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS a").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let state = ServerState::new(models.clone(), None, None);
+        let has_e051 = |state: &ServerState| {
+            let state = state.compile_result.try_read().ok()?;
+            let result = state.as_ref()?;
+            Some(result.diagnostics.iter().any(|d| &*d.code == "E051"))
+        };
+        let wait_for = |want: bool| {
+            let state = state.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while std::time::Instant::now() < deadline {
+                    if has_e051(&state) == Some(want) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+        assert!(wait_for(false).await, "the initial compile is clean");
+
+        let _watcher = start_watcher(state.clone(), &models).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("dbl.toml"),
+            "returns = \"DOUBLE\"\nbogus = 1\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("dbl.sql"), "x * 2\n").unwrap();
+        assert!(
+            wait_for(true).await,
+            "creating functions/ after start must recompile and surface E051"
+        );
+
+        // The new directory is watched, not only noticed once.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::write(
+            functions.join("dbl.toml"),
+            "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n",
+        )
+        .unwrap();
+        assert!(
+            wait_for(false).await,
+            "an edit inside the new functions/ must recompile"
         );
     }
 
