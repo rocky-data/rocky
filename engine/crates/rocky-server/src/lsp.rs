@@ -371,12 +371,9 @@ pub struct RockyLsp {
     /// (#1625). See [`RockyLsp::publish_project_config_diagnostic`] for why
     /// the state is tracked rather than republished on every compile.
     config_diagnostic_published: Arc<AtomicBool>,
-    /// The files that carried a compile diagnostic at the last publication.
-    /// The next publication sends an empty list for each of them that is now
-    /// clean, so a fixed diagnostic on another file (a pipeline changed from
-    /// ClickHouse to DuckDB clears E053 on the models it named) leaves the
-    /// editor. A plain `std` mutex: it is never held across an `.await`.
-    published_files: Arc<std::sync::Mutex<HashSet<Url>>>,
+    /// The files that carried a compile diagnostic at the last publication,
+    /// and the order publications go out in. See [`PublishedDiagnostics`].
+    published_files: Arc<PublishedDiagnostics>,
     /// Salsa database for incremental DSL parsing — backs `didOpen` /
     /// `didChange` so a parsed `RockyFile` is memoized across keystrokes
     /// and only re-runs when the buffer text actually changes.
@@ -517,10 +514,11 @@ impl RockyLsp {
             external_dependencies: Default::default(),
         };
 
+        let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
                 apply_project_gates(&dir_path, &mut result);
-                self.publish_diagnostics(&result).await;
+                self.publish_diagnostics(generation, &result).await;
                 *self.compile_result.write().await = Some(result);
             }
             Err(e) => {
@@ -837,30 +835,38 @@ impl RockyLsp {
         map
     }
 
-    async fn publish_diagnostics(&self, result: &CompileResult) {
-        Self::publish_compile_diagnostics(&self.client, &self.published_files, result).await;
+    async fn publish_diagnostics(&self, generation: u64, result: &CompileResult) {
+        Self::publish_compile_diagnostics(&self.client, &self.published_files, generation, result)
+            .await;
     }
 
     /// Publish the compile diagnostics, and clear the files that had some at
     /// the last publication and have none now.
     ///
+    /// `generation` is the value [`PublishedDiagnostics::begin_compile`]
+    /// returned when the compile behind `result` started. A publication
+    /// older than the last one sent is dropped: a slow compile that finishes
+    /// after a newer one must not put back a diagnostic the newer one
+    /// cleared. The publication lock is held across the sends, so two
+    /// publications never interleave on the wire.
+    ///
     /// An associated fn because the debounced `didChange` pass runs in a
-    /// spawned task that holds clones, not `&self`. The lock on `published`
-    /// is released before the first send: a send awaits tower-lsp's outgoing
-    /// channel, which the client handler also needs.
+    /// spawned task that holds clones, not `&self`.
     async fn publish_compile_diagnostics(
         client: &Client,
-        published: &std::sync::Mutex<HashSet<Url>>,
+        published: &PublishedDiagnostics,
+        generation: u64,
         result: &CompileResult,
     ) {
-        let outgoing = {
-            let mut last = published
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (outgoing, now) = plan_publication(&last, diagnostics_by_uri(result));
-            *last = now;
-            outgoing
-        };
+        // Only publishers take this lock; no client handler waits on it, so
+        // holding it across a send cannot block the handler the send needs.
+        let mut last = published.state.lock().await;
+        if generation < last.generation {
+            return;
+        }
+        let (outgoing, now) = plan_publication(&last.files, diagnostics_by_uri(result));
+        last.files = now;
+        last.generation = generation;
         for (uri, diags) in outgoing {
             client.publish_diagnostics(uri, diags, None).await;
         }
@@ -1434,6 +1440,7 @@ impl LanguageServer for RockyLsp {
                 // threads. The incremental path stays inline: it's already
                 // fast (<50 ms on 100-model projects), needs a live borrow
                 // of the previous result, and won't dominate the runtime.
+                let generation = published_files.begin_compile();
                 let use_incremental =
                     changed_file.is_some() && compile_result.read().await.is_some();
                 let new_result = if use_incremental {
@@ -1455,7 +1462,13 @@ impl LanguageServer for RockyLsp {
 
                 if let Some(mut result) = new_result {
                     apply_project_gates(&config.models_dir, &mut result);
-                    Self::publish_compile_diagnostics(&client, &published_files, &result).await;
+                    Self::publish_compile_diagnostics(
+                        &client,
+                        &published_files,
+                        generation,
+                        &result,
+                    )
+                    .await;
 
                     *compile_result.write().await = Some(result);
                 }
@@ -4638,6 +4651,41 @@ fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
     by_uri
 }
 
+/// The compile-diagnostic publication state shared by both LSP compile paths
+/// (`recompile` and the debounced `didChange` pass).
+///
+/// Each compile takes a generation number when it starts. Publications are
+/// serialized by an async lock held across their sends, and one older than
+/// the last publication sent is dropped. Without both, a slow compile that
+/// finished after a newer one, or two publications whose sends interleaved,
+/// could leave a stale diagnostic on the editor after the newer clear.
+#[derive(Debug, Default)]
+struct PublishedDiagnostics {
+    /// The last generation handed out by [`Self::begin_compile`].
+    started: std::sync::atomic::AtomicU64,
+    /// Held across a whole publication. Only publishers take it.
+    state: Mutex<PublishedState>,
+}
+
+#[derive(Debug, Default)]
+struct PublishedState {
+    /// The files that carried a compile diagnostic at the last publication.
+    /// The next publication sends an empty list for each that is now clean,
+    /// so a fixed diagnostic on another file (a pipeline changed from
+    /// ClickHouse to DuckDB clears E053 on the models it named) leaves the
+    /// editor.
+    files: HashSet<Url>,
+    /// The generation of the last publication sent.
+    generation: u64,
+}
+
+impl PublishedDiagnostics {
+    /// Take the generation for a compile that starts now.
+    fn begin_compile(&self) -> u64 {
+        self.started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
 /// What to send for one publication: the files with diagnostics now, plus an
 /// empty list for each file in `previous` that is clean now. The second
 /// value is the set to remember for the next publication.
@@ -4714,7 +4762,7 @@ pub async fn run_lsp() {
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
         schema_cache_throttle: SchemaCacheThrottle::new(),
         config_diagnostic_published: Arc::new(AtomicBool::new(false)),
-        published_files: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        published_files: Arc::default(),
         salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
         salsa_sources: Arc::new(RwLock::new(HashMap::new())),
     });
@@ -4755,7 +4803,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
-            published_files: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -4869,7 +4917,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
-            published_files: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -5046,7 +5094,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
-            published_files: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -5089,7 +5137,14 @@ mod tests {
         // The startup compile's own publications are not under test.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         seen.lock().unwrap().clear();
-        service.inner().published_files.lock().unwrap().clear();
+        service
+            .inner()
+            .published_files
+            .state
+            .lock()
+            .await
+            .files
+            .clear();
 
         let model_uri = Url::from_file_path(root.join("models/m.sql")).unwrap();
         result
@@ -5097,12 +5152,22 @@ mod tests {
             .push(rocky_compiler::diagnostic::Diagnostic::error(
                 "E053", "m", "no MERGE",
             ));
-        service.inner().publish_diagnostics(&result).await;
+        let generations = &service.inner().published_files;
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), &result)
+            .await;
         // The pipeline was fixed: the next compile has no diagnostic.
         result.diagnostics.clear();
-        service.inner().publish_diagnostics(&result).await;
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), &result)
+            .await;
         // A third, still clean, compile sends nothing more.
-        service.inner().publish_diagnostics(&result).await;
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), &result)
+            .await;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
@@ -5124,6 +5189,111 @@ mod tests {
             for_model[1]["diagnostics"].as_array().unwrap().len(),
             0,
             "the fixed diagnostic must be cleared"
+        );
+    }
+
+    /// A compile that started first but finishes last must not put back a
+    /// diagnostic that a newer compile already cleared. Before the
+    /// generation check it was published last, and stuck on the editor.
+    #[tokio::test]
+    async fn a_stale_publication_does_not_restore_a_cleared_diagnostic() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let clean = compile_function_project(&root);
+        let mut stale = compile_function_project(&root);
+        stale
+            .diagnostics
+            .push(rocky_compiler::diagnostic::Diagnostic::error(
+                "E053", "m", "no MERGE",
+            ));
+
+        let (mut service, mut socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "textDocument/publishDiagnostics" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+
+        // The client drops notifications until the session is initialized.
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        // The startup compile's own publications are not under test.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        seen.lock().unwrap().clear();
+        service
+            .inner()
+            .published_files
+            .state
+            .lock()
+            .await
+            .files
+            .clear();
+
+        let lsp = service.inner();
+        let first = lsp.published_files.begin_compile();
+        let second = lsp.published_files.begin_compile();
+        let third = lsp.published_files.begin_compile();
+        // Generation 1 shows the diagnostic, generation 3 clears it, and
+        // generation 2 — started before 3 — finishes last.
+        lsp.publish_diagnostics(first, &stale).await;
+        lsp.publish_diagnostics(third, &clean).await;
+        lsp.publish_diagnostics(second, &stale).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let model_uri = Url::from_file_path(root.join("models/m.sql")).unwrap();
+        let seen = seen.lock().unwrap();
+        let for_model: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|p| p["uri"] == serde_json::json!(model_uri.as_str()))
+            .collect();
+        assert_eq!(
+            for_model.len(),
+            2,
+            "the stale publication is dropped: {seen:?}"
+        );
+        assert_eq!(
+            for_model[1]["diagnostics"].as_array().unwrap().len(),
+            0,
+            "the editor ends clear"
         );
     }
 
@@ -5714,7 +5884,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
-            published_files: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
