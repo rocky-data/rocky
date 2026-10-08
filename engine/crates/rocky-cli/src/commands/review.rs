@@ -1342,10 +1342,9 @@ pub(crate) fn select_outstanding<'a>(
     // A row written before `fail_closed` existed (or by an older binary on a
     // shared ledger) lacks the field; see `is_fail_closed_deny` for how the
     // floor's own text still marks it.
-    for d in decisions
-        .into_iter()
-        .filter(|d| d.effect != PolicyEffect::Deny || (d.is_evaluation() && !is_fail_closed_deny(d)))
-    {
+    for d in decisions.into_iter().filter(|d| {
+        d.effect != PolicyEffect::Deny || (d.is_evaluation() && !is_fail_closed_deny(d))
+    }) {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
@@ -2873,7 +2872,10 @@ mod tests {
         );
         let legacy_floor: PolicyDecisionRecord =
             serde_json::from_value(legacy_json(&floor_reason)).expect("a legacy row parses");
-        assert!(!legacy_floor.fail_closed, "the field is absent on a legacy row");
+        assert!(
+            !legacy_floor.fail_closed,
+            "the field is absent on a legacy row"
+        );
         let legacy_policy: PolicyDecisionRecord =
             serde_json::from_value(legacy_json("matched rule 0")).expect("a legacy row parses");
         let escalation = qd(
@@ -2886,7 +2888,11 @@ mod tests {
 
         let floor = vec![escalation.clone(), legacy_floor];
         let (out, _) = select_outstanding(&floor, |_| false, |_| true);
-        assert_eq!(out.len(), 1, "the escalation stays after a legacy floor deny");
+        assert_eq!(
+            out.len(),
+            1,
+            "the escalation stays after a legacy floor deny"
+        );
         assert_eq!(out[0].effect, PolicyEffect::RequireReview);
 
         let policy = vec![escalation, legacy_policy];

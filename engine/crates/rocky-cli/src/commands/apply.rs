@@ -13200,7 +13200,12 @@ schema = "raw"
                 true,
                 "c.raw",
             ),
-            ("quality split: quarantine table", &split, true, "t__quarantine"),
+            (
+                "quality split: quarantine table",
+                &split,
+                true,
+                "t__quarantine",
+            ),
             ("quality split: valid table", &split, true, "t__valid"),
             ("quality drop: valid table", &drop, true, "t__valid"),
             ("quality tag: the table itself", &tag, true, "t"),
