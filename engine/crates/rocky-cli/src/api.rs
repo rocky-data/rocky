@@ -3242,11 +3242,19 @@ async fn submit_job(
     cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
-        let _permit = permit;
         let (final_state, result, error) =
             execute_job_subprocess(kind, config_path, state_path.clone(), request).await;
 
-        finish_job(task_state, state_path, record, final_state, result, error).await;
+        finish_job(
+            task_state,
+            state_path,
+            record,
+            final_state,
+            result,
+            error,
+            permit,
+        )
+        .await;
     });
 
     Ok((
@@ -3269,13 +3277,16 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
     }
 }
 
-async fn finish_job(
+async fn finish_job<P>(
     state: Arc<ServerState>,
     state_path: std::path::PathBuf,
     mut done: PersistedJob,
     final_state: JobState,
     result: Option<serde_json::Value>,
     error: Option<String>,
+    // The mutation permit the job holds (`None` for `plan`), released once
+    // the terminal record is durable and before it is visible.
+    permit: P,
 ) {
     done.state = job_state_str(final_state).to_string();
     done.finished_at = Some(chrono::Utc::now().to_rfc3339());
@@ -3285,11 +3296,17 @@ async fn finish_job(
     done.redaction_version = Some(version);
     // The outcome scrub checks its two fields. Check the whole record before
     // either sink so a cache hit and a restart serve the same held payload.
-    cache_job(&state, done.clone()).await;
+    //
+    // Order: persist, release the mutation permit, THEN cache the terminal
+    // record. `GET /jobs/{id}` reads the cache first, so a client that sees
+    // the job settle can submit the next run, apply or approve at once
+    // without a `409 mutation_in_progress` from a permit still held.
     if let Err(e) = persist_job(&state, state_path, done.clone()).await {
         tracing::warn!(error = %e, job_id = %done.job_id,
             "could not persist terminal job record; /runs is the reconcile surface");
     }
+    drop(permit);
+    cache_job(&state, done).await;
 }
 
 /// Build the full `rocky` argv (minus the binary path) for a job subprocess.
@@ -3441,11 +3458,17 @@ fn concise_job_error(stderr: &str) -> Option<String> {
     Some(format!("{}…", &text[..cut]))
 }
 
-/// A line a `tracing` subscriber wrote: a JSON object, an ANSI-coloured
-/// line, or a `fmt` line that opens with an RFC 3339 timestamp or a level.
+/// A line a `tracing` subscriber wrote: a JSON event (an object with a
+/// `level`), an ANSI-coloured line, or a `fmt` line that opens with an RFC
+/// 3339 timestamp or a level. Any other JSON, such as a warehouse error body
+/// in a `Caused by:` chain, is kept.
 fn is_tracing_line(line: &str) -> bool {
     let trimmed = line.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('\u{1b}') {
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<serde_json::Value>(trimmed)
+            .is_ok_and(|v| v.get("level").is_some());
+    }
+    if trimmed.starts_with('\u{1b}') {
         return true;
     }
     let bytes = trimmed.as_bytes();
@@ -9373,6 +9396,7 @@ mod tests {
             JobState::Failed,
             None,
             Some("ordinary failure".to_string()),
+            (),
         )
         .await;
         let cached = state.jobs.get("finished-scrub").await.unwrap();
@@ -11534,12 +11558,15 @@ Error: plan_models_changed: refusing to apply plan 'abc': models changed since t
 
 Caused by:
     0: a model it runs was changed
+{\"error_code\":\"TABLE_NOT_FOUND\",\"message\":\"no such table\"}
 {\"level\":\"TRACE\",\"message\":\"shutdown\"}
 ";
         let error = concise_job_error(stderr).expect("an error");
         assert!(error.starts_with("Error: plan_models_changed"), "{error}");
         assert!(error.contains("Caused by:"), "{error}");
         assert!(error.contains("a model it runs was changed"), "{error}");
+        // A warehouse error body is JSON too, but not a tracing event: kept.
+        assert!(error.contains("TABLE_NOT_FOUND"), "{error}");
         for leaked in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"] {
             assert!(!error.contains(leaked), "{leaked} leaked: {error}");
         }

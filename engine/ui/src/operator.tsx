@@ -237,11 +237,21 @@ export function WriteButton({
 /** The most of a failure the page shows, in characters. */
 export const FAILURE_MAX_CHARS = 1_500;
 
-/** A line a `tracing` subscriber wrote: JSON, ANSI-coloured, or `fmt`. */
+/** A JSON tracing event: an object with a `level`. Other JSON is kept. */
+function isJsonTracingEvent(line: string): boolean {
+  try {
+    const value: unknown = JSON.parse(line);
+    return value !== null && typeof value === "object" && "level" in value;
+  } catch {
+    return false;
+  }
+}
+
+/** A line a `tracing` subscriber wrote: a JSON event, ANSI-coloured, or `fmt`. */
 function isTracingLine(line: string): boolean {
   const trimmed = line.trimStart();
+  if (trimmed.startsWith("{")) return isJsonTracingEvent(trimmed);
   return (
-    trimmed.startsWith("{") ||
     trimmed.startsWith("\u001b") ||
     /^\d{4}-\d{2}-\d{2}T/.test(trimmed) ||
     /^(TRACE|DEBUG|INFO|WARN|ERROR) /.test(trimmed)

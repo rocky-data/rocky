@@ -194,24 +194,15 @@ fn serve(dir: &Path, root: &Path) -> (Server, u16) {
 }
 
 fn apply_job(port: u16, plan_id: &str) -> serde_json::Value {
-    // The previous job's record can read terminal a moment before its
-    // mutation permit is released, so a `409 mutation_in_progress` right
-    // after it is retried briefly.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let (status, body) = loop {
-        let (status, body) = http(
-            port,
-            "POST",
-            "/api/v1/jobs/apply",
-            &format!(r#"{{"plan_id":"{plan_id}"}}"#),
-        );
-        if !(status.contains("409") && body.contains("mutation_in_progress"))
-            || Instant::now() > deadline
-        {
-            break (status, body);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    // No retry on `409 mutation_in_progress`: the second apply is submitted
+    // the moment the first one reads terminal, which is what a person
+    // clicking Apply again does. The permit must be free by then.
+    let (status, body) = http(
+        port,
+        "POST",
+        "/api/v1/jobs/apply",
+        &format!(r#"{{"plan_id":"{plan_id}"}}"#),
+    );
     assert!(status.contains("202"), "{status}: {body}");
     let job_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
         .as_str()

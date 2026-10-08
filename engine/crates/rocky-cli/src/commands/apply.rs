@@ -11191,6 +11191,15 @@ autonomy_budget = { failures = 3, window = "7d" }
         config: &Path,
         principal: PolicyPrincipal,
     ) -> anyhow::Result<String> {
+        write_pipeline_plan_of(root, config, PlanKind::Run, principal)
+    }
+
+    fn write_pipeline_plan_of(
+        root: &Path,
+        config: &Path,
+        kind: PlanKind,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
         let rp = RunPlan {
             pipeline: Some("gold".to_string()),
             models: vec!["totals".to_string()],
@@ -11208,7 +11217,40 @@ autonomy_budget = { failures = 3, window = "7d" }
             false,
         )?;
         assert!(capabilities.models_fingerprint.is_some());
-        crate::plan_store::write_plan_governed(root, PlanKind::Run, &rp, principal, capabilities)
+        crate::plan_store::write_plan_governed(root, kind, &rp, principal, capabilities)
+    }
+
+    /// The AI-authored apply path re-checks too, after its review-marker
+    /// gate: an approved AI plan whose model was edited afterwards refuses
+    /// with `plan_models_changed` for a human applier.
+    #[tokio::test]
+    async fn approved_ai_authored_plan_refuses_when_its_models_changed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id =
+            write_pipeline_plan_of(root, &config, PlanKind::AiAuthored, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+
+        let err = super::run_apply_ai_authored_plan(
+            root,
+            &config,
+            &plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            false,
+        )
+        .await
+        .expect_err("a changed AI plan must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+            "{msg}"
+        );
+        assert!(!root.join("proj.duckdb").exists());
+        Ok(())
     }
 
     /// **Apply re-checks the reviewed models for every principal.** A human

@@ -339,6 +339,8 @@ describe("a failed job, said concisely", () => {
     "",
     "Caused by:",
     "    0: a model it runs was changed",
+    '{"error_code":"TABLE_NOT_FOUND","message":"no such table"}',
+    '{"level":"TRACE","message":"shutdown"}',
   ].join("\n");
 
   it("prefers the structured errors of the job's own output", () => {
@@ -358,7 +360,9 @@ describe("a failed job, said concisely", () => {
     const summary = failureSummary(job("apply", "failed", { error: STDERR }));
     expect(summary.startsWith("Error: plan_models_changed")).toBe(true);
     expect(summary).toContain("Caused by:");
-    for (const leaked of ["SELECT", ".cargo/registry", "DEBUG"]) {
+    // A warehouse error body is JSON too, but not a tracing event: kept.
+    expect(summary).toContain("TABLE_NOT_FOUND");
+    for (const leaked of ["SELECT", ".cargo/registry", "DEBUG", "TRACE"]) {
       expect(summary).not.toContain(leaked);
     }
     expect(failureSummary(job("apply", "failed", { error: null }))).toBe(
