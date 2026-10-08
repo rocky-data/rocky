@@ -970,16 +970,11 @@ async fn table_publish_restores_an_earlier_output_live_sandbox() {
     };
     publisher.check(&pointer).expect("check");
     let moved = publisher.move_table(&pointer).await.expect("publish A");
-    let TableMoved::Moved {
-        table_version,
-        warning,
-        ..
-    } = moved
-    else {
-        panic!("publishing A over B must write a commit: {moved:?}");
+    // `Moved` means the commit landed and the Iceberg sync succeeded.
+    let TableMoved::Moved { table_version, .. } = moved else {
+        panic!("publishing A over B must write a commit and sync Iceberg: {moved:?}");
     };
     assert!(table_version > b.table_version);
-    assert_eq!(warning, None, "the Iceberg sync must succeed");
     assert_eq!(
         read_count(sql_client.clone(), count_sql.clone()).await,
         3,

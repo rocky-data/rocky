@@ -3813,7 +3813,6 @@ mod tests {
             TableMoveOutcome::Moved {
                 table: "c.s.t".into(),
                 table_version: 3,
-                warning: None
             }
         );
         assert_eq!(
@@ -3824,6 +3823,64 @@ mod tests {
             *sql.log.lock().unwrap(),
             vec!["MSCK REPAIR TABLE c.s.t SYNC METADATA".to_string()]
         );
+    }
+
+    /// A SQL client whose first statement fails. It records every one.
+    #[derive(Default)]
+    struct FailFirstSqlClient {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SqlClient for FailFirstSqlClient {
+        async fn execute(&self, sql: &str) -> Result<()> {
+            let mut log = self.log.lock().unwrap();
+            log.push(sql.to_string());
+            if log.len() == 1 {
+                return Err(UniformWriterError::DeltaLog("warehouse unavailable".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// The Iceberg sync fails after the commit lands: the move is
+    /// `sync_failed`, not `moved`. A retry finds the table already current
+    /// and runs the sync again, which now succeeds.
+    #[tokio::test]
+    async fn a_failed_iceberg_sync_is_its_own_outcome_and_a_retry_runs_it_again() {
+        use rocky_core::environments::{EnvPointer, PointerVersion};
+        use rocky_core::table_publish::{TableMoved, TablePointerBackend};
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let sql = Arc::new(FailFirstSqlClient::default());
+        let writer = table_writer(&store, "tbl", sql.clone());
+        let (a, _) = two_builds(&writer).await;
+        let publisher = publish::DeltaTablePublisher::new().with_table(writer);
+        let pointer = EnvPointer {
+            model: "orders".into(),
+            run_id: "r1".into(),
+            version: PointerVersion::Known(content_addressed(&a, 1)),
+        };
+
+        let first = publisher.move_table(&pointer).await.unwrap();
+        assert!(
+            matches!(
+                &first,
+                TableMoved::SyncFailed { table_version: 3, committed: true, error, .. }
+                    if error.contains("Iceberg metadata sync failed")
+            ),
+            "{first:?}"
+        );
+        let retry = publisher.move_table(&pointer).await.unwrap();
+        assert_eq!(
+            retry,
+            TableMoved::AlreadyCurrent {
+                table: "c.s.t".into(),
+                table_version: 3
+            }
+        );
+        assert_eq!(sql.log.lock().unwrap().len(), 2, "the retry synced again");
     }
 
     /// What [`Interposed`] does to one `_delta_log` create.

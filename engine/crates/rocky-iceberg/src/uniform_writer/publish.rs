@@ -39,8 +39,10 @@ impl Default for DeltaTablePublisher {
 }
 
 impl DeltaTablePublisher {
-    /// A publisher with no tables. After each commit it runs the Iceberg
-    /// metadata sync (`MSCK REPAIR TABLE ... SYNC METADATA`).
+    /// A publisher with no tables. After each move, and on a table that
+    /// already serves the version, it runs the Iceberg metadata sync
+    /// (`MSCK REPAIR TABLE ... SYNC METADATA`). A failed sync is the
+    /// `sync_failed` outcome.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -130,23 +132,31 @@ impl TablePointerBackend for DeltaTablePublisher {
                 }
                 other => TableMoveError::NotMoved(other.to_string()),
             })?;
-        if !outcome.committed {
-            return Ok(TableMoved::AlreadyCurrent {
+        let table_version = outcome.table_version;
+        // The sync is idempotent. It runs on an already-current table too,
+        // so a retry repairs a sync that failed after an earlier commit.
+        if self.sync_iceberg
+            && let Err(e) = writer.sync_iceberg_metadata().await
+        {
+            return Ok(TableMoved::SyncFailed {
                 table,
-                table_version: outcome.table_version,
+                table_version,
+                committed: outcome.committed,
+                error: format!(
+                    "the Delta table serves the version, but the Iceberg metadata sync failed: {e}"
+                ),
             });
         }
-        let warning = if self.sync_iceberg {
-            writer.sync_iceberg_metadata().await.err().map(|e| {
-                format!("the Delta commit landed, but the Iceberg metadata sync failed: {e}")
-            })
+        Ok(if outcome.committed {
+            TableMoved::Moved {
+                table,
+                table_version,
+            }
         } else {
-            None
-        };
-        Ok(TableMoved::Moved {
-            table,
-            table_version: outcome.table_version,
-            warning,
+            TableMoved::AlreadyCurrent {
+                table,
+                table_version,
+            }
         })
     }
 }

@@ -240,23 +240,35 @@ pub struct TableMove {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum TableMoveOutcome {
-    /// One commit moved the table. `table_version` is that commit.
+    /// One commit moved the table, and its follow-up steps (the Iceberg
+    /// metadata sync) ran. `table_version` is that commit.
     Moved {
         /// The table name.
         table: String,
         /// The commit that made the table serve the version.
         table_version: u64,
-        /// A follow-up step after the commit failed (for example the Iceberg
-        /// metadata sync). The table did move.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        warning: Option<String>,
     },
-    /// The table already served the version. No commit was written.
+    /// The table already served the version. No commit was written. Its
+    /// follow-up steps ran again.
     AlreadyCurrent {
         /// The table name.
         table: String,
         /// The current table version.
         table_version: u64,
+    },
+    /// The Delta table serves the version (a commit moved it, or it already
+    /// served it), but a follow-up step failed: the Iceberg metadata sync.
+    /// Delta readers see the version; Iceberg readers may not. A retry of
+    /// the publish runs the sync again.
+    SyncFailed {
+        /// The table name.
+        table: String,
+        /// The table version that serves the version.
+        table_version: u64,
+        /// Whether this publish wrote the commit.
+        committed: bool,
+        /// Why the sync failed.
+        error: String,
     },
     /// The move failed. The table did not move, as far as the backend can
     /// tell.
@@ -277,12 +289,26 @@ pub enum TableMoveOutcome {
 }
 
 impl TableMoveOutcome {
-    /// Whether the table now serves the version.
+    /// Whether the Delta table now serves the version. The head's pointer
+    /// moves exactly for these.
     #[must_use]
     pub fn serves_version(&self) -> bool {
         match self {
-            Self::Moved { .. } | Self::AlreadyCurrent { .. } => true,
+            Self::Moved { .. } | Self::AlreadyCurrent { .. } | Self::SyncFailed { .. } => true,
             Self::Failed { .. } | Self::Unknown { .. } | Self::NotAttempted => false,
+        }
+    }
+
+    /// Whether every reader of the table sees the version: the Delta table
+    /// serves it and the follow-up steps ran.
+    #[must_use]
+    pub fn is_fully_served(&self) -> bool {
+        match self {
+            Self::Moved { .. } | Self::AlreadyCurrent { .. } => true,
+            Self::SyncFailed { .. }
+            | Self::Failed { .. }
+            | Self::Unknown { .. }
+            | Self::NotAttempted => false,
         }
     }
 }
@@ -769,12 +795,22 @@ mod tests {
             outcome: TableMoveOutcome::Moved {
                 table: "c.s.orders".into(),
                 table_version: 4,
-                warning: None,
             },
         };
         assert_eq!(
             serde_json::to_string(&moved).unwrap(),
             r#"{"model":"orders","outcome":{"outcome":"moved","table":"c.s.orders","table_version":4}}"#
         );
+        let sync_failed = TableMoveOutcome::SyncFailed {
+            table: "c.s.orders".into(),
+            table_version: 4,
+            committed: false,
+            error: "x".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&sync_failed).unwrap(),
+            r#"{"outcome":"sync_failed","table":"c.s.orders","table_version":4,"committed":false,"error":"x"}"#
+        );
+        assert!(sync_failed.serves_version() && !sync_failed.is_fully_served());
     }
 }

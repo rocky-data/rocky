@@ -46,21 +46,32 @@ use crate::state_sync::{self, LedgerSeamSession, StateSyncError};
 /// A table that a backend moved, or found already at the version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableMoved {
-    /// One commit moved the table.
+    /// One commit moved the table, and its follow-up steps ran.
     Moved {
         /// The table name.
         table: String,
         /// The commit that made the table serve the version.
         table_version: u64,
-        /// A follow-up step after the commit failed. The table did move.
-        warning: Option<String>,
     },
-    /// The table already served the version. No commit was written.
+    /// The table already served the version. No commit was written. Its
+    /// follow-up steps ran again.
     AlreadyCurrent {
         /// The table name.
         table: String,
         /// The current table version.
         table_version: u64,
+    },
+    /// The table serves the version, but a follow-up step (the Iceberg
+    /// metadata sync) failed.
+    SyncFailed {
+        /// The table name.
+        table: String,
+        /// The table version that serves the version.
+        table_version: u64,
+        /// Whether this move wrote the commit.
+        committed: bool,
+        /// Why the follow-up step failed.
+        error: String,
     },
 }
 
@@ -70,11 +81,9 @@ impl From<TableMoved> for TableMoveOutcome {
             TableMoved::Moved {
                 table,
                 table_version,
-                warning,
             } => Self::Moved {
                 table,
                 table_version,
-                warning,
             },
             TableMoved::AlreadyCurrent {
                 table,
@@ -82,6 +91,17 @@ impl From<TableMoved> for TableMoveOutcome {
             } => Self::AlreadyCurrent {
                 table,
                 table_version,
+            },
+            TableMoved::SyncFailed {
+                table,
+                table_version,
+                committed,
+                error,
+            } => Self::SyncFailed {
+                table,
+                table_version,
+                committed,
+                error,
             },
         }
     }
@@ -156,11 +176,12 @@ impl TablePublishReport {
         }
     }
 
-    /// Whether every planned table now serves its version. `false` means a
-    /// partial publish: readers see a mix of old and new tables.
+    /// Whether every planned table now serves its version to every reader.
+    /// `false` means a partial publish: readers see a mix of old and new
+    /// tables, or Iceberg readers miss a table whose sync failed.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.moves().iter().all(|m| m.outcome.serves_version())
+        self.moves().iter().all(|m| m.outcome.is_fully_served())
     }
 }
 
@@ -281,6 +302,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         fail_on: Option<String>,
         unknown_on: Option<String>,
+        sync_fail_on: Option<String>,
         refuse: Option<String>,
     }
 
@@ -334,10 +356,17 @@ mod tests {
                 });
             }
             served.insert(table.clone(), version);
+            if self.sync_fail_on.as_deref() == Some(pointer.model.as_str()) {
+                return Ok(TableMoved::SyncFailed {
+                    table,
+                    table_version: version,
+                    committed: true,
+                    error: "sync failed".into(),
+                });
+            }
             Ok(TableMoved::Moved {
                 table,
                 table_version: version,
-                warning: None,
             })
         }
     }
@@ -538,6 +567,33 @@ mod tests {
             retry.moves()[0].outcome,
             TableMoveOutcome::AlreadyCurrent { .. }
         ));
+    }
+
+    /// A failed Iceberg sync is not a complete publish, but the Delta table
+    /// moved: its pointer moves and later tables are still tried.
+    #[tokio::test]
+    async fn a_sync_failure_moves_the_pointer_but_the_publish_is_not_complete() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let tables = FakeTables {
+            sync_fail_on: Some("a".into()),
+            ..FakeTables::default()
+        };
+        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+            .await
+            .unwrap();
+        assert!(!report.is_complete(), "history must not read as served");
+        assert!(matches!(
+            report.moves()[0].outcome,
+            TableMoveOutcome::SyncFailed { .. }
+        ));
+        assert_eq!(tables.calls(), vec!["a", "b", "c"]);
+        let store = StateStore::open(&path).unwrap();
+        let head = store.get_environment(&env()).unwrap().unwrap();
+        assert_eq!(
+            head.pointers.keys().collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     /// A backend refusal at begin refuses the whole publish: nothing is
