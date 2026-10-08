@@ -8929,7 +8929,9 @@ impl StateStore {
     /// `take_over` lets this publish start from a head whose own table
     /// publish never finished (its process died). The caller must name that
     /// head as `expected_head`. Use it only when the other publisher is known
-    /// to be dead: two live publishers would move the same tables.
+    /// to be dead. A live publisher taken over stops before its next table
+    /// move ([`crate::table_publish::publish_tables`] reads the head first),
+    /// so it can still move the one table in flight.
     ///
     /// `check` runs on every resolved pointer inside the transaction, before
     /// anything is written. It is how the table backend refuses a version it

@@ -28,6 +28,10 @@
 //!   moved are not recorded. Recovery is a new publish with take-over, which
 //!   moves every table again (a table already at its version writes no
 //!   commit).
+//! - Take-over is for a dead publisher. A publisher that is slow but alive
+//!   reads the head again before each table move (a fence) and stops when
+//!   another publish took over, so it can move at most the one table that
+//!   was in flight.
 //! - A run that writes a table while a publish moves it is not serialized
 //!   with the publish. The later commit wins.
 //! - On Delta, a publish moves the model's own table. Two environments that
@@ -207,6 +211,54 @@ pub enum TablePublishError {
         #[source]
         source: StateSyncError,
     },
+    /// Another publish took over the environment while this one ran. This
+    /// publish stopped before its next table; `moves` records the tables it
+    /// moved before that. Its outcome is not written to the history, whose
+    /// head now belongs to the publish that took over.
+    #[error(
+        "table publish {started} stopped: another publish took over the environment (head is \
+         now {head:?}). Tables moved before it stopped: {moves:?}"
+    )]
+    Fenced {
+        /// The `Started` publish id.
+        started: String,
+        /// The head found, or `None` when the environment has no head.
+        head: Option<String>,
+        /// What happened to each table.
+        moves: Vec<TableMove>,
+    },
+}
+
+/// Whether this run's publish still holds the environment.
+enum Fence {
+    /// The head is the `Started` row of this publish, and it is publishing.
+    Held,
+    /// Another publish moved the head (a take-over).
+    Lost { head: Option<String> },
+    /// The head could not be read.
+    Unreadable { error: String },
+}
+
+/// Read the environment head and check that `started` still holds it.
+///
+/// It closes the window of a slow-but-alive publisher that another one took
+/// over: that publisher stops before its next table. It does not close it
+/// fully. A take-over that lands between this read and the table commit
+/// still lets one table move.
+async fn fence(session: &LedgerSeamSession, request: &PublishRequest, started: &str) -> Fence {
+    match session.read_environment(&request.environment).await {
+        Ok(Some(head))
+            if head.head_publish_id == started && head.publishing.as_deref() == Some(started) =>
+        {
+            Fence::Held
+        }
+        Ok(head) => Fence::Lost {
+            head: head.map(|h| h.head_publish_id),
+        },
+        Err(e) => Fence::Unreadable {
+            error: e.to_string(),
+        },
+    }
 }
 
 /// Publish an environment's tables (RV1-P3, experimental).
@@ -218,12 +270,17 @@ pub enum TablePublishError {
 /// moved, failed and untried table.
 ///
 /// `take_over` starts from a head whose own table publish never finished.
-/// See [`crate::state::StateStore::begin_table_publish`].
+/// It is for a **dead** publisher. See
+/// [`crate::state::StateStore::begin_table_publish`]. Before each table
+/// move, the publish reads the head again (a fence). When another publish
+/// took over, it stops and moves no more tables, so a wrongly taken-over
+/// live publisher can move at most the one table already in flight.
 ///
 /// # Errors
 ///
 /// [`TablePublishError::Begin`] when the begin step is refused (a head
 /// conflict, a publish in progress, a refused pointer); no table moved.
+/// [`TablePublishError::Fenced`] when another publish took over mid-way.
 /// [`TablePublishError::RecordFailed`] when the outcome could not be written.
 pub async fn publish_tables(
     session: &LedgerSeamSession,
@@ -239,28 +296,61 @@ pub async fn publish_tables(
     let planned: Vec<&EnvPointer> = started.to.values().collect();
     let mut moves = Vec::with_capacity(planned.len());
     let mut failed = false;
+    let mut fenced_by: Option<Option<String>> = None;
     for pointer in planned {
-        let outcome = if failed {
+        let outcome = if failed || fenced_by.is_some() {
             TableMoveOutcome::NotAttempted
         } else {
-            match backend.move_table(pointer).await {
-                Ok(moved) => moved.into(),
-                Err(error) => {
-                    failed = true;
+            match fence(session, request, &started.publish_id).await {
+                Fence::Held => match backend.move_table(pointer).await {
+                    Ok(moved) => moved.into(),
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(
+                            environment = %request.environment,
+                            model = %pointer.model,
+                            %error,
+                            "table publish: a table did not move (or its commit is unknown); \
+                             later tables are not tried"
+                        );
+                        error.into()
+                    }
+                },
+                Fence::Lost { head } => {
                     tracing::warn!(
                         environment = %request.environment,
-                        model = %pointer.model,
-                        %error,
-                        "table publish: a table did not move (or its commit is unknown); \
-                         later tables are not tried"
+                        publish = %started.publish_id,
+                        head = ?head,
+                        "table publish: another publish took over the environment; stopping \
+                         before the next table"
                     );
-                    error.into()
+                    fenced_by = Some(head);
+                    TableMoveOutcome::NotAttempted
+                }
+                Fence::Unreadable { error } => {
+                    failed = true;
+                    TableMoveOutcome::Failed {
+                        error: format!(
+                            "could not confirm this publish still holds the environment, so the \
+                             table was not moved: {error}"
+                        ),
+                    }
                 }
             }
         };
         moves.push(TableMove {
             model: pointer.model.clone(),
             outcome,
+        });
+    }
+
+    // Another publish took over: it owns the head now, so this one cannot
+    // record its outcome there. The error is the only record of its moves.
+    if let Some(head) = fenced_by {
+        return Err(TablePublishError::Fenced {
+            started: started.publish_id,
+            head,
+            moves,
         });
     }
 
@@ -716,11 +806,13 @@ mod tests {
         }
     }
 
-    /// The outcome cannot be recorded when another publish took over in
-    /// between. The error carries the moves, the only record of what moved,
-    /// and the history gains no row for them.
+    /// A take-over lands while the first publisher moves its first table
+    /// (as if the take-over wrongly judged it dead). The fence stops the
+    /// first publisher before its next move: `b` and `c` are never tried.
+    /// The error carries the moves, the only record of what moved, and the
+    /// history gains no row for them.
     #[tokio::test]
-    async fn a_take_over_mid_publish_makes_the_record_fail_with_the_moves() {
+    async fn a_take_over_between_two_moves_stops_the_first_publisher() {
         let dir = TempDir::new().unwrap();
         let (session, path) = local(&dir);
         let backend = TakeOverDuringMove {
@@ -730,21 +822,25 @@ mod tests {
         let err = publish_tables(&session, &req(None, ABC), &backend, false)
             .await
             .unwrap_err();
-        let TablePublishError::RecordFailed {
+        let TablePublishError::Fenced {
             started,
+            head,
             moves,
-            source,
         } = &err
         else {
-            panic!("expected RecordFailed, got {err:?}");
+            panic!("expected Fenced, got {err:?}");
         };
         assert_eq!(started, "prod#1");
-        assert_eq!(moves.len(), 3);
-        assert!(moves.iter().all(|m| m.outcome.serves_version()));
-        assert!(
-            matches!(source, StateSyncError::PublishConflict { found: Some(f), .. } if f == "prod#2"),
-            "{source:?}"
+        assert_eq!(head.as_deref(), Some("prod#2"));
+        assert_eq!(
+            backend.tables.calls(),
+            vec!["a"],
+            "no move after the take-over"
         );
+        let outcomes: Vec<&TableMoveOutcome> = moves.iter().map(|m| &m.outcome).collect();
+        assert!(matches!(outcomes[0], TableMoveOutcome::Moved { .. }));
+        assert!(matches!(outcomes[1], TableMoveOutcome::NotAttempted));
+        assert!(matches!(outcomes[2], TableMoveOutcome::NotAttempted));
         let store = StateStore::open(&path).unwrap();
         let ids: Vec<String> = store
             .publish_history(&env())

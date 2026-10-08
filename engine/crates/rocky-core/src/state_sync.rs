@@ -1704,6 +1704,25 @@ impl LedgerSeamSession {
 
         unreachable!("ledger-seam attempt loop always returns within the for body")
     }
+
+    /// Read one environment's head from the shared state, writing nothing.
+    /// Local reads the ledger file; a remote backend downloads the shared
+    /// blob first (one GET), then reads it. Nothing is uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Download and store errors.
+    pub async fn read_environment(
+        &self,
+        env: &crate::environments::EnvironmentName,
+    ) -> Result<Option<crate::environments::EnvironmentRecord>, StateSyncError> {
+        if !matches!(self.cfg.backend, StateBackend::Local) {
+            let _authority =
+                download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
+        }
+        let store = StateStore::open_read_only(&self.state_path)?;
+        Ok(store.get_environment(env)?)
+    }
 }
 
 impl LedgerSeamSession {
