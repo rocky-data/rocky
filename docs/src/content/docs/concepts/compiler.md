@@ -130,6 +130,7 @@ A `nullable = false` contract over `CAST(text_col AS INT)` therefore fails `E012
 A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGINT)` and `CAST(NULLIF(x, 0) AS INT)` are nullable even when `x` is not.
 An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
+A `UNION`, `INTERSECT` or `EXCEPT` is typed from all its branches, paired by position. The column name comes from the first branch. A column is non-null only if it is non-null in every branch, and its type is the common supertype of the branches (`Unknown` if there is none). If Rocky cannot type the query (for example branches with different column counts, or a `VALUES` branch), every column is nullable and computed columns are `Unknown`.
 An aggregate over a computed argument takes its type from that argument only when the argument's type comes from the SQL itself (a cast target): `SUM(CAST(y AS DOUBLE))` is `Float64`. Otherwise it stays `Unknown`: `MAX(LENGTH(n))` is `Unknown`, because the width of `LENGTH` differs between warehouses. `SUM` or `AVG` over a cast to `DECIMAL` is also `Unknown`, because each warehouse widens the precision differently.
 
 For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from qualified references to either input.
