@@ -3,8 +3,8 @@ import type { DagOutput } from "@rocky-types/dag";
 import type { ModelListOutput } from "@rocky-types/model_list";
 import dagFixture from "@rocky-fixtures/dag.json";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
-import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
-import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
+import staleDag from "../test/fixtures/dag-stale-compile.json";
+import staleModels from "../test/fixtures/model-list-stale-compile.json";
 import { NODE_HEIGHT, NODE_WIDTH, layeredFlow } from "./layout";
 import { compiledModels } from "./nodeRoute";
 
@@ -153,8 +153,8 @@ describe("layeredFlow", () => {
 
   it("takes a model the server did not compile out of the tab order", () => {
     const flow = layeredFlow(
-      twoPipelinesDag as unknown as DagOutput,
-      compiledModels(twoPipelinesModels as unknown as ModelListOutput),
+      staleDag as unknown as DagOutput,
+      compiledModels(staleModels as unknown as ModelListOutput),
     );
     const byId = new Map(flow.nodes.map((n) => [n.id, n]));
 
@@ -172,14 +172,14 @@ describe("layeredFlow", () => {
   });
 
   it("keeps every model in the tab order while the compiled set is unknown", () => {
-    const flow = layeredFlow(twoPipelinesDag as unknown as DagOutput, "unknown");
+    const flow = layeredFlow(staleDag as unknown as DagOutput, "unknown");
     expect(flow.nodes.every((n) => n.focusable)).toBe(true);
   });
 
   it("does not move a node when the compiled set changes", () => {
     // The panel refits on layout identity. A set that arrives after the DAG
     // changes which nodes open, and must not reshape the graph under a hand.
-    const dagValue = twoPipelinesDag as unknown as DagOutput;
+    const dagValue = staleDag as unknown as DagOutput;
     const before = layeredFlow(dagValue, "unknown").nodes.map((n) => [n.id, n.position]);
     const after = layeredFlow(dagValue, new Set<string>()).nodes.map((n) => [n.id, n.position]);
     expect(after).toEqual(before);

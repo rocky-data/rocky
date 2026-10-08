@@ -49,19 +49,19 @@ asserts against the live API what this fixture asserts in vitest.
 ## `dag-two-pipelines.json` and `model-list-two-pipelines.json`
 
 `GET /api/v1/dag` and `GET /api/v1/models` from one server, on a project
-whose graph draws a model the server did not compile.
+with two transformation pipelines, each with its own models directory.
 
 ```
 pipeline     directory    in the DAG         in the model list
 playground   models/      raw_orders         yes
                           customer_orders    yes
                           revenue_summary    yes
-reporting    reporting/   weekly_revenue     no   → /models/weekly_revenue is 404
+reporting    reporting/   weekly_revenue     yes  → /models/weekly_revenue is 200
 ```
 
-The DAG reads every transformation pipeline's own models directory. The
-server compiles one. The estate screen reads the model list to know which
-nodes open.
+The DAG and the server's compile both read every transformation pipeline's own
+models directory (#2011), so every drawn model is listed. The estate screen
+reads the model list to know which nodes open.
 
 ### To record them again
 
@@ -93,3 +93,36 @@ curl -s http://127.0.0.1:8137/api/v1/models | python3 -m json.tool > model-list-
 Wait for `/api/v1/models` to answer `200` before recording: until the first
 compile lands it answers `503 engine_not_ready`. `serve_ui.rs` builds the same
 project and fails if either capture stops describing the live server.
+
+## `dag-stale-compile.json` and `model-list-stale-compile.json`
+
+The "not compiled" state, recorded from a real server: the DAG draws
+`weekly_revenue`, the model list lacks it, `/models/weekly_revenue` answers
+`404`, and the DAG node carries `"compiled": false`.
+
+`/dag` reads the files on disk on every request. `/models` reads the last
+compile. So a model written after the compile is drawn and not listed. This
+is the only way to see the state from a real server on this project. A
+pipeline-model load error (W014, for example a model name shared across
+`models/` and `reporting/`) makes `/models` serve `models/` alone, but
+`/dag` loads the same models and answers the same error with a `500`, so it
+draws nothing and there is no pair to record.
+
+### To record them again
+
+Start from the two-pipeline project above, but leave `reporting/` empty:
+`rocky playground /tmp/stalefix`, append the `[pipeline.reporting]` block, and
+`mkdir /tmp/stalefix/reporting`. Then:
+
+```bash
+cd /tmp/stalefix && rocky serve --port 8137 &
+# wait until /api/v1/models answers 200, then write the model AFTER the compile:
+echo 'SELECT 1 AS week, 2 AS revenue' > reporting/weekly_revenue.sql
+# and reporting/weekly_revenue.toml, the same sidecar as above
+curl -s http://127.0.0.1:8137/api/v1/dag    | python3 -m json.tool > dag-stale-compile.json
+curl -s http://127.0.0.1:8137/api/v1/models | python3 -m json.tool > model-list-stale-compile.json
+```
+
+`serve_ui.rs` (`a_model_written_after_the_compile_is_drawn_but_not_listed`)
+builds the same project and fails if either capture stops describing the live
+server.

@@ -454,6 +454,15 @@ pub const W012: &str = "W012";
 /// A project with NO `rocky.toml` does not emit this. Absence is an ordinary
 /// project fact; unreadability is a failure to read.
 pub const W013: &str = "W013";
+/// `rocky serve` could not load the transformation pipelines' models (a model
+/// name shared across pipelines, a malformed sidecar, a dangling models
+/// directory), so it serves `models/` alone until the error is fixed (#2011).
+///
+/// The compile still succeeds, but `/api/v1/models` and `/api/v1/dag` show
+/// only `models/`, not the union of every pipeline's models. When `models/`
+/// itself holds no model, the compile fails with the load error instead
+/// (`engine_not_ready`). Emitted by `rocky serve` only.
+pub const W014: &str = "W014";
 
 /// Imported producer added a column. Surfaced (at info severity) only to
 /// consumers that read the producer via `SELECT *`, where an added column
@@ -587,8 +596,8 @@ pub const W056: &str = "W056";
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
-    W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
-    W048, W049, W050, W051, W052, W053, W056, P002,
+    W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
+    W046, W048, W049, W050, W051, W052, W053, W056, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

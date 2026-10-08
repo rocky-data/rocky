@@ -75,10 +75,15 @@ fn handle_event(
 
 /// Start watching a directory for file changes, and the state's bound
 /// `rocky.toml` too (`ServerState::config_path`).
+///
+/// `pipeline_roots` are the other model directories the compile reads: each
+/// transformation pipeline's own root when no `--models` was named (#2011).
+/// Each is watched recursively unless `watch_dir` already covers it.
 /// Returns a handle that keeps the watcher alive.
 pub fn start_watcher(
     state: Arc<ServerState>,
     watch_dir: &Path,
+    pipeline_roots: &[PathBuf],
 ) -> Result<RecommendedWatcher, notify::Error> {
     let (tx, mut rx) = mpsc::channel::<()>(1);
     let watch_dir_display = watch_dir.display().to_string();
@@ -156,7 +161,34 @@ pub fn start_watcher(
             Err(e) => warn!(error = %e, "watch error"),
         })?;
 
-    watcher.watch(watch_dir, RecursiveMode::Recursive)?;
+    // A project whose only roots are its pipelines' own directories (say
+    // `transforms/`) has no `models/`. That is not a reason to refuse to
+    // start: skip the missing default, watch the pipeline roots.
+    if watch_dir.exists() || pipeline_roots.is_empty() {
+        watcher.watch(watch_dir, RecursiveMode::Recursive)?;
+    } else {
+        warn!(
+            dir = %watch_dir.display(),
+            "the models directory does not exist; watching the pipelines' models directories only"
+        );
+    }
+    for root in pipeline_roots {
+        let covered = match (root.canonicalize(), watch_dir.canonicalize()) {
+            (Ok(r), Ok(w)) => r.starts_with(w),
+            _ => false,
+        };
+        if covered {
+            continue;
+        }
+        match watcher.watch(root, RecursiveMode::Recursive) {
+            Ok(()) => info!(dir = %root.display(), "watching a pipeline's models directory"),
+            Err(e) => warn!(
+                error = %e,
+                dir = %root.display(),
+                "cannot watch a pipeline's models directory"
+            ),
+        }
+    }
     // UDF definitions live beside the models directory, not in it
     // (`<models>/../functions/*.toml`, the directory the compiler reads). A
     // change there moves E051 and the types of UDF calls, so it recompiles
@@ -315,7 +347,7 @@ mod tests {
         };
         assert!(wait_for(false).await, "the initial compile is clean");
 
-        let _watcher = start_watcher(state.clone(), &models).unwrap();
+        let _watcher = start_watcher(state.clone(), &models, &[]).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         std::fs::write(
             functions.join("dbl.toml"),
@@ -326,6 +358,91 @@ mod tests {
             wait_for(true).await,
             "editing functions/dbl.toml must recompile and surface E051"
         );
+    }
+
+    /// Without `--models` the compile reads every transformation pipeline's
+    /// own models directory (#2011), so a model added under a second
+    /// pipeline's root recompiles and reaches the compile result.
+    #[tokio::test]
+    async fn a_second_pipelines_models_directory_is_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let models = root.join("models");
+        let reporting = root.join("reporting");
+        let write_model = |dir: &Path, name: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS a").unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_model(&models, "stg");
+        write_model(&reporting, "rpt");
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\n\
+             [pipeline.reporting.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+
+        let state = ServerState::new(models.clone(), None, Some(config));
+        let has_model = |state: &ServerState, name: &str| {
+            let state = state.compile_result.try_read().ok()?;
+            let result = state.as_ref()?;
+            Some(result.project.model(name).is_some())
+        };
+        let wait_for = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while std::time::Instant::now() < deadline {
+                    if has_model(&state, name) == Some(true) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+        assert!(
+            wait_for("rpt").await,
+            "the initial compile covers reporting/"
+        );
+
+        let _watcher =
+            start_watcher(state.clone(), &models, std::slice::from_ref(&reporting)).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        write_model(&reporting, "rpt2");
+        assert!(
+            wait_for("rpt2").await,
+            "a model added under reporting/ must recompile into the result"
+        );
+    }
+
+    /// A project whose only model root is a pipeline's `transforms/` has no
+    /// `models/`. The watcher must still start, and still watch that root.
+    #[tokio::test]
+    async fn a_missing_default_models_dir_does_not_stop_the_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let transforms = root.join("transforms");
+        std::fs::create_dir_all(&transforms).unwrap();
+        let missing = root.join("models");
+        let state = ServerState::new(missing.clone(), None, None);
+        let watcher = start_watcher(state.clone(), &missing, std::slice::from_ref(&transforms));
+        assert!(watcher.is_ok(), "a missing default must not refuse start");
+        // With no pipeline root to fall back on, a missing directory is
+        // still an error.
+        assert!(start_watcher(state, &missing, &[]).is_err());
     }
 
     /// A `functions/` directory created after the server starts is watched
@@ -367,7 +484,7 @@ mod tests {
         };
         assert!(wait_for(false).await, "the initial compile is clean");
 
-        let _watcher = start_watcher(state.clone(), &models).unwrap();
+        let _watcher = start_watcher(state.clone(), &models, &[]).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         std::fs::create_dir_all(&functions).unwrap();
         std::fs::write(

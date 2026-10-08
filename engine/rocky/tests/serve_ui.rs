@@ -310,17 +310,19 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
 ///
 /// This is what the estate screen's gate stands on (`nodeRoute.ts`). The DAG
 /// reads every transformation pipeline's own models directory, and the
-/// server compiles one. So a second pipeline with its models in `reporting/`
-/// puts `weekly_revenue` in the graph and not in the compile (#2011). The
-/// SPA marks a transformation node "not compiled" when its label is absent
-/// from `GET /api/v1/models`. That is right only if, for every such node,
-/// being listed is exactly a `200` from `GET /api/v1/models/{label}` and
-/// being absent is exactly a `404`. Both directions are asserted here,
+/// server compiles all of them (#2011). So a second pipeline with its models
+/// in `reporting/` puts `weekly_revenue` in the graph and in the compile.
+/// The SPA marks a transformation node "not compiled" when its label is
+/// absent from `GET /api/v1/models`. That is right only if, for every such
+/// node, being listed is exactly a `200` from `GET /api/v1/models/{label}`
+/// and being absent is exactly a `404`. Both directions are asserted here,
 /// against the real server.
 ///
-/// If the server starts compiling every pipeline's directory, the split
-/// goes away and the `weekly_revenue` assertion fails. Keep the equivalence,
-/// drop the split, and recapture the fixtures.
+/// With every directory compiled, drawn transformation nodes and listed
+/// models are the same set. The "not compiled" path still exists when a
+/// pipeline-model load error makes the server fall back to `models/` alone
+/// (W014), and when a model is written after the last compile
+/// (`a_model_written_after_the_compile_is_drawn_but_not_listed`).
 #[test]
 fn the_model_list_names_exactly_the_dag_models_the_detail_route_serves() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -386,14 +388,15 @@ fn the_model_list_names_exactly_the_dag_models_the_detail_route_serves() {
         drawn.insert(label);
     }
 
-    // Both branches above ran, and the split is the one #2011 describes.
+    // The union (#2011): the second pipeline's model is drawn AND listed, so
+    // for transformation nodes drawn == listed.
     assert!(
-        drawn.contains("weekly_revenue") && !listed.contains("weekly_revenue"),
-        "the DAG no longer draws a model the compile lacks; drawn {drawn:?}, listed {listed:?}"
+        drawn.contains("weekly_revenue") && listed.contains("weekly_revenue"),
+        "weekly_revenue is drawn and compiled; drawn {drawn:?}, listed {listed:?}"
     );
-    assert!(
-        listed.is_subset(&drawn),
-        "every compiled model is a DAG node; drawn {drawn:?}, listed {listed:?}"
+    assert_eq!(
+        drawn, listed,
+        "every drawn transformation node is a compiled model, and the reverse"
     );
 
     // The pair the SPA's tests read must still describe this server.
@@ -414,6 +417,84 @@ fn the_model_list_names_exactly_the_dag_models_the_detail_route_serves() {
     let fixture = ui_fixture("model-list-two-pipelines.json");
     assert_eq!(
         fixture["count"], list["count"],
+        "the captured model list's count disagrees with the live one; recapture it"
+    );
+}
+
+/// A model written after the compile is drawn but not listed: `/dag` reads the
+/// disk on every request, and `/models` reads the last compile. This is the
+/// "not compiled" state the estate screen's tests read from
+/// `dag-stale-compile.json` and `model-list-stale-compile.json`.
+///
+/// It is the only way to see that state from a real server on this project.
+/// A load error (W014) makes `/models` serve `models/` alone, but `/dag` loads
+/// the same models and answers the same error, so it draws nothing.
+#[test]
+fn a_model_written_after_the_compile_is_drawn_but_not_listed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = root.join("rocky.toml");
+    add_the_reporting_pipeline(&root, &config);
+
+    let (server, port) = serve_api(&root, &config);
+    let _keep_alive = &server;
+    write_weekly_revenue(&root);
+
+    let (status, _, body) = http_get(port, "/api/v1/models", "");
+    assert!(status.contains("200"), "{status}: {body}");
+    let list: serde_json::Value = serde_json::from_str(&body).expect("a JSON model list");
+    let listed: std::collections::BTreeSet<String> = list["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| m["name"].as_str().expect("a model name").to_string())
+        .collect();
+    assert!(!listed.contains("weekly_revenue"), "{listed:?}");
+
+    let (status, _, body) = http_get(port, "/api/v1/models/weekly_revenue", "");
+    assert!(status.contains("404"), "{status}: {body}");
+
+    let (status, _, body) = http_get(port, "/api/v1/dag", "");
+    assert!(status.contains("200"), "{status}: {body}");
+    let dag: serde_json::Value = serde_json::from_str(&body).expect("a JSON DAG");
+    let nodes = dag["nodes"].as_array().expect("nodes");
+    let live_nodes: std::collections::BTreeSet<(String, String, String)> = nodes
+        .iter()
+        .map(|n| {
+            let field = |name: &str| n[name].as_str().expect("a node field").to_string();
+            (field("kind"), field("id"), field("label"))
+        })
+        .collect();
+    let weekly = nodes
+        .iter()
+        .find(|n| n["label"] == "weekly_revenue")
+        .expect("the DAG draws the new model");
+    assert_eq!(weekly["compiled"], false, "{weekly}");
+
+    assert_eq!(
+        live_nodes,
+        nodes_in_ui_fixture("dag-stale-compile.json"),
+        "the live DAG and engine/ui/src/test/fixtures/dag-stale-compile.json disagree \
+         about their nodes (kind, id, label); recapture it (its README says how)"
+    );
+    assert_eq!(
+        listed,
+        models_in_ui_fixture("model-list-stale-compile.json"),
+        "the live model list and engine/ui/src/test/fixtures/model-list-stale-compile.json \
+         disagree; recapture it (its README says how)"
+    );
+    assert_eq!(
+        ui_fixture("model-list-stale-compile.json")["count"],
+        list["count"],
         "the captured model list's count disagrees with the live one; recapture it"
     );
 }
@@ -502,10 +583,15 @@ fn ui_fixture(file: &str) -> serde_json::Value {
     serde_json::from_str(&raw).expect("the fixture is JSON")
 }
 
-/// Grow `rocky playground` into a project whose DAG draws a model the server
-/// does not compile: a second transformation pipeline, its one model kept in
-/// `reporting/` rather than `models/`.
+/// Grow `rocky playground` into a project with a second transformation
+/// pipeline, its one model kept in `reporting/` rather than `models/`.
 fn add_a_second_models_directory(root: &std::path::Path, config: &std::path::Path) {
+    add_the_reporting_pipeline(root, config);
+    write_weekly_revenue(root);
+}
+
+/// Append the `reporting` pipeline and create its (empty) models directory.
+fn add_the_reporting_pipeline(root: &std::path::Path, config: &std::path::Path) {
     let mut toml = std::fs::OpenOptions::new()
         .append(true)
         .open(config)
@@ -521,9 +607,12 @@ auto_create_schemas = true
 "#,
     )
     .expect("append a pipeline");
+    std::fs::create_dir_all(root.join("reporting")).expect("reporting dir");
+}
 
+/// Write the one model of the `reporting` pipeline.
+fn write_weekly_revenue(root: &std::path::Path) {
     let reporting = root.join("reporting");
-    std::fs::create_dir_all(&reporting).expect("reporting dir");
     std::fs::write(
         reporting.join("weekly_revenue.sql"),
         "SELECT 1 AS week, 2 AS revenue\n",

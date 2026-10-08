@@ -23,9 +23,10 @@
  *   test            the test label        404
  *
  * A transformation node is not enough on its own. The DAG reads every
- * transformation pipeline's own models directory, and the server compiles
- * one directory, so the graph can name a model the route has never compiled
- * (#2011). Such a node is `not-compiled`. The compiled set is
+ * transformation pipeline's own models directory from disk, and the server
+ * compiles the same union (#2011) but only when it last compiled. An explicit
+ * `--models`, a failed compile or a file written since can leave the graph
+ * naming a model the route has never compiled. Such a node is `not-compiled`. The compiled set is
  * `GET /api/v1/models`, which reads the same compile the detail route reads.
  *
  * The two reads are not one snapshot. `/dag` reads the files on disk at

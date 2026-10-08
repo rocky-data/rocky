@@ -43,7 +43,10 @@ pub struct ServerState {
     /// Whether [`Self::models_dir`] was named explicitly (`serve --models`) or
     /// is just the conventional default.
     ///
-    /// Only the DAG projection cares. `GET /api/v1/dag` treats an explicit
+    /// The compile and the DAG projection both read it. Without `--models`,
+    /// [`Self::recompile`] compiles every transformation pipeline's own model
+    /// set, the set the DAG draws (#2011); with it, that one directory.
+    /// `GET /api/v1/dag` treats an explicit
     /// directory as a whole-project override, reading every transformation
     /// pipeline from it — the HTTP analogue of `rocky dag --models`. Applying
     /// that override to a *defaulted* path is what reproduced #1261 over HTTP:
@@ -592,8 +595,53 @@ impl ServerState {
             .config_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("rocky.toml"));
+        //
+        // Which models: without an explicit `--models`, every transformation
+        // pipeline's own model set, joined by name — the set `GET
+        // /api/v1/dag` draws and `rocky dag` / `rocky run --dag` load (#2011).
+        // Compiling only `models/` left a pipeline with `models =
+        // "reporting/**"` drawn in the DAG and answered 404 by
+        // `/api/v1/models/{name}`. It is ONE compile over the union, not one
+        // per pipeline: a `depends_on` across pipelines only resolves to the
+        // upstream model when both are in the same compile. An explicit
+        // `--models`, or a project with no transformation pipeline, compiles
+        // that one directory as before.
+        let union_of_pipelines = !self.models_dir_is_explicit;
         let compile_result = match tokio::task::spawn_blocking(move || {
-            let mut result = rocky_compiler::compile::compile(&config)?;
+            // A loader refusal (a name shared across pipelines, a malformed
+            // sidecar, a dangling models directory) must not take every model
+            // route down: fall back to compiling `models_dir` alone, as
+            // before the union, and carry the refusal out as a diagnostic.
+            let mut load_error: Option<String> = None;
+            let mut result = match gate_config
+                .as_ref()
+                .filter(|project| union_of_pipelines && has_transformation_pipeline(project))
+                .map(|project| {
+                    rocky_compiler::models_loader::load_transformation_models(
+                        &gate_config_path,
+                        project,
+                    )
+                }) {
+                Some(Ok(loaded)) => {
+                    let models =
+                        rocky_compiler::models_loader::union_by_model_name(&loaded.by_pipeline);
+                    rocky_compiler::compile::compile_preloaded_models(models, &config)
+                        .map_err(|e| e.to_string())?
+                }
+                Some(Err(e)) => {
+                    let reason = format!("{e:#}");
+                    // The fallback fails outright when `models/` is absent or
+                    // holds no model ("no models found"). Serving nothing with
+                    // the loader error buried in diagnostics would be a `200`
+                    // with `count: 0`, so the loader error fails the compile
+                    // (`engine_not_ready`) instead.
+                    let fallback =
+                        rocky_compiler::compile::compile(&config).map_err(|_| reason.clone())?;
+                    load_error = Some(reason);
+                    fallback
+                }
+                None => rocky_compiler::compile::compile(&config).map_err(|e| e.to_string())?,
+            };
             if let Some(project) = &gate_config {
                 crate::project_gates::apply_project_gates(
                     &mut result,
@@ -602,7 +650,7 @@ impl ServerState {
                     crate::project_gates::ModelSqlForm::Inlined,
                 );
             }
-            Ok::<_, rocky_compiler::compile::CompileError>(result)
+            Ok::<_, String>((result, load_error))
         })
         .await
         {
@@ -632,7 +680,21 @@ impl ServerState {
         }
 
         match compile_result {
-            Ok(mut result) => {
+            Ok((mut result, load_error)) => {
+                if let Some(reason) = load_error {
+                    warn!(error = %reason, "pipeline models could not be loaded; compiling models/ alone");
+                    result
+                        .diagnostics
+                        .push(rocky_compiler::diagnostic::Diagnostic::warning(
+                            rocky_compiler::diagnostic::W014,
+                            "rocky.toml",
+                            format!(
+                                "the transformation pipelines' models could not be loaded \
+                                 ({reason}). /models shows only the models/ directory and /dag \
+                                 answers an error until this is fixed."
+                            ),
+                        ));
+                }
                 // The compiler never saw the config, so it cannot raise
                 // this itself. Attach W013 to the stored result so every
                 // reader of `compile_result` — the diagnostics counts on
@@ -681,7 +743,7 @@ impl ServerState {
                 // the SPA describing a project whose models cannot be read as
                 // clean.
                 warn!(error = %e, "compilation failed");
-                let reason = e.to_string();
+                let reason = e;
                 self.publish_failure(reason.clone()).await;
                 RecompileOutcome {
                     config_error: config_unreadable,
@@ -782,6 +844,15 @@ impl ServerState {
 
         map
     }
+}
+
+/// Whether `project` declares a transformation pipeline: the pipelines whose
+/// models `recompile` compiles when no `--models` was named.
+fn has_transformation_pipeline(project: &rocky_core::config::RockyConfig) -> bool {
+    project
+        .pipelines
+        .values()
+        .any(|pipeline| pipeline.as_transformation().is_some())
 }
 
 #[cfg(test)]
@@ -1264,6 +1335,180 @@ mod tests {
         assert!(
             !models_dir.join(".rocky-state.redb").exists(),
             "nothing should create the default store when --state-path is set"
+        );
+    }
+
+    /// Two pipelines, `models/` and `other/`. Returns the project root.
+    fn two_pipeline_project(other_files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sidecar = |name: &str| {
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            )
+        };
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/stg.sql"), "SELECT 1 AS a").unwrap();
+        std::fs::write(root.join("models/stg.toml"), sidecar("stg")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        for (file, body) in other_files {
+            let body = body.replace("{SIDECAR}", &sidecar("x"));
+            std::fs::write(root.join("other").join(file), body).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.other]\ntype = \"transformation\"\nmodels = \"other/**\"\n\n\
+             [pipeline.other.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    async fn assert_models_dir_still_served(tmp: &tempfile::TempDir, needle: &str) {
+        let root = tmp.path().canonicalize().unwrap();
+        let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+        let outcome = state.recompile().await;
+        assert!(
+            outcome.compile_error.is_none(),
+            "a loader refusal must not drop the result: {outcome:?}"
+        );
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("models/ is still served");
+        assert!(result.project.model("stg").is_some());
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(needle) && d.message.contains("other"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the loader error is reported, naming the pipeline and file ({needle}): {:?}",
+                    result.diagnostics
+                )
+            });
+        assert_eq!(
+            &*warning.code, "W014",
+            "W013 means rocky.toml is unreadable"
+        );
+        assert_eq!(
+            warning.severity,
+            rocky_compiler::diagnostic::Severity::Warning
+        );
+        assert!(
+            warning.message.contains("only the models/ directory"),
+            "the message says what is served: {}",
+            warning.message
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W013"),
+            "the config reads fine, so no W013"
+        );
+    }
+
+    /// #2011 review: the same model name in two pipelines is refused by the
+    /// loader; `models/` must keep serving while the project is broken.
+    #[tokio::test]
+    async fn a_duplicate_name_across_pipelines_keeps_models_dir_served() {
+        let tmp = two_pipeline_project(&[("stg.sql", "SELECT 2 AS a"), ("stg.toml", "{SIDECAR}")]);
+        assert_models_dir_still_served(&tmp, "stg").await;
+    }
+
+    /// A malformed sidecar in another pipeline's directory, same contract.
+    #[tokio::test]
+    async fn a_malformed_sidecar_in_another_pipeline_keeps_models_dir_served() {
+        let tmp = two_pipeline_project(&[
+            ("bad.sql", "SELECT 2 AS a"),
+            ("bad.toml", "this is = = not toml"),
+        ]);
+        assert_models_dir_still_served(&tmp, "bad.toml").await;
+    }
+
+    /// Fixing the error and recompiling drops the warning and serves the
+    /// union again.
+    #[tokio::test]
+    async fn fixing_the_duplicate_serves_the_union_again() {
+        let tmp = two_pipeline_project(&[("stg.sql", "SELECT 2 AS a"), ("stg.toml", "{SIDECAR}")]);
+        let root = tmp.path().canonicalize().unwrap();
+        let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+        state.recompile().await;
+        {
+            let guard = state.compile_result.read().await;
+            let result = guard.as_ref().unwrap();
+            assert!(result.diagnostics.iter().any(|d| &*d.code == "W014"));
+            assert!(result.project.model("renamed").is_none());
+        }
+
+        std::fs::remove_file(root.join("other/stg.sql")).unwrap();
+        std::fs::remove_file(root.join("other/stg.toml")).unwrap();
+        std::fs::write(root.join("other/renamed.sql"), "SELECT 2 AS a").unwrap();
+        std::fs::write(
+            root.join("other/renamed.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"renamed\"\n",
+        )
+        .unwrap();
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().unwrap();
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W014"),
+            "the warning is gone: {:?}",
+            result.diagnostics
+        );
+        assert!(result.project.model("stg").is_some());
+        assert!(
+            result.project.model("renamed").is_some(),
+            "the union is served"
+        );
+    }
+
+    /// F1: with no `models/` to fall back to, the loader error must not hide
+    /// behind an empty `200`; the server reports `engine_not_ready` with it.
+    #[tokio::test]
+    async fn a_loader_error_with_no_models_dir_fails_the_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sidecar = "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"dup\"\n";
+        for dir in ["transforms", "extra"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("dup.sql"), "SELECT 1 AS a").unwrap();
+            std::fs::write(root.join(dir).join("dup.toml"), sidecar).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.a]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.a.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.b]\ntype = \"transformation\"\nmodels = \"extra/**\"\n\n\
+             [pipeline.b.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        // Once with `models/` absent, once present but empty.
+        for create_empty_models in [false, true] {
+            if create_empty_models {
+                std::fs::create_dir_all(root.join("models")).unwrap();
+            }
+            let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+            assert_loader_error_fails_compile(&state).await;
+        }
+    }
+
+    async fn assert_loader_error_fails_compile(state: &ServerState) {
+        let outcome = state.recompile().await;
+        let reason = outcome
+            .compile_error
+            .expect("the loader error fails the compile");
+        assert!(reason.contains("dup"), "names the duplicate: {reason}");
+        assert!(state.compile_result.read().await.is_none());
+        let failure = state.compile_failure.read().await;
+        assert!(
+            failure.as_deref().is_some_and(|f| f.contains("dup")),
+            "{failure:?}"
         );
     }
 }

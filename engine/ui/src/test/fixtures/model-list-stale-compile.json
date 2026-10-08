@@ -28,14 +28,7 @@
                 "customer_orders"
             ],
             "downstream": []
-        },
-        {
-            "name": "weekly_revenue",
-            "columns": 2,
-            "has_star": false,
-            "upstream": [],
-            "downstream": []
         }
     ],
-    "count": 4
+    "count": 3
 }

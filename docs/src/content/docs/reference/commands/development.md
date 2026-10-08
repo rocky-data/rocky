@@ -368,7 +368,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file; `/models` and `/dag` then show only `models/` until the error is fixed. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error instead. When given, only this directory is compiled. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
@@ -377,7 +377,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Requires `--token` with `--token-scope read-only`, and `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
 | `--allowed-host <HOST>` | `String` (repeatable) | `[]` | With `--ui`: an extra `Host` header value to accept, for a reverse proxy in front of the UI. Loopback names and the bind host are always accepted; any other `Host` is refused `421`. |
-| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. |
+| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added to `rocky.toml` later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
 | `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
 | `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
