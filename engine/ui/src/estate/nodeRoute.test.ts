@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import type { ModelListOutput } from "@rocky-types/model_list";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
+import staleDag from "../test/fixtures/dag-stale-compile.json";
 import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
 import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
+import staleModels from "../test/fixtures/model-list-stale-compile.json";
 import { CLASSIFIED_KINDS, compiledModels, nodeRoute } from "./nodeRoute";
 
 const captured = mixedDag as unknown as DagOutput;
@@ -159,10 +161,37 @@ describe("nodeRoute", () => {
   });
 
   describe("against the captured two-pipeline project", () => {
-    // Recorded from one `rocky serve`: a second transformation pipeline keeps
-    // its model in `reporting/`, which the DAG reads and the compile does not.
+    // Recorded from one `rocky serve` (#2011): a second transformation
+    // pipeline keeps its model in `reporting/`, and the server compiles every
+    // pipeline's directory, so all four drawn models are listed and servable.
     const dag = twoPipelinesDag as unknown as DagOutput;
     const models = twoPipelinesModels as unknown as ModelListOutput;
+
+    it("lists every model the DAG draws", () => {
+      const labels = dag.nodes.filter((n) => n.kind === "transformation").map((n) => n.label);
+      expect(labels).toHaveLength(4);
+      expect(models.count).toBe(4);
+      expect(new Set(models.models.map((m) => m.name))).toEqual(new Set(labels));
+    });
+
+    it("serves all four models and marks none not compiled", () => {
+      const compiled = compiledModels(models);
+      const routes = Object.fromEntries(dag.nodes.map((n) => [n.label, nodeRoute(n, compiled).state]));
+      expect(routes).toEqual({
+        customer_orders: "servable",
+        raw_orders: "servable",
+        revenue_summary: "servable",
+        weekly_revenue: "servable",
+      });
+    });
+  });
+
+  describe("against the captured stale-compile project", () => {
+    // Recorded from one `rocky serve`: `weekly_revenue` was written after the
+    // compile. `/dag` reads the disk and draws it, `/models` reads the last
+    // compile and lacks it, and `/models/weekly_revenue` answers 404.
+    const dag = staleDag as unknown as DagOutput;
+    const models = staleModels as unknown as ModelListOutput;
 
     it("draws a model the compile does not have", () => {
       const labels = dag.nodes.filter((n) => n.kind === "transformation").map((n) => n.label);

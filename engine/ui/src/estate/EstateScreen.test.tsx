@@ -10,8 +10,8 @@ import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
-import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
-import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
+import staleDag from "../test/fixtures/dag-stale-compile.json";
+import staleModels from "../test/fixtures/model-list-stale-compile.json";
 import { ApiError } from "../api";
 import { NOT_RECORDED } from "../format";
 import { EstateScreen, type EstateLoaders } from "./EstateScreen";
@@ -21,9 +21,9 @@ const capturedDag = dagFixture as unknown as DagOutput;
 const capturedHistory = historyFixture as unknown as HistoryOutput;
 /** The captured DAG that has a transformation node in it. See its README. */
 const mixedNodes = (mixedDag as unknown as DagOutput).nodes;
-/** One `rocky serve` whose DAG draws a model its compile does not have. */
-const partDag = twoPipelinesDag as unknown as DagOutput;
-const partModels = twoPipelinesModels as unknown as ModelListOutput;
+/** One `rocky serve` whose DAG draws a model written after its last compile. */
+const partDag = staleDag as unknown as DagOutput;
+const partModels = staleModels as unknown as ModelListOutput;
 
 const NOW = Date.parse("2026-09-05T08:00:00Z");
 

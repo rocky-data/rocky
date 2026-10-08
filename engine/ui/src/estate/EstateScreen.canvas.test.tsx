@@ -14,14 +14,14 @@ import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import historyFixture from "@rocky-fixtures/history.json";
 import { installFlowCanvas, nodeElement } from "../test/flowCanvas";
-import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
-import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
+import staleDag from "../test/fixtures/dag-stale-compile.json";
+import staleModels from "../test/fixtures/model-list-stale-compile.json";
 import { EstateScreen, type EstateLoaders } from "./EstateScreen";
 
 beforeAll(installFlowCanvas);
 
-const dag = twoPipelinesDag as unknown as DagOutput;
-const compiledAtStart = twoPipelinesModels as unknown as ModelListOutput;
+const dag = staleDag as unknown as DagOutput;
+const compiledAtStart = staleModels as unknown as ModelListOutput;
 const RAW = "transformation:raw_orders";
 
 const detail = (name: string): ModelDetailOutput => ({

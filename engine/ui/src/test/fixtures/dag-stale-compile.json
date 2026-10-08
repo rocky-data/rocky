@@ -67,7 +67,7 @@
             "strategy": {
                 "type": "full_refresh"
             },
-            "compiled": true
+            "compiled": false
         }
     ],
     "edges": [

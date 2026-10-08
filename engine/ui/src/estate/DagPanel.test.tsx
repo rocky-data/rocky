@@ -9,8 +9,8 @@ import type { DagOutput } from "@rocky-types/dag";
 import type { ModelListOutput } from "@rocky-types/model_list";
 import { installFlowCanvas, nodeElement } from "../test/flowCanvas";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
-import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
-import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
+import staleDag from "../test/fixtures/dag-stale-compile.json";
+import staleModels from "../test/fixtures/model-list-stale-compile.json";
 import { DagPanel, floorFor, layoutIdentity } from "./DagPanel";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 import { NOT_COMPILED } from "./ModelNode";
@@ -158,11 +158,11 @@ describe("DagPanel", () => {
 });
 
 describe("DagPanel on a project the server compiled only part of", () => {
-  // Recorded from one `rocky serve`: `weekly_revenue` lives in a second
-  // pipeline's `reporting/`, which the DAG reads and the compile does not, so
-  // `/api/v1/models/weekly_revenue` answers 404 on that same server.
-  const dag = twoPipelinesDag as unknown as DagOutput;
-  const compiled = compiledModels(twoPipelinesModels as unknown as ModelListOutput);
+  // Recorded from one `rocky serve`: `weekly_revenue` was written after the
+  // compile, so `/dag` (read from disk) draws it and the last compile lacks
+  // it. `/api/v1/models/weekly_revenue` answers 404 on that same server.
+  const dag = staleDag as unknown as DagOutput;
+  const compiled = compiledModels(staleModels as unknown as ModelListOutput);
   const OUTSIDE = "transformation:weekly_revenue";
   const INSIDE = "transformation:raw_orders";
 
