@@ -1531,6 +1531,20 @@ A model matches the scope only when it satisfies **every** key you set.
 
 A scope with neither `any = true` nor any real predicate is rejected at config load, so an empty scope can never silently match everything.
 
+#### Pipelines that run no models
+
+A replication, snapshot, load or quality pipeline writes tables, not models. The `apply` gate names each table it writes, and `models` globs match that name. Use the **bare table name**, with no catalog or schema:
+
+| Pipeline | Name the gate sees |
+|----------|--------------------|
+| `replication` | Each target table (and `<table><suffix>` for a suffix shadow run). |
+| `snapshot` | `target.table`, the history table. |
+| `load` | `target.table`. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
+| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
+| `quality` without quarantine | Nothing. It only reads, so no rule applies. |
+
+These names carry no tags, layer, classifications or contract, so a rule scoped by those keys does not match them. `any = true` does. One exception: a table named like a compiled model of the project takes that model's attributes.
+
 ```toml
 [policy]
 version = 1

@@ -869,49 +869,68 @@ pub(crate) fn pipeline_is_replication(
 /// The writes of a governed `Run` plan whose pipeline executes NO compiled
 /// models but still mutates the warehouse (#2290): a snapshot (its history
 /// table), a load (its target) and a quality pipeline with row quarantine on
-/// (the `__valid` / `__quarantine` tables beside the checked tables).
+/// (the tables the quarantine mode writes beside the checked tables).
 ///
 /// Returns `None` for replication, transformation and any pipeline that does
 /// not resolve: those keep the model path (and stay strict on a failure).
 /// Otherwise returns the table names the gate must name, plus the meaning of
-/// an empty set. The names are catalog-qualified; a quality table list with no
-/// `table` names its schema. A quality pipeline with quarantine on but no
-/// listed tables has an unknown write set, so it is [`EmptyTouched::Refuse`].
-/// A quality pipeline without quarantine only reads (its run record is state,
-/// not a warehouse write), so its empty set is a genuine [`EmptyTouched::NoOp`].
+/// an empty set.
+///
+/// A name is the **bare table name**, the same form the in-run replication
+/// gate (`gate_replication_targets`) uses for a replication target, so one
+/// `models = [...]` rule form covers every pipeline's writes. Where the table
+/// is known only at run time (a load that names no `table` loads one table per
+/// file; a quality entry with no `table` checks the whole schema) the name is
+/// `catalog.schema` instead. A quarantined quality table names what its mode
+/// writes: `split` the `<table><suffix_valid>` and `<table><suffix_quarantine>`
+/// tables, `drop` only the first, `tag` the table itself (rewritten in place).
+/// Every listed table is named, even one with no quarantinable assertion that
+/// the run would leave alone: that over-gates, which is the safe direction.
+/// A quality pipeline with quarantine on but no listed tables has an unknown
+/// write set, so it is [`EmptyTouched::Refuse`]. A quality pipeline without
+/// quarantine only reads (its run record is state, not a warehouse write), so
+/// its empty set is a genuine [`EmptyTouched::NoOp`].
 fn modelless_pipeline_writes(
     cfg: &rocky_core::config::RockyConfig,
     pipeline_name: Option<&str>,
 ) -> Option<(BTreeSet<String>, EmptyTouched)> {
-    use rocky_core::config::PipelineConfig;
+    use rocky_core::config::{PipelineConfig, QuarantineMode};
     let (_, pipeline) = crate::registry::resolve_pipeline(cfg, pipeline_name).ok()?;
     match pipeline {
         PipelineConfig::Snapshot(s) => Some((
-            BTreeSet::from([format!(
-                "{}.{}.{}",
-                s.target.catalog, s.target.schema, s.target.table
-            )]),
+            BTreeSet::from([s.target.table.clone()]),
             EmptyTouched::Refuse,
         )),
         PipelineConfig::Load(l) => Some((
             BTreeSet::from([match &l.target.table {
-                Some(table) => format!("{}.{}.{table}", l.target.catalog, l.target.schema),
+                Some(table) => table.clone(),
                 None => format!("{}.{}", l.target.catalog, l.target.schema),
             }]),
             EmptyTouched::Refuse,
         )),
         PipelineConfig::Quality(q) => {
-            if !q.checks.quarantine.as_ref().is_some_and(|c| c.enabled) {
+            let Some(quarantine) = q.checks.quarantine.as_ref().filter(|c| c.enabled) else {
                 return Some((BTreeSet::new(), EmptyTouched::NoOp));
+            };
+            let mut tables = BTreeSet::new();
+            for t in &q.tables {
+                let Some(table) = &t.table else {
+                    tables.insert(format!("{}.{}", t.catalog, t.schema));
+                    continue;
+                };
+                match quarantine.mode {
+                    QuarantineMode::Split => {
+                        tables.insert(format!("{table}{}", quarantine.suffix_valid));
+                        tables.insert(format!("{table}{}", quarantine.suffix_quarantine));
+                    }
+                    QuarantineMode::Drop => {
+                        tables.insert(format!("{table}{}", quarantine.suffix_valid));
+                    }
+                    QuarantineMode::Tag => {
+                        tables.insert(table.clone());
+                    }
+                }
             }
-            let tables = q
-                .tables
-                .iter()
-                .map(|t| match &t.table {
-                    Some(table) => format!("{}.{}.{table}", t.catalog, t.schema),
-                    None => format!("{}.{}", t.catalog, t.schema),
-                })
-                .collect();
             Some((tables, EmptyTouched::Refuse))
         }
         PipelineConfig::Replication(_) | PipelineConfig::Transformation(_) => None,
@@ -13012,7 +13031,35 @@ schema_template = "s__{source}"
     /// statement. A read-only quality pipeline stays a no-op.
     #[tokio::test]
     async fn modelless_writing_pipeline_is_denied_by_a_deny_rule() -> anyhow::Result<()> {
-        let cases: [(&str, &str, bool, &str); 4] = [
+        let quality = |mode: &str| {
+            format!(
+                r#"
+[pipeline.p]
+type = "quality"
+
+[pipeline.p.target]
+
+[[pipeline.p.tables]]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.p.checks]
+enabled = true
+
+[pipeline.p.checks.quarantine]
+enabled = true
+mode = "{mode}"
+"#
+            )
+        };
+        let split = quality("split");
+        let drop = quality("drop");
+        let tag = quality("tag");
+        // Keys are bare table names, as the in-run replication gate keys a
+        // replication target; `catalog.schema` only where the table is known
+        // only at run time.
+        let cases: Vec<(&str, &str, bool, &str)> = vec![
             (
                 "snapshot",
                 r#"
@@ -13032,10 +13079,25 @@ schema = "h"
 table = "hist"
 "#,
                 true,
-                "c.h.hist",
+                "hist",
             ),
             (
-                "load",
+                "load into a named table",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+table = "events"
+"#,
+                true,
+                "events",
+            ),
+            (
+                "load with one table per file",
                 r#"
 [pipeline.p]
 type = "load"
@@ -13048,28 +13110,10 @@ schema = "raw"
                 true,
                 "c.raw",
             ),
-            (
-                "quality with quarantine",
-                r#"
-[pipeline.p]
-type = "quality"
-
-[pipeline.p.target]
-
-[[pipeline.p.tables]]
-catalog = "c"
-schema = "s"
-table = "t"
-
-[pipeline.p.checks]
-enabled = true
-
-[pipeline.p.checks.quarantine]
-enabled = true
-"#,
-                true,
-                "c.s.t",
-            ),
+            ("quality split: quarantine table", &split, true, "t__quarantine"),
+            ("quality split: valid table", &split, true, "t__valid"),
+            ("quality drop: valid table", &drop, true, "t__valid"),
+            ("quality tag: the table itself", &tag, true, "t"),
             (
                 "quality read-only",
                 r#"
@@ -13087,7 +13131,7 @@ table = "t"
 enabled = true
 "#,
                 false,
-                "c.s.t",
+                "t",
             ),
         ];
         for (label, pipeline, writes, key, kind) in cases.into_iter().flat_map(|(l, p, w, k)| {
