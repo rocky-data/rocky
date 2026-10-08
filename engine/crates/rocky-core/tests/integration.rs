@@ -817,3 +817,108 @@ async fn test_full_refresh_on_seeded_data() {
     let target_count = p.row_count("target.raw_orders").await.unwrap();
     assert_eq!(source_count, target_count);
 }
+
+// ===========================================================================
+// Incremental watermark: a late row equal to the previous MAX (dbt v2 risk 1)
+// ===========================================================================
+
+fn watermark_model(unique_key: &[&str], lookback: Option<IncrementalLookback>) -> ModelIr {
+    let mut ir = ModelIr::transformation(
+        TargetRef {
+            catalog: String::new(),
+            schema: "target".into(),
+            table: "fct_orders".into(),
+        },
+        MaterializationStrategy::Incremental {
+            timestamp_column: "updated_at".into(),
+            unique_key: unique_key
+                .iter()
+                .map(|k| std::sync::Arc::from(*k))
+                .collect(),
+            lookback,
+            filter_column: None,
+        },
+        vec![],
+        "SELECT order_id, updated_at FROM source.orders WHERE @incremental_filter".into(),
+        GovernanceConfig {
+            permissions_file: None,
+            auto_create_catalogs: false,
+            auto_create_schemas: false,
+        },
+        None,
+        None,
+    );
+    ir.typed_columns = [
+        ("order_id", RockyType::Int64),
+        ("updated_at", RockyType::Timestamp),
+    ]
+    .into_iter()
+    .map(|(name, data_type)| TypedColumn {
+        name: name.into(),
+        data_type,
+        nullable: true,
+    })
+    .collect();
+    ir
+}
+
+async fn run_watermark_model(p: &TestPipeline, ir: &ModelIr, first: bool) {
+    let stmts = if first {
+        sql_gen::generate_transformation_initial_ddl(ir, &dialect()).unwrap()
+    } else {
+        sql_gen::generate_transformation_sql(ir, &dialect()).unwrap()
+    };
+    for stmt in stmts {
+        p.execute(&stmt).await.unwrap();
+    }
+}
+
+async fn watermark_scenario(ir: &ModelIr) -> u64 {
+    let p = TestPipeline::new();
+    p.execute("CREATE SCHEMA source").await.unwrap();
+    p.execute("CREATE SCHEMA target").await.unwrap();
+    p.execute("CREATE TABLE source.orders (order_id BIGINT, updated_at TIMESTAMP)")
+        .await
+        .unwrap();
+    p.execute("INSERT INTO source.orders VALUES (1, TIMESTAMP '2026-01-02 00:00:00')")
+        .await
+        .unwrap();
+    run_watermark_model(&p, ir, true).await;
+    // A late row: its timestamp EQUALS the target's current MAX.
+    p.execute("INSERT INTO source.orders VALUES (2, TIMESTAMP '2026-01-02 00:00:00')")
+        .await
+        .unwrap();
+    run_watermark_model(&p, ir, false).await;
+    p.row_count("target.fct_orders").await.unwrap()
+}
+
+/// dbt v2 risk 1: the incremental filter is a strict `>` against the target's
+/// `MAX(updated_at)`. A row that arrives late with a timestamp EQUAL to that
+/// maximum is never loaded when no `lookback` is set. This pins the current
+/// semantics (the compiler warns about it, W056); `>=` would duplicate rows
+/// under append.
+#[tokio::test]
+async fn test_incremental_strict_watermark_loses_a_late_row_equal_to_max() {
+    let rows = watermark_scenario(&watermark_model(&[], None)).await;
+    assert_eq!(rows, 1, "the late row at MAX is skipped without a lookback");
+}
+
+/// The same late row is loaded when a `lookback` re-reads the window, and a
+/// `unique_key` keeps the re-read row from duplicating.
+#[tokio::test]
+async fn test_incremental_lookback_with_unique_key_catches_the_late_row_once() {
+    let lookback = "1 day".parse::<IncrementalLookback>().unwrap();
+    let rows = watermark_scenario(&watermark_model(&["order_id"], Some(lookback))).await;
+    assert_eq!(rows, 2);
+}
+
+/// Lookback WITHOUT a `unique_key` appends the re-read row again (W046).
+#[tokio::test]
+async fn test_incremental_lookback_without_unique_key_duplicates_reread_rows() {
+    let lookback = "1 day".parse::<IncrementalLookback>().unwrap();
+    let rows = watermark_scenario(&watermark_model(&[], Some(lookback))).await;
+    assert_eq!(
+        rows, 3,
+        "row 1 is re-read and appended again, plus late row 2"
+    );
+}

@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
-    SourceSpan, W001, W002, W004, W005, W006, W046,
+    SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -1245,7 +1245,9 @@ fn check_merge_strategy(
 /// - a watermark absent from a provably complete output schema → **E046**:
 ///   the target would have no such column to take `MAX` of;
 /// - `lookback` without `unique_key` → **W046**: the re-read window is
-///   appended again on every run.
+///   appended again on every run;
+/// - neither `lookback` nor `unique_key` → **W056**: the strict `>` watermark
+///   skips a late row whose timestamp equals the target's `MAX`.
 ///
 /// A placeholder in a model of any other strategy is **E046** too: nothing
 /// would resolve it, and the warehouse would reject the SQL.
@@ -1397,6 +1399,26 @@ fn check_incremental_strategy(
                 ),
             )
             .with_suggestion("Add `unique_key` so the window is merged, or remove `lookback`"),
+        );
+    }
+
+    if !lookback.is_some_and(|lb| lb.amount > 0) && unique_key.is_empty() {
+        diagnostics.push(
+            Diagnostic::warning(
+                W056,
+                model_name,
+                format!(
+                    "model '{model_name}' is an append-only incremental model with no \
+                     `lookback`: the filter is a strict `>` against the target's \
+                     `MAX({watermark})`, so a row that arrives late with a '{watermark}' equal \
+                     to that maximum is never loaded"
+                ),
+            )
+            .with_suggestion(
+                "Set `lookback` (for example `\"1 hour\"`) together with `unique_key` so the \
+                 re-read window is merged instead of appended again, or confirm the source \
+                 never delivers rows at an already-loaded timestamp",
+            ),
         );
     }
 
