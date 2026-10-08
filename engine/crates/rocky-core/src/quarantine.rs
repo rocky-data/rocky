@@ -364,7 +364,7 @@ const SPLIT_TOKEN_LEN: usize = 32;
 /// table name leaves `<table>__valid` inside the 255-character identifier
 /// limit of Snowflake and Databricks; appending a suffix and a 32-digit token
 /// to it would not.
-const SPLIT_TABLE_PREFIX: &str = "_quarantine_labels_";
+pub const SPLIT_TABLE_PREFIX: &str = "_quarantine_labels_";
 
 /// [`compile_quarantine_sql`] with the `split` token supplied, so tests can
 /// pin the exact SQL.

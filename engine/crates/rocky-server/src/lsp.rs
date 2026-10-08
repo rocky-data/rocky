@@ -544,7 +544,14 @@ impl RockyLsp {
                 // Re-parse each `.rocky` file in `models_dir` and publish
                 // a synthetic E028 diagnostic for any that fail — this
                 // feeds the AI auto-fix arm in `code_action`.
-                self.publish_dsl_parse_diagnostics(&dir_path).await;
+                Self::publish_dsl_parse_diagnostics(
+                    &self.client,
+                    &self.published_files,
+                    &self.salsa_db,
+                    &self.salsa_sources,
+                    &dir_path,
+                )
+                .await;
             }
         }
     }
@@ -566,7 +573,19 @@ impl RockyLsp {
     /// path so cold-start projects (compile triggered before any
     /// `didOpen`) still surface E028 for syntactically-broken `.rocky`
     /// files.
-    async fn publish_dsl_parse_diagnostics(&self, models_dir: &std::path::Path) {
+    ///
+    /// Each file that gets an E028 is remembered in
+    /// [`PublishedState::parse_files`], so the next successful compile
+    /// clears it, and a file that parses again while the compile still fails
+    /// is cleared here. An associated fn because the debounced `didChange`
+    /// pass runs in a spawned task that holds clones, not `&self`.
+    async fn publish_dsl_parse_diagnostics(
+        client: &Client,
+        published: &PublishedDiagnostics,
+        salsa_db: &Mutex<RockyDatabase>,
+        salsa_sources: &RwLock<HashMap<Url, SourceFile>>,
+        models_dir: &std::path::Path,
+    ) {
         // Collect the `.rocky` paths off the async worker: the directory scan
         // is blocking I/O and this runs on LSP cold start (and after every
         // compile), so a large or slow models dir would otherwise stall the
@@ -597,9 +616,9 @@ impl RockyLsp {
             // memoize the parse so a series of compile failures during
             // an active edit doesn't re-parse the same broken file on
             // every keystroke.
-            let salsa_source = self.salsa_sources.read().await.get(&uri).copied();
+            let salsa_source = salsa_sources.read().await.get(&uri).copied();
             let (content, parse_outcome) = if let Some(source) = salsa_source {
-                let db = self.salsa_db.lock().await;
+                let db = salsa_db.lock().await;
                 let text = source.text(&*db).clone();
                 let outcome = rocky_lang::incremental::parse_file(&*db, source);
                 drop(db);
@@ -627,6 +646,11 @@ impl RockyLsp {
             // compile pipeline that called us is the source of truth
             // for non-parse diagnostics.
             if parse_outcome.is_ok() {
+                // Fixed since the last failure: take its E028 off the editor.
+                let mut last = published.state.lock().await;
+                if last.parse_files.remove(&uri) {
+                    client.publish_diagnostics(uri, Vec::new(), None).await;
+                }
                 continue;
             }
 
@@ -651,7 +675,9 @@ impl RockyLsp {
                 message,
                 ..Default::default()
             };
-            self.client.publish_diagnostics(uri, vec![diag], None).await;
+            let mut last = published.state.lock().await;
+            last.parse_files.insert(uri.clone());
+            client.publish_diagnostics(uri, vec![diag], None).await;
         }
     }
 
@@ -857,7 +883,9 @@ impl RockyLsp {
     /// than the last one published (or than a newer compile that failed, see
     /// [`PublishedDiagnostics::compile_failed`]) is dropped and not stored: a
     /// slow compile that finishes after a newer one must not put back a
-    /// diagnostic the newer one cleared, nor replace its stored result. The
+    /// diagnostic the newer one cleared, nor replace its stored result. A
+    /// newer compile that FAILED does not drop it: that failure cleared
+    /// nothing, and the older success is the last good result. The
     /// publication lock is held across the sends and the store, so two
     /// publications never interleave. Returns whether `result` was used.
     ///
@@ -878,7 +906,23 @@ impl RockyLsp {
         if generation < last.generation {
             return false;
         }
-        let (outgoing, now) = plan_publication(&last.files, diagnostics_by_uri(&result));
+        // A result older than a newer failed compile is still the last good
+        // one: the failure built nothing, so dropping it would leave the
+        // editor and the stored result empty. It keeps the failure's E028
+        // squiggles, which still stand; a result newer than every failure
+        // clears them.
+        let after_failure = generation < last.failed;
+        let mut previous = last.files.clone();
+        let mut current = diagnostics_by_uri(&result);
+        if after_failure {
+            // The failure's E028 files stay as the failure left them: this
+            // older result neither clears nor overwrites their squiggles.
+            previous.retain(|uri| !last.parse_files.contains(uri));
+            current.retain(|uri, _| !last.parse_files.contains(uri));
+        } else {
+            previous.extend(last.parse_files.drain());
+        }
+        let (outgoing, now) = plan_publication(&previous, current);
         last.files = now;
         last.generation = generation;
         for (uri, diags) in outgoing {
@@ -1402,6 +1446,8 @@ impl LanguageServer for RockyLsp {
             let schema_cache_throttle = self.schema_cache_throttle.clone();
             let config_diagnostic_published = self.config_diagnostic_published.clone();
             let published_files = self.published_files.clone();
+            let salsa_db = self.salsa_db.clone();
+            let salsa_sources = self.salsa_sources.clone();
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1490,6 +1536,16 @@ impl LanguageServer for RockyLsp {
                     // A newer compile that failed still outranks an older
                     // one that may yet succeed.
                     published_files.compile_failed(generation).await;
+                    // Same as `recompile`: a failed compile builds no
+                    // diagnostic, so surface the `.rocky` parse errors.
+                    Self::publish_dsl_parse_diagnostics(
+                        &client,
+                        &published_files,
+                        &salsa_db,
+                        &salsa_sources,
+                        &config.models_dir,
+                    )
+                    .await;
                 }
             });
         }
@@ -4696,6 +4752,11 @@ struct PublishedState {
     files: HashSet<Url>,
     /// The generation of the last publication sent.
     generation: u64,
+    /// The newest generation that failed to compile.
+    failed: u64,
+    /// The `.rocky` files that carry an E028 parse error from a failed
+    /// compile. A later successful compile clears them like `files`.
+    parse_files: HashSet<Url>,
 }
 
 impl PublishedDiagnostics {
@@ -4704,12 +4765,13 @@ impl PublishedDiagnostics {
         self.started.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Record that the compile of `generation` failed. It publishes nothing,
-    /// but it is newer than every compile that started before it, so none
-    /// of those may publish or store its result afterwards.
+    /// Record that the compile of `generation` failed. It publishes nothing
+    /// and clears nothing, so an older success that finishes later is still
+    /// the last good result and may publish and be stored. Only a success
+    /// that started later than it ends that.
     async fn compile_failed(&self, generation: u64) {
         let mut last = self.state.lock().await;
-        last.generation = last.generation.max(generation);
+        last.failed = last.failed.max(generation);
     }
 }
 
@@ -5334,15 +5396,8 @@ mod tests {
         );
     }
 
-    /// A newer compile that fails publishes nothing, but an older compile
-    /// that finishes after it must still not publish or store its result:
-    /// the failure is newer information than the older success.
-    #[tokio::test]
-    async fn an_older_compile_does_not_publish_over_a_newer_failed_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("project");
-        let older = compile_function_project(&root);
-        let (service, _socket) = LspService::new(|client| RockyLsp {
+    fn test_lsp(client: Client) -> RockyLsp {
+        RockyLsp {
             client,
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
@@ -5356,16 +5411,222 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
-        });
+        }
+    }
+
+    /// A newer compile that FAILS built nothing and cleared nothing, so an
+    /// older compile that succeeds and finishes after it is the last good
+    /// result: it is published and stored. Dropping it left `compile_result`
+    /// at `None` until the next success (#2292). A newer SUCCESS still wins.
+    #[tokio::test]
+    async fn an_older_success_is_kept_when_only_a_newer_compile_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let older = compile_function_project(&root);
+        let (service, _socket) = LspService::new(test_lsp);
         let lsp = service.inner();
         let first = lsp.published_files.begin_compile();
         let second = lsp.published_files.begin_compile();
         lsp.published_files.compile_failed(second).await;
         assert!(
-            !lsp.publish_diagnostics(first, older).await,
-            "the older success is dropped"
+            lsp.publish_diagnostics(first, older).await,
+            "the older success is the last good result"
         );
-        assert!(lsp.compile_result.read().await.is_none(), "and not stored");
+        assert!(lsp.compile_result.read().await.is_some(), "and is stored");
+
+        // A newer success outranks it: an older one is dropped after that.
+        let third = lsp.published_files.begin_compile();
+        let fourth = lsp.published_files.begin_compile();
+        assert!(
+            lsp.publish_diagnostics(fourth, compile_function_project(&root))
+                .await
+        );
+        assert!(
+            !lsp.publish_diagnostics(third, compile_function_project(&root))
+                .await
+        );
+    }
+
+    /// E028 files are in the tracked set: a successful compile clears the
+    /// squiggle a failed one put there, and an older success that finishes
+    /// after the failure does not clear it while the failure still stands.
+    #[tokio::test]
+    async fn a_parse_error_squiggle_is_cleared_by_the_next_success() {
+        use futures::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let ok = || compile_function_project(&root);
+        let bad = root.join("models/bad.rocky");
+        // Compile first: a `.rocky` file that does not parse fails it.
+        let (first_ok, second_ok) = (ok(), ok());
+        std::fs::write(&bad, "selct !!").unwrap();
+        let bad_uri = Url::from_file_path(&bad).unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "textDocument/publishDiagnostics" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+        // The client drops notifications until the session is initialized.
+        // The root has no `models`, so there is no startup compile.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_uri = Url::from_directory_path(empty.path()).unwrap();
+        for request in [
+            tower_lsp::jsonrpc::Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": empty_uri }))
+                .finish(),
+            tower_lsp::jsonrpc::Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            tower::ServiceExt::ready(&mut service).await.unwrap();
+            tower::Service::call(&mut service, request).await.unwrap();
+        }
+        let lsp = service.inner();
+        let older = lsp.published_files.begin_compile();
+        let failed = lsp.published_files.begin_compile();
+        let newer = lsp.published_files.begin_compile();
+        lsp.published_files.compile_failed(failed).await;
+        RockyLsp::publish_dsl_parse_diagnostics(
+            &lsp.client,
+            &lsp.published_files,
+            &lsp.salsa_db,
+            &lsp.salsa_sources,
+            &root.join("models"),
+        )
+        .await;
+        assert!(
+            lsp.published_files
+                .state
+                .lock()
+                .await
+                .parse_files
+                .contains(&bad_uri)
+        );
+
+        // The broken file is already tracked from an earlier publish: the
+        // older success must still leave its E028 alone.
+        lsp.published_files
+            .state
+            .lock()
+            .await
+            .files
+            .insert(bad_uri.clone());
+        // The older success must not clear the E028 of the newer failure.
+        assert!(lsp.publish_diagnostics(older, first_ok).await);
+        assert!(
+            lsp.published_files
+                .state
+                .lock()
+                .await
+                .parse_files
+                .contains(&bad_uri)
+        );
+        // A success newer than the failure clears it.
+        assert!(lsp.publish_diagnostics(newer, second_ok).await);
+        assert!(
+            lsp.published_files
+                .state
+                .lock()
+                .await
+                .parse_files
+                .is_empty()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let seen = seen.lock().unwrap();
+        let for_bad: Vec<usize> = seen
+            .iter()
+            .filter(|p| p["uri"] == serde_json::json!(bad_uri.as_str()))
+            .map(|p| p["diagnostics"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(
+            for_bad,
+            vec![1, 0],
+            "E028 shown, then cleared once: {seen:?}"
+        );
+    }
+
+    /// The debounced `didChange` path, over the wire: a compile that fails
+    /// must still refresh the `.rocky` parse diagnostics. The file on disk
+    /// stays broken (so the compile keeps failing), the editor buffer is
+    /// fixed, and the E028 squiggle must leave the editor.
+    #[tokio::test]
+    async fn a_failed_did_change_compile_refreshes_the_parse_diagnostics() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let bad = models.join("bad.rocky");
+        std::fs::write(&bad, "selct !!").unwrap();
+        let bad_uri = Url::from_file_path(&bad).unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "textDocument/publishDiagnostics" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": bad_uri, "version": 2 },
+                    "contentChanges": [{ "text": "from orders" }],
+                }))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+
+        let for_bad = || -> Vec<usize> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p["uri"] == serde_json::json!(bad_uri.as_str()))
+                .map(|p| p["diagnostics"].as_array().unwrap().len())
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while for_bad().last() != Some(&0) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let seq = for_bad();
+        assert_eq!(
+            seq.last(),
+            Some(&0),
+            "the fixed buffer must clear E028 after the debounced failed compile: {seq:?}"
+        );
     }
 
     /// Both LSP compile paths read the project's `rocky.toml` through one

@@ -122,6 +122,7 @@ Rocky prints the placeholder, not the value. Some fields print `${DATABRICKS_TOK
 | The policy-decision ledger | A `verify_after` check name and its outcome text are stored as `${NAME}`, so a later reader never needs the value. |
 | `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section is stored beside it, so `rocky apply` still refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |
 | Config errors and model-file errors | Every value of 8 bytes or more that the error quotes, including a TOML parse error in a sidecar, `_defaults.toml` or frontmatter. |
+| Adapter connection fields | The DuckDB `path`; the Databricks `host`, `http_path` and `client_id`; the Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role` and `database`. Rocky holds these with their placeholder, so a log line or error that quotes one (for example a DuckDB file that fails to open) prints `${NAME}`. Only the adapter connect path reads the value. |
 
 A value shorter than 8 bytes is not treated as a secret and prints as itself. The literal in `${VAR:-default}` is already in the file, so it prints as itself too. A value inside a TOML basic string that the parser unescapes (for example `\u0041` or `\t`) is matched in its unescaped form too.
 
@@ -1539,8 +1540,8 @@ A replication, snapshot, load or quality pipeline writes tables, not models. The
 |----------|--------------------|
 | `replication` | Each target table (and `<table><suffix>` for a suffix shadow run). |
 | `snapshot` | `target.table`, the history table. |
-| `load` | `target.table`. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
-| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
+| `load` | `target.table`, and `<table>__rocky_stg`, the staging table a load with a contract writes first. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
+| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default) and a working table `_quarantine_labels_<token>` (the token is random per run, so the gate sees `_quarantine_labels_`; match it with `_quarantine_labels_*`), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
 | `quality` without quarantine | Nothing. It only reads, so no rule applies. |
 
 These names carry no tags, layer, classifications or contract, so a rule scoped by those keys does not match them. `any = true` does. One exception: a table named like a compiled model of the project takes that model's attributes.

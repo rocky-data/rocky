@@ -3,7 +3,7 @@
     "schemas": {
       "AdapterConfig": {
         "additionalProperties": false,
-        "description": "Configuration for a named adapter instance.\n\nThe `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.\n\nCredential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.",
+        "description": "Configuration for a named adapter instance.\n\nThe `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.\n\nCredential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.\n\nThe DuckDB, Databricks and Snowflake connection fields (`path`, `host`, `http_path`, `client_id`, `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`) are [`EnvString`]s. A resolved `${VAR}` value in one of them prints only as `${NAME}` (#1919). The adapter connect path reads the plaintext with [`EnvString::expose`].",
         "properties": {
           "account": {
             "description": "Snowflake account identifier (e.g., \"xy12345.us-east-1\").",

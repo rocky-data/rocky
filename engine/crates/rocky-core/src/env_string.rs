@@ -151,6 +151,20 @@ impl EnvString {
     }
 }
 
+/// [`EnvString::expose`] for an optional field: the `Option<&str>` twin of
+/// `Option<String>::as_deref`, which `Option<EnvString>` deliberately does
+/// not support. Named `expose_opt` so the use site stays greppable.
+pub trait ExposeOpt {
+    /// The plaintext value, if set. Do not pass the result to a printer.
+    fn expose_opt(&self) -> Option<&str>;
+}
+
+impl ExposeOpt for Option<EnvString> {
+    fn expose_opt(&self) -> Option<&str> {
+        self.as_ref().map(EnvString::expose)
+    }
+}
+
 /// Join the printable forms with `sep`. The `[EnvString]` twin of
 /// `[String]::join`, which the type deliberately does not support.
 pub fn join_rendered(items: &[EnvString], sep: &str) -> String {

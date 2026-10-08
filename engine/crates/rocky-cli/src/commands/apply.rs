@@ -883,7 +883,7 @@ pub(crate) fn pipeline_is_replication(
 /// file; a quality entry with no `table` checks the whole schema) the name is
 /// `catalog.schema` instead. A quarantined quality table names what its mode
 /// writes: `split` the `<table><suffix_valid>` and `<table><suffix_quarantine>`
-/// tables, `drop` only the first, `tag` the table itself (rewritten in place).
+/// tables plus its `_quarantine_labels_` working table, `drop` only the first, `tag` the table itself (rewritten in place).
 /// Every listed table is named, even one with no quarantinable assertion that
 /// the run would leave alone: that over-gates, which is the safe direction.
 /// A quality pipeline with quarantine on but no listed tables has an unknown
@@ -901,18 +901,33 @@ fn modelless_pipeline_writes(
             BTreeSet::from([s.target.table.clone()]),
             EmptyTouched::Refuse,
         )),
-        PipelineConfig::Load(l) => Some((
-            BTreeSet::from([match &l.target.table {
-                Some(table) => table.clone(),
-                None => format!("{}.{}", l.target.catalog, l.target.schema),
-            }]),
-            EmptyTouched::Refuse,
-        )),
+        PipelineConfig::Load(l) => {
+            let mut tables = BTreeSet::new();
+            match &l.target.table {
+                Some(table) => {
+                    tables.insert(table.clone());
+                    // A contract-gated load stages into this table first
+                    // (`load_with_contract_gate`), so it is a real write.
+                    tables.insert(format!("{table}{}", crate::commands::load::STAGING_SUFFIX));
+                }
+                None => {
+                    tables.insert(format!("{}.{}", l.target.catalog, l.target.schema));
+                }
+            }
+            Some((tables, EmptyTouched::Refuse))
+        }
         PipelineConfig::Quality(q) => {
             let Some(quarantine) = q.checks.quarantine.as_ref().filter(|c| c.enabled) else {
                 return Some((BTreeSet::new(), EmptyTouched::NoOp));
             };
             let mut tables = BTreeSet::new();
+            if matches!(quarantine.mode, QuarantineMode::Split) {
+                // `split` creates a label table in the source's schema,
+                // `_quarantine_labels_<random token>`. The token is drawn at
+                // run time, so the prefix is the name a `models` glob can
+                // match.
+                tables.insert(rocky_core::quarantine::SPLIT_TABLE_PREFIX.to_string());
+            }
             for t in &q.tables {
                 let Some(table) = &t.table else {
                     tables.insert(format!("{}.{}", t.catalog, t.schema));
@@ -1977,6 +1992,9 @@ pub async fn evaluate_apply_policy_durable(
     // drops the rows read above. Keep a copy to write back, so a retried
     // propose still carries them.
     let carried_for_restore = seam_carried.clone();
+    // A crash between the first download and that write-back loses the rows
+    // too, so they also go to a sidecar file the next propose reads (#2292).
+    write_carried_sidecar(state_path, &seam_carried);
     let result = commit_remote_ledger_seam(
         cfg,
         state_path,
@@ -2016,9 +2034,15 @@ pub async fn evaluate_apply_policy_durable(
     )
     .await;
     match result {
-        Ok(gate) => Ok(gate),
+        Ok(gate) => {
+            clear_carried_sidecar(state_path);
+            Ok(gate)
+        }
         Err(e) => match restore_carried_draft_rows(state_path, &carried_for_restore) {
-            Ok(()) => Err(e),
+            Ok(()) => {
+                clear_carried_sidecar(state_path);
+                Err(e)
+            }
             Err(restore) => Err(e.context(format!(
                 "and {} worker draft decision row(s) could not be written back to the local \
                  state file {}, so a retried propose cannot publish them: {restore:#}",
@@ -2049,6 +2073,55 @@ fn restore_carried_draft_rows(state_path: &Path, carried: &[PolicyDecisionRecord
         )
     })?;
     carry_draft_rows(&store, carried)
+}
+
+/// The sidecar file beside the local state file that holds the carried draft
+/// rows while a propose runs (#2292).
+fn carried_sidecar_path(state_path: &Path) -> PathBuf {
+    let mut name = state_path.as_os_str().to_owned();
+    name.push(".carried-drafts.json");
+    PathBuf::from(name)
+}
+
+/// Write the carried rows to the sidecar, replacing it atomically. Best
+/// effort: the sidecar only covers a crash, so a failure is a warning.
+fn write_carried_sidecar(state_path: &Path, carried: &[PolicyDecisionRecord]) {
+    if carried.is_empty() {
+        return;
+    }
+    let path = carried_sidecar_path(state_path);
+    let tmp = path.with_extension("json.tmp");
+    let written = serde_json::to_vec(carried)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(anyhow::Error::from))
+        .and_then(|()| std::fs::rename(&tmp, &path).map_err(anyhow::Error::from));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, path = %path.display(), "could not write the carried draft rows sidecar");
+    }
+}
+
+/// Remove the sidecar once its rows are published or back in the local file.
+fn clear_carried_sidecar(state_path: &Path) {
+    let path = carried_sidecar_path(state_path);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, path = %path.display(), "could not remove the carried draft rows sidecar");
+    }
+}
+
+/// The rows a crashed propose left in the sidecar. A missing or unreadable
+/// sidecar carries nothing: it is a copy, and the same shape filter and caps
+/// apply to it as to the local file.
+fn read_carried_sidecar(state_path: &Path) -> Vec<PolicyDecisionRecord> {
+    let path = carried_sidecar_path(state_path);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "ignoring an unreadable carried draft rows sidecar");
+        Vec::new()
+    })
 }
 
 /// The `plan_id` prefixes of the draft tools' decision rows (`draft_model`,
@@ -2117,6 +2190,17 @@ pub(crate) fn local_draft_rows_to_carry(
         .list_policy_decisions()
         .context("failed to list the worker's local draft decisions")?;
     drop(store);
+    // Rows a crashed propose left in the sidecar, minus any the file holds.
+    let mut rows = rows;
+    let held: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|d| (d.timestamp, d.plan_id.clone(), d.model.clone()))
+        .collect();
+    rows.extend(
+        read_carried_sidecar(state_path)
+            .into_iter()
+            .filter(|d| !held.contains(&(d.timestamp, d.plan_id.clone(), d.model.clone()))),
+    );
     let mut carried = Vec::new();
     for row in rows {
         if !DRAFT_DECISION_PREFIXES
@@ -2980,6 +3064,7 @@ pub(crate) fn evaluate_apply_policy_core(
         }
 
         record(&PolicyDecisionRecord {
+            seq: 0,
             // The gate decided this set on purpose: an empty one says "no
             // compiled model here", and the queue must not re-resolve it.
             keys_recorded: true,
@@ -3440,6 +3525,17 @@ impl ExecutionExtras {
 /// executed. The residual still tracked under #1120 is state-object durability
 /// (compare-and-swap on the remote `state.redb`), not config-swap.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
+    // A `${VAR}` connection field must hash by its VALUE, so an env swap that
+    // re-routes the apply changes the identity (#1919). Credentials still
+    // serialize as "***" inside this scope.
+    //
+    // The result is a blake3 digest, never the JSON itself: plan files store
+    // it, and the JSON holds the resolved `${VAR}` values.
+    let json = rocky_core::env_string::with_env_values_scope(|| config_policy_identity_inner(cfg));
+    blake3::hash(json.as_bytes()).to_hex().to_string()
+}
+
+fn config_policy_identity_inner(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
         .iter()
@@ -4578,6 +4674,7 @@ fn evaluate_verify_after(
         )
     });
     let record = PolicyDecisionRecord {
+        seq: 0,
         keys_recorded: false,
         fail_closed: false,
         models: Vec::new(),
@@ -7806,6 +7903,7 @@ auto_create_schemas = true
         let store = StateStore::open(state_path)?;
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -7960,6 +8058,7 @@ default_agent_effect = "require_review"
         }
         // The custody seam downloads first and fails closed on the remote error.
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -9789,6 +9888,36 @@ auto_create_schemas = true
     /// change there refuses; but a CREDENTIAL change (token/password, a
     /// `RedactedString`) does NOT, because it serializes to `"***"`. This is the
     /// corrected equality (round-5 wrongly treated `path` as a secret).
+    /// #1919 red team: a `${VAR}` connection field hashes by its value, so an
+    /// env swap between plan and apply changes the routing identity.
+    #[test]
+    fn config_identity_changes_when_only_an_env_value_changes() {
+        use rocky_core::env_string::EnvString;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let with_db = |value: &str| {
+            let mut cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+            let adapter = cfg.adapters.get_mut("default").expect("default adapter");
+            adapter.path = Some(EnvString::substituted("ROCKY_IDENTITY_DB", value));
+            cfg
+        };
+        let a = super::config_policy_identity(&with_db("a.duckdb"));
+        let b = super::config_policy_identity(&with_db("b.duckdb"));
+        assert_ne!(
+            a, b,
+            "an env value swap re-routes the apply and must change the identity"
+        );
+        assert!(
+            !a.contains("duckdb") && !b.contains("duckdb"),
+            "the identity is persisted in plan files and must not hold a resolved env value"
+        );
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {
@@ -13201,6 +13330,27 @@ schema = "raw"
                 "c.raw",
             ),
             (
+                "load: the contract staging table",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+table = "events"
+"#,
+                true,
+                "events__rocky_stg",
+            ),
+            (
+                "quality split: the label working table",
+                &split,
+                true,
+                "_quarantine_labels_*",
+            ),
+            (
                 "quality split: quarantine table",
                 &split,
                 true,
@@ -13372,6 +13522,7 @@ autonomy_budget = { failures = 1, window = "7d" }
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -13593,6 +13744,7 @@ autonomy_budget = { failures = 1, window = "7d" }
 
     fn custody_record() -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             // A fixed, distinctive event time: budget consumers key on it, so
             // the published row must carry exactly this value.
             timestamp: Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap()
@@ -13948,12 +14100,14 @@ effect = "allow"
 
         let frozen_at = Utc::now() - chrono::Duration::hours(1);
         let freeze = PolicyDecisionRecord {
+            seq: 0,
             timestamp: frozen_at,
             plan_id: "freeze:real".to_string(),
             model: "any".to_string(),
             ..row("freeze:real", None, &[], PolicyEffect::Deny)
         };
         let honest_draft = PolicyDecisionRecord {
+            seq: 0,
             timestamp: frozen_at,
             capability: PolicyCapability::Propose,
             model: "orders".to_string(),
@@ -13968,12 +14122,14 @@ effect = "allow"
 
         // The worker forges its local file.
         let unfreeze = PolicyDecisionRecord {
+            seq: 0,
             timestamp: Utc::now(),
             plan_id: "unfreeze:real".to_string(),
             model: "any".to_string(),
             ..row("unfreeze:real", None, &[], PolicyEffect::Allow)
         };
         let budget_burn = PolicyDecisionRecord {
+            seq: 0,
             capability: PolicyCapability::Propose,
             model: "orders".to_string(),
             ..row(
@@ -13984,6 +14140,7 @@ effect = "allow"
             )
         };
         let overwrite = PolicyDecisionRecord {
+            seq: 0,
             effect: PolicyEffect::Allow,
             reason: "forged".to_string(),
             ..honest_draft.clone()
@@ -14067,6 +14224,53 @@ effect = "allow"
         );
     }
 
+    /// #2292: a crash between the first download and the write-back loses
+    /// the carried rows unless a sidecar holds them. Here the rows are in the
+    /// sidecar and the local file is replaced by an empty one (what the
+    /// download does): the next propose still carries them, and a clean
+    /// propose leaves no sidecar behind.
+    #[tokio::test]
+    async fn a_crash_after_the_download_does_not_lose_the_carried_rows() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+        let models = vec!["orders".to_string()];
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let carried =
+            super::local_draft_rows_to_carry(&harness.pod_b.state_path, &models, Utc::now())
+                .unwrap();
+        assert_eq!(carried.len(), 1);
+
+        // The crashed propose: sidecar written, then the download replaced
+        // the local file (no worker row in it), then the process died.
+        super::write_carried_sidecar(&harness.pod_b.state_path, &carried);
+        std::fs::remove_file(&harness.pod_b.state_path).unwrap();
+        let after_crash =
+            super::local_draft_rows_to_carry(&harness.pod_b.state_path, &models, Utc::now())
+                .unwrap();
+        assert_eq!(after_crash.len(), 1, "the sidecar carries the row");
+
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "published after the crash: {rows:?}"
+        );
+        assert!(
+            !super::carried_sidecar_path(&harness.pod_b.state_path).exists(),
+            "a finished propose leaves no sidecar"
+        );
+    }
+
     /// #2282 (A2): the worker controls its local file, so the carried set is
     /// bounded. 10,001 future-dated draft rows carry at most the per-draft
     /// cap, none dated after the propose's clock, and a row whose `plan_id`
@@ -14085,6 +14289,7 @@ effect = "allow"
             for i in 0..10_001i64 {
                 local
                     .record_policy_decision(&PolicyDecisionRecord {
+                        seq: 0,
                         timestamp: base + chrono::Duration::seconds(i),
                         capability: PolicyCapability::Propose,
                         model: "orders".to_string(),
@@ -14095,6 +14300,7 @@ effect = "allow"
             }
             local
                 .record_policy_decision(&PolicyDecisionRecord {
+                    seq: 0,
                     capability: PolicyCapability::Propose,
                     model: "orders".to_string(),
                     ..row("draft:other", None, &[], PolicyEffect::Allow)
@@ -14135,6 +14341,7 @@ effect = "allow"
             for i in 0..20i64 {
                 local
                     .record_policy_decision(&PolicyDecisionRecord {
+                        seq: 0,
                         timestamp: base + chrono::Duration::seconds(i),
                         capability: PolicyCapability::Propose,
                         model: "orders".to_string(),
@@ -14145,6 +14352,7 @@ effect = "allow"
             }
             local
                 .record_policy_decision(&PolicyDecisionRecord {
+                    seq: 0,
                     capability: PolicyCapability::Propose,
                     model: "orders".to_string(),
                     ..row("draft:other", None, &[], PolicyEffect::Allow)

@@ -89,7 +89,7 @@ fn build_adapter_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListAdapt
             name: name.clone(),
             adapter_type: ac.adapter_type.clone(),
             // A resolved `${VAR}` value prints as `${NAME}` (#1919).
-            host: ac.host.as_deref().map(render_placeholders),
+            host: ac.host.as_ref().map(|h| h.rendered().to_owned()),
         })
         .collect()
 }

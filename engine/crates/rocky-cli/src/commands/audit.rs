@@ -1605,6 +1605,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1635,6 +1636,7 @@ mod tests {
 
     fn row_at(ts: DateTime<Utc>, plan: &str, who: Option<&str>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             timestamp: ts,
             principal_ref: who.map(actor),
             ..decision(0, plan, "fct_orders", PolicyEffect::Allow)
@@ -1869,6 +1871,7 @@ mod tests {
 
         let label = "backfill: 2 model(s)";
         let plan_level = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
@@ -1925,6 +1928,7 @@ mod tests {
         use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let decisions = vec![PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1968,6 +1972,7 @@ mod tests {
         let state_path = root.join("state.redb");
 
         let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: models.into_iter().map(str::to_string).collect(),
@@ -2360,6 +2365,7 @@ mod tests {
         reason: &str,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -2795,6 +2801,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),

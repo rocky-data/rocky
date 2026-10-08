@@ -589,7 +589,7 @@ By default (`--format both`) `rocky catalog` writes `<out>/catalog.json`, `<out>
 The artifact contains:
 
 - `assets` — one entry per model or upstream source, with columns (name plus inferred type and nullability when known, and a per-column `description` from the sidecar `[columns]` table when set), upstream / downstream lists, and the model's intent description when supplied.
-- `edges` — one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `expression`, `aggregation: <fn>`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved for future use).
+- `edges` — one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `try_cast`, `expression`, `aggregation: <fn>`; `aggregation` and `cast` apply directly to a column, and a nested call such as `MAX(LENGTH(n))` or `CAST(MAX(x) AS BIGINT)` is `expression`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved for future use).
 - `stats` — aggregate counts (`asset_count`, `edge_count`, `column_count`, `assets_with_star`, `orphan_columns`, `duration_ms`).
 - A `config_hash` fingerprint of `rocky.toml` so consumers can tell whether the catalog was built against the current configuration.
 

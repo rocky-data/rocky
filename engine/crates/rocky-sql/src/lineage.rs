@@ -746,23 +746,35 @@ fn extract_expr_lineage(
             // conversion, so its output is nullable even over a non-null input.
             // Track it distinctly so typecheck doesn't carry the input's
             // non-null bit through (#1148).
-            lineage.transform = match kind {
+            //
+            // The outer cast composes with the inner edge kind; it never
+            // overwrites what the inner expression did (#2295).
+            lineage.transform = match (kind, &lineage.transform) {
                 // Fallible outer cast: nullable output regardless of the inner.
-                CastKind::TryCast | CastKind::SafeCast => TransformKind::TryCast,
+                (CastKind::TryCast | CastKind::SafeCast, _) => TransformKind::TryCast,
                 // Infallible outer cast: fallibility is sticky — an inner edge
                 // already classified `TryCast` (e.g.
                 // `CAST(TRY_CAST(x AS INT) AS BIGINT)`) still returns NULL when
-                // the inner conversion fails, so the output stays nullable. A
-                // cast chain with no fallible link keeps the plain `Cast`
-                // classification (the outer cast's target type is recovered in
-                // typecheck Step 2 either way).
-                CastKind::Cast | CastKind::DoubleColon => {
-                    if lineage.transform == TransformKind::TryCast {
-                        TransformKind::TryCast
-                    } else {
-                        TransformKind::Cast
-                    }
+                // the inner conversion fails, so the output stays nullable.
+                (CastKind::Cast | CastKind::DoubleColon, TransformKind::TryCast) => {
+                    TransformKind::TryCast
                 }
+                // An infallible cast over a bare column, or over a cast chain
+                // with no fallible link, keeps the column's nullability. That
+                // is what `Cast` promises. The outer cast's target type is
+                // recovered in typecheck Step 2.
+                (
+                    CastKind::Cast | CastKind::DoubleColon,
+                    TransformKind::Direct | TransformKind::Cast,
+                ) => TransformKind::Cast,
+                // An infallible cast over a computed value — `CAST(MAX(x) AS
+                // BIGINT)`, `CAST(NULLIF(x, 0) AS INT)` — can be NULL when the
+                // column is not. It takes the inner expression's nullability,
+                // which the edge cannot carry, so it is a general expression.
+                (
+                    CastKind::Cast | CastKind::DoubleColon,
+                    TransformKind::Aggregation(_) | TransformKind::Expression,
+                ) => TransformKind::Expression,
             };
             Some(lineage)
         }
@@ -780,7 +792,8 @@ fn extract_expr_lineage(
                             && let Some(mut lineage) =
                                 extract_expr_lineage(inner_expr, alias_map, source_tables)
                         {
-                            lineage.transform = TransformKind::Aggregation(func_name.clone());
+                            lineage.transform =
+                                compose_function_transform(&func_name, &lineage.transform);
                             return Some(lineage);
                         }
                     }
@@ -790,6 +803,30 @@ fn extract_expr_lineage(
             }
         }
         _ => None,
+    }
+}
+
+/// The edge kind of a call to `func_name` whose traced argument has edge kind
+/// `inner`.
+///
+/// `Aggregation(f)` means "`f` applied directly to a bare column": typecheck
+/// derives the result type from that column's type. A call over a computed
+/// argument — `MAX(LENGTH(n))`, `SUM(CAST(y AS DOUBLE))` — does not have the
+/// column's type, so it is a general `Expression` (#2295). `COUNT` is the
+/// exception: it is a non-null integer whatever its argument is.
+fn compose_function_transform(func_name: &str, inner: &TransformKind) -> TransformKind {
+    match inner {
+        TransformKind::Direct => TransformKind::Aggregation(func_name.to_string()),
+        TransformKind::Cast
+        | TransformKind::TryCast
+        | TransformKind::Aggregation(_)
+        | TransformKind::Expression => {
+            if func_name == "COUNT" {
+                TransformKind::Aggregation(func_name.to_string())
+            } else {
+                TransformKind::Expression
+            }
+        }
     }
 }
 
@@ -1546,6 +1583,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nested_plain.columns[0].transform, TransformKind::Cast);
+    }
+
+    /// A nested call or cast composes its edge kind with the inner one instead
+    /// of overwriting it (#2295). Before, every row below was labelled with
+    /// the outer kind alone: `Cast` or `Aggregation(outer)`.
+    #[test]
+    fn nested_calls_compose_edge_kinds() {
+        let sql = "SELECT CAST(NULLIF(x, 0) AS INT) AS a, CAST(MAX(x) AS BIGINT) AS b, \
+                   MAX(LENGTH(n)) AS c, SUM(CAST(y AS DOUBLE)) AS d, \
+                   COUNT(UPPER(n)) AS e, TRY_CAST(MAX(x) AS INT) AS f, \
+                   MAX(x) AS g, CAST(x AS BIGINT) AS h FROM cat.sch.t";
+        let result = extract_lineage(sql).unwrap();
+        let kinds: Vec<_> = result
+            .columns
+            .iter()
+            .map(|c| (c.target_column.as_str(), c.transform.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("a", TransformKind::Expression),
+                ("b", TransformKind::Expression),
+                ("c", TransformKind::Expression),
+                ("d", TransformKind::Expression),
+                ("e", TransformKind::Aggregation("COUNT".to_string())),
+                ("f", TransformKind::TryCast),
+                ("g", TransformKind::Aggregation("MAX".to_string())),
+                ("h", TransformKind::Cast),
+            ]
+        );
     }
 
     #[test]

@@ -3909,8 +3909,12 @@ effect = "require_review"
         use rocky_core::product::commit::{run_phase_a, run_phase_b};
         use rocky_ir::RockyType;
 
+        // `revenue_eur` is NOT NULL in the contract. A bare `CAST(SUM(..))`
+        // is nullable (SUM over no rows is NULL), so the worker states the
+        // default; before #2295 lineage wrongly read the cast as NOT NULL.
         const WORKER_SQL: &str = "SELECT\n    client_id,\n    charged_on AS date,\n    \
-             CAST(SUM(amount_eur) AS DECIMAL(18,2)) AS revenue_eur\nFROM raw.stripe_charges\n\
+             CAST(COALESCE(SUM(amount_eur), 0) AS DECIMAL(18,2)) AS revenue_eur\n\
+             FROM raw.stripe_charges\n\
              WHERE NOT refunded\nGROUP BY client_id, charged_on\n";
         const DRAFT_SIDECAR: &str = "name = \"revenue_daily\"\nintent = \"Daily gross revenue \
              per client in EUR, refunds excluded\"\n";

@@ -652,6 +652,49 @@ mod tests {
         assert!(names.contains(&("good_mart", ModelTestStatus::Pass)));
     }
 
+    /// #2045 shape 4 through the `rocky test` entry point: a producer whose
+    /// target schema fails validation, a stale same-named seed table, and a
+    /// consumer scoped with `--model`. The consumer never passes on the stale
+    /// seed value, and the scoped run still reports it as failed.
+    #[test]
+    fn scoped_run_reports_a_consumer_whose_producer_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(
+            dir.path().join("data").join("seed.sql"),
+            "CREATE TABLE main.source AS SELECT 7 AS v",
+        )
+        .unwrap();
+        std::fs::write(models.join("source.sql"), "SELECT 42 AS v").unwrap();
+        std::fs::write(
+            models.join("source.toml"),
+            "name = \"source\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"memory\"\nschema = \"bad-name\"\ntable = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("consumer.sql"), "SELECT v FROM source").unwrap();
+        std::fs::write(
+            models.join("consumer.toml"),
+            "name = \"consumer\"\ndepends_on = [\"source\"]\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"memory\"\nschema = \"out\"\ntable = \"consumer\"\n",
+        )
+        .unwrap();
+        let result = run_tests(
+            &models,
+            None,
+            Some("consumer"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert_eq!(result.passed, 0, "{:?}", result.model_results);
+        assert_eq!(result.total, 1, "{:?}", result.model_results);
+        let (name, why) = &result.failures[0];
+        assert_eq!(name, "consumer");
+        assert!(why.contains("upstream 'source'"), "{why}");
+    }
+
     /// `--model good_mart` filters the reported results to one model. The
     /// upstream `raw_orders` still executes (so good_mart's SQL resolves)
     /// but doesn't appear in `model_results`. Closes the TODO that had

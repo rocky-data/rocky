@@ -21,7 +21,7 @@ use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
-use crate::semantic::{ModelSchema, SemanticGraph};
+use crate::semantic::{LineageEdge, ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
@@ -501,16 +501,22 @@ fn compute_model_typecheck(
     // Lineage resolves aliases to source models, losing which occurrence an
     // outer join null-extends. Infer in the SQL relation scope before using
     // the resulting nullable bit for contracts and downstream models.
+    //
+    // A nested expression (`CAST(MAX(x) AS BIGINT)`) and a column with no
+    // traceable source (`COUNT(*)`) also need it: the edge kind alone cannot
+    // type them (#2295).
     let needs_inference = udf_scope.is_active()
-        || typed_cols.iter().any(|col| {
-            graph
-                .producing_edge(model_name, &col.name)
-                .is_some_and(|edge| {
+        || typed_cols
+            .iter()
+            .any(|col| match graph.producing_edge(model_name, &col.name) {
+                Some(edge) => {
                     edge.transform.is_cast()
+                        || edge.transform == rocky_sql::lineage::TransformKind::Expression
                         || (!col.nullable
                             && edge.transform == rocky_sql::lineage::TransformKind::Direct)
-                })
-        });
+                }
+                None => true,
+            });
     let inferred_cols = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
@@ -521,29 +527,58 @@ fn compute_model_typecheck(
             .ok()
         });
     if let Some(inferred) = &inferred_cols {
-        let mut nullable_by_name = HashMap::new();
+        let mut inferred_by_name = HashMap::new();
         for (index, col) in inferred.columns.iter().enumerate() {
             // Match semantic-graph star expansion, which keeps the first
             // occurrence when multiple relations expose the same name.
-            nullable_by_name
-                .entry(col.name.as_str())
-                .or_insert((col.nullable, inferred.reference_outputs.contains(&index)));
+            inferred_by_name.entry(col.name.as_str()).or_insert((
+                col,
+                inferred.exact_type_outputs.contains(&index),
+                inferred.count_outputs.contains(&index),
+            ));
         }
         for col in &mut typed_cols {
-            let Some(edge) = graph.producing_edge(model_name, &col.name) else {
-                continue;
-            };
-            let Some(&(nullable, reference_output)) = nullable_by_name.get(col.name.as_str())
+            let Some(&(inferred_col, exact_type, count)) = inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
-            if edge.transform == rocky_sql::lineage::TransformKind::Direct
-                || (edge.transform == rocky_sql::lineage::TransformKind::Cast && reference_output)
-            {
-                // Lineage also labels CAST(SUM(...)) as Cast. Preserve existing
-                // computed-expression behavior; only reference casts carry this
-                // join-side correction. Cast target refinement still runs below.
-                col.nullable |= nullable;
+            let Some(edge) = graph.producing_edge(model_name, &col.name) else {
+                // No traceable source column. Only `COUNT(...)` is typed here:
+                // it is a non-null BIGINT whatever its argument (#2295). Other
+                // source-less projections (literals, multi-column arithmetic)
+                // stay Unknown.
+                if count {
+                    col.data_type = inferred_col.data_type.clone();
+                    col.nullable = inferred_col.nullable;
+                }
+                continue;
+            };
+            match &edge.transform {
+                // A bare column or a cast over one: inference in the SQL
+                // relation scope carries the outer-join side. Only ever widen
+                // nullability. Cast target refinement still runs below.
+                rocky_sql::lineage::TransformKind::Direct
+                | rocky_sql::lineage::TransformKind::Cast
+                | rocky_sql::lineage::TransformKind::TryCast => {
+                    col.nullable |= inferred_col.nullable;
+                }
+                // A nested expression. Step 1 left it `(Unknown, true)`. Take
+                // inference's answer only when the type comes straight from
+                // the SQL (a cast target, `COUNT`, or `SUM`/`MIN`/`MAX`/`AVG`
+                // over one) and the traced input column is known — the same
+                // "Unknown input stays Unknown" rule as cast refinement.
+                rocky_sql::lineage::TransformKind::Expression => {
+                    if exact_type
+                        && inferred_col.data_type != RockyType::Unknown
+                        && edge_input_is_known(edge, typed_models, col_index)
+                    {
+                        col.data_type = inferred_col.data_type.clone();
+                        col.nullable = inferred_col.nullable;
+                    }
+                }
+                // An aggregate over a bare column: Step 1 already typed it
+                // from the column's type.
+                rocky_sql::lineage::TransformKind::Aggregation(_) => {}
             }
         }
     }
@@ -2475,9 +2510,27 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             (ty, true)
         }
         "MIN" | "MAX" => (input_type.clone(), true),
-        "COUNT_DISTINCT" => (RockyType::Int64, false),
+        // `COUNT(DISTINCT x)` reaches here as "COUNT": lineage keys on the
+        // function name, never on its DISTINCT modifier.
         _ => (RockyType::Unknown, true),
     }
+}
+
+/// Whether the source column a lineage edge reads has a known type.
+fn edge_input_is_known(
+    edge: &LineageEdge,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    col_index: &HashMap<String, HashMap<String, usize>>,
+) -> bool {
+    typed_models
+        .get(&*edge.source.model)
+        .and_then(|columns| {
+            col_index
+                .get(&*edge.source.model)
+                .and_then(|index| index.get(&*edge.source.column))
+                .map(|&index| &columns[index])
+        })
+        .is_some_and(|input| input.data_type != RockyType::Unknown)
 }
 
 /// Refine explicit casts by parsing their target types from the model SQL.
@@ -2529,16 +2582,7 @@ fn enhanced_inference(
             continue;
         }
 
-        let input_is_known = typed_models
-            .get(&*edge.source.model)
-            .and_then(|columns| {
-                col_index
-                    .get(&*edge.source.model)
-                    .and_then(|index| index.get(&*edge.source.column))
-                    .map(|&index| &columns[index])
-            })
-            .is_some_and(|input| input.data_type != RockyType::Unknown);
-        if !input_is_known {
+        if !edge_input_is_known(edge, typed_models, col_index) {
             continue;
         }
 
@@ -2691,14 +2735,21 @@ fn infer_binary_op_type(
         ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
 
         // Arithmetic → numeric promotion
-        ast::BinaryOperator::Plus
-        | ast::BinaryOperator::Minus
-        | ast::BinaryOperator::Multiply
-        | ast::BinaryOperator::Divide
-        | ast::BinaryOperator::Modulo => {
+        ast::BinaryOperator::Plus | ast::BinaryOperator::Minus | ast::BinaryOperator::Multiply => {
             let result_type = crate::types::common_supertype(&left_type, &right_type)
                 .unwrap_or(RockyType::Unknown);
             (result_type, nullable)
+        }
+        // Division and modulo by zero return NULL in several dialects (DuckDB,
+        // Spark with ANSI mode off), so the result is nullable even over
+        // non-null operands (#2295).
+        ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo => {
+            let result_type = crate::types::common_supertype(&left_type, &right_type)
+                .unwrap_or(RockyType::Unknown);
+            (result_type, true)
+        }
+        ast::BinaryOperator::DuckIntegerDivide | ast::BinaryOperator::MyIntegerDivide => {
+            (RockyType::Unknown, true)
         }
 
         // String concatenation
@@ -3014,15 +3065,28 @@ pub fn infer_select_types(
 pub(crate) struct SelectInference {
     pub(crate) columns: Vec<TypedColumn>,
     // Projection indexes keep metadata aligned with duplicate wildcard names.
-    reference_outputs: HashSet<usize>,
+    /// Outputs whose inferred type comes straight from the SQL — see
+    /// [`has_exact_type`].
+    exact_type_outputs: HashSet<usize>,
+    /// Outputs that are a `COUNT(...)` call.
+    count_outputs: HashSet<usize>,
 }
 
 impl SelectInference {
     fn push_expression(&mut self, name: String, expr: &Expr, scope: &TypeScope) {
-        if is_column_reference(expr) {
-            self.reference_outputs.insert(self.columns.len());
-        }
         let (data_type, nullable) = infer_expr_type(expr, scope);
+        let function = function_name(expr);
+        // `SUM` / `AVG` of a DECIMAL widens the precision by a
+        // dialect-dependent amount (DuckDB DECIMAL(38, s), Databricks
+        // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
+        let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
+            && matches!(data_type, RockyType::Decimal { .. });
+        if has_exact_type(expr) && !widened_decimal {
+            self.exact_type_outputs.insert(self.columns.len());
+        }
+        if function.as_deref() == Some("COUNT") {
+            self.count_outputs.insert(self.columns.len());
+        }
         self.columns.push(TypedColumn {
             name,
             data_type,
@@ -3031,15 +3095,39 @@ impl SelectInference {
     }
 }
 
-fn is_column_reference(expr: &Expr) -> bool {
+/// The upper-cased name of the function `expr` calls, looking through
+/// parentheses.
+fn function_name(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
-        Expr::Nested(expr)
-        | Expr::Cast {
-            expr,
-            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
-            ..
-        } => is_column_reference(expr),
+        Expr::Nested(inner) => function_name(inner),
+        Expr::Function(func) => Some(func.name.to_string().to_uppercase()),
+        _ => None,
+    }
+}
+
+/// Whether [`infer_expr_type`] reads this expression's type from the SQL
+/// itself rather than from a guess: a column, a cast (its target), `COUNT`,
+/// or `SUM` / `MIN` / `MAX` / `AVG` over one of these.
+///
+/// Anything else — a scalar function whose result width is dialect-dependent
+/// (`LENGTH`), a numeric literal, `COALESCE` over a literal — is not exact, so
+/// a nested expression built from it stays `Unknown` (#2295).
+fn has_exact_type(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
+        Expr::Nested(inner) => has_exact_type(inner),
+        Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
+            "COUNT" => true,
+            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
+                ast::FunctionArguments::List(list) => matches!(
+                    list.args.first(),
+                    Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                        if has_exact_type(arg)
+                ),
+                _ => false,
+            },
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3752,6 +3840,151 @@ mod tests {
         assert!(
             columns[0].nullable,
             "expression inference remains conservative for casted aggregates"
+        );
+    }
+
+    /// Typecheck one model over a source `t` (`x INT NOT NULL`, `n STRING NOT
+    /// NULL`, `y INT NOT NULL`) and return its `(name, type, nullable)` rows.
+    fn typecheck_over_t(source: &str, sql: &str) -> Vec<(String, RockyType, bool)> {
+        let sources = HashMap::from([(
+            source.to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+                ("y", RockyType::Int32, false),
+            ]),
+        )]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// Golden table for #2295. Lineage used to overwrite a nested call's edge
+    /// kind with the outer one, so the column's type and nullability came
+    /// from the bare input column. Each row gives the old answer in a comment.
+    /// The invariant: inference may wrongly say nullable, never non-null.
+    #[test]
+    fn nested_expression_types_and_nullability_golden() {
+        for source in ["t", "cat.sch.t"] {
+            let sql = format!(
+                "SELECT CAST(NULLIF(x, 0) AS INT) AS a, CAST(MAX(x) AS BIGINT) AS b, \
+                 MAX(LENGTH(n)) AS c, SUM(CAST(y AS DOUBLE)) AS d, COUNT(*) AS e, \
+                 COUNT(x) AS f, COUNT(DISTINCT x) AS g, MAX(CAST(y AS BIGINT)) AS h, \
+                 SUM(CAST(y AS DECIMAL(10,2))) AS i FROM {source}"
+            );
+            let expected = vec![
+                // old: (Int32, false) — unsound, NULL when x = 0
+                ("a".to_string(), RockyType::Int32, true),
+                // old: (Int64, false) — unsound, NULL on an empty group
+                ("b".to_string(), RockyType::Int64, true),
+                // old: (String, true) — n's type, not an integer. LENGTH's
+                // width is dialect-dependent, so Unknown over a guess.
+                ("c".to_string(), RockyType::Unknown, true),
+                // old: (Int64, true) — y's integer type
+                ("d".to_string(), RockyType::Float64, true),
+                // old: (Unknown, true) — no lineage edge
+                ("e".to_string(), RockyType::Int64, false),
+                // unchanged
+                ("f".to_string(), RockyType::Int64, false),
+                // unchanged — reaches inference as "COUNT"
+                ("g".to_string(), RockyType::Int64, false),
+                // old: (Int32, true) — y's type, not the cast target
+                ("h".to_string(), RockyType::Int64, true),
+                // old: (Int64, true) — y's integer type. SUM widens a
+                // DECIMAL by a dialect-dependent amount: Unknown.
+                ("i".to_string(), RockyType::Unknown, true),
+            ];
+            assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
+        }
+    }
+
+    /// Controls: a bare column, a cast over one and a direct aggregate keep
+    /// their answers.
+    #[test]
+    fn direct_edges_keep_their_types_after_nested_fix() {
+        let rows = typecheck_over_t(
+            "t",
+            "SELECT x, CAST(x AS BIGINT) AS cx, TRY_CAST(n AS INT) AS tn FROM t",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("x".to_string(), RockyType::Int32, false),
+                ("cx".to_string(), RockyType::Int64, false),
+                ("tn".to_string(), RockyType::Int32, true),
+            ]
+        );
+        let rows = typecheck_over_t("t", "SELECT MAX(x) AS mx, SUM(y) AS sy FROM t");
+        assert_eq!(
+            rows,
+            vec![
+                ("mx".to_string(), RockyType::Int32, true),
+                ("sy".to_string(), RockyType::Int64, true),
+            ]
+        );
+    }
+
+    /// A model whose only column is `COUNT(*)` has no lineage edge at all, so
+    /// expression inference must run for edge-less columns too.
+    #[test]
+    fn count_star_alone_is_non_null_bigint() {
+        assert_eq!(
+            typecheck_over_t("t", "SELECT COUNT(*) AS c FROM t"),
+            vec![("c".to_string(), RockyType::Int64, false)]
+        );
+        // Other edge-less projections stay Unknown: a literal's width is not
+        // known from the SQL alone.
+        assert_eq!(
+            typecheck_over_t("t", "SELECT 1 AS one FROM t"),
+            vec![("one".to_string(), RockyType::Unknown, true)]
+        );
+    }
+
+    /// When expression inference cannot run (a set operation), the edge kind
+    /// is the only answer. A cast over an aggregate must then be nullable, not
+    /// the input column's NOT NULL.
+    #[test]
+    fn nested_cast_is_nullable_without_expression_inference() {
+        let rows = typecheck_over_t(
+            "t",
+            "SELECT CAST(MAX(x) AS BIGINT) AS b FROM t \
+             UNION ALL SELECT CAST(MAX(x) AS BIGINT) AS b FROM t",
+        );
+        assert_eq!(rows.len(), 1);
+        // old: (Unknown, false)
+        assert!(rows[0].2, "CAST(MAX(x)) can be NULL: {rows:?}");
+    }
+
+    #[test]
+    fn division_and_modulo_are_nullable() {
+        let scope = TypeScope::new();
+        for sql in ["4 / 2", "4 % 2"] {
+            let expr = parse_expr(sql);
+            let (_, nullable) = infer_expr_type(&expr, &scope);
+            assert!(nullable, "{sql}: division by zero can return NULL");
+        }
+        // The integer-division operators do not parse in the Databricks
+        // dialect; build them directly.
+        for op in [
+            ast::BinaryOperator::DuckIntegerDivide,
+            ast::BinaryOperator::MyIntegerDivide,
+        ] {
+            let expr = Expr::BinaryOp {
+                left: Box::new(parse_expr("4")),
+                op: op.clone(),
+                right: Box::new(parse_expr("2")),
+            };
+            let (_, nullable) = infer_expr_type(&expr, &scope);
+            assert!(nullable, "{op}: division by zero can return NULL");
+        }
+        let (_, nullable) = infer_expr_type(&parse_expr("4 * 2"), &scope);
+        assert!(
+            !nullable,
+            "multiplication of non-null literals stays non-null"
         );
     }
 

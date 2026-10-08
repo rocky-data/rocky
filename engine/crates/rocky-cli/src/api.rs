@@ -5162,6 +5162,7 @@ mod tests {
             .expect("run recorded");
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                seq: 0,
                 keys_recorded: false,
                 fail_closed: false,
                 models: Vec::new(),
@@ -5494,6 +5495,7 @@ mod tests {
         StateStore::open(&state_path)
             .unwrap()
             .record_policy_decision(&PolicyDecisionRecord {
+                seq: 0,
                 keys_recorded: false,
                 fail_closed: false,
                 models: Vec::new(),
@@ -5592,6 +5594,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, _) = governor_fixture(dir.path());
         let row = |plan: &str, day: u32, month: u32, who: Option<&str>| PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),

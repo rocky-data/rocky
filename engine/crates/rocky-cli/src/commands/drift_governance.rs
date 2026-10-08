@@ -345,6 +345,7 @@ impl DriftGovernor {
         let reason = rocky_core::secret_registry::render_placeholders(&reason);
 
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -580,6 +581,7 @@ pub(crate) fn finalize_drift_verify_after(
         // carrying `rule_id` is exactly the pair
         // `budget_failures_in_window` counts against the granting rule.
         let record = PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -925,6 +927,7 @@ mod tests {
     /// attached. Written by `govern` under `autoapply:<run_id>`.
     fn applied_decision(run_id: &str, model: &str) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1232,6 +1235,7 @@ mod tests {
             PolicyPrincipal::Human => "human",
         };
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -1358,6 +1362,7 @@ mod tests {
             .unwrap();
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                seq: 0,
                 keys_recorded: false,
                 fail_closed: false,
                 models: Vec::new(),

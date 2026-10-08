@@ -24,6 +24,7 @@
 //! update plan) lives in `rocky_compiler::import::dbt_package`; this file is
 //! the process and filesystem shell around it.
 
+use rocky_core::env_string::ExposeOpt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1235,7 +1236,7 @@ fn run_dbt(
     let dbt = locate_dbt(opts.dbt.as_deref())?;
     let timeout =
         std::time::Duration::from_secs(opts.dbt_timeout.unwrap_or(DEFAULT_DBT_TIMEOUT_SECS));
-    let duckdb_path = match (adapter.adapter_type.as_str(), adapter.path.as_deref()) {
+    let duckdb_path = match (adapter.adapter_type.as_str(), adapter.path.expose_opt()) {
         ("duckdb", Some(p)) => Some(
             std::path::absolute(p).with_context(|| format!("cannot resolve DuckDB path {p}"))?,
         ),

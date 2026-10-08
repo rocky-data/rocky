@@ -1771,6 +1771,7 @@ mod tests {
         rule_id: Option<usize>,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),

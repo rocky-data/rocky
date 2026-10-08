@@ -1196,11 +1196,15 @@ fn build_queue(
     let source_schemas =
         crate::source_schemas::load_project_source_schemas(config_path, state_path, None)?;
 
-    // `list_policy_decisions` yields oldest-first; scan the NEWEST `max_scan`
-    // rows (matching `list_runs`' newest-first convention) so a long-lived
-    // ledger never ages genuinely-pending escalations out of the queue.
+    // Scan the NEWEST `max_scan` rows (matching `list_runs` newest-first
+    // convention) so a long-lived ledger never ages genuinely-pending
+    // escalations out of the queue. "Newest" is insertion order, not the
+    // storage order: a row written after the clock stepped back sorts early
+    // by timestamp but must not fall out of the cap (#2293).
+    let mut newest_first: Vec<&PolicyDecisionRecord> = decisions.iter().collect();
+    newest_first.sort_by_key(|d| std::cmp::Reverse(ledger_order(d)));
     let (outstanding, excluded_non_plan) = select_outstanding(
-        decisions.iter().rev().take(max_scan),
+        newest_first.into_iter().take(max_scan),
         |plan_id| ai_plan_is_reviewed(root, plan_id),
         |plan_id| plan_file_path(root, plan_id).exists(),
     );
@@ -1348,7 +1352,7 @@ pub(crate) fn select_outstanding<'a>(
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
-                if d.timestamp > cur.timestamp {
+                if ledger_order(d) > ledger_order(cur) {
                     *cur = d;
                 }
             })
@@ -1374,6 +1378,17 @@ pub(crate) fn select_outstanding<'a>(
         })
         .collect();
     (outstanding, excluded_non_plan)
+}
+
+/// The order that says which of two ledger rows is the later one: insertion
+/// order first, the timestamp only to place rows from before `seq` existed
+/// (`seq == 0`, which sort before every stamped row).
+///
+/// The timestamp alone is wrong after a clock rollback: a row written after
+/// the clock stepped back carries the earlier time, so a timestamp pick keeps
+/// the older row (#2293).
+pub(crate) fn ledger_order(d: &PolicyDecisionRecord) -> (u64, chrono::DateTime<chrono::Utc>) {
+    (d.seq, d.timestamp)
 }
 
 /// The graph keys a queue row stands for — what the ranking resolves and what
@@ -1451,6 +1466,7 @@ pub(crate) fn record_plan_review_escalation(
     reason: &str,
 ) {
     let record = PolicyDecisionRecord {
+        seq: 0,
         // The plan-level writer names its set on purpose.
         keys_recorded: true,
         fail_closed: false,
@@ -2629,6 +2645,7 @@ mod tests {
         cap: PolicyCapability,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            seq: 0,
             keys_recorded: false,
             fail_closed: false,
             models: Vec::new(),
@@ -2945,6 +2962,111 @@ mod tests {
         assert_eq!(out.len(), 1, "only the plan-backed escalation surfaces");
         assert_eq!(out[0].plan_id, "planReal");
         assert_eq!(excluded, 3, "the three custody-only rows are counted out");
+    }
+
+    /// #2293: a row written after the clock stepped back is the later one. The
+    /// queue picks by insertion order, so the `allow` that cleared an
+    /// escalation wins although its timestamp is older, and a `require_review`
+    /// written after a rollback is not hidden by an older `allow`.
+    #[test]
+    fn queue_picks_the_row_written_last_after_a_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        // Written first, dated later (10:00).
+        let mut first = qd(
+            0,
+            "planA",
+            "m",
+            PolicyEffect::RequireReview,
+            PolicyCapability::Apply,
+        );
+        // Written second, dated EARLIER (09:58): the clock stepped back.
+        let mut second = qd(
+            0,
+            "planA",
+            "m",
+            PolicyEffect::Allow,
+            PolicyCapability::Apply,
+        );
+        first.timestamp = Utc.with_ymd_and_hms(2026, 7, 7, 10, 0, 0).unwrap();
+        second.timestamp = Utc.with_ymd_and_hms(2026, 7, 7, 9, 58, 0).unwrap();
+        store.record_policy_decision(&first).unwrap();
+        store.record_policy_decision(&second).unwrap();
+        let rows = store.list_policy_decisions().unwrap();
+        let (out, _) = select_outstanding(&rows, |_| false, |_| true);
+        assert!(
+            out.is_empty(),
+            "the later allow cleared the escalation: {out:?}"
+        );
+
+        // The other way round: the allow is dated later, the escalation was
+        // written last (dated earlier). The escalation is outstanding.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut allow = qd(
+            0,
+            "planB",
+            "m",
+            PolicyEffect::Allow,
+            PolicyCapability::Apply,
+        );
+        let mut escalation = qd(
+            0,
+            "planB",
+            "m",
+            PolicyEffect::RequireReview,
+            PolicyCapability::Apply,
+        );
+        allow.timestamp = Utc.with_ymd_and_hms(2026, 7, 7, 10, 0, 0).unwrap();
+        escalation.timestamp = Utc.with_ymd_and_hms(2026, 7, 7, 9, 58, 0).unwrap();
+        store.record_policy_decision(&allow).unwrap();
+        store.record_policy_decision(&escalation).unwrap();
+        let rows = store.list_policy_decisions().unwrap();
+        let (out, _) = select_outstanding(&rows, |_| false, |_| true);
+        assert_eq!(out.len(), 1, "the escalation was written last: {out:?}");
+        assert_eq!(out[0].effect, PolicyEffect::RequireReview);
+    }
+
+    /// #2293: the scan cap keeps the rows written last, not the rows dated
+    /// last, so an escalation written after a rollback is not aged out.
+    #[test]
+    fn queue_scan_cap_keeps_rows_written_last_after_a_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plans_dir = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(plans_dir.join("planX.json"), "{}").unwrap();
+        let store = StateStore::open(&root.join("state.redb")).unwrap();
+        // Three escalations; the last one written is dated EARLIEST.
+        for (i, hour) in [(1, 12), (2, 11), (3, 9)] {
+            let mut r = qd(
+                0,
+                "planX",
+                &format!("m{i}"),
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            );
+            r.timestamp = Utc.with_ymd_and_hms(2026, 7, 7, hour, 0, 0).unwrap();
+            store.record_policy_decision(&r).unwrap();
+        }
+        let decisions = store.list_policy_decisions().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 13, 0, 0).unwrap();
+        let (entries, _) = build_queue(
+            root,
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            &root.join("models"),
+            &decisions,
+            now,
+            2,
+        )
+        .expect("no rocky.toml is written here, so the config leg must not refuse");
+        let models: Vec<&str> = entries.iter().map(|e| e.model.as_str()).collect();
+        assert!(
+            models.contains(&"m3"),
+            "the row written last must stay in the cap: {models:?}"
+        );
+        assert!(!models.contains(&"m1"), "m1 was written first: {models:?}");
     }
 
     /// FIX: the scan cap must keep the NEWEST rows. `list_policy_decisions`

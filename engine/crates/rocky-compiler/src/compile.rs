@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_join_propagation_preserves_grouped_cast_contracts() {
+    fn cast_over_grouped_aggregate_is_nullable_under_outer_join_propagation() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("totals.toml"),
@@ -1655,10 +1655,22 @@ mod tests {
             )
             .unwrap();
             let result = compile(&config).unwrap();
-            assert!(!result.has_errors, "{join}: {:?}", result.diagnostics);
+            // This test used to assert `total` NOT NULL with no errors. That
+            // answer came from lineage labelling `CAST(SUM(...))` as a plain
+            // cast of `o.id`, which also made a global `CAST(SUM(x) AS BIGINT)`
+            // over an empty table NOT NULL — unsound (#2295). A cast takes its
+            // operand's nullability, and `SUM` is nullable, like a bare
+            // `SUM(o.id)` already was. The NOT NULL contract is now refused.
+            let errors: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_error())
+                .map(|d| (&*d.code, d.model.as_str()))
+                .collect();
+            assert_eq!(errors, vec![("E012", "totals")], "{join}");
             let total = &result.type_check.typed_models["totals"][1];
             assert_eq!(total.data_type, RockyType::Int64);
-            assert!(!total.nullable, "{join}");
+            assert!(total.nullable, "{join}");
         }
     }
 

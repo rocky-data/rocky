@@ -28,6 +28,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use rocky_core::env_string::ExposeOpt;
 use rocky_core::models::{SourceConfig, StrategyConfig, TargetConfig};
 use rocky_core::tests::{TestDecl, TestSeverity, TestType};
 
@@ -1783,13 +1784,15 @@ pub fn render_profiles_yml(
         env.push((var.to_string(), value.to_string()));
         out.insert(key.into(), format!("{{{{ env_var(\"{var}\") }}}}").into());
     };
-    let need = |field: &str, v: Option<&String>| -> Result<String, String> {
-        v.filter(|s| !s.is_empty()).cloned().ok_or_else(|| {
-            format!(
-                "the {} adapter has no `{field}`; dbt needs it to compile the package",
-                adapter.adapter_type
-            )
-        })
+    let need = |field: &str, v: Option<&str>| -> Result<String, String> {
+        v.filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "the {} adapter has no `{field}`; dbt needs it to compile the package",
+                    adapter.adapter_type
+                )
+            })
     };
     out.insert("type".into(), adapter.adapter_type.as_str().into());
     out.insert("threads".into(), 4.into());
@@ -1807,21 +1810,21 @@ pub fn render_profiles_yml(
         "snowflake" => {
             out.insert(
                 "account".into(),
-                need("account", adapter.account.as_ref())?.into(),
+                need("account", adapter.account.expose_opt())?.into(),
             );
             out.insert(
                 "user".into(),
-                need("username", adapter.username.as_ref())?.into(),
+                need("username", adapter.username.expose_opt())?.into(),
             );
             out.insert(
                 "database".into(),
-                need("database", adapter.database.as_ref())?.into(),
+                need("database", adapter.database.expose_opt())?.into(),
             );
             if let Some(w) = &adapter.warehouse {
-                out.insert("warehouse".into(), w.as_str().into());
+                out.insert("warehouse".into(), w.expose().into());
             }
             if let Some(r) = &adapter.role {
-                out.insert("role".into(), r.as_str().into());
+                out.insert("role".into(), r.expose().into());
             }
             out.insert("schema".into(), dbt_schema.into());
             if let Some(t) = &adapter.oauth_token {
@@ -1835,7 +1838,7 @@ pub fn render_profiles_yml(
             } else if let Some(k) = &adapter.private_key_path {
                 // dbt runs in a temp directory; a relative path must stay
                 // relative to where `rocky` was started.
-                out.insert("private_key_path".into(), absolute(k)?.into());
+                out.insert("private_key_path".into(), absolute(k.expose())?.into());
             } else if let Some(p) = adapter.password.as_ref().or(adapter.pat.as_ref()) {
                 secret(
                     &mut out,
@@ -1851,7 +1854,7 @@ pub fn render_profiles_yml(
             }
         }
         "databricks" => {
-            let host = need("host", adapter.host.as_ref())?;
+            let host = need("host", adapter.host.expose_opt())?;
             let host = host
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
@@ -1860,10 +1863,10 @@ pub fn render_profiles_yml(
             out.insert("host".into(), host.into());
             out.insert(
                 "http_path".into(),
-                need("http_path", adapter.http_path.as_ref())?.into(),
+                need("http_path", adapter.http_path.expose_opt())?.into(),
             );
             if let Some(c) = &adapter.database {
-                out.insert("catalog".into(), c.as_str().into());
+                out.insert("catalog".into(), c.expose().into());
             }
             out.insert("schema".into(), dbt_schema.into());
             if let Some(t) = &adapter.token {
@@ -1875,7 +1878,7 @@ pub fn render_profiles_yml(
                 );
             } else if let (Some(id), Some(cs)) = (&adapter.client_id, &adapter.client_secret) {
                 out.insert("auth_type".into(), "oauth".into());
-                out.insert("client_id".into(), id.as_str().into());
+                out.insert("client_id".into(), id.expose().into());
                 secret(
                     &mut out,
                     "client_secret",
@@ -1891,7 +1894,7 @@ pub fn render_profiles_yml(
         "bigquery" => {
             out.insert(
                 "project".into(),
-                need("project_id", adapter.project_id.as_ref())?.into(),
+                need("project_id", adapter.project_id.as_deref())?.into(),
             );
             out.insert("dataset".into(), dbt_schema.into());
             if let Some(l) = &adapter.location {
@@ -1910,7 +1913,10 @@ pub fn render_profiles_yml(
             }
         }
         "postgres" => {
-            out.insert("host".into(), need("host", adapter.host.as_ref())?.into());
+            out.insert(
+                "host".into(),
+                need("host", adapter.host.expose_opt())?.into(),
+            );
             let port = match adapter.extra.get("port") {
                 Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(5432),
                 Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(5432),
@@ -1919,11 +1925,11 @@ pub fn render_profiles_yml(
             out.insert("port".into(), port.into());
             out.insert(
                 "user".into(),
-                need("username", adapter.username.as_ref())?.into(),
+                need("username", adapter.username.expose_opt())?.into(),
             );
             out.insert(
                 "dbname".into(),
-                need("database", adapter.database.as_ref())?.into(),
+                need("database", adapter.database.expose_opt())?.into(),
             );
             out.insert("schema".into(), dbt_schema.into());
             if let Some(p) = &adapter.password {
