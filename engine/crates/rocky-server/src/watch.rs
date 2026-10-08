@@ -161,7 +161,17 @@ pub fn start_watcher(
             Err(e) => warn!(error = %e, "watch error"),
         })?;
 
-    watcher.watch(watch_dir, RecursiveMode::Recursive)?;
+    // A project whose only roots are its pipelines' own directories (say
+    // `transforms/`) has no `models/`. That is not a reason to refuse to
+    // start: skip the missing default, watch the pipeline roots.
+    if watch_dir.exists() || pipeline_roots.is_empty() {
+        watcher.watch(watch_dir, RecursiveMode::Recursive)?;
+    } else {
+        warn!(
+            dir = %watch_dir.display(),
+            "the models directory does not exist; watching the pipelines' models directories only"
+        );
+    }
     for root in pipeline_roots {
         let covered = match (root.canonicalize(), watch_dir.canonicalize()) {
             (Ok(r), Ok(w)) => r.starts_with(w),
@@ -416,6 +426,23 @@ mod tests {
             wait_for("rpt2").await,
             "a model added under reporting/ must recompile into the result"
         );
+    }
+
+    /// A project whose only model root is a pipeline's `transforms/` has no
+    /// `models/`. The watcher must still start, and still watch that root.
+    #[tokio::test]
+    async fn a_missing_default_models_dir_does_not_stop_the_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let transforms = root.join("transforms");
+        std::fs::create_dir_all(&transforms).unwrap();
+        let missing = root.join("models");
+        let state = ServerState::new(missing.clone(), None, None);
+        let watcher = start_watcher(state.clone(), &missing, std::slice::from_ref(&transforms));
+        assert!(watcher.is_ok(), "a missing default must not refuse start");
+        // With no pipeline root to fall back on, a missing directory is
+        // still an error.
+        assert!(start_watcher(state, &missing, &[]).is_err());
     }
 
     /// A `functions/` directory created after the server starts is watched
