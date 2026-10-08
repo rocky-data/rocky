@@ -1992,6 +1992,9 @@ pub async fn evaluate_apply_policy_durable(
     // drops the rows read above. Keep a copy to write back, so a retried
     // propose still carries them.
     let carried_for_restore = seam_carried.clone();
+    // A crash between the first download and that write-back loses the rows
+    // too, so they also go to a sidecar file the next propose reads (#2292).
+    write_carried_sidecar(state_path, &seam_carried);
     let result = commit_remote_ledger_seam(
         cfg,
         state_path,
@@ -2031,9 +2034,15 @@ pub async fn evaluate_apply_policy_durable(
     )
     .await;
     match result {
-        Ok(gate) => Ok(gate),
+        Ok(gate) => {
+            clear_carried_sidecar(state_path);
+            Ok(gate)
+        }
         Err(e) => match restore_carried_draft_rows(state_path, &carried_for_restore) {
-            Ok(()) => Err(e),
+            Ok(()) => {
+                clear_carried_sidecar(state_path);
+                Err(e)
+            }
             Err(restore) => Err(e.context(format!(
                 "and {} worker draft decision row(s) could not be written back to the local \
                  state file {}, so a retried propose cannot publish them: {restore:#}",
@@ -2064,6 +2073,55 @@ fn restore_carried_draft_rows(state_path: &Path, carried: &[PolicyDecisionRecord
         )
     })?;
     carry_draft_rows(&store, carried)
+}
+
+/// The sidecar file beside the local state file that holds the carried draft
+/// rows while a propose runs (#2292).
+fn carried_sidecar_path(state_path: &Path) -> PathBuf {
+    let mut name = state_path.as_os_str().to_owned();
+    name.push(".carried-drafts.json");
+    PathBuf::from(name)
+}
+
+/// Write the carried rows to the sidecar, replacing it atomically. Best
+/// effort: the sidecar only covers a crash, so a failure is a warning.
+fn write_carried_sidecar(state_path: &Path, carried: &[PolicyDecisionRecord]) {
+    if carried.is_empty() {
+        return;
+    }
+    let path = carried_sidecar_path(state_path);
+    let tmp = path.with_extension("json.tmp");
+    let written = serde_json::to_vec(carried)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(anyhow::Error::from))
+        .and_then(|()| std::fs::rename(&tmp, &path).map_err(anyhow::Error::from));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, path = %path.display(), "could not write the carried draft rows sidecar");
+    }
+}
+
+/// Remove the sidecar once its rows are published or back in the local file.
+fn clear_carried_sidecar(state_path: &Path) {
+    let path = carried_sidecar_path(state_path);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, path = %path.display(), "could not remove the carried draft rows sidecar");
+    }
+}
+
+/// The rows a crashed propose left in the sidecar. A missing or unreadable
+/// sidecar carries nothing: it is a copy, and the same shape filter and caps
+/// apply to it as to the local file.
+fn read_carried_sidecar(state_path: &Path) -> Vec<PolicyDecisionRecord> {
+    let path = carried_sidecar_path(state_path);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "ignoring an unreadable carried draft rows sidecar");
+        Vec::new()
+    })
 }
 
 /// The `plan_id` prefixes of the draft tools' decision rows (`draft_model`,
@@ -2132,6 +2190,17 @@ pub(crate) fn local_draft_rows_to_carry(
         .list_policy_decisions()
         .context("failed to list the worker's local draft decisions")?;
     drop(store);
+    // Rows a crashed propose left in the sidecar, minus any the file holds.
+    let mut rows = rows;
+    let held: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|d| (d.timestamp, d.plan_id.clone(), d.model.clone()))
+        .collect();
+    rows.extend(
+        read_carried_sidecar(state_path)
+            .into_iter()
+            .filter(|d| !held.contains(&(d.timestamp, d.plan_id.clone(), d.model.clone()))),
+    );
     let mut carried = Vec::new();
     for row in rows {
         if !DRAFT_DECISION_PREFIXES
@@ -14100,6 +14169,53 @@ effect = "allow"
             draft_rows(&rows).len(),
             1,
             "the retried propose publishes the worker's draft row: {rows:?}"
+        );
+    }
+
+    /// #2292: a crash between the first download and the write-back loses
+    /// the carried rows unless a sidecar holds them. Here the rows are in the
+    /// sidecar and the local file is replaced by an empty one (what the
+    /// download does): the next propose still carries them, and a clean
+    /// propose leaves no sidecar behind.
+    #[tokio::test]
+    async fn a_crash_after_the_download_does_not_lose_the_carried_rows() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+        let models = vec!["orders".to_string()];
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let carried =
+            super::local_draft_rows_to_carry(&harness.pod_b.state_path, &models, Utc::now())
+                .unwrap();
+        assert_eq!(carried.len(), 1);
+
+        // The crashed propose: sidecar written, then the download replaced
+        // the local file (no worker row in it), then the process died.
+        super::write_carried_sidecar(&harness.pod_b.state_path, &carried);
+        std::fs::remove_file(&harness.pod_b.state_path).unwrap();
+        let after_crash =
+            super::local_draft_rows_to_carry(&harness.pod_b.state_path, &models, Utc::now())
+                .unwrap();
+        assert_eq!(after_crash.len(), 1, "the sidecar carries the row");
+
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "published after the crash: {rows:?}"
+        );
+        assert!(
+            !super::carried_sidecar_path(&harness.pod_b.state_path).exists(),
+            "a finished propose leaves no sidecar"
         );
     }
 
