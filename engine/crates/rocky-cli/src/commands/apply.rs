@@ -565,6 +565,14 @@ async fn run_apply_run_plan(
         subjects,
     );
     apply_policy_gate(root, plan_id, gate)?;
+    verify_plan_models_before_execution(
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        &run_plan,
+        modelless,
+    )?;
 
     // Resolve the post-apply verification checks *before* the run plan is moved
     // into execution (the run plan owns the models_dir the resolver reads).
@@ -4875,6 +4883,14 @@ async fn run_apply_ai_authored_plan(
             );
         }
     }
+    verify_plan_models_before_execution(
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        &run_plan,
+        modelless,
+    )?;
 
     // Resolve the post-apply verification checks before the run plan is moved.
     let verify_checks = required_verify_after(
@@ -4989,7 +5005,7 @@ fn refuse_governed_dag_apply(
 /// runs, in every pipeline's directory, still matches the fingerprint the plan
 /// and its approval recorded. Runs whoever applies the plan, as late as
 /// possible before execution. A plan without `--dag`, or one that is not
-/// review-gated, is unaffected.
+/// review-gated, is checked later by [`verify_plan_models_before_execution`].
 fn verify_reviewed_dag_scope(
     plan: &PersistedPlan,
     plan_id: &str,
@@ -4997,10 +5013,45 @@ fn verify_reviewed_dag_scope(
     config_path: &Path,
     run_plan: &RunPlan,
 ) -> Result<()> {
-    if !run_plan.dag || !super::review::plan_is_reviewable(plan) {
+    if !reviewed_dag_plan(plan, run_plan) {
         return Ok(());
     }
     super::approval_scope::verify_dag_scope_for_apply(plan, plan_id, config, config_path, run_plan)
+}
+
+fn reviewed_dag_plan(plan: &PersistedPlan, run_plan: &RunPlan) -> bool {
+    run_plan.dag && super::review::plan_is_reviewable(plan)
+}
+
+/// A run plan executes only if the models it would run still match the
+/// fingerprint the plan (and any approval of it) recorded, whoever applies
+/// it. `run` recompiles the models on disk; before this, only an agent's
+/// apply was re-checked (inside `run`), so a person's apply ran models
+/// edited after the plan was made.
+///
+/// Called after the policy and review gates, so their refusals keep their
+/// precedence, and before any warehouse statement. Skipped where nothing
+/// would be re-checked twice or nothing compiled runs: a reviewed `--dag`
+/// plan ([`verify_reviewed_dag_scope`] already ran), a model-less pipeline
+/// (snapshot, load, quality) and a replication-only plan.
+fn verify_plan_models_before_execution(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    run_plan: &RunPlan,
+    modelless: bool,
+) -> Result<()> {
+    if reviewed_dag_plan(plan, run_plan) || modelless || is_replication_only(config, run_plan) {
+        return Ok(());
+    }
+    super::approval_scope::verify_plan_models_for_apply(
+        plan,
+        plan_id,
+        Some(config),
+        config_path,
+        run_plan,
+    )
 }
 
 fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
@@ -5232,6 +5283,16 @@ async fn run_apply_backfill_plan(
         if set.is_empty() {
             bail!("backfill plan '{plan_id}' names no models to rebuild");
         }
+        // Every principal: the models the backfill rebuilds must still match
+        // the fingerprint its approval covered. `execute_backfill_set`
+        // recompiles them from disk.
+        super::approval_scope::verify_plan_models_for_apply(
+            &plan,
+            plan_id,
+            cfg.as_ref().map(|l| &l.config),
+            config_path,
+            &run_plan,
+        )?;
 
         // A half-open window must never execute: `to_selection` only yields a
         // Range when BOTH bounds are present, so a lone bound would silently fall
@@ -11092,20 +11153,132 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// #2239: a human-authored `--dag` plan is not review-gated, so the scope
-    /// check does not run and an edit after planning still applies, exactly as
-    /// before.
+    /// A human-authored `--dag` plan is not review-gated, but it carries a
+    /// models fingerprint, so an edit after planning now refuses the apply
+    /// (`plan_models_changed`) instead of running the edited models. Before
+    /// this, only a reviewed plan or an agent's apply was re-checked.
     #[tokio::test]
-    async fn human_authored_dag_plan_is_not_scope_checked() -> anyhow::Result<()> {
+    async fn human_authored_dag_plan_refuses_when_its_models_changed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let config = two_pipeline_dag_project(root)?;
         let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Human)?;
         std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
 
+        let err = apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect_err("a human apply of a changed plan must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("models changed since this plan was made; plan again"),
+            "{msg}"
+        );
+        assert!(
+            !root.join("proj.duckdb").exists(),
+            "refused before the warehouse is opened"
+        );
+        Ok(())
+    }
+
+    /// A plain (non-`--dag`) run plan for one transformation pipeline,
+    /// persisted through the production capability path as `principal`.
+    fn write_pipeline_plan(
+        root: &Path,
+        config: &Path,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
+        let rp = RunPlan {
+            pipeline: Some("gold".to_string()),
+            models: vec!["totals".to_string()],
+            execution_layers: vec![vec!["totals".to_string()]],
+            ..minimal_run_plan()
+        };
+        let cfg = rocky_core::config::load_optional_project_config(Some(config))?;
+        let scope = super::super::approval_scope::approval_scope(cfg.as_ref(), config, &rp)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        crate::plan_store::write_plan_governed(root, PlanKind::Run, &rp, principal, capabilities)
+    }
+
+    /// **Apply re-checks the reviewed models for every principal.** A human
+    /// apply of a plain run plan whose model was edited, added or removed
+    /// after planning refuses with `plan_models_changed`, before the policy
+    /// gate and before the warehouse is opened. `run` recompiles the models
+    /// on disk, so without this the edited model would run.
+    #[tokio::test]
+    async fn human_apply_refuses_a_plan_whose_models_changed() -> anyhow::Result<()> {
+        type Edit = fn(&Path) -> std::io::Result<()>;
+        let edits: [(&str, Edit); 3] = [
+            ("changed", |root| {
+                std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")
+            }),
+            ("added", |root| {
+                std::fs::write(root.join("gold/extra.sql"), "SELECT 4 AS v\n")?;
+                std::fs::write(
+                    root.join("gold/extra.toml"),
+                    std::fs::read_to_string(root.join("gold/totals.toml"))?
+                        .replace("table = \"totals\"", "table = \"extra\""),
+                )
+            }),
+            ("removed", |root| {
+                std::fs::remove_file(root.join("gold/totals.sql"))?;
+                std::fs::remove_file(root.join("gold/totals.toml"))
+            }),
+        ];
+        for (label, edit) in edits {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            let config = two_pipeline_dag_project(root)?;
+            let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+            edit(root)?;
+
+            let err = apply_dag_plan_as_human(root, &config, &plan_id)
+                .await
+                .expect_err("a human apply of a changed plan must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+                "{label}: {msg}"
+            );
+            assert!(
+                !root.join("proj.duckdb").exists(),
+                "{label}: refused before the warehouse is opened"
+            );
+        }
+        Ok(())
+    }
+
+    /// The other half: an unchanged plain run plan applies for a human, and
+    /// builds its model. The re-check must not refuse a plan whose models
+    /// still match.
+    #[tokio::test]
+    async fn human_apply_of_an_unchanged_plan_proceeds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+
         apply_dag_plan_as_human(root, &config, &plan_id)
             .await
-            .expect("a human-authored --dag plan applies the current models");
+            .expect("an unchanged plan must apply");
+
+        let adapter =
+            rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&root.join("proj.duckdb"))?;
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard.execute_sql("SELECT v FROM proj.marts.totals")?;
+        assert_eq!(rows.rows.len(), 1, "totals materialized");
         Ok(())
     }
 

@@ -58,8 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{FAIL_CLOSED_FLOOR_MARKER, ai_plan_is_reviewed, review_marker_path};
 use crate::commands::approval_scope::{
-    ApprovalScope, CompiledUnit, NoModels, OwnedScopeIdentities, ScopeUnit, approval_scope,
-    scope_fingerprint,
+    ApprovalScope, CompiledUnit, NoModels, ScopeUnit, approval_scope, scope_fingerprint,
 };
 use crate::commands::audit::{blast_radius_union, compile_project_with_schemas, plan_file_path};
 use crate::output::{
@@ -642,17 +641,7 @@ fn verify_current_models_for_approval(
         return Err(stale());
     }
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
-    let binds_mask = config.as_ref().is_some_and(|cfg| {
-        plan.kind != PlanKind::Backfill
-            && !scope.dag
-            && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
-            && (run_plan.run_all || run_plan.models_dir.is_some())
-            && run_plan.model.is_none()
-    });
-    let ids = OwnedScopeIdentities::from_config(
-        config.as_ref(),
-        binds_mask.then_some(run_plan.env.as_deref()),
-    );
+    let ids = super::approval_scope::plan_scope_identities(plan, scope, config.as_ref(), run_plan);
     let actual = scope_fingerprint(scope, units, &ids.borrowed()).map_err(|_| stale())?;
     if actual.as_deref() != Some(expected) {
         return Err(stale());
@@ -995,6 +984,7 @@ pub(crate) const APPROVER_IDENTITY_UNRESOLVED: &str = "approver_identity_unresol
 ///   session source   git identity   -> approver
 ///   http_api         resolved       -> that identity, source HttpApi
 ///   http_api         unresolved     -> Err(approver_identity_unresolved)
+///   http_api         "unknown"      -> Err(approver_identity_unresolved)
 ///   anything else    resolved       -> that identity, source Local
 ///   anything else    unresolved     -> "unknown", source Local (unchanged)
 /// ```
@@ -1012,6 +1002,14 @@ pub(crate) fn review_approver(
     use rocky_core::state::SessionSource;
     match session_source {
         SessionSource::HttpApi => match git_identity {
+            // A git config that literally says `unknown` names nobody either.
+            Ok(identity) if identity.email.trim().eq_ignore_ascii_case("unknown") => bail!(
+                "{APPROVER_IDENTITY_UNRESOLVED}: refusing to approve over the HTTP API because \
+                 the server's git identity is the placeholder `{}`, which names nobody. Set \
+                 `git config --global user.email <addr>` for the user running `rocky serve`, \
+                 or approve in a terminal with `rocky review <plan-id> --approve`.",
+                identity.email.trim()
+            ),
             Ok(identity) => Ok(ApproverIdentity {
                 source: crate::output::ApproverSource::HttpApi,
                 ..identity
@@ -1700,6 +1698,45 @@ mod tests {
             assert_eq!(approver.email, "unknown", "{source:?}");
             assert_eq!(approver.source, ApproverSource::Local, "{source:?}");
         }
+    }
+
+    /// A git config whose email is literally `unknown` (any case, any
+    /// surrounding space) is the placeholder the CLI writes when it has no
+    /// identity. Over the HTTP API it refuses like an unreadable identity;
+    /// the CLI keeps it.
+    #[test]
+    fn review_approver_refuses_a_literal_unknown_email_over_the_http_api() {
+        use rocky_core::state::SessionSource;
+        for email in ["unknown", "Unknown", " UNKNOWN "] {
+            let identity = Ok(ApproverIdentity {
+                email: email.to_string(),
+                name: None,
+                host: "laptop".to_string(),
+                source: ApproverSource::Local,
+            });
+            let err = review_approver(SessionSource::HttpApi, identity)
+                .expect_err("a literal `unknown` email must refuse over the HTTP API");
+            let msg = format!("{err:#}");
+            assert!(msg.starts_with(APPROVER_IDENTITY_UNRESOLVED), "{msg}");
+        }
+        let near_miss = Ok(ApproverIdentity {
+            email: "unknown@example.com".to_string(),
+            name: None,
+            host: "laptop".to_string(),
+            source: ApproverSource::Local,
+        });
+        let approver = review_approver(SessionSource::HttpApi, near_miss).expect("a real address");
+        assert_eq!(approver.email, "unknown@example.com");
+        let cli = Ok(ApproverIdentity {
+            email: "unknown".to_string(),
+            name: None,
+            host: "laptop".to_string(),
+            source: ApproverSource::Local,
+        });
+        assert_eq!(
+            review_approver(SessionSource::Cli, cli).unwrap().email,
+            "unknown"
+        );
     }
 
     /// **The production read.** Under `ROCKY_SESSION_SOURCE=http_api` (what

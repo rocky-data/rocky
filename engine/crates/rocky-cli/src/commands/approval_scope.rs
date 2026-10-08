@@ -419,3 +419,116 @@ pub(crate) fn verify_dag_scope_for_apply(
     }
     Ok(())
 }
+
+/// Whether apply reconciles masks for this plan, so its fingerprint binds the
+/// env-resolved mask. The same predicate plan time computes (`bind_masks` in
+/// `plan.rs`): a Replication pipeline whose model leg runs (`--all` /
+/// `--models`) on a full, `--model`-less, non-`--dag` run. A backfill
+/// reconciles no masks.
+pub(crate) fn plan_binds_mask(
+    plan: &crate::plan_store::PersistedPlan,
+    scope: &ApprovalScope,
+    cfg: Option<&RockyConfig>,
+    run_plan: &RunPlan,
+) -> bool {
+    cfg.is_some_and(|cfg| {
+        plan.kind != crate::plan_store::PlanKind::Backfill
+            && !scope.dag
+            && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
+            && (run_plan.run_all || run_plan.models_dir.is_some())
+            && run_plan.model.is_none()
+    })
+}
+
+/// The identities a plan's scope fingerprint binds: the config's routing,
+/// governance and execution-control identities, plus the mask where
+/// [`plan_binds_mask`] says apply reconciles one. Review and apply both read
+/// this, so the two recompute the fingerprint the same way.
+pub(crate) fn plan_scope_identities(
+    plan: &crate::plan_store::PersistedPlan,
+    scope: &ApprovalScope,
+    cfg: Option<&RockyConfig>,
+    run_plan: &RunPlan,
+) -> OwnedScopeIdentities {
+    let binds_mask = plan_binds_mask(plan, scope, cfg, run_plan);
+    OwnedScopeIdentities::from_config(cfg, binds_mask.then_some(run_plan.env.as_deref()))
+}
+
+/// The stable code `rocky apply` refuses with when the models a plan
+/// fingerprinted no longer match the models on disk. It is in the error text,
+/// so a failed HTTP apply job's `error` carries it.
+pub(crate) const PLAN_MODELS_CHANGED: &str = "plan_models_changed";
+
+/// Apply-time check, for every principal: a plan that carries a models
+/// fingerprint executes only if the models it would run still produce that
+/// fingerprint.
+///
+/// `rocky apply` does not replay stored SQL: `run` recompiles the models on
+/// disk. Before this check, a person's apply ran whatever the models had
+/// become since the plan was made and reviewed; only an agent's apply was
+/// re-checked (inside `run`, through the governed context). This recomputes
+/// the fingerprint with the same scope, compile and identities review uses
+/// before it writes an approval ([`plan_scope_identities`],
+/// [`scope_fingerprint`]), seeded from the plan's reviewed source-schema
+/// snapshot.
+///
+/// A plan with no fingerprint (a legacy plan, or one whose models did not
+/// compile at plan time) is not this check's business: a review-gated apply
+/// already refuses it elsewhere.
+pub(crate) fn verify_plan_models_for_apply(
+    plan: &crate::plan_store::PersistedPlan,
+    plan_id: &str,
+    cfg: Option<&RockyConfig>,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    let capabilities = plan.embedded_capabilities();
+    let Some(expected) = capabilities.models_fingerprint.as_deref() else {
+        return Ok(());
+    };
+    if capabilities.fingerprint_version == 0 {
+        return Ok(());
+    }
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "{PLAN_MODELS_CHANGED}: refusing to apply plan '{plan_id}': models changed since \
+             this plan was made; plan again with `rocky plan` (and review the new plan if it \
+             needs approval). {why}. Apply runs the models on disk, so it re-checks them \
+             against the plan first."
+        )
+    };
+    let source_schemas: HashMap<_, _> = capabilities
+        .reviewed_source_schemas
+        .ok_or_else(|| {
+            refuse("The plan has no reviewed source-schema snapshot to re-check its models with")
+        })?
+        .into_iter()
+        .collect();
+    let scope = if plan.kind == crate::plan_store::PlanKind::Backfill {
+        // A backfill executes its persisted directory, without a glob.
+        ApprovalScope {
+            dag: false,
+            units: vec![ScopeUnit {
+                pipeline: None,
+                models_dir: PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                models_glob: None,
+            }],
+            seeds_dir: None,
+        }
+    } else {
+        approval_scope(cfg, config_path, run_plan)?
+    };
+    let compiled = scope
+        .compile(&source_schemas, NoModels::Empty)
+        .map_err(|e| refuse(&format!("Its models no longer compile ({e:#})")))?;
+    let ids = plan_scope_identities(plan, &scope, cfg, run_plan);
+    let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
+        .map_err(|e| refuse(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
+    if actual.as_deref() != Some(expected) {
+        return Err(refuse(
+            "A model it runs was added, removed or changed, or the config those models run \
+             under changed",
+        ));
+    }
+    Ok(())
+}
