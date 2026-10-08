@@ -134,7 +134,8 @@ fn resolved_poll_interval(
 pub async fn run_serve(
     models_dir: &Path,
     // Whether `models_dir` came from an explicit `--models`, as opposed to the
-    // conventional default. Only `GET /api/v1/dag` distinguishes them; see
+    // conventional default. `GET /api/v1/dag` and the resident compile
+    // distinguish them; see
     // `rocky_server::state::ServerState::models_dir_is_explicit`.
     models_dir_is_explicit: bool,
     contracts_dir: Option<&Path>,
@@ -211,11 +212,19 @@ pub async fn run_serve(
         println!("Rocky UI: {address}");
     }
 
-    // Start filesystem watcher if requested
+    // Start filesystem watcher if requested. Without `--models` the compile
+    // reads every transformation pipeline's own models directory (#2011), so
+    // each of those is watched too.
     let _watcher = if watch {
+        let pipeline_roots = if models_dir_is_explicit {
+            Vec::new()
+        } else {
+            pipeline_model_roots(state.config_path.as_deref())
+        };
         Some(rocky_server::watch::start_watcher(
             state.clone(),
             models_dir,
+            &pipeline_roots,
         )?)
     } else {
         None
@@ -671,6 +680,34 @@ fn build_serve_state(
     ))
 }
 
+/// The models directory of every transformation pipeline that exists now:
+/// the directories `ServerState::recompile` reads without `--models` (#2011).
+///
+/// Read once, when the watcher starts. A config that cannot be read gives no
+/// extra directory; the compile reports that config error itself. A pipeline
+/// added to `rocky.toml` later is compiled, but its directory is only watched
+/// after a restart.
+fn pipeline_model_roots(config_path: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let Some(config_path) = config_path else {
+        return Vec::new();
+    };
+    let Ok(Some(config)) = rocky_core::config::load_optional_project_config(Some(config_path))
+    else {
+        return Vec::new();
+    };
+    config
+        .pipelines
+        .values()
+        .filter_map(|pipeline| pipeline.as_transformation())
+        .filter_map(
+            |tx| match crate::models_loader::locate_models_dir(&tx.models, config_path) {
+                Ok(crate::models_loader::ModelsDir::Present(dir)) => Some(dir),
+                Ok(crate::models_loader::ModelsDir::Absent(_)) | Err(_) => None,
+            },
+        )
+        .collect()
+}
+
 /// `--open` needs `--ui`: without the UI there is no page to open. Checked
 /// before anything binds, like the `--ui` rules, so the refusal names the fix
 /// and costs nothing.
@@ -832,6 +869,33 @@ pub(crate) fn validate_ui_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `serve --watch` without `--models` watches every transformation
+    /// pipeline's existing models directory: the set the compile reads
+    /// (#2011). A missing root and a non-transformation pipeline add nothing.
+    #[test]
+    fn pipeline_model_roots_are_every_transformation_pipelines_existing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("reporting")).unwrap();
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\n\
+             [pipeline.reporting.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.gone]\ntype = \"transformation\"\nmodels = \"gone/**\"\n\n\
+             [pipeline.gone.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let mut roots = pipeline_model_roots(Some(&config));
+        roots.sort();
+        assert_eq!(roots, [root.join("models"), root.join("reporting")]);
+        assert!(pipeline_model_roots(None).is_empty());
+    }
 
     /// `--open` without `--ui` is refused before anything binds, naming the
     /// fix; every other combination passes.
@@ -1343,13 +1407,15 @@ mod tests {
     /// that loads it, as `rocky compile` does. Two pipelines load a merge
     /// model each; only the one on ClickHouse (no upsert, E053) is refused.
     /// Goes through `build_serve_state`, so it also covers the installation of
-    /// the checks, and reads the diagnostics the API serves from.
+    /// the checks, and reads the diagnostics the API serves from. The
+    /// ClickHouse model lives outside `models/`, so it is only compiled, and
+    /// only judged, because the compile reads every pipeline's root (#2011).
     #[tokio::test]
     async fn serve_resolves_per_pipeline_model_targets_like_compile() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let write_merge_model = |sub: &str, name: &str| {
-            let models = root.join("models").join(sub);
+            let models = root.join(sub);
             std::fs::create_dir_all(&models).unwrap();
             std::fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
             std::fs::write(
@@ -1359,14 +1425,14 @@ mod tests {
             )
             .unwrap();
         };
-        write_merge_model("ch", "on_clickhouse");
-        write_merge_model("duck", "on_duckdb");
+        write_merge_model("reporting", "on_clickhouse");
+        write_merge_model("models/duck", "on_duckdb");
         let config = root.join("rocky.toml");
         std::fs::write(
             &config,
             "[adapter.ch]\ntype = \"clickhouse\"\nhost = \"localhost\"\n\n\
              [adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
-             [pipeline.a]\ntype = \"transformation\"\nmodels = \"models/ch/**\"\n\
+             [pipeline.a]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\
              target = { adapter = \"ch\" }\n\n\
              [pipeline.b]\ntype = \"transformation\"\nmodels = \"models/duck/**\"\n\
              target = { adapter = \"local\" }\n",
