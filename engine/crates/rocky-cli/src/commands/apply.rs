@@ -3528,7 +3528,11 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
     // A `${VAR}` connection field must hash by its VALUE, so an env swap that
     // re-routes the apply changes the identity (#1919). Credentials still
     // serialize as "***" inside this scope.
-    rocky_core::env_string::with_env_values_scope(|| config_policy_identity_inner(cfg))
+    //
+    // The result is a blake3 digest, never the JSON itself: plan files store
+    // it, and the JSON holds the resolved `${VAR}` values.
+    let json = rocky_core::env_string::with_env_values_scope(|| config_policy_identity_inner(cfg));
+    blake3::hash(json.as_bytes()).to_hex().to_string()
 }
 
 fn config_policy_identity_inner(cfg: &rocky_core::config::RockyConfig) -> String {
@@ -9907,6 +9911,10 @@ auto_create_schemas = true
         assert_ne!(
             a, b,
             "an env value swap re-routes the apply and must change the identity"
+        );
+        assert!(
+            !a.contains("duckdb") && !b.contains("duckdb"),
+            "the identity is persisted in plan files and must not hold a resolved env value"
         );
     }
 
