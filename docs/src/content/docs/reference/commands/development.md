@@ -396,7 +396,7 @@ rocky serve --ui
 
 With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process read-only token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
 
-A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
+A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. The address is also printed on stdout, so it lands in anything that captures stdout (a terminal log, `docker logs`, a service journal) and in browser history. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
 
 ```bash
 rocky serve --ui --token s3cret --token-scope read-only

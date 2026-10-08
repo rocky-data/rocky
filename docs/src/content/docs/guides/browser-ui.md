@@ -45,7 +45,7 @@ Open that address, or add `--open` to open it in your default browser. The page 
 
 The UI needs a read-only token (a token that can read but not change anything). With no token configured, the server generates a per-process token. It works for every request until the server stops. The server prints a note on stderr when it generates one. Each start makes a new token, so an old address stops working after a restart.
 
-A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself.
+A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. The address is also printed on stdout, so it lands in anything that captures stdout (a terminal log, `docker logs`, a service journal) and in browser history. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself.
 
 To choose the token, or to keep the same token across restarts:
 
