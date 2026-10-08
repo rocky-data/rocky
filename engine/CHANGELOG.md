@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.78.0] — 2026-10-08
+
+Read these first. Each one can change what an existing project does.
+
+- The state store moves to schema v32. An engine at 1.77.0 or older cannot open a v32 store, so there is no downgrade once the state is written. Upgrade every process that shares a state store together. (#2280)
+- A plan written before #2297 must be re-planned. The plan's routing identity is now a hash, so an old plan no longer matches at apply. Run `rocky plan` again. (#2297)
+- An interactive `rocky gc` is gated as an agent. A `deny` or `require_review` rule scoped to agents now also applies to a person who runs `rocky gc`. (#2284)
+- `propose` refuses when the remote ledger is unreachable, under `s3`, `gcs` or `tiered` with a `[policy]` block. It fails closed, and rolls back the draft. (#2282)
+- Nullability inference is more conservative. A `nullable = false` contract can newly fail with `E012`, for a cast that can fail, a cast over an aggregate or scalar call, or a model with a `UNION`, `INTERSECT` or `EXCEPT`. Wrap the expression in `COALESCE`. (#2295, #2299, #2303)
+- `rocky compile --deny-warnings` fails on `W056`: an `incremental` model with no `lookback`. (#2289)
 
 ### Added
 
@@ -45,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rocky emit-sql` runs the per-model-target checks of `rocky compile` (#2286).** It refuses SQL that the pipeline's warehouse cannot run (E042/E043, E044, E049, E051, E053, E054) instead of emitting it.
 
 ### Changed
+
+- **Docs: "production-grade" becomes "GA (live-tested)".** The roadmap page defines the GA and Beta adapter grades. The grade says how well an adapter is tested, not how widely it is used. (#2285)
 
 - **A plan's routing identity is now a blake3 digest, not the config JSON (#1919).** Plan files under `.rocky/plans/` used to hold the resolved values of `${VAR}` connection fields (host, path, account and others) in clear text. They now hold a hash. A plan written before this change no longer matches at apply: re-run `rocky plan`.
 
