@@ -40,11 +40,11 @@ use crate::config::ChConfig;
 #[derive(Debug, Error)]
 pub enum ChError {
     /// The adapter configuration is invalid.
-    #[error("invalid clickhouse configuration: {0}")]
+    #[error("invalid clickhouse configuration: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
 
     /// The request could not be sent or the response could not be read.
-    #[error("clickhouse HTTP transport error: {0}")]
+    #[error("clickhouse HTTP transport error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Transport(#[from] reqwest::Error),
 
     /// The client-side deadline passed. The server may still have run the
@@ -53,7 +53,7 @@ pub enum ChError {
     Timeout { secs: u64 },
 
     /// The server rejected the statement.
-    #[error("clickhouse error{}: {message}", code_suffix(*.code, .name.as_deref(), *.status))]
+    #[error("clickhouse error{}: {}", code_suffix(*.code, .name.as_deref(), *.status), rocky_core::secret_registry::render_placeholders(message))]
     Server {
         /// The `X-ClickHouse-Exception-Code` (e.g. `60` for `UNKNOWN_TABLE`).
         code: Option<i32>,
@@ -65,11 +65,15 @@ pub enum ChError {
     },
 
     /// The response body did not have the expected shape.
-    #[error("clickhouse response could not be decoded: {0}")]
+    #[error("clickhouse response could not be decoded: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Decode(String),
 
     /// `describe_table` found no columns: the table does not exist.
-    #[error("table {database}.{table} does not exist")]
+    #[error(
+        "table {}.{} does not exist",
+        rocky_core::secret_registry::render_placeholders(database),
+        rocky_core::secret_registry::render_placeholders(table)
+    )]
     NotFound { database: String, table: String },
 }
 
@@ -373,6 +377,25 @@ fn normalize_cell(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_text_prints_resolved_var_as_placeholder() {
+        let secret = "ch-1919.internal.example.com";
+        rocky_core::secret_registry::register_substitution("ROCKY_TEST_CH_HOST_1919", secret);
+        let config = ChError::Config(format!("cannot reach {secret}"));
+        let shown = config.to_string();
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("${ROCKY_TEST_CH_HOST_1919}"), "{shown}");
+        let server = ChError::Server {
+            code: Some(516),
+            name: None,
+            status: 401,
+            message: format!("user at {secret} rejected"),
+        };
+        let shown = server.to_string();
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("${ROCKY_TEST_CH_HOST_1919}"), "{shown}");
+    }
 
     #[test]
     fn json_compact_cells_normalize_to_text() {

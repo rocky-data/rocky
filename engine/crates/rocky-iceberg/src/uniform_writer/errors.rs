@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum UniformWriterError {
-    #[error("object store: {0}")]
+    #[error("object store: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ObjectStore(#[from] object_store::Error),
 
     #[error("parquet: {0}")]
@@ -14,13 +14,13 @@ pub enum UniformWriterError {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("io: {0}")]
+    #[error("io: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Io(#[from] std::io::Error),
 
-    #[error("delta log parse: {0}")]
+    #[error("delta log parse: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     DeltaLog(String),
 
-    #[error("sql client: {0}")]
+    #[error("sql client: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Sql(String),
 
     #[error(
@@ -41,7 +41,7 @@ pub enum UniformWriterError {
     )]
     DeletionVectorsUnsupported,
 
-    #[error("retry budget exhausted on conditional log put: {0}")]
+    #[error("retry budget exhausted on conditional log put: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     CondPutRetryExhausted(String),
 
     /// The table's `_delta_log` holds a Delta checkpoint. Rocky's log reader

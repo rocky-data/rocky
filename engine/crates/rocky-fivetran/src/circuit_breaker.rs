@@ -76,10 +76,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CircuitError {
     /// Valkey / Redis transport failure.
-    #[error("circuit valkey: {0}")]
+    #[error("circuit valkey: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Valkey(String),
     /// Misconfigured backend.
-    #[error("circuit config: {0}")]
+    #[error("circuit config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
 }
 

@@ -36,15 +36,18 @@ use tracing::{debug, warn};
 #[derive(Debug, Error)]
 pub enum IcebergError {
     /// Transport-level HTTP error (connection refused, timeout, TLS, etc.).
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
 
     /// Non-success status code from the catalog API.
-    #[error("API error ({status}): {message}")]
+    #[error(
+        "API error ({status}): {}",
+        rocky_core::secret_registry::render_placeholders(message)
+    )]
     Api { status: u16, message: String },
 
     /// Response body could not be parsed into the expected type.
-    #[error("unexpected response format: {0}")]
+    #[error("unexpected response format: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     UnexpectedResponse(String),
 
     /// 429 Too Many Requests after all retries exhausted.
