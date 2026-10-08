@@ -445,6 +445,9 @@ pub const W012: &str = "W012";
 /// (W005) and the warehouse schema cache all came through empty because the
 /// file could not be parsed, not because the project declares nothing.
 ///
+/// `rocky serve` also uses it when the transformation pipelines' models cannot be
+/// loaded and it falls back to `models/` alone (#2011).
+///
 /// Emitted by the long-running surfaces — `rocky lsp` and `rocky serve` —
 /// which stay usable on a broken config by design rather than refusing.
 /// Every one-shot entry point (`rocky lineage`, the MCP tools, `rocky plan`)
