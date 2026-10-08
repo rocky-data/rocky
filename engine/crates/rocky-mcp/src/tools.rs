@@ -4321,8 +4321,9 @@ impl RockyMcpServer {
     /// the same step ([`rocky_cli::commands::evaluate_apply_policy_durable`],
     /// #2282). A row left only in the local file is replaced by the next
     /// `download_state` before review ever reads it. That path is
-    /// fail-closed: an unreachable ledger is an error, and the caller's
-    /// rollback guard removes the draft. The Worker profile never publishes:
+    /// fail-closed: an unreachable ledger is an `Err` carrying the cause, and
+    /// the caller hands its rollback guard to
+    /// [`Self::ledger_unreachable_after_rollback`]. The Worker profile never publishes:
     /// it records locally, and the fulfill loop's `propose` carries the row.
     ///
     /// `prior_classifications` is the pre-image for the dual evaluation
@@ -4333,7 +4334,7 @@ impl RockyMcpServer {
         decision_id: &str,
         marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
         prior_classifications: Option<&std::collections::BTreeMap<String, Vec<String>>>,
-    ) -> Result<rocky_cli::commands::PolicyGate, Json<ToolError>> {
+    ) -> Result<rocky_cli::commands::PolicyGate, String> {
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
                 stem.to_string(),
@@ -4399,13 +4400,34 @@ impl RockyMcpServer {
             None,
         )
         .await
-        .map_err(|e| {
-            ToolError::internal(
-                format!("failed to record the policy decision on the shared state ledger: {e:#}"),
-                "The remote [state] backend must be reachable so the draft's policy decision \
-                 survives to review (fail-closed). The draft was not kept.",
-            )
-        })
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The draft tools' refusal when the shared ledger could not record the
+    /// decision (`Err` from [`Self::evaluate_draft_policy`]). The draft is
+    /// rolled back HERE, through the same [`rollback_disposition`] the deny
+    /// arms use, so the message says what really happened: "not kept" only
+    /// when the rollback succeeded, and the leftover paths otherwise.
+    fn ledger_unreachable_after_rollback(
+        &self,
+        rollback: DraftRollback,
+        cause: &str,
+    ) -> Json<ToolError> {
+        let (disposition, rollback_failed_paths) = rollback_disposition(
+            &self.root,
+            rollback,
+            "The draft was not kept.",
+            "Rolling the draft back FAILED",
+        );
+        ToolError::internal_after_rollback(
+            format!(
+                "failed to record the policy decision on the shared state ledger: {cause}. \
+                 {disposition}"
+            ),
+            "The remote [state] backend must be reachable so the draft's policy decision \
+             survives to review (fail-closed). Retry once it is reachable.",
+            rollback_failed_paths,
+        )
     }
 
     /// Durable freeze-marker LIST for a draft-class gate over `stem` — a
@@ -4672,14 +4694,18 @@ impl RockyMcpServer {
         // STRUCTURAL rather than an artifact of the merge staying correct.
         let prior_classifications_by_model: std::collections::BTreeMap<String, Vec<String>> =
             std::iter::once((paths.stem.clone(), prior_classifications)).collect();
-        let gate = self
+        let gate = match self
             .evaluate_draft_policy(
                 &paths.stem,
                 &decision_id,
                 &marker_freezes,
                 Some(&prior_classifications_by_model),
             )
-            .await?;
+            .await
+        {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
 
         match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
@@ -4846,10 +4872,14 @@ impl RockyMcpServer {
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
-        match self
+        let gate = match self
             .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
-            .await?
+            .await
         {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5032,10 +5062,14 @@ impl RockyMcpServer {
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
-        match self
+        let gate = match self
             .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
-            .await?
+            .await
         {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5274,10 +5308,14 @@ impl RockyMcpServer {
         // classification, not by the pre-patch attribute set.
         let decision_id = format!("draft-metadata:{}", paths.stem);
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
-        match self
+        let gate = match self
             .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
-            .await?
+            .await
         {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop

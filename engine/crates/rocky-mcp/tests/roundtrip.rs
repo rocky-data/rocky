@@ -1871,6 +1871,121 @@ async fn worker_draft_model_never_writes_the_remote_state_ledger() {
     assert!(puts > 0, "the Default profile still publishes its own row");
 }
 
+fn remote_state_key() -> String {
+    format!(
+        "v{}/state.redb",
+        rocky_core::state::current_schema_version()
+    )
+}
+
+/// The Default profile publishes its draft decision. When the ledger cannot
+/// take it (every compare-and-swap attempt conflicts), the draft is removed
+/// and the error says so.
+#[tokio::test]
+async fn default_draft_is_removed_when_the_ledger_cannot_record_it() {
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    harness
+        .faults
+        .arm_precondition_failures(remote_state_key(), 100);
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    write_target_defaults(dir.path());
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "daily_revenue",
+                "SELECT 1 AS id",
+                "a draft the ledger cannot record",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    client.cancel().await.unwrap();
+
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("The draft was not kept."), "{message}");
+    assert!(err.get("rollback_failed_paths").is_none(), "{err:?}");
+    assert!(!dir.path().join("models").join("daily_revenue.sql").exists());
+    assert!(
+        !dir.path()
+            .join("models")
+            .join("daily_revenue.toml")
+            .exists()
+    );
+}
+
+/// #2282 item 4: when the ledger cannot record the decision AND the rollback
+/// fails, the error must not claim the draft "was not kept". It used to
+/// return early with that fixed text while the drop guard only logged the
+/// failed rollback. The models directory goes read-only between the write
+/// and the verdict, so the fresh contract cannot be unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ledger_failure_with_a_failed_rollback_reports_the_leftover() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    harness
+        .faults
+        .arm_precondition_failures(remote_state_key(), 100);
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    drop(rocky_core::state::StateStore::open(&state_path).expect("pre-create the ledger"));
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let models_at_mutation = models.clone();
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        make_models_read_only(&models_at_mutation)
+    })
+    .await;
+    let Some(result) = result else {
+        eprintln!("skipping: a read-only models directory does not block unlink here (root?)");
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("internal"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "{err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("shared state ledger") && message.contains("could not be removed"),
+        "{message}"
+    );
+    assert!(!message.contains("not kept"), "{message}");
+    assert!(
+        !err["remediation_hint"]
+            .as_str()
+            .unwrap()
+            .contains("not kept"),
+        "{err:?}"
+    );
+    drop(restore);
+    assert!(contract.exists(), "the leftover really is on disk");
+}
+
 /// A `require_review` verdict PERSISTS the draft (it is the reviewable artifact,
 /// mirroring the propose gate) and returns a structured `policy_review_required`
 /// signal that routes the agent to human review.
