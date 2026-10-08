@@ -4399,6 +4399,103 @@ mod tests {
         assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
     }
 
+    /// #2307: a column read through a CTE takes the type of the CTE body's
+    /// column, traced to the physical table at the end of the chain.
+    #[test]
+    fn a_cte_column_takes_the_type_of_its_body_column() {
+        for (sql, want, nullable) in [
+            // Shadowed name: the body reads `u.n` (STRING), not source `t`.
+            (
+                "WITH t AS (SELECT n AS x FROM u) SELECT x FROM t",
+                RockyType::String,
+                false,
+            ),
+            // Import CTE: `SELECT *` over the same-named source passes through.
+            (
+                "WITH t AS (SELECT * FROM t) SELECT x FROM t",
+                RockyType::Int32,
+                false,
+            ),
+            (
+                "WITH t AS (SELECT * FROM t) SELECT z FROM t",
+                RockyType::Int32,
+                true,
+            ),
+            // A chain of CTEs traces to the physical table at its end.
+            (
+                "WITH a AS (SELECT n AS x FROM u), b AS (SELECT x AS y FROM a) SELECT y FROM b",
+                RockyType::String,
+                false,
+            ),
+            (
+                "WITH a AS (SELECT * FROM t), b AS (SELECT * FROM a) SELECT z FROM b",
+                RockyType::Int32,
+                true,
+            ),
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_eq!(rows[0].1, want, "{sql}: {rows:?}");
+            assert_eq!(rows[0].2, nullable, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2307: `SELECT *` over an import CTE (`WITH orders AS (SELECT * FROM
+    /// orders)`) expands the upstream model's columns with their types, so a
+    /// `time_column` the upstream projects does not raise E020.
+    #[test]
+    fn a_star_over_an_import_cte_keeps_the_upstream_columns_and_types() {
+        let ti = make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders \
+             WHERE ts >= @start_date AND ts < @end_date",
+        );
+        let models = vec![
+            make_model("orders", "SELECT id, ts FROM source.raw.base"),
+            ti,
+        ];
+        let project = Project::from_models(models).unwrap();
+        let external = HashMap::from([(
+            "source.raw.base".to_string(),
+            vec![
+                rocky_ir::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                },
+                rocky_ir::ColumnInfo {
+                    name: "ts".to_string(),
+                    data_type: "DATE".to_string(),
+                    nullable: false,
+                },
+            ],
+        )]);
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let typed_sources = HashMap::from([(
+            "source.raw.base".to_string(),
+            source_schema(&[
+                ("id", RockyType::Int64, false),
+                ("ts", RockyType::Date, false),
+            ]),
+        )]);
+        let result =
+            typecheck_project_with_models(&graph, &typed_sources, None, &project.models, None);
+        let ti_cols = &result.typed_models["ti"];
+        let ts = ti_cols.iter().find(|c| c.name == "ts");
+        assert_eq!(
+            ts.map(|c| &c.data_type),
+            Some(&RockyType::Date),
+            "{ti_cols:?}"
+        );
+        assert!(ti_cols.iter().any(|c| c.name == "id"), "{ti_cols:?}");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
     /// #2303: a set operation is typed by combining its branches by
     /// position. A column is non-null only when it is non-null in every branch.
     #[test]

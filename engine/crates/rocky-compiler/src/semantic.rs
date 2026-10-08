@@ -402,18 +402,6 @@ pub fn build_semantic_graph(
             .filter_map(|t| t.alias.as_ref().map(|a| (a.clone(), t.name.clone())))
             .collect();
 
-        // Names this query binds with a `WITH` clause (#2307). A CTE shadows a
-        // source or model of the same name, so a column read through it is the
-        // CTE's own column. The edge to the same-named object would hand the
-        // column that object's type, so no edge is made: the column keeps no
-        // upstream type (`Unknown`) until the expression inference sets one.
-        let cte_names: std::collections::HashSet<&str> = lineage_result
-            .source_tables
-            .iter()
-            .filter(|t| t.binding == lineage::TableBinding::Cte)
-            .map(|t| t.name.as_str())
-            .collect();
-
         // Row-selection edges: a reference whose table could not be
         // determined statically (an unqualified column in a join) is dropped,
         // as value lineage does. Dedup is per model (alias resolution can fold
@@ -425,9 +413,6 @@ pub fn build_semantic_graph(
                 continue;
             };
             let source_name = alias_to_table.get(table).unwrap_or(table);
-            if cte_names.contains(source_name.as_str()) {
-                continue;
-            }
             let edge = RowSelectionEdge {
                 source: QualifiedColumn {
                     model: Arc::from(source_name.as_str()),
@@ -461,9 +446,10 @@ pub fn build_semantic_graph(
                 alias_to_table.get(t).cloned().or(Some(t.clone()))
             });
 
-            if let Some(ref source_name) = source_table
-                && !cte_names.contains(source_name.as_str())
-            {
+            // A read through a CTE already names the CTE body's physical
+            // origin, or no table at all: lineage never leaves a CTE's name
+            // here for a same-named source or model to capture (#2307).
+            if let Some(ref source_name) = source_table {
                 edges.push(LineageEdge {
                     source: QualifiedColumn {
                         model: Arc::from(source_name.as_str()),
@@ -481,9 +467,74 @@ pub fn build_semantic_graph(
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star {
             for table_ref in &lineage_result.source_tables {
-                // A star over a CTE returns the CTE's columns, not those of a
-                // source or model that shares its name (#2307).
+                // A star over a CTE returns the CTE body's columns, never
+                // those of a source or model that shares its name (#2307).
+                // Lineage has already traced each body column to its physical
+                // origin, and a body that is itself an unresolved `SELECT *`
+                // lists the physical tables it passes through.
                 if table_ref.binding == lineage::TableBinding::Cte {
+                    for col in &table_ref.cte_columns {
+                        if !output_names.insert(col.target_column.clone()) {
+                            continue;
+                        }
+                        output_columns.push(ColumnDef {
+                            name: col.target_column.clone(),
+                        });
+                        if let Some(source) = &col.source_table {
+                            edges.push(LineageEdge {
+                                source: QualifiedColumn {
+                                    model: Arc::from(source.as_str()),
+                                    column: Arc::from(col.source_column.as_str()),
+                                },
+                                target: QualifiedColumn {
+                                    model: model_name_arc.clone(),
+                                    column: Arc::from(col.target_column.as_str()),
+                                },
+                                transform: col.transform.clone(),
+                            });
+                        }
+                    }
+                    for inner_name in &table_ref.derived_sources {
+                        // Same #1631 rule as a direct star: a model's columns
+                        // only when the reader depends on that model.
+                        let reader_depends_on_it = upstream_map
+                            .get(model_name.as_str())
+                            .is_some_and(|deps| deps.iter().any(|dep| dep == inner_name));
+                        let inner_columns: Vec<&str> = if let Some(upstream_schema) = models
+                            .get(inner_name.as_str())
+                            .filter(|_| reader_depends_on_it)
+                        {
+                            upstream_schema
+                                .columns
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect()
+                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                            source_cols.iter().map(|c| c.name.as_str()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let inner_arc: Arc<str> = Arc::from(inner_name.as_str());
+                        for name in inner_columns {
+                            if output_names.insert(name.to_string()) {
+                                let col_arc: Arc<str> = Arc::from(name);
+                                output_columns.push(ColumnDef {
+                                    name: name.to_string(),
+                                });
+                                edges.push(LineageEdge {
+                                    source: QualifiedColumn {
+                                        model: inner_arc.clone(),
+                                        column: col_arc.clone(),
+                                    },
+                                    target: QualifiedColumn {
+                                        model: model_name_arc.clone(),
+                                        column: col_arc,
+                                    },
+                                    transform: TransformKind::Direct,
+                                });
+                            }
+                        }
+                    }
                     continue;
                 }
                 let table_name = &table_ref.name;

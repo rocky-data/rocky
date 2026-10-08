@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use std::ops::ControlFlow;
@@ -207,6 +208,11 @@ pub struct LineageResult {
     /// `#[serde(default)]` keeps a cache written by an older build loadable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_selection: Vec<RowSelectionLineage>,
+    /// Where each entry of [`Self::columns`] really comes from, by position:
+    /// a physical table and column, or `None` when unknown. Built during
+    /// extraction to resolve reads through a CTE (#2307); not serialized.
+    #[serde(skip)]
+    column_origins: Vec<Option<ColumnOrigin>>,
 }
 
 /// What a name in a `FROM`/`JOIN` position actually refers to.
@@ -260,6 +266,13 @@ pub struct TableReference {
     /// and for derived tables that already resolved their columns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_sources: Vec<String>,
+    /// For a [`TableBinding::Cte`] reference: the CTE body's output columns,
+    /// each named by `target_column` and traced to the physical table and
+    /// column it comes from (`source_table = None` when unknown). A CTE body
+    /// that is an unresolved `SELECT *` lists its physical tables in
+    /// [`Self::derived_sources`] instead (#2307).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cte_columns: Vec<ColumnLineage>,
 }
 
 /// Extracts the names of tables referenced in FROM/JOIN clauses.
@@ -306,29 +319,229 @@ pub fn extract_lineage(sql: &str) -> Result<LineageResult, String> {
     }
 }
 
-/// The CTE names visible at a point in the walk, folded to lower case.
+/// The CTE names visible at a point in the walk, folded to lower case, each
+/// with what its body resolves to.
 ///
 /// SQL scoping nests inward: a name bound by an outer query's `WITH` is
-/// visible inside that query's subqueries, so the set is passed down. It never
+/// visible inside that query's subqueries, so the map is passed down. It never
 /// travels back up — a CTE bound inside a subquery is invisible outside it.
-type CteScope = HashSet<String>;
-
-/// Every name `query`'s own `WITH` clause binds, added to those already
-/// visible. This is the set the query's MAIN BODY sees: all of them.
 ///
-/// The bodies need a narrower set — see [`walk_cte_bodies`].
-fn bind_cte_names(query: &Query, outer: &CteScope) -> CteScope {
-    let mut scope = outer.clone();
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            scope.insert(cte.alias.name.value.to_lowercase());
+/// The value is `None` when the body cannot be read: a recursive CTE's
+/// reference to itself, or a body the extractor refuses.
+type CteScope = HashMap<String, Option<Arc<CteBody>>>;
+
+/// Where one output column really comes from: a physical table, a column of
+/// it, and how the value is transformed on the way.
+type ColumnOrigin = (String, String, TransformKind);
+
+/// What a `WITH` body produces, resolved down to physical tables (#2307).
+///
+/// A reference to a CTE takes its columns and their lineage from here, the
+/// way a derived table takes them from its subquery. A body that reads an
+/// earlier CTE was resolved when that body was walked, so a chain of CTEs
+/// traces to the physical tables at its end.
+#[derive(Debug, Default)]
+struct CteBody {
+    /// Output columns by name, with their origin when it is known.
+    columns: Vec<(String, Option<ColumnOrigin>)>,
+    /// Physical tables an unresolved `SELECT *` in the body reads. Empty when
+    /// the body has no star.
+    star_sources: Vec<String>,
+}
+
+impl CteBody {
+    fn from_result(result: &LineageResult, ctes: &CteScope) -> Self {
+        let mut body = CteBody::default();
+        for (i, col) in result.columns.iter().enumerate() {
+            let origin = result.column_origins.get(i).cloned().flatten();
+            body.columns.push((col.target_column.clone(), origin));
+        }
+        if result.has_star {
+            for t in &result.source_tables {
+                match t.binding {
+                    TableBinding::Cte => {
+                        let Some(Some(inner)) = ctes.get(&t.name.to_lowercase()) else {
+                            continue;
+                        };
+                        for (name, origin) in &inner.columns {
+                            if !body.has_column(name) {
+                                body.columns.push((name.clone(), origin.clone()));
+                            }
+                        }
+                        body.star_sources.extend(inner.star_sources.iter().cloned());
+                    }
+                    TableBinding::Physical if t.name == "(subquery)" => {
+                        for name in t.derived_columns.iter().flatten() {
+                            if !body.has_column(name) {
+                                body.columns.push((name.clone(), None));
+                            }
+                        }
+                        body.star_sources.extend(t.derived_sources.iter().cloned());
+                    }
+                    TableBinding::Physical => body.star_sources.push(t.name.clone()),
+                }
+            }
+            body.star_sources.dedup();
+        }
+        body
+    }
+
+    fn has_column(&self, name: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+    }
+
+    /// The origin of `column` read from this CTE. A column the body does not
+    /// list passes through its `SELECT *` only when exactly one table feeds
+    /// the star; with several, the owner is unknown.
+    fn origin_of(&self, column: &str) -> Option<ColumnOrigin> {
+        if let Some((_, origin)) = self
+            .columns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(column))
+        {
+            return origin.clone();
+        }
+        match self.star_sources.as_slice() {
+            [only] => Some((only.clone(), column.to_string(), TransformKind::Direct)),
+            _ => None,
         }
     }
-    scope
+}
+
+/// The transform of an outer read over an inner one. A plain read keeps what
+/// the inner column did; a fallible inner cast stays fallible under a cast.
+fn compose_transform(outer: &TransformKind, inner: &TransformKind) -> TransformKind {
+    match (outer, inner) {
+        (TransformKind::Direct, inner) => inner.clone(),
+        (TransformKind::Cast, TransformKind::TryCast) => TransformKind::TryCast,
+        (outer, _) => outer.clone(),
+    }
+}
+
+/// The relation a column reference names: by alias first, then by name.
+fn find_relation<'a>(
+    table: &str,
+    source_tables: &'a [TableReference],
+) -> Option<&'a TableReference> {
+    source_tables
+        .iter()
+        .find(|t| {
+            t.alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(table))
+        })
+        .or_else(|| {
+            source_tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table))
+        })
+}
+
+/// How a read of `table.column` resolves when `table` may be a CTE.
+enum CteRead {
+    /// `table` is not a CTE: the read stays as it is.
+    NotCte,
+    /// The read goes through a CTE to this physical origin.
+    Origin(ColumnOrigin),
+    /// The read goes through a CTE whose column origin is unknown.
+    Unknown,
+}
+
+fn read_through_cte(
+    table: &str,
+    column: &str,
+    source_tables: &[TableReference],
+    ctes: &CteScope,
+) -> CteRead {
+    let Some(relation) = find_relation(table, source_tables) else {
+        return CteRead::NotCte;
+    };
+    match relation.binding {
+        TableBinding::Physical => CteRead::NotCte,
+        TableBinding::Cte => match ctes.get(&relation.name.to_lowercase()) {
+            Some(Some(body)) => body
+                .origin_of(column)
+                .map_or(CteRead::Unknown, CteRead::Origin),
+            Some(None) | None => CteRead::Unknown,
+        },
+    }
+}
+
+/// Rewrite a row-selection edge that reads through a CTE so it names the
+/// CTE body's physical origin, or no table when that is unknown.
+fn resolve_row_selection(
+    rs: &mut RowSelectionLineage,
+    source_tables: &[TableReference],
+    ctes: &CteScope,
+) {
+    let Some(table) = rs.source_table.clone() else {
+        return;
+    };
+    match read_through_cte(&table, &rs.source_column, source_tables, ctes) {
+        CteRead::NotCte => {}
+        CteRead::Origin((t, c, _)) => {
+            rs.source_table = Some(t);
+            rs.source_column = c;
+        }
+        CteRead::Unknown => rs.source_table = None,
+    }
+}
+
+/// Rewrite every column and row-selection entry of one `SELECT` that reads
+/// through a CTE so it names the CTE body's physical origin, or no table when
+/// that is unknown (#2307). A CTE named like a source shadows it, so an entry
+/// must never keep the CTE's name: a consumer would bind it to the same-named
+/// object and take that object's types.
+///
+/// Also records each column's origin for [`CteBody::from_result`]. Runs once
+/// per `SELECT`: a rewritten entry names a physical table that a CTE in the
+/// same scope may shadow, so resolving it again would be wrong.
+fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
+    let mut origins = Vec::with_capacity(result.columns.len());
+    for col in &mut result.columns {
+        let Some(table) = col.source_table.clone() else {
+            origins.push(None);
+            continue;
+        };
+        match read_through_cte(&table, &col.source_column, &result.source_tables, ctes) {
+            CteRead::NotCte => {
+                let origin = match find_relation(&table, &result.source_tables) {
+                    Some(t) if t.name == "(subquery)" => None,
+                    Some(t) => Some((
+                        t.name.clone(),
+                        col.source_column.clone(),
+                        col.transform.clone(),
+                    )),
+                    None => Some((table, col.source_column.clone(), col.transform.clone())),
+                };
+                origins.push(origin);
+            }
+            CteRead::Origin((t, c, inner)) => {
+                col.transform = compose_transform(&col.transform, &inner);
+                col.source_table = Some(t.clone());
+                col.source_column = c.clone();
+                origins.push(Some((t, c, col.transform.clone())));
+            }
+            CteRead::Unknown => {
+                col.source_table = None;
+                origins.push(None);
+            }
+        }
+    }
+    result.column_origins = origins;
+    let source_tables = &result.source_tables;
+    for rs in &mut result.row_selection {
+        resolve_row_selection(rs, source_tables, ctes);
+    }
+    let mut seen = HashSet::new();
+    result.row_selection.retain(|rs| seen.insert(rs.clone()));
 }
 
 /// The real table names read inside `query`'s own `WITH` bodies, in clause
-/// order, with `WITH`-bound names removed.
+/// order, with `WITH`-bound names removed; and the scope `query`'s main body
+/// sees: the outer CTEs plus every CTE this clause binds, with its body.
 ///
 /// **Binding is incremental, and that is the whole point.** Inside CTE *i*,
 /// only CTEs 1..*i*-1 are visible — plus *i* itself when the clause is
@@ -341,9 +554,9 @@ fn bind_cte_names(query: &Query, outer: &CteScope) -> CteScope {
 ///      orders AS (SELECT 1)            -- the CTE, defined AFTER
 /// SELECT * FROM a
 /// ```
-fn walk_cte_bodies(query: &Query, outer: &CteScope) -> Vec<String> {
+fn walk_cte_bodies(query: &Query, outer: &CteScope) -> (Vec<String>, CteScope) {
     let Some(with) = &query.with else {
-        return Vec::new();
+        return (Vec::new(), outer.clone());
     };
     let mut visible = outer.clone();
     let mut found = Vec::new();
@@ -351,14 +564,18 @@ fn walk_cte_bodies(query: &Query, outer: &CteScope) -> Vec<String> {
         let own_name = cte.alias.name.value.to_lowercase();
         let mut body_scope = visible.clone();
         if with.recursive {
-            body_scope.insert(own_name.clone());
+            body_scope.insert(own_name.clone(), None);
         }
-        if let Ok(inner) = extract_query_lineage(&cte.query, &body_scope) {
-            collect_nested(&inner, &mut found);
-        }
-        visible.insert(own_name);
+        let body = match extract_query_lineage(&cte.query, &body_scope) {
+            Ok(inner) => {
+                collect_nested(&inner, &mut found);
+                Some(Arc::new(CteBody::from_result(&inner, &body_scope)))
+            }
+            Err(_) => None,
+        };
+        visible.insert(own_name, body);
     }
-    found
+    (found, visible)
 }
 
 /// Fold one inner query's reads into a nested-source list.
@@ -376,12 +593,12 @@ fn collect_nested(inner: &LineageResult, out: &mut Vec<String>) {
 }
 
 fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<LineageResult, String> {
-    let ctes = bind_cte_names(query, outer_ctes);
-    let nested_sources = walk_cte_bodies(query, outer_ctes);
+    let (nested_sources, ctes) = walk_cte_bodies(query, outer_ctes);
     let mut result = extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)?;
     if let SetExpr::Select(select) = query.body.as_ref() {
         let edges = extract_order_limit(query, select, &result.source_tables);
-        for edge in edges {
+        for mut edge in edges {
+            resolve_row_selection(&mut edge, &result.source_tables, &ctes);
             if !result.row_selection.contains(&edge) {
                 result.row_selection.push(edge);
             }
@@ -471,14 +688,17 @@ fn extract_set_expr_lineage(
                 extract_select_columns(&select.projection, &alias_map, &source_tables);
             let row_selection = extract_row_selection(select, &alias_map, &source_tables);
 
-            Ok(LineageResult {
+            let mut result = LineageResult {
                 source_tables,
                 columns,
                 has_star,
                 unresolved_projections,
                 nested_sources,
                 row_selection,
-            })
+                column_origins: Vec::new(),
+            };
+            resolve_through_ctes(&mut result, ctes);
+            Ok(result)
         }
         SetExpr::Query(inner) => {
             let mut result = extract_query_lineage(inner, ctes)?;
@@ -535,17 +755,45 @@ fn extract_table_factor(
             // A CTE reference is always a single unqualified name, so a
             // multi-part read can never be one — checking the whole spelling
             // is what keeps `v2.orders` from being shadowed by a CTE `orders`.
-            let binding = if ctes.contains(&name.to_lowercase()) {
+            let cte = ctes.get(&name.to_lowercase());
+            let binding = if cte.is_some() {
                 TableBinding::Cte
             } else {
                 TableBinding::Physical
             };
+            let body = cte.cloned().flatten();
+            let cte_columns = body
+                .as_ref()
+                .map(|body| {
+                    body.columns
+                        .iter()
+                        .map(|(target, origin)| match origin {
+                            Some((table, column, transform)) => ColumnLineage {
+                                source_table: Some(table.clone()),
+                                source_column: column.clone(),
+                                target_column: target.clone(),
+                                transform: transform.clone(),
+                            },
+                            None => ColumnLineage {
+                                source_table: None,
+                                source_column: target.clone(),
+                                target_column: target.clone(),
+                                transform: TransformKind::Direct,
+                            },
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let derived_sources = body
+                .map(|body| body.star_sources.clone())
+                .unwrap_or_default();
             tables.push(TableReference {
                 name,
                 alias: alias.as_ref().map(|a| a.name.value.clone()),
                 binding,
                 derived_columns: None,
-                derived_sources: Vec::new(),
+                derived_sources,
+                cte_columns,
             });
         }
         TableFactor::Derived {
@@ -597,6 +845,7 @@ fn extract_table_factor(
                 binding: TableBinding::Physical,
                 derived_columns,
                 derived_sources,
+                cte_columns: Vec::new(),
             });
         }
         _ => {}
@@ -1669,6 +1918,91 @@ mod tests {
     /// #1892: a `WITH`-bound name looks exactly like a table read, and a
     /// consumer that cannot tell them apart derives an edge to a model that
     /// the query never reads.
+    fn origin(sql: &str) -> Vec<(Option<String>, String, String)> {
+        extract_lineage(sql)
+            .unwrap()
+            .columns
+            .into_iter()
+            .map(|c| (c.source_table, c.source_column, c.target_column))
+            .collect()
+    }
+
+    /// #2307: a column read through a CTE names the CTE body's physical
+    /// origin, never the CTE's own name (which a same-named source would
+    /// capture).
+    #[test]
+    fn a_cte_column_traces_to_its_bodys_origin() {
+        let some = |t: &str, c: &str, x: &str| (Some(t.to_string()), c.to_string(), x.to_string());
+        // Shadowed name.
+        assert_eq!(
+            origin("WITH t AS (SELECT n AS x FROM u) SELECT x FROM t"),
+            vec![some("u", "n", "x")]
+        );
+        assert_eq!(
+            origin("WITH t AS (SELECT n AS x FROM u) SELECT a.x FROM t AS a"),
+            vec![some("u", "n", "x")]
+        );
+        // Import CTE: the star passes the same-named physical table through.
+        assert_eq!(
+            origin("WITH orders AS (SELECT * FROM orders) SELECT id FROM orders"),
+            vec![some("orders", "id", "id")]
+        );
+        // A chain of CTEs, by column and by star.
+        assert_eq!(
+            origin(
+                "WITH a AS (SELECT n AS x FROM u AS uu), b AS (SELECT x AS y FROM a) SELECT y FROM b"
+            ),
+            vec![some("u", "n", "y")]
+        );
+        assert_eq!(
+            origin("WITH a AS (SELECT * FROM raw.o), b AS (SELECT * FROM a) SELECT id FROM b"),
+            vec![some("raw.o", "id", "id")]
+        );
+        // A star over two tables cannot tell which one owns the column.
+        assert_eq!(
+            origin("WITH c AS (SELECT * FROM p, q) SELECT id FROM c"),
+            vec![(None, "id".to_string(), "id".to_string())]
+        );
+        // A transform in the body carries through a plain outer read.
+        let r =
+            extract_lineage("WITH c AS (SELECT TRY_CAST(n AS INT) AS x FROM u) SELECT x FROM c")
+                .unwrap();
+        assert_eq!(r.columns[0].transform, TransformKind::TryCast);
+    }
+
+    /// #2307: a CTE reference carries the body's traced columns, and an import
+    /// CTE's star lists the physical table it passes through.
+    #[test]
+    fn a_cte_reference_carries_its_bodys_columns() {
+        let r = extract_lineage("WITH c AS (SELECT n AS x FROM u) SELECT * FROM c").unwrap();
+        let c = &r.source_tables[0].cte_columns;
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].source_table.as_deref(), Some("u"));
+        assert_eq!(c[0].source_column, "n");
+        assert_eq!(c[0].target_column, "x");
+        let r =
+            extract_lineage("WITH orders AS (SELECT * FROM orders) SELECT * FROM orders").unwrap();
+        assert_eq!(r.source_tables[0].binding, TableBinding::Cte);
+        assert_eq!(
+            r.source_tables[0].derived_sources,
+            vec!["orders".to_string()]
+        );
+    }
+
+    /// #2307: a row-selection edge through a CTE names the body's origin.
+    #[test]
+    fn a_row_selection_edge_through_a_cte_names_the_bodys_origin() {
+        let r = extract_lineage("WITH c AS (SELECT n AS x FROM u) SELECT x FROM c WHERE x > 1")
+            .unwrap();
+        let filter = r
+            .row_selection
+            .iter()
+            .find(|rs| rs.kind == RowSelectionKind::Filter)
+            .unwrap();
+        assert_eq!(filter.source_table.as_deref(), Some("u"));
+        assert_eq!(filter.source_column, "n");
+    }
+
     #[test]
     fn a_cte_reference_is_not_a_table_read() {
         let result =
