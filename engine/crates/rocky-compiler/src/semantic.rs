@@ -402,6 +402,18 @@ pub fn build_semantic_graph(
             .filter_map(|t| t.alias.as_ref().map(|a| (a.clone(), t.name.clone())))
             .collect();
 
+        // Names this query binds with a `WITH` clause (#2307). A CTE shadows a
+        // source or model of the same name, so a column read through it is the
+        // CTE's own column. The edge to the same-named object would hand the
+        // column that object's type, so no edge is made: the column keeps no
+        // upstream type (`Unknown`) until the expression inference sets one.
+        let cte_names: std::collections::HashSet<&str> = lineage_result
+            .source_tables
+            .iter()
+            .filter(|t| t.binding == lineage::TableBinding::Cte)
+            .map(|t| t.name.as_str())
+            .collect();
+
         // Row-selection edges: a reference whose table could not be
         // determined statically (an unqualified column in a join) is dropped,
         // as value lineage does. Dedup is per model (alias resolution can fold
@@ -413,6 +425,9 @@ pub fn build_semantic_graph(
                 continue;
             };
             let source_name = alias_to_table.get(table).unwrap_or(table);
+            if cte_names.contains(source_name.as_str()) {
+                continue;
+            }
             let edge = RowSelectionEdge {
                 source: QualifiedColumn {
                     model: Arc::from(source_name.as_str()),
@@ -446,7 +461,9 @@ pub fn build_semantic_graph(
                 alias_to_table.get(t).cloned().or(Some(t.clone()))
             });
 
-            if let Some(ref source_name) = source_table {
+            if let Some(ref source_name) = source_table
+                && !cte_names.contains(source_name.as_str())
+            {
                 edges.push(LineageEdge {
                     source: QualifiedColumn {
                         model: Arc::from(source_name.as_str()),
@@ -464,6 +481,11 @@ pub fn build_semantic_graph(
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star {
             for table_ref in &lineage_result.source_tables {
+                // A star over a CTE returns the CTE's columns, not those of a
+                // source or model that shares its name (#2307).
+                if table_ref.binding == lineage::TableBinding::Cte {
+                    continue;
+                }
                 let table_name = &table_ref.name;
                 let table_name_arc: Arc<str> = Arc::from(table_name.as_str());
                 // A star takes a model's columns only when the reader actually
@@ -889,6 +911,29 @@ mod tests {
             !names.contains(&"model_only_col"),
             "the shadowed model's columns are not what the query returns: {names:?}"
         );
+    }
+
+    /// #2307: the same shadowing for a source. A star over a CTE must not take
+    /// the columns of an external source that shares the CTE's name.
+    #[test]
+    fn a_star_over_a_cte_does_not_take_the_shadowed_sources_columns() {
+        let models = vec![make_model(
+            "reader",
+            "WITH t AS (SELECT 1 AS cte_only_col) SELECT * FROM t",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let sources = HashMap::from([(
+            "t".to_string(),
+            vec![ColumnInfo {
+                name: "source_only_col".to_string(),
+                data_type: "INT".to_string(),
+                nullable: true,
+            }],
+        )]);
+        let graph = build_semantic_graph(&project, &sources).unwrap();
+        let reader = graph.model_schema("reader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(!names.contains(&"source_only_col"), "{names:?}");
     }
 
     /// The expansion must not depend on which model the topological walk
