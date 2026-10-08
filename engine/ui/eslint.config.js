@@ -32,7 +32,34 @@ export default tseslint.config(
           message: "render API values as text; the UI carries no HTML from the engine",
         },
         {
+          selector:
+            "AssignmentExpression[left.type='MemberExpression'][left.property.value=/^(innerHTML|outerHTML|srcdoc)$/]",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector: "AssignmentExpression[left.type='MemberExpression'][left.property.name='srcdoc']",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
           selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='document'][callee.property.name=/^(write|writeln)$/]",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector: "CallExpression[callee.property.name='createContextualFragment']",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector: "JSXAttribute[name.name=/^src[dD]oc$/]",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector:
+            "CallExpression[callee.property.name='setAttribute'][arguments.0.value=/^srcdoc$/i]",
           message: "render API values as text; the UI carries no HTML from the engine",
         },
       ],

@@ -3409,7 +3409,13 @@ async fn execute_job_subprocess(
 
     // The canonical output is emitted on stdout; embed it verbatim when parseable.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    let mut result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    // The UI shows each `errors[].error` as a failure line. Clean them here,
+    // like `error`, so the response never carries a secret, an absolute path
+    // or a backtrace the browser would display.
+    if let Some(result) = result.as_mut() {
+        sanitize_result_errors(result);
+    }
 
     if output.status.success() {
         (JobState::Succeeded, result, None)
@@ -3423,39 +3429,144 @@ async fn execute_job_subprocess(
     }
 }
 
-/// The most a failed job's `error` carries, in bytes.
-const JOB_ERROR_MAX_BYTES: usize = 4_000;
+/// The most a failed job's `error` (and each `errors[].error`) carries, in
+/// bytes, before the trailing `…`.
+const JOB_ERROR_MAX_BYTES: usize = 1_500;
 
 /// The part of a failed child's stderr a reader acts on.
 ///
 /// A child run with `RUST_LOG` set writes tracing lines to stderr: JSON
 /// objects, or `fmt` lines that start with a timestamp or a level. Those can
-/// carry SQL and local file paths, and they bury the error. They are dropped.
-/// Of what is left, the error is the final `Error:` line and what follows it
-/// (anyhow's `Caused by:` chain); without one, the last ten lines. The result
-/// is capped at [`JOB_ERROR_MAX_BYTES`]. `None` when nothing is left.
+/// carry SQL and local file paths, and they bury the error. They are dropped,
+/// and so are indented backtrace lines (`  at …`, `  with …`). Of what is
+/// left, the error is the final `Error:` line and what follows it (anyhow's
+/// `Caused by:` chain); without one, the last ten lines that name no
+/// absolute path. The text then goes through [`sanitize_job_text`]. `None`
+/// when nothing is left.
 fn concise_job_error(stderr: &str) -> Option<String> {
     let lines: Vec<&str> = stderr
         .lines()
-        .filter(|line| !is_tracing_line(line))
+        .filter(|line| !is_tracing_line(line) && !is_backtrace_line(line))
         .collect();
-    let start = lines
-        .iter()
-        .rposition(|line| line.starts_with("Error:"))
-        .unwrap_or(lines.len().saturating_sub(10));
-    let text = lines[start..].join("\n");
+    let text = match lines.iter().rposition(|line| line.starts_with("Error:")) {
+        Some(start) => lines[start..].join("\n"),
+        None => {
+            let kept: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| !contains_absolute_path(line))
+                .collect();
+            kept[kept.len().saturating_sub(10)..].join("\n")
+        }
+    };
+    let text = sanitize_job_text(&text);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Clean one job message for the browser: drop backtrace lines, drop the
+/// source location from a panic line, redact registered secrets and absolute
+/// filesystem paths, and cap the length at [`JOB_ERROR_MAX_BYTES`].
+fn sanitize_job_text(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|line| !is_backtrace_line(line))
+        .map(strip_panic_location)
+        .collect();
+    let text = lines.join("\n");
+    let text = redact_absolute_paths(&crate::secret_filter::redact(text.trim()));
     let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
     if text.len() <= JOB_ERROR_MAX_BYTES {
-        return Some(text.to_string());
+        return text.to_string();
     }
     let mut cut = JOB_ERROR_MAX_BYTES;
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    Some(format!("{}…", &text[..cut]))
+    crate::secret_filter::redact_truncated_tail(&format!("{}…", &text[..cut]))
+}
+
+/// Run every `errors[].error` string of a job result through
+/// [`sanitize_job_text`]. Other fields are left as they are.
+fn sanitize_result_errors(result: &mut serde_json::Value) {
+    let Some(errors) = result
+        .get_mut("errors")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in errors {
+        if let Some(error) = entry.get_mut("error")
+            && let Some(text) = error.as_str()
+        {
+            *error = serde_json::Value::String(sanitize_job_text(text));
+        }
+    }
+}
+
+/// An indented backtrace or context line: `  at <path>` or `  with <value>`.
+fn is_backtrace_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.len() < line.len() && (trimmed.starts_with("at ") || trimmed.starts_with("with "))
+}
+
+/// `thread 'main' panicked at src/x.rs:1:2:` keeps `thread 'main' panicked:`.
+/// The location names a source file, which tells the reader nothing.
+fn strip_panic_location(line: &str) -> String {
+    match line.find(" panicked at ") {
+        Some(at) => format!("{} panicked:", &line[..at]),
+        None => line.to_string(),
+    }
+}
+
+/// Characters a path token may follow and still count as absolute.
+fn opens_path_token(prev: Option<char>) -> bool {
+    prev.is_none_or(|c| c.is_whitespace() || "'\"`([{<=,;".contains(c))
+}
+
+/// Characters that end a path token.
+fn closes_path_token(c: char) -> bool {
+    c.is_whitespace() || "'\"`)]}>,;".contains(c)
+}
+
+/// The byte length of an absolute path starting at `rest`, or `None`: a Unix
+/// path (`/x…`), a home path (`~/x…`) or a Windows path (`C:\x…`).
+fn absolute_path_at(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let starts = match bytes {
+        [b'/', next, ..] => !next.is_ascii_whitespace() && *next != b'/',
+        [b'~', b'/', ..] => true,
+        [letter, b':', b'\\', ..] => letter.is_ascii_alphabetic(),
+        _ => false,
+    };
+    starts.then(|| rest.find(closes_path_token).unwrap_or(rest.len()))
+}
+
+fn contains_absolute_path(line: &str) -> bool {
+    redact_absolute_paths(line) != line
+}
+
+/// Replace every absolute filesystem path in `text` with `<path>`. A URL's
+/// `//host/x` is not a path: its slashes follow `:` or a host character.
+fn redact_absolute_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if opens_path_token(prev)
+            && let Some(len) = absolute_path_at(rest)
+        {
+            out.push_str("<path>");
+            i += len;
+            prev = Some('>');
+            continue;
+        }
+        let c = rest.chars().next().expect("i is on a char boundary");
+        out.push(c);
+        prev = Some(c);
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// A line a `tracing` subscriber wrote: a JSON event (an object with a
@@ -11591,5 +11702,77 @@ Caused by:
             error.len()
         );
         assert!(error.ends_with('…'));
+    }
+
+    /// Backtrace lines, a panic's source location, absolute paths and
+    /// registered secrets never reach the job's `error`.
+    #[test]
+    fn drops_backtraces_panic_locations_paths_and_secrets() {
+        let secret = "CONCISE-PROBE-5d1c-SECRET-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_CONCISE_PROBE", secret);
+        let stderr = format!(
+            "\
+thread 'main' panicked at crates/rocky-cli/src/run.rs:12:5:
+Error: failed to open '/Users/me/project/models/a.sql' with token {secret}
+
+Caused by:
+    0: C:\\Users\\me\\state.redb is locked
+       at /rustc/abc/library/core/src/x.rs:1
+       with ~/secret/thing
+    1: see https://docs.example.com/a/b for help
+"
+        );
+        let error = concise_job_error(&stderr).expect("an error");
+        for leaked in [
+            "/Users/me",
+            "C:\\Users",
+            "/rustc",
+            "~/secret",
+            "crates/rocky-cli",
+            secret,
+        ] {
+            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+        }
+        assert!(
+            error.starts_with("Error: failed to open '<path>'"),
+            "{error}"
+        );
+        assert!(error.contains("<path> is locked"), "{error}");
+        assert!(
+            error.contains("https://docs.example.com/a/b"),
+            "a URL is not a path: {error}"
+        );
+
+        // Without an `Error:` line, a line naming an absolute path is
+        // dropped, and a panic keeps its message but not its location.
+        let tail = "thread 'main' panicked at src/x.rs:1:2:\nboom\nreading /etc/passwd\n";
+        let error = concise_job_error(tail).expect("an error");
+        assert_eq!(error, "thread 'main' panicked:\nboom");
+    }
+
+    /// Each `errors[].error` in a job result goes through the same cleaning,
+    /// so the UI's failure line carries no path or secret either.
+    #[test]
+    fn result_errors_are_sanitized_and_capped() {
+        let secret = "RESULT-ERRORS-PROBE-77ab-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_RESULT_ERRORS_PROBE", secret);
+        let mut result = serde_json::json!({
+            "errors": [
+                { "asset_key": ["a"], "error": format!("bad {secret} at /home/me/x.sql\n   at src/y.rs:1") },
+                { "asset_key": ["b"], "error": "x".repeat(5_000) },
+                { "asset_key": ["c"] },
+            ],
+            "other": "/home/me/untouched",
+        });
+        super::sanitize_result_errors(&mut result);
+        let first = result["errors"][0]["error"].as_str().unwrap();
+        assert!(first.starts_with("bad "), "{first}");
+        assert!(first.ends_with(" at <path>"), "{first}");
+        for leaked in [secret, "/home/me", "src/y.rs"] {
+            assert!(!first.contains(leaked), "{leaked} leaked: {first}");
+        }
+        let long = result["errors"][1]["error"].as_str().unwrap();
+        assert!(long.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8());
+        assert_eq!(result["other"], "/home/me/untouched");
     }
 }
