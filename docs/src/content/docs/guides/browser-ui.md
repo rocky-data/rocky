@@ -123,7 +123,7 @@ rocky review <plan-id> --approve
 
 A plan bound to a data product shows no Apply button. Apply it in a terminal. The spec digest must come from you, not from the plan.
 
-Apply runs the models as they are on disk, not SQL stored in the plan. So it first checks that they still match the plan. If a model was added, removed or edited after the plan was made, or the config it runs under changed, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. This holds for every apply, from the UI or the CLI, by a person or an agent.
+Apply runs the models as they are on disk, not SQL stored in the plan. So it checks the plan's models before it runs them. If a model was added, removed or edited after the plan was made, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. A person's apply compares the models only, so a different environment or an edit to another pipeline does not refuse it. The models can still change between this check and the run's own compile. An agent's apply is checked again inside the run. A plan whose models did not compile at plan time has no fingerprint and is not checked. A plan made before this check refuses with `plan_snapshot_missing`; plan again.
 
 ## Products
 
