@@ -3142,32 +3142,6 @@ pub async fn run(
     .await
 }
 
-/// Fire the terminal pipeline hook for a non-replication run (#2317):
-/// `pipeline_complete` on `Ok`, `pipeline_error` on `Err`, then drain async
-/// webhooks so fire-and-forget deliveries are not dropped at exit.
-///
-/// Replication fires its own pair inline with a table count; the other
-/// pipeline types have no table loop, so `pipeline_complete` here carries no
-/// `table_count`.
-async fn fire_non_replication_pipeline_end(
-    hook_registry: &HookRegistry,
-    run_id: &str,
-    pipeline_name: &str,
-    started: Instant,
-    result: &Result<()>,
-) {
-    let ctx = match result {
-        Ok(()) => HookContext::pipeline_complete_untabled(
-            run_id,
-            pipeline_name,
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        ),
-        Err(error) => HookContext::pipeline_error(run_id, pipeline_name, &format!("{error:#}")),
-    };
-    let _ = hook_registry.fire(&ctx).await;
-    let _ = hook_registry.wait_async_webhooks().await;
-}
-
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_explicit_contracts(
@@ -4006,6 +3980,16 @@ pub async fn run_with_explicit_contracts(
     // established for `finalize_idempotency`. On delegated `Err`, the
     // `?` propagates out of the async block and the wrapper releases the
     // `InFlight` stamp. FR-004 F2.
+    // Every exit of a non-replication arm, including the early `?` exits
+    // (models-dir lookup, freeze fence, state acquire/open/finalize), settles
+    // here: one `pipeline_complete` or `pipeline_error` for the
+    // `pipeline_start` fired above, then the async webhooks drain (#2317).
+    // The error hook runs while the remote state lock may still be held.
+    if !matches!(
+        &pipeline_config,
+        rocky_core::config::PipelineConfig::Replication(_)
+    ) {
+        let outcome: Result<()> = async {
     match pipeline_config {
         rocky_core::config::PipelineConfig::Transformation(t) => {
             // WP-01 PR-B (2b, RD-003): the transformation arm was a live
@@ -4277,31 +4261,14 @@ pub async fn run_with_explicit_contracts(
                              persisted to the remote [state] backend",
                         )?;
                     }
-                    let result = record_custody_exit_result(
+                    return record_custody_exit_result(
                         record_custody,
                         &run_id,
                         governed,
                         loaded.config.state.on_upload_failure,
                     );
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &result,
-                    )
-                    .await;
-                    return result;
                 }
                 Err(e) => {
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &Err(anyhow::anyhow!("{e:#}")),
-                    )
-                    .await;
                     // `session_disposition` decides. A typed run-status
                     // failure (`RunFailed` / the `PartialFailure` sentinel)
                     // means `run_transformation` completed its terminal state
@@ -4449,31 +4416,14 @@ pub async fn run_with_explicit_contracts(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
                     )?;
-                    let result = record_custody_exit_result(
+                    return record_custody_exit_result(
                         record_custody,
                         &run_id,
                         governed,
                         loaded.config.state.on_upload_failure,
                     );
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &result,
-                    )
-                    .await;
-                    return result;
                 }
                 Err(e) => {
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &Err(anyhow::anyhow!("{e:#}")),
-                    )
-                    .await;
                     // A typed gate failure means `run_quality` completed its
                     // terminal state writes — the `Failure` record carrying
                     // `check_gate_failed` is persisted — so the session must
@@ -4593,31 +4543,14 @@ pub async fn run_with_explicit_contracts(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
                     )?;
-                    let result = record_custody_exit_result(
+                    return record_custody_exit_result(
                         record_custody,
                         &run_id,
                         governed,
                         loaded.config.state.on_upload_failure,
                     );
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &result,
-                    )
-                    .await;
-                    return result;
                 }
                 Err(e) => {
-                    fire_non_replication_pipeline_end(
-                        &hook_registry,
-                        &run_id,
-                        pipeline_name,
-                        start,
-                        &Err(anyhow::anyhow!("{e:#}")),
-                    )
-                    .await;
                     session
                         .abandon("snapshot exited before terminal state writes")
                         .await;
@@ -4665,7 +4598,7 @@ pub async fn run_with_explicit_contracts(
             // all — `run_load`'s own `require_synced` is unconditional (see
             // the deliberate-exception note in load.rs).
             let governed = exec_fp_gate.is_some();
-            let result = super::load::run_load(
+            super::load::run_load(
                 config_path,
                 &loaded,
                 state_path,
@@ -4681,20 +4614,25 @@ pub async fn run_with_explicit_contracts(
                 },
                 output_json,
             )
-            .await;
-            if result.is_ok() {
-                finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
-            }
-            fire_non_replication_pipeline_end(
-                &hook_registry,
+            .await?;
+            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
+            return Ok(());
+        }
+    }
+            Ok(())
+        }
+        .await;
+        let end_ctx = match &outcome {
+            Ok(()) => HookContext::pipeline_complete_untabled(
                 &run_id,
                 pipeline_name,
-                start,
-                &result,
-            )
-            .await;
-            return result;
-        }
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+            Err(error) => HookContext::pipeline_error(&run_id, pipeline_name, &error.to_string()),
+        };
+        let _ = hook_registry.fire(&end_ctx).await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return outcome;
     }
 
     let pipeline = pipeline_config

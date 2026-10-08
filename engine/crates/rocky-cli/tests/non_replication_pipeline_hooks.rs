@@ -222,3 +222,20 @@ auto_create_schemas = true
         ["pipeline_start", "pipeline_complete"]
     );
 }
+
+/// An early exit before the delegated run (here: the state store cannot be
+/// opened) must still pair the `pipeline_start` with a `pipeline_error`.
+#[tokio::test]
+async fn early_exit_still_fires_pipeline_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(tmp.path(), "SELECT id FROM main.src").await;
+    // A directory where the state file should be makes the open fail.
+    std::fs::create_dir(tmp.path().join("state.redb")).unwrap();
+
+    run_pipeline(tmp.path(), "tr")
+        .await
+        .expect_err("an unopenable state store fails the run");
+
+    let got = names(&events(&tmp.path().join("hook.log")));
+    assert_eq!(got, ["pipeline_start", "pipeline_error"], "{got:?}");
+}

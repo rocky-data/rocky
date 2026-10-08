@@ -98,7 +98,7 @@ The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky wri
 
 ### Which events fire for which pipeline type
 
-`pipeline_start`, `pipeline_complete` and `pipeline_error` fire for every pipeline type that `rocky run` executes: replication, transformation, quality, snapshot and load. The other events depend on what the pipeline does.
+`pipeline_start`, `pipeline_complete` and `pipeline_error` fire when `rocky run` executes a whole pipeline of any type: replication, transformation, quality, snapshot or load. They do not fire for `rocky run --model X`, for `rocky run --select` with several models, or for a transformation node run under `--dag`. The other events depend on what the pipeline does.
 
 | Event | Replication | Transformation | Quality, snapshot, load |
 |-------|-------------|----------------|-------------------------|
