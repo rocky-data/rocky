@@ -692,6 +692,11 @@ fn is_freeze_record(d: &PolicyDecisionRecord) -> bool {
 /// a `freeze:` entry that no later `unfreeze:` entry supersedes is active. This
 /// is how a freeze persists with no new table and how the normal
 /// policy-change flow lifts it.
+///
+/// "Latest" is `(seq, timestamp)`: the store-stamped insertion order first, so
+/// a clock that stepped back cannot hide an unfreeze (#2296). A row from
+/// before the stamp reads `seq = 0` and so sorts before every stamped row;
+/// two such rows keep timestamp order among themselves.
 #[must_use]
 pub fn active_freezes(decisions: &[PolicyDecisionRecord]) -> Vec<ActiveFreeze> {
     // Latest freeze/unfreeze record per (principal, scope) key. Keyed on a
@@ -706,7 +711,7 @@ pub fn active_freezes(decisions: &[PolicyDecisionRecord]) -> Vec<ActiveFreeze> {
         latest
             .entry(key)
             .and_modify(|cur| {
-                if d.timestamp >= cur.timestamp {
+                if (d.seq, d.timestamp) >= (cur.seq, cur.timestamp) {
                     *cur = d;
                 }
             })
@@ -2073,6 +2078,64 @@ mod tests {
             n,
         ));
         assert_eq!(active_freezes(&ledger).len(), 1);
+    }
+
+    fn seq_row(prefix: &str, seq: u64, ts: DateTime<Utc>) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            seq,
+            ..freeze_row(prefix, PolicyPrincipal::Agent, "any", ts)
+        }
+    }
+
+    /// #2296: an unfreeze written after a freeze, with the clock stepped back
+    /// (higher `seq`, lower timestamp), still lifts the freeze.
+    #[test]
+    fn test_active_freezes_orders_by_seq_then_timestamp() {
+        let n = now();
+        let ledger = vec![
+            seq_row(FREEZE_PLAN_PREFIX, 1, n),
+            seq_row(UNFREEZE_PLAN_PREFIX, 2, n - chrono::Duration::hours(3)),
+        ];
+        assert!(
+            active_freezes(&ledger).is_empty(),
+            "a later-written unfreeze lifts the freeze despite an older timestamp"
+        );
+        // Slice order must not matter.
+        let reversed: Vec<_> = ledger.into_iter().rev().collect();
+        assert!(active_freezes(&reversed).is_empty());
+    }
+
+    /// #2296: a freeze written after an unfreeze (higher `seq`, lower
+    /// timestamp) stays active.
+    #[test]
+    fn test_active_freezes_later_seq_freeze_stays_active() {
+        let n = now();
+        let ledger = vec![
+            seq_row(UNFREEZE_PLAN_PREFIX, 1, n),
+            seq_row(FREEZE_PLAN_PREFIX, 2, n - chrono::Duration::hours(3)),
+        ];
+        assert_eq!(active_freezes(&ledger).len(), 1);
+        let reversed: Vec<_> = ledger.into_iter().rev().collect();
+        assert_eq!(active_freezes(&reversed).len(), 1);
+    }
+
+    /// #2296: legacy `seq = 0` rows keep timestamp order among themselves, and
+    /// sort before a stamped row.
+    #[test]
+    fn test_active_freezes_legacy_seq_zero_keeps_timestamp_order() {
+        let n = now();
+        let freeze = seq_row(FREEZE_PLAN_PREFIX, 0, n - chrono::Duration::hours(2));
+        let unfreeze = seq_row(UNFREEZE_PLAN_PREFIX, 0, n - chrono::Duration::hours(1));
+        assert!(active_freezes(&[freeze.clone(), unfreeze.clone()]).is_empty());
+        assert!(active_freezes(&[unfreeze.clone(), freeze.clone()]).is_empty());
+        let refreeze = seq_row(FREEZE_PLAN_PREFIX, 0, n);
+        assert_eq!(
+            active_freezes(&[unfreeze.clone(), freeze.clone(), refreeze]).len(),
+            1
+        );
+        // A stamped row outranks any legacy row, whatever the timestamps.
+        let stamped_freeze = seq_row(FREEZE_PLAN_PREFIX, 1, n - chrono::Duration::hours(9));
+        assert_eq!(active_freezes(&[unfreeze, stamped_freeze]).len(), 1);
     }
 
     #[test]

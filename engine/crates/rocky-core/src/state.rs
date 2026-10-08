@@ -995,8 +995,17 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   stamped row. Guarded by
 ///   `test_v32_policy_decision_seq_is_stamped_in_insertion_order`.
 ///
-///   **Gates still order by `timestamp`** (`active_freezes`). A gate that reads
-///   `seq` MUST bump, because an older binary would pick a different freeze.
+///   **`active_freezes` now orders by `(seq, timestamp)` (#2296), with no
+///   further bump.** The gate reads `seq`, but a binary that ignores `seq`
+///   cannot share a v32 ledger: engine-v1.77.0 is schema v31 and refuses a v32
+///   store at open (or starts a fresh local store, `Recreate`), and it keeps
+///   the `v31/` remote key. So in a released world every writer of a v32
+///   ledger stamps `seq`. The one exception is a dev build from `main` between
+///   the v32 ledger fields (#2280) and the stamp (#2297): its rows read
+///   `seq = 0`, sort before every stamped row, and keep timestamp order among
+///   themselves. v32 is unreleased, so this is the last point to read `seq`
+///   in a gate without a bump. Guarded by
+///   `test_active_freezes_orders_by_seq_then_timestamp` and its siblings.
 ///
 /// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
 ///   identity of each model output. Nothing read it in P1b; it was recorded
