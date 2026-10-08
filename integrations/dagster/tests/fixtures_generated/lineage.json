@@ -61,6 +61,28 @@
     {
       "source": {
         "model": "customer_orders",
+        "column": "total_revenue"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "avg_order_value"
+      },
+      "transform": "expression"
+    },
+    {
+      "source": {
+        "model": "customer_orders",
+        "column": "order_count"
+      },
+      "target": {
+        "model": "revenue_summary",
+        "column": "avg_order_value"
+      },
+      "transform": "expression"
+    },
+    {
+      "source": {
+        "model": "customer_orders",
         "column": "first_order"
       },
       "target": {

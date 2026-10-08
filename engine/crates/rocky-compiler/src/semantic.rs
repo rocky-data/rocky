@@ -439,10 +439,14 @@ pub fn build_semantic_graph(
         let mut output_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for col_lineage in &lineage_result.columns {
+            // An output built from several columns has one lineage entry per
+            // source column but is one output column (#2318).
             output_names.insert(col_lineage.target_column.clone());
-            output_columns.push(ColumnDef {
-                name: col_lineage.target_column.clone(),
-            });
+            if !col_lineage.extra_source {
+                output_columns.push(ColumnDef {
+                    name: col_lineage.target_column.clone(),
+                });
+            }
 
             // Resolve source table name to a model or external source
             let source_table = col_lineage.source_table.as_ref().and_then(|t| {
@@ -480,13 +484,21 @@ pub fn build_semantic_graph(
                 // origin, and a body that is itself an unresolved `SELECT *`
                 // lists the physical tables it passes through.
                 if table_ref.binding == lineage::TableBinding::Cte {
+                    // A CTE column built from several columns has one entry
+                    // per origin: one output column, several edges (#2318).
+                    let mut keep = false;
                     for col in &table_ref.cte_columns {
-                        if !output_names.insert(col.target_column.clone()) {
+                        if !col.extra_source {
+                            keep = output_names.insert(col.target_column.clone());
+                            if keep {
+                                output_columns.push(ColumnDef {
+                                    name: col.target_column.clone(),
+                                });
+                            }
+                        }
+                        if !keep {
                             continue;
                         }
-                        output_columns.push(ColumnDef {
-                            name: col.target_column.clone(),
-                        });
                         if let Some(source) = &col.source_table {
                             edges.push(LineageEdge {
                                 source: QualifiedColumn {
@@ -1111,6 +1123,59 @@ mod tests {
         let source_models: Vec<&str> = trace.iter().map(|e| &*e.source.model).collect();
         assert!(source_models.contains(&"b"));
         assert!(source_models.contains(&"a"));
+    }
+
+    /// #2318: the issue's repro. `amount` is built with `*` over two models,
+    /// so it has one value edge per operand, and still one output column.
+    #[test]
+    fn a_column_built_with_an_operator_traces_to_every_operand() {
+        let models = vec![
+            make_model("a", "SELECT 1 AS id, 2 AS x"),
+            make_model("b", "SELECT 1 AS id, 3 AS y"),
+            make_model(
+                "m",
+                "SELECT a.id, CAST(a.x * b.y AS DECIMAL(18, 2)) AS amount \
+                 FROM a JOIN b ON a.id = b.id",
+            ),
+            make_model(
+                "n",
+                "WITH c AS (SELECT a.x * b.y AS amount FROM a JOIN b ON a.id = b.id) \
+                 SELECT * FROM c",
+            ),
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        for model in ["m", "n"] {
+            let mut sources: Vec<(String, String, TransformKind)> = graph
+                .trace_column(model, "amount")
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.source.model.to_string(),
+                        e.source.column.to_string(),
+                        e.transform.clone(),
+                    )
+                })
+                .collect();
+            sources.sort_by(|l, r| (&l.0, &l.1).cmp(&(&r.0, &r.1)));
+            assert_eq!(
+                sources,
+                vec![
+                    ("a".to_string(), "x".to_string(), TransformKind::Expression),
+                    ("b".to_string(), "y".to_string(), TransformKind::Expression),
+                ],
+                "{model}"
+            );
+            let outputs = graph
+                .model_schema(model)
+                .unwrap()
+                .columns
+                .iter()
+                .filter(|c| c.name == "amount")
+                .count();
+            assert_eq!(outputs, 1, "{model}: one output column");
+        }
     }
 
     #[test]

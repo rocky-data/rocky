@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CastKind, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, NamedWindowDefinition,
-    NamedWindowExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins, Value, Visit, Visitor, WindowSpec, WindowType,
+    CastKind, Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    JoinConstraint, JoinOperator, NamedWindowDefinition, NamedWindowExpr, OrderByKind, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, Visit, Visitor,
+    WindowSpec, WindowType,
 };
 use sqlparser::parser::Parser;
 
@@ -75,6 +76,12 @@ pub struct ColumnLineage {
     /// outer alias spelled like the table would capture it (#2307).
     #[serde(default, skip_serializing_if = "is_false")]
     pub physical: bool,
+    /// Another source of the output the previous entry already names, not a
+    /// new output column. An output built from several columns (`a.x * b.y`)
+    /// has one entry per source column; the first has this `false`, the rest
+    /// `true` (#2318).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub extra_source: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -359,8 +366,10 @@ type ColumnOrigin = (String, String, TransformKind);
 /// traces to the physical tables at its end.
 #[derive(Debug, Default)]
 struct CteBody {
-    /// Output columns by name, with their origin when it is known.
-    columns: Vec<(String, Option<ColumnOrigin>)>,
+    /// Output columns by name, with every origin that is known. A column built
+    /// from several columns (`a.x * b.y`) has several; one with none known has
+    /// an empty list.
+    columns: Vec<(String, Vec<ColumnOrigin>)>,
     /// Physical tables an unresolved `SELECT *` in the body reads. Empty when
     /// the body has no star.
     star_sources: Vec<String>,
@@ -371,7 +380,16 @@ impl CteBody {
         let mut body = CteBody::default();
         for (i, col) in result.columns.iter().enumerate() {
             let origin = result.column_origins.get(i).cloned().flatten();
-            body.columns.push((col.target_column.clone(), origin));
+            // One entry per source column of an expression (#2318): the later
+            // ones add origins to the column the first one named.
+            if col.extra_source
+                && let Some((_, origins)) = body.columns.last_mut()
+            {
+                origins.extend(origin);
+            } else {
+                body.columns
+                    .push((col.target_column.clone(), origin.into_iter().collect()));
+            }
         }
         if result.has_star {
             for t in &result.source_tables {
@@ -390,7 +408,7 @@ impl CteBody {
                     TableBinding::Physical if t.name == "(subquery)" => {
                         for name in t.derived_columns.iter().flatten() {
                             if !body.has_column(name) {
-                                body.columns.push((name.clone(), None));
+                                body.columns.push((name.clone(), Vec::new()));
                             }
                         }
                         body.star_sources.extend(t.derived_sources.iter().cloned());
@@ -412,17 +430,17 @@ impl CteBody {
     /// The origin of `column` read from this CTE. A column the body does not
     /// list passes through its `SELECT *` only when exactly one table feeds
     /// the star; with several, the owner is unknown.
-    fn origin_of(&self, column: &str) -> Option<ColumnOrigin> {
-        if let Some((_, origin)) = self
+    fn origins_of(&self, column: &str) -> Vec<ColumnOrigin> {
+        if let Some((_, origins)) = self
             .columns
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(column))
         {
-            return origin.clone();
+            return origins.clone();
         }
         match self.star_sources.as_slice() {
-            [only] => Some((only.clone(), column.to_string(), TransformKind::Direct)),
-            _ => None,
+            [only] => vec![(only.clone(), column.to_string(), TransformKind::Direct)],
+            _ => Vec::new(),
         }
     }
 }
@@ -434,6 +452,21 @@ fn compose_transform(outer: &TransformKind, inner: &TransformKind) -> TransformK
         (TransformKind::Direct, inner) => inner.clone(),
         (TransformKind::Cast, TransformKind::TryCast) => TransformKind::TryCast,
         (outer, _) => outer.clone(),
+    }
+}
+
+/// The transform of an outer read over a CTE column built from several
+/// columns. The inner value is an `Expression`, so a cast or a function over it
+/// has no one column's type either; `COUNT` and a fallible cast keep their
+/// own nullability rules.
+fn compose_multi_origin_transform(outer: &TransformKind) -> TransformKind {
+    match outer {
+        TransformKind::Direct => TransformKind::Expression,
+        TransformKind::TryCast => TransformKind::TryCast,
+        TransformKind::Aggregation(f) if f == "COUNT" => outer.clone(),
+        TransformKind::Cast | TransformKind::Aggregation(_) | TransformKind::Expression => {
+            TransformKind::Expression
+        }
     }
 }
 
@@ -460,8 +493,9 @@ fn find_relation<'a>(
 enum CteRead {
     /// `table` is not a CTE: the read stays as it is.
     NotCte,
-    /// The read goes through a CTE to this physical origin.
-    Origin(ColumnOrigin),
+    /// The read goes through a CTE to these physical origins: one for a
+    /// column of the body, several for a column built from several columns.
+    Origins(Vec<ColumnOrigin>),
     /// The read goes through a CTE whose column origin is unknown.
     Unknown,
 }
@@ -478,32 +512,41 @@ fn read_through_cte(
     match relation.binding {
         TableBinding::Physical => CteRead::NotCte,
         TableBinding::Cte => match ctes.get(&relation.name.to_lowercase()) {
-            Some(Some(body)) => body
-                .origin_of(column)
-                .map_or(CteRead::Unknown, CteRead::Origin),
+            Some(Some(body)) => match body.origins_of(column) {
+                origins if origins.is_empty() => CteRead::Unknown,
+                origins => CteRead::Origins(origins),
+            },
             Some(None) | None => CteRead::Unknown,
         },
     }
 }
 
 /// Rewrite a row-selection edge that reads through a CTE so it names the
-/// CTE body's physical origin, or no table when that is unknown.
+/// CTE body's physical origin, or no table when that is unknown. A CTE column
+/// built from several columns yields one edge per origin.
 fn resolve_row_selection(
-    rs: &mut RowSelectionLineage,
+    rs: RowSelectionLineage,
     source_tables: &[TableReference],
     ctes: &CteScope,
-) {
+) -> Vec<RowSelectionLineage> {
     let Some(table) = rs.source_table.clone() else {
-        return;
+        return vec![rs];
     };
     match read_through_cte(&table, &rs.source_column, source_tables, ctes) {
-        CteRead::NotCte => {}
-        CteRead::Origin((t, c, _)) => {
-            rs.source_table = Some(t);
-            rs.source_column = c;
-            rs.physical = true;
-        }
-        CteRead::Unknown => rs.source_table = None,
+        CteRead::NotCte => vec![rs],
+        CteRead::Origins(origins) => origins
+            .into_iter()
+            .map(|(t, c, _)| RowSelectionLineage {
+                source_table: Some(t),
+                source_column: c,
+                physical: true,
+                ..rs.clone()
+            })
+            .collect(),
+        CteRead::Unknown => vec![RowSelectionLineage {
+            source_table: None,
+            ..rs
+        }],
     }
 }
 
@@ -517,9 +560,11 @@ fn resolve_row_selection(
 /// per `SELECT`: a rewritten entry names a physical table that a CTE in the
 /// same scope may shadow, so resolving it again would be wrong.
 fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
+    let mut columns = Vec::with_capacity(result.columns.len());
     let mut origins = Vec::with_capacity(result.columns.len());
-    for col in &mut result.columns {
+    for mut col in std::mem::take(&mut result.columns) {
         let Some(table) = col.source_table.clone() else {
+            columns.push(col);
             origins.push(None);
             continue;
         };
@@ -534,28 +579,44 @@ fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
                     )),
                     None => Some((table, col.source_column.clone(), col.transform.clone())),
                 };
+                columns.push(col);
                 origins.push(origin);
             }
-            CteRead::Origin((t, c, inner)) => {
-                col.transform = compose_transform(&col.transform, &inner);
-                col.source_table = Some(t.clone());
-                col.source_column = c.clone();
-                col.physical = true;
-                origins.push(Some((t, c, col.transform.clone())));
+            CteRead::Origins(inner) => {
+                // A column built from several columns is an `Expression` edge
+                // per origin, whatever wraps it here.
+                let many = inner.len() > 1;
+                for (i, (t, c, inner_kind)) in inner.into_iter().enumerate() {
+                    let mut entry = col.clone();
+                    entry.extra_source |= i > 0;
+                    entry.transform = if many {
+                        compose_multi_origin_transform(&col.transform)
+                    } else {
+                        compose_transform(&col.transform, &inner_kind)
+                    };
+                    entry.source_table = Some(t.clone());
+                    entry.source_column = c.clone();
+                    entry.physical = true;
+                    origins.push(Some((t, c, entry.transform.clone())));
+                    columns.push(entry);
+                }
             }
             CteRead::Unknown => {
                 col.source_table = None;
+                columns.push(col);
                 origins.push(None);
             }
         }
     }
+    result.columns = columns;
     result.column_origins = origins;
     let source_tables = &result.source_tables;
-    for rs in &mut result.row_selection {
-        resolve_row_selection(rs, source_tables, ctes);
-    }
     let mut seen = HashSet::new();
-    result.row_selection.retain(|rs| seen.insert(rs.clone()));
+    result.row_selection = std::mem::take(&mut result.row_selection)
+        .into_iter()
+        .flat_map(|rs| resolve_row_selection(rs, source_tables, ctes))
+        .filter(|rs| seen.insert(rs.clone()))
+        .collect();
 }
 
 /// The real table names read inside `query`'s own `WITH` bodies, in clause
@@ -616,10 +677,11 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
     let mut result = extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)?;
     if let SetExpr::Select(select) = query.body.as_ref() {
         let edges = extract_order_limit(query, select, &result.source_tables);
-        for mut edge in edges {
-            resolve_row_selection(&mut edge, &result.source_tables, &ctes);
-            if !result.row_selection.contains(&edge) {
-                result.row_selection.push(edge);
+        for edge in edges {
+            for edge in resolve_row_selection(edge, &result.source_tables, &ctes) {
+                if !result.row_selection.contains(&edge) {
+                    result.row_selection.push(edge);
+                }
             }
         }
     }
@@ -787,21 +849,32 @@ fn extract_table_factor(
                 .map(|body| {
                     body.columns
                         .iter()
-                        .map(|(target, origin)| match origin {
-                            Some((table, column, transform)) => ColumnLineage {
-                                source_table: Some(table.clone()),
-                                source_column: column.clone(),
-                                target_column: target.clone(),
-                                transform: transform.clone(),
-                                physical: false,
-                            },
-                            None => ColumnLineage {
-                                source_table: None,
-                                source_column: target.clone(),
-                                target_column: target.clone(),
-                                transform: TransformKind::Direct,
-                                physical: false,
-                            },
+                        .flat_map(|(target, origins)| {
+                            // One entry per origin: a column built from
+                            // several columns has several (#2318).
+                            let mut entries: Vec<ColumnLineage> = origins
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (table, column, transform))| ColumnLineage {
+                                    source_table: Some(table.clone()),
+                                    source_column: column.clone(),
+                                    target_column: target.clone(),
+                                    transform: transform.clone(),
+                                    physical: false,
+                                    extra_source: i > 0,
+                                })
+                                .collect();
+                            if entries.is_empty() {
+                                entries.push(ColumnLineage {
+                                    source_table: None,
+                                    source_column: target.clone(),
+                                    target_column: target.clone(),
+                                    transform: TransformKind::Direct,
+                                    physical: false,
+                                    extra_source: false,
+                                });
+                            }
+                            entries
                         })
                         .collect()
                 })
@@ -894,6 +967,7 @@ fn source_less_column(target: &str) -> ColumnLineage {
         target_column: target.to_string(),
         transform: TransformKind::Expression,
         physical: false,
+        extra_source: false,
     }
 }
 
@@ -933,40 +1007,53 @@ fn extract_select_columns(
                 // Push whatever lineage we can recover regardless — the edge is
                 // still useful for impact analysis even when the output name
                 // isn't authoritative.
-                if let Some(lineage) = extract_expr_lineage(expr, alias_map, source_tables) {
-                    columns.push(lineage);
+                //
+                // An expression over several columns (`SELECT a + b`) has no
+                // single name to give them, so it adds no entry: naming each
+                // one after its source would invent output columns.
+                //
+                // A parenthesised item is not traced either: it stays as it was
+                // before #2318 (unresolved, no entry), so a model's column set
+                // does not change under it.
+                if !matches!(expr, Expr::Nested(_))
+                    && let [lineage] =
+                        extract_expr_lineage(expr, alias_map, source_tables).as_slice()
+                {
+                    columns.push(lineage.clone());
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                match extract_expr_lineage(expr, alias_map, source_tables) {
-                    Some(mut lineage) => {
-                        lineage.target_column = alias.value.clone();
-                        columns.push(lineage);
-                    }
-                    // A named projection with no upstream column — `COUNT(*)`,
-                    // a literal, a multi-column expression — is still a real
-                    // output column. Emit a source-less entry so it's not
-                    // dropped from the model's schema (the column set drives
-                    // `rocky profile` / the Inspector Columns tab and the
-                    // typed schema); it simply has no column-level lineage edge.
-                    None => columns.push(source_less_column(&alias.value)),
+                let sources = extract_expr_lineage(expr, alias_map, source_tables);
+                if sources.is_empty() {
+                    // A named projection with no upstream column — `COUNT(*)`
+                    // or a literal — is still a real output column. Emit a
+                    // source-less entry so it's not dropped from the model's
+                    // schema (the column set drives `rocky profile` / the
+                    // Inspector Columns tab and the typed schema); it simply
+                    // has no column-level lineage edge.
+                    columns.push(source_less_column(&alias.value));
+                }
+                // One entry per source column: an output built from several
+                // columns has several value-lineage edges with one target.
+                for (i, mut lineage) in sources.into_iter().enumerate() {
+                    lineage.target_column = alias.value.clone();
+                    lineage.extra_source = i > 0;
+                    columns.push(lineage);
                 }
             }
             // Spark SQL `SELECT expr AS (a, b, c)` — multi-alias binding.
-            // Emit one lineage entry per alias, cloning the upstream lineage.
+            // Emit one lineage entry per alias and source, cloning the upstream lineage.
             SelectItem::ExprWithAliases { expr, aliases } => {
-                match extract_expr_lineage(expr, alias_map, source_tables) {
-                    Some(base) => {
-                        for alias in aliases {
-                            let mut lineage = base.clone();
-                            lineage.target_column = alias.value.clone();
-                            columns.push(lineage);
-                        }
+                let sources = extract_expr_lineage(expr, alias_map, source_tables);
+                for alias in aliases {
+                    if sources.is_empty() {
+                        columns.push(source_less_column(&alias.value));
                     }
-                    None => {
-                        for alias in aliases {
-                            columns.push(source_less_column(&alias.value));
-                        }
+                    for (i, base) in sources.iter().enumerate() {
+                        let mut lineage = base.clone();
+                        lineage.target_column = alias.value.clone();
+                        lineage.extra_source = i > 0;
+                        columns.push(lineage);
                     }
                 }
             }
@@ -976,108 +1063,179 @@ fn extract_select_columns(
     (columns, has_star, unresolved_projections)
 }
 
+/// The value sources of one expression: an edge for every column it reads,
+/// outside nested queries (#2318).
+///
+/// Edge kinds, outermost wins:
+/// - a bare column (optionally parenthesised) is `Direct`;
+/// - `CAST` / `TRY_CAST` compose with the inner edge ([`compose_cast_transform`]);
+/// - a function over exactly one column is `Aggregation(name)`, composed with
+///   what the argument did ([`compose_function_transform`]);
+/// - everything else (a binary or unary operator, `CASE`, `BETWEEN`, `IN`, a
+///   function over several columns) is `Expression`, one edge per column.
+///
+/// The fallback reads columns through [`ColumnRefCollector`], the same visitor
+/// the row-selection code uses. That visitor covers every `Expr` variant, so
+/// a new operator cannot be skipped the way a hand-written match skipped
+/// `BinaryOp`.
 fn extract_expr_lineage(
     expr: &Expr,
     alias_map: &HashMap<String, String>,
     source_tables: &[TableReference],
-) -> Option<ColumnLineage> {
+) -> Vec<ColumnLineage> {
     match expr {
-        Expr::Identifier(ident) => {
-            let col_name = ident.value.clone();
-            // No table qualifier — try to resolve from single source
-            let source_table = if source_tables.len() == 1 {
-                Some(
-                    source_tables[0]
-                        .alias
-                        .clone()
-                        .unwrap_or(source_tables[0].name.clone()),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => column_refs(expr)
+            .into_iter()
+            .take(1)
+            .map(|(qualifier, column)| {
+                column_lineage(
+                    qualifier,
+                    column,
+                    TransformKind::Direct,
+                    alias_map,
+                    source_tables,
                 )
-            } else {
-                None
-            };
-            Some(ColumnLineage {
-                source_table,
-                source_column: col_name.clone(),
-                target_column: col_name,
-                transform: TransformKind::Direct,
-                physical: false,
             })
-        }
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let table_part = parts[parts.len() - 2].value.to_lowercase();
-            let col_name = parts[parts.len() - 1].value.clone();
-            let resolved_table = alias_map.get(&table_part).cloned().unwrap_or(table_part);
-            Some(ColumnLineage {
-                source_table: Some(resolved_table),
-                source_column: col_name.clone(),
-                target_column: col_name,
-                transform: TransformKind::Direct,
-                physical: false,
-            })
-        }
+            .collect(),
+        Expr::Nested(inner) => extract_expr_lineage(inner, alias_map, source_tables),
         Expr::Cast { expr, kind, .. } => {
-            let mut lineage = extract_expr_lineage(expr, alias_map, source_tables)?;
-            // A fallible cast (`TRY_CAST` / `SAFE_CAST`) yields NULL on a failed
-            // conversion, so its output is nullable even over a non-null input.
-            // Track it distinctly so typecheck doesn't carry the input's
-            // non-null bit through (#1148).
-            //
-            // The outer cast composes with the inner edge kind; it never
-            // overwrites what the inner expression did (#2295).
-            lineage.transform = match (kind, &lineage.transform) {
-                // Fallible outer cast: nullable output regardless of the inner.
-                (CastKind::TryCast | CastKind::SafeCast, _) => TransformKind::TryCast,
-                // Infallible outer cast: fallibility is sticky — an inner edge
-                // already classified `TryCast` (e.g.
-                // `CAST(TRY_CAST(x AS INT) AS BIGINT)`) still returns NULL when
-                // the inner conversion fails, so the output stays nullable.
-                (CastKind::Cast | CastKind::DoubleColon, TransformKind::TryCast) => {
-                    TransformKind::TryCast
-                }
-                // An infallible cast over a bare column, or over a cast chain
-                // with no fallible link, keeps the column's nullability. That
-                // is what `Cast` promises. The outer cast's target type is
-                // recovered in typecheck Step 2.
-                (
-                    CastKind::Cast | CastKind::DoubleColon,
-                    TransformKind::Direct | TransformKind::Cast,
-                ) => TransformKind::Cast,
-                // An infallible cast over a computed value — `CAST(MAX(x) AS
-                // BIGINT)`, `CAST(NULLIF(x, 0) AS INT)` — can be NULL when the
-                // column is not. It takes the inner expression's nullability,
-                // which the edge cannot carry, so it is a general expression.
-                (
-                    CastKind::Cast | CastKind::DoubleColon,
-                    TransformKind::Aggregation(_) | TransformKind::Expression,
-                ) => TransformKind::Expression,
-            };
-            Some(lineage)
+            let mut sources = extract_expr_lineage(expr, alias_map, source_tables);
+            for lineage in &mut sources {
+                lineage.transform = compose_cast_transform(kind, &lineage.transform);
+            }
+            sources
         }
         Expr::Function(func) => {
-            // Try to trace through aggregate/scalar functions to their column args
             let func_name = func.name.to_string().to_uppercase();
-            let args = &func.args;
-            match args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => {
-                    // Trace through first column argument
-                    for arg in &arg_list.args {
-                        if let sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner_expr),
-                        ) = arg
-                            && let Some(mut lineage) =
-                                extract_expr_lineage(inner_expr, alias_map, source_tables)
-                        {
-                            lineage.transform =
-                                compose_function_transform(&func_name, &lineage.transform);
-                            return Some(lineage);
-                        }
+            let mut sources = Vec::new();
+            if let FunctionArguments::List(arg_list) = &func.args {
+                for arg in &arg_list.args {
+                    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(inner_expr),
+                        ..
                     }
-                    None
+                    | FunctionArg::ExprNamed {
+                        arg: FunctionArgExpr::Expr(inner_expr),
+                        ..
+                    }) = arg
+                    else {
+                        continue;
+                    };
+                    sources.extend(extract_expr_lineage(inner_expr, alias_map, source_tables));
                 }
-                _ => None,
             }
+            let mut sources = dedup_sources(sources);
+            match sources.as_mut_slice() {
+                [only] => only.transform = compose_function_transform(&func_name, &only.transform),
+                many => {
+                    for lineage in many {
+                        lineage.transform = compose_multi_source_function(&func_name);
+                    }
+                }
+            }
+            sources
         }
-        _ => None,
+        _ => dedup_sources(
+            column_refs(expr)
+                .into_iter()
+                .map(|(qualifier, column)| {
+                    column_lineage(
+                        qualifier,
+                        column,
+                        TransformKind::Expression,
+                        alias_map,
+                        source_tables,
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// One value-lineage edge for a column reference, resolving its qualifier
+/// through `alias_map`. An unqualified column resolves to the only source
+/// table, and to none when several are in scope.
+fn column_lineage(
+    qualifier: Option<String>,
+    column: String,
+    transform: TransformKind,
+    alias_map: &HashMap<String, String>,
+    source_tables: &[TableReference],
+) -> ColumnLineage {
+    let source_table = match qualifier {
+        Some(table) => Some(alias_map.get(&table).cloned().unwrap_or(table)),
+        None if source_tables.len() == 1 => Some(
+            source_tables[0]
+                .alias
+                .clone()
+                .unwrap_or(source_tables[0].name.clone()),
+        ),
+        None => None,
+    };
+    ColumnLineage {
+        source_table,
+        source_column: column.clone(),
+        target_column: column,
+        transform,
+        physical: false,
+        extra_source: false,
+    }
+}
+
+/// Drops repeated reads of one column (`x * x`), keeping the first.
+fn dedup_sources(sources: Vec<ColumnLineage>) -> Vec<ColumnLineage> {
+    let mut seen = HashSet::new();
+    sources
+        .into_iter()
+        .filter(|s| seen.insert((s.source_table.clone(), s.source_column.to_lowercase())))
+        .collect()
+}
+
+/// The edge kind of a cast over an edge of kind `inner`.
+fn compose_cast_transform(kind: &CastKind, inner: &TransformKind) -> TransformKind {
+    // A fallible cast (`TRY_CAST` / `SAFE_CAST`) yields NULL on a failed
+    // conversion, so its output is nullable even over a non-null input.
+    // Track it distinctly so typecheck doesn't carry the input's
+    // non-null bit through (#1148).
+    //
+    // The outer cast composes with the inner edge kind; it never
+    // overwrites what the inner expression did (#2295).
+    match (kind, inner) {
+        // Fallible outer cast: nullable output regardless of the inner.
+        (CastKind::TryCast | CastKind::SafeCast, _) => TransformKind::TryCast,
+        // Infallible outer cast: fallibility is sticky; an inner edge
+        // already classified `TryCast` (e.g.
+        // `CAST(TRY_CAST(x AS INT) AS BIGINT)`) still returns NULL when
+        // the inner conversion fails, so the output stays nullable.
+        (CastKind::Cast | CastKind::DoubleColon, TransformKind::TryCast) => TransformKind::TryCast,
+        // An infallible cast over a bare column, or over a cast chain
+        // with no fallible link, keeps the column's nullability. That
+        // is what `Cast` promises. The outer cast's target type is
+        // recovered in typecheck Step 2.
+        (CastKind::Cast | CastKind::DoubleColon, TransformKind::Direct | TransformKind::Cast) => {
+            TransformKind::Cast
+        }
+        // An infallible cast over a computed value (`CAST(MAX(x) AS
+        // BIGINT)`, `CAST(NULLIF(x, 0) AS INT)`, `CAST(a * b AS INT)`) can be
+        // NULL when the column is not. It takes the inner expression's
+        // nullability, which the edge cannot carry, so it is a general
+        // expression.
+        (
+            CastKind::Cast | CastKind::DoubleColon,
+            TransformKind::Aggregation(_) | TransformKind::Expression,
+        ) => TransformKind::Expression,
+    }
+}
+
+/// The edge kind of each column of a call to `func_name` over several columns.
+/// The result has no single input column's type, so it is an `Expression`;
+/// `COUNT` is the exception, a non-null integer whatever it counts.
+fn compose_multi_source_function(func_name: &str) -> TransformKind {
+    if func_name == "COUNT" {
+        TransformKind::Aggregation(func_name.to_string())
+    } else {
+        TransformKind::Expression
     }
 }
 
@@ -1565,7 +1723,7 @@ mod tests {
 
     #[test]
     fn test_parenthesised_projection_counts_as_unresolved() {
-        // `(id)` is `Expr::Nested`, which the extractor does not trace: it
+        // `(id)` is `Expr::Nested`, which an unnamed item does not trace: it
         // yields no column entry, and with no star and no alias there is
         // nothing else to signal the gap.
         let result = extract_lineage("SELECT (id) FROM catalog.schema.users").unwrap();
@@ -1920,7 +2078,7 @@ mod tests {
     fn source_less_named_projections_are_kept() {
         let result = extract_lineage(
             "SELECT customer_id, COUNT(*) AS order_count, \
-             total_revenue / order_count AS avg_order_value \
+             1 AS one, total_revenue / order_count AS avg_order_value \
              FROM cat.sch.customer_orders GROUP BY customer_id",
         )
         .unwrap();
@@ -1929,14 +2087,22 @@ mod tests {
             .iter()
             .map(|c| (c.target_column.as_str(), c))
             .collect();
-        // COUNT(*) and the division expression both lack a source column, but
-        // are present in the column set.
+        // COUNT(*) and the literal both lack a source column, but are present
+        // in the column set.
         let order_count = by_name.get("order_count").expect("order_count kept");
         assert_eq!(order_count.source_table, None);
-        let avg = by_name
-            .get("avg_order_value")
-            .expect("avg_order_value kept");
-        assert_eq!(avg.source_table, None);
+        let one = by_name.get("one").expect("one kept");
+        assert_eq!(one.source_table, None);
+        // The division reads two columns: one edge each (#2318). Lineage does
+        // not substitute a sibling alias, so `order_count` is attributed to the
+        // table, the same as a bare `order_count AS x` always was.
+        let avg: Vec<_> = result
+            .columns
+            .iter()
+            .filter(|c| c.target_column == "avg_order_value")
+            .map(|c| (c.source_column.as_str(), c.extra_source))
+            .collect();
+        assert_eq!(avg, vec![("total_revenue", false), ("order_count", true)]);
         // The sourced column still resolves normally.
         assert!(by_name.contains_key("customer_id"));
     }
@@ -2635,5 +2801,160 @@ mod tests {
         assert!(result.row_selection.is_empty());
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("row_selection"));
+    }
+
+    /// #2318: every column an expression reads is a value source, whatever
+    /// operator combines them. Returns `(source_table, source_column,
+    /// transform)` for each edge of the `amount` output, sorted.
+    fn amount_sources(sql: &str) -> Vec<(Option<String>, String, TransformKind)> {
+        let mut edges: Vec<_> = extract_lineage(sql)
+            .unwrap()
+            .columns
+            .into_iter()
+            .filter(|c| c.target_column == "amount")
+            .map(|c| (c.source_table, c.source_column, c.transform))
+            .collect();
+        edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        edges
+    }
+
+    fn expr_edge(t: &str, c: &str) -> (Option<String>, String, TransformKind) {
+        (
+            Some(t.to_string()),
+            c.to_string(),
+            TransformKind::Expression,
+        )
+    }
+
+    #[test]
+    fn a_binary_operator_traces_both_operands() {
+        assert_eq!(
+            amount_sources("SELECT x + 1 AS amount FROM a"),
+            vec![expr_edge("a", "x")]
+        );
+        assert_eq!(
+            amount_sources("SELECT a.x * b.y AS amount FROM a JOIN b ON a.id = b.id"),
+            vec![expr_edge("a", "x"), expr_edge("b", "y")]
+        );
+    }
+
+    #[test]
+    fn nested_arithmetic_across_two_tables_traces_every_column() {
+        assert_eq!(
+            amount_sources(
+                "SELECT CAST((a.x + 2) * (b.y - a.z) AS DECIMAL(18, 2)) AS amount \
+                 FROM a JOIN b ON a.id = b.id"
+            ),
+            vec![
+                expr_edge("a", "x"),
+                expr_edge("a", "z"),
+                expr_edge("b", "y")
+            ]
+        );
+    }
+
+    #[test]
+    fn case_when_traces_conditions_and_branches() {
+        assert_eq!(
+            amount_sources(
+                "SELECT CASE WHEN a.flag THEN a.x ELSE b.y END AS amount \
+                 FROM a JOIN b ON a.id = b.id"
+            ),
+            vec![
+                expr_edge("a", "flag"),
+                expr_edge("a", "x"),
+                expr_edge("b", "y")
+            ]
+        );
+    }
+
+    #[test]
+    fn unary_minus_traces_its_operand() {
+        assert_eq!(
+            amount_sources("SELECT -x AS amount FROM a"),
+            vec![expr_edge("a", "x")]
+        );
+    }
+
+    #[test]
+    fn between_traces_all_three_operands() {
+        assert_eq!(
+            amount_sources(
+                "SELECT a.x BETWEEN a.lo AND b.hi AS amount FROM a JOIN b ON a.id = b.id"
+            ),
+            vec![
+                expr_edge("a", "lo"),
+                expr_edge("a", "x"),
+                expr_edge("b", "hi")
+            ]
+        );
+    }
+
+    #[test]
+    fn in_list_and_multi_column_function_trace_every_column() {
+        assert_eq!(
+            amount_sources("SELECT x IN (y, 3) AS amount FROM a"),
+            vec![expr_edge("a", "x"), expr_edge("a", "y")]
+        );
+        assert_eq!(
+            amount_sources("SELECT COALESCE(a.x, b.y) AS amount FROM a JOIN b ON a.id = b.id"),
+            vec![expr_edge("a", "x"), expr_edge("b", "y")]
+        );
+        // One column under a function keeps the function's edge kind.
+        assert_eq!(
+            amount_sources("SELECT UPPER(x) AS amount FROM a"),
+            vec![(
+                Some("a".to_string()),
+                "x".to_string(),
+                TransformKind::Aggregation("UPPER".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_function_over_arithmetic_is_an_expression() {
+        assert_eq!(
+            amount_sources("SELECT SUM(a.x * b.y) AS amount FROM a JOIN b ON a.id = b.id"),
+            vec![expr_edge("a", "x"), expr_edge("b", "y")]
+        );
+        assert_eq!(
+            amount_sources("SELECT SUM(x + 1) AS amount FROM a"),
+            vec![expr_edge("a", "x")]
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_column_is_a_direct_edge() {
+        assert_eq!(
+            amount_sources("SELECT (x) AS amount FROM a"),
+            vec![(
+                Some("a".to_string()),
+                "x".to_string(),
+                TransformKind::Direct
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unnamed_multi_column_expression_invents_no_output_column() {
+        let result = extract_lineage("SELECT a + b FROM t").unwrap();
+        assert!(result.columns.is_empty());
+        assert_eq!(result.unresolved_projections, 1);
+    }
+
+    #[test]
+    fn a_cte_column_built_from_two_columns_traces_to_both_origins() {
+        let mut got = origin(
+            "WITH c AS (SELECT a.x * b.y AS amount FROM a JOIN b ON a.id = b.id) \
+             SELECT amount FROM c",
+        );
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (Some("a".into()), "x".into(), "amount".into()),
+                (Some("b".into()), "y".into(), "amount".into()),
+            ]
+        );
     }
 }
