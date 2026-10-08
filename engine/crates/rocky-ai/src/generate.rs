@@ -319,8 +319,8 @@ fn validate_generated_code(
     // Report the errors this generation *introduced*.
     //
     // Not "every error in the merged project": `rocky ai` validates with empty
-    // `source_schemas` by a deliberate prior choice (see the `arc7-wave2` note
-    // at its call site), so upstream columns degrade to nullable `Unknown` and
+    // `source_schemas` by a deliberate prior choice (see the `empty_source_schemas`
+    // note at its call site), so upstream columns degrade to nullable `Unknown` and
     // contract checks fire against models the real compile accepts. Failing on
     // those burns all three attempts on something no retry can fix — the
     // previous code's own comment observed as much.

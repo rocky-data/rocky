@@ -203,8 +203,9 @@ pub async fn run_ai(
         None => (Vec::new(), Vec::new()),
     };
 
-    // TODO(arc7-wave2): promote stub once `rocky-ai`'s generate callpath is
-    // audited — the `ValidationContext`-bound `source_schemas` differs from
+    // Missing (not implemented): validation gets empty `source_schemas`
+    // until `rocky-ai`'s generate callpath is audited. The
+    // `ValidationContext`-bound `source_schemas` differs from
     // the `CompilerConfig.source_schemas` wired above. Empty maps here keep
     // AI validation's behaviour unchanged; swapping them for the cache
     // loader would change prompt grounding in ways that want a dedicated
