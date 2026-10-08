@@ -629,8 +629,13 @@ impl ServerState {
                         .map_err(|e| e.to_string())?
                 }
                 Some(Err(e)) => {
-                    load_error = Some(format!("{e:#}"));
-                    rocky_compiler::compile::compile(&config).map_err(|e| e.to_string())?
+                    let reason = format!("{e:#}");
+                    // The fallback can fail outright (an absent `models/` is
+                    // "no models found"); the loader error is the real cause.
+                    let fallback =
+                        rocky_compiler::compile::compile(&config).map_err(|_| reason.clone())?;
+                    load_error = Some(reason);
+                    fallback
                 }
                 None => rocky_compiler::compile::compile(&config).map_err(|e| e.to_string())?,
             };
@@ -674,15 +679,28 @@ impl ServerState {
         match compile_result {
             Ok((mut result, load_error)) => {
                 if let Some(reason) = load_error {
+                    // Nothing to fall back to: `models/` is absent (the
+                    // compile treats that as empty) or holds no model. Serving
+                    // an empty project with the real error buried in the
+                    // diagnostics would answer `200` with `count: 0`.
+                    if result.project.model_count() == 0 {
+                        warn!(error = %reason, "pipeline models could not be loaded and models/ has none");
+                        self.publish_failure(reason.clone()).await;
+                        return RecompileOutcome {
+                            config_error: config_unreadable,
+                            compile_error: Some(reason),
+                        };
+                    }
                     warn!(error = %reason, "pipeline models could not be loaded; compiling models/ alone");
                     result
                         .diagnostics
                         .push(rocky_compiler::diagnostic::Diagnostic::warning(
-                            rocky_compiler::diagnostic::W013,
+                            rocky_compiler::diagnostic::W014,
                             "rocky.toml",
                             format!(
                                 "the transformation pipelines' models could not be loaded \
-                                 ({reason}). Serving the models directory alone until it is fixed."
+                                 ({reason}). /models and /dag show only the models/ directory \
+                                 until this error is fixed."
                             ),
                         ));
                 }
@@ -1370,14 +1388,32 @@ mod tests {
         let guard = state.compile_result.read().await;
         let result = guard.as_ref().expect("models/ is still served");
         assert!(result.project.model("stg").is_some());
-        let reported = result
+        let warning = result
             .diagnostics
             .iter()
-            .any(|d| d.message.contains(needle) && d.message.contains("other"));
+            .find(|d| d.message.contains(needle) && d.message.contains("other"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the loader error is reported, naming the pipeline and file ({needle}): {:?}",
+                    result.diagnostics
+                )
+            });
+        assert_eq!(
+            &*warning.code, "W014",
+            "W013 means rocky.toml is unreadable"
+        );
+        assert_eq!(
+            warning.severity,
+            rocky_compiler::diagnostic::Severity::Warning
+        );
         assert!(
-            reported,
-            "the loader error is reported, naming the pipeline and file ({needle}): {:?}",
-            result.diagnostics
+            warning.message.contains("only the models/ directory"),
+            "the message says what is served: {}",
+            warning.message
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W013"),
+            "the config reads fine, so no W013"
         );
     }
 
@@ -1397,5 +1433,91 @@ mod tests {
             ("bad.toml", "this is = = not toml"),
         ]);
         assert_models_dir_still_served(&tmp, "bad.toml").await;
+    }
+
+    /// Fixing the error and recompiling drops the warning and serves the
+    /// union again.
+    #[tokio::test]
+    async fn fixing_the_duplicate_serves_the_union_again() {
+        let tmp = two_pipeline_project(&[("stg.sql", "SELECT 2 AS a"), ("stg.toml", "{SIDECAR}")]);
+        let root = tmp.path().canonicalize().unwrap();
+        let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+        state.recompile().await;
+        {
+            let guard = state.compile_result.read().await;
+            let result = guard.as_ref().unwrap();
+            assert!(result.diagnostics.iter().any(|d| &*d.code == "W014"));
+            assert!(result.project.model("renamed").is_none());
+        }
+
+        std::fs::remove_file(root.join("other/stg.sql")).unwrap();
+        std::fs::remove_file(root.join("other/stg.toml")).unwrap();
+        std::fs::write(root.join("other/renamed.sql"), "SELECT 2 AS a").unwrap();
+        std::fs::write(
+            root.join("other/renamed.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"renamed\"\n",
+        )
+        .unwrap();
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().unwrap();
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W014"),
+            "the warning is gone: {:?}",
+            result.diagnostics
+        );
+        assert!(result.project.model("stg").is_some());
+        assert!(
+            result.project.model("renamed").is_some(),
+            "the union is served"
+        );
+    }
+
+    /// F1: with no `models/` to fall back to, the loader error must not hide
+    /// behind an empty `200`; the server reports `engine_not_ready` with it.
+    #[tokio::test]
+    async fn a_loader_error_with_no_models_dir_fails_the_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sidecar = "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"dup\"\n";
+        for dir in ["transforms", "extra"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("dup.sql"), "SELECT 1 AS a").unwrap();
+            std::fs::write(root.join(dir).join("dup.toml"), sidecar).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.a]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.a.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.b]\ntype = \"transformation\"\nmodels = \"extra/**\"\n\n\
+             [pipeline.b.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        // Once with `models/` absent, once present but empty.
+        for create_empty_models in [false, true] {
+            if create_empty_models {
+                std::fs::create_dir_all(root.join("models")).unwrap();
+            }
+            let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+            assert_loader_error_fails_compile(&state).await;
+        }
+    }
+
+    async fn assert_loader_error_fails_compile(state: &ServerState) {
+        let outcome = state.recompile().await;
+        let reason = outcome
+            .compile_error
+            .expect("the loader error fails the compile");
+        assert!(reason.contains("dup"), "names the duplicate: {reason}");
+        assert!(state.compile_result.read().await.is_none());
+        let failure = state.compile_failure.read().await;
+        assert!(
+            failure.as_deref().is_some_and(|f| f.contains("dup")),
+            "{failure:?}"
+        );
     }
 }

@@ -439,6 +439,7 @@ span, and sometimes a suggested fix.
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
 | `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
+| `W014` | `rocky serve` could not load the transformation pipelines' models (a model name shared across pipelines, a malformed sidecar, a dangling models directory), so `/api/v1/models` and `/api/v1/dag` show only `models/` until the error is fixed. If `models/` has no model either, the server reports `engine_not_ready` with the load error instead |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `W042` | Aggregate argument is cast implicitly at run time and fails on values that do not convert (escalate with `--deny-warnings W042`) |

@@ -368,7 +368,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W013` warning that names the pipeline and file. When given, only this directory is compiled. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file; `/models` and `/dag` then show only `models/` until the error is fixed. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error instead. When given, only this directory is compiled. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
