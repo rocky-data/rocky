@@ -8,6 +8,7 @@
 //! Results are emitted as a [`DagRunOutput`] in JSON mode so orchestrators
 //! can correlate per-node status, timing, and errors.
 
+#[cfg(feature = "duckdb")]
 use rocky_core::env_string::ExposeOpt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
