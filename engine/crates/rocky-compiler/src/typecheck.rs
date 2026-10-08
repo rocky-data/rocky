@@ -4452,6 +4452,50 @@ mod tests {
         );
     }
 
+    /// #2307: a CTE body column from the null-supplying side of an outer join
+    /// is nullable in the model, though the source column is NOT NULL.
+    #[test]
+    fn a_cte_body_outer_join_column_stays_nullable() {
+        let o: &[(&str, RockyType, bool)] = &[("id", RockyType::Int32, false)];
+        let p: &[(&str, RockyType, bool)] = &[
+            ("oid", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+        ];
+        for sql in [
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT y FROM a",
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT a.y FROM a",
+            "WITH a AS (SELECT o.id, p.y AS yy FROM o LEFT JOIN p ON o.id = p.oid), \
+             b AS (SELECT yy FROM a) SELECT yy FROM b",
+        ] {
+            let rows = typecheck_over(sql, &[("o", o), ("p", p)]);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert!(rows[0].2, "{sql}: {rows:?}");
+        }
+        // The preserved side stays NOT NULL.
+        let rows = typecheck_over(
+            "WITH a AS (SELECT o.id, p.y FROM o LEFT JOIN p ON o.id = p.oid) SELECT id FROM a",
+            &[("o", o), ("p", p)],
+        );
+        assert!(!rows[0].2, "{rows:?}");
+    }
+
+    /// #2307: a recursive CTE's column is nullable when its recursive branch
+    /// can supply NULL, whatever the anchor says.
+    #[test]
+    fn a_recursive_cte_column_is_nullable_when_a_branch_can_be_null() {
+        let o: &[(&str, RockyType, bool)] = &[
+            ("id", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+        ];
+        let rows = typecheck_over(
+            "WITH RECURSIVE r AS (SELECT id, id AS v FROM o \
+             UNION ALL SELECT r.id, o.z FROM r JOIN o ON r.id = o.id) SELECT v FROM r",
+            &[("o", o)],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].2, "{rows:?}");
+    }
+
     /// #2307: a CTE with another name leaves the source read alone.
     #[test]
     fn a_non_shadowing_cte_keeps_source_types() {
