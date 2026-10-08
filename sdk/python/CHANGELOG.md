@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-10-08
+
+Pairs with engine 1.78.0.
+
+### Changed
+
+- Generated models follow engine 1.78.0. Row-selection lineage edges can now have the kinds `distinct_on` and `order_limit`; `kind` stays a string, so older code keeps working.
+- The adapter `extra` map and the DuckDB, Databricks and Snowflake connection fields print a resolved `${VAR}` as `${NAME}` (engine change; the generated field docs now say so).
+
 ## [0.18.0] — 2026-10-07
 
 Pairs with engine 1.77.0.
