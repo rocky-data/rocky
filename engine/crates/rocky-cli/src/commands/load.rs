@@ -25,7 +25,7 @@ use crate::registry::{AdapterRegistry, resolve_pipeline};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Suffix appended to a target table name to form its per-load staging table.
-const STAGING_SUFFIX: &str = "__rocky_stg";
+pub(crate) const STAGING_SUFFIX: &str = "__rocky_stg";
 
 /// Execute `rocky load`: discover files, load them into the target table(s).
 ///

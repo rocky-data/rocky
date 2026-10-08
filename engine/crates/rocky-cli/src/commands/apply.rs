@@ -883,7 +883,7 @@ pub(crate) fn pipeline_is_replication(
 /// file; a quality entry with no `table` checks the whole schema) the name is
 /// `catalog.schema` instead. A quarantined quality table names what its mode
 /// writes: `split` the `<table><suffix_valid>` and `<table><suffix_quarantine>`
-/// tables, `drop` only the first, `tag` the table itself (rewritten in place).
+/// tables plus its `_quarantine_labels_` working table, `drop` only the first, `tag` the table itself (rewritten in place).
 /// Every listed table is named, even one with no quarantinable assertion that
 /// the run would leave alone: that over-gates, which is the safe direction.
 /// A quality pipeline with quarantine on but no listed tables has an unknown
@@ -901,18 +901,33 @@ fn modelless_pipeline_writes(
             BTreeSet::from([s.target.table.clone()]),
             EmptyTouched::Refuse,
         )),
-        PipelineConfig::Load(l) => Some((
-            BTreeSet::from([match &l.target.table {
-                Some(table) => table.clone(),
-                None => format!("{}.{}", l.target.catalog, l.target.schema),
-            }]),
-            EmptyTouched::Refuse,
-        )),
+        PipelineConfig::Load(l) => {
+            let mut tables = BTreeSet::new();
+            match &l.target.table {
+                Some(table) => {
+                    tables.insert(table.clone());
+                    // A contract-gated load stages into this table first
+                    // (`load_with_contract_gate`), so it is a real write.
+                    tables.insert(format!("{table}{}", crate::commands::load::STAGING_SUFFIX));
+                }
+                None => {
+                    tables.insert(format!("{}.{}", l.target.catalog, l.target.schema));
+                }
+            }
+            Some((tables, EmptyTouched::Refuse))
+        }
         PipelineConfig::Quality(q) => {
             let Some(quarantine) = q.checks.quarantine.as_ref().filter(|c| c.enabled) else {
                 return Some((BTreeSet::new(), EmptyTouched::NoOp));
             };
             let mut tables = BTreeSet::new();
+            if matches!(quarantine.mode, QuarantineMode::Split) {
+                // `split` creates a label table in the source's schema,
+                // `_quarantine_labels_<random token>`. The token is drawn at
+                // run time, so the prefix is the name a `models` glob can
+                // match.
+                tables.insert(rocky_core::quarantine::SPLIT_TABLE_PREFIX.to_string());
+            }
             for t in &q.tables {
                 let Some(table) = &t.table else {
                     tables.insert(format!("{}.{}", t.catalog, t.schema));
@@ -13199,6 +13214,27 @@ schema = "raw"
 "#,
                 true,
                 "c.raw",
+            ),
+            (
+                "load: the contract staging table",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+table = "events"
+"#,
+                true,
+                "events__rocky_stg",
+            ),
+            (
+                "quality split: the label working table",
+                &split,
+                true,
+                "_quarantine_labels_*",
             ),
             (
                 "quality split: quarantine table",
