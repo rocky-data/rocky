@@ -28,7 +28,10 @@ This is the most important fact for sizing the work. Not every inference rule re
      ├─ lineage (rocky-sql/src/lineage.rs::extract_expr_lineage)
      │     Identifier / CompoundIdentifier ─▶ Direct
      │     Cast over a column              ─▶ Cast / TryCast
-     │     Function over a column          ─▶ Aggregation(name)
+     │     Function over a column          ─▶ Aggregation(name), for ANY
+     │       (first column argument)           function name, not only aggregates
+     │     CAST over a column or function  ─▶ Cast / TryCast (overwrites an
+     │                                          inner Aggregation edge)
      │     anything else (a + b, CASE,     ─▶ no edge ─▶ Expression
      │       literals, CAST(a + b AS ..))
      ▼
@@ -66,6 +69,10 @@ The unmerged WP-03 branch states the same fact in its own doc comment ("arithmet
 1. **`SUM` over a decimal keeps the input digits.** `infer_aggregation_type` returns `Decimal(p,s)` for `SUM` over `Decimal(p,s)`. A sum of ten `DECIMAL(10,2)` values can need 11 integer digits. The type is too narrow.
 2. **`SUM` over an integer is `Int64`, and `SUM` over `Float32` is `Float32`.** Whether that bounds what the warehouse writes depends on the warehouse. Inference has no dialect (the `AVG` arm's own comment says so).
 3. **Declared decimal digits wrap.** `sql_type_to_rocky` narrows sqlparser's `u64` precision and signed scale with `as u8`. `DECIMAL(300,2)` becomes a different type. `DECIMAL(10,-2)` becomes scale 254.
+3a. **A function or cast wrapped around another function reads the wrong input.** Lineage traces the first column argument through nested calls and then overwrites the edge kind with the outer one. Read from `extract_expr_lineage` and Step 1 of `compute_model_typecheck`; not executed. Three results:
+   - `MAX(LENGTH(name))` and `SUM(LENGTH(name))` take `name`'s type (`String`), not the function's result. `SUM(CAST(y AS DOUBLE))` takes `y`'s pre-cast type. These are wrong concrete types.
+   - `CAST(NULLIF(x, 0) AS INT)` gets a `Cast` edge, which keeps `x`'s nullable bit. If `x` is non-null, the column is non-null, but `NULLIF` can return NULL. The same holds for `CAST(MAX(x) AS BIGINT)`. This is a wrong non-nullable result, the direction §4 forbids.
+   - `COUNT(*)` has no column argument, so it gets no edge and is `(Unknown, true)`, not `(Int64, false)`. The `COUNT_DISTINCT` arm of `infer_aggregation_type` is dead: lineage names the function `COUNT` and the `DISTINCT` flag is separate.
 4. **String-read decimal digits are not range-checked.** `decimal_family_type` (in both `rocky-compiler/src/compile.rs` and `rocky-core/src/contracts.rs`) parses precision and scale as `u8`. It accepts precision 0, scale greater than precision, and precision above every warehouse limit.
 
 **Latent defects (diagnostics only, today).**
@@ -78,9 +85,10 @@ The unmerged WP-03 branch states the same fact in its own doc comment ("arithmet
 
 **Mapping and assignability.**
 
-10. **`is_assignable(Int64, Float64)` is `true`.** It falls through to `common_supertype`, whose doc comment says it "allows widening conversions that might lose precision". A value above 2^53 changes.
+10. **`is_assignable(Int64, Float64)` is `true`.** It falls through to `common_supertype`, whose doc comment says it "allows widening conversions that might lose precision". A value above 2^53 changes. This is the only integer-to-float pair that is wrongly assignable. `Int32` or `Int64` to `Float32` and `Float64` to `Float32` are already `false` today, because their supertype is `Float64`. Also today, `is_assignable(TimestampNtz, Timestamp)` is `true` and the reverse is `false`.
+    `is_assignable` has two production callers, and both see any change to it: the load gate (`landed_type_conforms` in `rocky-core/src/contracts.rs`) and the UDF argument check (`rocky-compiler/src/udf.rs`, which raises `E051`).
 11. **`Timestamp` and `TimestampNtz` unify to `Timestamp`.** One is an instant, the other is a wall-clock reading. Mixing them is not a widening.
-12. **The per-adapter `TypeMapper` impls have no production caller.** `rocky-core/src/traits.rs::TypeMapper` is string-to-string. Its DuckDB, Databricks and Snowflake impls are called only from their own tests. The DuckDB `types_compatible` treats any two `DECIMAL…` strings as compatible. The `rocky-ir/src/types.rs` module doc says `TypeMapper` maps between warehouse types and `RockyType`. It does not.
+12. **The per-adapter `TypeMapper` impls have no production caller.** `rocky-core/src/traits.rs::TypeMapper` is string-to-string. It is also public SDK surface: `rocky-adapter-sdk` re-exports it, and `rocky init-adapter` scaffolds an impl for third-party adapters. Its DuckDB, Databricks and Snowflake impls are called only from their own tests. The DuckDB `types_compatible` treats any two `DECIMAL…` strings as compatible. The `rocky-ir/src/types.rs` module doc says `TypeMapper` maps between warehouse types and `RockyType`. It does not.
 
 ### What is already closed — do not re-do
 
@@ -162,9 +170,10 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 
 **Integer pairs.** `Int32` and `Int64` operands with no decimal:
 
-- `+`, `-`, `*` give `Int64`. Today `Int32 + Int32` gives `Int32`. That is narrower than what Snowflake (`NUMBER(38,0)`) and BigQuery (`INT64`) write.
+- Two `Int32` operands: `+`, `-`, `*` give `Int64`. Today `Int32 + Int32` gives `Int32`. That is narrower than what Snowflake (`NUMBER(38,0)`) and BigQuery (`INT64`) write. The product of two `Int32` values fits in `Int64`, so this is a sound bound on every adapter.
+- Any `Int64` operand: `+`, `-`, `*` have the same dialect problem as `SUM(Int64)`. Snowflake writes `NUMBER(38,0)` for `Int64 * Int64`, which `Int64` does not hold. So the result is Open question A, not a fixed `Int64`. The interim answer is `Int64`, published as a known under-bound together with the `SUM` one.
 - `/` gives `Unknown`. Warehouses return a float or a decimal, not an integer.
-- `%` gives `Int64`.
+- `%` gives `Int64` (the remainder is smaller than the divisor, so it fits).
 
 **Unification** (`COALESCE`, `CASE`, `IF`, `GREATEST`, `LEAST`, join keys) is not arithmetic. It takes `max(i)` and `max(s)` over the whole branch set, with no carry digit. Branches are unified as a set, not by a fold, so the order of arguments cannot change the result. Above the cap, the result is `Unknown`.
 
@@ -173,15 +182,16 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | Function | Input | Result | Nullable |
 |---|---|---|---|
 | `COUNT`, `COUNT(DISTINCT …)` | any | `Int64` | no |
-| `SUM` | `Decimal(p, s)` | `Decimal(38, s)` | yes |
+| `SUM` | `Decimal(p, s)`, `p ≤ 38` | `Decimal(38, s)` | yes |
+| `SUM` | `Decimal(p, s)`, `p > 38` | `Unknown` | yes |
 | `SUM` | `Int32`, `Int64` | Open question A | yes |
-| `SUM` | `Float32`, `Float64` | `Float64` | yes |
+| `SUM` | `Float32`, `Float64` | `Float64` (today `Float32` stays `Float32`) | yes |
 | `AVG` | `Decimal` | `Unknown` (unchanged, #1238) | yes |
 | `AVG` | integer or float | Open question A | yes |
 | `MIN`, `MAX` | `T` | `T` | yes |
 | any other | any | `Unknown` | yes |
 
-`SUM` over `Decimal(p, s)` becomes `Decimal(38, s)`. A sum of values with scale `s` has at most `s` fractional digits. Warehouses widen a decimal sum's precision, most to 38. Postgres `NUMERIC` has no precision cap, so on Postgres `Decimal(38, s)` is not a proven bound. Dialect-aware inference (Open question A, Option 3) closes that gap. This is a deliberate change: a contract that declares `Decimal(10,2)` for `SUM(amount)` now fails `E011` and must declare `Decimal(38,2)`.
+`SUM` over `Decimal(p, s)` with `p ≤ 38` becomes `Decimal(38, s)`. With `p > 38` (a BigQuery `BIGNUMERIC` source, declared up to 76) a fixed 38 would be narrower than the input, so the result is `Unknown`. A sum of values with scale `s` has at most `s` fractional digits. Warehouses widen a decimal sum's precision, most to 38. Postgres `NUMERIC` has no precision cap, so on Postgres `Decimal(38, s)` is not a proven bound. Dialect-aware inference (Open question A, Option 3) closes that gap. This is a deliberate change: a contract that declares `Decimal(10,2)` for `SUM(amount)` now fails `E011` and must declare `Decimal(38,2)`.
 
 **Casts.** A cast's type is its target type, read by one shared parser:
 
@@ -199,22 +209,23 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | Exponent | `1e10`, `2.5E-3` | `Float64` |
 | Anything else | | `Unknown` |
 
-Fractional literals are `Decimal`, not `Float64`, because `0.1` is exact as a decimal and not as a binary float. A leading minus sign is a unary operator and keeps its operand's type.
+Fractional literals are `Decimal`, not `Float64`, because `0.1` is exact as a decimal and not as a binary float. This is a dialect fact, not a universal one: BigQuery types `1.50` as `FLOAT64`. Open question G covers it. A leading minus sign is a unary operator and keeps its operand's type.
 
 ### 4. Nullability
 
 Inference follows SQL three-valued logic. These rules are binding. Each one only ever widens toward "nullable".
 
-- Comparison, arithmetic, boolean logic, `IN` list: nullable if any operand is nullable.
+- Comparison, boolean logic, `IN` list: nullable if any operand is nullable.
+- Arithmetic `+ - *`: nullable if any operand is nullable. `/` and `%`: always nullable. DuckDB returns NULL for division by zero, and Databricks with `ANSI_MODE = off` does the same (also for decimal overflow). The live cross-check in Validation must confirm the DuckDB case before this ships. Whether `+ - *` over decimals is also fallible on a non-ANSI adapter is part of Open question B.
 - `IS NULL`, `IS NOT NULL`, `EXISTS`: non-nullable `Boolean`.
 - `COALESCE`: nullable only when every argument is nullable.
 - `CASE` with no `ELSE`, `NULLIF`, `LAG`, `LEAD`, `NTH_VALUE`, `SUM`, `AVG`, `MIN`, `MAX`: nullable.
 - `TRY_CAST`, `SAFE_CAST`: nullable.
-- Plain `CAST` / `::`: Open question B.
+- Plain `CAST` / `::`: Open question B. A cast over a function result is nullable unless the function is proven non-null (Context, defect 3a).
 - Any unmodelled expression or literal: `(Unknown, true)`. The `_ => (RockyType::Unknown, false)` arm in `infer_expr_type`'s `Value` match becomes `true`.
 - Outer joins: the null-extended side's columns are nullable (today's correction in `compute_model_typecheck`, kept).
 
-This is consistent with ADR-CONTRACTS §4. Its remedy text ("use `COALESCE` or a `WHERE … IS NOT NULL` filter, never a `CAST`") stays correct under both answers to Open question B.
+**Cross-reference note on ADR-CONTRACTS and `AGENT_REVIEW.md`.** Both say "`CAST` is nullable" (ADR-CONTRACTS Context and §4, and the nullability rule in `AGENT_REVIEW.md`). That is not what `main` does. In `compute_model_typecheck` Step 1 and in `infer_expr_type`, a plain `CAST` keeps its input's nullable bit. Only `TRY_CAST` / `SAFE_CAST` are always nullable. So those two texts describe Option 1 of Open question B, while the code is Option 3. This ADR does not edit either text. Whichever option B takes, both need one edit to match it. ADR-CONTRACTS' validation line (`nullable = false` over `CAST(x AS ...)` ⇒ `E012`) is wrong for `main` today. The remedy text ("use `COALESCE` or a `WHERE … IS NOT NULL` filter, never a `CAST`") stays correct under every option.
 
 ### 5. Cross-dialect mapping
 
@@ -242,7 +253,8 @@ The classification is an exhaustive match per adapter, with no `_ =>` arm (the `
 ### 6. Assignability versus exact match
 
 - `is_assignable(from, to)` means "every value of `from` is a value of `to`, unchanged". It is value-preserving.
-- So `Int64` to `Float64`, `Int32` or `Int64` to `Float32`, and `Float64` to `Float32` are **not** assignable. `Int32` to `Float64` is assignable: `Float64` holds every 32-bit integer exactly.
+- So `Int64` to `Float64` is **not** assignable. This is the one change from today. `Int32` or `Int64` to `Float32` and `Float64` to `Float32` are already not assignable, and stay so. `Int32` to `Float64` stays assignable: `Float64` holds every 32-bit integer exactly.
+- Both callers see this change: the load gate and the UDF argument check (`E051`). See Deliberate behaviour changes 3 and 7.
 - `Timestamp` and `TimestampNtz` are not assignable to each other and have no common supertype. Unifying them gives `Unknown`. Open question D covers whether to keep today's behaviour for a transition period.
 - Which gate uses `is_assignable` and which uses exact match is ADR-CONTRACTS Open question B. This ADR defines only what "assignable" means.
 
@@ -294,7 +306,11 @@ Today `CAST` keeps its input's nullability. On Databricks with `ANSI_MODE = off`
 - *Option 2 — nullable unless the conversion is total.* A widening cast (`Int32` to `Int64`, any type to `String`) keeps the input's nullability. A narrowing or parsing cast is nullable.
 - *Option 3 — keep today's rule, and document that it assumes ANSI mode.*
 
-**Recommendation: Option 2.** It is sound on every adapter and keeps the common case (`CAST(id AS BIGINT)`) non-null. Then update the one-line rule in `AGENT_REVIEW.md` to match. ADR-CONTRACTS also needs one edit under Option 2: its Context says `CAST` is nullable, and its Validation lists `nullable = false` over `CAST(x AS ...)` ⇒ `E012` with no condition. Today the code keeps the input's nullability for a plain `CAST`, so that line is already not what `main` does. Under Option 2 it holds only for a non-total cast.
+**Recommendation: Option 2.** It is sound on every adapter and keeps the common case (`CAST(id AS BIGINT)`) non-null. Then update the one-line rule in `AGENT_REVIEW.md` to match, and edit ADR-CONTRACTS (see the cross-reference note in §4). Under Option 2 the ADR-CONTRACTS validation line holds only for a non-total cast.
+
+The same ANSI-off argument covers other fallible operations: decimal `+ - *` overflow returns NULL on Databricks with `ANSI_MODE = off`. If the owner accepts Option 2 for that reason, the arithmetic rule in §4 must follow it. Do not ratify one without the other.
+
+Option 2 needs the input type. For `CAST(a + b AS …)` (Open question C, Option 1) the input is `Unknown`, so that cast stays nullable.
 
 **C. A typed escape hatch for an arithmetic column.**
 
@@ -315,14 +331,16 @@ Arithmetic, `CASE` and `COALESCE` columns are `Unknown` at the model level, and 
 
 **E. The per-adapter `TypeMapper` trait.**
 
-- *Option 1 — delete it.* It has no production caller, and its DuckDB impl accepts any decimal pair.
+- *Option 1 — delete it.* It has no production caller, and its DuckDB impl accepts any decimal pair. It is public `rocky-adapter-sdk` surface and a scaffold target of `rocky init-adapter`, so deleting it breaks third-party adapters and needs a changelog entry and a template change.
 - *Option 2 — rewrite it* to return a `RockyType` and own the dialect pins in §5, replacing `GateDialect`.
+
+Option 2 is the same kind of break for any third-party impl, since the return type changes.
 
 **Recommendation: Option 2 if Open question A takes Option 3** (the adapter then needs a typed hook anyway). Otherwise Option 1. Either way, fix the `rocky-ir/src/types.rs` module doc.
 
 **F. The unmerged branch `feat/wp03-pr1-decimal-inference`.**
 
-Sixteen commits from July 2026. It is not on `origin`. Its merge base is 584 commits behind `main`.
+Sixteen commits from July 2026. It is not on `origin`. Its merge base is about 585 commits behind `main` (counted 2026-10-08).
 
 What it holds:
 
@@ -346,6 +364,16 @@ Options:
 
 **Recommendation: Option 3.** The algebra was red-teamed once and matches §3. The gate half is the part `main` has moved past. Archive with a tag (for example `archive/wp03-pr1-decimal-inference` at `899e2f4f`) pushed to `origin`, so the commits stay reachable after the local branch is deleted.
 
+**G. Fractional literal type per dialect.**
+
+§3 types `1.50` as `Decimal(3,2)`. DuckDB, Snowflake, Databricks and Trino read it as a decimal. BigQuery reads it as `FLOAT64`. Literal typing is latent today, so nothing breaks yet. It breaks the day Open question C (Option 2) makes literals reach typed columns.
+
+- *Option 1 — `Decimal` everywhere.* Simple. Wrong type name on BigQuery, so a landed-type comparison there can fail.
+- *Option 2 — `Unknown` for a fractional literal until dialect-aware inference exists* (Open question A, Option 3).
+- *Option 3 — `Decimal`, with BigQuery as a pinned exception once the adapter hook exists.*
+
+**Recommendation: Option 3, with Option 2 as the interim for any rule that makes literals live.** Do not take Open question C, Option 2 before this is settled.
+
 ---
 
 ## Consequences
@@ -353,6 +381,8 @@ Options:
 ### What changes
 
 - `rocky-ir/src/types.rs`: an `(integer_digits, scale)` decimal algebra with checked arithmetic. Operator-specific arithmetic. Set-wide unification where `Unknown` absorbs. `is_assignable` becomes value-preserving. The module doc stops claiming `TypeMapper` maps to `RockyType`.
+- `rocky-compiler/src/typecheck.rs`, `rocky-sql/src/lineage.rs`: a function-wrapped function or cast reads the right input type and nullable bit (defect 3a). `COUNT(*)` is typed. The dead `COUNT_DISTINCT` arm goes.
+- `rocky-compiler/src/udf.rs`: the argument check follows the new `is_assignable` (`E051` changes).
 - `rocky-compiler/src/typecheck.rs`: `infer_binary_op_type` uses the operator table. `infer_expr_type` types literals by form and makes unmodelled literals nullable. `sql_type_to_rocky` validates digits before narrowing. `infer_aggregation_type` changes `SUM`. `IF`/`IFF` unify both branches.
 - `rocky-compiler/src/compile.rs` and `rocky-core/src/contracts.rs`: both `decimal_family_type` functions apply the declared range.
 - Each adapter: an exhaustive write classification (§5).
@@ -363,9 +393,14 @@ Options:
 
 1. A contract declaring `Decimal(p,s)` for `SUM` over `Decimal(p,s)` fails `E011`. The fix is to declare `Decimal(38,s)`.
 2. A `DECIMAL(300,2)` or `DECIMAL(5,10)` declaration stops compiling.
-3. A load contract declaring `DOUBLE` stops accepting landed `BIGINT` (§6).
+3. A load contract declaring `DOUBLE` stops accepting landed `BIGINT` (§6). This is the only integer-to-float pair that changes.
 4. Some join-key and operand diagnostics change, because `common_supertype` changes.
 5. Depending on Open questions B and D: some `nullable = false` contracts over a cast fail `E012`, and mixed timestamp branches become `Unknown`.
+6. `SUM(Float32)` becomes `Float64`. A contract declaring `Float32` for it fails `E011`.
+7. A UDF call that passes an `Int64` argument to a `DOUBLE` parameter starts raising `E051` (§6). Today it passes.
+8. A load contract that declares `TIMESTAMP` against a landed `TIMESTAMP_NTZ` column stops being accepted if Open question D takes Option 1. Today `is_assignable(TimestampNtz, Timestamp)` is `true`.
+9. `CAST(NULLIF(x, 0) AS …)`, `CAST(MAX(x) AS …)` and similar casts over a function become nullable, so a `nullable = false` contract over them fails `E012`. `MAX(LENGTH(n))`, `SUM(CAST(y AS DOUBLE))` and `COUNT(*)` change type (defect 3a).
+10. `/` and `%` columns become nullable even over non-null operands.
 
 ### Migration and compatibility
 
@@ -375,7 +410,7 @@ Options:
 
 ### What it does and does NOT close
 
-- **Closes, once implemented:** RD-010 (operator rules, literal typing, digit validation, unification), and the inference half of RD-028 (`IF`/`IFF` branches, aggregate rules). The live `SUM` decimal under-bound.
+- **Closes, once implemented:** the nested function and cast defects (3a), RD-010 (operator rules, literal typing, digit validation, unification), and the inference half of RD-028 (`IF`/`IFF` branches, aggregate rules). The live `SUM` decimal under-bound.
 - **Does NOT close:**
   - **Contract gate rules.** `Unknown` at a gate, exact versus assignable per gate, and breaking-change classification are ADR-CONTRACTS.
   - **Date-function typing.** `DATE_TRUNC`, `DATE_ADD` and `MONTHS_BETWEEN` (RD-028) are latent today. They need per-function signatures, which this ADR does not list.
@@ -411,12 +446,17 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - Operator matrix over `Int32`, `Int64`, `Decimal` pairs for `+ - * / %`, asserting the `(RockyType, nullable)` pair. `Decimal(10,2) + Decimal(10,2)` ⇒ `Decimal(11,2)`. `*` ⇒ `Decimal(20,4)`. `/` ⇒ `Unknown`.
 - Unification: `Decimal(10,0)` with `Decimal(10,10)` ⇒ `Decimal(20,10)`. `Int32` with `Decimal(5,2)` ⇒ `Decimal(12,2)`. Over the cap ⇒ `Unknown`. Every permutation of a three-branch `COALESCE` gives the same result.
 - An upper-bound property test: for random operands, the exact result of the operation fits the inferred type.
-- A live cross-check on DuckDB: the value DuckDB writes fits the inferred type for each operator.
+- A live cross-check on DuckDB: the value DuckDB writes fits the inferred type for each operator. It also checks nullability: `x / 0` and `x % 0` on a non-null `x`.
+- `SUM` over `Decimal(60, 2)` ⇒ `Unknown`, not `Decimal(38,2)`.
 
 **Declarations and literals (§3, §7)**
 - `DECIMAL(300,2)`, `DECIMAL(10,-2)`, `DECIMAL(5,10)`, `DECIMAL(0,0)` ⇒ the new error, in a cast, a source schema and a contract.
 - `DECIMAL(76,38)` ⇒ accepted. `DECIMAL(10)` ⇒ `Decimal(10,0)` in all three parsers.
 - Literals: `42`, `1.50`, `1e10`, a 25-digit integer, a 40-digit integer, malformed text.
+
+**Nested functions and casts (defect 3a)**
+- `MAX(LENGTH(n))` ⇒ `Int64`, nullable. `SUM(CAST(y AS DOUBLE))` ⇒ `Float64`. `COUNT(*)` ⇒ `Int64`, non-null.
+- `CAST(NULLIF(x, 0) AS INT)` with non-null `x` ⇒ nullable. `CAST(x AS BIGINT)` with non-null `x` ⇒ the rule chosen in Open question B.
 
 **Aggregates (§3, Open question A)**
 - `SUM` over `Decimal(10,2)` reaches the model's typed columns as `Decimal(38,2)`, nullable.
@@ -428,7 +468,8 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - `IF(c, a, b)` with `b` nullable ⇒ nullable.
 
 **Mapping and assignability (§5, §6)**
-- `is_assignable(Int64, Float64)` ⇒ `false`. `is_assignable(Int32, Float64)` ⇒ `true`.
+- `is_assignable(Int64, Float64)` ⇒ `false`. `is_assignable(Int32, Float64)` ⇒ `true`. `is_assignable(Int64, Float32)` and `is_assignable(Float64, Float32)` stay `false`.
+- The UDF argument check and the load gate each have a test for the `Int64` to `Float64` change.
 - `default_type_mapper` and `warehouse_type_to_rocky` agree on every string that both map to a concrete type.
 - Per adapter: an exhaustive write classification over every `RockyType` variant. A new variant fails to compile until each adapter classifies it. A lossy write is refused with the diagnostic.
 
