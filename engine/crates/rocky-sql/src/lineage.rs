@@ -455,6 +455,21 @@ fn compose_transform(outer: &TransformKind, inner: &TransformKind) -> TransformK
     }
 }
 
+/// The transform of an outer read (`outer`) over one CTE column whose body
+/// edge is `inner`. A bare read keeps what the body did. A cast chain stays a
+/// cast, and a fallible inner cast stays fallible. Any other wrapper over a
+/// computed column (`MAX(label)` over a cast, an aggregate, or an expression)
+/// has no one column's type, so it is an `Expression`, as the inline form is.
+fn compose_cte_read(outer: &TransformKind, inner: &TransformKind) -> TransformKind {
+    match (outer, inner) {
+        (TransformKind::Direct, _) | (_, TransformKind::Direct) => compose_transform(outer, inner),
+        (TransformKind::Cast, TransformKind::Cast | TransformKind::TryCast) => {
+            compose_transform(outer, inner)
+        }
+        _ => compose_multi_origin_transform(outer),
+    }
+}
+
 /// The transform of an outer read over a CTE column built from several
 /// columns. The inner value is an `Expression`, so a cast or a function over it
 /// has no one column's type either; `COUNT` and a fallible cast keep their
@@ -589,10 +604,10 @@ fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
                 for (i, (t, c, inner_kind)) in inner.into_iter().enumerate() {
                     let mut entry = col.clone();
                     entry.extra_source |= i > 0;
-                    entry.transform = if many || inner_kind == TransformKind::Expression {
+                    entry.transform = if many {
                         compose_multi_origin_transform(&col.transform)
                     } else {
-                        compose_transform(&col.transform, &inner_kind)
+                        compose_cte_read(&col.transform, &inner_kind)
                     };
                     entry.source_table = Some(t.clone());
                     entry.source_column = c.clone();
@@ -1004,9 +1019,10 @@ fn extract_select_columns(
                 if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
                     unresolved_projections += 1;
                 }
-                // Push whatever lineage we can recover regardless — the edge is
-                // still useful for impact analysis even when the output name
-                // isn't authoritative.
+                // Push the lineage of a bare column, a cast or a one-column
+                // function call, even though the output name is not
+                // authoritative: the entry is named after the traced source
+                // column, which is right for impact analysis.
                 //
                 // An expression over several columns (`SELECT a + b`) has no
                 // single name to give them, so it adds no entry: naming each
@@ -3024,5 +3040,39 @@ mod tests {
         };
         assert_eq!(names("SELECT id, amount * 100 FROM orders"), vec!["id"]);
         assert_eq!(names("SELECT x, x + 1 FROM orders"), vec!["x"]);
+    }
+
+    #[test]
+    fn an_outer_wrapper_over_a_cte_cast_or_aggregate_is_an_expression() {
+        let kinds = |cte: &str, outer: &str| {
+            amount_kinds(&format!(
+                "WITH c AS ({cte} FROM t) SELECT {outer} AS m FROM c"
+            ))
+        };
+        let expr = vec![TransformKind::Expression];
+        // Scenario A: a cast column.
+        assert_eq!(kinds("SELECT CAST(x AS VARCHAR) AS s", "MAX(s)"), expr);
+        // Scenario B: an aggregate column.
+        assert_eq!(kinds("SELECT COUNT(n) AS k", "MAX(k)"), expr);
+        assert_eq!(kinds("SELECT COUNT(n) AS k", "SUM(k)"), expr);
+        assert_eq!(kinds("SELECT MAX(x) AS k", "CAST(k AS BIGINT)"), expr);
+        assert_eq!(kinds("SELECT TRY_CAST(x AS INT) AS k", "MAX(k)"), expr);
+        // Kept: a bare read, a cast chain, a fallible chain, COUNT.
+        assert_eq!(
+            kinds("SELECT CAST(x AS VARCHAR) AS s", "s"),
+            vec![TransformKind::Cast]
+        );
+        assert_eq!(
+            kinds("SELECT CAST(x AS VARCHAR) AS s", "CAST(s AS TEXT)"),
+            vec![TransformKind::Cast]
+        );
+        assert_eq!(
+            kinds("SELECT TRY_CAST(x AS INT) AS k", "CAST(k AS BIGINT)"),
+            vec![TransformKind::TryCast]
+        );
+        assert_eq!(
+            kinds("SELECT CAST(x AS VARCHAR) AS s", "COUNT(s)"),
+            vec![TransformKind::Aggregation("COUNT".into())]
+        );
     }
 }

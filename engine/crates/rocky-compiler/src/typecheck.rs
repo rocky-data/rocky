@@ -4958,9 +4958,35 @@ mod tests {
             "{:?}",
             by_name["a"]
         );
-        // `b` (SUM over `x * 1.5`) is left to expression inference, which
-        // does not model decimal arithmetic; the edge kind is pinned in
-        // rocky-sql instead.
+        // `b` (SUM over `x * 1.5`) is typed by expression inference, which
+        // reads the arithmetic as an integer: not asserted; the edge kind is
+        // pinned in rocky-sql.
+        // Scenarios A and B: a wrapper over a cast or an aggregate column.
+        {
+            let typed = typecheck_over_t(
+                "t",
+                "WITH c AS (SELECT CAST(x AS VARCHAR) AS s, COUNT(n) AS k, MAX(x) AS mx FROM t) \
+             SELECT MAX(s) AS a, MAX(k) AS b, SUM(k) AS e, CAST(mx AS BIGINT) AS f FROM c",
+            );
+            let by_name: HashMap<_, _> = typed
+                .iter()
+                .map(|(n, t, nl)| (n.as_str(), (t, *nl)))
+                .collect();
+            assert!(!by_name["a"].0.is_integer(), "{:?}", by_name["a"]);
+            assert!(
+                !matches!(by_name["b"].0, RockyType::String),
+                "{:?}",
+                by_name["b"]
+            );
+            assert!(
+                !matches!(by_name["e"].0, RockyType::String),
+                "{:?}",
+                by_name["e"]
+            );
+            // MAX(x) is NULL over zero rows, so the cast of it is nullable even
+            // though `x` is NOT NULL.
+            assert!(by_name["f"].1, "{:?}", by_name["f"]);
+        }
         assert_eq!(by_name["d"], &RockyType::Int64);
     }
 
