@@ -4465,22 +4465,17 @@ impl RockyMcpServer {
             })
     }
 
-    /// The logical model name (`ModelConfig.name`) of the model whose sidecar
-    /// is `models/<stem>.toml`. A sidecar may set `name` apart from the file
-    /// stem, and the compile filter, the policy gate and the audit ledger all
-    /// select by the logical name (#1829 item 5). Reads the sidecar the draft
-    /// tool has just written (no model-directory load, so no second pass over
-    /// every model). Falls back to the stem when there is no sidecar, no
-    /// string `name`, or the sidecar does not parse: the compile that follows
-    /// reports the real problem.
+    /// The logical model name (`ModelConfig.name`) of the model `stem`. A
+    /// model's config may set `name` apart from the file stem, and the compile
+    /// filter, the policy gate and the audit ledger all select by the logical
+    /// name (#1829 item 5). Read through the model loader's own rule
+    /// ([`rocky_core::models::declared_model_name`]: the sidecar, else the
+    /// `---toml` frontmatter, after `${VAR}` substitution) for this one model
+    /// only, so there is no second pass over every model. Falls back to the
+    /// stem when no name is declared or the config does not read: the compile
+    /// that follows reports the real problem.
     fn logical_model_name(&self, stem: &str) -> String {
-        std::fs::read_to_string(self.models_dir.join(format!("{stem}.toml")))
-            .ok()
-            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-            .and_then(|table| match table.get("name") {
-                Some(toml::Value::String(name)) if !name.is_empty() => Some(name.clone()),
-                _ => None,
-            })
+        rocky_core::models::declared_model_name(&self.models_dir, stem)
             .unwrap_or_else(|| stem.to_string())
     }
 

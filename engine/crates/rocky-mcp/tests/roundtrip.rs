@@ -3590,6 +3590,60 @@ effect = "deny"
     }
 }
 
+/// The logical name of an inline model (`---toml` frontmatter, no sidecar)
+/// whose `name` is a `${VAR:-default}` placeholder: resolved the way the
+/// model loader resolves it. Reading only a sidecar, the draft tools fell
+/// back to the file stem here.
+#[tokio::test]
+async fn draft_contract_records_the_logical_name_of_an_inline_model() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    let models = dir.path().join("models");
+    std::fs::write(
+        models.join("payments.sql"),
+        "---toml\nname = \"${ROCKY_T1829_INLINE_UNSET:-gold_payments}\"\n\n[strategy]\n\
+         type = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\n\
+         table = \"gold_payments\"\n---\nSELECT 1 AS id\n",
+    )
+    .unwrap();
+    let args = serde_json::json!({
+        "model": "payments",
+        "spec": "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n",
+    });
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(metadata_args(args)))
+        .await
+        .expect("draft call");
+    assert_eq!(result.is_error, Some(true), "the deny rule fires");
+    client.cancel().await.unwrap();
+
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+    let decisions = store.list_policy_decisions().expect("list decisions");
+    assert!(
+        decisions.iter().any(|d| d.model == "gold_payments"),
+        "{decisions:?}"
+    );
+    assert!(
+        !decisions.iter().any(|d| d.model == "payments"),
+        "{decisions:?}"
+    );
+}
+
 /// Happy path: a structured patch merges `[freshness]` + `[classification]`
 /// into the sidecar via parse-merge, preserving the existing strategy/target,
 /// and the result carries the compile with the write.
