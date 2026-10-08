@@ -5058,15 +5058,15 @@ pub struct AdapterConfig {
     ///
     /// Top-level typos still error (`tooken = "..."` is still rejected);
     /// only keys nested under `[adapter.<name>.extra]` flow through to the
-    /// adapter unchanged. Adapters read these via `.extra.get("...")` and
+    /// adapter unchanged. Adapters read these via `.extra.expose().get("...")` and
     /// validate them themselves — Rocky doesn't schema-check the contents.
     ///
     /// Values are `serde_json::Value` so the field survives `just codegen`
     /// (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables /
     /// arrays still round-trip through serde because they all map to the
     /// JSON shape.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "crate::env_string::ExtraMap::is_empty")]
+    pub extra: crate::env_string::ExtraMap,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -5283,7 +5283,7 @@ impl AdapterConfig {
                 push("database", self.database.expose_opt());
                 // A port in `[extra]` moves the endpoint as much as one
                 // written `host:port` (which the host locator keeps).
-                let port = self.extra.get("port").map(|p| match p {
+                let port = self.extra.expose().get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),
                 });
@@ -5293,7 +5293,7 @@ impl AdapterConfig {
                 // Every target names its database, so the session's default
                 // `database` does not locate them; host and port do.
                 push("host", self.host.expose_opt());
-                let port = self.extra.get("port").map(|p| match p {
+                let port = self.extra.expose().get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),
                 });
@@ -5302,7 +5302,7 @@ impl AdapterConfig {
             "sqlserver" => {
                 push("host", self.host.expose_opt());
                 push("database", self.database.expose_opt());
-                let port = self.extra.get("port").map(|p| match p {
+                let port = self.extra.expose().get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),
                 });
@@ -13271,7 +13271,7 @@ table = "customers_history"
             ratelimit: None,
             stampede: None,
             circuit_breaker: None,
-            extra: std::collections::BTreeMap::new(),
+            extra: crate::env_string::ExtraMap::new(),
         };
 
         let debug = format!("{cfg:?}");
@@ -13345,12 +13345,14 @@ x_trino_user = "service-account"
         assert_eq!(cfg.adapter_type, "trino");
         assert_eq!(
             cfg.extra
+                .expose()
                 .get("default_schema")
                 .and_then(serde_json::Value::as_str),
             Some("analytics"),
         );
         assert_eq!(
             cfg.extra
+                .expose()
                 .get("x_trino_user")
                 .and_then(serde_json::Value::as_str),
             Some("service-account"),
@@ -13385,15 +13387,22 @@ bool_key = true
 "#;
         let cfg: AdapterConfig = toml::from_str(toml_str).expect("mixed-type extra should parse");
         assert_eq!(
-            cfg.extra.get("str_key").and_then(serde_json::Value::as_str),
+            cfg.extra
+                .expose()
+                .get("str_key")
+                .and_then(serde_json::Value::as_str),
             Some("hello")
         );
         assert_eq!(
-            cfg.extra.get("int_key").and_then(serde_json::Value::as_i64),
+            cfg.extra
+                .expose()
+                .get("int_key")
+                .and_then(serde_json::Value::as_i64),
             Some(42)
         );
         assert_eq!(
             cfg.extra
+                .expose()
                 .get("bool_key")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
@@ -13413,7 +13422,11 @@ mode = "jwt"
 issuer = "https://idp.example.com"
 "#;
         let cfg: AdapterConfig = toml::from_str(toml_str).expect("nested table should parse");
-        let auth = cfg.extra.get("auth").expect("auth sub-table present");
+        let auth = cfg
+            .extra
+            .expose()
+            .get("auth")
+            .expect("auth sub-table present");
         assert_eq!(
             auth.get("mode").and_then(serde_json::Value::as_str),
             Some("jwt")
@@ -13421,6 +13434,24 @@ issuer = "https://idp.example.com"
         assert_eq!(
             auth.get("issuer").and_then(serde_json::Value::as_str),
             Some("https://idp.example.com")
+        );
+    }
+
+    /// #1919: a resolved `${VAR}` in `extra` prints as its name in `Debug` and
+    /// JSON, while the adapters still read the plaintext.
+    #[test]
+    fn adapter_extra_prints_resolved_values_as_names() {
+        let keyfile = "/secrets/ROCKY-CFG-EXTRA-keyfile-3d9f.json";
+        crate::secret_registry::register_substitution("ROCKY_CFG_EXTRA_KEYFILE", keyfile);
+        let toml_str = format!("type = \"bigquery\"\n\n[extra]\nkeyfile = \"{keyfile}\"\n");
+        let cfg: AdapterConfig = toml::from_str(&toml_str).unwrap();
+        for printed in [format!("{cfg:?}"), serde_json::to_string(&cfg).unwrap()] {
+            assert!(!printed.contains(keyfile), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_CFG_EXTRA_KEYFILE}"), "{printed}");
+        }
+        assert_eq!(
+            cfg.extra.expose().get("keyfile").and_then(|v| v.as_str()),
+            Some(keyfile)
         );
     }
 

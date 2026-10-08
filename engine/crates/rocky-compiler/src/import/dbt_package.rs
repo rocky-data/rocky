@@ -1900,7 +1900,12 @@ pub fn render_profiles_yml(
             if let Some(l) = &adapter.location {
                 out.insert("location".into(), l.expose().into());
             }
-            match adapter.extra.get("keyfile").and_then(|v| v.as_str()) {
+            match adapter
+                .extra
+                .expose()
+                .get("keyfile")
+                .and_then(|v| v.as_str())
+            {
                 Some(keyfile) => {
                     out.insert("method".into(), "service-account".into());
                     out.insert("keyfile".into(), absolute(keyfile)?.into());
@@ -1917,7 +1922,7 @@ pub fn render_profiles_yml(
                 "host".into(),
                 need("host", adapter.host.expose_opt())?.into(),
             );
-            let port = match adapter.extra.get("port") {
+            let port = match adapter.extra.expose().get("port") {
                 Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(5432),
                 Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(5432),
                 _ => 5432,
