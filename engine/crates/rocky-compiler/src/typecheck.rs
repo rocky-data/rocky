@@ -473,8 +473,9 @@ fn compute_model_typecheck(
 
             match &edge.transform {
                 rocky_sql::lineage::TransformKind::Direct => upstream_type,
-                // Infallible cast: type is refined in Step 2; nullability is the
-                // input's (a non-null input stays non-null).
+                // Plain cast: type is refined in Step 2. Nullability starts as
+                // the input's; the expression-inference pass below widens it
+                // when the cast can fail (#2299).
                 rocky_sql::lineage::TransformKind::Cast => (RockyType::Unknown, upstream_type.1),
                 // Fallible cast (`TRY_CAST` / `SAFE_CAST`): returns NULL on a
                 // failed conversion, so the output is nullable regardless of the
@@ -2647,11 +2648,21 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
             kind,
             ..
         } => {
+            let target = sql_type_to_rocky(data_type);
             let nullable = match kind {
-                ast::CastKind::Cast | ast::CastKind::DoubleColon => infer_expr_type(expr, scope).1,
+                ast::CastKind::Cast | ast::CastKind::DoubleColon => {
+                    let (source, source_nullable) = infer_expr_type(expr, scope);
+                    // A plain cast can still yield NULL: Spark/Databricks with
+                    // ANSI off, and some dialects' `::`, return NULL on a value
+                    // that does not convert (#2299). Say nullable unless the
+                    // cast provably cannot fail.
+                    source_nullable
+                        || (cast_can_fail(&source, data_type, &target)
+                            && !integer_literal_fits(expr, data_type, &target))
+                }
                 ast::CastKind::TryCast | ast::CastKind::SafeCast => true,
             };
-            (sql_type_to_rocky(data_type), nullable)
+            (target, nullable)
         }
 
         // Binary operations
@@ -3091,6 +3102,97 @@ fn infer_case_type(
     }
 
     (result_type, nullable)
+}
+
+/// Whether a plain `CAST(x AS target)` can return NULL (or fail) for a
+/// non-null `x` of type `source`.
+///
+/// Only the conversions listed as safe return `false`; everything else,
+/// including an `Unknown` source, is treated as fallible. Inference may wrongly
+/// say nullable, never wrongly non-null (#2299).
+fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyType) -> bool {
+    use RockyType as T;
+    // A VARIANT can hold a JSON null, which casts to SQL NULL (Databricks,
+    // Snowflake), and an Unknown source may be one. Both stay fallible.
+    if matches!(source, T::Variant | T::Unknown) {
+        return true;
+    }
+    // Any other type renders as text.
+    if *target == T::String {
+        return false;
+    }
+    // `sql_type_to_rocky` folds TINYINT/SMALLINT into Int32, so the width of
+    // the target is lost; a cast to either can overflow whatever the source.
+    if matches!(
+        target_sql,
+        ast::DataType::TinyInt(_) | ast::DataType::SmallInt(_)
+    ) {
+        return *source != T::Boolean;
+    }
+    match (source, target) {
+        (T::Unknown, _) | (_, T::Unknown) => true,
+        (
+            T::Decimal {
+                precision: sp,
+                scale: ss,
+            },
+            T::Decimal {
+                precision: tp,
+                scale: ts,
+            },
+        ) => {
+            // Safe only when no integer digit and no fractional digit is lost.
+            let source_int_digits = i16::from(*sp) - i16::from(*ss);
+            let target_int_digits = i16::from(*tp) - i16::from(*ts);
+            target_int_digits < source_int_digits || ts < ss
+        }
+        (a, b) if a == b => false,
+        (T::Boolean, T::Int32 | T::Int64 | T::Float32 | T::Float64) => false,
+        (T::Int32, T::Int64 | T::Float32 | T::Float64) => false,
+        (T::Int64, T::Float32 | T::Float64) => false,
+        (T::Float32, T::Float64) => false,
+        (T::Decimal { .. }, T::Float32 | T::Float64) => false,
+        (T::Date, T::Timestamp | T::TimestampNtz) => false,
+        (T::Timestamp | T::TimestampNtz, T::Date | T::Timestamp | T::TimestampNtz) => false,
+        _ => true,
+    }
+}
+
+/// Whether `expr` is an integer literal that fits the cast target, so the cast
+/// cannot fail (`CAST(0 AS DECIMAL(18,2))`, `CAST(1 AS SMALLINT)`).
+fn integer_literal_fits(expr: &Expr, target_sql: &ast::DataType, target: &RockyType) -> bool {
+    match expr {
+        Expr::Nested(inner) => integer_literal_fits(inner, target_sql, target),
+        Expr::Value(val) => {
+            let ast::Value::Number(text, _) = &val.value else {
+                return false;
+            };
+            let Ok(value) = text.parse::<i128>() else {
+                return false;
+            };
+            let in_range = |min: i128, max: i128| (min..=max).contains(&value);
+            match target_sql {
+                ast::DataType::TinyInt(_) => in_range(i8::MIN.into(), i8::MAX.into()),
+                ast::DataType::SmallInt(_) => in_range(i16::MIN.into(), i16::MAX.into()),
+                ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::MediumInt(_) => {
+                    in_range(i32::MIN.into(), i32::MAX.into())
+                }
+                ast::DataType::BigInt(_) => in_range(i64::MIN.into(), i64::MAX.into()),
+                _ => match target {
+                    RockyType::Decimal { precision, scale } => {
+                        let integer_digits = if value == 0 {
+                            0
+                        } else {
+                            value.unsigned_abs().to_string().len()
+                        };
+                        integer_digits + usize::from(*scale) <= usize::from(*precision)
+                    }
+                    _ => false,
+                },
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Convert an sqlparser DataType to RockyType.
@@ -4035,6 +4137,129 @@ mod tests {
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect()
+    }
+
+    /// Golden table for #2299, through the full typecheck (lineage edge plus
+    /// expression inference). A plain cast that can fail returns NULL on some
+    /// warehouses (Spark with ANSI off), so it is nullable over a NOT NULL
+    /// input. A cast that cannot fail keeps the input's nullability.
+    #[test]
+    fn fallible_plain_cast_is_nullable_golden() {
+        // `x` and `y` are INT NOT NULL, `n` is STRING NOT NULL.
+        for (expr, nullable) in [
+            // String to numeric, boolean, temporal, decimal: can fail.
+            ("CAST(n AS INT)", true),
+            ("CAST(n AS BIGINT)", true),
+            ("CAST(n AS DOUBLE)", true),
+            ("CAST(n AS DECIMAL(10,2))", true),
+            ("CAST(n AS DATE)", true),
+            ("CAST(n AS TIMESTAMP)", true),
+            ("CAST(n AS BOOLEAN)", true),
+            ("n::INT", true),
+            // Nested: the fallible cast sits under another call.
+            ("ABS(CAST(n AS INT))", true),
+            // Numeric narrowing: can fail.
+            ("CAST(CAST(x AS BIGINT) AS INT)", true),
+            ("CAST(x AS SMALLINT)", true),
+            ("CAST(x AS TINYINT)", true),
+            ("CAST(x AS DECIMAL(10,2))", true),
+            // Fallible by construction, as before.
+            ("TRY_CAST(x AS BIGINT)", true),
+            ("SAFE_CAST(x AS BIGINT)", true),
+            // Cannot fail: keeps the input's NOT NULL.
+            ("CAST(x AS INT)", false),
+            ("CAST(x AS BIGINT)", false),
+            ("CAST(x AS DOUBLE)", false),
+            ("CAST(x AS FLOAT)", false),
+            ("CAST(x AS STRING)", false),
+            ("CAST(n AS STRING)", false),
+            ("CAST(n AS VARCHAR(10))", false),
+            ("x::BIGINT", false),
+        ] {
+            let rows = typecheck_over_t("t", &format!("SELECT {expr} AS c FROM t"));
+            assert_eq!(rows.len(), 1, "{expr}: {rows:?}");
+            assert_eq!(rows[0].2, nullable, "{expr}: {rows:?}");
+        }
+    }
+
+    /// #2299: `CAST(s AS INT)` over a NOT NULL string fails a `nullable =
+    /// false` contract (E012).
+    #[test]
+    fn fallible_cast_fails_not_null_contract() {
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: Some("Int32".to_string()),
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("n", RockyType::String, false)]),
+        )]);
+        let project =
+            Project::from_models(vec![make_model("m", "SELECT CAST(n AS INT) AS c FROM t")])
+                .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        assert!(
+            validate_contract("m", &result.typed_models["m"], &contract)
+                .iter()
+                .any(|d| &*d.code == "E012")
+        );
+    }
+
+    /// #2299 at the expression level: decimal narrowing, an unknown input and
+    /// the safe conversions.
+    #[test]
+    fn cast_fallibility_by_source_type() {
+        let d = |precision, scale| RockyType::Decimal { precision, scale };
+        let mut scope = TypeScope::new();
+        for (name, ty) in [
+            ("d102", d(10, 2)),
+            ("i64", RockyType::Int64),
+            ("f64", RockyType::Float64),
+            ("dt", RockyType::Date),
+            ("ts", RockyType::Timestamp),
+            ("b", RockyType::Boolean),
+            ("u", RockyType::Unknown),
+        ] {
+            scope
+                .columns
+                .insert(CiKey::owned(name.to_string()), (ty, false));
+        }
+        for (expr, nullable) in [
+            ("CAST(d102 AS DECIMAL(12,2))", false),
+            ("CAST(d102 AS DECIMAL(10,2))", false),
+            ("CAST(d102 AS DECIMAL(5,2))", true),
+            ("CAST(d102 AS DECIMAL(12,0))", true),
+            ("CAST(d102 AS DOUBLE)", false),
+            ("CAST(d102 AS BIGINT)", true),
+            ("CAST(i64 AS DOUBLE)", false),
+            ("CAST(i64 AS INT)", true),
+            ("CAST(i64 AS DECIMAL(20,0))", true),
+            ("CAST(f64 AS FLOAT)", true),
+            ("CAST(f64 AS BIGINT)", true),
+            ("CAST(dt AS TIMESTAMP)", false),
+            ("CAST(ts AS DATE)", false),
+            ("CAST(dt AS INT)", true),
+            ("CAST(b AS INT)", false),
+            ("CAST(u AS INT)", true),
+            ("CAST(u AS STRING)", true),
+            ("CAST(0 AS DECIMAL(18,2))", false),
+            ("CAST(1000 AS DECIMAL(5,2))", true),
+            ("CAST(100 AS DECIMAL(5,2))", false),
+            ("CAST(99 AS DECIMAL(5,2))", false),
+            ("CAST(300 AS TINYINT)", true),
+            ("CAST(100 AS TINYINT)", false),
+            ("CAST(3000000000 AS INT)", true),
+            ("CAST(7 AS INT)", false),
+        ] {
+            let (_, got) = infer_expr_type(&parse_expr(expr), &scope);
+            assert_eq!(got, nullable, "{expr}");
+        }
     }
 
     /// Golden table for #2295. Lineage used to overwrite a nested call's edge

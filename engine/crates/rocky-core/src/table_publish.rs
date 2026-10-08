@@ -29,9 +29,13 @@
 //!   moves every table again (a table already at its version writes no
 //!   commit).
 //! - Take-over is for a dead publisher. A publisher that is slow but alive
-//!   reads the head again before each table move (a fence) and stops when
-//!   another publish took over, so it can move at most the one table that
-//!   was in flight.
+//!   reads the head again (a fence) and stops when another publish took
+//!   over. The state sync has no partial read: a remote fence downloads the
+//!   whole state blob. [`publish_tables`] fences before every table, so a
+//!   publisher that lost the environment moves at most the table in flight.
+//!   [`publish_tables_fenced_every`] spaces the fence (for example every
+//!   [`FENCE_EVERY`] tables) and then such a publisher can move up to that
+//!   many tables first.
 //! - A run that writes a table while a publish moves it is not serialized
 //!   with the publish. A commit that lands between the publish's read of
 //!   the table and its commit makes that table's move fail (the Delta
@@ -236,6 +240,19 @@ pub enum TablePublishError {
     },
 }
 
+/// A suggested fence spacing for a large publish on a remote state store,
+/// where each fence downloads the whole state blob. Opt in with
+/// [`publish_tables_fenced_every`]: a fenced publisher can then move up to
+/// this many tables before a fence stops it. [`publish_tables`] fences
+/// before every table.
+pub const FENCE_EVERY: usize = 8;
+
+/// Whether the fence runs before the table at `index` of `total`: the first,
+/// every `every`th after it, and the last.
+fn fence_due(index: usize, total: usize, every: usize) -> bool {
+    index.is_multiple_of(every.max(1)) || index + 1 == total
+}
+
 /// Whether this run's publish still holds the environment.
 enum Fence {
     /// The head is the `Started` row of this publish, and it is publishing.
@@ -278,10 +295,14 @@ async fn fence(session: &LedgerSeamSession, request: &PublishRequest, started: &
 ///
 /// `options.take_over` starts from a head whose own table publish never
 /// finished. It is for a **dead** publisher. See
-/// [`crate::state::StateStore::begin_table_publish`]. Before each table
-/// move, the publish reads the head again (a fence). When another publish
-/// took over, it stops and moves no more tables, so a wrongly taken-over
-/// live publisher can move at most the one table already in flight.
+/// [`crate::state::StateStore::begin_table_publish`]. The publish reads the
+/// head again (a fence) before every table. When a fence finds that another
+/// publish took over, the publish stops and moves no more tables, so a
+/// wrongly taken-over live publisher moves at most the table already in
+/// flight. A remote fence downloads the whole state blob; a large publish
+/// can trade that guarantee for cost with [`publish_tables_fenced_every`]
+/// and [`FENCE_EVERY`]. A fence that cannot read the head fails closed: the
+/// table is not moved.
 ///
 /// `options.allow_shared_tables` lets the publish move a table that another
 /// environment points at a different version; without it the begin step
@@ -299,6 +320,22 @@ pub async fn publish_tables(
     backend: &dyn TablePointerBackend,
     options: TablePublishOptions,
 ) -> Result<TablePublishReport, TablePublishError> {
+    publish_tables_fenced_every(session, request, backend, options, 1).await
+}
+
+/// [`publish_tables`] with the number of tables between fences set by the
+/// caller. `1` fences before every move.
+///
+/// # Errors
+///
+/// As [`publish_tables`].
+pub async fn publish_tables_fenced_every(
+    session: &LedgerSeamSession,
+    request: &PublishRequest,
+    backend: &dyn TablePointerBackend,
+    options: TablePublishOptions,
+    fence_every: usize,
+) -> Result<TablePublishReport, TablePublishError> {
     let check = |p: &EnvPointer| backend.check(p);
     let started = state_sync::begin_table_publish(session, request, options, &check)
         .await
@@ -308,11 +345,17 @@ pub async fn publish_tables(
     let mut moves = Vec::with_capacity(planned.len());
     let mut failed = false;
     let mut fenced_by: Option<Option<String>> = None;
-    for pointer in planned {
+    let total = planned.len();
+    for (index, pointer) in planned.into_iter().enumerate() {
         let outcome = if failed || fenced_by.is_some() {
             TableMoveOutcome::NotAttempted
         } else {
-            match fence(session, request, &started.publish_id).await {
+            let checked = if fence_due(index, total, fence_every) {
+                fence(session, request, &started.publish_id).await
+            } else {
+                Fence::Held
+            };
+            match checked {
                 Fence::Held => match backend.move_table(pointer).await {
                     Ok(moved) => moved.into(),
                     Err(error) => {
@@ -944,10 +987,10 @@ mod tests {
     }
 
     /// A take-over lands while the first publisher moves its first table
-    /// (as if the take-over wrongly judged it dead). The fence stops the
-    /// first publisher before its next move: `b` and `c` are never tried.
-    /// The error carries the moves, the only record of what moved, and the
-    /// history gains no row for them.
+    /// (as if the take-over wrongly judged it dead). With a fence before
+    /// every move, the fence stops the first publisher before its next
+    /// move: `b` and `c` are never tried. The error carries the moves, the
+    /// only record of what moved, and the history gains no row for them.
     #[tokio::test]
     async fn a_take_over_between_two_moves_stops_the_first_publisher() {
         let dir = TempDir::new().unwrap();
@@ -995,6 +1038,73 @@ mod tests {
                 .as_deref(),
             Some("prod#2")
         );
+    }
+
+    /// With `FENCE_EVERY` spacing (opt-in) the fence runs before the first table, every
+    /// `FENCE_EVERY`th table and the last. A take-over during the first
+    /// move lets the next `FENCE_EVERY - 1` tables move, and the fence
+    /// before table `FENCE_EVERY` stops the publisher. The last table is
+    /// never moved.
+    #[tokio::test]
+    async fn a_spaced_fence_stops_a_fenced_publisher_at_the_next_fence() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let backend = TakeOverDuringMove {
+            session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
+            tables: FakeTables::default(),
+        };
+        let names: Vec<String> = (0..10).map(|i| format!("t{i:02}")).collect();
+        let versions: Vec<_> = names.iter().map(|m| delta(m, 1)).collect();
+        let versions: Vec<(&str, Option<OutputVersion>)> = versions
+            .iter()
+            .map(|(m, v)| (m.as_str(), v.clone()))
+            .collect();
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&run_with_output_versions("r9", &versions))
+                .unwrap();
+        }
+        let sources: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "r9")).collect();
+        let err =
+            publish_tables_fenced_every(&session, &req(None, &sources), &backend, NEW, FENCE_EVERY)
+                .await
+                .unwrap_err();
+        let TablePublishError::Fenced { moves, .. } = &err else {
+            panic!("expected Fenced, got {err:?}");
+        };
+        assert_eq!(
+            backend.tables.calls(),
+            names[..FENCE_EVERY].to_vec(),
+            "the take-over stops the publisher at the next fence"
+        );
+        assert!(matches!(moves[9].outcome, TableMoveOutcome::NotAttempted));
+    }
+
+    /// The last table is always fenced, so a short publish is stopped
+    /// before it.
+    #[tokio::test]
+    async fn the_last_table_is_always_fenced() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let backend = TakeOverDuringMove {
+            session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
+            tables: FakeTables::default(),
+        };
+        let err =
+            publish_tables_fenced_every(&session, &req(None, ABC), &backend, NEW, FENCE_EVERY)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, TablePublishError::Fenced { .. }));
+        assert_eq!(backend.tables.calls(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn fence_due_marks_first_every_nth_and_last() {
+        let due: Vec<usize> = (0..10).filter(|i| fence_due(*i, 10, 4)).collect();
+        assert_eq!(due, vec![0, 4, 8, 9]);
+        assert!((0..5).all(|i| fence_due(i, 5, 1)));
+        assert!((0..3).all(|i| fence_due(i, 3, 0)), "0 is treated as 1");
     }
 
     /// Two pods publish from the same head at once over remote state with

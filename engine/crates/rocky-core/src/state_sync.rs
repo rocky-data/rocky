@@ -1709,6 +1709,12 @@ impl LedgerSeamSession {
     /// Local reads the ledger file; a remote backend downloads the shared
     /// blob first (one GET), then reads it. Nothing is uploaded.
     ///
+    /// It skips config resolution and the writer check: it never opens the
+    /// store for writing, so it needs neither. That is fine for a read, and
+    /// wrong for anything that writes. A remote read costs the whole state
+    /// blob; callers that read in a loop should space the reads (the table
+    /// publish fence does).
+    ///
     /// # Errors
     ///
     /// Download and store errors.

@@ -995,8 +995,17 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   stamped row. Guarded by
 ///   `test_v32_policy_decision_seq_is_stamped_in_insertion_order`.
 ///
-///   **Gates still order by `timestamp`** (`active_freezes`). A gate that reads
-///   `seq` MUST bump, because an older binary would pick a different freeze.
+///   **`active_freezes` now orders by `(seq, timestamp)` (#2296), with no
+///   further bump.** The gate reads `seq`, but a binary that ignores `seq`
+///   cannot share a v32 ledger: engine-v1.77.0 is schema v31 and refuses a v32
+///   store at open (or starts a fresh local store, `Recreate`), and it keeps
+///   the `v31/` remote key. So in a released world every writer of a v32
+///   ledger stamps `seq`. The one exception is a dev build from `main` between
+///   the v32 ledger fields (#2280) and the stamp (#2297): its rows read
+///   `seq = 0`, sort before every stamped row, and keep timestamp order among
+///   themselves. v32 is unreleased, so this is the last point to read `seq`
+///   in a gate without a bump. Guarded by
+///   `test_active_freezes_orders_by_seq_then_timestamp` and its siblings.
 ///
 /// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
 ///   identity of each model output. Nothing read it in P1b; it was recorded
@@ -1033,6 +1042,15 @@ pub enum StateError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The policy decision write sequence is at `u64::MAX`. Only a forged or
+    /// corrupt row can put it there; stamping on would tie every later row
+    /// and send ordering back to timestamps, so the write is refused.
+    #[error(
+        "policy decision sequence is exhausted (last seq {0}); the ledger holds a forged or \
+         corrupt row"
+    )]
+    PolicySeqExhausted(u64),
 
     #[error(
         "state schema version mismatch: database has v{found}, binary expects v{expected}. \
@@ -7147,7 +7165,9 @@ impl StateStore {
                 }
             };
             let mut stamped = decision.clone();
-            stamped.seq = last_seq.saturating_add(1);
+            stamped.seq = last_seq
+                .checked_add(1)
+                .ok_or(StateError::PolicySeqExhausted(last_seq))?;
             let bytes = serde_json::to_vec(&stamped)?;
             table.insert(key.as_str(), bytes.as_slice())?;
             let counter = format!("{}:{}", stamped.seq, table.len()?);
@@ -16786,6 +16806,52 @@ mod tests {
         downloaded.record_policy_decision(&row(101)).unwrap();
         assert_eq!(seqs(&downloaded).last(), Some(&22));
         assert!(POLICY_SEQ_ROWS_PARSED.with(std::cell::Cell::get) >= 21);
+    }
+
+    /// A forged or corrupt `seq` at `u64::MAX` refuses the next write rather
+    /// than tying every later row (which would send ordering back to
+    /// timestamps, #2296).
+    #[test]
+    fn test_policy_decision_seq_at_max_refuses_the_next_write() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let row = |i: u32| PolicyDecisionRecord {
+            seq: 0,
+            keys_recorded: true,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-10-08T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: format!("p{i}"),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: String::new(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        store.record_policy_decision(&row(1)).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut m = txn.open_table(METADATA).unwrap();
+                m.insert(POLICY_DECISION_SEQ_KEY, format!("{}:1", u64::MAX).as_str())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let err = store.record_policy_decision(&row(2)).unwrap_err();
+        assert!(
+            matches!(err, StateError::PolicySeqExhausted(n) if n == u64::MAX),
+            "{err}"
+        );
     }
 
     /// `graph_keys` yields the model set when there is one and the single

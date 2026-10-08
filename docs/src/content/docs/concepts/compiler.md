@@ -124,7 +124,9 @@ Aliases remain distinct in self-joins, and downstream models inherit the resulti
 A `nullable = false` contract on an affected column with a known type raises `E012`.
 This analysis is conservative: a later `WHERE` filter does not narrow nullability.
 
-A cast keeps its operand's nullability only when the operand is a column.
+A cast keeps its operand's nullability only when the operand is a column and the cast cannot fail.
+A cast that can fail is nullable even over a `NOT NULL` input, because some warehouses return `NULL` for a value that does not convert (Spark and Databricks with ANSI mode off). These casts can fail: text or an unknown type to a number, boolean, date or timestamp; a number to a narrower number (`BIGINT` to `INT`, anything to `SMALLINT` or `TINYINT`, a number to a `DECIMAL` that may not hold it); a `DOUBLE` to `FLOAT`. These casts cannot fail and keep the operand's nullability: the same type, `INT` to `BIGINT`, a number to `DOUBLE` or `FLOAT`, anything to text, `DATE` to `TIMESTAMP`, and an integer literal that fits the target (`CAST(0 AS DECIMAL(18,2))`). `TRY_CAST` and `SAFE_CAST` are always nullable.
+A `nullable = false` contract over `CAST(text_col AS INT)` therefore fails `E012`. Use `COALESCE` or a source that is already numeric.
 A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGINT)` and `CAST(NULLIF(x, 0) AS INT)` are nullable even when `x` is not.
 An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
