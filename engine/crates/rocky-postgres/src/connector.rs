@@ -30,7 +30,7 @@ use crate::config::{Flavor, PgConfig, SslMode};
 use crate::tls::{RustlsConnect, Verification, client_config};
 
 /// Errors from the PostgreSQL / Redshift connector.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum PgError {
     /// Invalid adapter configuration.
     #[error("invalid configuration: {0}")]
@@ -64,6 +64,14 @@ pub enum PgError {
     /// A described table does not exist (or is not visible to this role).
     #[error("table {schema}.{table} not found")]
     NotFound { schema: String, table: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for PgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "PgError", self)
+    }
 }
 
 impl PgError {
@@ -528,6 +536,21 @@ fn timestamptz_to_rfc3339(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_PG_DBG", SECRET);
+        let err = PgError::Connect {
+            host: format!("db-{SECRET}"),
+            port: 5432,
+            message: "refused".into(),
+            sqlstate: None,
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_PG_DBG}"), "{debug}");
+    }
 
     #[test]
     fn transient_classification_follows_sqlstate_classes() {

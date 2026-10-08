@@ -75,7 +75,7 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum FivetranError {
     #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
@@ -113,6 +113,14 @@ pub enum FivetranError {
         "emit-fivetran-state: all {total} connector(s) returned missing schema_config; no healthy connectors found"
     )]
     NoHealthyConnectors { total: usize },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for FivetranError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "FivetranError", self)
+    }
 }
 
 /// Wire-decode shape for `GET /v1/destinations/{id}`. The envelope

@@ -41,7 +41,7 @@ use tracing::{debug, warn};
 // Error
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum AirbyteError {
     #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
@@ -64,6 +64,14 @@ pub enum AirbyteError {
         rocky_core::secret_registry::render_placeholders(base)
     )]
     UntrustedNextUrl { base: String, next: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for AirbyteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "AirbyteError", self)
+    }
 }
 
 /// Returns `true` when `candidate` is on the same scheme + host + port as

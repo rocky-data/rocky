@@ -33,7 +33,7 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 
 /// Errors returned by the Iceberg REST Catalog client.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum IcebergError {
     /// Transport-level HTTP error (connection refused, timeout, TLS, etc.).
     #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
@@ -53,6 +53,15 @@ pub enum IcebergError {
     /// 429 Too Many Requests after all retries exhausted.
     #[error("rate limited -- retry after backoff")]
     RateLimited,
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of `message` and of the wrapped transport error, whose URL
+/// can hold a resolved value (#1919).
+impl std::fmt::Debug for IcebergError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "IcebergError", self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +762,26 @@ impl std::fmt::Debug for IcebergCatalogClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_display_and_debug_print_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_ICE_ERR_SECRET", SECRET);
+        let errors = [
+            IcebergError::Api {
+                status: 404,
+                message: format!("table {SECRET} not found"),
+            },
+            IcebergError::UnexpectedResponse(format!("bad body {SECRET}")),
+        ];
+        for err in errors {
+            let shown = err.to_string();
+            let debug = format!("{err:?}");
+            assert!(!shown.contains(SECRET), "Display leaks: {shown}");
+            assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+            assert!(shown.contains("${RV_ICE_ERR_SECRET}"), "{shown}");
+        }
+    }
 
     #[test]
     fn test_debug_hides_secrets() {

@@ -19,7 +19,7 @@ use tracing::{Instrument, Span, debug, field, info_span, warn};
 use crate::auth::Auth;
 
 /// Errors from the Databricks SQL Statement Execution API.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ConnectorError {
     #[error("auth error: {0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -73,6 +73,14 @@ pub enum ConnectorError {
     /// underlying `arrow::error::ArrowError` message.
     #[error("Arrow IPC decode error: {0}")]
     Arrow(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ConnectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ConnectorError", self)
+    }
 }
 
 /// Configuration for the Databricks SQL connector.
@@ -1515,6 +1523,19 @@ fn poll_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_DBX_DBG", SECRET);
+        let err = ConnectorError::StatementFailed {
+            id: format!("id-{SECRET}"),
+            message: "bad".into(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DBX_DBG}"), "{debug}");
+    }
 
     /// The run-loop classifier hoists the connector's own `is_transient`
     /// judgement: retryable API/statement errors become `Transient` with the

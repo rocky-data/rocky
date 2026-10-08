@@ -27,7 +27,7 @@ use tracing::{Instrument, Span, debug, field, info_span, warn};
 use crate::auth::Auth;
 
 /// Errors from the Snowflake SQL REST API.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ConnectorError {
     #[error("auth error: {0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -61,6 +61,14 @@ pub enum ConnectorError {
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ConnectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ConnectorError", self)
+    }
 }
 
 /// Configuration for the Snowflake connector.
@@ -882,6 +890,19 @@ pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_SF_DBG", SECRET);
+        let err = ConnectorError::StatementFailed {
+            handle: format!("h-{SECRET}"),
+            message: "bad".into(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SF_DBG}"), "{debug}");
+    }
 
     /// The run-loop classifier hoists the connector's own `is_transient`
     /// judgement: 429 / 503 / throttle become `Transient`, a rejected

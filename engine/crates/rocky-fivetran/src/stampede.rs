@@ -45,7 +45,7 @@ use thiserror::Error;
 ///
 /// Like the other coordination-layer errors, these are coarse on
 /// purpose — fail-open is the caller's only useful policy.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum LockError {
     /// Valkey / Redis transport failure (connect refused, TLS error,
     /// command timeout).
@@ -55,6 +55,14 @@ pub enum LockError {
     /// rather than from a request.
     #[error("stampede config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "LockError", self)
+    }
 }
 
 /// Trait every stampede-lock backend implements.

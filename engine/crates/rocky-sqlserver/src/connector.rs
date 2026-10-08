@@ -37,7 +37,7 @@ use crate::config::{Auth, Encrypt, SqlServerConfig};
 type Conn = Client<Compat<TcpStream>>;
 
 /// Errors from the SQL Server connector.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SqlServerError {
     /// Invalid adapter configuration.
     #[error("invalid configuration: {0}")]
@@ -72,6 +72,14 @@ pub enum SqlServerError {
     /// A described table does not exist (or is not visible to this login).
     #[error("table {schema}.{table} not found")]
     NotFound { schema: String, table: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SqlServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "SqlServerError", self)
+    }
 }
 
 /// Error numbers Microsoft documents as transient for Azure SQL Database
@@ -520,6 +528,21 @@ fn numeric_text(n: tiberius::numeric::Numeric) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_MSSQL_DBG", SECRET);
+        let err = SqlServerError::Connect {
+            host: format!("db-{SECRET}"),
+            port: 1433,
+            message: "refused".into(),
+            number: None,
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_MSSQL_DBG}"), "{debug}");
+    }
     use std::borrow::Cow;
 
     #[test]

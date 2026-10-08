@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors surfaced by [`FivetranCircuitBreaker`] backends.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CircuitError {
     /// Valkey / Redis transport failure.
     #[error("circuit valkey: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
@@ -81,6 +81,14 @@ pub enum CircuitError {
     /// Misconfigured backend.
     #[error("circuit config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for CircuitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "CircuitError", self)
+    }
 }
 
 /// Discriminator for what kind of failure tripped the breaker. Only
