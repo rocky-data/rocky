@@ -5,7 +5,8 @@ import type { ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import { ApiError } from "./api";
-import { ProjectActions } from "./estate/ProjectActions";
+import type { ProjectOutput } from "@rocky-types/project";
+import { ProjectActions, planUnavailable } from "./estate/ProjectActions";
 import {
   READ_ONLY_REASON,
   WriteAccessProvider,
@@ -109,6 +110,29 @@ describe("Run and Plan on the estate", () => {
     expect(alert).toHaveTextContent(/already in progress/);
     expect(alert).toHaveTextContent(/Wait for it to finish/);
     expect(client.status).not.toHaveBeenCalled();
+  });
+
+  it("draw Plan disabled, with the reason, where rocky plan cannot help", () => {
+    const project = (types: string[]) =>
+      ({ pipelines: types.map((t, i) => ({ name: `p${i}`, pipeline_type: t })) }) as unknown as ProjectOutput;
+    expect(planUnavailable(null)).toBeUndefined();
+    expect(planUnavailable(project(["replication"]))).toBeUndefined();
+    expect(planUnavailable(project(["transformation"]))).toMatch(/has none/);
+    expect(planUnavailable(project(["replication", "transformation"]))).toMatch(/--pipeline/);
+
+    const { client, submitted } = fakeJobs();
+    const reason = planUnavailable(project(["transformation"]));
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} planDisabledReason={reason} />
+      </WriteAccessProvider>,
+    );
+    const plan = screen.getByRole("button", { name: "Plan" });
+    expect(plan).toBeDisabled();
+    fireEvent.click(plan);
+    expect(screen.getByText(reason ?? "")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
+    expect(submitted).toEqual([]);
   });
 
   it("shows a failed job's error", async () => {

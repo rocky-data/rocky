@@ -438,6 +438,12 @@ function Approval({
             onClick={() => apply.start({ plan_id: planId })}
           />
           <JobLine label="Apply" view={apply.view} />
+          {status.reviewed && (
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+              Apply runs the models as they are on disk now. If you edited them after the
+              approval, plan and approve again before you apply.
+            </p>
+          )}
         </div>
       )}
 

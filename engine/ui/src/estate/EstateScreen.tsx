@@ -12,7 +12,7 @@ import type { JobClient } from "../operator";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
-import { ProjectActions } from "./ProjectActions";
+import { ProjectActions, planUnavailable } from "./ProjectActions";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
 import { SchedulePanel, SpoolCounts } from "./SchedulePanel";
@@ -117,6 +117,8 @@ export function EstateScreen({
     if (selected !== null && shown === null) setSelected(null);
   }, [selected, shown]);
 
+  const planReason = planUnavailable(project.kind === "ready" ? project.value : null);
+
   const refreshAll = () => {
     project.reload();
     dag.reload();
@@ -132,7 +134,7 @@ export function EstateScreen({
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium uppercase tracking-wide text-zinc-500">Estate</h2>
         <div className="flex items-start gap-3">
-          <ProjectActions jobs={jobs} onDone={refreshAll} />
+          <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
         <button
           type="button"
           onClick={refreshAll}
@@ -161,7 +163,14 @@ export function EstateScreen({
                   name={shown}
                   load={loaders.detail}
                   onClose={() => setSelected(null)}
-                  actions={<ProjectActions model={shown} jobs={jobs} onDone={refreshAll} />}
+                  actions={
+                    <ProjectActions
+                      model={shown}
+                      jobs={jobs}
+                      onDone={refreshAll}
+                      planDisabledReason={planReason}
+                    />
+                  }
                 />
               )}
             </div>
