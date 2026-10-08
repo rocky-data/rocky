@@ -1,3 +1,4 @@
+use rocky_core::env_string::ExposeOpt;
 use std::path::Path;
 use std::time::Instant;
 
@@ -310,7 +311,7 @@ async fn collect_health_checks(
                     }
                     match adapter.adapter_type.as_str() {
                         "databricks" => {
-                            if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
+                            if adapter.host.is_none() || adapter.host.expose_opt() == Some("") {
                                 suggestions.push(format!("adapters.{name}: host not configured"));
                                 adapter_ok = false;
                             }

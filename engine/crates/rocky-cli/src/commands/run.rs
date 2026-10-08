@@ -1,3 +1,4 @@
+use rocky_core::env_string::ExposeOpt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2567,7 +2568,7 @@ fn ensure_resume_namespace_is_pinned(
     }
     if target_adapter
         .database
-        .as_deref()
+        .expose_opt()
         .is_some_and(|db| !db.trim().is_empty())
     {
         return Ok(());

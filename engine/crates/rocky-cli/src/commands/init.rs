@@ -492,6 +492,7 @@ SELECT
 
 #[cfg(test)]
 mod tests {
+    use rocky_core::env_string::ExposeOpt;
     /// #1738. The "rocky.toml already exists" guard must refuse a DANGLING
     /// symlink, and must not write through it.
     ///
@@ -654,7 +655,10 @@ mod tests {
             .expect("generated duckdb rocky.toml must parse");
         let adapter = &cfg.adapters["default"];
         assert_eq!(adapter.adapter_type, "duckdb");
-        let path = adapter.path.as_deref().expect("duckdb template sets path");
+        let path = adapter
+            .path
+            .expose_opt()
+            .expect("duckdb template sets path");
         let expected = rocky_duckdb::dialect::catalog_name_for_path(path);
 
         let pipeline = cfg.pipelines["default"]

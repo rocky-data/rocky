@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::env_string::EnvString;
+use crate::env_string::{EnvString, ExposeOpt};
 use crate::hooks::HooksConfig;
 use crate::path_presence::{PathPresence, classify_not_found};
 use crate::redacted::RedactedString;
@@ -4901,6 +4901,12 @@ pub enum AdapterKind {
 /// Credential fields (`token`, `client_secret`, `api_key`, `api_secret`,
 /// `password`, `oauth_token`) are wrapped in [`RedactedString`] so that
 /// `Debug` output never leaks secrets.
+///
+/// The DuckDB, Databricks and Snowflake connection fields (`path`, `host`,
+/// `http_path`, `client_id`, `account`, `warehouse`, `username`,
+/// `private_key_path`, `role`, `database`) are [`EnvString`]s. A resolved
+/// `${VAR}` value in one of them prints only as `${NAME}` (#1919). The
+/// adapter connect path reads the plaintext with [`EnvString::expose`].
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterConfig {
@@ -4914,10 +4920,10 @@ pub struct AdapterConfig {
     pub kind: Option<AdapterKind>,
 
     // -- Databricks fields --
-    pub host: Option<String>,
-    pub http_path: Option<String>,
+    pub host: Option<EnvString>,
+    pub http_path: Option<EnvString>,
     pub token: Option<RedactedString>,
-    pub client_id: Option<String>,
+    pub client_id: Option<EnvString>,
     pub client_secret: Option<RedactedString>,
     pub timeout_secs: Option<u64>,
 
@@ -4928,25 +4934,25 @@ pub struct AdapterConfig {
 
     // -- Snowflake fields --
     /// Snowflake account identifier (e.g., "xy12345.us-east-1").
-    pub account: Option<String>,
+    pub account: Option<EnvString>,
     /// Snowflake warehouse to use for query execution.
-    pub warehouse: Option<String>,
+    pub warehouse: Option<EnvString>,
     /// Snowflake username (for password or key-pair auth).
-    pub username: Option<String>,
+    pub username: Option<EnvString>,
     /// Snowflake password (for password auth).
     pub password: Option<RedactedString>,
     /// OAuth access token (pre-obtained from an IdP).
     pub oauth_token: Option<RedactedString>,
     /// Path to RSA private key file (PEM) for key-pair auth.
-    pub private_key_path: Option<String>,
+    pub private_key_path: Option<EnvString>,
     /// Programmatic Access Token (issued via Snowsight User Profile).
     /// Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN`
     /// token-type header — distinct from `oauth_token`.
     pub pat: Option<RedactedString>,
     /// Snowflake role to use for the session.
-    pub role: Option<String>,
+    pub role: Option<EnvString>,
     /// Default database for the session.
-    pub database: Option<String>,
+    pub database: Option<EnvString>,
 
     // -- BigQuery fields --
     /// Google Cloud project ID.
@@ -4959,7 +4965,7 @@ pub struct AdapterConfig {
     /// When unset, the adapter uses an in-memory database.
     /// A persistent path is required when the same DuckDB adapter is also used
     /// as a discovery source — discovery and warehouse share the same database.
-    pub path: Option<String>,
+    pub path: Option<EnvString>,
 
     // -- Manual discovery fields --
     /// The source schemas and tables a `type = "manual"` discovery adapter
@@ -5233,27 +5239,27 @@ impl AdapterConfig {
             "duckdb" => {
                 let path = self
                     .path
-                    .as_deref()
+                    .expose_opt()
                     .map_or_else(in_memory_duckdb_locator, canonical_path_string);
                 push("path", Some(&path));
             }
             "databricks" => {
-                push("host", self.host.as_deref());
-                push("http_path", self.http_path.as_deref());
+                push("host", self.host.expose_opt());
+                push("http_path", self.http_path.expose_opt());
             }
             "snowflake" => {
-                push("account", self.account.as_deref());
-                push("host", self.host.as_deref());
-                push("database", self.database.as_deref());
+                push("account", self.account.expose_opt());
+                push("host", self.host.expose_opt());
+                push("database", self.database.expose_opt());
             }
             "bigquery" => push("project_id", self.project_id.as_deref()),
             "trino" => {
-                push("host", self.host.as_deref());
-                push("catalog", self.database.as_deref());
+                push("host", self.host.expose_opt());
+                push("catalog", self.database.expose_opt());
             }
             "postgres" | "redshift" => {
-                push("host", self.host.as_deref());
-                push("database", self.database.as_deref());
+                push("host", self.host.expose_opt());
+                push("database", self.database.expose_opt());
                 // A port in `[extra]` moves the endpoint as much as one
                 // written `host:port` (which the host locator keeps).
                 let port = self.extra.get("port").map(|p| match p {
@@ -5265,7 +5271,7 @@ impl AdapterConfig {
             "clickhouse" => {
                 // Every target names its database, so the session's default
                 // `database` does not locate them; host and port do.
-                push("host", self.host.as_deref());
+                push("host", self.host.expose_opt());
                 let port = self.extra.get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),
@@ -5273,8 +5279,8 @@ impl AdapterConfig {
                 push("port", port.as_deref());
             }
             "sqlserver" => {
-                push("host", self.host.as_deref());
-                push("database", self.database.as_deref());
+                push("host", self.host.expose_opt());
+                push("database", self.database.expose_opt());
                 let port = self.extra.get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),
@@ -5282,18 +5288,18 @@ impl AdapterConfig {
                 push("port", port.as_deref());
             }
             "fivetran" => push("destination_id", self.destination_id.as_deref()),
-            "airbyte" | "iceberg" => push("host", self.host.as_deref()),
+            "airbyte" | "iceberg" => push("host", self.host.expose_opt()),
             "manual" => {}
             _ => {
-                push("host", self.host.as_deref());
-                push("http_path", self.http_path.as_deref());
-                push("account", self.account.as_deref());
-                push("database", self.database.as_deref());
+                push("host", self.host.expose_opt());
+                push("http_path", self.http_path.expose_opt());
+                push("account", self.account.expose_opt());
+                push("database", self.database.expose_opt());
                 push("project_id", self.project_id.as_deref());
                 push("destination_id", self.destination_id.as_deref());
                 push(
                     "path",
-                    self.path.as_deref().map(canonical_path_string).as_deref(),
+                    self.path.expose_opt().map(canonical_path_string).as_deref(),
                 );
             }
         }
@@ -8860,7 +8866,7 @@ mod tests {
         let cfg = load_rocky_config_credential_tolerant(&path)
             .expect("tolerant load must accept an unset placeholder");
         assert_eq!(
-            cfg.adapters.get("wh").map(|a| a.host.as_deref()),
+            cfg.adapters.get("wh").map(|a| a.host.expose_opt()),
             Some(Some("${ROCKY_TEST_UNSET_HOST_1536}")),
             "the placeholder must survive verbatim, not collapse to empty"
         );
@@ -9334,7 +9340,7 @@ token = "pat"
         let adapter = config.adapters.get("default").expect("adapter parsed");
         assert_eq!(adapter.adapter_type, "databricks");
         assert_eq!(
-            adapter.host.as_deref(),
+            adapter.host.expose_opt(),
             Some("${ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST}"),
             "the placeholder must survive verbatim, never silently blank"
         );
@@ -10728,6 +10734,108 @@ autonomy_budget = { failures = 2, window = "${ROCKY_T1919_POLICY}" }
         assert!(json.contains("${ROCKY_T1919_POLICY}_*"), "{json}");
     }
 
+    /// The DuckDB, Databricks and Snowflake connection fields hold a resolved
+    /// `${VAR}` value for the adapter and print it only as `${NAME}`: in
+    /// `{:?}` of the whole config, in serialized JSON, and in `Display`.
+    /// Before this change each field was a `String` and printed the value.
+    #[test]
+    fn resolved_adapter_connection_fields_print_only_as_their_placeholders() {
+        // One distinct value per field, so a leak names the field.
+        const VARS: [(&str, &str); 10] = [
+            (
+                "ROCKY_T1919_DUCK_PATH",
+                "/tmp/ROCKY-1919-DUCK-PATH-c2e8.duckdb",
+            ),
+            ("ROCKY_T1919_DBX_HOST", "ROCKY-1919-DBX-HOST-9a41.example"),
+            (
+                "ROCKY_T1919_DBX_HTTP",
+                "/sql/1.0/warehouses/ROCKY-1919-HTTP-51b0",
+            ),
+            ("ROCKY_T1919_DBX_CLIENT", "ROCKY-1919-DBX-CLIENT-07dd"),
+            ("ROCKY_T1919_SF_ACCOUNT", "ROCKY-1919-SF-ACCOUNT-3c6f"),
+            ("ROCKY_T1919_SF_WH", "ROCKY-1919-SF-WAREHOUSE-e4a2"),
+            ("ROCKY_T1919_SF_USER", "ROCKY-1919-SF-USER-8b13"),
+            ("ROCKY_T1919_SF_KEY", "/keys/ROCKY-1919-SF-KEYPATH-6f90.pem"),
+            ("ROCKY_T1919_SF_ROLE", "ROCKY-1919-SF-ROLE-a7c5"),
+            ("ROCKY_T1919_SF_DB", "ROCKY-1919-SF-DATABASE-2d38"),
+        ];
+        for (name, value) in VARS {
+            // SAFETY: test-only; every variable name is unique to this test.
+            unsafe { std::env::set_var(name, value) };
+        }
+        let (_d, path) = write_cfg(
+            r#"
+[adapter.duck]
+type = "duckdb"
+path = "${ROCKY_T1919_DUCK_PATH}"
+
+[adapter.dbx]
+type = "databricks"
+host = "${ROCKY_T1919_DBX_HOST}"
+http_path = "${ROCKY_T1919_DBX_HTTP}"
+client_id = "${ROCKY_T1919_DBX_CLIENT}"
+
+[adapter.sf]
+type = "snowflake"
+account = "${ROCKY_T1919_SF_ACCOUNT}"
+warehouse = "${ROCKY_T1919_SF_WH}"
+username = "${ROCKY_T1919_SF_USER}"
+private_key_path = "${ROCKY_T1919_SF_KEY}"
+role = "${ROCKY_T1919_SF_ROLE}"
+database = "${ROCKY_T1919_SF_DB}"
+"#,
+        );
+        let loaded = load_rocky_config(&path);
+        for (name, _) in VARS {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(name) };
+        }
+        let cfg = loaded.expect("the config loads");
+        let duck = &cfg.adapters["duck"];
+        let dbx = &cfg.adapters["dbx"];
+        let sf = &cfg.adapters["sf"];
+
+        // The adapter connect path still reads every plaintext value.
+        let exposed = [
+            duck.path.expose_opt(),
+            dbx.host.expose_opt(),
+            dbx.http_path.expose_opt(),
+            dbx.client_id.expose_opt(),
+            sf.account.expose_opt(),
+            sf.warehouse.expose_opt(),
+            sf.username.expose_opt(),
+            sf.private_key_path.expose_opt(),
+            sf.role.expose_opt(),
+            sf.database.expose_opt(),
+        ];
+        for ((_, value), got) in VARS.iter().zip(exposed) {
+            assert_eq!(got, Some(*value));
+        }
+
+        let debug = format!("{cfg:?}");
+        let adapter_debug = format!("{dbx:?} {sf:?} {duck:?}");
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let display = format!(
+            "{} {} {}",
+            dbx.host.as_ref().unwrap(),
+            sf.account.as_ref().unwrap(),
+            duck.path.as_ref().unwrap()
+        );
+        for printed in [&debug, &adapter_debug, &json] {
+            for (name, value) in VARS {
+                assert!(!printed.contains(value), "{name}'s value leaked: {printed}");
+                assert!(
+                    printed.contains(&format!("${{{name}}}")),
+                    "{name}: {printed}"
+                );
+            }
+        }
+        assert_eq!(
+            display,
+            "${ROCKY_T1919_DBX_HOST} ${ROCKY_T1919_SF_ACCOUNT} ${ROCKY_T1919_DUCK_PATH}"
+        );
+    }
+
     /// A value the TOML parser unescapes is stored in its unescaped form,
     /// which is not the registered bytes. It must still print as `${NAME}`.
     #[test]
@@ -11263,7 +11371,7 @@ fail_fast = false
             "databricks"
         );
         assert_eq!(
-            config.adapters["databricks_prod"].host.as_deref(),
+            config.adapters["databricks_prod"].host.expose_opt(),
             Some("workspace.cloud.databricks.com")
         );
         assert_eq!(config.adapters["fivetran_main"].adapter_type, "fivetran");
@@ -11727,7 +11835,7 @@ target = { catalog_template = "main", schema_template = "staging" }
         assert!(config.adapters.contains_key("default"));
         assert_eq!(config.adapters["default"].adapter_type, "duckdb");
         assert_eq!(
-            config.adapters["default"].path.as_deref(),
+            config.adapters["default"].path.expose_opt(),
             Some("test.duckdb")
         );
     }

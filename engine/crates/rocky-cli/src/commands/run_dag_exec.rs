@@ -8,6 +8,7 @@
 //! Results are emitted as a [`DagRunOutput`] in JSON mode so orchestrators
 //! can correlate per-node status, timing, and errors.
 
+use rocky_core::env_string::ExposeOpt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -564,7 +565,9 @@ fn plan_runtime_dag(
 #[cfg(feature = "duckdb")]
 fn default_catalog_of(adapter: &rocky_core::config::AdapterConfig) -> Option<String> {
     (adapter.adapter_type == "duckdb").then(|| {
-        rocky_duckdb::dialect::catalog_name_for_path(adapter.path.as_deref().unwrap_or(":memory:"))
+        rocky_duckdb::dialect::catalog_name_for_path(
+            adapter.path.expose_opt().unwrap_or(":memory:"),
+        )
     })
 }
 

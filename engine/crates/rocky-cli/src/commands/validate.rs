@@ -1,3 +1,4 @@
+use rocky_core::env_string::ExposeOpt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -579,7 +580,7 @@ fn validate_adapter(
 
     match adapter.adapter_type.as_str() {
         "databricks" => {
-            if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
+            if adapter.host.is_none() || adapter.host.expose_opt() == Some("") {
                 ok = false;
                 msgs.push(ValidateMessage {
                     severity: "warn".into(),
@@ -589,7 +590,7 @@ fn validate_adapter(
                     field: Some(format!("adapter.{name}.host")),
                 });
             }
-            if adapter.http_path.is_none() || adapter.http_path.as_deref() == Some("") {
+            if adapter.http_path.is_none() || adapter.http_path.expose_opt() == Some("") {
                 ok = false;
                 msgs.push(ValidateMessage {
                     severity: "warn".into(),
@@ -1296,7 +1297,7 @@ fn validate_replication_pipeline(
         && disc_adapter.adapter_type == "duckdb"
         && disc_adapter
             .path
-            .as_deref()
+            .expose_opt()
             .is_none_or(|p| p.is_empty() || p == ":memory:")
     {
         msgs.push(ValidateMessage {
@@ -1396,7 +1397,8 @@ fn duckdb_catalog_template_mismatch(
     if target_adapter.adapter_type != "duckdb" {
         return None;
     }
-    let path = target_adapter.path.as_ref()?;
+    let shown_path = target_adapter.path.as_ref()?;
+    let path = shown_path.expose();
     if !rocky_core::schema::template_placeholder_names(&pipeline.target.catalog_template).is_empty()
     {
         return None;
@@ -1410,7 +1412,7 @@ fn duckdb_catalog_template_mismatch(
         code: "V055".into(),
         message: format!(
             "pipeline.{name}: target.catalog_template = '{}' but DuckDB names the catalog \
-             '{expected}' for adapter.{}'s path '{path}' (the file's base name, or \
+             '{expected}' for adapter.{}'s path '{shown_path}' (the file's base name, or \
              '<name>_db' when that name collides with a reserved catalog) — `rocky run` will \
              fail with a catalog-not-found error unless target.catalog_template matches.",
             pipeline.target.catalog_template, pipeline.target.adapter

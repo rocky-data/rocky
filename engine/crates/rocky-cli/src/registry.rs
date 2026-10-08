@@ -3,6 +3,7 @@
 //! The registry parses `RockyConfig.adapters` and creates the appropriate
 //! trait-object implementations, stored by name for pipeline resolution.
 
+use rocky_core::env_string::ExposeOpt;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -121,15 +122,15 @@ pub(crate) fn sqlserver_config(
         v.as_ref().map(rocky_core::redacted::RedactedString::expose)
     }
     let creds = rocky_sqlserver::Credentials {
-        username: adapter_cfg.username.as_deref(),
+        username: adapter_cfg.username.expose_opt(),
         password: expose(&adapter_cfg.password),
         access_token: expose(&adapter_cfg.oauth_token),
-        client_id: adapter_cfg.client_id.as_deref(),
+        client_id: adapter_cfg.client_id.expose_opt(),
         client_secret: expose(&adapter_cfg.client_secret),
     };
     rocky_sqlserver::SqlServerConfig::new(
-        adapter_cfg.host.as_deref(),
-        adapter_cfg.database.as_deref(),
+        adapter_cfg.host.expose_opt(),
+        adapter_cfg.database.expose_opt(),
         &creds,
         Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
         &adapter_cfg.extra,
@@ -182,9 +183,9 @@ pub(crate) fn postgres_config(
     extra.remove("late_binding_views");
     let cfg = rocky_postgres::PgConfig::new(
         flavor,
-        adapter_cfg.host.as_deref(),
-        adapter_cfg.database.as_deref(),
-        adapter_cfg.username.as_deref(),
+        adapter_cfg.host.expose_opt(),
+        adapter_cfg.database.expose_opt(),
+        adapter_cfg.username.expose_opt(),
         adapter_cfg
             .password
             .as_ref()
@@ -209,9 +210,9 @@ pub(crate) fn clickhouse_config(
     adapter_cfg: &AdapterConfig,
 ) -> Result<rocky_clickhouse::ChConfig> {
     rocky_clickhouse::ChConfig::new(
-        adapter_cfg.host.as_deref(),
-        adapter_cfg.database.as_deref(),
-        adapter_cfg.username.as_deref(),
+        adapter_cfg.host.expose_opt(),
+        adapter_cfg.database.expose_opt(),
+        adapter_cfg.username.expose_opt(),
         adapter_cfg
             .password
             .as_ref()
@@ -347,9 +348,9 @@ impl AdapterRegistry {
                 "databricks" => {
                     let host = adapter_cfg
                         .host
-                        .as_deref()
+                        .expose_opt()
                         .context(format!("adapters.{name}: host required for databricks"))?;
-                    let http_path = adapter_cfg.http_path.as_deref().context(format!(
+                    let http_path = adapter_cfg.http_path.expose_opt().context(format!(
                         "adapters.{name}: http_path required for databricks"
                     ))?;
 
@@ -361,7 +362,7 @@ impl AdapterRegistry {
                     let auth = Auth::from_config(AuthConfig {
                         host: host.to_string(),
                         token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
-                        client_id: adapter_cfg.client_id.clone(),
+                        client_id: adapter_cfg.client_id.expose_opt().map(str::to_owned),
                         client_secret: adapter_cfg
                             .client_secret
                             .as_ref()
@@ -394,7 +395,7 @@ impl AdapterRegistry {
                         Auth::from_config(AuthConfig {
                             host: host.to_string(),
                             token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
-                            client_id: adapter_cfg.client_id.clone(),
+                            client_id: adapter_cfg.client_id.expose_opt().map(str::to_owned),
                             client_secret: adapter_cfg
                                 .client_secret
                                 .as_ref()
@@ -414,8 +415,10 @@ impl AdapterRegistry {
                 "duckdb" => {
                     // Use a persistent file when `path` is set, otherwise in-memory.
                     // Discovery + warehouse share the same connector via `Arc<Mutex<>>`.
-                    let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_deref() {
-                        DuckDbWarehouseAdapter::open(std::path::Path::new(p))
+                    // The message prints the path as `${NAME}`; only the
+                    // open call sees the plaintext (#1919).
+                    let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_ref() {
+                        DuckDbWarehouseAdapter::open(std::path::Path::new(p.expose()))
                             .context(format!("adapters.{name}: failed to open DuckDB at '{p}'"))?
                     } else {
                         DuckDbWarehouseAdapter::in_memory().context(format!(
@@ -528,7 +531,7 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "airbyte" => {
-                    let api_url = adapter_cfg.host.as_deref().context(format!(
+                    let api_url = adapter_cfg.host.expose_opt().context(format!(
                         "adapters.{name}: host (API URL) required for airbyte"
                     ))?;
                     let auth_token = adapter_cfg.token.as_ref().map(|s| s.expose().to_string());
@@ -540,7 +543,7 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "iceberg" => {
-                    let catalog_url = adapter_cfg.host.as_deref().context(format!(
+                    let catalog_url = adapter_cfg.host.expose_opt().context(format!(
                         "adapters.{name}: host (REST catalog URL) required for iceberg"
                     ))?;
                     let auth_token = adapter_cfg.token.as_ref().map(|s| s.expose().to_string());
@@ -587,17 +590,17 @@ impl AdapterRegistry {
                 "snowflake" => {
                     let account = adapter_cfg
                         .account
-                        .as_deref()
+                        .expose_opt()
                         .context(format!("adapters.{name}: account required for snowflake"))?;
                     let sf_warehouse = adapter_cfg
                         .warehouse
-                        .as_deref()
+                        .expose_opt()
                         .context(format!("adapters.{name}: warehouse required for snowflake"))?;
 
                     let sf_auth = rocky_snowflake::auth::Auth::from_config(
                         rocky_snowflake::auth::AuthConfig {
                             account: account.to_string(),
-                            username: adapter_cfg.username.clone(),
+                            username: adapter_cfg.username.expose_opt().map(str::to_owned),
                             password: adapter_cfg
                                 .password
                                 .as_ref()
@@ -606,7 +609,10 @@ impl AdapterRegistry {
                                 .oauth_token
                                 .as_ref()
                                 .map(|s| s.expose().to_string()),
-                            private_key_path: adapter_cfg.private_key_path.clone(),
+                            private_key_path: adapter_cfg
+                                .private_key_path
+                                .expose_opt()
+                                .map(str::to_owned),
                             pat: adapter_cfg.pat.as_ref().map(|s| s.expose().to_string()),
                         },
                     )
@@ -615,9 +621,9 @@ impl AdapterRegistry {
                     let sf_connector_config = rocky_snowflake::connector::ConnectorConfig {
                         account: account.to_string(),
                         warehouse: sf_warehouse.to_string(),
-                        database: adapter_cfg.database.clone(),
+                        database: adapter_cfg.database.expose_opt().map(str::to_owned),
                         schema: None,
-                        role: adapter_cfg.role.clone(),
+                        role: adapter_cfg.role.expose_opt().map(str::to_owned),
                         timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
                         retry: adapter_cfg.retry.clone(),
                     };
@@ -675,14 +681,14 @@ impl AdapterRegistry {
                     // provide `username` to populate `X-Trino-User`).
                     // `database` is repurposed as the default catalog;
                     // schema is left to be supplied per-pipeline.
-                    let coordinator = adapter_cfg.host.as_deref().context(format!(
+                    let coordinator = adapter_cfg.host.expose_opt().context(format!(
                         "adapters.{name}: host (coordinator URL) required for trino"
                     ))?;
                     let auth = if let Some(token) = adapter_cfg.token.as_ref() {
                         TrinoAuth::jwt(token.expose().to_string())
                             .context(format!("adapters.{name}: invalid Trino JWT token"))?
                     } else {
-                        let user = adapter_cfg.username.as_deref().context(format!(
+                        let user = adapter_cfg.username.expose_opt().context(format!(
                             "adapters.{name}: username required for trino basic auth"
                         ))?;
                         let pw = adapter_cfg.password.as_ref().context(format!(
@@ -692,10 +698,10 @@ impl AdapterRegistry {
                             .context(format!("adapters.{name}: invalid Trino basic auth"))?
                     };
                     let mut cfg = TrinoClientConfig::new(coordinator);
-                    if let Some(u) = adapter_cfg.username.as_deref() {
+                    if let Some(u) = adapter_cfg.username.expose_opt() {
                         cfg = cfg.with_user(u);
                     }
-                    if let Some(c) = adapter_cfg.database.as_deref() {
+                    if let Some(c) = adapter_cfg.database.expose_opt() {
                         cfg = cfg.with_default_catalog(c);
                     }
                     cfg = cfg
@@ -752,7 +758,7 @@ impl AdapterRegistry {
                 // one (#1609).
                 #[cfg(test)]
                 "recording" => {
-                    let key = adapter_cfg.path.as_deref().unwrap_or_default();
+                    let key = adapter_cfg.path.expose_opt().unwrap_or_default();
                     let adapter = Arc::new(crate::testing::RecordingWarehouseAdapter::new(key));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
@@ -769,7 +775,7 @@ impl AdapterRegistry {
                 "test-fail-write" => {
                     let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory()
                         .context(format!("adapters.{name}: in-memory DuckDB for test double"))?;
-                    let failure = match adapter_cfg.path.as_deref() {
+                    let failure = match adapter_cfg.path.expose_opt() {
                         Some("auth") => crate::testing::FailingWriteKind::Auth,
                         Some("rate-limit") => crate::testing::FailingWriteKind::RateLimit,
                         Some("breaker") => crate::testing::FailingWriteKind::CircuitBreaker,
@@ -946,16 +952,16 @@ impl AdapterRegistry {
             let adapter_cfg = self.adapter_configs.get(name);
             let auth = adapter_cfg.and_then(|cfg| {
                 Auth::from_config(AuthConfig {
-                    host: cfg.host.clone().unwrap_or_default(),
+                    host: cfg.host.expose_opt().unwrap_or_default().to_owned(),
                     token: cfg.token.as_ref().map(|s| s.expose().to_string()),
-                    client_id: cfg.client_id.clone(),
+                    client_id: cfg.client_id.expose_opt().map(str::to_owned),
                     client_secret: cfg.client_secret.as_ref().map(|s| s.expose().to_string()),
                 })
                 .ok()
             });
             return match auth {
                 Some(a) => {
-                    let host = adapter_cfg.and_then(|c| c.host.as_deref()).unwrap_or("");
+                    let host = adapter_cfg.and_then(|c| c.host.expose_opt()).unwrap_or("");
                     Box::new(DatabricksGovernanceAdapter::new(connector, host, a))
                 }
                 None => Box::new(DatabricksGovernanceAdapter::without_workspace(connector)),
@@ -989,11 +995,11 @@ impl AdapterRegistry {
     ) -> Option<Arc<dyn GovernanceCatalogClient>> {
         if self.connectors.contains_key(name) {
             let adapter_cfg = self.adapter_configs.get(name)?;
-            let host = adapter_cfg.host.as_deref()?;
+            let host = adapter_cfg.host.expose_opt()?;
             let auth = Auth::from_config(AuthConfig {
                 host: host.to_string(),
                 token: adapter_cfg.token.as_ref().map(|s| s.expose().to_string()),
-                client_id: adapter_cfg.client_id.clone(),
+                client_id: adapter_cfg.client_id.expose_opt().map(str::to_owned),
                 client_secret: adapter_cfg
                     .client_secret
                     .as_ref()
@@ -1060,16 +1066,16 @@ impl AdapterRegistry {
 
         let account = adapter_cfg
             .account
-            .as_deref()
+            .expose_opt()
             .context(format!("adapters.{name}: account required for snowflake"))?;
         let sf_warehouse = adapter_cfg
             .warehouse
-            .as_deref()
+            .expose_opt()
             .context(format!("adapters.{name}: warehouse required for snowflake"))?;
 
         let sf_auth = rocky_snowflake::auth::Auth::from_config(rocky_snowflake::auth::AuthConfig {
             account: account.to_string(),
-            username: adapter_cfg.username.clone(),
+            username: adapter_cfg.username.expose_opt().map(str::to_owned),
             password: adapter_cfg
                 .password
                 .as_ref()
@@ -1078,7 +1084,7 @@ impl AdapterRegistry {
                 .oauth_token
                 .as_ref()
                 .map(|s| s.expose().to_string()),
-            private_key_path: adapter_cfg.private_key_path.clone(),
+            private_key_path: adapter_cfg.private_key_path.expose_opt().map(str::to_owned),
             pat: None,
         })
         .context(format!("adapters.{name}: auth configuration error"))?;
@@ -1087,9 +1093,9 @@ impl AdapterRegistry {
             rocky_snowflake::connector::ConnectorConfig {
                 account: account.to_string(),
                 warehouse: sf_warehouse.to_string(),
-                database: adapter_cfg.database.clone(),
+                database: adapter_cfg.database.expose_opt().map(str::to_owned),
                 schema: None,
-                role: adapter_cfg.role.clone(),
+                role: adapter_cfg.role.expose_opt().map(str::to_owned),
                 timeout: Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(120)),
                 retry: adapter_cfg.retry.clone(),
             },
@@ -1257,6 +1263,56 @@ kind = "discovery"
         assert!(msg.contains("workspace/rocky.toml"));
         assert!(msg.contains("[pipelines.raw_replication.source]"));
         assert!(msg.contains("discovery = { adapter = \"metadata\" }"));
+    }
+
+    /// A DuckDB `path` from `${VAR}` reaches the adapter as plaintext: the
+    /// database file is created at the resolved path. The open error names
+    /// the path only as `${NAME}` (#1919).
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_resolved_duckdb_path_reaches_the_adapter_and_prints_as_its_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rocky-1919-registry-open.duckdb");
+        let missing = dir.path().join("no-such-dir-1919").join("x.duckdb");
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            "[adapter.ok]\ntype = \"duckdb\"\npath = \"${ROCKY_T1919_REG_OK}\"\n",
+        )
+        .unwrap();
+        let bad_path = dir.path().join("bad.toml");
+        std::fs::write(
+            &bad_path,
+            "[adapter.bad]\ntype = \"duckdb\"\npath = \"${ROCKY_T1919_REG_BAD}\"\n",
+        )
+        .unwrap();
+        // SAFETY: test-only; the variable names are unique to this test.
+        unsafe {
+            std::env::set_var("ROCKY_T1919_REG_OK", &db);
+            std::env::set_var("ROCKY_T1919_REG_BAD", &missing);
+        }
+        let ok = rocky_core::config::load_rocky_config(&cfg_path);
+        let bad = rocky_core::config::load_rocky_config(&bad_path);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_REG_OK");
+            std::env::remove_var("ROCKY_T1919_REG_BAD");
+        }
+
+        let ok = ok.expect("the config loads");
+        AdapterRegistry::from_config(&ok).expect("the adapter opens");
+        assert!(db.exists(), "the adapter must open the resolved path");
+
+        let bad = bad.expect("the config loads");
+        let Err(err) = AdapterRegistry::from_config(&bad) else {
+            panic!("a path in a missing directory must not open");
+        };
+        let shown = err.to_string();
+        assert!(
+            !shown.contains(&missing.display().to_string()),
+            "the resolved path leaked: {shown}"
+        );
+        assert!(shown.contains("${ROCKY_T1919_REG_BAD}"), "{shown}");
     }
 
     #[test]

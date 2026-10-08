@@ -2192,6 +2192,7 @@ pub fn validate(dag: &UnifiedDag) -> Vec<UnifiedDagError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env_string::ExposeOpt;
 
     /// Attributes a flat model list to the config's single transformation
     /// pipeline — the shape every test here uses.
@@ -3949,7 +3950,7 @@ mod tests {
     fn duckdb_stem_catalog(adapter: &AdapterConfig) -> Option<String> {
         adapter
             .path
-            .as_deref()
+            .expose_opt()
             .and_then(|p| std::path::Path::new(p).file_stem())
             .and_then(std::ffi::OsStr::to_str)
             .map(str::to_owned)
