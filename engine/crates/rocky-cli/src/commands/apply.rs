@@ -9952,12 +9952,18 @@ auto_create_schemas = true
                 "an env swap in {label} must change the routing identity"
             );
         }
-        for value in ["proj-a", "dest-a"] {
-            assert!(
-                !base.contains(value),
-                "the identity must not hold the resolved value {value}"
-            );
-        }
+        // A hex digest cannot contain a short value, so a substring check
+        // proves nothing. Pin the shape instead: the raw JSON is longer than
+        // 64 characters and holds braces and quotes.
+        assert_eq!(
+            base.len(),
+            64,
+            "the identity must be a 64-char blake3 hex digest"
+        );
+        assert!(
+            base.chars().all(|c| c.is_ascii_hexdigit()),
+            "the identity must be hex only, not the config JSON: {base}"
+        );
     }
 
     #[test]

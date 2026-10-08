@@ -392,7 +392,11 @@ impl BigQueryAdapter {
             },
         };
 
-        debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
+        debug!(
+            sql = sql,
+            project = %rocky_core::secret_registry::render_placeholders(&self.project_id),
+            "executing BigQuery query"
+        );
 
         let resp = self
             .client

@@ -425,6 +425,20 @@ mod tests {
         assert_eq!(replacement_for("1234567"), None);
     }
 
+    /// A short `location`, project or destination id (for example `US`) is
+    /// not rewritten, so it prints as itself. This is the documented floor
+    /// behaviour, not a gap to close here.
+    #[test]
+    fn a_value_under_the_floor_prints_as_itself() {
+        let short = "Zq7x9kP";
+        assert!(short.len() < SECRET_LENGTH_FLOOR);
+        register_substitution("ROCKY_REGISTRY_PRINTS_SHORT", short);
+        assert_eq!(
+            render_placeholders(&format!("project {short} in US")),
+            format!("project {short} in US")
+        );
+    }
+
     #[test]
     fn the_floor_is_inclusive_at_exactly_eight_bytes() {
         let eight = "12345678";
