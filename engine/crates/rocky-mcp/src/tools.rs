@@ -4316,13 +4316,14 @@ impl RockyMcpServer {
     /// tool body (via [`Self::draft_marker_freezes`]); the local-backend
     /// evaluation is synchronous and uses it directly.
     ///
-    /// Under a remote `[state]` backend with a `[policy]` block the decision
-    /// row is published to the shared ledger in the same step
-    /// ([`rocky_cli::commands::evaluate_apply_policy_durable`], #2282). A
-    /// row left only in the local file is replaced by the loop's next
+    /// Under a remote `[state]` backend with a `[policy]` block, the Default
+    /// and Approver profiles publish the decision row to the shared ledger in
+    /// the same step ([`rocky_cli::commands::evaluate_apply_policy_durable`],
+    /// #2282). A row left only in the local file is replaced by the next
     /// `download_state` before review ever reads it. That path is
     /// fail-closed: an unreachable ledger is an error, and the caller's
-    /// rollback guard removes the draft.
+    /// rollback guard removes the draft. The Worker profile never publishes:
+    /// it records locally, and the fulfill loop's `propose` carries the row.
     ///
     /// `prior_classifications` is the pre-image for the dual evaluation
     /// (`draft_model` on an existing model); `None` is a plain evaluation.
@@ -4343,7 +4344,19 @@ impl RockyMcpServer {
         // A config that does not load cannot name a remote backend; the
         // synchronous gate answers it exactly (`NotConfigured` for an absent
         // file, `Unloadable` for a broken one — #1559).
-        let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path) else {
+        //
+        // The WORKER profile always takes the synchronous, local-only gate
+        // (#2282). It is the untrusted fulfill worker: publishing would need
+        // write access to the shared state blob that also carries freezes and
+        // budgets. Its row stays in the local file, and the trusted loop's
+        // `propose` publishes it (`evaluate_apply_policy_durable`'s
+        // `carry_drafts_for`). So the worker never uploads state.
+        let loaded = if self.profile == McpProfile::Worker {
+            None
+        } else {
+            rocky_core::config::load_rocky_config(&self.config_path).ok()
+        };
+        let Some(cfg) = loaded else {
             return Ok(match prior_classifications {
                 Some(prior) => {
                     rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
@@ -4383,6 +4396,7 @@ impl RockyMcpServer {
             &state_path,
             marker_freezes,
             prior_classifications,
+            None,
         )
         .await
         .map_err(|e| {

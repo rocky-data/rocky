@@ -486,7 +486,8 @@ pub async fn propose_governed_run_plan(
     // download here replaced the replicated `policy_decisions` table and
     // dropped the worker's local `draft_model` decision before review (#2282),
     // and left this propose's own row local-only for the next download to
-    // drop. Fail-closed on a download or publish failure.
+    // drop. The worker never uploads, so this seam also publishes the
+    // worker's local draft rows. Fail-closed on a download or publish failure.
     let gate = match &cfg {
         Some(cfg) => super::evaluate_apply_policy_durable(
             cfg,
@@ -499,6 +500,10 @@ pub async fn propose_governed_run_plan(
             state_path,
             &marker_freezes,
             None,
+            // The worker's `draft_model` rows live only in the local file
+            // (the worker never writes the remote ledger); this propose
+            // publishes them with its own row (#2282).
+            Some(&models),
         )
         .await
         .map_err(|e| ProposeError::LedgerDownload(format!("{e:#}")))?,

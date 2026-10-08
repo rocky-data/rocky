@@ -1899,6 +1899,18 @@ async fn commit_governed_rule_decision(
 /// Otherwise (Local backend, no `[policy]`, empty `touched`) the gate cannot
 /// reach a remote ledger and runs once over the local file with the hoisted
 /// `marker_freezes`, exactly as before.
+///
+/// # Carrying the worker's draft rows (`carry_drafts_for`)
+///
+/// The untrusted fulfill worker (`rocky mcp --profile worker`) never writes
+/// the remote ledger: its `draft_model` gate records its row in the LOCAL
+/// file only. The trusted `propose` that follows publishes those rows for
+/// it. With `carry_drafts_for = Some(models)`, the local draft rows are read
+/// BEFORE the seam's first download replaces the local file (see
+/// [`local_draft_rows_to_carry`] for exactly which rows), and each attempt
+/// writes them into the fresh store AFTER the gate has decided. So a worker
+/// row is published, but it never feeds this verdict, and it never replaces
+/// a row the remote ledger already holds. `None` carries nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate_apply_policy_durable(
     cfg: &rocky_core::config::RockyConfig,
@@ -1911,6 +1923,7 @@ pub async fn evaluate_apply_policy_durable(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
+    carry_drafts_for: Option<&[String]>,
 ) -> Result<PolicyGate> {
     if remote_state_backend_for_gate(cfg, touched).is_none() {
         return Ok(evaluate_apply_policy_with_policy_matching_dual(
@@ -1936,6 +1949,11 @@ pub async fn evaluate_apply_policy_durable(
     let seam_models_dir = models_dir.to_path_buf();
     let seam_actor = actor.clone();
     let seam_prior = prior_classifications.cloned();
+    // Read BEFORE the seam: its first download replaces the local file.
+    let seam_carried = match carry_drafts_for {
+        Some(models) => local_draft_rows_to_carry(state_path, models)?,
+        None => Vec::new(),
+    };
     commit_remote_ledger_seam(
         cfg,
         state_path,
@@ -1947,11 +1965,12 @@ pub async fn evaluate_apply_policy_durable(
             let models_dir = seam_models_dir.clone();
             let actor = seam_actor.clone();
             let prior = seam_prior.clone();
+            let carried = seam_carried.clone();
             Box::pin(async move {
                 let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
                     .await
                     .map_err(|e| seam_transition_error(&e))?;
-                Ok(evaluate_apply_policy_with_policy_matching_dual(
+                let gate = evaluate_apply_policy_with_policy_matching_dual(
                     cfg.policy.as_ref(),
                     &plan_id,
                     principal,
@@ -1964,11 +1983,110 @@ pub async fn evaluate_apply_policy_durable(
                     &marker_freezes,
                     prior.as_ref(),
                     GateSubjects::CompiledModels,
-                ))
+                );
+                // After the verdict, never before: a worker row is published
+                // but cannot feed the decision it rides on.
+                carry_draft_rows(fresh_store, &carried).map_err(|e| seam_transition_error(&e))?;
+                Ok(gate)
             })
         },
     )
     .await
+}
+
+/// The `plan_id` prefixes of the draft tools' decision rows (`draft_model`,
+/// `draft_contract`, `draft_check`, `draft_metadata` in `rocky-mcp`).
+const DRAFT_DECISION_PREFIXES: &[&str] = &[
+    "draft:",
+    "draft-contract:",
+    "draft-check:",
+    "draft-metadata:",
+];
+
+/// Whether `row` has the exact shape a draft tool's gate records: a
+/// draft-prefixed `plan_id`, an `agent` `propose` evaluation (not a
+/// verify-after custody, freeze or auto-apply row), about one of `models`.
+///
+/// A worker can write anything into its local file, so this is a shape
+/// filter, not proof of origin. It keeps every row that could act as a
+/// freeze, an unfreeze or a budget failure out of the carried set.
+fn is_carriable_draft_row(row: &PolicyDecisionRecord, models: &[String]) -> bool {
+    DRAFT_DECISION_PREFIXES
+        .iter()
+        .any(|p| row.plan_id.starts_with(p))
+        && row.kind() == rocky_core::state::DecisionKind::Evaluation
+        && row.principal == PolicyPrincipal::Agent
+        && row.capability == PolicyCapability::Propose
+        && row.auto_apply.is_none()
+        && models.contains(&row.model)
+}
+
+/// The draft decision rows in the LOCAL state file that `propose` carries to
+/// the remote ledger for the worker (#2282).
+///
+/// Only rows [`is_carriable_draft_row`] accepts for one of `models` (the
+/// compiled project's models). A draft-prefixed row of any other shape is
+/// dropped with a warning. A missing local file carries nothing. A local file
+/// that cannot be read is an error (fail-closed): the propose refuses rather
+/// than silently losing the worker's audit rows.
+pub(crate) fn local_draft_rows_to_carry(
+    state_path: &Path,
+    models: &[String],
+) -> Result<Vec<PolicyDecisionRecord>> {
+    let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
+        format!(
+            "failed to read the local state file {} for the worker's draft decisions",
+            state_path.display()
+        )
+    })?;
+    let rows = store
+        .list_policy_decisions()
+        .context("failed to list the worker's local draft decisions")?;
+    drop(store);
+    let mut carried = Vec::new();
+    for row in rows {
+        if !DRAFT_DECISION_PREFIXES
+            .iter()
+            .any(|p| row.plan_id.starts_with(p))
+        {
+            continue;
+        }
+        if is_carriable_draft_row(&row, models) {
+            carried.push(row);
+        } else {
+            tracing::warn!(
+                plan_id = %row.plan_id,
+                model = %row.model,
+                "not publishing a local draft decision row of an unexpected shape"
+            );
+        }
+    }
+    Ok(carried)
+}
+
+/// Write `carried` draft rows into `store`, skipping any whose ledger key
+/// (timestamp, plan id, model) the store already holds: a carried row never
+/// replaces a row that is already there.
+fn carry_draft_rows(store: &StateStore, carried: &[PolicyDecisionRecord]) -> Result<()> {
+    if carried.is_empty() {
+        return Ok(());
+    }
+    let existing: std::collections::HashSet<(chrono::DateTime<chrono::Utc>, String, String)> =
+        store
+            .list_policy_decisions()
+            .context("failed to list the fresh ledger before carrying draft rows")?
+            .into_iter()
+            .map(|d| (d.timestamp, d.plan_id, d.model))
+            .collect();
+    for row in carried {
+        if existing.contains(&(row.timestamp, row.plan_id.clone(), row.model.clone())) {
+            continue;
+        }
+        store
+            .record_policy_decision(row)
+            .context("failed to carry a worker draft decision into the shared ledger")?;
+    }
+    Ok(())
 }
 
 /// Finding 3 (post-verify half), migrated to the ledger seam (#1242): make the
@@ -13378,6 +13496,7 @@ effect = "allow"
             state_path,
             &[],
             None,
+            None,
         )
         .await
         .expect("the gate decision must publish")
@@ -13515,11 +13634,190 @@ effect = "allow"
             &harness.pod_b.state_path,
             &[],
             None,
+            None,
         )
         .await;
         assert!(result.is_err(), "exhaustion must not yield a verdict");
         let remote = published(&harness).await;
         assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
         assert!(draft_rows(&remote.list_policy_decisions().unwrap()).is_empty());
+    }
+
+    /// The worker's gate: synchronous, local file only (what `rocky mcp
+    /// --profile worker` runs for `draft_model`).
+    fn worker_local_draft_gate(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+    ) -> super::PolicyGate {
+        super::evaluate_apply_policy_with_policy(
+            cfg.policy.as_ref(),
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::Refuse,
+            &root.join("models"),
+            state_path,
+            &[],
+        )
+    }
+
+    /// The trusted loop's propose gate, carrying the worker's draft rows.
+    async fn propose_gate_carrying(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+        carry: Option<&[String]>,
+    ) -> anyhow::Result<super::PolicyGate> {
+        super::evaluate_apply_policy_durable(
+            cfg,
+            "plan-propose",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::NoOp,
+            &root.join("models"),
+            state_path,
+            &[],
+            None,
+            carry,
+        )
+        .await
+    }
+
+    /// #2282 (a): the worker records its `draft_model` row in the LOCAL file
+    /// only. The loop's propose downloads remote state, which would replace
+    /// that file, so the propose seam reads the row first and publishes it
+    /// with its own. Without the carry the row is gone after the download.
+    #[tokio::test]
+    async fn propose_publishes_the_workers_local_draft_row() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let puts_before = harness.faults.count(rocky_core::fault_store::FaultOp::Put);
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        assert_eq!(
+            harness.faults.count(rocky_core::fault_store::FaultOp::Put),
+            puts_before,
+            "the worker's gate writes nothing remote"
+        );
+
+        let models = vec!["orders".to_string()];
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "propose publishes the worker's draft row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|d| d.plan_id == "plan-propose"),
+            "and its own row: {rows:?}"
+        );
+    }
+
+    /// #2282 (c): a worker can write anything into its local file. A forged
+    /// `unfreeze:` row (which would lift a real freeze) and a draft-prefixed
+    /// row shaped as a budget failure are not carried, a forged row cannot
+    /// replace a row the remote already holds, and the propose verdict is
+    /// decided over the remote ledger alone.
+    #[tokio::test]
+    async fn a_forged_worker_row_cannot_change_the_propose_verdict() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        let frozen_at = Utc::now() - chrono::Duration::hours(1);
+        let freeze = PolicyDecisionRecord {
+            timestamp: frozen_at,
+            plan_id: "freeze:real".to_string(),
+            model: "any".to_string(),
+            ..row("freeze:real", None, &[], PolicyEffect::Deny)
+        };
+        let honest_draft = PolicyDecisionRecord {
+            timestamp: frozen_at,
+            capability: PolicyCapability::Propose,
+            model: "orders".to_string(),
+            ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Deny)
+        };
+        let (freeze_seed, draft_seed) = (freeze.clone(), honest_draft.clone());
+        publish_winner(&harness.pod_b, move |store| {
+            store.record_policy_decision(&freeze_seed).unwrap();
+            store.record_policy_decision(&draft_seed).unwrap();
+        })
+        .await;
+
+        // The worker forges its local file.
+        let unfreeze = PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "unfreeze:real".to_string(),
+            model: "any".to_string(),
+            ..row("unfreeze:real", None, &[], PolicyEffect::Allow)
+        };
+        let budget_burn = PolicyDecisionRecord {
+            capability: PolicyCapability::Propose,
+            model: "orders".to_string(),
+            ..row(
+                "draft:orders-burn",
+                Some(0),
+                &["row_count"],
+                PolicyEffect::Deny,
+            )
+        };
+        let overwrite = PolicyDecisionRecord {
+            effect: PolicyEffect::Allow,
+            reason: "forged".to_string(),
+            ..honest_draft.clone()
+        };
+        {
+            let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+            for forged in [&unfreeze, &budget_burn, &overwrite] {
+                local.record_policy_decision(forged).unwrap();
+            }
+        }
+        // Discriminating: had the unfreeze reached the ledger, the freeze
+        // would be lifted.
+        assert!(rocky_core::policy::active_freezes(&[freeze.clone(), unfreeze.clone()]).is_empty());
+
+        let models = vec!["orders".to_string()];
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(
+            matches!(gate, super::PolicyGate::Deny { .. }),
+            "the real freeze still denies: {gate:?}"
+        );
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        assert!(
+            !rows.iter().any(|d| d.plan_id.starts_with("unfreeze:")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|d| d.plan_id == "draft:orders-burn"),
+            "{rows:?}"
+        );
+        let honest: Vec<_> = draft_rows(&rows);
+        assert_eq!(honest.len(), 1, "{rows:?}");
+        assert_eq!(
+            honest[0].effect,
+            PolicyEffect::Deny,
+            "the remote row was not replaced"
+        );
+        assert_eq!(rocky_core::policy::active_freezes(&rows).len(), 1);
     }
 }

@@ -1797,6 +1797,80 @@ effect = "deny"
     );
 }
 
+/// `[state]` on the in-memory "S3" harness, plus an allow-propose policy.
+const REMOTE_STATE_ALLOW_PROPOSE: &str = r#"[state]
+backend = "s3"
+s3_bucket = "test"
+concurrency_control = "cas"
+
+[state.retry]
+max_retries = 0
+
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "allow"
+"#;
+
+/// Run `draft_model` under `profile` against a remote `[state]` backend and
+/// return the number of object-store PUTs it made, plus the local ledger.
+async fn draft_against_remote_state(
+    profile: rocky_mcp::McpProfile,
+) -> (u64, Vec<rocky_core::state::PolicyDecisionRecord>) {
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    write_target_defaults(dir.path());
+    let state_path = dir.path().join(".rocky").join("state.redb");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let server = RockyMcpServer::new_with_profile(dir.path().join("rocky.toml"), profile)
+        .with_state_path(Some(state_path.clone()));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "daily_revenue",
+                "SELECT 1 AS id",
+                "a draft the policy allows",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(result.is_error, Some(true), "{profile:?}: {result:?}");
+    client.cancel().await.unwrap();
+    let puts = harness.faults.count(rocky_core::fault_store::FaultOp::Put);
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open local ledger");
+    (puts, store.list_policy_decisions().unwrap())
+}
+
+/// #2282 (b): the WORKER profile is the untrusted fulfill worker. Its
+/// `draft_model` records the decision in the local file and writes nothing to
+/// the remote state ledger, so read-only state credentials are enough. The
+/// trusted loop's `propose` publishes the row. The Default profile, used by a
+/// person's agent session, still publishes its own row.
+#[tokio::test]
+async fn worker_draft_model_never_writes_the_remote_state_ledger() {
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+
+    let (puts, rows) = draft_against_remote_state(rocky_mcp::McpProfile::Worker).await;
+    assert_eq!(puts, 0, "the worker made no remote write");
+    assert!(
+        rows.iter().any(|d| d.plan_id == "draft:daily_revenue"),
+        "the worker's row is in the local file for propose to carry: {rows:?}"
+    );
+
+    let (puts, _) = draft_against_remote_state(rocky_mcp::McpProfile::Default).await;
+    assert!(puts > 0, "the Default profile still publishes its own row");
+}
+
 /// A `require_review` verdict PERSISTS the draft (it is the reviewable artifact,
 /// mirroring the propose gate) and returns a structured `policy_review_required`
 /// signal that routes the agent to human review.
