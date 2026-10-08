@@ -3112,7 +3112,12 @@ fn infer_case_type(
 /// say nullable, never wrongly non-null (#2299).
 fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyType) -> bool {
     use RockyType as T;
-    // Any type renders as text.
+    // A VARIANT can hold a JSON null, which casts to SQL NULL (Databricks,
+    // Snowflake), and an Unknown source may be one. Both stay fallible.
+    if matches!(source, T::Variant | T::Unknown) {
+        return true;
+    }
+    // Any other type renders as text.
     if *target == T::String {
         return false;
     }
@@ -4242,7 +4247,7 @@ mod tests {
             ("CAST(dt AS INT)", true),
             ("CAST(b AS INT)", false),
             ("CAST(u AS INT)", true),
-            ("CAST(u AS STRING)", false),
+            ("CAST(u AS STRING)", true),
             ("CAST(0 AS DECIMAL(18,2))", false),
             ("CAST(1000 AS DECIMAL(5,2))", true),
             ("CAST(100 AS DECIMAL(5,2))", false),

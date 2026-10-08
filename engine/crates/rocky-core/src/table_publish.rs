@@ -1040,13 +1040,13 @@ mod tests {
         );
     }
 
-    /// With the default spacing the fence runs before the first table, every
+    /// With `FENCE_EVERY` spacing (opt-in) the fence runs before the first table, every
     /// `FENCE_EVERY`th table and the last. A take-over during the first
     /// move lets the next `FENCE_EVERY - 1` tables move, and the fence
     /// before table `FENCE_EVERY` stops the publisher. The last table is
     /// never moved.
     #[tokio::test]
-    async fn the_default_fence_spacing_stops_a_fenced_publisher_at_the_next_fence() {
+    async fn a_spaced_fence_stops_a_fenced_publisher_at_the_next_fence() {
         let dir = TempDir::new().unwrap();
         let (session, path) = local(&dir);
         let backend = TakeOverDuringMove {
