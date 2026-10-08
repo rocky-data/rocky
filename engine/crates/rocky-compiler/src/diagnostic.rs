@@ -569,14 +569,17 @@ pub const W053: &str = "W053";
 /// `accepted_values` and `relationships` (dropped, counted); and a
 /// `dbt run --empty` that did not build every model.
 pub const W055: &str = "W055";
-/// A transformation `incremental` model sets neither `lookback` nor `unique_key`.
+/// A transformation `incremental` model sets no `lookback` (with or without
+/// `unique_key`).
 ///
 /// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
 /// The incremental filter is a strict `>` against the target's own
 /// `MAX(<watermark>)`, so a row that arrives late with a timestamp equal to that
-/// maximum is never loaded. Appending with `>=` would load the same rows again
-/// on every run, so Rocky does not change the comparison: set `lookback` with a
-/// `unique_key` to merge the re-read window, or accept the gap. A warning, not
+/// maximum is never loaded. `unique_key` alone does not fix this: it merges the
+/// rows the filter reads, and the filter never reads that row. Appending with
+/// `>=` would load the same rows again on every run, so Rocky does not change
+/// the comparison: set `lookback` with a `unique_key` to merge the re-read
+/// window, or accept the gap. A warning, not
 /// an error: a source that never back-fills equal timestamps is safe.
 pub const W056: &str = "W056";
 

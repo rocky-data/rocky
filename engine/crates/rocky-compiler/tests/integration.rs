@@ -1171,8 +1171,9 @@ fn lookback_without_unique_key_warns_w046() {
 }
 
 /// The strict `>` watermark skips a late row whose timestamp equals the
-/// target's `MAX`. With neither `lookback` nor `unique_key` the compiler warns
-/// (W056); a lookback or a key silences it. Warning, not error.
+/// target's `MAX`. With no `lookback` the compiler warns (W056), with or
+/// without `unique_key`: a key only merges rows the filter reads, and the
+/// filter never reads that row. A lookback silences it. Warning, not error.
 #[test]
 fn append_only_incremental_without_lookback_warns_w056() {
     let sql = "SELECT id, updated_at FROM src WHERE @incremental_filter";
@@ -1195,6 +1196,14 @@ fn append_only_incremental_without_lookback_warns_w056() {
     );
     assert_eq!(
         w056("type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]"),
+        1,
+        "unique_key without lookback still loses the late row"
+    );
+    assert_eq!(
+        w056(
+            "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]\n\
+             lookback = \"1 day\""
+        ),
         0
     );
     assert!(!compile_leaf(INCREMENTAL_WM, sql).has_errors);

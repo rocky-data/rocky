@@ -439,7 +439,7 @@ span, and sometimes a suggested fix.
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
-| `W056` | An `incremental` model sets neither `lookback` nor `unique_key`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded |
+| `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
