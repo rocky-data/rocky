@@ -223,40 +223,10 @@ impl ExtraMap {
             .map(|(k, v)| {
                 (
                     crate::secret_registry::render_placeholders(k),
-                    render_extra_value(v.clone()),
+                    crate::secret_registry::render_json_placeholders(v.clone()),
                 )
             })
             .collect()
-    }
-}
-
-/// [`crate::secret_registry::render_json_placeholders`], plus numbers: a
-/// number whose digits hold a resolved value prints as a string with
-/// `${NAME}` in place of them.
-fn render_extra_value(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Number(n) => {
-            let text = n.to_string();
-            let rendered = crate::secret_registry::render_placeholders(&text);
-            if rendered == text {
-                Value::Number(n)
-            } else {
-                Value::String(rendered)
-            }
-        }
-        Value::Array(items) => Value::Array(items.into_iter().map(render_extra_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, v)| {
-                    (
-                        crate::secret_registry::render_placeholders(&k),
-                        render_extra_value(v),
-                    )
-                })
-                .collect(),
-        ),
-        other => crate::secret_registry::render_json_placeholders(other),
     }
 }
 

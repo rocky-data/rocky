@@ -232,8 +232,9 @@ pub fn render_placeholders(text: &str) -> String {
 }
 
 /// [`render_placeholders`] over every string in a JSON document: string
-/// values and object keys, at any depth. Numbers, booleans and structure are
-/// left as they are.
+/// values, object keys and numbers, at any depth. A number that holds a
+/// resolved value prints as a string. Booleans and structure are left as
+/// they are.
 ///
 /// For an output that is built as a `serde_json::Value` from a config type
 /// rather than from typed fields, such as a plan's config snapshot (#1919).
@@ -252,6 +253,16 @@ pub fn render_json_placeholders(value: serde_json::Value) -> serde_json::Value {
                 .map(|(k, v)| (render_placeholders(&k), render_json_placeholders(v)))
                 .collect(),
         ),
+        // A number whose digits hold a resolved value prints as a string.
+        Value::Number(n) => {
+            let text = n.to_string();
+            let rendered = render_placeholders(&text);
+            if rendered == text {
+                Value::Number(n)
+            } else {
+                Value::String(rendered)
+            }
+        }
         other => other,
     }
 }
@@ -389,9 +400,50 @@ pub fn is_empty() -> bool {
         .is_empty()
 }
 
+/// The body of a hand-written `Debug` for an error type: `Name(<Display>)`
+/// with each resolved value rendered. A derived `Debug` prints the plaintext
+/// of every field and wrapped error (#1919). Rendering here, not relying on
+/// `Display`, keeps the guarantee for a `Display` that does not render.
+pub fn fmt_rendered_debug(
+    f: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    err: &dyn std::fmt::Display,
+) -> std::fmt::Result {
+    write!(f, "{name}({})", render_placeholders(&err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_render_covers_numbers_and_fmt_rendered_debug_renders_display() {
+        register_substitution("RV_REG_NUM", "4815162343");
+        let v = render_json_placeholders(
+            serde_json::json!({"n": 4815162343u64, "k": [4815162343u64], "f": 1.5}),
+        );
+        assert_eq!(
+            v,
+            serde_json::json!({"n": "${RV_REG_NUM}", "k": ["${RV_REG_NUM}"], "f": 1.5})
+        );
+
+        struct Plain(&'static str);
+        impl std::fmt::Display for Plain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::fmt::Debug for Plain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt_rendered_debug(f, "Plain", self)
+            }
+        }
+        // A Display that never renders is still rendered by the Debug helper.
+        assert_eq!(
+            format!("{:?}", Plain("x 4815162343 y")),
+            "Plain(x ${RV_REG_NUM} y)"
+        );
+    }
 
     /// Long enough to clear the floor, distinctive enough that no other test's
     /// fixture can collide with it. The registry is process-global and every

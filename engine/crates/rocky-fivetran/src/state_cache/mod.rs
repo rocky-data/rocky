@@ -127,7 +127,7 @@ pub enum CacheError {
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CacheError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "CacheError", self)
     }
 }
 

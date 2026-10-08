@@ -275,7 +275,7 @@ pub enum BudgetError {
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for BudgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BudgetError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "BudgetError", self)
     }
 }
 

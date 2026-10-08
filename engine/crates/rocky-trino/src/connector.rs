@@ -115,7 +115,7 @@ pub enum TrinoError {
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for TrinoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TrinoError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "TrinoError", self)
     }
 }
 

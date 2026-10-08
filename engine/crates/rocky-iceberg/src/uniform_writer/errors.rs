@@ -33,7 +33,7 @@ pub enum UniformWriterError {
     #[error(
         "partitioned tables are not supported by phase 1; partition columns: {}. \
          See arc 1 wave 2 phase 2 for partitioned-table support.",
-        render(&format!("{:?}", .0))
+        format!("{:?}", .0.iter().map(|c| render(c)).collect::<Vec<_>>())
     )]
     PartitionedUnsupported(Vec<String>),
 
@@ -126,7 +126,7 @@ pub enum UniformWriterError {
 /// the plaintext of every field and of every wrapped error (#1919).
 impl std::fmt::Debug for UniformWriterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UniformWriterError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "UniformWriterError", self)
     }
 }
 

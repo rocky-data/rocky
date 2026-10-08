@@ -37,7 +37,7 @@ use tracing::debug;
 use crate::config::ChConfig;
 
 /// Errors surfaced by the ClickHouse connector.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ChError {
     /// The adapter configuration is invalid.
     #[error("invalid clickhouse configuration: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
@@ -75,6 +75,13 @@ pub enum ChError {
         rocky_core::secret_registry::render_placeholders(table)
     )]
     NotFound { database: String, table: String },
+}
+
+/// `Debug` prints the rendered `Display` text (#1919).
+impl std::fmt::Debug for ChError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ChError", self)
+    }
 }
 
 fn code_suffix(code: Option<i32>, name: Option<&str>, status: u16) -> String {
@@ -377,6 +384,16 @@ fn normalize_cell(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "s3cr3t-value-123";
+        rocky_core::secret_registry::register_substitution("RV_CH_DBG", SECRET);
+        let err = ChError::Config(format!("host {SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CH_DBG}"), "{debug}");
+    }
 
     #[test]
     fn error_text_prints_resolved_var_as_placeholder() {

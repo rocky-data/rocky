@@ -70,7 +70,7 @@ pub enum AirbyteError {
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for AirbyteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AirbyteError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "AirbyteError", self)
     }
 }
 

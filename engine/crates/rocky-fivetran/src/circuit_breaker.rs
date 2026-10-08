@@ -87,7 +87,7 @@ pub enum CircuitError {
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for CircuitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CircuitError({self})")
+        rocky_core::secret_registry::fmt_rendered_debug(f, "CircuitError", self)
     }
 }
 
