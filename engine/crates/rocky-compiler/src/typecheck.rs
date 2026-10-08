@@ -506,7 +506,15 @@ fn compute_model_typecheck(
     // A nested expression (`CAST(MAX(x) AS BIGINT)`) and a column with no
     // traceable source (`COUNT(*)`) also need it: the edge kind alone cannot
     // type them (#2295).
+    // A set operation takes its type from every branch, but lineage reads only
+    // the first; a model whose columns are all nullable would otherwise skip
+    // inference and keep the first branch's type (#2303 red team). A keyword
+    // match is enough: a false positive only runs inference once more.
+    let mentions_set_operation = model_by_name
+        .get(model_name)
+        .is_some_and(|m| sql_mentions_set_operation(&m.sql));
     let needs_inference = udf_scope.is_active()
+        || mentions_set_operation
         || typed_cols
             .iter()
             .any(|col| match graph.producing_edge(model_name, &col.name) {
@@ -3133,6 +3141,18 @@ fn infer_case_type(
     (result_type, nullable)
 }
 
+/// Whether `sql` contains a `UNION`, `INTERSECT` or `EXCEPT` keyword as a
+/// whole word, in any case. Over-approximates (a keyword inside a string or
+/// an identifier matches too); the caller only uses it to run inference.
+fn sql_mentions_set_operation(sql: &str) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| {
+            w.eq_ignore_ascii_case("union")
+                || w.eq_ignore_ascii_case("intersect")
+                || w.eq_ignore_ascii_case("except")
+        })
+}
+
 /// Whether a plain `CAST(x AS target)` can return NULL (or fail) for a
 /// non-null `x` of type `source`.
 ///
@@ -4497,6 +4517,37 @@ mod tests {
                 .iter()
                 .any(|d| &*d.code == "E012")
         );
+    }
+
+    /// #2303 red team: a set operation whose columns are all nullable still
+    /// runs inference, so it does not keep the first branch's concrete type.
+    #[test]
+    fn all_nullable_union_does_not_keep_the_first_branch_type() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("z", RockyType::Int32, true),
+                ("n", RockyType::String, true),
+            ]),
+        )]);
+        let project = Project::from_models(vec![make_model(
+            "m",
+            "SELECT z AS c FROM t UNION ALL SELECT n FROM t",
+        )])
+        .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let typed = typecheck_project_with_models(&graph, &sources, None, &project.models, None)
+            .typed_models["m"]
+            .clone();
+        let c = typed.iter().find(|col| col.name == "c").unwrap();
+        assert_ne!(c.data_type, RockyType::Int32, "{c:?}");
+        assert!(c.nullable);
+        assert!(super::sql_mentions_set_operation(
+            "select a from t Union select b from u"
+        ));
+        assert!(!super::sql_mentions_set_operation(
+            "select unionized from t"
+        ));
     }
 
     /// #2299 at the expression level: decimal narrowing, an unknown input and
