@@ -767,7 +767,8 @@ impl UniformWriter {
     ///   partitioned or rowTracking table, or a malformed hash;
     /// - [`UniformWriterError::PublishSourceUnavailable`] when no commit of
     ///   this table added a file, the file was added before the latest
-    ///   schema or partitioning change, or its bytes are gone (for example
+    ///   protocol, schema, partitioning or column-mapping-mode change, its
+    ///   `add` carries a deletion vector, or its bytes are gone (for example
     ///   after a `VACUUM`);
     /// - every error of the replace commit (checkpoint, append-only, a
     ///   concurrent shape change, the retry budget).
@@ -813,9 +814,22 @@ impl UniformWriter {
             };
             if found.version < live.shape_version {
                 return Err(unavailable(format!(
-                    "`{name}` was added at commit {}, before the schema or partitioning changed \
-                     at commit {}",
+                    "`{name}` was added at commit {}, before the protocol, schema, partitioning \
+                     or column mapping changed at commit {}",
                     found.version, live.shape_version
+                )));
+            }
+            // A deletion vector would hide rows of the file. Rocky never
+            // writes one, so a lifted `add` that carries one is not Rocky's
+            // output as recorded.
+            if found
+                .add
+                .get("deletionVector")
+                .is_some_and(|dv| !dv.is_null())
+            {
+                return Err(unavailable(format!(
+                    "the `add` of `{name}` at commit {} carries a deletion vector",
+                    found.version
                 )));
             }
             match self.store.head(&object_path(&prefix, &name)?).await {
@@ -3606,6 +3620,94 @@ mod tests {
         // B was added before the change too: refused as well.
         let state = writer.discover().await.unwrap();
         assert!(writer.restore_content_addressed(&[b], state).await.is_err());
+    }
+
+    /// Restoring `a` is refused as a publish source, the table still
+    /// discovers, and no commit is written at `next`.
+    async fn assert_restore_refused(writer: &UniformWriter, store: &InMemory, a: &str, next: u64) {
+        let state = writer
+            .discover()
+            .await
+            .expect("the table itself is still writable");
+        let err = writer
+            .restore_content_addressed(&[a.to_string()], state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, UniformWriterError::PublishSourceUnavailable { .. }),
+            "{err}"
+        );
+        assert!(!commit_exists(store, "tbl", next).await);
+    }
+
+    /// A file written before a protocol change is not published: the new
+    /// protocol can change how its bytes must be read.
+    #[tokio::test]
+    async fn restore_refuses_a_file_written_before_a_protocol_change() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        put_commit(
+            &store,
+            "tbl",
+            3,
+            &[serde_json::json!({"protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": ["columnMapping", "icebergCompatV2", "appendOnly"],
+            }})],
+        )
+        .await;
+        assert_restore_refused(&writer, &store, &a, 4).await;
+    }
+
+    /// A file written before a `delta.columnMapping.mode` change is not
+    /// published, even when the schema string is unchanged.
+    #[tokio::test]
+    async fn restore_refuses_a_file_written_before_a_column_mapping_mode_change() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        let mut meta = commit_lines(&store, "tbl", 0)
+            .await
+            .into_iter()
+            .find(|l| l.get("metaData").is_some())
+            .unwrap();
+        meta["metaData"]["configuration"]["delta.columnMapping.mode"] = Value::from("id");
+        put_commit(&store, "tbl", 3, &[meta]).await;
+        assert_restore_refused(&writer, &store, &a, 4).await;
+    }
+
+    /// An `add` of the target file that carries a deletion vector is not
+    /// lifted: the vector would hide rows the recorded output had.
+    #[tokio::test]
+    async fn restore_refuses_an_add_that_carries_a_deletion_vector() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        // Commit 3 adds A again with a deletion vector; commit 4 removes it.
+        let mut add = commit_lines(&store, "tbl", 1)
+            .await
+            .into_iter()
+            .find(|l| l.get("add").is_some())
+            .unwrap();
+        add["add"]["deletionVector"] = serde_json::json!({
+            "storageType": "u", "pathOrInlineDv": "ab", "offset": 1,
+            "sizeInBytes": 36, "cardinality": 2
+        });
+        let path = add["add"]["path"].clone();
+        put_commit(&store, "tbl", 3, &[add]).await;
+        put_commit(
+            &store,
+            "tbl",
+            4,
+            &[serde_json::json!({"remove": {"path": path, "dataChange": true}})],
+        )
+        .await;
+        assert_restore_refused(&writer, &store, &a, 5).await;
     }
 
     fn content_addressed(hash: &str, version: u64) -> rocky_core::state::OutputVersion {

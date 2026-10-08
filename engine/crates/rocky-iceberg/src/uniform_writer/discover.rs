@@ -1310,9 +1310,10 @@ pub(super) struct LiveSet {
     /// since, keyed by canonical key. A table publish lifts an earlier
     /// version's `add` from here.
     pub ever_added: std::collections::BTreeMap<String, LiveFile>,
-    /// The commit whose `metaData` last changed the schema or the partition
-    /// columns (the first `metaData` counts). A file added before it was
-    /// written for another schema.
+    /// The commit that last changed the protocol, or whose `metaData` last
+    /// changed the schema, the partition columns or
+    /// `delta.columnMapping.mode` (the first of each counts). A file added
+    /// before it was written for another table shape.
     pub shape_version: u64,
 }
 
@@ -1605,14 +1606,25 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
                         removes.push(entry);
                     }
                 }
-                "protocol" => protocol = Some(action.clone()),
+                "protocol" => {
+                    // A protocol change can change how a file must be read
+                    // (a new reader feature), so it moves the shape version.
+                    if protocol.as_ref() != Some(action) {
+                        shape_version = version;
+                    }
+                    protocol = Some(action.clone());
+                }
                 "metaData" => {
-                    // Only a schema or partitioning change moves the shape
-                    // version; a property change keeps old files readable.
+                    // A schema, partitioning or column-mapping-mode change
+                    // moves the shape version; another property change keeps
+                    // old files readable.
                     let shape = |m: &serde_json::Value| {
                         (
                             m.get("schemaString").cloned(),
                             m.get("partitionColumns").cloned(),
+                            m.get("configuration")
+                                .and_then(|c| c.get("delta.columnMapping.mode"))
+                                .cloned(),
                         )
                     };
                     if metadata.as_ref().map(shape) != Some(shape(action)) {
