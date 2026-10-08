@@ -9904,7 +9904,10 @@ auto_create_schemas = true
         };
         let a = super::config_policy_identity(&with_db("a.duckdb"));
         let b = super::config_policy_identity(&with_db("b.duckdb"));
-        assert_ne!(a, b, "an env value swap re-routes the apply and must change the identity");
+        assert_ne!(
+            a, b,
+            "an env value swap re-routes the apply and must change the identity"
+        );
     }
 
     #[test]
