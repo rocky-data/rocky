@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A resolved `${VAR}` value prints as `${NAME}` in more places (#1919).** The `Debug` output of these error types now prints the rendered error text, so a wrapped error no longer shows a plaintext value: the Iceberg, Delta writer, Airbyte, BigQuery, ClickHouse, Databricks, Fivetran, Postgres, SQL Server, Snowflake and Trino connector errors. The Delta writer errors that name a table (checkpoint, unsupported feature, changed table, append-only, publish, commit outcome) and the partition-column error print it rendered. Numbers and object keys that hold a resolved value print as `${NAME}` in the adapter `extra` map and in the plan's `config_snapshot`; a number then prints as a string. A plan written by 1.77 or 1.78 whose config holds such a number can be refused at apply with "config has changed"; run `rocky plan` again. Values under 8 bytes still print as themselves. Not converted yet: the derived `Debug` of `AuthError`, `ConfigError`, `WebhookError`, `ObjectStoreError`, `ValkeyCacheError`, `StateSyncError` and `AdapterError`. Library users who build an adapter without config substitution are not covered: nothing is registered, so nothing renders.
+
 ## [1.78.0] — 2026-10-08
 
 Read these first. Each one can change what an existing project does.
@@ -28,7 +34,6 @@ Read these first. Each one can change what an existing project does.
 
 ### Fixed
 
-- **A resolved `${VAR}` value prints as `${NAME}` in more places (#1919).** The `Debug` output of these error types now prints the rendered error text, so a wrapped error no longer shows a plaintext value: the Iceberg, Delta writer, Airbyte, BigQuery, ClickHouse, Databricks, Fivetran, Postgres, SQL Server, Snowflake and Trino connector errors. The Delta writer errors that name a table (checkpoint, unsupported feature, changed table, append-only, publish, commit outcome) and the partition-column error print it rendered. Numbers and object keys that hold a resolved value print as `${NAME}` in the adapter `extra` map and in the plan's `config_snapshot`; a number then prints as a string. A plan written by 1.77 or 1.78 whose config holds such a number can be refused at apply with "config has changed"; run `rocky plan` again. Values under 8 bytes still print as themselves. Not converted yet: the derived `Debug` of `AuthError`, `ConfigError`, `WebhookError`, `ObjectStoreError`, `ValkeyCacheError`, `StateSyncError` and `AdapterError`. Library users who build an adapter without config substitution are not covered: nothing is registered, so nothing renders.
 
 - **Trino, ClickHouse, Iceberg, Airbyte and Fivetran errors print a resolved `${VAR}` value as `${NAME}` (#1919).** Connection and HTTP error text from these adapters (transport errors that carry the URL, server messages, config messages, object-store and cache errors) goes through the secret registry when it is shown. The usual 8-byte floor applies. What is sent to the connector does not change.
 
