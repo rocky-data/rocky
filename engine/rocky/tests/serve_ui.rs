@@ -199,7 +199,7 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
 }
 
 /// `rocky serve --ui` with no token flags, on loopback: the server generates
-/// a read-only token, prints it only in the address line, says so on stderr
+/// a read-only token, prints it in the address line, says so on stderr
 /// without the secret, and the token authenticates reads but not writes. On a
 /// non-loopback bind the same command still refuses to start.
 ///
@@ -261,6 +261,20 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
+    // A port that is already taken: the bind fails, so no token is printed.
+    let taken = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let taken_port = taken.local_addr().expect("addr").port();
+    let failed = serve(&["--port", &taken_port.to_string()])
+        .output()
+        .expect("spawn rocky serve");
+    assert!(!failed.status.success());
+    assert!(
+        !String::from_utf8_lossy(&failed.stdout).contains("Rocky UI:"),
+        "a server that never bound printed a token: {}",
+        String::from_utf8_lossy(&failed.stdout)
+    );
+    drop(taken);
+
     let stderr_path = dir.path().join("serve.stderr");
     let port = TcpListener::bind("127.0.0.1:0")
         .expect("bind")
@@ -312,7 +326,7 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
 
     drop(server);
     let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
-    assert!(stderr.contains("one-time read-only token"), "{stderr}");
+    assert!(stderr.contains("per-process read-only token"), "{stderr}");
     assert!(
         !stderr.contains(&token),
         "the token must appear only on stdout: {stderr}"
@@ -903,7 +917,7 @@ fn wait_for_compiled_models(port: u16) {
 ///
 /// What it does not pin: that the opener runs only AFTER the bind. That
 /// ordering is a race a test cannot observe from outside without flaking,
-/// and it is pinned in-process by `the_opener_receives_the_printed_address_only_after_ready`
+/// and it is pinned in-process by `the_address_prints_and_opens_only_after_ready`
 /// on the readiness latch.
 #[cfg(unix)]
 #[test]

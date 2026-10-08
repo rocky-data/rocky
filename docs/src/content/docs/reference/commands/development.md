@@ -372,7 +372,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
-| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a one-time read-only token. |
+| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a per-process read-only token. |
 | `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. The one exception is `read-only` with `--ui` on loopback, which gets a generated token. |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Needs a read-only token: on loopback with no token, the server generates one for the process; on any other host, pass `--token` with `--token-scope read-only`. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
@@ -394,7 +394,9 @@ rocky serve --ui
 # Rocky UI: http://127.0.0.1:8080/ui/#token=<64 hex characters>
 ```
 
-With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a read-only token for this process. It prints that token only in the `Rocky UI:` address on stdout, and a note on stderr. The token changes on every restart. To keep one token, or to serve on any other host, choose it yourself:
+With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process read-only token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
+
+A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
 
 ```bash
 rocky serve --ui --token s3cret --token-scope read-only

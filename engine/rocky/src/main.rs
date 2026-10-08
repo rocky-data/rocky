@@ -1857,8 +1857,8 @@ enum Command {
         /// route); when unset, a loopback server asks no request for a
         /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
         /// omitted. Required when `--host` is non-loopback, including with
-        /// `--ui`. With `--ui` on loopback and no token, a one-time read-only
-        /// token is generated for the process.
+        /// `--ui`. With `--ui` on loopback and no token, a per-process
+        /// read-only token is generated.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
@@ -1878,9 +1878,10 @@ enum Command {
         /// Serve the browser UI at `/ui/`. Release binaries carry it; from
         /// source, build with `--features ui`. The UI token is read-only, so
         /// it never reaches a mutating route. On loopback with no token
-        /// configured, a one-time read-only token is generated for this
-        /// process; it changes on restart. On any other host, pass `--token`
-        /// with `--token-scope read-only`. With `--scheduler`,
+        /// configured, a per-process read-only token is generated: a new
+        /// one each time the server starts. It is meant for a single-user
+        /// machine. On a shared host, or any non-loopback host, pass
+        /// `--token` with `--token-scope read-only`. With `--scheduler`,
         /// `ROCKY_WEBHOOK_SECRET` is required. Prints the address to open,
         /// token included.
         #[arg(long)]

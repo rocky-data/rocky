@@ -43,9 +43,11 @@ Rocky UI: http://127.0.0.1:8080/ui/#token=<secret>
 
 Open that address, or add `--open` to open it in your default browser. The page reads the token from the part after `#`, keeps it for the browser tab, and removes it from the address bar. Browsers never send that part to a server, so the token is in no access log.
 
-The UI needs a read-only token (a token that can read but not change anything). With no token configured, the server generates one for this process. It prints a note on stderr when it does. The token changes each time the server starts, so an old address stops working after a restart.
+The UI needs a read-only token (a token that can read but not change anything). With no token configured, the server generates a per-process token. It works for every request until the server stops. The server prints a note on stderr when it generates one. Each start makes a new token, so an old address stops working after a restart.
 
-To keep the same token across restarts, choose it yourself:
+A generated token is for a single-user machine. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. On a shared host, an ssh port-forward, a devcontainer or Codespace, or behind a proxy, choose the token yourself.
+
+To choose the token, or to keep the same token across restarts:
 
 ```bash
 rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
@@ -152,7 +154,7 @@ The page reads. It does not write.
 
 With `--ui`, the server adds checks that a plain `rocky serve` does not run:
 
-- `--ui` refuses to start with a token that is not read-only. On a host that is not loopback, it also refuses to start without a token. On a loopback host with no token, it generates a read-only token for the process.
+- `--ui` refuses to start with a token that is not read-only. On a host that is not loopback, it also refuses to start without a token. On a loopback host with no token, it generates a per-process read-only token.
 - A request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry gets `421 host_not_allowed`. This defends against DNS rebinding, where an attacker's domain is made to resolve to `127.0.0.1`. `GET /api/v1/health` skips this check, so a load balancer probe still works.
 - A request whose `Origin` is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`. The check reads the origin's host, not the whole origin, so an `http` or `https` origin on an allowed host passes whatever its port. On a loopback server that includes `http://localhost:5173`, a local dev server. `GET /api/v1/health` skips this check too.
 - Every UI file response carries a Content Security Policy. The page loads scripts and fonts from this server only, and styles from this server or inline. Nothing may frame it.
