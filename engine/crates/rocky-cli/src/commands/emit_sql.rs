@@ -182,8 +182,13 @@ fn emit_models_selected(
             (Some(dir), _, _) => (dir.to_path_buf(), None),
             (None, Some(glob), Some(cfg_path)) => {
                 let dir = match crate::models_loader::locate_models_dir(&glob, cfg_path)? {
-                    crate::models_loader::ModelsDir::Present(dir)
-                    | crate::models_loader::ModelsDir::Absent(dir) => dir,
+                    crate::models_loader::ModelsDir::Present(dir) => dir,
+                    // A typo'd `models = "..."` must not read as "nothing to
+                    // emit"; `rocky run --model` refuses the same way.
+                    crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
+                        "models directory '{}' not found (required for --pipeline)",
+                        dir.display()
+                    ),
                 };
                 (
                     dir,
@@ -997,6 +1002,30 @@ mod tests {
         std::fs::write(&empty, "[adapter]\ntype = \"duckdb\"\n").unwrap();
         let none = run(Some(&empty), "p1");
         assert!(none.contains("does not match any pipeline"), "{none}");
+    }
+
+    /// A `--pipeline` whose models directory does not exist is refused, not
+    /// reported as "nothing to emit".
+    #[test]
+    fn pipeline_flag_with_a_missing_models_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.duck]\ntype = \"duckdb\"\n\
+             [pipeline.p1]\ntype = \"transformation\"\nmodels = \"modles/**\"\n\
+             [pipeline.p1.target]\nadapter = \"duck\"\n",
+        )
+        .unwrap();
+        let vars = rocky_core::run_vars::RunVars::new();
+        let err = emit_models_selected(Some(&config), None, None, &vars, None, Some("p1"))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .expect("a missing models directory must be refused");
+        assert!(
+            err.contains("models directory") && err.contains("not found"),
+            "{err}"
+        );
     }
 
     #[test]
