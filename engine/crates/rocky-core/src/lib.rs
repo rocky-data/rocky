@@ -74,6 +74,7 @@ pub mod source_freshness;
 pub mod sql_gen;
 pub mod state;
 pub mod state_sync;
+pub mod table_publish;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;
 pub mod tests;

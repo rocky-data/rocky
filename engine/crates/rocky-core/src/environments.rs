@@ -177,14 +177,105 @@ pub struct EnvironmentRecord {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Who moved the head.
     pub updated_by: PrincipalRef,
+    /// The publish id of a table publish that started and has not recorded
+    /// its outcome yet (RV1-P3). While it is set, every other publish to this
+    /// environment is refused with [`EnvironmentError::PublishInProgress`].
+    /// Omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publishing: Option<String>,
 }
 
-/// What a publish changed. Only `state_only` exists in RV1-P2.
+/// What a publish changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishScope {
     /// The publish moved state pointers only. No warehouse object changed.
     StateOnly,
+    /// The publish moved Delta tables, one commit per table (RV1-P3). It is
+    /// NOT atomic across tables: readers can see some tables moved and others
+    /// not. [`PublishRecord::tables`] says which.
+    DeltaPerTable,
+}
+
+/// The table part of a [`PublishScope::DeltaPerTable`] publish.
+///
+/// A table publish writes two history rows:
+///
+/// ```text
+///   env#N    Started  { planned }          head = env#N, publishing = env#N
+///      ── one Delta commit per table, in `planned` order ──
+///   env#N+1  Finished { started, moves }   head = env#N+1, publishing = None
+/// ```
+///
+/// In the `Started` row, `to` is the plan, not what moved. The `Finished`
+/// row's `to` holds only the models whose table now serves the version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum TablePublish {
+    /// The publish claimed the environment. No table had moved yet.
+    Started {
+        /// The models to move, in the order the tables are committed.
+        planned: Vec<String>,
+    },
+    /// The publish ended. `moves` holds one entry per planned model, in order.
+    Finished {
+        /// The publish id of the `Started` row this row closes.
+        started: String,
+        /// What happened to each table.
+        moves: Vec<TableMove>,
+    },
+}
+
+/// What a table publish did to one model's table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableMove {
+    /// The model name.
+    pub model: String,
+    /// What happened.
+    pub outcome: TableMoveOutcome,
+}
+
+/// The outcome of one table move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TableMoveOutcome {
+    /// One commit moved the table. `table_version` is that commit.
+    Moved {
+        /// The table name.
+        table: String,
+        /// The commit that made the table serve the version.
+        table_version: u64,
+        /// A follow-up step after the commit failed (for example the Iceberg
+        /// metadata sync). The table did move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    /// The table already served the version. No commit was written.
+    AlreadyCurrent {
+        /// The table name.
+        table: String,
+        /// The current table version.
+        table_version: u64,
+    },
+    /// The move failed. The table did not move, as far as the backend can
+    /// tell.
+    Failed {
+        /// Why.
+        error: String,
+    },
+    /// An earlier move failed, so this one was not tried.
+    NotAttempted,
+}
+
+impl TableMoveOutcome {
+    /// Whether the table now serves the version.
+    #[must_use]
+    pub fn serves_version(&self) -> bool {
+        match self {
+            Self::Moved { .. } | Self::AlreadyCurrent { .. } => true,
+            Self::Failed { .. } | Self::NotAttempted => false,
+        }
+    }
 }
 
 /// One append-only publish history row. Key: [`history_key`].
@@ -211,6 +302,10 @@ pub struct PublishRecord {
     pub plan_id: Option<String>,
     /// What the publish changed.
     pub scope: PublishScope,
+    /// The table part of a [`PublishScope::DeltaPerTable`] publish. Omitted
+    /// for a state-only publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<TablePublish>,
 }
 
 /// One pointer to publish: take `model`'s output version from run `run_id`.
@@ -291,6 +386,10 @@ pub enum PublishRefusal {
         run_id: String,
         reason: UnversionedReason,
     },
+    /// The table backend of a table publish (RV1-P3) cannot move this
+    /// model's table to the version. Nothing was written.
+    #[error("the table backend cannot publish this version: {reason}")]
+    BackendRefused { reason: String },
 }
 
 /// A publish or environment request that is wrong in itself.
@@ -321,6 +420,20 @@ pub enum EnvironmentError {
     /// A stored head is corrupt: its seq cannot advance.
     #[error("environment {environment:?} head seq {seq} cannot advance")]
     SeqOverflow { environment: String, seq: u64 },
+    /// A table publish started and has not recorded its outcome. Its tables
+    /// may be part moved. Nothing was written.
+    #[error(
+        "environment {environment:?} has a table publish in progress ({publish_id}); its tables \
+         may be part moved. Wait for it to finish. If its process died, publish again with \
+         take-over from head {publish_id}"
+    )]
+    PublishInProgress {
+        environment: String,
+        publish_id: String,
+    },
+    /// The outcome does not match the publish it closes.
+    #[error("table publish {publish_id:?} cannot be finished: {reason}")]
+    FinishMismatch { publish_id: String, reason: String },
 }
 
 /// Resolve one source against the run's recorded executions. Pure, so the
@@ -624,6 +737,35 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PublishScope::StateOnly).unwrap(),
             "\"state_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PublishScope::DeltaPerTable).unwrap(),
+            "\"delta_per_table\""
+        );
+    }
+
+    /// A P2 row (no `tables`, no `publishing`) reads back with both `None`,
+    /// and a state-only row still serializes without them.
+    #[test]
+    fn rows_without_the_table_fields_read_as_state_only() {
+        let head = format!(
+            r#"{{"name":"prod","seq":1,"head_publish_id":"prod#1","pointers":{{}},"updated_at":"2026-10-06T00:00:00Z","updated_by":{by}}}"#,
+            by = serde_json::to_string(&PrincipalRef::unnamed()).unwrap()
+        );
+        let rec: EnvironmentRecord = serde_json::from_str(&head).unwrap();
+        assert_eq!(rec.publishing, None);
+        assert!(!serde_json::to_string(&rec).unwrap().contains("publishing"));
+        let moved = TableMove {
+            model: "orders".into(),
+            outcome: TableMoveOutcome::Moved {
+                table: "c.s.orders".into(),
+                table_version: 4,
+                warning: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&moved).unwrap(),
+            r#"{"model":"orders","outcome":{"outcome":"moved","table":"c.s.orders","table_version":4}}"#
         );
     }
 }
