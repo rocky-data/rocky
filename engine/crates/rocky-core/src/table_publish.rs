@@ -30,6 +30,9 @@
 //!   commit).
 //! - A run that writes a table while a publish moves it is not serialized
 //!   with the publish. The later commit wins.
+//! - On Delta, a publish moves the model's own table. Two environments that
+//!   both hold a model move the same table, and their compare-and-swap
+//!   tokens are separate. Rocky does not check this yet.
 //! - A pointer pins no data: `VACUUM` can remove the files of a version an
 //!   environment points to.
 //!
@@ -91,6 +94,11 @@ pub trait TablePointerBackend: Send + Sync {
     /// Whether this backend can move `pointer`'s table. Runs inside the
     /// begin transaction, before anything is written; an `Err` refuses the
     /// whole publish with no table touched.
+    ///
+    /// It checks the version's shape (its kind, its files, a configured
+    /// table), not whether the files still exist. A version whose files a
+    /// `VACUUM` removed fails in [`Self::move_table`], after earlier tables
+    /// may have moved.
     ///
     /// # Errors
     ///
@@ -549,6 +557,81 @@ mod tests {
         assert_eq!(
             store.get_environment(&env()).unwrap().unwrap().publishing,
             None
+        );
+    }
+
+    /// A backend that, during its first move, lets a second publisher take
+    /// over the environment (as if it wrongly judged the first one dead).
+    struct TakeOverDuringMove {
+        session: LedgerSeamSession,
+        tables: FakeTables,
+    }
+
+    #[async_trait::async_trait]
+    impl TablePointerBackend for TakeOverDuringMove {
+        fn check(&self, _pointer: &EnvPointer) -> Result<(), String> {
+            Ok(())
+        }
+        async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, String> {
+            if self.tables.calls().is_empty() {
+                state_sync::begin_table_publish(
+                    &self.session,
+                    &req(Some("prod#1"), &[("a", "r2")]),
+                    true,
+                    &|_| Ok(()),
+                )
+                .await
+                .unwrap();
+            }
+            self.tables.move_table(pointer).await
+        }
+    }
+
+    /// The outcome cannot be recorded when another publish took over in
+    /// between. The error carries the moves, the only record of what moved,
+    /// and the history gains no row for them.
+    #[tokio::test]
+    async fn a_take_over_mid_publish_makes_the_record_fail_with_the_moves() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let backend = TakeOverDuringMove {
+            session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
+            tables: FakeTables::default(),
+        };
+        let err = publish_tables(&session, &req(None, ABC), &backend, false)
+            .await
+            .unwrap_err();
+        let TablePublishError::RecordFailed {
+            started,
+            moves,
+            source,
+        } = &err
+        else {
+            panic!("expected RecordFailed, got {err:?}");
+        };
+        assert_eq!(started, "prod#1");
+        assert_eq!(moves.len(), 3);
+        assert!(moves.iter().all(|m| m.outcome.serves_version()));
+        assert!(
+            matches!(source, StateSyncError::PublishConflict { found: Some(f), .. } if f == "prod#2"),
+            "{source:?}"
+        );
+        let store = StateStore::open(&path).unwrap();
+        let ids: Vec<String> = store
+            .publish_history(&env())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.publish_id)
+            .collect();
+        assert_eq!(ids, vec!["prod#1", "prod#2"], "no finished row for prod#1");
+        assert_eq!(
+            store
+                .get_environment(&env())
+                .unwrap()
+                .unwrap()
+                .publishing
+                .as_deref(),
+            Some("prod#2")
         );
     }
 
