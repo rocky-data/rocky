@@ -70,7 +70,41 @@ From v32, the engine API can record **environments**: named sets of pointers, su
 - A `delta_observed` pointer names an observation, not a unique identity. A `DROP` + `CREATE` starts a new Delta table at version 0, so an earlier table with the same name can carry the same `(table, version)` pair.
 - A publish and a run on the same remote state contend like two runs. A publish replays on a fresh download when the blob moved. A run does not: under `cas` its finalize makes one conditional upload with no replay. A publish that lands between a run's start and its finalize makes that run fail with `CasConflict`. Two runs behave the same way today.
 - **A pointer does not pin data yet.** `rocky gc`, run-history retention and Delta `VACUUM` can remove a version that an environment points to. Pinning comes in a later phase.
-- A pointer changes no warehouse object. It is state only.
+- A pointer changes no warehouse object. It is state only. The table publish below is the exception.
+
+### Delta table publish (experimental)
+
+**On Delta, a publish moves one table at a time. It is not atomic across tables.** Readers can see some tables at the new version and others at the old one until the last commit lands. Rocky reports which tables moved. It never claims an environment-wide switch.
+
+The engine API `table_publish::publish_tables` moves each model's Delta table to the output version its pointer names. Each table gets one Delta commit. The commit makes the table's live files equal the files of that earlier output again. No data is copied. There is no CLI verb yet.
+
+```
+  begin   CAS on the head        prod#1  started   (environment marked "publishing")
+    │ head moved? refused, no table touched
+    ▼
+  fence ─▶ commit table a ─▶ fence ─▶ commit table b ─▶ ...   stop at the first failure
+    │ another publish took over? stop, no more tables
+    ▼
+  finish                         prod#2  finished  (one outcome per table)
+```
+
+- The begin step claims the environment before any table moves. When two publishers start from the same head, one gets a publish conflict and moves no table.
+- While a publish is in progress, every other publish to that environment is refused with `PublishInProgress`. That includes a state-only publish.
+- A failure stops the publish. The finished row names one outcome per table:
+  - `moved`: one commit moved it (with its commit version), and the Iceberg sync ran;
+  - `already_current`: it already served the version, so no commit was written;
+  - `sync_failed`: the Delta table serves the version, but the Iceberg sync failed;
+  - `failed`: no commit was written (with the error);
+  - `unknown`: the commit write returned an error that does not say whether the commit was stored (for example a timeout);
+  - `not_attempted`: an earlier table failed or ended `unknown`.
+- The head's pointers move only for `moved`, `already_current` and `sync_failed`. The other tables keep their old version, so the environment is part published until you publish again. A publish is complete only when every table is `moved` or `already_current`.
+- Publish again to reconcile. A table whose `unknown` commit did land is then `already_current`. A table that is `sync_failed` is synced again, because the sync also runs on an already-current table.
+- If the process dies between two commits, nothing records which tables moved. The environment stays `publishing`. A new publish that names that head and asks to take over moves every table again. A table already at its version gets no new commit.
+- Take over only when the first publisher is dead. Before each table, a publish reads the head again (a fence). If another publish took over, it stops with `Fenced` and moves no more tables. A wrongly taken-over publisher that is still alive can still move the one table it was committing.
+- Only `content_addressed` outputs of unpartitioned tables can be published. A partitioned output, a `delta_observed` version (it names a table version, not files Rocky wrote), and a table with no configured writer are refused before anything is written.
+- The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), a version written before the table's protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
+- A run is not ordered with a publish. If another commit changes the table's files after the publish read them and before it commits, the publish fails for that table and writes nothing. It never removes files it did not see. Otherwise the later commit wins.
+- The publish moves the model's own table, which every environment that holds the model shares. So it refuses when another environment's head, or the plan of its unfinished table publish, points the same table at a different version. The error names that environment. The `allow_shared_tables` option publishes anyway.
 
 ## Per-namespace state files
 

@@ -1306,6 +1306,15 @@ pub(super) struct LiveSet {
     /// The latest `delta.rowTracking` `domainMetadata` action body, from the
     /// same replay as `head_version`. `None` when no commit carries one.
     pub row_tracking_domain: Option<serde_json::Value>,
+    /// The latest `add` of every file any commit added, live or removed
+    /// since, keyed by canonical key. A table publish lifts an earlier
+    /// version's `add` from here.
+    pub ever_added: std::collections::BTreeMap<String, LiveFile>,
+    /// The commit that last changed the protocol, or whose `metaData` last
+    /// changed the schema, the partition columns or
+    /// `delta.columnMapping.mode` (the first of each counts). A file added
+    /// before it was written for another table shape.
+    pub shape_version: u64,
 }
 
 /// The parts of a table's protocol and metadata that shape a write. A change
@@ -1544,6 +1553,8 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
     };
 
     let mut files: std::collections::BTreeMap<String, LiveFile> = Default::default();
+    let mut ever_added: std::collections::BTreeMap<String, LiveFile> = Default::default();
+    let mut shape_version = 0;
     let mut protocol: Option<serde_json::Value> = None;
     let mut metadata: Option<serde_json::Value> = None;
     let mut row_tracking_domain: Option<serde_json::Value> = None;
@@ -1595,8 +1606,32 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
                         removes.push(entry);
                     }
                 }
-                "protocol" => protocol = Some(action.clone()),
-                "metaData" => metadata = Some(action.clone()),
+                "protocol" => {
+                    // A protocol change can change how a file must be read
+                    // (a new reader feature), so it moves the shape version.
+                    if protocol.as_ref() != Some(action) {
+                        shape_version = version;
+                    }
+                    protocol = Some(action.clone());
+                }
+                "metaData" => {
+                    // A schema, partitioning or column-mapping-mode change
+                    // moves the shape version; another property change keeps
+                    // old files readable.
+                    let shape = |m: &serde_json::Value| {
+                        (
+                            m.get("schemaString").cloned(),
+                            m.get("partitionColumns").cloned(),
+                            m.get("configuration")
+                                .and_then(|c| c.get("delta.columnMapping.mode"))
+                                .cloned(),
+                        )
+                    };
+                    if metadata.as_ref().map(shape) != Some(shape(action)) {
+                        shape_version = version;
+                    }
+                    metadata = Some(action.clone());
+                }
                 "domainMetadata"
                     if action.get("domain").and_then(|v| v.as_str())
                         == Some("delta.clustering")
@@ -1641,6 +1676,13 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
             files.remove(c);
         }
         for (c, add) in adds {
+            ever_added.insert(
+                c.clone(),
+                LiveFile {
+                    version,
+                    add: add.clone(),
+                },
+            );
             files.insert(c, LiveFile { version, add });
         }
     }
@@ -1665,6 +1707,8 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
         protocol,
         metadata,
         row_tracking_domain,
+        ever_added,
+        shape_version,
     })
 }
 

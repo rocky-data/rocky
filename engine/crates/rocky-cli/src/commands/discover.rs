@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
+use rocky_core::env_string::ExposeOpt;
 use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
 use rocky_core::state::StateStore;
 use rocky_fivetran::client::FivetranClient;
@@ -682,8 +683,12 @@ async fn emit_fivetran_state(
             .with_context(|| format!("adapters.{name}: api_secret required for fivetran"))?;
         let destination_id = adapter_cfg
             .destination_id
-            .as_deref()
+            .expose_opt()
             .with_context(|| format!("adapters.{name}: destination_id required for fivetran"))?;
+        let destination_shown = adapter_cfg
+            .destination_id
+            .as_ref()
+            .map_or("", rocky_core::env_string::EnvString::rendered);
 
         let mut client = FivetranClient::with_retry(
             api_key.to_string(),
@@ -737,7 +742,7 @@ async fn emit_fivetran_state(
             .fetch_envelope(destination_id, force_refresh)
             .await
             .with_context(|| {
-                format!("fetching Fivetran envelope for adapter '{name}' (destination '{destination_id}')")
+                format!("fetching Fivetran envelope for adapter '{name}' (destination '{destination_shown}')")
             })?;
 
         let output_path = if multi_destination {

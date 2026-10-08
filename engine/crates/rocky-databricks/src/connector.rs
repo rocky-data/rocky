@@ -536,7 +536,7 @@ impl DatabricksConnector {
             statement.kind = classify_statement_kind(sql),
             "rocky.adapter.name" = "databricks",
             "rocky.statement.kind" = classify_statement_kind(sql),
-            "rocky.warehouse.name" = %self.config.warehouse_id,
+            "rocky.warehouse.name" = %rocky_core::secret_registry::render_placeholders(&self.config.warehouse_id),
             "rocky.warehouse.query_id" = field::Empty,
             "rocky.warehouse.bytes_scanned" = field::Empty,
             "rocky.retry.attempt" = field::Empty,

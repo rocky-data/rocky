@@ -2704,6 +2704,56 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
         // Nested expression
         Expr::Nested(inner) => infer_expr_type(inner, scope),
 
+        // `SUBSTRING(x FROM a FOR b)`, `SUBSTR(x, a)` and `CEIL`/`FLOOR` parse
+        // as their own nodes, not function calls. Same rule as the entries in
+        // `NULL_PRESERVING_SCALARS` (#2298); a date `CEIL(x TO DAY)` stays
+        // Unknown.
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            // Postgres regex forms (`FROM 'pattern'`, `SIMILAR`) return NULL
+            // on no match, so the start and length must be integer typed.
+            let nullable = infer_expr_type(expr, scope).1
+                || [substring_from, substring_for]
+                    .into_iter()
+                    .flatten()
+                    .any(|e| !is_non_null_of(e, scope, RockyType::is_integer));
+            (RockyType::String, nullable)
+        }
+        Expr::Ceil { expr, field } | Expr::Floor { expr, field } => {
+            if matches!(
+                field,
+                ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)
+            ) {
+                let (ty, nullable) = infer_expr_type(expr, scope);
+                let exact = ty.is_integer() || ty.is_float();
+                (ty, nullable || !exact)
+            } else {
+                (RockyType::Unknown, true)
+            }
+        }
+
+        // `TRIM(...)` parses as its own node, not a function call. NULL only
+        // for a NULL operand or trim character (#2298).
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            let nullable = infer_expr_type(expr, scope).1
+                || trim_what
+                    .as_deref()
+                    .is_some_and(|e| infer_expr_type(e, scope).1)
+                || trim_characters
+                    .as_deref()
+                    .is_some_and(|es| es.iter().any(|e| infer_expr_type(e, scope).1));
+            (RockyType::String, nullable)
+        }
+
         _ => (RockyType::Unknown, true),
     }
 }
@@ -2757,6 +2807,125 @@ fn infer_binary_op_type(
 
         _ => (RockyType::Unknown, nullable),
     }
+}
+
+/// Scalar functions whose result is NULL only when an argument is NULL, so a
+/// call over non-null arguments is non-null (#2298).
+///
+/// Each entry is non-null over non-null arguments in every dialect Rocky
+/// targets (DuckDB, Databricks/Spark, Snowflake, BigQuery, Trino), or the
+/// function is left out and stays nullable. Dialect evidence:
+///
+/// - `UPPER`, `LOWER`, `REVERSE`, `TRIM`, `LTRIM`, `RTRIM`: standard string
+///   functions; NULL in, NULL out, and no dialect here maps an empty result to
+///   NULL (Oracle does, and is not a target).
+/// - `LENGTH`, `CHAR_LENGTH`, `CHARACTER_LENGTH`, `OCTET_LENGTH`: return a
+///   count; NULL only for a NULL argument.
+/// - `SUBSTRING`, `SUBSTR`: an out-of-range start gives an empty string, not
+///   NULL (ANSI, DuckDB, Spark, Snowflake, Trino, BigQuery). Only when the
+///   start and length are inferred integers: Postgres regex forms
+///   (`SUBSTRING(x FROM 'pat')`, `SUBSTRING(x, 'pat')`, `SIMILAR`) return NULL
+///   on no match.
+/// - `LPAD`, `RPAD`: NULL only for a NULL argument. A bad pad (empty string in
+///   BigQuery or Trino) raises an error; it does not return NULL.
+/// - `CONCAT`: Postgres, DuckDB and Snowflake-style `CONCAT` skip NULL
+///   arguments, Spark and BigQuery return NULL for any NULL argument. Either
+///   way, all-non-null arguments give a non-null result, so no dialect switch
+///   is needed. `CONCAT_WS` is left out: with a NULL separator it returns NULL
+///   and the dialects disagree on the rest.
+/// - `ABS`, `SIGN`, `CEIL`, `CEILING`, `FLOOR`, `ROUND`: NULL only for a NULL
+///   argument over inferred integer and float types. Over `DECIMAL`, Spark with
+///   ANSI mode off returns NULL when the rounded value overflows the precision.
+///   Over a string, Spark with ANSI off casts a non-numeric value to NULL.
+///   Unknown proves nothing. All three stay nullable (see `args_all_non_null`).
+///
+/// Dialects checked: ANSI, DuckDB, Spark/Databricks, Snowflake, Trino, BigQuery
+/// and Postgres (regex SUBSTRING). SQL Server and ClickHouse were not checked
+/// against these rules; the type guards (integer or float arguments only) are
+/// what keep the claim narrow there.
+///
+/// Not listed, so nullable: `LEFT`/`RIGHT` (a negative length is NULL in some
+/// dialects), `REPLACE`, `INITCAP`, `TRUNC`/`TRUNCATE` (date forms), `POSITION`
+/// family, `POWER`/`SQRT`/`LOG`/`LN` (domain errors return NULL in DuckDB and
+/// Spark), `NULLIF`, `/` and `%`.
+const NULL_PRESERVING_SCALARS: &[&str] = &[
+    "UPPER",
+    "LOWER",
+    "REVERSE",
+    "TRIM",
+    "LTRIM",
+    "RTRIM",
+    "LENGTH",
+    "CHAR_LENGTH",
+    "CHARACTER_LENGTH",
+    "OCTET_LENGTH",
+    "SUBSTRING",
+    "SUBSTR",
+    "LPAD",
+    "RPAD",
+    "CONCAT",
+    "ABS",
+    "SIGN",
+    "CEIL",
+    "CEILING",
+    "FLOOR",
+    "ROUND",
+];
+
+/// True when `expr` is non-null and its inferred type satisfies `accept`.
+/// `Unknown` is never accepted by the integer and float predicates.
+fn is_non_null_of(expr: &ast::Expr, scope: &TypeScope, accept: fn(&RockyType) -> bool) -> bool {
+    let (ty, nullable) = infer_expr_type(expr, scope);
+    !nullable && accept(&ty)
+}
+
+/// True when `name` is a null-preserving scalar and the call is a plain
+/// scalar call whose every argument is a non-null expression.
+///
+/// Anything unusual (no arguments, a named or wildcard argument, an `OVER`,
+/// `FILTER` or `WITHIN GROUP` clause, a non-integer/float argument to a numeric
+/// function, a non-integer substring or pad length) returns false, which keeps the result nullable.
+fn args_all_non_null(name: &str, func: &ast::Function, scope: &TypeScope) -> bool {
+    if !NULL_PRESERVING_SCALARS.contains(&name)
+        || func.over.is_some()
+        || func.filter.is_some()
+        || !func.within_group.is_empty()
+        || func.null_treatment.is_some()
+    {
+        return false;
+    }
+    let ast::FunctionArguments::List(arg_list) = &func.args else {
+        return false;
+    };
+    if arg_list.args.is_empty()
+        || arg_list.duplicate_treatment.is_some()
+        || !arg_list.clauses.is_empty()
+    {
+        return false;
+    }
+    let numeric = matches!(
+        name,
+        "ABS" | "SIGN" | "CEIL" | "CEILING" | "FLOOR" | "ROUND"
+    );
+    arg_list.args.iter().enumerate().all(|(i, arg)| {
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+            return false;
+        };
+        // Numeric functions: every argument must be an inferred integer or
+        // float. Spark with ANSI off casts a non-numeric string to NULL, a
+        // decimal can overflow to NULL, and Unknown proves nothing.
+        // SUBSTRING/SUBSTR start and length, and LPAD/RPAD length, must be
+        // integers: Postgres `SUBSTRING(x, 'pattern')` returns NULL on no match.
+        if numeric {
+            is_non_null_of(expr, scope, |t| t.is_integer() || t.is_float())
+        } else if matches!(name, "SUBSTRING" | "SUBSTR") && i > 0
+            || matches!(name, "LPAD" | "RPAD") && i == 1
+        {
+            is_non_null_of(expr, scope, RockyType::is_integer)
+        } else {
+            !infer_expr_type(expr, scope).1
+        }
+    })
 }
 
 /// Infer the result type of a SQL function call.
@@ -2828,20 +2997,25 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             (arg_type, true)
         }
 
-        // String functions
+        // String functions. The entries in `NULL_PRESERVING_SCALARS` are
+        // non-null when every argument is non-null (#2298); the rest stay
+        // nullable.
         "CONCAT" | "CONCAT_WS" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
         | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REVERSE" | "INITCAP" => {
-            (RockyType::String, true)
+            (RockyType::String, !args_all_non_null(&name, func, scope))
         }
-        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" => (RockyType::Int64, true),
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" => {
+            (RockyType::Int64, !args_all_non_null(&name, func, scope))
+        }
         "POSITION" | "STRPOS" | "INSTR" => (RockyType::Int64, true),
 
         // Numeric functions
         "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE" | "TRUNC" => {
             let arg_type = first_arg_type(func, scope);
-            (arg_type, true)
+            let nullable = !args_all_non_null(&name, func, scope);
+            (arg_type, nullable)
         }
-        "SIGN" => (RockyType::Int32, true),
+        "SIGN" => (RockyType::Int32, !args_all_non_null(&name, func, scope)),
         "POWER" | "POW" | "SQRT" | "LOG" | "LOG2" | "LOG10" | "LN" | "EXP" | "SIN" | "COS"
         | "TAN" => (RockyType::Float64, true),
 
@@ -3899,6 +4073,174 @@ mod tests {
                 ("i".to_string(), RockyType::Unknown, true),
             ];
             assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
+        }
+    }
+
+    /// Golden table for #2298: expression -> (type, nullable) through direct
+    /// inference. Source `t` has `x INT NOT NULL`, `n STRING NOT NULL`,
+    /// `y INT NOT NULL`, plus nullable `nx INT`, `nn STRING`.
+    #[test]
+    fn null_preserving_scalars_golden() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+                ("y", RockyType::Int32, false),
+                ("nx", RockyType::Int32, true),
+                ("nn", RockyType::String, true),
+                ("f", RockyType::Float64, false),
+                (
+                    "d",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+            ]),
+        )]);
+        let s = RockyType::String;
+        let i64t = RockyType::Int64;
+        let i32t = RockyType::Int32;
+        let cases: Vec<(&str, RockyType, bool)> = vec![
+            // null-preserving over non-null input: non-null
+            ("UPPER(n)", s.clone(), false),
+            ("LOWER(n)", s.clone(), false),
+            ("TRIM(n)", s.clone(), false),
+            ("LTRIM(n)", s.clone(), false),
+            ("RTRIM(n)", s.clone(), false),
+            ("REVERSE(n)", s.clone(), false),
+            ("LENGTH(n)", i64t.clone(), false),
+            ("CHAR_LENGTH(n)", i64t.clone(), false),
+            ("SUBSTRING(n, 1, 2)", s.clone(), false),
+            ("SUBSTR(n, 2)", s.clone(), false),
+            ("LPAD(n, 5, '0')", s.clone(), false),
+            ("RPAD(n, 5, '0')", s.clone(), false),
+            ("CONCAT(n, 'a')", s.clone(), false),
+            ("ABS(x)", i32t.clone(), false),
+            ("ROUND(x)", i32t.clone(), false),
+            ("FLOOR(x)", i32t.clone(), false),
+            ("CEIL(x)", i32t.clone(), false),
+            ("CEILING(x)", i32t.clone(), false),
+            ("SIGN(x)", i32t.clone(), false),
+            ("UPPER(TRIM(n))", s.clone(), false),
+            // a nullable argument stays nullable
+            ("UPPER(nn)", s.clone(), true),
+            ("LENGTH(nn)", i64t.clone(), true),
+            ("ABS(nx)", i32t.clone(), true),
+            ("CONCAT(n, nn)", s.clone(), true),
+            ("SUBSTRING(nn, 1, 2)", s.clone(), true),
+            ("LPAD(n, 5, nn)", s.clone(), true),
+            ("UPPER(NULL)", s.clone(), true),
+            ("UPPER(TRIM(nn))", s.clone(), true),
+            // decimal numerics stay nullable (Spark overflow gives NULL)
+            (
+                "ROUND(d, 1)",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            (
+                "FLOOR(d)",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            (
+                "CEIL(d)",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            // regex SUBSTRING returns NULL on no match: nullable
+            ("SUBSTRING(n FROM 'a+')", s.clone(), true),
+            ("SUBSTRING(n, 'a+')", s.clone(), true),
+            ("SUBSTRING(n FROM 'a' FOR '#')", s.clone(), true),
+            // a string start is nullable; an integer FROM/FOR form is not
+            ("SUBSTRING(n, n)", s.clone(), true),
+            ("SUBSTR(n, '1')", s.clone(), true),
+            ("SUBSTRING(n FROM 1 FOR 2)", s.clone(), false),
+            ("LPAD(n, '5', '0')", s.clone(), true),
+            // ANSI-off Spark: a non-numeric string casts to NULL
+            ("ABS(n)", s.clone(), true),
+            ("FLOOR(n)", s.clone(), true),
+            ("ROUND(n, 1)", s.clone(), true),
+            // Unknown never qualifies
+            ("ABS(UNKNOWN_FN(x))", RockyType::Unknown, true),
+            ("ABS((SELECT 1))", RockyType::Unknown, true),
+            // float input stays non-null
+            ("ABS(f)", RockyType::Float64, false),
+            // not in the table: stay nullable
+            ("NULLIF(x, 0)", i32t.clone(), true),
+            ("x / y", i32t.clone(), true),
+            ("x % y", i32t.clone(), true),
+            ("LEFT(n, 2)", s.clone(), true),
+            ("REPLACE(n, 'a', 'b')", s.clone(), true),
+            ("CONCAT_WS(',', n, n)", s.clone(), true),
+            ("SQRT(x)", RockyType::Float64, true),
+            // a malformed call stays nullable
+            ("UPPER()", s.clone(), true),
+        ];
+        let mut failures = Vec::new();
+        for (expr, ty, nullable) in cases {
+            let sql = format!("SELECT {expr} AS c FROM t");
+            let columns = infer_select_types(&sql, &sources, "m").unwrap();
+            let got = (columns[0].data_type.clone(), columns[0].nullable);
+            if got != (ty.clone(), nullable) {
+                failures.push(format!("{expr}: got {got:?}, want {:?}", (ty, nullable)));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// #2298: `CAST(UPPER(name) AS STRING)` over a NOT NULL column is non-null
+    /// through the full typecheck, and satisfies a `nullable = false` contract
+    /// (no E012). The nullable and unlisted-function variants still fail it.
+    #[test]
+    fn cast_over_null_preserving_scalar_satisfies_not_null_contract() {
+        let contract = |type_name: &str| CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("n", RockyType::String, false),
+                ("nn", RockyType::String, true),
+                ("x", RockyType::Int32, false),
+            ]),
+        )]);
+        for (expr, type_name, expect_e012) in [
+            ("CAST(UPPER(n) AS STRING)", "String", false),
+            ("CAST(LENGTH(n) AS BIGINT)", "Int64", false),
+            ("CAST(ABS(x) AS INT)", "Int32", false),
+            ("CAST(UPPER(nn) AS STRING)", "String", true),
+            ("CAST(LEFT(n, 2) AS STRING)", "String", true),
+            ("CAST(NULLIF(n, 'a') AS STRING)", "String", true),
+            ("CAST(x / x AS INT)", "Int32", true),
+        ] {
+            let sql = format!("SELECT {expr} AS c FROM t");
+            let project = Project::from_models(vec![make_model("m", &sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let result =
+                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let columns = &result.typed_models["m"];
+            let has_e012 = validate_contract("m", columns, &contract(type_name))
+                .iter()
+                .any(|d| &*d.code == "E012");
+            assert_eq!(has_e012, expect_e012, "{expr}: {columns:?}");
         }
     }
 

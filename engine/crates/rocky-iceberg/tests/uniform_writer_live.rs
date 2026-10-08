@@ -863,3 +863,121 @@ async fn point_to_same_target_is_noop_live_sandbox() {
          (after_build={count_after_build}, after_point_to={count_after_pointto})"
     );
 }
+
+/// Live test for the RV1-P3 Delta table publish: build output A (3 rows),
+/// then output B (5 rows), then publish A again through
+/// `DeltaTablePublisher`. One Delta commit makes A live, and Photon counts
+/// A's 3 rows. Not run in CI.
+///
+/// Requires the same env as `point_to_same_target_is_noop_live_sandbox`.
+/// The table's content is replaced.
+#[tokio::test]
+#[ignore]
+async fn table_publish_restores_an_earlier_output_live_sandbox() {
+    use rocky_core::environments::{EnvPointer, PointerVersion};
+    use rocky_core::state::OutputVersion;
+    use rocky_core::table_publish::{TableMoved, TablePointerBackend};
+    use rocky_iceberg::uniform_writer::publish::DeltaTablePublisher;
+
+    let Some(cfg) = try_load_config() else {
+        eprintln!("skipping: ROCKY_TEST_* env vars not set");
+        return;
+    };
+    let Some(store) = build_s3_store(&cfg) else {
+        eprintln!("skipping: failed to build S3 store from environment");
+        return;
+    };
+    let Some(connector) = connector_from_env() else {
+        eprintln!("skipping: DATABRICKS_* env vars not set");
+        return;
+    };
+    let sql_client = Arc::new(DatabricksSqlClient { connector });
+    let fqtn = format!("{}.{}.{}", cfg.catalog, cfg.schema, cfg.table);
+    let count_sql = format!("SELECT COUNT(*) AS n FROM {fqtn}");
+    let read_count = |sql_client: Arc<DatabricksSqlClient>, sql: String| async move {
+        let res = sql_client.connector.execute_sql(&sql).await.expect("count");
+        let cell = &res.rows[0][0];
+        cell.as_i64()
+            .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
+            .expect("count parses as i64")
+    };
+    let new_writer = || {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: cfg.catalog.clone(),
+                schema: cfg.schema.clone(),
+                table: cfg.table.clone(),
+                prefix: cfg.prefix.clone(),
+                engine_info: "rocky-iceberg/table-publish-live-test".into(),
+            },
+            store.clone(),
+            sql_client.clone() as Arc<dyn SqlClient>,
+        )
+        .with_table_bucket(cfg.bucket.clone())
+    };
+    let writer = new_writer();
+    let state = writer.discover().await.expect("discover");
+    if !state.partition_columns.is_empty() || state.row_tracking_enabled {
+        eprintln!("skipping: publish needs an unpartitioned, non-rowTracking table");
+        return;
+    }
+    let expected_cols: std::collections::BTreeSet<&str> =
+        ["id", "name", "ts"].into_iter().collect();
+    let actual_cols: std::collections::BTreeSet<&str> =
+        state.physical.keys().map(String::as_str).collect();
+    if expected_cols != actual_cols {
+        eprintln!("skipping: this test expects schema (id, name, ts); table has {actual_cols:?}");
+        return;
+    }
+
+    let batch = |rows: i64| {
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let ids = Int64Array::from((0..rows).map(|i| 900_800 + i).collect::<Vec<_>>());
+        let names = StringArray::from(
+            (0..rows)
+                .map(|i| format!("publish-{i}"))
+                .collect::<Vec<_>>(),
+        );
+        let ts =
+            TimestampMicrosecondArray::from((0..rows).map(|i| now_micros + i).collect::<Vec<_>>())
+                .with_timezone("UTC");
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names), Arc::new(ts)]).unwrap()
+    };
+    let a = writer.write_batch(batch(3)).await.expect("build A");
+    let b = writer.write_batch(batch(5)).await.expect("build B");
+    writer.sync_iceberg_metadata().await.expect("MSCK after B");
+    assert_eq!(read_count(sql_client.clone(), count_sql.clone()).await, 5);
+
+    let publisher = DeltaTablePublisher::new().with_table(new_writer());
+    let pointer = EnvPointer {
+        model: cfg.table.clone(),
+        run_id: "live".into(),
+        version: PointerVersion::Known(OutputVersion::content_addressed(
+            fqtn.clone(),
+            vec![a.table_version],
+            vec![a.blake3_hash.clone()],
+            false,
+        )),
+    };
+    publisher.check(&pointer).expect("check");
+    let moved = publisher.move_table(&pointer).await.expect("publish A");
+    // `Moved` means the commit landed and the Iceberg sync succeeded.
+    let TableMoved::Moved { table_version, .. } = moved else {
+        panic!("publishing A over B must write a commit and sync Iceberg: {moved:?}");
+    };
+    assert!(table_version > b.table_version);
+    assert_eq!(
+        read_count(sql_client.clone(), count_sql.clone()).await,
+        3,
+        "Photon must read A's rows after the publish"
+    );
+}

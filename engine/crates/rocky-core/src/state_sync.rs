@@ -1704,6 +1704,25 @@ impl LedgerSeamSession {
 
         unreachable!("ledger-seam attempt loop always returns within the for body")
     }
+
+    /// Read one environment's head from the shared state, writing nothing.
+    /// Local reads the ledger file; a remote backend downloads the shared
+    /// blob first (one GET), then reads it. Nothing is uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Download and store errors.
+    pub async fn read_environment(
+        &self,
+        env: &crate::environments::EnvironmentName,
+    ) -> Result<Option<crate::environments::EnvironmentRecord>, StateSyncError> {
+        if !matches!(self.cfg.backend, StateBackend::Local) {
+            let _authority =
+                download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
+        }
+        let store = StateStore::open_read_only(&self.state_path)?;
+        Ok(store.get_environment(env)?)
+    }
 }
 
 impl LedgerSeamSession {
@@ -5139,6 +5158,14 @@ pub async fn publish_pointers(
     session: &LedgerSeamSession,
     request: &crate::environments::PublishRequest,
 ) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    require_publish_cas(session).await?;
+    publish_pointers_with_hook(session, request, None).await
+}
+
+/// Refuse a publish over a remote backend without effective CAS: there the
+/// seam is one download and one unconditional upload, so a concurrent
+/// publish could be lost silently.
+async fn require_publish_cas(session: &LedgerSeamSession) -> Result<(), StateSyncError> {
     if !matches!(session.cfg.backend, StateBackend::Local) {
         // The same resolution `execute` performs: the backend default for an
         // unset mode, confirmed by the startup probe.
@@ -5149,7 +5176,63 @@ pub async fn publish_pointers(
             });
         }
     }
-    publish_pointers_with_hook(session, request, None).await
+    Ok(())
+}
+
+/// Start a table publish against the shared state (RV1-P3): run
+/// [`StateStore::begin_table_publish`] as one [`LedgerSeamSession`]
+/// transition, with the same CAS guard and replay rules as
+/// [`publish_pointers`]. A head another publish moved is a
+/// [`StateSyncError::PublishConflict`]; nothing is written.
+///
+/// # Errors
+///
+/// As [`publish_pointers`], plus
+/// [`crate::environments::EnvironmentError::PublishInProgress`] wrapped in
+/// [`StateSyncError::State`].
+pub async fn begin_table_publish(
+    session: &LedgerSeamSession,
+    request: &crate::environments::PublishRequest,
+    options: crate::environments::TablePublishOptions,
+    check: &(dyn Fn(&crate::environments::EnvPointer) -> Result<(), String> + Sync),
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    require_publish_cas(session).await?;
+    session
+        .execute(move |store, _base| {
+            // The store call is synchronous; the future only carries its
+            // result, so it borrows nothing from the caller.
+            let result = store
+                .begin_table_publish(request, options, check)
+                .map_err(publish_error);
+            Box::pin(async move { result })
+        })
+        .await
+}
+
+/// Record a table publish's outcome against the shared state (RV1-P3): run
+/// [`StateStore::finish_table_publish`] as one [`LedgerSeamSession`]
+/// transition. It replays like [`publish_pointers`]; the environment is
+/// marked `publishing`, so no other publish can move the head in between.
+///
+/// # Errors
+///
+/// As [`StateStore::finish_table_publish`], plus every seam error.
+pub async fn finish_table_publish(
+    session: &LedgerSeamSession,
+    env: &crate::environments::EnvironmentName,
+    started: &str,
+    moves: &[crate::environments::TableMove],
+    principal: &crate::config::PrincipalRef,
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    require_publish_cas(session).await?;
+    session
+        .execute(move |store, _base| {
+            let result = store
+                .finish_table_publish(env, started, moves, principal)
+                .map_err(publish_error);
+            Box::pin(async move { result })
+        })
+        .await
 }
 
 /// The publish transition WITHOUT the CAS guard. Tests use it to show what

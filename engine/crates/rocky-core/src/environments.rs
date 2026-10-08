@@ -15,8 +15,9 @@
 //!
 //! - A pointer pins no data. `rocky gc`, run-history retention and Delta
 //!   `VACUUM` can remove a version an environment points to. Pinning is RV1-P5.
-//! - A pointer controls no warehouse object (no view swap, no clone). That is
-//!   RV1-P3 / RV1-P4.
+//! - A state-only publish controls no warehouse object (no view swap, no
+//!   clone). The table publish in [`crate::table_publish`] (RV1-P3) moves
+//!   Delta tables, one commit per table; views are RV1-P4.
 //! - There is no rollback verb and no CLI verb yet.
 //!
 //! Concurrency. The local store serializes writers through one redb write
@@ -177,14 +178,139 @@ pub struct EnvironmentRecord {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Who moved the head.
     pub updated_by: PrincipalRef,
+    /// The publish id of a table publish that started and has not recorded
+    /// its outcome yet (RV1-P3). While it is set, every other publish to this
+    /// environment is refused with [`EnvironmentError::PublishInProgress`].
+    /// Omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publishing: Option<String>,
 }
 
-/// What a publish changed. Only `state_only` exists in RV1-P2.
+/// What a publish changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishScope {
     /// The publish moved state pointers only. No warehouse object changed.
     StateOnly,
+    /// The publish moved Delta tables, one commit per table (RV1-P3). It is
+    /// NOT atomic across tables: readers can see some tables moved and others
+    /// not. [`PublishRecord::tables`] says which.
+    DeltaPerTable,
+}
+
+/// The table part of a [`PublishScope::DeltaPerTable`] publish.
+///
+/// A table publish writes two history rows:
+///
+/// ```text
+///   env#N    Started  { planned }          head = env#N, publishing = env#N
+///      ── one Delta commit per table, in `planned` order ──
+///   env#N+1  Finished { started, moves }   head = env#N+1, publishing = None
+/// ```
+///
+/// In the `Started` row, `to` is the plan, not what moved. The `Finished`
+/// row's `to` holds only the models whose table now serves the version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum TablePublish {
+    /// The publish claimed the environment. No table had moved yet.
+    Started {
+        /// The models to move, in the order the tables are committed.
+        planned: Vec<String>,
+    },
+    /// The publish ended. `moves` holds one entry per planned model, in order.
+    Finished {
+        /// The publish id of the `Started` row this row closes.
+        started: String,
+        /// What happened to each table.
+        moves: Vec<TableMove>,
+    },
+}
+
+/// What a table publish did to one model's table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableMove {
+    /// The model name.
+    pub model: String,
+    /// What happened.
+    pub outcome: TableMoveOutcome,
+}
+
+/// The outcome of one table move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TableMoveOutcome {
+    /// One commit moved the table, and its follow-up steps (the Iceberg
+    /// metadata sync) ran. `table_version` is that commit.
+    Moved {
+        /// The table name.
+        table: String,
+        /// The commit that made the table serve the version.
+        table_version: u64,
+    },
+    /// The table already served the version. No commit was written. Its
+    /// follow-up steps ran again.
+    AlreadyCurrent {
+        /// The table name.
+        table: String,
+        /// The current table version.
+        table_version: u64,
+    },
+    /// The Delta table serves the version (a commit moved it, or it already
+    /// served it), but a follow-up step failed: the Iceberg metadata sync.
+    /// Delta readers see the version; Iceberg readers may not. A retry of
+    /// the publish runs the sync again.
+    SyncFailed {
+        /// The table name.
+        table: String,
+        /// The table version that serves the version.
+        table_version: u64,
+        /// Whether this publish wrote the commit.
+        committed: bool,
+        /// Why the sync failed.
+        error: String,
+    },
+    /// The move failed. The table did not move, as far as the backend can
+    /// tell.
+    Failed {
+        /// Why.
+        error: String,
+    },
+    /// The move's commit may have landed: its write returned an error that
+    /// does not say whether the commit was stored. The pointer does not
+    /// move. A retry of the publish finds the table already current when the
+    /// commit did land.
+    Unknown {
+        /// The error the commit write returned.
+        error: String,
+    },
+    /// An earlier move failed or ended unknown, so this one was not tried.
+    NotAttempted,
+}
+
+impl TableMoveOutcome {
+    /// Whether the Delta table now serves the version. The head's pointer
+    /// moves exactly for these.
+    #[must_use]
+    pub fn serves_version(&self) -> bool {
+        match self {
+            Self::Moved { .. } | Self::AlreadyCurrent { .. } | Self::SyncFailed { .. } => true,
+            Self::Failed { .. } | Self::Unknown { .. } | Self::NotAttempted => false,
+        }
+    }
+
+    /// Whether every reader of the table sees the version: the Delta table
+    /// serves it and the follow-up steps ran.
+    #[must_use]
+    pub fn is_fully_served(&self) -> bool {
+        match self {
+            Self::Moved { .. } | Self::AlreadyCurrent { .. } => true,
+            Self::SyncFailed { .. }
+            | Self::Failed { .. }
+            | Self::Unknown { .. }
+            | Self::NotAttempted => false,
+        }
+    }
 }
 
 /// One append-only publish history row. Key: [`history_key`].
@@ -211,6 +337,10 @@ pub struct PublishRecord {
     pub plan_id: Option<String>,
     /// What the publish changed.
     pub scope: PublishScope,
+    /// The table part of a [`PublishScope::DeltaPerTable`] publish. Omitted
+    /// for a state-only publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<TablePublish>,
 }
 
 /// One pointer to publish: take `model`'s output version from run `run_id`.
@@ -220,6 +350,18 @@ pub struct PublishSource {
     pub model: String,
     /// The run whose execution of `model` supplies the version.
     pub run_id: String,
+}
+
+/// How a table publish (RV1-P3) may start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TablePublishOptions {
+    /// Start from a head whose own table publish never finished. Only for a
+    /// publisher known to be dead.
+    pub take_over: bool,
+    /// Publish even when another environment points a model's table at a
+    /// different version. On Delta both environments name the same table,
+    /// so the publish moves it under the other environment too.
+    pub allow_shared_tables: bool,
 }
 
 /// A request to move an environment's pointers.
@@ -291,6 +433,23 @@ pub enum PublishRefusal {
         run_id: String,
         reason: UnversionedReason,
     },
+    /// The table backend of a table publish (RV1-P3) cannot move this
+    /// model's table to the version. Nothing was written.
+    #[error("the table backend cannot publish this version: {reason}")]
+    BackendRefused { reason: String },
+    /// Another environment points this model's table at a different version
+    /// (or a version this binary cannot read). A table publish moves the
+    /// table itself, so it would move it under that environment too.
+    #[error(
+        "environment {other:?} ({publish_id}) points table `{table}` at a different version; \
+         a table publish would move it under {other:?} too. Publish with the shared-table \
+         override to move it anyway"
+    )]
+    TableSharedWithEnvironment {
+        other: String,
+        publish_id: String,
+        table: String,
+    },
 }
 
 /// A publish or environment request that is wrong in itself.
@@ -321,6 +480,20 @@ pub enum EnvironmentError {
     /// A stored head is corrupt: its seq cannot advance.
     #[error("environment {environment:?} head seq {seq} cannot advance")]
     SeqOverflow { environment: String, seq: u64 },
+    /// A table publish started and has not recorded its outcome. Its tables
+    /// may be part moved. Nothing was written.
+    #[error(
+        "environment {environment:?} has a table publish in progress ({publish_id}); its tables \
+         may be part moved. Wait for it to finish. If its process died, publish again with \
+         take-over from head {publish_id}"
+    )]
+    PublishInProgress {
+        environment: String,
+        publish_id: String,
+    },
+    /// The outcome does not match the publish it closes.
+    #[error("table publish {publish_id:?} cannot be finished: {reason}")]
+    FinishMismatch { publish_id: String, reason: String },
 }
 
 /// Resolve one source against the run's recorded executions. Pure, so the
@@ -625,5 +798,44 @@ mod tests {
             serde_json::to_string(&PublishScope::StateOnly).unwrap(),
             "\"state_only\""
         );
+        assert_eq!(
+            serde_json::to_string(&PublishScope::DeltaPerTable).unwrap(),
+            "\"delta_per_table\""
+        );
+    }
+
+    /// A P2 row (no `tables`, no `publishing`) reads back with both `None`,
+    /// and a state-only row still serializes without them.
+    #[test]
+    fn rows_without_the_table_fields_read_as_state_only() {
+        let head = format!(
+            r#"{{"name":"prod","seq":1,"head_publish_id":"prod#1","pointers":{{}},"updated_at":"2026-10-06T00:00:00Z","updated_by":{by}}}"#,
+            by = serde_json::to_string(&PrincipalRef::unnamed()).unwrap()
+        );
+        let rec: EnvironmentRecord = serde_json::from_str(&head).unwrap();
+        assert_eq!(rec.publishing, None);
+        assert!(!serde_json::to_string(&rec).unwrap().contains("publishing"));
+        let moved = TableMove {
+            model: "orders".into(),
+            outcome: TableMoveOutcome::Moved {
+                table: "c.s.orders".into(),
+                table_version: 4,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&moved).unwrap(),
+            r#"{"model":"orders","outcome":{"outcome":"moved","table":"c.s.orders","table_version":4}}"#
+        );
+        let sync_failed = TableMoveOutcome::SyncFailed {
+            table: "c.s.orders".into(),
+            table_version: 4,
+            committed: false,
+            error: "x".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&sync_failed).unwrap(),
+            r#"{"outcome":"sync_failed","table":"c.s.orders","table_version":4,"committed":false,"error":"x"}"#
+        );
+        assert!(sync_failed.serves_version() && !sync_failed.is_fully_served());
     }
 }

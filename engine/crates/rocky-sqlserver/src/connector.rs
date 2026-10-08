@@ -293,9 +293,9 @@ impl SqlServerClient {
                 other => other.to_string(),
             };
             SqlServerError::Connect {
-                host: host.to_string(),
+                host: rocky_core::secret_registry::render_placeholders(host),
                 port,
-                message,
+                message: rocky_core::secret_registry::render_placeholders(&message),
                 number,
             }
         };

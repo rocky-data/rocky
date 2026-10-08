@@ -1894,11 +1894,11 @@ pub fn render_profiles_yml(
         "bigquery" => {
             out.insert(
                 "project".into(),
-                need("project_id", adapter.project_id.as_deref())?.into(),
+                need("project_id", adapter.project_id.expose_opt())?.into(),
             );
             out.insert("dataset".into(), dbt_schema.into());
             if let Some(l) = &adapter.location {
-                out.insert("location".into(), l.as_str().into());
+                out.insert("location".into(), l.expose().into());
             }
             match adapter.extra.get("keyfile").and_then(|v| v.as_str()) {
                 Some(keyfile) => {
