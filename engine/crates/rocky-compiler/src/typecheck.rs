@@ -4367,6 +4367,34 @@ mod tests {
             .collect()
     }
 
+    /// #2307: a CTE named like a source shadows it. The column comes from the
+    /// CTE body (`u.n`, a STRING), never from the same-named source `t` (INT).
+    #[test]
+    fn a_cte_named_like_a_source_does_not_take_the_sources_types() {
+        for sql in [
+            "WITH t AS (SELECT n AS x FROM u) SELECT x FROM t",
+            // Aliased, qualified and nested forms of the same read.
+            "WITH t AS (SELECT n AS x FROM u) SELECT a.x FROM t AS a",
+            "WITH t AS (SELECT n AS x FROM u) SELECT t.x AS x FROM t",
+            "WITH t AS (SELECT n AS x FROM u), w AS (SELECT x FROM t) SELECT x FROM t",
+            // The inner `t` is the source; the outer `t` is the CTE.
+            "WITH t AS (SELECT n AS x FROM t) SELECT x FROM t",
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_ne!(rows[0].1, RockyType::Int32, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2307: a CTE with another name leaves the source read alone.
+    #[test]
+    fn a_non_shadowing_cte_keeps_source_types() {
+        let rows = typecheck_over_t_and_u("WITH c AS (SELECT n FROM u) SELECT x FROM t");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+        let rows = typecheck_over_t_and_u("SELECT x FROM t");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
     /// #2303: a set operation is typed by combining its branches by
     /// position. A column is non-null only when it is non-null in every branch.
     #[test]
