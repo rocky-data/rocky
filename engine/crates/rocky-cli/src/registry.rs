@@ -418,8 +418,18 @@ impl AdapterRegistry {
                     // The message prints the path as `${NAME}`; only the
                     // open call sees the plaintext (#1919).
                     let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_ref() {
-                        DuckDbWarehouseAdapter::open(std::path::Path::new(p.expose()))
-                            .context(format!("adapters.{name}: failed to open DuckDB at '{p}'"))?
+                        // DuckDB's own IO error names the plaintext path, so
+                        // it is rendered here instead of chained as the source.
+                        DuckDbWarehouseAdapter::open(std::path::Path::new(p.expose())).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "adapters.{name}: failed to open DuckDB at '{p}': {}",
+                                    rocky_core::secret_registry::render_placeholders(
+                                        &e.to_string()
+                                    )
+                                )
+                            },
+                        )?
                     } else {
                         DuckDbWarehouseAdapter::in_memory().context(format!(
                             "adapters.{name}: failed to create in-memory DuckDB"
@@ -457,9 +467,9 @@ impl AdapterRegistry {
                         .as_ref()
                         .map(rocky_core::redacted::RedactedString::expose)
                         .context(format!("adapters.{name}: api_secret required for fivetran"))?;
-                    let destination_id = adapter_cfg.destination_id.as_deref().context(format!(
-                        "adapters.{name}: destination_id required for fivetran"
-                    ))?;
+                    let destination_id = adapter_cfg.destination_id.expose_opt().context(
+                        format!("adapters.{name}: destination_id required for fivetran"),
+                    )?;
 
                     let mut client = FivetranClient::with_retry(
                         api_key.to_string(),
@@ -652,9 +662,9 @@ impl AdapterRegistry {
                 "bigquery" => {
                     let project_id = adapter_cfg
                         .project_id
-                        .as_deref()
+                        .expose_opt()
                         .context(format!("adapters.{name}: project_id required for bigquery"))?;
-                    let location = adapter_cfg.location.as_deref().unwrap_or("US");
+                    let location = adapter_cfg.location.expose_opt().unwrap_or("US");
 
                     let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
                         .context(format!("adapters.{name}: auth configuration error"))?;
@@ -1028,9 +1038,9 @@ impl AdapterRegistry {
 
         let project_id = adapter_cfg
             .project_id
-            .as_deref()
+            .expose_opt()
             .context(format!("adapters.{name}: project_id required for bigquery"))?;
-        let location = adapter_cfg.location.as_deref().unwrap_or("US");
+        let location = adapter_cfg.location.expose_opt().unwrap_or("US");
 
         let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
             .context(format!("adapters.{name}: auth configuration error"))?;
@@ -1307,7 +1317,9 @@ kind = "discovery"
         let Err(err) = AdapterRegistry::from_config(&bad) else {
             panic!("a path in a missing directory must not open");
         };
-        let shown = err.to_string();
+        // `{err:#}` is what the CLI prints: the whole chain, so DuckDB's own
+        // IO error (which names the plaintext path) must be rendered too.
+        let shown = format!("{err:#}");
         assert!(
             !shown.contains(&missing.display().to_string()),
             "the resolved path leaked: {shown}"

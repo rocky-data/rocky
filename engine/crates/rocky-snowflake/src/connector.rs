@@ -308,7 +308,7 @@ impl SnowflakeConnector {
             statement.kind = classify_statement_kind(sql),
             "rocky.adapter.name" = "snowflake",
             "rocky.statement.kind" = classify_statement_kind(sql),
-            "rocky.warehouse.name" = %self.config.warehouse,
+            "rocky.warehouse.name" = %rocky_core::secret_registry::render_placeholders(&self.config.warehouse),
             "rocky.warehouse.query_id" = field::Empty,
             "rocky.retry.attempt" = field::Empty,
         );

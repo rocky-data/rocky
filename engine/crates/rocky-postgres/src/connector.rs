@@ -245,12 +245,15 @@ impl PgClient {
         });
 
         let connect_err = |e: tokio_postgres::Error| PgError::Connect {
-            host: cfg.host.clone(),
+            // The message prints, so a resolved `${VAR}` host shows as
+            // `${NAME}` (#1919).
+            host: rocky_core::secret_registry::render_placeholders(&cfg.host),
             port: cfg.port,
             sqlstate: e.code().map(|c| c.code().to_string()),
-            message: e
-                .as_db_error()
-                .map_or_else(|| error_chain(&e), |db| db.message().to_string()),
+            message: rocky_core::secret_registry::render_placeholders(
+                &e.as_db_error()
+                    .map_or_else(|| error_chain(&e), |db| db.message().to_string()),
+            ),
         };
 
         let client = match &self.tls {

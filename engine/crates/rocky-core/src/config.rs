@@ -4928,7 +4928,7 @@ pub struct AdapterConfig {
     pub timeout_secs: Option<u64>,
 
     // -- Fivetran fields --
-    pub destination_id: Option<String>,
+    pub destination_id: Option<EnvString>,
     pub api_key: Option<RedactedString>,
     pub api_secret: Option<RedactedString>,
 
@@ -4956,9 +4956,9 @@ pub struct AdapterConfig {
 
     // -- BigQuery fields --
     /// Google Cloud project ID.
-    pub project_id: Option<String>,
+    pub project_id: Option<EnvString>,
     /// BigQuery processing location (e.g., "US", "EU", "us-central1").
-    pub location: Option<String>,
+    pub location: Option<EnvString>,
 
     // -- DuckDB fields --
     /// Optional file path for a persistent DuckDB database.
@@ -5112,7 +5112,7 @@ impl std::fmt::Debug for AdapterConfig {
 /// checkpoint's scope and compared field-wise there (`==`), never parsed
 /// from its rendered form. The [`std::fmt::Display`] rendering
 /// (`snowflake account=xy12345 database=ANALYTICS`) is for messages only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointIdentity {
     /// The adapter type (`duckdb`, `snowflake`, ...).
     pub adapter_type: String,
@@ -5129,13 +5129,34 @@ pub struct EndpointIdentity {
     pub locators: std::collections::BTreeMap<String, String>,
 }
 
+/// Prints each locator value in its `${NAME}` form (#1919). The stored
+/// `locators` keep the resolved text, because a resume compares them
+/// field-wise and two values behind one variable name are two endpoints.
 impl std::fmt::Display for EndpointIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.adapter_type)?;
         for (key, value) in &self.locators {
-            write!(f, " {key}={value}")?;
+            write!(
+                f,
+                " {key}={}",
+                crate::secret_registry::render_placeholders(value)
+            )?;
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for EndpointIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rendered: std::collections::BTreeMap<&String, String> = self
+            .locators
+            .iter()
+            .map(|(k, v)| (k, crate::secret_registry::render_placeholders(v)))
+            .collect();
+        f.debug_struct("EndpointIdentity")
+            .field("adapter_type", &self.adapter_type)
+            .field("locators", &rendered)
+            .finish()
     }
 }
 
@@ -5252,7 +5273,7 @@ impl AdapterConfig {
                 push("host", self.host.expose_opt());
                 push("database", self.database.expose_opt());
             }
-            "bigquery" => push("project_id", self.project_id.as_deref()),
+            "bigquery" => push("project_id", self.project_id.expose_opt()),
             "trino" => {
                 push("host", self.host.expose_opt());
                 push("catalog", self.database.expose_opt());
@@ -5287,7 +5308,7 @@ impl AdapterConfig {
                 });
                 push("port", port.as_deref());
             }
-            "fivetran" => push("destination_id", self.destination_id.as_deref()),
+            "fivetran" => push("destination_id", self.destination_id.expose_opt()),
             "airbyte" | "iceberg" => push("host", self.host.expose_opt()),
             "manual" => {}
             _ => {
@@ -5295,8 +5316,8 @@ impl AdapterConfig {
                 push("http_path", self.http_path.expose_opt());
                 push("account", self.account.expose_opt());
                 push("database", self.database.expose_opt());
-                push("project_id", self.project_id.as_deref());
-                push("destination_id", self.destination_id.as_deref());
+                push("project_id", self.project_id.expose_opt());
+                push("destination_id", self.destination_id.expose_opt());
                 push(
                     "path",
                     self.path.expose_opt().map(canonical_path_string).as_deref(),
@@ -10836,6 +10857,90 @@ database = "${ROCKY_T1919_SF_DB}"
         );
     }
 
+    /// The BigQuery `project_id` and `location` and the Fivetran
+    /// `destination_id` hold a resolved `${VAR}` value for the adapter and
+    /// print only as `${NAME}`. The endpoint identity keeps the resolved text
+    /// for resume comparison but prints `${NAME}` in `Display` and `Debug`.
+    #[test]
+    fn resolved_bigquery_and_fivetran_fields_print_only_as_their_placeholders() {
+        const VARS: [(&str, &str); 4] = [
+            ("ROCKY_T1919_BQ_PROJECT", "rocky-1919-bq-project-5d21"),
+            ("ROCKY_T1919_BQ_LOC", "ROCKY-1919-BQ-LOC-eu9x"),
+            ("ROCKY_T1919_FT_DEST", "rocky_1919_ft_dest_7e03"),
+            (
+                "ROCKY_T1919_DUCK_HOST_PATH",
+                "/data/ROCKY-1919-EP-PATH-b8.db",
+            ),
+        ];
+        for (name, value) in VARS {
+            // SAFETY: test-only; every variable name is unique to this test.
+            unsafe { std::env::set_var(name, value) };
+        }
+        let (_d, path) = write_cfg(
+            r#"
+[adapter.bq]
+type = "bigquery"
+project_id = "${ROCKY_T1919_BQ_PROJECT}"
+location = "${ROCKY_T1919_BQ_LOC}"
+
+[adapter.ft]
+type = "fivetran"
+kind = "discovery"
+destination_id = "${ROCKY_T1919_FT_DEST}"
+api_key = "k"
+api_secret = "s"
+
+[adapter.duck]
+type = "duckdb"
+path = "${ROCKY_T1919_DUCK_HOST_PATH}"
+"#,
+        );
+        let loaded = load_rocky_config(&path);
+        for (name, _) in VARS {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(name) };
+        }
+        let cfg = loaded.expect("the config loads");
+        let bq = &cfg.adapters["bq"];
+        let ft = &cfg.adapters["ft"];
+        let duck = &cfg.adapters["duck"];
+
+        // The adapter still reads plaintext.
+        assert_eq!(bq.project_id.expose_opt(), Some(VARS[0].1));
+        assert_eq!(bq.location.expose_opt(), Some(VARS[1].1));
+        assert_eq!(ft.destination_id.expose_opt(), Some(VARS[2].1));
+
+        let ep_bq = bq.endpoint_identity();
+        let ep_ft = ft.endpoint_identity();
+        let ep_duck = duck.endpoint_identity();
+        // The stored locators stay resolved: a resume compares them.
+        assert_eq!(ep_bq.locators["project_id"], VARS[0].1);
+        assert_eq!(ep_ft.locators["destination_id"], VARS[2].1);
+
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let debug = format!("{cfg:?} {bq:?} {ft:?}");
+        let ep_text = format!("{ep_bq} {ep_ft} {ep_duck} {ep_bq:?} {ep_ft:?} {ep_duck:?}");
+        for printed in [&json, &debug] {
+            for (name, value) in &VARS[..3] {
+                assert!(!printed.contains(value), "{name}'s value leaked: {printed}");
+                assert!(
+                    printed.contains(&format!("${{{name}}}")),
+                    "{name}: {printed}"
+                );
+            }
+        }
+        for (name, value) in VARS {
+            if name == "ROCKY_T1919_BQ_LOC" {
+                continue; // location is not part of the endpoint identity
+            }
+            assert!(!ep_text.contains(value), "{name}'s value leaked: {ep_text}");
+            assert!(
+                ep_text.contains(&format!("${{{name}}}")),
+                "{name}: {ep_text}"
+            );
+        }
+    }
+
     /// A value the TOML parser unescapes is stored in its unescaped form,
     /// which is not the registered bytes. It must still print as `${NAME}`.
     #[test]
@@ -11376,7 +11481,7 @@ fail_fast = false
         );
         assert_eq!(config.adapters["fivetran_main"].adapter_type, "fivetran");
         assert_eq!(
-            config.adapters["fivetran_main"].destination_id.as_deref(),
+            config.adapters["fivetran_main"].destination_id.expose_opt(),
             Some("dest_123")
         );
 

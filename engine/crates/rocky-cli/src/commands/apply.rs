@@ -9918,6 +9918,48 @@ auto_create_schemas = true
         );
     }
 
+    /// #1919: the BigQuery `project_id` and `location` and the Fivetran
+    /// `destination_id` are `EnvString`s. An env swap in any of them still
+    /// changes the routing identity, and the identity holds no resolved value.
+    #[test]
+    fn config_identity_changes_when_a_bigquery_or_fivetran_env_value_changes() {
+        use rocky_core::env_string::EnvString;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter.default]\ntype = \"bigquery\"\nproject_id = \"p\"\n\n[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\ndestination_id = \"d\"\napi_key = \"k\"\napi_secret = \"s\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let with = |project: &str, location: &str, dest: &str| {
+            let mut cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+            let bq = cfg.adapters.get_mut("default").expect("default adapter");
+            bq.project_id = Some(EnvString::substituted("ROCKY_IDENT_BQ_P", project));
+            bq.location = Some(EnvString::substituted("ROCKY_IDENT_BQ_L", location));
+            let ft = cfg.adapters.get_mut("ft").expect("ft adapter");
+            ft.destination_id = Some(EnvString::substituted("ROCKY_IDENT_FT_D", dest));
+            cfg
+        };
+        let base = super::config_policy_identity(&with("proj-a", "US", "dest-a"));
+        for (label, changed) in [
+            ("project_id", with("proj-b", "US", "dest-a")),
+            ("location", with("proj-a", "EU", "dest-a")),
+            ("destination_id", with("proj-a", "US", "dest-b")),
+        ] {
+            assert_ne!(
+                base,
+                super::config_policy_identity(&changed),
+                "an env swap in {label} must change the routing identity"
+            );
+        }
+        for value in ["proj-a", "dest-a"] {
+            assert!(
+                !base.contains(value),
+                "the identity must not hold the resolved value {value}"
+            );
+        }
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {
