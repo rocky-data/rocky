@@ -13,6 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use rocky_compiler::models_loader::union_by_model_name;
 use rocky_core::models::{Model, StrategyConfig};
 use rocky_core::seeds::SeedFile;
 use rocky_core::unified_dag::{self, NodeKind, UnifiedDag};
@@ -526,29 +527,6 @@ fn build_column_lineage_from_models(
         .collect();
 
     Ok((edges, None))
-}
-
-/// Flatten a per-pipeline attribution back into the single name-keyed list the
-/// node enrichment and the `model_map` lookup want, sorted by name to match
-/// [`load_all_models`].
-///
-/// Deduping by name is safe rather than lossy: `load_transformation_models`
-/// has already refused two *distinct files* sharing a model name, so a name
-/// reaching this twice is one file claimed by two pipelines — same `Model`
-/// either way. That claim is itself refused downstream by `build_unified_dag`,
-/// which can name both pipelines; this only has to not panic before it does.
-fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeline) -> Vec<Model> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut all: Vec<Model> = Vec::new();
-    for models in by_pipeline.values() {
-        for model in models {
-            if seen.insert(model.config.name.clone()) {
-                all.push(model.clone());
-            }
-        }
-    }
-    all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
-    all
 }
 
 /// Load models from a directory and its immediate subdirectories

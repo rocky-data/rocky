@@ -1,0 +1,1031 @@
+//! Shared model-directory loader for CLI commands and `rocky serve`.
+//!
+//! The canonical "load every model in the project" path: top-level dir plus
+//! every directory beneath it, including **both** `.sql` (sidecar
+//! `.toml`) and `.rocky` DSL files. Commands that need the model list (but not
+//! the resolved DAG) should use this instead of
+//! [`rocky_core::models::load_models_from_dir`], which collects only `.sql`
+//! files and therefore silently drops `.rocky` DSL models.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use rocky_core::models::Model;
+
+/// Where a transformation pipeline's `models` glob points, and whether anything
+/// is there.
+///
+/// Both variants carry the derived path: a caller that must distinguish "no
+/// models to build" from "models at this path" needs the path in *both* cases —
+/// `run` reports the absent directory it decided against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelsDir {
+    /// The base directory exists, and resolved inside the project root **at the
+    /// moment it was checked**.
+    ///
+    /// Precisely that, and no more: the path handed back is the ordinary
+    /// (non-canonical) one, so a symlink component retargeted after this check
+    /// and before the directory is opened is not caught. Closing that window
+    /// needs a directory handle carried from check to open, which no caller
+    /// does today. The guarantee is therefore a guard against a
+    /// **misconfigured** `models` glob, not against an adversary who can
+    /// already write inside the project tree — one who can retarget a symlink
+    /// there can equally edit `rocky.toml` or the model SQL, which no path
+    /// check would stop.
+    Present(PathBuf),
+    /// The base directory does not exist. A no-op for every caller.
+    ///
+    /// Containment is **not** asserted for this variant, matching the order the
+    /// existence check has always run in: an absent directory is never read, so
+    /// there is nothing to confine.
+    Absent(PathBuf),
+}
+
+/// Return the literal directory prefix of a `models` glob.
+///
+/// Wildcards apply to path components, so a wildcard-bearing component is not
+/// part of the directory prefix: both `models/*.sql` and
+/// `models/orders*.sql` resolve to `models`, while `models/staging/**`
+/// resolves to `models/staging`. A literal model source such as
+/// `models/orders.sql` also resolves to its parent directory. A wildcard in the
+/// first component keeps the historical `models` fallback.
+pub fn models_base(models_glob: &str, project_root: &Path) -> PathBuf {
+    if models_glob.is_empty() {
+        return PathBuf::from("models");
+    }
+    let Some(wildcard) = models_glob.find(&['*', '?', '['][..]) else {
+        let path = Path::new(models_glob);
+        if is_model_source(path) && !project_root.join(path).is_dir() {
+            return path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        }
+        return PathBuf::from(models_glob);
+    };
+    let literal_prefix = &models_glob[..wildcard];
+    let base = if literal_prefix.ends_with(['/', '\\']) {
+        Path::new(literal_prefix)
+    } else {
+        Path::new(literal_prefix)
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+    };
+    if base.as_os_str().is_empty() {
+        PathBuf::from("models")
+    } else {
+        base.to_path_buf()
+    }
+}
+
+/// Resolve a model-file glob relative to its config file.
+pub fn resolved_models_glob(models_glob: &str, config_path: &Path) -> String {
+    let project_root = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let effective_glob = if models_glob.is_empty() {
+        PathBuf::from("models/**")
+    } else if models_glob
+        .find(&['*', '?', '['][..])
+        .is_some_and(|wildcard| !models_glob[..wildcard].contains(['/', '\\']))
+    {
+        // A wildcard in the first component uses the historical `models`
+        // base. Match against that same base rather than the project root.
+        Path::new("models").join(models_glob)
+    } else {
+        PathBuf::from(models_glob)
+    };
+    let resolved = project_root.join(&effective_glob);
+    if effective_glob
+        .to_string_lossy()
+        .contains(&['*', '?', '['][..])
+        || (is_model_source(&effective_glob) && !resolved.is_dir())
+    {
+        resolved
+    } else {
+        resolved.join("**")
+    }
+    .to_string_lossy()
+    .into_owned()
+}
+
+fn is_model_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("sql" | "rocky")
+    )
+}
+
+/// Derive a `models` glob's base directory and confine it to the project root,
+/// without deciding what an absent directory means.
+///
+/// The base contains the literal path components before the first
+/// wildcard-bearing component, so `models/**`, `models/*.sql`, and
+/// `models/orders*.sql` all resolve to `models`. Taking every literal character
+/// before the wildcard instead leaves the last form as `models/orders` and
+/// probes it as a directory, so the pipeline silently contributes no models.
+///
+/// A glob that is *all* wildcard (`**/*.sql`) has an empty base, which falls
+/// back to `models` rather than the project root. That fallback was previously
+/// unreachable here: `str::split` yields `Some("")` for a leading wildcard, never
+/// `None`, so `unwrap_or` never fired and the empty base joined to the project
+/// root — while `gc.rs` and `apply.rs`, which filter the empty case, resolved
+/// `models`. Execution therefore loaded one directory while the **policy** target
+/// map was built from another, and a missing mapping leaves a target evaluated
+/// against default attributes (see `apply::resolve_touched_apply_targets`). All
+/// consumers now agree.
+///
+/// `resolve_models_dir` (its `Option`-returning wrapper), execution, validation,
+/// scope, branch, and the policy/apply paths all consume this, so a glob cannot
+/// be understood or confined one way when deciding what to build and another
+/// way when building it.
+pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<ModelsDir> {
+    // `Path::new("rocky.toml").parent()` is `Some("")`, not `None`, and an empty
+    // path fails to canonicalize — normalize it to the cwd so a relative default
+    // config (the common case) still resolves its models.
+    let project_root = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let models_dir = project_root.join(models_base(models_glob, project_root));
+    // `try_exists`, not `exists`. `Path::exists` maps *every* metadata error to
+    // `false`, so a directory that exists but cannot be reached — a parent
+    // component denying traversal, most plainly — reported as absent. Absent is
+    // a skip for most callers, so the pipeline's models silently never loaded
+    // and the project looked model-free: a DAG with no transformation nodes
+    // reported as success, and `rocky dag --column-lineage` reporting
+    // *authoritative* emptiness (#1336).
+    //
+    // This is the same reasoning the canonicalize failure below already
+    // applies, and for the same reason: a probe that cannot answer "does this
+    // exist?" is not a probe that answers no.
+    //
+    // The blast radius, measured rather than assumed: `try_exists` converts
+    // only `NotFound` to `Ok(false)`. A genuinely missing path and a *broken
+    // symlink* therefore stay `Absent` and nothing changes for them. Every
+    // other metadata failure now propagates — `PermissionDenied`,
+    // `NotADirectory` (a non-final component of the glob's base is a regular
+    // file), `InvalidFilename` (an over-long component), and whatever a
+    // failing network mount reports. All of them are configurations that
+    // cannot resolve, and all of them previously reported as "absent" and were
+    // silently skipped. That silence is the defect, not the propagation.
+    let exists = models_dir.try_exists().with_context(|| {
+        format!(
+            "could not determine whether models directory '{}' exists",
+            models_dir.display()
+        )
+    })?;
+    if !exists {
+        // `try_exists` reports a dangling symlink as `Ok(false)` — the one
+        // metadata failure it does fold. A models directory that is a link to
+        // nowhere is not an absent one (#1817): the project would compile
+        // empty and report success. Ask the shared discriminator.
+        match rocky_core::path_presence::classify_not_found(&models_dir) {
+            rocky_core::path_presence::PathPresence::Absent => {
+                return Ok(ModelsDir::Absent(models_dir));
+            }
+            rocky_core::path_presence::PathPresence::Present { detail } => {
+                anyhow::bail!(
+                    "models directory '{}' cannot be read: {detail}",
+                    models_dir.display()
+                );
+            }
+        }
+    }
+    // Confine to the project root. Both sides canonicalized so intra-project
+    // symlinks resolve before the prefix check (macOS `/tmp` is itself a
+    // symlink, so asymmetric resolution would false-reject).
+    let canonical_root = project_root.canonicalize().with_context(|| {
+        format!(
+            "project root '{}' could not be resolved",
+            project_root.display()
+        )
+    })?;
+    // Fail CLOSED when the models directory cannot be resolved. This previously
+    // swallowed the error and returned `Present` with the containment check
+    // simply skipped — so a directory that exists but cannot be canonicalized
+    // (a parent component that denies traversal, or a removal racing the
+    // `exists()` above) was loaded unconfined. A probe that cannot answer
+    // "is this inside the project?" is not the same as a probe that answers yes.
+    let canonical_models = models_dir.canonicalize().with_context(|| {
+        format!(
+            "models directory '{}' exists but could not be resolved, so it \
+             cannot be confirmed to be inside the project root",
+            models_dir.display()
+        )
+    })?;
+    if !canonical_models.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "models directory '{}' resolves outside the project root '{}'",
+            canonical_models.display(),
+            canonical_root.display(),
+        );
+    }
+    Ok(ModelsDir::Present(models_dir))
+}
+
+/// Resolve a transformation pipeline's `models` glob to its base directory,
+/// confined to the project root. `None` when the directory does not exist.
+///
+/// The `Option`-shaped view of [`locate_models_dir`], for callers that treat an
+/// absent directory as "nothing to do" and never need to name it.
+pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Option<PathBuf>> {
+    Ok(match locate_models_dir(models_glob, config_path)? {
+        ModelsDir::Present(dir) => Some(dir),
+        ModelsDir::Absent(_) => None,
+    })
+}
+
+/// Load all models under `models_dir` (every directory beneath it, #1328),
+/// including `.rocky` DSL files.
+///
+/// A load failure in **any** of those directories is an error. Subdirectory
+/// failures used to be discarded, so a malformed model one level down simply
+/// vanished from the model list and every command built on this loader carried
+/// on as though it did not exist — `run --dag` reported success having built
+/// nothing for that subtree. That is the same silent-success class as the
+/// top-level load, which stopped being swallowed in #1244.
+///
+/// **Scope.** This reads the top level plus one level down. A model at
+/// `models/a/b/` is still not loaded at all — not an error, simply absent
+/// (#1262). Propagating subdirectory errors does not close that hole, and a
+/// project nesting models deeper than one level still silently builds nothing
+/// for the deeper subtree.
+pub fn load_project_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    let (models, mut errors) = load_project_models_partial(models_dir, project_freshness);
+    if errors.is_empty() {
+        Ok(models)
+    } else {
+        Err(errors.remove(0))
+    }
+}
+
+/// Load only project models whose primary source path matches `models_glob`.
+///
+/// `project_freshness` is the project's `[freshness]` block, threaded down
+/// so a model that declares none of its own inherits it (#1435). Pass
+/// `None` only when the caller wants declared-only freshness — see
+/// `member_max_lags` in `commands::tick`.
+pub fn load_project_models_matching(
+    models_dir: &Path,
+    models_glob: &str,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    let load = |dir: &Path| {
+        crate::project::load_dir_models_matching(dir, models_glob, project_freshness)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to load models from {}", dir.display()))
+    };
+    let (models, mut errors) = load_project_models_partial_with(models_dir, &load);
+    if errors.is_empty() {
+        Ok(models)
+    } else {
+        Err(errors.remove(0))
+    }
+}
+
+/// Load every matching model that parses and return one error per directory
+/// that failed.
+pub fn load_project_models_matching_partial(
+    models_dir: &Path,
+    models_glob: &str,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
+    let load = |dir: &Path| {
+        crate::project::load_dir_models_matching(dir, models_glob, project_freshness)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to load models from {}", dir.display()))
+    };
+    load_project_models_partial_with(models_dir, &load)
+}
+
+/// Load everything that loads, returning the models plus one error per
+/// directory that failed.
+///
+/// For a caller that is deliberately tolerant — it answers a question about the
+/// models that *do* exist — discarding the whole set because one subdirectory is
+/// malformed is worse than the silence it replaces.
+///
+/// The sharp case is `rocky-cli`'s `apply::resolve_touched_apply_targets`,
+/// which maps physical target FQNs back to logical model names so an
+/// attribute-scoped policy rule (`layer = "gold"`, `classifications = ["pii"]`)
+/// still fires on a maintenance apply. An empty map leaves every target
+/// unresolved, and an unresolved target is evaluated against **default**
+/// attributes — so a rule requiring a positive attribute stops matching and a
+/// destructive compact/archive can fall through to a permissive default. Losing
+/// mappings there is a policy fail-open, not a degraded answer.
+///
+/// Strict callers should use [`load_project_models`], which surfaces the first
+/// error instead.
+pub fn load_project_models_partial(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
+    load_project_models_partial_with(models_dir, &|dir| load_one_dir(dir, project_freshness))
+}
+
+fn load_project_models_partial_with(
+    models_dir: &Path,
+    load_one: &impl Fn(&Path) -> Result<Vec<Model>>,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
+    // The traversal itself lives in rocky-core (`model_walk`) so every
+    // scanner of a models tree — this loader, the compiler's model loading,
+    // the sidecar loaders — sees the same directory set (#1262). This
+    // function's job is only to run `load_one` over each visited directory
+    // and to surface every walk error beside the load errors: a dropped walk
+    // error is a directory that vanished with nothing said about it, the
+    // silent-drop family this walk exists to close.
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+    let mut all = Vec::new();
+    // The ROOT's walk error first, every other error in traversal order after.
+    //
+    // A strict caller surfaces only the first error, so the order decides
+    // what the operator is told. With `models` itself a dangling link, the
+    // walk's root error is the one that names the right object; the per-
+    // directory load that follows blames `models/_defaults.toml`, a leaf
+    // under the broken root that exists exactly as much as the root does
+    // (#1817). But ONLY the root's: putting every walk error first let a
+    // depth-ceiling breach deep in the tree outrank a parse error in the
+    // root model the operator can actually act on (#1822, round three).
+    let (root_walk, deeper_walk): (Vec<_>, Vec<_>) = walk_errors
+        .into_iter()
+        .partition(|e| walk_error_dir(e) == models_dir);
+    let mut errors: Vec<anyhow::Error> = root_walk.into_iter().map(anyhow::Error::new).collect();
+    for dir in dirs {
+        match load_one(&dir) {
+            Ok(models) => all.extend(models),
+            Err(e) => errors.push(e),
+        }
+    }
+    errors.extend(deeper_walk.into_iter().map(anyhow::Error::new));
+    (all, errors)
+}
+
+/// The directory a walk error is about, whichever variant it is.
+fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
+    use rocky_core::model_walk::ModelWalkError;
+    match e {
+        ModelWalkError::ReadDir { dir, .. }
+        | ModelWalkError::DirEntry { dir, .. }
+        | ModelWalkError::DepthCeiling { dir, .. } => dir,
+        ModelWalkError::UnresolvedEntry { path, .. } => path,
+    }
+}
+
+/// Load one directory's models, naming that directory in the error.
+fn load_one_dir(
+    dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    crate::project::load_dir_models(dir, project_freshness)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to load models from {}", dir.display()))
+}
+
+/// Every transformation model in the project, attributed to the pipeline that
+/// declared it, plus the roots those models were actually loaded from.
+#[derive(Debug)]
+pub struct TransformationModels {
+    pub by_pipeline: rocky_core::unified_dag::ModelsByPipeline,
+    /// Declared transformation pipelines whose configured models root does
+    /// not exist, with the path that failed to resolve. Recorded during the
+    /// same pass that loads the others — a second resolver walk could
+    /// disagree with this one whenever the filesystem changes underneath.
+    pub missing_roots: Vec<(String, PathBuf)>,
+    /// The distinct directories that contributed at least one model, in
+    /// `cfg.pipelines` order. A pipeline whose directory is absent, or present
+    /// but empty, contributes nothing and is not listed — so "how many roots
+    /// are there" answers the question the lineage compile actually asks
+    /// ("whose models must I cover"), not "how many were configured".
+    pub contributing_roots: Vec<PathBuf>,
+}
+
+/// Load each transformation pipeline's own model set, keyed by pipeline name.
+///
+/// Only transformation pipelines consume models, so a project without one loads
+/// nothing and can never fail on a `models/` directory it would not have
+/// executed. Each pipeline's base directory and complete file glob are derived
+/// from its `models` setting exactly the way `rocky run` derives them, so
+/// `--dag` and a plain run apply the same **glob** to the files they see.
+///
+/// They do **not** yet see the same files. This walk reads the base directory
+/// plus one level of subdirectories, while a plain run compiles through
+/// `Project::load_models_with_db`, which reads the base directory only — so a
+/// `models/staging/` layout is a DAG node here and invisible to `rocky run`.
+/// The glob is not what limits either: `models/**` matches at every depth.
+/// Unifying the two traversals is #1262; this doc must not claim it is done.
+///
+/// A missing directory is not an error here — that matches `run`, which treats
+/// an absent models directory as a no-op rather than a failure.
+///
+/// Attribution is per pipeline, which is the half of #1261 that
+/// `build_unified_dag` needs: given one flat list it gave every transformation
+/// pipeline the same nodes and the DAG collapsed into
+/// `circular dependency detected involving: []`. Two pipelines pointed at the
+/// SAME directory therefore both load it — deliberately not deduplicated across
+/// pipelines, because that shared claim is exactly what `build_unified_dag` has
+/// to see in order to refuse it by name.
+///
+/// A model name reached from more than one DIRECTORY is still an ERROR, not a
+/// silent pick-the-first: a transformation node is keyed by model name alone, so
+/// two distinct files sharing a name cannot both be built. Failing here names
+/// both files. (Two pipelines sharing ONE directory is a different situation and
+/// is diagnosed by `build_unified_dag` instead, which can name the pipelines.)
+pub fn load_transformation_models(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Result<TransformationModels> {
+    use rocky_core::config::PipelineConfig;
+
+    let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
+    // Distinct roots that actually yielded at least one model, and their
+    // canonical forms for the distinctness test. Recorded during this single
+    // pass rather than by a second walk of the config: a separate resolver pass
+    // can disagree with this one whenever the filesystem changes underneath, and
+    // a root that resolves but contributes nothing is not a root the lineage
+    // compile needs to cover.
+    let mut contributing_roots: Vec<PathBuf> = Vec::new();
+    // Declared transformation pipelines whose models root does not exist,
+    // in `cfg.pipelines` order. See the Absent arm below.
+    let mut missing_roots: Vec<(String, PathBuf)> = Vec::new();
+    let mut canonical_roots: Vec<PathBuf> = Vec::new();
+    // model name -> the canonical FILE it was first loaded from.
+    //
+    // Keyed on the file, not on the pipeline's base directory. Two pipelines
+    // whose roots nest (`transforms/**` and `transforms/staging/**`) reach the
+    // SAME file through different bases, and a base-keyed check called that a
+    // duplicate — reporting "declared in both X and X", naming one path twice.
+    // It is not a duplicate name; it is one model claimed by two pipelines,
+    // which `build_unified_dag` reports properly because it can name them.
+    let mut file_of_name: HashMap<String, (PathBuf, String)> = HashMap::new();
+
+    for (pipeline_name, pipeline) in &cfg.pipelines {
+        let PipelineConfig::Transformation(t) = pipeline else {
+            continue;
+        };
+        let dir = match locate_models_dir(&t.models, config_path)? {
+            ModelsDir::Present(dir) => dir,
+            ModelsDir::Absent(path) => {
+                // Still a skip, as it always was — but the absence is
+                // RECORDED, so `rocky dag` can refuse an all-missing project
+                // instead of exporting an empty graph as success (#1397).
+                // An existing-but-empty root is deliberately NOT recorded:
+                // creating the directory is an explicit act, and an empty
+                // transformation pipeline is a supported no-op.
+                missing_roots.push((pipeline_name.clone(), path));
+                continue;
+            }
+        };
+        let models_glob = resolved_models_glob(&t.models, config_path);
+
+        let mut models: Vec<rocky_core::models::Model> = Vec::new();
+        // Names already seen inside THIS pipeline's own tree. The loader reads a
+        // base directory plus one level below it, so one pipeline can reach the
+        // same name twice (`transforms/orders` and `transforms/staging/orders`)
+        // — that is a duplicate no matter how many pipelines exist.
+        let mut seen_here: HashMap<String, String> = HashMap::new();
+        for model in load_project_models_matching(&dir, &models_glob, Some(&cfg.freshness))? {
+            let canonical = std::fs::canonicalize(&model.file_path)
+                .unwrap_or_else(|_| PathBuf::from(&model.file_path));
+
+            // Two genuinely distinct FILES sharing a model name: within this
+            // pipeline, or against one already loaded for another. Either way
+            // the DAG could only build one of them, so name both files.
+            let clash = seen_here.get(&model.config.name).or_else(|| {
+                file_of_name
+                    .get(&model.config.name)
+                    .filter(|(seen_canonical, _)| seen_canonical != &canonical)
+                    .map(|(_, seen_display)| seen_display)
+            });
+            if let Some(first) = clash {
+                anyhow::bail!(
+                    "duplicate model name '{}': declared in both {} and {}. A \
+                     transformation node is keyed by model name alone, so two \
+                     models sharing a name cannot both be built — rename one.",
+                    model.config.name,
+                    first,
+                    model.file_path.display(),
+                );
+            }
+
+            seen_here.insert(
+                model.config.name.clone(),
+                model.file_path.display().to_string(),
+            );
+            file_of_name.insert(
+                model.config.name.clone(),
+                (canonical, model.file_path.display().to_string()),
+            );
+            models.push(model);
+        }
+        models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+        if !models.is_empty() {
+            let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if !canonical_roots.contains(&canonical) {
+                canonical_roots.push(canonical);
+                contributing_roots.push(dir.clone());
+            }
+        }
+        by_pipeline.insert(pipeline_name.clone(), models);
+    }
+    Ok(TransformationModels {
+        by_pipeline,
+        contributing_roots,
+        missing_roots,
+    })
+}
+
+/// Flatten a per-pipeline attribution back into the single name-keyed list the
+/// node enrichment and the `model_map` lookup want, sorted by name to match
+/// [`load_all_models`].
+///
+/// Deduping by name is safe rather than lossy: `load_transformation_models`
+/// has already refused two *distinct files* sharing a model name, so a name
+/// reaching this twice is one file claimed by two pipelines — same `Model`
+/// either way. That claim is itself refused downstream by `build_unified_dag`,
+/// which can name both pipelines; this only has to not panic before it does.
+pub fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeline) -> Vec<Model> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all: Vec<Model> = Vec::new();
+    for models in by_pipeline.values() {
+        for model in models {
+            if seen.insert(model.config.name.clone()) {
+                all.push(model.clone());
+            }
+        }
+    }
+    all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+    all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, contents).expect("write");
+    }
+
+    /// A valid model with a target, so it loads cleanly.
+    fn write_model(dir: &Path, name: &str) {
+        write(&dir.join(format!("{name}.sql")), "SELECT 1 AS id\n");
+        write(
+            &dir.join(format!("{name}.toml")),
+            &format!(
+                "name = \"{name}\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn loads_models_at_every_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write_model(&models.join("staging"), "stg");
+        write_model(&models.join("staging").join("deep"), "lvl2");
+        write_model(&models.join("staging").join("deep").join("deeper"), "lvl3");
+
+        let loaded = load_project_models(&models, None).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["lvl2", "lvl3", "stg", "top"]);
+    }
+
+    /// The #1262 silent drop, pinned at its sharpest: a malformed sidecar two
+    /// levels down is an ERROR — proving the file is actually read — where it
+    /// used to be invisible because the walk never reached it.
+    #[test]
+    fn a_broken_model_below_the_first_subdirectory_level_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write(&models.join("a").join("b").join("broken.sql"), "SELECT 1\n");
+        write(
+            &models.join("a").join("b").join("broken.toml"),
+            "name = [\n",
+        );
+
+        let err = load_project_models(&models, None).expect_err("a deep failure must propagate");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load models from"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("a{}b", std::path::MAIN_SEPARATOR)),
+            "the error must name the deep directory: {rendered}"
+        );
+    }
+
+    /// The regression this change exists for: a malformed sidecar one level down
+    /// used to be discarded, leaving the caller with a short model list and no
+    /// indication anything was missing.
+    #[test]
+    fn a_broken_model_in_a_subdirectory_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write(&models.join("staging").join("broken.sql"), "SELECT 1\n");
+        write(&models.join("staging").join("broken.toml"), "name = [\n");
+
+        let err =
+            load_project_models(&models, None).expect_err("subdirectory failure must propagate");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load models from"),
+            "expected the load-failure context, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("staging"),
+            "the error must name the failing subdirectory, got: {rendered}"
+        );
+    }
+
+    /// Callers pass directories that may not exist; that must stay a non-error.
+    #[test]
+    fn a_missing_directory_yields_no_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let loaded = load_project_models(&tmp.path().join("does-not-exist"), None).expect("load");
+        assert!(loaded.is_empty());
+    }
+
+    /// Files directly inside the models directory are not descended into, and a
+    /// non-model file in a subdirectory is ignored rather than failing.
+    #[test]
+    fn unrelated_files_do_not_fail_the_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write(&models.join("README.md"), "# notes\n");
+        write(&models.join("docs").join("notes.md"), "# more notes\n");
+
+        let loaded = load_project_models(&models, None).expect("load");
+        let names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        assert_eq!(names, ["top"]);
+    }
+
+    #[test]
+    fn matching_load_skips_metadata_in_a_directory_with_no_matching_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "orders");
+        write_model(&models.join("excluded"), "customers");
+        write(&models.join("excluded/_defaults.toml"), "target = [\n");
+        let glob = models.join("orders*.sql").to_string_lossy().into_owned();
+
+        let loaded = load_project_models_matching(&models, &glob, None)
+            .expect("metadata belonging only to excluded models must not be parsed");
+
+        let names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        assert_eq!(names, ["orders"]);
+    }
+
+    /// `models` is documented as a glob, not a directory. Deriving the base by
+    /// splitting on `**` alone leaves `models/*.sql` intact, which is then
+    /// probed as a literal directory, never exists, and silently contributes no
+    /// models at all — the exact silent-success shape this work is closing.
+    #[test]
+    fn resolve_models_dir_handles_every_glob_shape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::fs::create_dir_all(root.join("models").join("staging")).expect("mkdir models/staging");
+        std::fs::create_dir_all(root.join("transforms")).expect("mkdir transforms");
+
+        for (glob, expected) in [
+            ("models/**", Some("models")),
+            ("models/*.sql", Some("models")),
+            ("models/orders*.sql", Some("models")),
+            ("models/staging/orders*.sql", Some("models/staging")),
+            ("transforms/stag*/orders.sql", Some("transforms")),
+            ("models/staging/**", Some("models/staging")),
+            ("models", Some("models")),
+            ("transforms/**", Some("transforms")),
+            // An absent directory is not an error: it matches `run`, which
+            // treats a missing models directory as a no-op.
+            ("nope/**", None),
+        ] {
+            assert_eq!(
+                resolve_models_dir(glob, &config).expect("resolve"),
+                expected.map(|e| root.join(e)),
+                "glob {glob:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_derivation_keeps_fallback_and_absolute_root_semantics() {
+        let root = Path::new("/project");
+        assert_eq!(models_base("", root), Path::new("models"));
+        assert_eq!(models_base("orders*.sql", root), Path::new("models"));
+        assert_eq!(models_base("/orders*.sql", root), Path::new("/"));
+        assert_eq!(models_base("models/orders.sql", root), Path::new("models"));
+        assert_eq!(models_base("orders.sql", root), Path::new(""));
+        assert_eq!(models_base("/orders.rocky", root), Path::new("/"));
+    }
+
+    #[test]
+    fn a_leading_wildcard_matches_inside_the_models_fallback() {
+        let resolved = resolved_models_glob("ord*.sql", Path::new("/project/rocky.toml"));
+        assert_eq!(resolved, "/project/models/ord*.sql");
+
+        let recursive = resolved_models_glob("**/*.sql", Path::new("/project/rocky.toml"));
+        assert_eq!(recursive, "/project/models/**/*.sql");
+    }
+
+    #[test]
+    fn a_literal_model_file_remains_an_exact_glob() {
+        assert_eq!(
+            resolved_models_glob("models/orders.sql", Path::new("/project/rocky.toml")),
+            "/project/models/orders.sql"
+        );
+        assert_eq!(
+            resolved_models_glob("orders.rocky", Path::new("/project/rocky.toml")),
+            "/project/orders.rocky"
+        );
+        assert_eq!(
+            resolved_models_glob("", Path::new("/project/rocky.toml")),
+            "/project/models/**"
+        );
+    }
+
+    #[test]
+    fn a_literal_directory_with_a_model_extension_remains_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models.sql");
+        std::fs::create_dir_all(&models).expect("mkdir models.sql");
+        let config = tmp.path().join("rocky.toml");
+
+        assert_eq!(
+            models_base("models.sql", tmp.path()),
+            Path::new("models.sql")
+        );
+        assert_eq!(
+            resolved_models_glob("models.sql", &config),
+            models.join("**").to_string_lossy()
+        );
+    }
+
+    /// The blast radius of `try_exists`, pinned rather than described.
+    ///
+    /// Only `NotFound` becomes `Ok(false)`. A missing directory and a broken
+    /// symlink therefore stay `Absent`; a non-directory path component and an
+    /// over-long name propagate. That list started as a table in a PR
+    /// description and one row of it was wrong — the over-long case, because
+    /// the probe that "measured" it used a short path merely *named*
+    /// `nametoolong`. A test cannot make that mistake quietly.
+    #[test]
+    fn locate_models_dir_separates_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+
+        // Missing: absent, not an error.
+        assert!(matches!(
+            locate_models_dir("nope/**", &config).expect("missing is not an error"),
+            ModelsDir::Absent(_)
+        ));
+
+        // Broken symlink: `try_exists` still answers `Ok(false)` for it — that
+        // row of the #1336 table is unchanged — but it is no longer ACCEPTED as
+        // absence. An entry is there, aimed at nothing; calling that "no models
+        // directory" compiled the project empty and reported success (#1817).
+        // The shared discriminator decides now, and it refuses.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling"))
+                .expect("symlink");
+            assert!(
+                !root
+                    .join("dangling")
+                    .try_exists()
+                    .expect("try_exists answers"),
+                "precondition: try_exists folds the dangling link to false, as #1336 pinned"
+            );
+            let err = locate_models_dir("dangling/**", &config)
+                .expect_err("a dangling symlink is a broken models dir, not an absent one");
+            assert!(format!("{err:#}").contains("cannot be resolved"), "{err:#}");
+        }
+
+        // A regular file where a directory component must be.
+        std::fs::write(root.join("notes.txt"), "x").expect("write file");
+        assert!(
+            locate_models_dir("notes.txt/models/**", &config).is_err(),
+            "a non-directory path component cannot resolve, so it must not \
+             report as merely absent"
+        );
+
+        // An over-long component.
+        let long = "x".repeat(5000);
+        assert!(
+            locate_models_dir(&format!("{long}/**"), &config).is_err(),
+            "an over-long name cannot resolve either"
+        );
+    }
+
+    /// An unreachable models directory is an error, not an absence (#1336).
+    ///
+    /// `Path::exists` collapses every metadata error to `false`, so a parent
+    /// that denies traversal used to report the directory absent — and absent
+    /// is a skip, so the project silently looked model-free.
+    ///
+    /// The probe is validated before it is trusted: if this process can still
+    /// stat through a mode-000 directory (running as root, or a filesystem
+    /// that ignores the mode), the scenario did not reproduce and asserting on
+    /// it would be asserting on nothing. Skipping loudly beats a green test
+    /// that never exercised the path.
+    /// The other half of the ordering rule (#1822, round three): a walk error
+    /// DEEPER in the tree must not outrank a load error in the root. Here the
+    /// root holds a model whose frontmatter does not parse, and a subdirectory
+    /// is a dangling link. The parse error is the one the operator can act on;
+    /// it comes first, and the dangling subdirectory is still reported after.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_parse_error_outranks_a_deeper_walk_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+        write(
+            &models.join("broken.sql"),
+            "---toml\nname = \n---\nSELECT 1 AS id\n",
+        );
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging"))
+            .expect("symlink");
+
+        let (_, errors) = load_project_models_partial(&models, None);
+        assert_eq!(
+            errors.len(),
+            2,
+            "one parse error, one walk error: {errors:?}"
+        );
+        let first = format!("{:#}", errors[0]);
+        let second = format!("{:#}", errors[1]);
+        assert!(
+            first.contains("broken.sql") || first.contains("frontmatter"),
+            "the actionable root error comes first: {first}"
+        );
+        assert!(
+            second.contains("staging") && second.contains("cannot be resolved"),
+            "the dangling subdirectory is still reported, after it: {second}"
+        );
+    }
+
+    /// #1817, review round two: with `models` a dangling link the walker
+    /// reports the root honestly, but the per-directory load ran first and
+    /// blamed `models/_defaults.toml` — a leaf under the broken root, which
+    /// exists exactly as much as the root does. The FIRST error is the one a
+    /// strict caller shows, so it must be the walk's.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_models_root_is_blamed_before_anything_under_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).expect("symlink");
+
+        let (_, errors) = load_project_models_partial(&models, None);
+        assert!(
+            !errors.is_empty(),
+            "a dangling root is an error, not an empty project"
+        );
+        let first = format!("{:#}", errors[0]);
+        assert!(
+            first.contains("cannot be resolved") && !first.contains("_defaults.toml"),
+            "the first error names the broken root, not a leaf under it: {first}"
+        );
+    }
+
+    /// #1817. `try_exists` answers `Ok(false)` for a dangling symlink — the
+    /// #1336 note called that out and left it. A models dir that is a link
+    /// to nowhere then reported `Absent`, the pipeline loaded no models, and
+    /// the DAG reported success with no nodes.
+    #[cfg(unix)]
+    #[test]
+    fn locate_models_dir_errors_when_the_directory_is_a_dangling_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::os::unix::fs::symlink(root.join("gone"), root.join("models")).expect("symlink");
+
+        let err = locate_models_dir("models/**", &config)
+            .expect_err("a models dir that is there and cannot be resolved is not absent");
+        assert!(
+            format!("{err:#}").contains("cannot be resolved"),
+            "the error names the broken link: {err:#}"
+        );
+        // The control: a directory nobody created is still `Absent`.
+        assert!(matches!(
+            locate_models_dir("never/**", &config).expect("absent"),
+            ModelsDir::Absent(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_models_dir_errors_when_the_directory_cannot_be_reached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("models")).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let reproduced = locked.join("models").try_exists().is_err();
+        let result = locate_models_dir("locked/models/**", &config);
+        // Restore before asserting so a failure cannot leave an undeletable
+        // temp dir behind.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+        if !reproduced {
+            eprintln!(
+                "skipping: this process can stat through a mode-000 directory, \
+                 so the unreachable case did not reproduce"
+            );
+            return;
+        }
+        let err = result.expect_err("an unreachable models directory must not report as absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not determine whether"),
+            "the error must say the probe failed, not that the directory is \
+             missing: {msg}"
+        );
+    }
+
+    /// `Absent` carries the path it decided against, which `run` reports and
+    /// `validate` names in its warning. An `Option` cannot express that, which
+    /// is why `locate_models_dir` exists alongside `resolve_models_dir`.
+    #[test]
+    fn locate_models_dir_names_the_absent_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::fs::create_dir_all(root.join("models")).expect("mkdir models");
+
+        assert_eq!(
+            locate_models_dir("models/*.sql", &config).expect("locate"),
+            ModelsDir::Present(root.join("models")),
+        );
+        assert_eq!(
+            locate_models_dir("nope/**", &config).expect("locate"),
+            ModelsDir::Absent(root.join("nope")),
+            "the absent branch must name the directory it decided against"
+        );
+    }
+
+    /// An all-wildcard glob has an empty base, which must fall back to `models`
+    /// — not join to the project root. `split` yields `Some("")` here, never
+    /// `None`, so the `unwrap_or` fallback only fires because of the `.filter`.
+    ///
+    /// This is what `gc.rs` and `apply.rs` already derived for the same glob;
+    /// before the filter, execution loaded the project root while the policy
+    /// target map was built from `<project>/models`.
+    ///
+    /// Mutation that must turn this red: drop `.filter(|base| !base.is_empty())`.
+    #[test]
+    fn an_all_wildcard_glob_falls_back_to_the_models_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::fs::create_dir_all(root.join("models")).expect("mkdir models");
+
+        assert_eq!(
+            locate_models_dir("**/*.sql", &config).expect("locate"),
+            ModelsDir::Present(root.join("models")),
+            "an empty base must mean `models`, not the project root"
+        );
+    }
+
+    /// A glob escaping the project root is refused rather than read.
+    #[test]
+    fn resolve_models_dir_refuses_an_escape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir project");
+        std::fs::create_dir_all(tmp.path().join("outside")).expect("mkdir outside");
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+
+        let err = resolve_models_dir("../outside/order*.sql", &config)
+            .expect_err("literal-prefix escape must be refused");
+        assert!(
+            format!("{err:#}").contains("outside the project root"),
+            "unexpected error: {err:#}"
+        );
+    }
+}
