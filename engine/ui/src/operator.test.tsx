@@ -8,9 +8,11 @@ import { ApiError } from "./api";
 import type { ProjectOutput } from "@rocky-types/project";
 import { ProjectActions, planUnavailable } from "./estate/ProjectActions";
 import {
+  JobLine,
   READ_ONLY_REASON,
   WriteAccessProvider,
   accessFromScope,
+  failureSummary,
   type JobClient,
   type WriteAccess,
 } from "./operator";
@@ -58,9 +60,12 @@ describe("Run and Plan on the estate", () => {
     for (const name of ["Run", "Plan"]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
+      // The reason is the tooltip; the banner says it once, so it is not
+      // repeated under every button.
+      expect(button).toHaveAttribute("title", READ_ONLY_REASON);
       fireEvent.click(button);
     }
-    expect(screen.getAllByText(READ_ONLY_REASON).length).toBeGreaterThan(0);
+    expect(screen.queryAllByText(READ_ONLY_REASON)).toEqual([]);
     expect(submitted).toEqual([]);
   });
 
@@ -266,7 +271,8 @@ describe("Approve and Apply on the plan page", () => {
     const approve = within(section).getByRole("button", { name: "Approve" });
     expect(approve).toBeDisabled();
     fireEvent.click(approve);
-    expect(within(section).getAllByText(READ_ONLY_REASON).length).toBeGreaterThan(0);
+    expect(approve).toHaveAttribute("title", READ_ONLY_REASON);
+    expect(within(section).queryAllByText(READ_ONLY_REASON)).toEqual([]);
     expect(submitted).toEqual([]);
   });
 });
@@ -280,5 +286,95 @@ describe("approverLine", () => {
       "approved locally by a@b.c",
     );
     expect(approverLine(null)).toMatch(/names no approver/);
+  });
+});
+
+describe("a write button while its job runs", () => {
+  it("is disabled and says running… until the job settles, and submits once", async () => {
+    let finish: (value: JobStatus) => void = () => {};
+    const submitted: Record<string, unknown>[] = [];
+    let reads = 0;
+    const client: JobClient = {
+      submit: vi.fn(async (_kind, body) => {
+        submitted.push(body);
+        return { job_id: "job_1" };
+      }),
+      status: vi.fn(() => {
+        reads += 1;
+        if (reads === 1) return Promise.resolve(job("run", "running"));
+        return new Promise<JobStatus>((resolve) => {
+          finish = resolve;
+        });
+      }),
+    };
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} />
+      </WriteAccessProvider>,
+    );
+    const run = screen.getByRole("button", { name: "Run" });
+    // Two clicks before React re-renders: one job.
+    fireEvent.click(run);
+    fireEvent.click(run);
+    const busy = await screen.findByRole("button", { name: "Run: running…" });
+    expect(busy).toBeDisabled();
+    fireEvent.click(busy);
+    await waitFor(() => expect(reads).toBe(2), { timeout: 3000 });
+    expect(screen.getByRole("button", { name: "Run: running…" })).toBeDisabled();
+    expect(submitted).toEqual([{}]);
+
+    finish(job("run", "succeeded"));
+    const again = await screen.findByRole("button", { name: "Run" });
+    expect(again).toBeEnabled();
+    expect(submitted).toEqual([{}]);
+  });
+});
+
+describe("a failed job, said concisely", () => {
+  const STDERR = [
+    '{"timestamp":"2026-10-08T10:00:00Z","level":"DEBUG","fields":{"sql":"SELECT secret FROM t"}}',
+    "2026-10-08T10:00:00.1Z DEBUG rocky_core: reading /home/me/.cargo/registry/src/lib.rs",
+    "DEBUG rocky_core: SELECT * FROM t",
+    "Error: plan_models_changed: refusing to apply plan 'abc': models changed since this plan was made",
+    "",
+    "Caused by:",
+    "    0: a model it runs was changed",
+  ].join("\n");
+
+  it("prefers the structured errors of the job's own output", () => {
+    const failed = job("apply", "failed", {
+      error: STDERR,
+      result: {
+        errors: [
+          { asset_key: ["main", "dim_customer"], error: "model 'dim_customer' failed: boom" },
+          { asset_key: [], error: "  " },
+        ],
+      },
+    });
+    expect(failureSummary(failed)).toBe("main.dim_customer: model 'dim_customer' failed: boom");
+  });
+
+  it("else shows the final Error: block, never a tracing line", () => {
+    const summary = failureSummary(job("apply", "failed", { error: STDERR }));
+    expect(summary.startsWith("Error: plan_models_changed")).toBe(true);
+    expect(summary).toContain("Caused by:");
+    for (const leaked of ["SELECT", ".cargo/registry", "DEBUG"]) {
+      expect(summary).not.toContain(leaked);
+    }
+    expect(failureSummary(job("apply", "failed", { error: null }))).toBe(
+      "The job ended without a message.",
+    );
+    const long = failureSummary(job("apply", "failed", { error: `Error: ${"x".repeat(5000)}` }));
+    expect(long.length).toBeLessThan(1_600);
+  });
+
+  it("renders only the concise failure on the page", () => {
+    render(
+      <JobLine label="Apply" view={{ kind: "done", job: job("apply", "failed", { error: STDERR }) }} />,
+    );
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/Apply: failed\. Error: plan_models_changed/);
+    expect(alert.textContent).not.toContain("SELECT");
+    expect(alert.textContent).not.toContain(".cargo/registry");
   });
 });

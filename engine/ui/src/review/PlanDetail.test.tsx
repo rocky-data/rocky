@@ -667,7 +667,10 @@ describe("PlanDetail", () => {
     expect(enabled).toEqual(["Show 20 rows"]);
     expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
-    expect(screen.getAllByText(READ_ONLY_REASON).length).toBeGreaterThan(0);
+    // One place for the read-only reason (the shell banner); here it is
+    // each button's tooltip, never a line under every button.
+    expect(screen.getByRole("button", { name: "Apply" })).toHaveAttribute("title", READ_ONLY_REASON);
+    expect(screen.queryAllByText(READ_ONLY_REASON)).toEqual([]);
     expect(container.querySelector("form")).toBeNull();
   });
 

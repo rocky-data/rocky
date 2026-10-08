@@ -70,14 +70,12 @@ export function ProjectActions({
       <div className="flex flex-wrap items-start gap-2">
         <WriteButton
           label={model === undefined ? "Plan" : "Plan this model"}
-          busyLabel="Planning…"
           busy={jobBusy(plan.view)}
           disabledReason={planDisabledReason}
           onClick={() => plan.start(body)}
         />
         <WriteButton
           label={model === undefined ? "Run" : "Run this model"}
-          busyLabel="Running…"
           busy={jobBusy(run.view)}
           onClick={() => run.start(body)}
         />

@@ -128,6 +128,14 @@ export function useJob(
     };
   }, []);
 
+  // A second start while one job is in flight is ignored, even when two
+  // clicks land before React re-renders the button disabled.
+  const inFlight = useRef(false);
+  const settle = useCallback((next: JobView) => {
+    inFlight.current = false;
+    setView(next);
+  }, []);
+
   const follow = useCallback(
     (jobId: string) => {
       const tick = () => {
@@ -139,21 +147,23 @@ export function useJob(
               setTimeout(tick, pollMs);
               return;
             }
-            setView({ kind: "done", job });
+            settle({ kind: "done", job });
             done.current?.(job);
           })
           .catch((error: unknown) => {
             if (!alive.current) return;
-            setView({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
+            settle({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
           });
       };
       tick();
     },
-    [client, pollMs],
+    [client, pollMs, settle],
   );
 
   const start = useCallback(
     (body: Record<string, unknown> = {}) => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       setView({ kind: "submitting" });
       client
         .submit(kind, body)
@@ -164,10 +174,10 @@ export function useJob(
         })
         .catch((error: unknown) => {
           if (!alive.current) return;
-          setView({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
+          settle({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
         });
     },
-    [client, kind, follow],
+    [client, kind, follow, settle],
   );
 
   return { view, start };
@@ -178,44 +188,100 @@ export function jobBusy(view: JobView): boolean {
   return view.kind === "submitting" || view.kind === "running";
 }
 
+/** What a button says while its job is in flight. */
+export const RUNNING_LABEL = "running…";
+
 /**
- * A control that changes something. In read-only mode it is drawn disabled,
- * with the reason beside it — never hidden, so the reader knows the action
- * exists and why it is not theirs.
+ * A control that changes something. In read-only mode it is drawn disabled —
+ * never hidden, so the reader knows the action exists. The read-only reason
+ * is the button's tooltip only: the shell banner already says it once, so
+ * it is not repeated under every button. A reason of this button's own
+ * (`disabledReason`, such as "Approve the plan first.") is shown beside it.
+ * While its job is in flight the button is disabled and says "running…".
  */
 export function WriteButton({
   label,
-  busyLabel,
   busy = false,
   disabledReason,
   onClick,
 }: {
   label: string;
-  busyLabel?: string;
   busy?: boolean;
   /** A reason this action cannot run now, beyond read-only mode. */
   disabledReason?: string;
   onClick: () => void;
 }) {
   const access = useWriteAccess();
-  const reason = access.kind === "read_only" ? access.reason : disabledReason;
-  const disabled = reason !== undefined || busy;
+  const readOnlyReason = access.kind === "read_only" ? access.reason : undefined;
+  const ownReason = readOnlyReason === undefined ? disabledReason : undefined;
+  const disabled = readOnlyReason !== undefined || disabledReason !== undefined || busy;
   return (
     <span className="inline-flex flex-col items-start gap-0.5">
       <button
         type="button"
         onClick={onClick}
         disabled={disabled}
-        title={reason}
+        aria-busy={busy}
+        title={readOnlyReason ?? disabledReason}
         className="rounded border border-amber-400 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:border-zinc-300 disabled:bg-zinc-100 disabled:text-zinc-400 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100 dark:disabled:border-zinc-700 dark:disabled:bg-zinc-900 dark:disabled:text-zinc-500"
       >
-        {busy ? (busyLabel ?? `${label}…`) : label}
+        {busy ? `${label}: ${RUNNING_LABEL}` : label}
       </button>
-      {reason !== undefined && (
-        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{reason}</span>
+      {ownReason !== undefined && (
+        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{ownReason}</span>
       )}
     </span>
   );
+}
+
+/** The most of a failure the page shows, in characters. */
+export const FAILURE_MAX_CHARS = 1_500;
+
+/** A line a `tracing` subscriber wrote: JSON, ANSI-coloured, or `fmt`. */
+function isTracingLine(line: string): boolean {
+  const trimmed = line.trimStart();
+  return (
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("\u001b") ||
+    /^\d{4}-\d{2}-\d{2}T/.test(trimmed) ||
+    /^(TRACE|DEBUG|INFO|WARN|ERROR) /.test(trimmed)
+  );
+}
+
+function cap(text: string): string {
+  return text.length <= FAILURE_MAX_CHARS ? text : `${text.slice(0, FAILURE_MAX_CHARS)}…`;
+}
+
+/**
+ * What a failed job says, concisely.
+ *
+ * First the structured errors of the child's own output (`result.errors`,
+ * e.g. `model 'dim_customer' failed: ...`). Failing that, the final
+ * `Error:` / `Caused by:` block of `error`, with any tracing lines dropped:
+ * a server run with `RUST_LOG` can carry SQL and local paths there. Never
+ * the raw stderr. Capped at [`FAILURE_MAX_CHARS`].
+ */
+export function failureSummary(job: JobStatus): string {
+  const result = job.result as { errors?: unknown } | null | undefined;
+  if (result !== null && typeof result === "object" && Array.isArray(result.errors)) {
+    const lines = result.errors
+      .map((entry: unknown) => {
+        if (entry === null || typeof entry !== "object") return null;
+        const { asset_key, error } = entry as { asset_key?: unknown; error?: unknown };
+        if (typeof error !== "string" || error.trim() === "") return null;
+        const where = Array.isArray(asset_key) ? asset_key.join(".") : "";
+        return where === "" ? error.trim() : `${where}: ${error.trim()}`;
+      })
+      .filter((line): line is string => line !== null);
+    if (lines.length > 0) return cap(lines.join("\n"));
+  }
+  const lines = (job.error ?? "").split("\n").filter((line) => !isTracingLine(line));
+  let start = -1;
+  lines.forEach((line, index) => {
+    if (line.startsWith("Error:")) start = index;
+  });
+  const text = (start >= 0 ? lines.slice(start) : lines.slice(-10)).join("\n").trim();
+  return text === "" ? "The job ended without a message." : cap(text);
 }
 
 /**
@@ -258,8 +324,8 @@ export function JobLine({ label, view }: { label: string; view: JobView }) {
       return view.job.state === "succeeded" ? (
         <p className="text-xs text-emerald-700 dark:text-emerald-300">{label}: done.</p>
       ) : (
-        <p role="alert" className="text-xs text-red-700 dark:text-red-300">
-          {label}: failed. {view.job.error ?? "The job ended without a message."}
+        <p role="alert" className="whitespace-pre-wrap break-words text-xs text-red-700 dark:text-red-300">
+          {label}: failed. {failureSummary(view.job)}
         </p>
       );
   }

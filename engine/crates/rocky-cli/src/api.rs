@@ -3397,17 +3397,69 @@ async fn execute_job_subprocess(
     if output.status.success() {
         (JobState::Succeeded, result, None)
     } else {
-        // Surface the last few stderr lines (the actionable tail) as the error.
+        // Surface the actionable part of stderr as the error: the final
+        // `Error:` / `Caused by:` block, never the child's tracing lines.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let lines: Vec<&str> = stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(10)..].join("\n");
-        let msg = if tail.trim().is_empty() {
-            format!("`rocky {}` exited with {}", kind.verb(), output.status)
-        } else {
-            tail
-        };
+        let msg = concise_job_error(&stderr)
+            .unwrap_or_else(|| format!("`rocky {}` exited with {}", kind.verb(), output.status));
         (JobState::Failed, result, Some(msg))
     }
+}
+
+/// The most a failed job's `error` carries, in bytes.
+const JOB_ERROR_MAX_BYTES: usize = 4_000;
+
+/// The part of a failed child's stderr a reader acts on.
+///
+/// A child run with `RUST_LOG` set writes tracing lines to stderr: JSON
+/// objects, or `fmt` lines that start with a timestamp or a level. Those can
+/// carry SQL and local file paths, and they bury the error. They are dropped.
+/// Of what is left, the error is the final `Error:` line and what follows it
+/// (anyhow's `Caused by:` chain); without one, the last ten lines. The result
+/// is capped at [`JOB_ERROR_MAX_BYTES`]. `None` when nothing is left.
+fn concise_job_error(stderr: &str) -> Option<String> {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !is_tracing_line(line))
+        .collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.starts_with("Error:"))
+        .unwrap_or(lines.len().saturating_sub(10));
+    let text = lines[start..].join("\n");
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= JOB_ERROR_MAX_BYTES {
+        return Some(text.to_string());
+    }
+    let mut cut = JOB_ERROR_MAX_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}…", &text[..cut]))
+}
+
+/// A line a `tracing` subscriber wrote: a JSON object, an ANSI-coloured
+/// line, or a `fmt` line that opens with an RFC 3339 timestamp or a level.
+fn is_tracing_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('\u{1b}') {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    let timestamp = bytes.len() >= 11
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T';
+    timestamp
+        || ["TRACE ", "DEBUG ", "INFO ", "WARN ", "ERROR "]
+            .iter()
+            .any(|level| trimmed.starts_with(level))
 }
 
 /// The variable a job child reads to learn it was started by the HTTP API.
@@ -11461,5 +11513,56 @@ adapter = "db"
             &JobRequest::default(),
         );
         assert_eq!(command.as_std().get_current_dir(), None);
+    }
+}
+
+#[cfg(test)]
+mod concise_job_error_tests {
+    use super::{JOB_ERROR_MAX_BYTES, concise_job_error};
+
+    /// A child run with `RUST_LOG` writes tracing lines, JSON or `fmt`, with
+    /// SQL and local paths in them. The job's `error` keeps only the final
+    /// `Error:` block and its `Caused by:` chain.
+    #[test]
+    fn keeps_the_final_error_block_and_drops_tracing_lines() {
+        let stderr = "\
+{\"timestamp\":\"2026-10-08T10:00:00Z\",\"level\":\"DEBUG\",\"fields\":{\"sql\":\"SELECT 1\"}}
+2026-10-08T10:00:00.000000Z DEBUG rocky_core: reading /home/me/.cargo/registry/src/x.rs
+DEBUG rocky_core: SELECT * FROM secret_table
+\u{1b}[2m2026-10-08T10:00:01Z\u{1b}[0m \u{1b}[34mINFO\u{1b}[0m compiled
+Error: plan_models_changed: refusing to apply plan 'abc': models changed since this plan was made
+
+Caused by:
+    0: a model it runs was changed
+{\"level\":\"TRACE\",\"message\":\"shutdown\"}
+";
+        let error = concise_job_error(stderr).expect("an error");
+        assert!(error.starts_with("Error: plan_models_changed"), "{error}");
+        assert!(error.contains("Caused by:"), "{error}");
+        assert!(error.contains("a model it runs was changed"), "{error}");
+        for leaked in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"] {
+            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+        }
+    }
+
+    /// Without an `Error:` line, the last ten non-tracing lines; with
+    /// nothing at all, `None`; and the result is capped.
+    #[test]
+    fn falls_back_to_the_tail_and_caps_the_length() {
+        let stderr: String = (0..15).map(|i| format!("line {i}\n")).collect();
+        let error = concise_job_error(&stderr).unwrap();
+        assert!(error.starts_with("line 5"), "{error}");
+        assert!(error.ends_with("line 14"), "{error}");
+
+        assert_eq!(concise_job_error("{\"level\":\"DEBUG\"}\n\n"), None);
+
+        let long = format!("Error: {}", "é".repeat(JOB_ERROR_MAX_BYTES));
+        let error = concise_job_error(&long).unwrap();
+        assert!(
+            error.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8(),
+            "{}",
+            error.len()
+        );
+        assert!(error.ends_with('…'));
     }
 }

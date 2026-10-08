@@ -13,11 +13,26 @@ export default tseslint.config(
   {
     files: ["**/*.{ts,tsx,mjs}"],
     rules: {
-      // The shell renders every API value as text. Keep it that way.
+      // The shell renders every API value as text. Keep it that way. This is
+      // the `react/no-danger` rule, written with the plugins installed here,
+      // and it also covers the non-JSX ways to inject markup.
       "no-restricted-syntax": [
         "error",
         {
           selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector: "Property[key.name='dangerouslySetInnerHTML']",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector:
+            "AssignmentExpression[left.type='MemberExpression'][left.property.name=/^(innerHTML|outerHTML)$/]",
+          message: "render API values as text; the UI carries no HTML from the engine",
+        },
+        {
+          selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
           message: "render API values as text; the UI carries no HTML from the engine",
         },
       ],

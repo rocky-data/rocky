@@ -408,7 +408,6 @@ function Approval({
           )}
           <WriteButton
             label="Approve"
-            busyLabel="Approving…"
             busy={jobBusy(approve.view)}
             onClick={() => approve.start({ plan_id: planId })}
           />
@@ -432,7 +431,6 @@ function Approval({
         <div className="space-y-1">
           <WriteButton
             label="Apply"
-            busyLabel="Applying…"
             busy={jobBusy(apply.view)}
             disabledReason={status.reviewed ? undefined : "Approve the plan first."}
             onClick={() => apply.start({ plan_id: planId })}
@@ -440,8 +438,9 @@ function Approval({
           <JobLine label="Apply" view={apply.view} />
           {status.reviewed && (
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-              Apply runs the models as they are on disk now. If you edited them after the
-              approval, plan and approve again before you apply.
+              Apply runs the models on disk, and first checks they still match this plan. If
+              you edited them after the plan, apply refuses (plan_models_changed): plan and
+              approve again.
             </p>
           )}
         </div>
