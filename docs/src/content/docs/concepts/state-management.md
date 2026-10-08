@@ -94,6 +94,7 @@ The engine API `table_publish::publish_tables` moves each model's Delta table to
 - Only `content_addressed` outputs of unpartitioned tables can be published. A partitioned output, a `delta_observed` version (it names a table version, not files Rocky wrote), and a table with no configured writer are refused before anything is written.
 - The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), and a version written before the table's schema or partitioning changed.
 - A run that writes the same table while a publish moves it is not ordered with the publish. The later commit wins.
+- The publish moves the model's own table. Two environments that both hold a model move the same table, and neither sees the other's publish. Rocky does not check this yet, so publish a model's table from one environment only.
 - After each commit, Rocky runs `MSCK REPAIR TABLE ... SYNC METADATA` so Iceberg readers see the change. If that step fails, the table still moved, and the outcome carries a warning.
 
 ## Per-namespace state files
