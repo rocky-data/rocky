@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 
 use rocky_core::environments::EnvPointer;
 use rocky_core::state::OutputVersion;
-use rocky_core::table_publish::{TableMoved, TablePointerBackend};
+use rocky_core::table_publish::{TableMoveError, TableMoved, TablePointerBackend};
 
-use super::UniformWriter;
+use super::{UniformWriter, UniformWriterError};
 
 /// A [`TablePointerBackend`] over Delta UniForm tables that Rocky's
 /// content-addressed writer owns. One [`UniformWriter`] per table.
@@ -114,14 +114,22 @@ impl TablePointerBackend for DeltaTablePublisher {
         self.resolve(pointer).map(|_| ())
     }
 
-    async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, String> {
-        let (writer, files) = self.resolve(pointer)?;
+    async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, TableMoveError> {
+        let (writer, files) = self.resolve(pointer).map_err(TableMoveError::NotMoved)?;
         let table = writer.config().fqtn();
-        let state = writer.discover().await.map_err(|e| e.to_string())?;
+        let state = writer
+            .discover()
+            .await
+            .map_err(|e| TableMoveError::NotMoved(e.to_string()))?;
         let outcome = writer
             .restore_content_addressed(files, state)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                UniformWriterError::CommitOutcomeUnknown { .. } => {
+                    TableMoveError::Unknown(e.to_string())
+                }
+                other => TableMoveError::NotMoved(other.to_string()),
+            })?;
         if !outcome.committed {
             return Ok(TableMoved::AlreadyCurrent {
                 table,

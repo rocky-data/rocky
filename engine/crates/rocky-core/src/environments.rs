@@ -264,7 +264,15 @@ pub enum TableMoveOutcome {
         /// Why.
         error: String,
     },
-    /// An earlier move failed, so this one was not tried.
+    /// The move's commit may have landed: its write returned an error that
+    /// does not say whether the commit was stored. The pointer does not
+    /// move. A retry of the publish finds the table already current when the
+    /// commit did land.
+    Unknown {
+        /// The error the commit write returned.
+        error: String,
+    },
+    /// An earlier move failed or ended unknown, so this one was not tried.
     NotAttempted,
 }
 
@@ -274,7 +282,7 @@ impl TableMoveOutcome {
     pub fn serves_version(&self) -> bool {
         match self {
             Self::Moved { .. } | Self::AlreadyCurrent { .. } => true,
-            Self::Failed { .. } | Self::NotAttempted => false,
+            Self::Failed { .. } | Self::Unknown { .. } | Self::NotAttempted => false,
         }
     }
 }

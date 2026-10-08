@@ -110,9 +110,31 @@ pub trait TablePointerBackend: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Why the table did not move. The backend must return `Err` only when
-    /// it wrote no commit.
-    async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, String>;
+    /// [`TableMoveError::NotMoved`] when the backend wrote no commit;
+    /// [`TableMoveError::Unknown`] when the commit write failed in a way
+    /// that does not say whether the commit was stored.
+    async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, TableMoveError>;
+}
+
+/// Why a [`TablePointerBackend::move_table`] call did not report a move.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum TableMoveError {
+    /// No commit was written. The table did not move.
+    #[error("{0}")]
+    NotMoved(String),
+    /// The commit write failed, but the commit may have been stored (for
+    /// example a timeout after the request was sent).
+    #[error("{0}")]
+    Unknown(String),
+}
+
+impl From<TableMoveError> for TableMoveOutcome {
+    fn from(e: TableMoveError) -> Self {
+        match e {
+            TableMoveError::NotMoved(error) => Self::Failed { error },
+            TableMoveError::Unknown(error) => Self::Unknown { error },
+        }
+    }
 }
 
 /// The result of a table publish that recorded its outcome.
@@ -208,9 +230,10 @@ pub async fn publish_tables(
                         environment = %request.environment,
                         model = %pointer.model,
                         %error,
-                        "table publish: a table did not move; later tables are not tried"
+                        "table publish: a table did not move (or its commit is unknown); \
+                         later tables are not tried"
                     );
-                    TableMoveOutcome::Failed { error }
+                    error.into()
                 }
             }
         };
@@ -257,6 +280,7 @@ mod tests {
         served: Mutex<BTreeMap<String, u64>>,
         calls: Mutex<Vec<String>>,
         fail_on: Option<String>,
+        unknown_on: Option<String>,
         refuse: Option<String>,
     }
 
@@ -290,10 +314,16 @@ mod tests {
                 _ => Ok(()),
             }
         }
-        async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, String> {
+        async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, TableMoveError> {
             self.calls.lock().unwrap().push(pointer.model.clone());
             if self.fail_on.as_deref() == Some(pointer.model.as_str()) {
-                return Err("injected failure".into());
+                return Err(TableMoveError::NotMoved("injected failure".into()));
+            }
+            if self.unknown_on.as_deref() == Some(pointer.model.as_str()) {
+                // The commit lands, but the write reports an error.
+                let (table, version) = table_and_version(pointer);
+                self.served.lock().unwrap().insert(table, version);
+                return Err(TableMoveError::Unknown("timed out after sending".into()));
             }
             let (table, version) = table_and_version(pointer);
             let mut served = self.served.lock().unwrap();
@@ -467,6 +497,49 @@ mod tests {
         ));
     }
 
+    /// A commit write that errors after it may have landed is recorded
+    /// `unknown`, not `failed`, and stops the publish. The pointer does not
+    /// move. A retry finds the table already current.
+    #[tokio::test]
+    async fn an_ambiguous_commit_error_is_recorded_unknown_and_a_retry_reconciles_it() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = local(&dir);
+        let tables = FakeTables {
+            unknown_on: Some("a".into()),
+            ..FakeTables::default()
+        };
+        let report = publish_tables(&session, &req(None, ABC), &tables, false)
+            .await
+            .unwrap();
+        assert!(!report.is_complete());
+        assert!(
+            matches!(&report.moves()[0].outcome, TableMoveOutcome::Unknown { error } if error.contains("timed out")),
+            "{:?}",
+            report.moves()
+        );
+        assert!(matches!(
+            report.moves()[1].outcome,
+            TableMoveOutcome::NotAttempted
+        ));
+        let store = StateStore::open(&path).unwrap();
+        let head = store.get_environment(&env()).unwrap().unwrap();
+        assert!(head.pointers.is_empty(), "an unknown move moves no pointer");
+        drop(store);
+
+        let retry_tables = FakeTables {
+            served: Mutex::new(tables.served()),
+            ..FakeTables::default()
+        };
+        let retry = publish_tables(&session, &req(Some("prod#2"), ABC), &retry_tables, false)
+            .await
+            .unwrap();
+        assert!(retry.is_complete());
+        assert!(matches!(
+            retry.moves()[0].outcome,
+            TableMoveOutcome::AlreadyCurrent { .. }
+        ));
+    }
+
     /// A backend refusal at begin refuses the whole publish: nothing is
     /// written and no table is touched.
     #[tokio::test]
@@ -572,7 +645,7 @@ mod tests {
         fn check(&self, _pointer: &EnvPointer) -> Result<(), String> {
             Ok(())
         }
-        async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, String> {
+        async fn move_table(&self, pointer: &EnvPointer) -> Result<TableMoved, TableMoveError> {
             if self.tables.calls().is_empty() {
                 state_sync::begin_table_publish(
                     &self.session,

@@ -264,16 +264,19 @@ pub struct WriteResult {
     pub size_bytes: u64,
 }
 
-/// What [`UniformWriter::commit_replace`] does when a conditional PUT loses
-/// to another commit.
+/// Who calls [`UniformWriter::commit_replace`], which sets what it does when
+/// the commit PUT does not succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnConflict {
-    /// Re-read the live set and recompute the removes against the new head.
-    /// A build replaces the table's content, so the winner's files go too.
-    Recompute,
-    /// Refuse when the new head's live files differ from the ones the first
-    /// attempt saw. A table publish must not remove files it never saw.
-    RefuseIfFilesChanged,
+enum ReplaceMode {
+    /// A build. A lost conditional PUT re-reads the live set and recomputes
+    /// the removes against the new head: a build replaces the table's
+    /// content, so the winner's files go too.
+    Build,
+    /// A table publish. A lost conditional PUT refuses when the new head's
+    /// live files differ from the ones the first attempt saw: a publish must
+    /// not remove files it never saw. A PUT error that does not say whether
+    /// the commit was stored is [`UniformWriterError::CommitOutcomeUnknown`].
+    Publish,
 }
 
 /// Result of one replace: the table's live set now equals the files written
@@ -737,7 +740,7 @@ impl UniformWriter {
             live,
             state,
             modification_time_millis,
-            OnConflict::Recompute,
+            ReplaceMode::Build,
         )
         .await?
         .into_single()
@@ -872,7 +875,7 @@ impl UniformWriter {
             live,
             state,
             modification_time_millis,
-            OnConflict::RefuseIfFilesChanged,
+            ReplaceMode::Publish,
         )
         .await
     }
@@ -1032,7 +1035,7 @@ impl UniformWriter {
             live,
             state,
             modification_time_millis,
-            OnConflict::Recompute,
+            ReplaceMode::Build,
         )
         .await
     }
@@ -1056,7 +1059,7 @@ impl UniformWriter {
     /// new head, a schema or protocol change refuses, and the retry may turn
     /// into a no-op when the winner already wrote this exact output.
     ///
-    /// With [`OnConflict::RefuseIfFilesChanged`] (a table publish) a conflict
+    /// With [`ReplaceMode::Publish`] (a table publish) a conflict
     /// whose winner changed the live files refuses instead: recomputing the
     /// removes against the new head would silently remove the winner's
     /// files. That includes a winner that wrote this exact output; the next
@@ -1067,7 +1070,7 @@ impl UniformWriter {
         mut live: discover::LiveSet,
         state: UniformTableState,
         modification_time_millis: i64,
-        on_conflict: OnConflict,
+        mode: ReplaceMode,
     ) -> Result<ReplaceOutcome> {
         use std::collections::{BTreeMap, BTreeSet};
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
@@ -1222,9 +1225,9 @@ impl UniformWriter {
                     // set, protocol, metadata and row-id high-water mark in
                     // one replay so the next attempt reflects the new head.
                     live = self.live_set().await?;
-                    match on_conflict {
-                        OnConflict::Recompute => {}
-                        OnConflict::RefuseIfFilesChanged => {
+                    match mode {
+                        ReplaceMode::Build => {}
+                        ReplaceMode::Publish => {
                             let now: BTreeSet<String> = live.files.keys().cloned().collect();
                             if now != first_files {
                                 return Err(UniformWriterError::TableChangedDuringWrite {
@@ -1245,7 +1248,29 @@ impl UniformWriter {
                         "conditional put conflict on _delta_log entry; re-read the live set, retrying"
                     );
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    // These errors reject the request before anything is
+                    // stored. Any other one (a timeout, a dropped connection,
+                    // a 5xx) may come after the store kept the object.
+                    let rejected = matches!(
+                        e,
+                        object_store::Error::InvalidPath { .. }
+                            | object_store::Error::NotSupported { .. }
+                            | object_store::Error::NotImplemented { .. }
+                            | object_store::Error::PermissionDenied { .. }
+                            | object_store::Error::Unauthenticated { .. }
+                    );
+                    return Err(match mode {
+                        ReplaceMode::Publish if !rejected => {
+                            UniformWriterError::CommitOutcomeUnknown {
+                                table: self.config.fqtn(),
+                                version: target_version,
+                                detail: e.to_string(),
+                            }
+                        }
+                        ReplaceMode::Publish | ReplaceMode::Build => e.into(),
+                    });
+                }
             }
         }
         Err(UniformWriterError::CondPutRetryExhausted(format!(
@@ -2565,7 +2590,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
+            .commit_replace(vec![staged], stale, state, 0, ReplaceMode::Build)
             .await
             .unwrap();
         assert_eq!(outcome.table_version, 3, "the 412 at v2 retried at v3");
@@ -2623,7 +2648,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
+            .commit_replace(vec![staged], stale, state, 0, ReplaceMode::Build)
             .await
             .unwrap();
         assert!(!outcome.committed);
@@ -2854,7 +2879,7 @@ mod tests {
             size_bytes: 11,
         };
         match writer
-            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
+            .commit_replace(vec![staged], stale, state, 0, ReplaceMode::Build)
             .await
         {
             Err(UniformWriterError::TableChangedDuringWrite { .. }) => {}
@@ -3383,7 +3408,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
+            .commit_replace(vec![staged], stale, state, 0, ReplaceMode::Build)
             .await
             .unwrap();
         assert_eq!(outcome.table_version, 2, "the 412 at v1 retried at v2");
@@ -3807,12 +3832,15 @@ mod tests {
         /// Land `body` at `version` first, as a concurrent writer would, so
         /// the create loses.
         CompetitorFirst { version: u64, body: String },
+        /// Store the create at `version`, then return a transport error, as
+        /// a timeout after the request reached the store would.
+        LandThenFail { version: u64 },
     }
 
     impl Interpose {
         fn version(&self) -> u64 {
             match self {
-                Self::CompetitorFirst { version, .. } => *version,
+                Self::CompetitorFirst { version, .. } | Self::LandThenFail { version } => *version,
             }
         }
     }
@@ -3860,6 +3888,13 @@ mod tests {
                         .put(location, PutPayload::from(Bytes::from(body.into_bytes())))
                         .await?;
                     self.inner.put_opts(location, payload, opts).await
+                }
+                Some(Interpose::LandThenFail { .. }) => {
+                    self.inner.put_opts(location, payload, opts).await?;
+                    Err(object_store::Error::Generic {
+                        store: "Interposed",
+                        source: "operation timed out".into(),
+                    })
                 }
                 None => self.inner.put_opts(location, payload, opts).await,
             }
@@ -3970,6 +4005,38 @@ mod tests {
             "the concurrent append survives and nothing else changed"
         );
         assert!(!commit_exists(&store, "tbl", 4).await);
+    }
+
+    /// The commit PUT stores the object, then returns a transport error. The
+    /// publish records the move `unknown`, not `failed`, and a second
+    /// publish finds the table already serving the version.
+    #[tokio::test]
+    async fn a_publish_whose_commit_put_errors_after_landing_is_recorded_unknown() {
+        use rocky_core::environments::TableMoveOutcome;
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let plain = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, b) = two_builds(&plain).await;
+        let writer = interposed_writer(&store, Interpose::LandThenFail { version: 3 });
+        let report = publish_first_build(writer, &a, &b).await;
+
+        assert!(
+            matches!(
+                &report.moves()[0].outcome,
+                TableMoveOutcome::Unknown { error } if error.contains("may have landed")
+            ),
+            "{:?}",
+            report.moves()
+        );
+        assert!(commit_exists(&store, "tbl", 3).await, "the commit landed");
+        let state = plain.discover().await.unwrap();
+        let again = plain
+            .restore_content_addressed(std::slice::from_ref(&a), state)
+            .await
+            .unwrap();
+        assert!(!again.committed, "a retry finds the table current");
+        assert_eq!(again.table_version, 3);
     }
 
     /// The backend refuses, before anything is written, a version it cannot

@@ -94,6 +94,19 @@ pub enum UniformWriterError {
          written. Run the model again to build a version that can be published."
     )]
     PublishSourceUnavailable { table: String, detail: String },
+
+    /// The PUT of a table-publish commit (RV1-P3) failed with an error that
+    /// does not say whether the commit was stored (for example a timeout
+    /// after the request was sent). The commit may have landed.
+    #[error(
+        "table `{table}`: the write of commit {version} failed, and it may have landed: \
+         {detail}. Publish again: a table that already serves the version writes no commit."
+    )]
+    CommitOutcomeUnknown {
+        table: String,
+        version: u64,
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, UniformWriterError>;
