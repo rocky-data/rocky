@@ -1,16 +1,16 @@
 {
   "content": [
     {
-      "text": "{\"code\":\"policy_review_required\",\"message\":\"policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1.\",\"plan_id\":\"3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1\",\"policy_rule\":\"0\",\"remediation_hint\":\"A human must run `rocky review 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1 --approve` then `rocky apply 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1`; never approve on the user's behalf.\"}",
+      "text": "{\"code\":\"policy_review_required\",\"message\":\"policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65.\",\"plan_id\":\"53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65\",\"policy_rule\":\"0\",\"remediation_hint\":\"A human must run `rocky review 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65 --approve` then `rocky apply 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65`; never approve on the user's behalf.\"}",
       "type": "text"
     }
   ],
   "isError": true,
   "structuredContent": {
     "code": "policy_review_required",
-    "message": "policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1.",
-    "plan_id": "3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1",
+    "message": "policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65.",
+    "plan_id": "53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65",
     "policy_rule": "0",
-    "remediation_hint": "A human must run `rocky review 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1 --approve` then `rocky apply 3c16f355c93e68016277cfd39c0d63ff4ef7feaf661b202a58c968da84b6b0d1`; never approve on the user's behalf."
+    "remediation_hint": "A human must run `rocky review 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65 --approve` then `rocky apply 53fe595e643208f10e1346bbcfae2d73537cf4b5179e69f95c5d20f7aab43e65`; never approve on the user's behalf."
   }
 }
