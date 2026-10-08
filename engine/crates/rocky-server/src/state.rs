@@ -690,8 +690,8 @@ impl ServerState {
                             "rocky.toml",
                             format!(
                                 "the transformation pipelines' models could not be loaded \
-                                 ({reason}). /models and /dag show only the models/ directory \
-                                 until this error is fixed."
+                                 ({reason}). /models shows only the models/ directory and /dag \
+                                 answers an error until this is fixed."
                             ),
                         ));
                 }
