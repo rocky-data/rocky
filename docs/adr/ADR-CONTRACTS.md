@@ -1,6 +1,6 @@
 # ADR-CONTRACTS — What a contract guarantees, where it is enforced, and how it may change
 
-**Status:** Proposed — awaiting ratification
+**Status:** Accepted (ratified 2026-10-08)
 
 **Work package:** WP-03 (compiler and contract soundness) and WP-04 (governance semantics)
 **Closes (once ratified and implemented):** audit findings **RD-011** (contract compatibility ignores nested and parameterized structure), **RD-012** (breaking-change classification defaults to safe), **RD-013** (promotion fails open when the semantic comparison cannot run). Sets the contract semantics that **WP-04** builds on.

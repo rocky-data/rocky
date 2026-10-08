@@ -1,6 +1,6 @@
 # ADR-TYPES — What an inferred type promises, how decimals are sized, and how a type crosses a warehouse
 
-**Status:** Proposed — awaiting ratification
+**Status:** Accepted (ratified 2026-10-08)
 
 **Work package:** WP-03 (compiler and contract soundness)
 **Closes (once ratified and implemented):** audit findings **RD-010** (decimal arithmetic and numeric literal inference are unsound) and the inference half of **RD-028** (some expression and function types come from incomplete rules). Decides the fate of the unmerged branch `feat/wp03-pr1-decimal-inference` (Open question F).

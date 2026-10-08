@@ -24,16 +24,16 @@ These three ADRs were authored under adversarial review (Codex, 10 findings disp
 
 | ADR | Status | Closes |
 |---|---|---|
-| [`ADR-CONTRACTS.md`](ADR-CONTRACTS.md) | Proposed — awaiting ratification | RD-011 (recursive contract compatibility, `Unknown` policy), RD-012 (default-breaking classification), RD-013 (promotion fails closed). Sets the contract semantics WP-04 builds on. |
+| [`ADR-CONTRACTS.md`](ADR-CONTRACTS.md) | Accepted (ratified 2026-10-08) | RD-011 (recursive contract compatibility, `Unknown` policy), RD-012 (default-breaking classification), RD-013 (promotion fails closed). Sets the contract semantics WP-04 builds on. |
 
 ## WP-00 / WP-04 / WP-07 / WP-08 — Identity, approval and trust boundaries (design gate)
 
 | ADR | Status | Closes |
 |---|---|---|
-| [`ADR-TRUST.md`](ADR-TRUST.md) | Proposed — awaiting ratification | The design half of RD-026, RD-035, RD-043 and RD-045. Defines verified principals, signed approvals, the worker / loop / operator boundary, and break-glass (ADR-CONTRACTS Open question E). |
+| [`ADR-TRUST.md`](ADR-TRUST.md) | Accepted (ratified 2026-10-08) | The design half of RD-026, RD-035, RD-043 and RD-045. Defines verified principals, signed approvals, the worker / loop / operator boundary, and break-glass (ADR-CONTRACTS Open question E). |
 
 ## WP-03 — Type inference semantics (design gate)
 
 | ADR | Status | Closes |
 |---|---|---|
-| [`ADR-TYPES.md`](ADR-TYPES.md) | Proposed — awaiting ratification | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |
+| [`ADR-TYPES.md`](ADR-TYPES.md) | Accepted (ratified 2026-10-08) | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |

@@ -1,6 +1,6 @@
 # ADR-TRUST — Who is acting, what makes an approval valid, and where the trust boundaries are
 
-**Status:** Proposed — awaiting ratification
+**Status:** Accepted (ratified 2026-10-08)
 
 **Work package:** WP-00 (credential containment), WP-04 (governance semantics), WP-07 (editor), WP-08 (supply chain)
 **Closes (once ratified and implemented):** the design half of audit findings **RD-026** (secret-bearing CI runs mutable PR code), **RD-035** (local principal and approval controls are not a hostile-agent boundary), **RD-043** (the editor has no workspace-trust gate) and **RD-045** (mutable or unverified downloads). Answers ADR-CONTRACTS Open question E (break-glass for a refused promote).
