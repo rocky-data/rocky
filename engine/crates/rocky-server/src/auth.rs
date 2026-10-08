@@ -272,7 +272,12 @@ fn is_webhook_trigger_path(path: &str) -> bool {
 /// request
 ///   ├─ exempt path? ────────────────► handler   (health, HMAC webhook)
 ///   ├─ no token configured? ────────► handler   (loopback-only mode)
-///   ├─ token missing / wrong? ──────► 401 unauthorized
+///   ├─ Bearer header present
+///   │    └─ wrong? ─────────────────► 401 unauthorized
+///   ├─ no Bearer header (--ui only): the session cookie
+///   │    ├─ missing / wrong? ───────► 401 unauthorized
+///   │    └─ unsafe method without an allowed Origin
+///   │       AND `X-Rocky-UI: 1`? ───► 403 ui_write_not_from_ui
 ///   ├─ scope Full ──────────────────► handler
 ///   └─ scope ReadOnly
 ///        ├─ GET / HEAD / OPTIONS ───► handler
@@ -299,18 +304,57 @@ pub async fn require_bearer_token(
         return next.run(request).await;
     };
 
-    let provided = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    let Some(provided) = provided else {
-        return unauthorized_response();
-    };
-
-    if !constant_time_eq(provided.as_bytes(), token.secret.as_bytes()) {
-        return unauthorized_response();
+    let authorization = request.headers().get(header::AUTHORIZATION);
+    match authorization {
+        // A Bearer header decides on its own: a wrong one is a 401 even when
+        // a valid cookie rides along, so one request never mixes credentials.
+        Some(value) => {
+            let Some(provided) = value.to_str().ok().and_then(|h| h.strip_prefix("Bearer ")) else {
+                return unauthorized_response();
+            };
+            if !constant_time_eq(provided.as_bytes(), token.secret.as_bytes()) {
+                return unauthorized_response();
+            }
+        }
+        // No Bearer header: the `--ui` session cookie, if this server has a
+        // UI. A browser adds a cookie by itself, so a cookie-authenticated
+        // write must also prove it came from this server's own page.
+        None => {
+            let Some(ui) = state.ui.as_ref() else {
+                return unauthorized_response();
+            };
+            let cookies: Vec<&str> = request
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if !crate::ui_session::cookie_authenticates(&state.ui_session_key, token, &cookies) {
+                return unauthorized_response();
+            }
+            if !is_safe_method(request.method()) {
+                // Present AND allowed: a missing Origin is refused too.
+                let origin_ok = request
+                    .headers()
+                    .get(header::ORIGIN)
+                    .and_then(|o| o.to_str().ok())
+                    .is_some_and(|o| ui.origin_allowed(o, &state.allowed_origins));
+                let marker_ok = request
+                    .headers()
+                    .get(crate::ui_session::UI_WRITE_HEADER)
+                    .is_some_and(|v| v.as_bytes() == b"1");
+                if !(origin_ok && marker_ok) {
+                    return envelope_response(
+                        StatusCode::FORBIDDEN,
+                        "ui_write_not_from_ui",
+                        "a write with the UI session cookie must carry this server's Origin \
+                         and `X-Rocky-UI: 1`",
+                        "make changes from the page this server serves, or send \
+                         `Authorization: Bearer <token>` instead of the cookie",
+                    );
+                }
+            }
+        }
     }
 
     // Authenticated. Now: is this token allowed to do what it is asking?
@@ -447,7 +491,7 @@ fn envelope_response(status: StatusCode, code: &str, message: &str, hint: &str) 
 /// Constant-time byte comparison. Returns `true` only if both slices have
 /// the same length *and* every byte matches; runtime is independent of
 /// the position of the first mismatch.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

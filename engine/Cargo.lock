@@ -4620,6 +4620,7 @@ version = "1.78.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "chrono",
  "futures",
  "indexmap",
@@ -4642,6 +4643,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tower-lsp",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

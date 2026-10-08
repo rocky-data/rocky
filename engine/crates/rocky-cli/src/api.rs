@@ -25,6 +25,7 @@
 //! POST /api/v1/jobs/run                         → submit a run job    → 202 {job_id}
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
 //! POST /api/v1/jobs/apply                       → submit an apply job → 202 {job_id}
+//! POST /api/v1/jobs/approve                     → approve a plan (= rocky review --approve) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -186,6 +187,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/run", post(submit_run))
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
+        .route("/api/v1/jobs/approve", post(submit_approve))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/schedule/spool", get(schedule_spool))
@@ -557,11 +559,27 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run/apply job is already in progress on this project",
+            "another run, apply or approve job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
         err
+    }
+
+    /// `400` — an `apply` or `approve` job named no plan, or a `plan_id` that
+    /// is not the 64 lowercase hex characters of a plan digest. Refused
+    /// before the permit is taken and before any argv is built, so a value
+    /// that looks like a flag never reaches the child's command line.
+    fn invalid_plan_id(kind: JobKind) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_plan_id",
+            format!(
+                "a {} job needs `plan_id`: exactly 64 lowercase hex characters",
+                kind.verb()
+            ),
+            Some("use a plan_id from GET /api/v1/review/queue or from a plan job's result"),
+        )
     }
 
     /// `400` — the request body could not be parsed.
@@ -880,6 +898,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/run",
         "POST /api/v1/jobs/plan",
         "POST /api/v1/jobs/apply",
+        "POST /api/v1/jobs/approve",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
         "GET /api/v1/schedule/spool",
@@ -1127,6 +1146,18 @@ async fn meta(State(state): State<Arc<ServerState>>) -> PrettyJson<MetaOutput> {
         config_hash,
         capabilities: capabilities(),
         routes: api_v1_routes(),
+        token_scope: meta_token_scope(state.auth.as_ref()),
+    })
+}
+
+/// The scope `GET /api/v1/meta` reports: the installed token's, or `None`
+/// when no token is configured. Reads the scope field only, never the secret.
+fn meta_token_scope(
+    token: Option<&rocky_server::auth::ServeToken>,
+) -> Option<crate::output::MetaTokenScope> {
+    token.map(|token| match token.scope {
+        rocky_server::auth::TokenScope::Full => crate::output::MetaTokenScope::Full,
+        rocky_server::auth::TokenScope::ReadOnly => crate::output::MetaTokenScope::ReadOnly,
     })
 }
 
@@ -2685,7 +2716,8 @@ pub(crate) struct JobRequest {
     pipeline: Option<String>,
     /// `--model <name>` for `run`/`plan` (single-model execution).
     model: Option<String>,
-    /// The positional `<plan_id>` for `apply`.
+    /// The positional `<plan_id>` for `apply` and `approve`: required there,
+    /// and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.
     plan_id: Option<String>,
     /// `--expect-spec-digest <hex>` for `apply` — the approved-spec digest
     /// the caller expects the plan to be bound to. The engine's gate is
@@ -3114,6 +3146,20 @@ async fn submit_apply(
     submit_job(JobKind::Apply, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/approve` — approve a plan: `rocky review <plan_id>
+/// --approve` as a job (takes the permit). Body `{"plan_id": "<64 hex>"}`.
+///
+/// The child runs with `ROCKY_SESSION_SOURCE=http_api`, so the marker records
+/// `ApproverSource::HttpApi` and the server's git identity, and the child
+/// refuses (`approver_identity_unresolved`) when that identity cannot be read.
+async fn submit_approve(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Approve, state, &headers, &body).await
+}
+
 /// Shared submission path for all three job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
@@ -3134,6 +3180,7 @@ async fn submit_job(
         serde_json::from_slice(body)
             .map_err(|e| ApiError::bad_request(format!("invalid job request body: {e}")))?
     };
+    validate_job_plan_id(kind, &request)?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3209,6 +3256,19 @@ async fn submit_job(
         .into_response())
 }
 
+/// `apply` and `approve` name a plan; refuse any `plan_id` that is not a plan
+/// digest before the permit is taken or an argv is built. `run` and `plan`
+/// ignore the field, as before.
+fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    match kind {
+        JobKind::Run | JobKind::Plan => Ok(()),
+        JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
+            Some(plan_id) if is_plan_id(plan_id) => Ok(()),
+            Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
+        },
+    }
+}
+
 async fn finish_job(
     state: Arc<ServerState>,
     state_path: std::path::PathBuf,
@@ -3254,7 +3314,7 @@ fn job_subprocess_args(
     }
     args.push("--state-path".into());
     args.push(state_path.into());
-    args.push(kind.verb().into());
+    args.push(kind.subcommand().into());
     match kind {
         JobKind::Run | JobKind::Plan => {
             if let Some(filter) = &request.filter {
@@ -3283,6 +3343,12 @@ fn job_subprocess_args(
                 args.push("--expect-spec-digest".into());
                 args.push(digest.into());
             }
+        }
+        JobKind::Approve => {
+            if let Some(plan_id) = &request.plan_id {
+                args.push(plan_id.into());
+            }
+            args.push("--approve".into());
         }
     }
     args
@@ -3344,6 +3410,11 @@ async fn execute_job_subprocess(
     }
 }
 
+/// The variable a job child reads to learn it was started by the HTTP API.
+const HTTP_API_SESSION_SOURCE_ENV: &str = "ROCKY_SESSION_SOURCE";
+/// The value `run_audit::detect_session_source` maps to `SessionSource::HttpApi`.
+const HTTP_API_SESSION_SOURCE: &str = "http_api";
+
 fn job_subprocess_command(
     exe: std::path::PathBuf,
     kind: JobKind,
@@ -3353,6 +3424,11 @@ fn job_subprocess_command(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(exe);
     rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
+    // Every child the HTTP API starts says so. The run record then shows
+    // `session_source: http_api` instead of `cli`, and `rocky review
+    // --approve` stamps `ApproverSource::HttpApi` and refuses to fall back
+    // to an `unknown` approver. It labels the channel, not the person.
+    cmd.env(HTTP_API_SESSION_SOURCE_ENV, HTTP_API_SESSION_SOURCE);
     for arg in job_subprocess_args(kind, config_path, state_path, request) {
         cmd.arg(arg);
     }
@@ -8973,15 +9049,21 @@ mod tests {
         let base = spawn_router(state).await;
 
         let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{base}/api/v1/jobs/apply"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: ErrorEnvelope = resp.json().await.unwrap();
-        assert_eq!(body.code, "mutation_in_progress");
-        assert_eq!(body.running_job_id.as_deref(), Some("job_incumbent"));
+        let plan_id = "a".repeat(64);
+        // `approve` takes the same permit: an approval cannot land while a
+        // run or an apply is in flight.
+        for route in ["apply", "approve"] {
+            let resp = client
+                .post(format!("{base}/api/v1/jobs/{route}"))
+                .json(&serde_json::json!({ "plan_id": plan_id }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 409, "{route}");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "mutation_in_progress", "{route}");
+            assert_eq!(body.running_job_id.as_deref(), Some("job_incumbent"));
+        }
 
         drop(held);
     }
@@ -8994,10 +9076,21 @@ mod tests {
     fn job_kind_mutation_and_verb_semantics() {
         assert!(JobKind::Run.mutates());
         assert!(JobKind::Apply.mutates());
+        assert!(JobKind::Approve.mutates());
         assert!(!JobKind::Plan.mutates());
         assert_eq!(JobKind::Run.verb(), "run");
         assert_eq!(JobKind::Plan.verb(), "plan");
         assert_eq!(JobKind::Apply.verb(), "apply");
+        assert_eq!(JobKind::Approve.verb(), "approve");
+        assert_eq!(JobKind::Approve.subcommand(), "review");
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            assert_eq!(JobKind::parse(kind.verb()), Some(kind));
+        }
     }
 
     /// FF-WP1 (finding 5) — the apply job's argv threading, pinned at the
@@ -9094,7 +9187,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/api/v1/jobs/apply"))
             .json(&serde_json::json!({
-                "plan_id": "abc",
+                "plan_id": "a".repeat(64),
                 "expect_spec_digest": "sha256:feed"
             }))
             .send()
@@ -10047,6 +10140,16 @@ mod tests {
                 "ui_router() uses `{form}`, which this guard cannot classify"
             );
         }
+        // The one exception, named exactly: `POST /login`, the token field on
+        // the failed-login page. It changes no project state; it checks the
+        // token (constant time) and sets the session cookie, and it refuses
+        // a request without an allowed Origin. Anything else is refused.
+        let login = r#".route("/login", get(login_link).post(login_form))"#;
+        assert!(
+            ui_body.contains(login),
+            "ui_router() must register the login exchange by exactly `{login}`"
+        );
+        let ui_body = ui_body.replace(login, "");
         let ui_mutating: usize = ["post(", "put(", "patch(", "delete("]
             .iter()
             .map(|verb| ui_body.matches(verb).count())
@@ -10054,7 +10157,7 @@ mod tests {
         assert_eq!(
             ui_mutating, 0,
             "ui_router() is merged outside the bearer layer, so it may register \
-             safe methods only"
+             safe methods only (and the named `POST /login`)"
         );
 
         let registered: usize = ["post(", "put(", "patch(", "delete("]
@@ -10698,5 +10801,568 @@ adapter = "db"
             1,
             "an over-limit request writes no spool file"
         );
+    }
+
+    // --- Operator mode and the UI session (`rocky serve --ui`) ---
+
+    /// A `--ui` server whose token carries `scope`, with optional allowed
+    /// origins, and optionally a webhook ingress with `webhook_secret`.
+    fn ui_state_scoped(
+        scope: rocky_server::auth::TokenScope,
+        allowed_origins: &[&str],
+        webhook: Option<(&str, &tempfile::TempDir)>,
+    ) -> Arc<ServerState> {
+        use rocky_server::ui::{InMemoryAssets, UiConfig};
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "index.html".to_string(),
+            b"<!doctype html><div id=root></div>".to_vec(),
+        );
+        let (config_path, ingress) = match webhook {
+            Some((secret, dir)) => {
+                let config_path = dir.path().join("rocky.toml");
+                std::fs::write(&config_path, WEBHOOK_TEST_CONFIG).unwrap();
+                (
+                    Some(config_path),
+                    Some(rocky_server::webhook_ingress::WebhookIngress {
+                        secret: Some(secret.to_string()),
+                        bind_is_loopback: true,
+                        rocky_dir: dir.path().join(".rocky"),
+                        rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(100.0),
+                    }),
+                )
+            }
+            None => (None, None),
+        };
+        ServerState::with_auth_and_webhook(
+            simple_project_models(),
+            false,
+            None,
+            config_path,
+            Some(ServeToken {
+                secret: "s3cret-operator-token".to_string(),
+                scope,
+            }),
+            allowed_origins.iter().map(ToString::to_string).collect(),
+            None,
+            ingress,
+            Some(UiConfig {
+                bind_host: "127.0.0.1".to_string(),
+                allowed_hosts: Vec::new(),
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
+        )
+    }
+
+    const OPERATOR_TOKEN: &str = "s3cret-operator-token";
+
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// Log in with the printed link and return the `name=value` cookie pair.
+    async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303);
+        let set_cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    /// `GET /login?t=<token>`: `303 /ui/` with an `HttpOnly`,
+    /// `SameSite=Strict`, session cookie whose value is not the token. Both
+    /// answers carry `no-store` and `no-referrer`.
+    #[tokio::test]
+    async fn login_link_sets_the_session_cookie_and_redirects_to_the_page() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303);
+        assert_eq!(resp.headers()["location"], "/ui/");
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+        let cookie = resp.headers()["set-cookie"].to_str().unwrap();
+        assert!(cookie.starts_with("rocky_ui="), "{cookie}");
+        for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+            assert!(cookie.contains(attr), "{cookie}");
+        }
+        assert!(
+            !cookie.contains("Max-Age") && !cookie.contains("Secure"),
+            "{cookie}"
+        );
+        assert!(
+            !cookie.contains(OPERATOR_TOKEN),
+            "the cookie is not the token"
+        );
+
+        // Behind a TLS proxy the cookie is `Secure`.
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .ends_with("; Secure")
+        );
+    }
+
+    /// A wrong, stale or missing token: `401`, a small page with a token
+    /// field, no cookie, and nothing from the request echoed back.
+    #[tokio::test]
+    async fn a_wrong_login_link_gets_the_page_without_a_cookie_or_an_echo() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        for query in ["?t=stale-token-from-yesterday", "", "?other=1"] {
+            let resp = client
+                .get(format!("{base}/login{query}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{query}");
+            assert!(resp.headers().get("set-cookie").is_none(), "{query}");
+            assert_eq!(resp.headers()["cache-control"], "no-store");
+            assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains(r#"action="/login""#), "{body}");
+            assert!(body.contains("newest"), "{body}");
+            assert!(!body.contains("stale-token-from-yesterday"), "{body}");
+        }
+    }
+
+    /// `POST /login` (the page's token field) needs an Origin that is
+    /// present AND allowed, and then answers like the link.
+    #[tokio::test]
+    async fn post_login_needs_an_allowed_origin() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let form = format!("t={OPERATOR_TOKEN}");
+        let post = |origin: Option<&str>, body: String| {
+            let mut req = client
+                .post(format!("{base}/login"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body);
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            req.send()
+        };
+        let resp = post(None, form.clone()).await.unwrap();
+        assert_eq!(resp.status(), 403, "a missing Origin is refused");
+        assert!(resp.headers().get("set-cookie").is_none());
+        let resp = post(Some("https://evil.example"), form.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "a foreign Origin is refused");
+        assert!(resp.headers().get("set-cookie").is_none());
+
+        let resp = post(Some(&base), form).await.unwrap();
+        assert_eq!(resp.status(), 303);
+        assert!(
+            resp.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .starts_with("rocky_ui=")
+        );
+        let resp = post(Some(&base), "t=wrong".to_string()).await.unwrap();
+        assert_eq!(resp.status(), 401);
+        assert!(resp.headers().get("set-cookie").is_none());
+    }
+
+    /// The cookie authenticates reads. A write with it needs BOTH an allowed
+    /// Origin and `X-Rocky-UI: 1`; then the token's scope decides, exactly as
+    /// for a Bearer request. A Bearer write keeps today's rules.
+    #[tokio::test]
+    async fn cookie_session_reads_and_its_writes_need_origin_and_the_ui_header() {
+        for (scope, write_status) in [(TokenScope::Full, 200), (TokenScope::ReadOnly, 403)] {
+            let base = spawn_router(ui_state_scoped(scope, &[], None)).await;
+            let client = no_redirect_client();
+            let cookie = login_cookie(&client, &base).await;
+
+            let resp = client
+                .get(format!("{base}/api/v1/meta"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{scope:?}: a cookie GET works");
+
+            let write = |origin: Option<&str>, marker: bool| {
+                let mut req = client
+                    .post(format!("{base}/api/v1/compile"))
+                    .header("cookie", &cookie);
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                if marker {
+                    req = req.header("x-rocky-ui", "1");
+                }
+                req.send()
+            };
+            let resp = write(Some(&base), false).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: no X-Rocky-UI");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
+            let resp = write(None, true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: no Origin");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
+            let resp = write(Some("https://evil.example"), true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: a foreign Origin");
+
+            let resp = write(Some(&base), true).await.unwrap();
+            assert_eq!(resp.status(), write_status, "{scope:?}: both present");
+            if scope == TokenScope::ReadOnly {
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(body.code, "forbidden_read_only_token");
+            }
+
+            // Bearer: unchanged. No Origin and no marker needed.
+            let resp = client
+                .post(format!("{base}/api/v1/compile"))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), write_status, "{scope:?}: Bearer write");
+        }
+    }
+
+    /// A cookie that is not this process's: the raw token, garbage, or one
+    /// minted by another server (another key) is `401`. So is a wrong Bearer
+    /// beside a good cookie: one request never mixes credentials.
+    #[tokio::test]
+    async fn a_foreign_cookie_or_a_wrong_bearer_beside_one_is_unauthorized() {
+        let other = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let foreign = login_cookie(&client, &other).await;
+        let good = login_cookie(&client, &base).await;
+        for cookie in [
+            foreign.as_str(),
+            &format!("rocky_ui={OPERATOR_TOKEN}"),
+            "rocky_ui=",
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/meta"))
+                .header("cookie", cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{cookie}");
+        }
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .header("cookie", &good)
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// Another page on this machine (a different localhost port) passes the
+    /// Origin guard, but holds no credential: `401`. A foreign site WITH the
+    /// token is still refused by the Origin guard: `403`.
+    #[tokio::test]
+    async fn a_local_page_without_the_token_is_401_and_a_foreign_origin_with_it_is_403() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let resp = client
+            .post(format!("{base}/api/v1/compile"))
+            .header("origin", "http://localhost:9999")
+            .header("x-rocky-ui", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .post(format!("{base}/api/v1/compile"))
+            .header("origin", "https://evil.example")
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "origin_not_allowed");
+    }
+
+    /// The webhook route is the one write route outside the token. Under a
+    /// writable `--ui` it still answers only to its HMAC: neither the
+    /// full-scope Bearer token nor the UI cookie gets an unsigned POST in.
+    #[tokio::test]
+    async fn the_webhook_still_needs_its_hmac_under_a_writable_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ui_state_scoped(TokenScope::Full, &[], Some(("hook-secret", &dir)));
+        let base = spawn_router(state).await;
+        let client = no_redirect_client();
+        let cookie = login_cookie(&client, &base).await;
+        let url = format!("{base}/api/v1/hooks/trigger/raw");
+        for req in [
+            client.post(&url).bearer_auth(OPERATOR_TOKEN),
+            client
+                .post(&url)
+                .header("cookie", &cookie)
+                .header("origin", &base)
+                .header("x-rocky-ui", "1"),
+            client.post(&url),
+        ] {
+            let resp = req.body("{}").send().await.unwrap();
+            assert_eq!(resp.status(), 401, "an unsigned webhook POST is refused");
+        }
+        let spooled = rocky_core::schedule::spool::list_pending_files(&dir.path().join(".rocky"))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(spooled, 0, "nothing unsigned reached the spool");
+        let body = b"{}";
+        let resp = client
+            .post(&url)
+            .header(WEBHOOK_SIGNATURE_HEADER, sign("hook-secret", body))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "a signed POST still works: {}",
+            resp.status()
+        );
+    }
+
+    /// The token reaches no log line: not the login link's query, not the
+    /// form body, not a refusal. Every event this process emits at TRACE
+    /// while serving the login paths is captured and searched.
+    #[tokio::test]
+    async fn the_token_never_reaches_a_log_line() {
+        use std::io::Write as _;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        // Current-thread runtime: every task the server spawns runs on this
+        // thread, under this subscriber.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!("capture is live");
+
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let _ = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}-stale"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .get(format!("{base}/api/v1/meta"))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let mut sink = captured.clone();
+        sink.flush().unwrap();
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("capture is live"),
+            "the capture works: {logs}"
+        );
+        assert!(
+            !logs.contains(OPERATOR_TOKEN),
+            "the token was logged:\n{logs}"
+        );
+    }
+
+    /// `GET /api/v1/meta` says what the token may do, and never the token.
+    #[tokio::test]
+    async fn meta_reports_the_token_scope_and_never_the_secret() {
+        for (state, expected) in [
+            (
+                test_state_with_scoped_token(ServeToken::full("s3cret")),
+                serde_json::json!("full"),
+            ),
+            (
+                test_state_with_scoped_token(ServeToken::read_only("s3cret")),
+                serde_json::json!("read_only"),
+            ),
+            (test_state(), serde_json::Value::Null),
+        ] {
+            let base = spawn_router(state).await;
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/api/v1/meta"))
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let text = resp.text().await.unwrap();
+            assert!(!text.contains("s3cret"), "{text}");
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["token_scope"], expected, "{text}");
+        }
+    }
+
+    /// `apply` and `approve` refuse a `plan_id` that is not 64 lowercase hex
+    /// characters, with `400 invalid_plan_id`, BEFORE the permit: a held
+    /// permit would otherwise answer 409.
+    #[tokio::test]
+    async fn apply_and_approve_refuse_a_malformed_plan_id_before_the_permit() {
+        let state = test_state();
+        let _held = state.mutation_permit.try_acquire("job_incumbent").unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let upper = "A".repeat(64);
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        for route in ["apply", "approve"] {
+            for body in [
+                serde_json::json!({}),
+                serde_json::json!({ "plan_id": "abc" }),
+                serde_json::json!({ "plan_id": upper }),
+                serde_json::json!({ "plan_id": short }),
+                serde_json::json!({ "plan_id": long }),
+                serde_json::json!({ "plan_id": "--approve" }),
+            ] {
+                let resp = client
+                    .post(format!("{base}/api/v1/jobs/{route}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 400, "{route} {body}");
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(envelope.code, "invalid_plan_id", "{route} {body}");
+            }
+        }
+    }
+
+    /// The approve job's argv: `review <plan_id> --approve`, with the same
+    /// global `--config` / `--state-path` every job gets.
+    #[test]
+    fn approve_job_runs_review_approve_with_the_job_argv() {
+        let plan_id = "b".repeat(64);
+        let request = JobRequest {
+            plan_id: Some(plan_id.clone()),
+            ..JobRequest::default()
+        };
+        let args: Vec<String> = job_subprocess_args(
+            JobKind::Approve,
+            Some(std::path::Path::new("rocky.toml")),
+            std::path::Path::new("state.redb"),
+            &request,
+        )
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--output",
+                "json",
+                "--config",
+                "rocky.toml",
+                "--state-path",
+                "state.redb",
+                "review",
+                plan_id.as_str(),
+                "--approve",
+            ]
+        );
+    }
+
+    /// Every job child the HTTP API starts carries
+    /// `ROCKY_SESSION_SOURCE=http_api`, over whatever the server inherited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_children_carry_the_http_api_session_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s' \"$ROCKY_SESSION_SOURCE\"\n")
+            .expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod probe");
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            let built = job_subprocess_command(
+                probe.clone(),
+                kind,
+                None,
+                &dir.path().join("state.redb"),
+                &JobRequest::default(),
+            );
+            let envs: Vec<_> = built
+                .as_std()
+                .get_envs()
+                .filter(|(k, _)| *k == "ROCKY_SESSION_SOURCE")
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+                .collect();
+            assert_eq!(
+                envs,
+                vec![Some(std::ffi::OsString::from("http_api"))],
+                "{kind:?}"
+            );
+            let output = job_subprocess_command(
+                probe.clone(),
+                kind,
+                None,
+                &dir.path().join("state.redb"),
+                &JobRequest::default(),
+            )
+            .output()
+            .await
+            .expect("run probe");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "http_api",
+                "{kind:?}"
+            );
+        }
     }
 }

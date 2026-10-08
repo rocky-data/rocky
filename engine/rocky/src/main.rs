@@ -1865,31 +1865,41 @@ enum Command {
         /// route); when unset, a loopback server asks no request for a
         /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
         /// omitted. Required when `--host` is non-loopback, including with
-        /// `--ui`. With `--ui` on loopback and no token, a per-process
-        /// read-only token is generated.
+        /// `--ui`. With `--ui` on loopback and no token, a per-process token
+        /// is generated: full scope (operator mode) unless `--read-only`,
+        /// `--allowed-host` or `--allowed-origin` is given.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
         /// `read-only` authenticates the same way but is refused `403` on any
-        /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
-        /// to hand a browser UI, so one leak can't reach a warehouse mutation.
-        /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
-        /// token is an error, except `read-only` with `--ui` on loopback,
-        /// which gets a generated token.
+        /// request whose method is not `GET`, `HEAD`, or `OPTIONS`. Falls
+        /// back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token
+        /// is an error, except with `--ui` on loopback, which gets a
+        /// generated token of that scope. With `--ui`, `full` is accepted
+        /// only on a loopback bind with no `--allowed-host` and no
+        /// `--allowed-origin`.
         #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
         token_scope: Option<String>,
+        /// The same as `--token-scope read-only`. With `--ui`, it gives a
+        /// view-only UI: the browser cannot run, plan, approve or apply.
+        /// Conflicts with `--token-scope full`.
+        #[arg(long = "read-only")]
+        read_only: bool,
         /// CORS allowlist. Repeat for each origin (e.g.
         /// `--allowed-origin http://localhost:5173`). The default
-        /// allowlist is empty (same-origin only).
+        /// allowlist is empty (same-origin only). With `--ui`, any entry
+        /// marks the server as shared, so the UI keeps a read-only token.
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
         /// Serve the browser UI at `/ui/`. Release binaries carry it; from
-        /// source, build with `--features ui`. The UI token is read-only, so
-        /// it never reaches a mutating route. On loopback with no token
-        /// configured, a per-process read-only token is generated: a new
-        /// one each time the server starts. It is meant for a single-user
-        /// machine. On a shared host, or any non-loopback host, pass
-        /// `--token` with `--token-scope read-only`. With `--scheduler`,
+        /// source, build with `--features ui`. On loopback with no token
+        /// configured, a per-process token is generated: a new one each time
+        /// the server starts. It is full scope (operator mode: the UI can
+        /// run, plan, approve and apply as the user running the server)
+        /// unless `--read-only` is given, or `--allowed-host` /
+        /// `--allowed-origin` mark the server as shared. Operator mode is
+        /// for a single-user machine. On a shared host, or any non-loopback
+        /// host, pass `--token` with `--read-only`. With `--scheduler`,
         /// `ROCKY_WEBHOOK_SECRET` is required. Prints the address to open,
         /// token included.
         #[arg(long)]
@@ -1897,6 +1907,7 @@ enum Command {
         /// With `--ui`: an extra `Host` header value to accept, for a reverse
         /// proxy in front of the UI. Repeat for each. Loopback names and the
         /// bind host are always accepted; any other `Host` is refused `421`.
+        /// Marks the server as shared, so `--ui` keeps a read-only token.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_hosts: Vec<String>,
         /// With `--ui`: open the printed address in the default browser once
@@ -5232,6 +5243,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             token,
             token_scope,
+            read_only,
             allowed_origins,
             ui,
             allowed_hosts,
@@ -5283,6 +5295,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 watch,
                 token,
                 token_scope,
+                read_only,
                 allowed_origins,
                 ui,
                 allowed_hosts,

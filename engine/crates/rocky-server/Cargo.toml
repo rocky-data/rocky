@@ -22,6 +22,9 @@ axum = { workspace = true }
 # `parse_file` tracked query instead of re-parsing on every keystroke.
 salsa = { workspace = true }
 tower = { workspace = true }
+# The `--ui` session cookie: a keyed blake3 of the bearer token (`ui_session`).
+blake3 = { workspace = true }
+uuid = { workspace = true }
 tower-http = { workspace = true }
 tower-lsp = { workspace = true }
 notify = { workspace = true }

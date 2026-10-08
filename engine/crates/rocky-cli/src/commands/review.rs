@@ -23,8 +23,12 @@
 //! The classifier may skip for a missing models directory or a failed base
 //! compile. The marker can still be written when the selected models compile
 //! for conditional DROP review. A failed DROP compile refuses approval. A
-//! marker count of zero does not prove that a base delta was computed. The
-//! approver identity falls back to `unknown` when git identity cannot be read.
+//! marker count of zero does not prove that a base delta was computed. On
+//! the CLI the approver identity falls back to `unknown` when git identity
+//! cannot be read. Under `ROCKY_SESSION_SOURCE=http_api` (a job the HTTP API
+//! started) the marker records `ApproverSource::HttpApi`, and an unreadable
+//! identity refuses with `approver_identity_unresolved` instead; see
+//! [`review_approver`].
 //!
 //! One case is NOT recoverable and refuses instead (#1680): a `rocky.toml`
 //! that is PRESENT and does not load. The schema cache the classifier types
@@ -506,13 +510,10 @@ async fn compute_review_with_disclosure_and_seam(
 
     let mut marker_written = false;
     if approve {
-        let approver =
-            crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| ApproverIdentity {
-                email: "unknown".to_string(),
-                name: None,
-                host: "unknown".to_string(),
-                source: crate::output::ApproverSource::Local,
-            });
+        let approver = review_approver(
+            super::run_audit::detect_session_source(),
+            crate::commands::branch::approver_identity_pub(),
+        )?;
         let marker = ReviewMarker {
             plan_id: plan_id.to_string(),
             reviewed_at: Utc::now(),
@@ -684,13 +685,10 @@ async fn compute_review_marker_only(
     disclose(&[], &None)?;
     let mut marker_written = false;
     if approve {
-        let approver =
-            crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| ApproverIdentity {
-                email: "unknown".to_string(),
-                name: None,
-                host: "unknown".to_string(),
-                source: crate::output::ApproverSource::Local,
-            });
+        let approver = review_approver(
+            super::run_audit::detect_session_source(),
+            crate::commands::branch::approver_identity_pub(),
+        )?;
         let marker = ReviewMarker {
             plan_id: plan_id.to_string(),
             reviewed_at: Utc::now(),
@@ -972,6 +970,70 @@ fn write_review_marker(root: &Path, plan_id: &str, marker: &ReviewMarker) -> Res
     Ok(())
 }
 
+/// One line naming who approved and through which channel, for the text
+/// form of `rocky review --status`. `HttpApi` says "over the HTTP API", never
+/// "from the browser": the source names the channel, not the person.
+pub(crate) fn approver_line(approver: &ApproverIdentity) -> String {
+    use crate::output::ApproverSource;
+    let channel = match approver.source {
+        ApproverSource::Local => "locally",
+        ApproverSource::HttpApi => "over the HTTP API",
+        ApproverSource::CiOidc => "from CI (OIDC)",
+        ApproverSource::Pat => "with a personal access token",
+    };
+    format!("approved {channel} by {}", approver.email)
+}
+
+/// The stable code an HTTP-API approval refuses with when the server's git
+/// identity cannot be read. It is in the error text, so the failed job's
+/// `error` carries it.
+pub(crate) const APPROVER_IDENTITY_UNRESOLVED: &str = "approver_identity_unresolved";
+
+/// Who the review marker names as approver.
+///
+/// ```text
+///   session source   git identity   -> approver
+///   http_api         resolved       -> that identity, source HttpApi
+///   http_api         unresolved     -> Err(approver_identity_unresolved)
+///   anything else    resolved       -> that identity, source Local
+///   anything else    unresolved     -> "unknown", source Local (unchanged)
+/// ```
+///
+/// The HTTP API refuses where the CLI falls back. A terminal user sees the
+/// `unknown` they produced; an approval clicked in a browser would carry it
+/// with nobody watching. `ROCKY_SESSION_SOURCE=http_api` is set by the
+/// server on its job children (`api::job_subprocess_command`). The MCP
+/// `approve_plan_id` path calls the same core without that variable, so it
+/// keeps the `Local` / `unknown` behaviour.
+pub(crate) fn review_approver(
+    session_source: rocky_core::state::SessionSource,
+    git_identity: Result<ApproverIdentity>,
+) -> Result<ApproverIdentity> {
+    use rocky_core::state::SessionSource;
+    match session_source {
+        SessionSource::HttpApi => match git_identity {
+            Ok(identity) => Ok(ApproverIdentity {
+                source: crate::output::ApproverSource::HttpApi,
+                ..identity
+            }),
+            Err(e) => bail!(
+                "{APPROVER_IDENTITY_UNRESOLVED}: refusing to approve over the HTTP API because \
+                 the server's git identity cannot be read ({e:#}). The marker would name an \
+                 `unknown` approver. Set `git config --global user.email <addr>` for the user \
+                 running `rocky serve`, or approve in a terminal with `rocky review <plan-id> \
+                 --approve`."
+            ),
+        },
+        SessionSource::Cli | SessionSource::Dagster | SessionSource::Lsp => Ok(git_identity
+            .unwrap_or_else(|_| ApproverIdentity {
+                email: "unknown".to_string(),
+                name: None,
+                host: "unknown".to_string(),
+                source: crate::output::ApproverSource::Local,
+            })),
+    }
+}
+
 /// Test-support: write a WELL-FORMED review marker naming `plan_id`, exactly
 /// as `rocky review --approve` would. Since the apply gate parses and matches
 /// the marker (FF-WP1), test fixtures can no longer plant a bare `{}` — they
@@ -1069,6 +1131,9 @@ pub fn run_review_status(config_path: &Path, plan_id: &str, output_json: bool) -
             "pending review".to_string()
         };
         println!("plan {} ({}): {state}", output.plan_id, output.kind);
+        if let Some(approver) = &output.approver {
+            println!("  {}", approver_line(approver));
+        }
         if let (Some(product), Some(digest)) = (&output.product_id, &output.spec_digest) {
             println!("  product: {product} @ {digest}");
         }
@@ -1592,6 +1657,137 @@ fn render_excluded_note(excluded: u64) {
 mod tests {
     use super::*;
     use crate::output::ApproverSource;
+
+    fn git_identity_for_test() -> Result<ApproverIdentity> {
+        Ok(ApproverIdentity {
+            email: "ops@example.com".to_string(),
+            name: Some("Ops".to_string()),
+            host: "laptop".to_string(),
+            source: ApproverSource::Local,
+        })
+    }
+
+    /// The approver table, every row. Over the HTTP API the identity is
+    /// kept and the source becomes `HttpApi`; an unreadable identity
+    /// REFUSES there, while every other session keeps the `unknown`
+    /// fallback.
+    #[test]
+    fn review_approver_stamps_http_api_and_refuses_an_unresolved_identity() {
+        use rocky_core::state::SessionSource;
+        let approver =
+            review_approver(SessionSource::HttpApi, git_identity_for_test()).expect("resolved");
+        assert_eq!(approver.source, ApproverSource::HttpApi);
+        assert_eq!(approver.email, "ops@example.com");
+        assert_eq!(approver.name.as_deref(), Some("Ops"));
+
+        let err = review_approver(
+            SessionSource::HttpApi,
+            Err(anyhow::anyhow!("git user.email is not configured")),
+        )
+        .expect_err("no identity over the HTTP API must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with(APPROVER_IDENTITY_UNRESOLVED), "{msg}");
+        assert!(msg.contains("user.email"), "{msg}");
+
+        for source in [
+            SessionSource::Cli,
+            SessionSource::Dagster,
+            SessionSource::Lsp,
+        ] {
+            let approver = review_approver(source, git_identity_for_test()).unwrap();
+            assert_eq!(approver.source, ApproverSource::Local, "{source:?}");
+            let approver = review_approver(source, Err(anyhow::anyhow!("no git"))).unwrap();
+            assert_eq!(approver.email, "unknown", "{source:?}");
+            assert_eq!(approver.source, ApproverSource::Local, "{source:?}");
+        }
+    }
+
+    /// **The production read.** Under `ROCKY_SESSION_SOURCE=http_api` (what
+    /// the server sets on its job children) a marker-only approval writes a
+    /// marker whose approver source is `http_api`, or refuses and writes
+    /// nothing. Which one depends on this machine's git identity, so the
+    /// test asserts the branch that identity selects, and both branches
+    /// assert something.
+    #[tokio::test]
+    async fn an_http_api_approval_writes_http_api_or_refuses_without_a_marker() {
+        let _env = crate::testing::lock_pipes_env();
+        // SAFETY: serialized by the pipes-env lock, which every reader of
+        // ROCKY_SESSION_SOURCE takes; restored below.
+        let previous = std::env::var_os("ROCKY_SESSION_SOURCE");
+        unsafe { std::env::set_var("ROCKY_SESSION_SOURCE", "http_api") };
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "c".repeat(64);
+        let result =
+            compute_review_marker_only(dir.path(), &plan_id, true, &PlanKind::Gc, |_, _| Ok(()))
+                .await;
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("ROCKY_SESSION_SOURCE", v),
+                None => std::env::remove_var("ROCKY_SESSION_SOURCE"),
+            }
+        }
+        match crate::commands::branch::approver_identity_pub() {
+            Ok(identity) => {
+                result.expect("an identity resolves, so the approval lands");
+                let ReviewMarkerState::Approved(marker) = review_marker_state(dir.path(), &plan_id)
+                else {
+                    panic!("the marker must parse and name the plan");
+                };
+                assert_eq!(marker.approver.source, ApproverSource::HttpApi);
+                assert_eq!(marker.approver.email, identity.email);
+            }
+            Err(_) => {
+                let err = result.expect_err("no identity over the HTTP API must refuse");
+                assert!(format!("{err:#}").contains(APPROVER_IDENTITY_UNRESOLVED));
+                assert!(matches!(
+                    review_marker_state(dir.path(), &plan_id),
+                    ReviewMarkerState::Absent
+                ));
+            }
+        }
+    }
+
+    /// Markers written before `http_api` existed parse unchanged, and a new
+    /// marker carrying it round-trips. `review --status` shows the channel.
+    #[test]
+    fn old_and_new_markers_parse_and_status_names_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = "d".repeat(64);
+        let old = serde_json::json!({
+            "plan_id": plan_id,
+            "reviewed_at": "2026-09-01T12:00:00Z",
+            "base_ref": "HEAD",
+            "breaking_change_count": 0,
+            "approver": {"email": "dev@example.com", "name": "Dev", "host": "box", "source": "local"}
+        });
+        let path = review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let ReviewMarkerState::Approved(marker) = review_marker_state(dir.path(), &plan_id) else {
+            panic!("an old marker must still approve");
+        };
+        assert_eq!(marker.approver.source, ApproverSource::Local);
+        assert_eq!(
+            approver_line(&marker.approver),
+            "approved locally by dev@example.com"
+        );
+
+        let mut new = old.clone();
+        new["approver"]["source"] = serde_json::json!("http_api");
+        std::fs::write(&path, serde_json::to_vec(&new).unwrap()).unwrap();
+        let ReviewMarkerState::Approved(marker) = review_marker_state(dir.path(), &plan_id) else {
+            panic!("a new marker must approve");
+        };
+        assert_eq!(marker.approver.source, ApproverSource::HttpApi);
+        assert_eq!(
+            approver_line(&marker.approver),
+            "approved over the HTTP API by dev@example.com"
+        );
+        assert_eq!(
+            serde_json::to_value(&marker).unwrap()["approver"]["source"],
+            "http_api"
+        );
+    }
 
     #[tokio::test]
     async fn approval_discloses_drops_before_marker_and_refuses_failed_review() -> anyhow::Result<()>

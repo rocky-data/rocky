@@ -97,7 +97,8 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
     );
     let config = root.join("rocky.toml");
 
-    // Refusals first: a full-scope token is not a UI token.
+    // Refusals first: a full-scope token on a fronted server (one with
+    // `--allowed-host`) is not a UI token: a fronted server is shared.
     let refused = rocky()
         .current_dir(&root)
         .args([
@@ -107,6 +108,8 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
             "--ui",
             "--token",
             "t",
+            "--allowed-host",
+            "rocky.example.test",
             "--port",
             "0",
         ])
@@ -114,7 +117,7 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
         .expect("spawn rocky serve");
     assert!(!refused.status.success());
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("read-only"),
+        String::from_utf8_lossy(&refused.stderr).contains("per-person tokens"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
@@ -146,14 +149,14 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
     let server = Server(child);
     let _keep_alive = &server;
 
-    // The printed address: the page, with the token in the fragment.
+    // The printed address: the login link, with the token in the query.
     let mut first_line = String::new();
     BufReader::new(stdout)
         .read_line(&mut first_line)
         .expect("read the banner");
     assert_eq!(
         first_line.trim(),
-        format!("Rocky UI: http://127.0.0.1:{port}/ui/#token=s3cret")
+        format!("Rocky UI: http://127.0.0.1:{port}/login?t=s3cret")
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -186,6 +189,26 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
     let (status, _, body) = http_get(port, "/api/v1/meta", "Authorization: Bearer s3cret\r\n");
     assert!(status.contains("200"), "{status}: {body}");
     assert!(body.contains("\"capabilities\""), "{body}");
+    assert!(body.contains("\"token_scope\": \"read_only\""), "{body}");
+
+    // The printed link trades the token for a session cookie, and the
+    // cookie then reads the API.
+    let (status, headers, _) = http_get(port, "/login?t=s3cret", "");
+    assert!(status.contains("303"), "{status}");
+    assert!(headers.contains("location: /ui/"), "{headers}");
+    let cookie = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("set-cookie: "))
+        .and_then(|v| v.split(';').next())
+        .expect("a session cookie")
+        .to_string();
+    assert!(!cookie.contains("s3cret"), "{cookie}");
+    let (status, _, body) = http_get(port, "/api/v1/meta", &format!("Cookie: {cookie}\r\n"));
+    assert!(status.contains("200"), "{status}: {body}");
+    let (status, headers, body) = http_get(port, "/login?t=zz-old-token-zz", "");
+    assert!(status.contains("401"), "{status}");
+    assert!(!headers.contains("set-cookie"), "{headers}");
+    assert!(!body.contains("zz-old-token-zz"), "{body}");
 
     // And a foreign Host is refused before routing.
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -198,10 +221,11 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
     );
 }
 
-/// `rocky serve --ui` with no token flags, on loopback: the server generates
-/// a read-only token, prints it in the address line, says so on stderr
-/// without the secret, and the token authenticates reads but not writes. On a
-/// non-loopback bind the same command still refuses to start.
+/// `rocky serve --ui` with no token flags, on loopback: operator mode. The
+/// server generates a FULL-scope token, prints it in the login link, says so
+/// on stderr without the secret, and the token authenticates reads and
+/// writes. A fronted server refuses a full scope, and a non-loopback bind
+/// still refuses to start without a token.
 ///
 /// Needs the embedded page, like the test above, so it skips without
 /// `engine/ui/dist`.
@@ -250,13 +274,20 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
-    // `--token-scope full` alone is refused: the UI token is read-only.
-    let refused = serve(&["--token-scope", "full", "--port", "0"])
-        .output()
-        .expect("spawn rocky serve");
+    // `--token-scope full` on a fronted server is refused: it is shared.
+    let refused = serve(&[
+        "--token-scope",
+        "full",
+        "--allowed-origin",
+        "https://portal.example.test",
+        "--port",
+        "0",
+    ])
+    .output()
+    .expect("spawn rocky serve");
     assert!(!refused.status.success());
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("read-only"),
+        String::from_utf8_lossy(&refused.stderr).contains("per-person tokens"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
@@ -293,7 +324,7 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
     BufReader::new(stdout)
         .read_line(&mut first_line)
         .expect("read the banner");
-    let prefix = format!("Rocky UI: http://127.0.0.1:{port}/ui/#token=");
+    let prefix = format!("Rocky UI: http://127.0.0.1:{port}/login?t=");
     let token = first_line
         .trim()
         .strip_prefix(&prefix)
@@ -310,7 +341,9 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
     let (status, _, body) = http_get(port, "/api/v1/meta", &auth);
     assert!(status.contains("200"), "{status}: {body}");
 
-    // Read-only: a write with the generated token is refused.
+    assert!(body.contains("\"token_scope\": \"full\""), "{body}");
+
+    // Operator mode: a write with the generated token is accepted.
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     write!(
         stream,
@@ -320,13 +353,15 @@ fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
     let mut raw = String::new();
     stream.read_to_string(&mut raw).expect("response");
     assert!(
-        raw.starts_with("HTTP/1.0 403") || raw.starts_with("HTTP/1.1 403"),
+        raw.starts_with("HTTP/1.0 200") || raw.starts_with("HTTP/1.1 200"),
         "{raw}"
     );
 
     drop(server);
     let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
-    assert!(stderr.contains("per-process read-only token"), "{stderr}");
+    assert!(stderr.contains("per-process token"), "{stderr}");
+    assert!(stderr.contains("operator mode"), "{stderr}");
+    assert!(stderr.contains("--read-only"), "{stderr}");
     assert!(
         !stderr.contains(&token),
         "the token must appear only on stdout: {stderr}"
@@ -1031,7 +1066,7 @@ fn open_hands_the_opener_the_printed_address_and_survives_an_opener_that_fails()
         .strip_prefix("Rocky UI: ")
         .unwrap_or_else(|| panic!("the banner is the address line: {printed}"))
         .to_string();
-    assert_eq!(address, format!("http://127.0.0.1:{port}/ui/#token=s3cret"));
+    assert_eq!(address, format!("http://127.0.0.1:{port}/login?t=s3cret"));
     wait_for_health(port);
     assert_eq!(
         recorded(&record_ok),
@@ -1048,7 +1083,7 @@ fn open_hands_the_opener_the_printed_address_and_survives_an_opener_that_fails()
     let (server, printed) = serve_with_open(port);
     assert_eq!(
         printed,
-        format!("Rocky UI: http://127.0.0.1:{port}/ui/#token=s3cret")
+        format!("Rocky UI: http://127.0.0.1:{port}/login?t=s3cret")
     );
     wait_for_health(port);
     assert_eq!(recorded(&record_fail).len(), 1);

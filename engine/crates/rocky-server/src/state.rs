@@ -126,6 +126,10 @@ pub struct ServerState {
     /// Secret and scope travel as one value so a scope can never be set
     /// without a token to attach it to.
     pub auth: Option<ServeToken>,
+    /// The per-process key the `--ui` session cookie is derived with
+    /// ([`crate::ui_session`]). Random at every start, never written
+    /// anywhere, so a restart ends every browser session.
+    pub ui_session_key: crate::ui_session::UiSessionKey,
     /// CORS allowlist passed to [`crate::auth::build_cors_layer`]. An
     /// empty list means same-origin only.
     pub allowed_origins: Vec<String>,
@@ -438,6 +442,7 @@ impl ServerState {
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
             auth,
+            ui_session_key: crate::ui_session::UiSessionKey::generate(),
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
             store_access: Arc::new(tokio::sync::Semaphore::new(1)),

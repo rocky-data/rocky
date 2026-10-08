@@ -20,8 +20,9 @@
 //!
 //! `read-only` authenticates exactly like `full` but is refused `403` on any
 //! request whose HTTP method is not safe (`GET`, `HEAD`, `OPTIONS`). That is
-//! the token a browser UI should hold: a leak of it cannot reach
-//! `POST /api/v1/jobs/run` and through it the warehouse.
+//! the token a shared browser UI must hold: a leak of it cannot reach
+//! `POST /api/v1/jobs/run` and through it the warehouse. `--read-only` is the
+//! same as `--token-scope read-only`, and conflicts with `--token-scope full`.
 //!
 //! It does not gate the webhook ingress, which is Bearer-exempt. Under
 //! `--scheduler` on a loopback bind with no `ROCKY_WEBHOOK_SECRET` that route
@@ -32,19 +33,41 @@
 //! A scope with no token is an **error**, not a silent no-op: the operator
 //! asked to restrict something that would otherwise stay fully mutable.
 //!
-//! # `--ui` on loopback with no token
+//! # `--ui` tokens and operator mode
 //!
-//! `--ui` needs a read-only token. On a loopback bind with no token
-//! configured, `rocky serve --ui` generates a per-process one (244 random
-//! bits, scope `read-only`). It is valid for every request until the process
-//! exits, and each start makes a new one. Once the listener is bound, the
-//! server prints the `Rocky UI:` address with the token on stdout and a note
-//! on stderr. `--open` hands that address to the system opener, whose command
-//! line other local users can read, so a generated token is for a
-//! single-user machine; a shared host should pass `--token`. `--token-scope
-//! read-only` alone still generates; `--token-scope full` alone is refused,
-//! since the UI token is read-only. A non-loopback bind never generates: it
-//! still refuses to start without a token. Without `--ui` nothing is
+//! "Fronted" means `--allowed-host` or `--allowed-origin` was given (any
+//! entry): another name or page reaches this server, so it is shared.
+//!
+//! ```text
+//!   bind          fronted  secret  scope         -> result
+//!   loopback      no       none    none or full  -> generated, FULL (operator mode)
+//!   loopback      no       none    read-only     -> generated, read-only
+//!   loopback      yes      none    none or r-o   -> generated, read-only
+//!   loopback      yes      none    full          -> refused: a fronted server is shared
+//!   loopback      no       given   full          -> accepted (operator mode)
+//!   loopback      yes      given   full          -> refused: a fronted server is shared
+//!   loopback      any      given   read-only     -> accepted
+//!   non-loopback  any      any     full          -> refused: the UI token must be read-only
+//!   non-loopback  any      none    -             -> refused: a token is required
+//! ```
+//!
+//! Operator mode is a full-scope UI token: the browser can run, plan, approve
+//! and apply, acting as the OS user who started the server, as the VS Code
+//! extension does. A process that can read that token could already run
+//! `rocky` as that user. A foreign browser tab cannot use it: the token
+//! travels in an `Authorization` header the browser never adds by itself, and
+//! the `Host`/`Origin` guard refuses a foreign origin. The server cannot
+//! detect an SSH `-L` tunnel or a port-forward to its loopback port, so
+//! `--read-only` is the answer whenever someone else can reach the port.
+//!
+//! A generated token has 244 random bits. It is valid for every request
+//! until the process exits, and each start makes a new one. Once the
+//! listener is bound, the server prints the `Rocky UI:` address with the
+//! token on stdout, for every scope, and notes on stderr (a generated token;
+//! operator mode). `--open` hands that address to the system opener, whose
+//! command line other local users can read: at full scope another local OS
+//! user could act with it, so a generated token is for a single-user
+//! machine. A non-loopback bind never generates. Without `--ui` nothing is
 //! generated, so a loopback server with no token still asks no request for one.
 //!
 //! There is no `[serve]` section in `rocky.toml` — `rocky-core/src/config.rs`
@@ -162,10 +185,12 @@ pub async fn run_serve(
     // The raw `--token-scope` value, unparsed. `None` falls back to
     // `ROCKY_SERVE_TOKEN_SCOPE`, then to `TokenScope::Full`.
     token_scope: Option<String>,
+    // `--read-only`: `--token-scope read-only` by another name.
+    read_only: bool,
     allowed_origins: Vec<String>,
     // `--ui`: serve the embedded browser UI at `/ui/`. Validated in
-    // `build_serve_state` (token present and read-only; webhook secret with
-    // `--scheduler`; the feature compiled in).
+    // `build_serve_state` (the token matrix in `validate_ui_flags`; webhook
+    // secret with `--scheduler`; the feature compiled in).
     ui: bool,
     // `--allowed-host`: extra `Host` values the `--ui` guard accepts.
     allowed_hosts: Vec<String>,
@@ -207,6 +232,7 @@ pub async fn run_serve(
         &serve_config.host,
         auth_token,
         token_scope,
+        read_only,
         allowed_origins,
         ui,
         allowed_hosts,
@@ -215,16 +241,20 @@ pub async fn run_serve(
         UiBuild::current(),
     )?;
 
-    // The one address a person needs: the page, with the token in the
-    // fragment. The fragment never reaches the server, and the page clears it
-    // after reading it once. Printed on stdout, once the listener is bound
+    // The one address a person needs: the login link, token in the query.
+    // `GET /login` trades it for a session cookie and redirects to the page,
+    // which never holds the token. Printed for every scope, full included,
+    // on stdout, once the listener is bound
     // (`announce_when_ready`, below), so a script can capture it. The same
     // string is what `--open` hands the opener, so the two cannot drift: the
     // address that opens is the address that printed.
-    let page_address = match (ui, state.auth.as_ref()) {
-        (true, Some(token)) => Some(ui_address(&serve_config.host, port, &token.secret)),
-        _ => None,
-    };
+    let announcement = ui_announcement(
+        ui,
+        &serve_config.host,
+        port,
+        state.auth.as_ref(),
+        token_origin,
+    );
 
     // Start filesystem watcher if requested. Without `--models` the compile
     // reads every transformation pipeline's own models directory (#2011), so
@@ -270,7 +300,7 @@ pub async fn run_serve(
     // failed bind (a port in use) returns from `api::serve` without raising
     // the latch, and `shutdown` (raised below) ends the task. A missing or
     // failing opener is a warning, never a reason not to serve.
-    if let Some(address) = page_address {
+    if let Some(announcement) = announcement {
         let opener: Option<std::sync::Arc<dyn BrowserOpener>> = if open {
             Some(std::sync::Arc::new(SystemOpener))
         } else {
@@ -279,10 +309,7 @@ pub async fn run_serve(
         announce_when_ready(
             server_ready.clone(),
             shutdown.clone(),
-            Announcement {
-                address,
-                token_origin,
-            },
+            announcement,
             std::sync::Arc::new(StdAnnouncer),
             opener,
         );
@@ -497,9 +524,11 @@ pub(crate) fn config_posture(config_path: Option<&Path>) -> rocky_server::state:
 fn resolve_serve_token(
     secret: Option<String>,
     token_scope: Option<String>,
-    missing: MissingToken,
+    read_only: bool,
+    exposure: UiExposure,
 ) -> Result<(Option<ServeToken>, TokenOrigin)> {
-    let raw = match token_scope {
+    let raw = merge_read_only_flag(read_only, token_scope)?;
+    let raw = match raw {
         Some(v) => Some(v),
         None => env_var_fail_closed("ROCKY_SERVE_TOKEN_SCOPE")?,
     };
@@ -507,31 +536,58 @@ fn resolve_serve_token(
         Some(raw) => Some(raw.parse::<TokenScope>()?),
         None => None,
     };
-    resolve_token_for_bind(secret, scope, missing)
+    resolve_token_for_bind(secret, scope, exposure)
 }
 
-/// What a server with no configured token does about it.
+/// `--read-only` is `--token-scope read-only` by another name. It folds into
+/// the flag value before the env var is consulted, so like `--token-scope` it
+/// overrides `ROCKY_SERVE_TOKEN_SCOPE`. With `--token-scope full` it is a
+/// contradiction and refused; with `--token-scope read-only` it is redundant
+/// and accepted.
+fn merge_read_only_flag(read_only: bool, token_scope: Option<String>) -> Result<Option<String>> {
+    if !read_only {
+        return Ok(token_scope);
+    }
+    match token_scope.as_deref() {
+        None | Some("read-only") => Ok(Some("read-only".to_string())),
+        Some(other) => anyhow::bail!(
+            "--read-only conflicts with --token-scope {other}. Pass one of them: \
+             --read-only is the same as --token-scope read-only."
+        ),
+    }
+}
+
+/// How the `--ui` page is exposed, which decides what token `--ui` may hold
+/// and whether one is generated.
+///
+/// "Fronted" means `--allowed-host` or `--allowed-origin` was given: some
+/// other name or page reaches this server, a reverse proxy or a second app.
+/// A fronted server is shared, so the UI stays read-only there until writes
+/// carry per-person identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissingToken {
-    /// Serve without one. On a loopback bind that is the documented no-auth
-    /// mode; a non-loopback bind is refused later (`api::serve`), and `--ui`
-    /// is refused by [`validate_ui_flags`].
-    Leave,
-    /// `--ui` on a loopback bind: generate a per-process read-only token for
-    /// this process, so `rocky serve --ui` works with no token flags.
-    GenerateForLocalUi,
+pub(crate) enum UiExposure {
+    /// No `--ui`. Nothing is generated and nothing here applies: a loopback
+    /// server with no token serves every route with no auth, as it always has.
+    NoUi,
+    /// `--ui` on a loopback bind with no `--allowed-host` / `--allowed-origin`.
+    /// Operator mode: a generated token is full scope unless the operator
+    /// asks for `read-only`.
+    Local,
+    /// `--ui` on a loopback bind with `--allowed-host` or `--allowed-origin`.
+    /// A generated token is read-only, and a full token is refused.
+    Fronted,
+    /// `--ui` on a non-loopback bind. Never generates; the token must be
+    /// given and read-only.
+    Remote,
 }
 
-impl MissingToken {
-    /// Generation is for `--ui` on loopback only. Without `--ui`, a loopback
-    /// server with no token keeps serving every route with no auth, as it
-    /// always has. A non-loopback bind never generates: the LAN-exposure rule
-    /// wants a token the operator chose.
-    fn for_bind(ui: bool, host: &str) -> Self {
-        if ui && crate::api::is_loopback(host) {
-            Self::GenerateForLocalUi
-        } else {
-            Self::Leave
+impl UiExposure {
+    pub(crate) fn for_bind(ui: bool, host: &str, fronted: bool) -> Self {
+        match (ui, crate::api::is_loopback(host), fronted) {
+            (false, _, _) => Self::NoUi,
+            (true, true, false) => Self::Local,
+            (true, true, true) => Self::Fronted,
+            (true, false, _) => Self::Remote,
         }
     }
 }
@@ -548,36 +604,51 @@ pub(crate) enum TokenOrigin {
     Generated,
 }
 
-/// [`pair_token_with_scope`], plus the case it refuses that `--ui` on a
-/// loopback bind turns into a generated token.
+/// The refusal for a full-scope UI token on a fronted loopback server.
+const FRONTED_FULL_REFUSAL: &str = "rocky serve --ui with --allowed-host or --allowed-origin \
+     refuses a full-scope token: a server reached through a proxy or another page is shared, \
+     and writes from a shared UI need per-person tokens, which Rocky does not have yet. Use \
+     --read-only (or --token-scope read-only), or drop --allowed-host / --allowed-origin to run \
+     the UI in operator mode on your own machine.";
+
+/// [`pair_token_with_scope`], plus the cases where `--ui` on a loopback bind
+/// generates a token.
 ///
 /// ```text
-///   secret  scope       missing             -> outcome
-///   Some    any         any                 -> that secret (pair_token_with_scope)
-///   None    none        GenerateForLocalUi  -> generated, read-only
-///   None    read-only   GenerateForLocalUi  -> generated, read-only
-///   None    full        GenerateForLocalUi  -> refused: the UI token is read-only
-///   None    any         Leave               -> pair_token_with_scope, unchanged
+///   secret  scope       exposure  -> outcome
+///   None    none/full   Local     -> generated, FULL (operator mode)
+///   None    read-only   Local     -> generated, read-only
+///   None    none/r-o    Fronted   -> generated, read-only
+///   None    full        Fronted   -> refused: a fronted server is shared
+///   any     any         other     -> pair_token_with_scope, unchanged
 /// ```
+///
+/// A given secret is paired here and judged by [`validate_ui_flags`].
 fn resolve_token_for_bind(
     secret: Option<String>,
     scope: Option<TokenScope>,
-    missing: MissingToken,
+    exposure: UiExposure,
 ) -> Result<(Option<ServeToken>, TokenOrigin)> {
-    match (secret, scope, missing) {
-        (None, None | Some(TokenScope::ReadOnly), MissingToken::GenerateForLocalUi) => Ok((
+    let generated = |scope| {
+        Ok((
             Some(ServeToken {
                 secret: generate_ui_token(),
-                scope: TokenScope::ReadOnly,
+                scope,
             }),
             TokenOrigin::Generated,
-        )),
-        (None, Some(TokenScope::Full), MissingToken::GenerateForLocalUi) => anyhow::bail!(
-            "rocky serve --ui requires a read-only token, and --token-scope (or \
-             ROCKY_SERVE_TOKEN_SCOPE) asks for `full`. Drop the scope or set it to \
-             `read-only`: on a loopback bind, --ui then generates a per-process read-only token."
-        ),
-        (secret, scope, MissingToken::Leave | MissingToken::GenerateForLocalUi) => {
+        ))
+    };
+    match (secret, scope, exposure) {
+        (None, None | Some(TokenScope::Full), UiExposure::Local) => generated(TokenScope::Full),
+        (None, Some(TokenScope::ReadOnly), UiExposure::Local)
+        | (None, None | Some(TokenScope::ReadOnly), UiExposure::Fronted) => {
+            generated(TokenScope::ReadOnly)
+        }
+        (None, Some(TokenScope::Full), UiExposure::Fronted) => {
+            anyhow::bail!("{FRONTED_FULL_REFUSAL}")
+        }
+        (secret @ Some(_), scope, UiExposure::Local | UiExposure::Fronted)
+        | (secret, scope, UiExposure::NoUi | UiExposure::Remote) => {
             Ok((pair_token_with_scope(secret, scope)?, TokenOrigin::Operator))
         }
     }
@@ -588,7 +659,7 @@ fn resolve_token_for_bind(
 ///
 /// The bits come from `rand`'s thread RNG through the workspace `uuid`
 /// dependency (feature `fast-rng`): ChaCha12, seeded and reseeded from the
-/// operating system's RNG. Hex needs no escaping in the URL fragment that
+/// operating system's RNG. Hex needs no escaping in the login URL that
 /// carries it. Never logged through tracing; the printed address carries it,
 /// and `--open` passes that address to the opener.
 fn generate_ui_token() -> String {
@@ -695,6 +766,7 @@ fn build_serve_state(
     host: &str,
     auth_token: Option<String>,
     token_scope: Option<String>,
+    read_only: bool,
     allowed_origins: Vec<String>,
     ui: bool,
     allowed_hosts: Vec<String>,
@@ -713,8 +785,10 @@ fn build_serve_state(
     };
     // Blank from either source — the flag or the env var — is refused.
     let secret = reject_blank_secret("ROCKY_SERVE_TOKEN", secret)?;
-    let (token, token_origin) =
-        resolve_serve_token(secret, token_scope, MissingToken::for_bind(ui, host))?;
+    // Fronted: some other name or page reaches this server. Any entry counts.
+    let fronted = !allowed_hosts.is_empty() || !allowed_origins.is_empty();
+    let exposure = UiExposure::for_bind(ui, host, fronted);
+    let (token, token_origin) = resolve_serve_token(secret, token_scope, read_only, exposure)?;
 
     // The webhook secret is read once, here, because two decisions hang on
     // it: the ingress below, and the `--ui --scheduler` refusal.
@@ -725,7 +799,7 @@ fn build_serve_state(
     };
 
     validate_ui_flags(
-        ui,
+        exposure,
         token.as_ref(),
         scheduler,
         webhook_secret.is_some(),
@@ -871,20 +945,23 @@ pub(crate) fn validate_open_flag(open: bool, ui: bool) -> Result<()> {
     Ok(())
 }
 
-/// The page address `rocky serve --ui` prints, token in the fragment.
+/// The login link `rocky serve --ui` prints: `/login?t=<token>`.
 ///
 /// One function for the print and for `--open`, so what opens is exactly what
 /// printed. A wildcard bind (`0.0.0.0`, `::`) is shown as `localhost`: the one
 /// name a wildcard bind promises a browser on the same machine can reach. Any
-/// other IPv6 literal is bracketed, as a URL requires. The fragment never
-/// reaches the server, and the page clears it after reading it once.
+/// other IPv6 literal is bracketed, as a URL requires. The token is
+/// form-encoded, so a supplied token with `&`, `#` or `+` survives the trip.
+/// `GET /login` answers `Cache-Control: no-store` and `Referrer-Policy:
+/// no-referrer` and redirects, so the token does not stay in the address bar.
 pub(crate) fn ui_address(bind_host: &str, port: u16, token_secret: &str) -> String {
     let shown_host = match bind_host {
         "0.0.0.0" | "::" => "localhost".to_string(),
         host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
         host => host.to_string(),
     };
-    format!("http://{shown_host}:{port}/ui/#token={token_secret}")
+    let token: String = url::form_urlencoded::byte_serialize(token_secret.as_bytes()).collect();
+    format!("http://{shown_host}:{port}/login?t={token}")
 }
 
 /// How `--open` reaches a browser: a seam, so a test can substitute one and
@@ -939,10 +1016,34 @@ impl BrowserOpener for SystemOpener {
 
 /// What `rocky serve --ui` tells the person once the listener is bound.
 pub(crate) struct Announcement {
-    /// The page address, token in the fragment ([`ui_address`]).
+    /// The page address, token in the fragment ([`ui_address`]). Printed for
+    /// every token, full scope included: it is the one address a person needs.
     pub(crate) address: String,
     /// Whether the token in it was generated for this process.
     pub(crate) token_origin: TokenOrigin,
+    /// Whether the token is full scope, so the UI can make changes.
+    pub(crate) operator_mode: bool,
+}
+
+/// What `run_serve` announces for the installed token: the login link for
+/// every `--ui` token, full scope included, and operator mode when the token
+/// is full scope. `None` without `--ui` or without a token.
+pub(crate) fn ui_announcement(
+    ui: bool,
+    bind_host: &str,
+    port: u16,
+    token: Option<&ServeToken>,
+    token_origin: TokenOrigin,
+) -> Option<Announcement> {
+    let token = token.filter(|_| ui)?;
+    Some(Announcement {
+        address: ui_address(bind_host, port, &token.secret),
+        token_origin,
+        operator_mode: match token.scope {
+            TokenScope::Full => true,
+            TokenScope::ReadOnly => false,
+        },
+    })
 }
 
 /// Where the announcement goes: a seam, so a test can assert what is printed
@@ -969,12 +1070,20 @@ impl Announcer for StdAnnouncer {
 
 /// The stderr note for a generated token. It names no secret.
 const GENERATED_TOKEN_NOTE: &str = "rocky serve --ui: no token was configured, so a per-process \
-     read-only token was generated. Each start makes a new one, so the address stops working \
-     after a restart. To keep one token, or on a shared machine, pass --token (or set \
+     token was generated. Each start makes a new one, so the address stops working after a \
+     restart. To keep one token, or on a shared machine, pass --token (or set \
      ROCKY_SERVE_TOKEN).";
 
+/// The stderr note for operator mode: a full-scope UI token. It names no
+/// secret.
+pub(crate) const OPERATOR_MODE_NOTE: &str = "rocky serve --ui: operator mode. This UI can make \
+     changes (run, plan, approve, apply) as the user running this server. Use --read-only for \
+     a view-only UI, and whenever someone else can reach this port (an SSH tunnel, a \
+     port-forward).";
+
 /// Once `ready` is raised, unless `shutdown` comes first: print the address,
-/// then the generated-token note, then hand the address to `opener`.
+/// then the generated-token note, then the operator-mode note, then hand the
+/// address to `opener`.
 ///
 /// Waiting on `ready` means a token is never printed for a port the server
 /// failed to bind. Its own task, so a slow or failing opener never delays the
@@ -999,6 +1108,9 @@ pub(crate) fn announce_when_ready(
                     TokenOrigin::Generated => out.note_line(GENERATED_TOKEN_NOTE),
                     TokenOrigin::Operator => {}
                 }
+                if announcement.operator_mode {
+                    out.note_line(OPERATOR_MODE_NOTE);
+                }
                 let Some(opener) = opener else { return };
                 if let Err(error) = opener.open(&announcement.address) {
                     tracing::warn!(
@@ -1018,20 +1130,22 @@ pub(crate) fn announce_when_ready(
 /// - A token must be present: every UI request presents one. On a loopback
 ///   bind with none configured, [`resolve_token_for_bind`] has already
 ///   generated one, so this refusal is the non-loopback case.
-/// - The token must be read-only: the UI token must not reach a mutation.
-///   One server has one token, so `--ui` makes it read-only; a job
-///   submission needs a second sidecar without `--ui`, or the CLI.
+/// - A full-scope token is operator mode, and only a [`UiExposure::Local`]
+///   server may hold one: loopback, with no `--allowed-host` and no
+///   `--allowed-origin`. A fronted server is shared, and a non-loopback bind
+///   is reachable from the network; both need a read-only token until writes
+///   carry per-person identity.
 /// - With `--scheduler`, `ROCKY_WEBHOOK_SECRET` must be set: a browser can
 ///   reach the webhook route, and without a secret a loopback bind accepts
 ///   unsigned requests.
 pub(crate) fn validate_ui_flags(
-    ui: bool,
+    exposure: UiExposure,
     token: Option<&ServeToken>,
     scheduler: bool,
     webhook_secret_present: bool,
     built_with_ui: bool,
 ) -> Result<()> {
-    if !ui {
+    if exposure == UiExposure::NoUi {
         return Ok(());
     }
     if !built_with_ui {
@@ -1044,17 +1158,21 @@ pub(crate) fn validate_ui_flags(
     let Some(token) = token else {
         anyhow::bail!(
             "rocky serve --ui refuses to start without a token: every UI request presents \
-             one. Pass `--token <secret> --token-scope read-only`, or set ROCKY_SERVE_TOKEN \
-             and ROCKY_SERVE_TOKEN_SCOPE=read-only. Only a loopback bind (127.0.0.1) \
-             generates a per-process token by itself."
+             one. Pass `--token <secret> --read-only`, or set ROCKY_SERVE_TOKEN and \
+             ROCKY_SERVE_TOKEN_SCOPE=read-only. Only a loopback bind (127.0.0.1) generates a \
+             per-process token by itself."
         );
     };
-    if token.scope != TokenScope::ReadOnly {
-        anyhow::bail!(
-            "rocky serve --ui requires `--token-scope read-only`: the UI token must not \
-             reach a mutating route. For job submissions run a second sidecar without \
-             --ui, or use the CLI."
-        );
+    match (token.scope, exposure) {
+        (TokenScope::ReadOnly, _) | (TokenScope::Full, UiExposure::Local | UiExposure::NoUi) => {}
+        (TokenScope::Full, UiExposure::Fronted) => anyhow::bail!("{FRONTED_FULL_REFUSAL}"),
+        (TokenScope::Full, UiExposure::Remote) => anyhow::bail!(
+            "rocky serve --ui on a non-loopback bind requires a read-only token \
+             (`--read-only`, or `--token-scope read-only`): the server is reachable from the \
+             network, and writes from a shared UI need per-person tokens, which Rocky does not \
+             have yet. For job submissions run a second sidecar without --ui, or use the CLI. \
+             Operator mode (a UI that can make changes) is for a loopback bind only."
+        ),
     }
     if scheduler && !webhook_secret_present {
         anyhow::bail!(
@@ -1115,27 +1233,29 @@ mod tests {
     fn ui_address_is_the_printed_shape_with_a_reachable_host() {
         assert_eq!(
             ui_address("127.0.0.1", 8080, "t"),
-            "http://127.0.0.1:8080/ui/#token=t"
+            "http://127.0.0.1:8080/login?t=t"
         );
         assert_eq!(
             ui_address("0.0.0.0", 9000, "s3cret"),
-            "http://localhost:9000/ui/#token=s3cret"
+            "http://localhost:9000/login?t=s3cret"
         );
         assert_eq!(
             ui_address("::", 8080, "t"),
-            "http://localhost:8080/ui/#token=t"
+            "http://localhost:8080/login?t=t"
         );
-        assert_eq!(
-            ui_address("::1", 8080, "t"),
-            "http://[::1]:8080/ui/#token=t"
-        );
+        assert_eq!(ui_address("::1", 8080, "t"), "http://[::1]:8080/login?t=t");
         assert_eq!(
             ui_address("rocky.internal", 8080, "t"),
-            "http://rocky.internal:8080/ui/#token=t"
+            "http://rocky.internal:8080/login?t=t"
         );
         assert_eq!(
             ui_address("fd00::1", 8080, "t"),
-            "http://[fd00::1]:8080/ui/#token=t"
+            "http://[fd00::1]:8080/login?t=t"
+        );
+        // A supplied token is form-encoded, so it reaches `/login` intact.
+        assert_eq!(
+            ui_address("127.0.0.1", 8080, "a&b#c+d e"),
+            "http://127.0.0.1:8080/login?t=a%26b%23c%2Bd+e"
         );
     }
 
@@ -1210,7 +1330,45 @@ mod tests {
         Announcement {
             address: address.to_string(),
             token_origin,
+            operator_mode: false,
         }
+    }
+
+    /// Operator mode (a generated FULL-scope token) still prints the login
+    /// link with the token on stdout, then the generated-token note, then the
+    /// operator-mode note. Neither note carries the token.
+    #[tokio::test]
+    async fn operator_mode_prints_the_address_with_the_token_then_both_notes() {
+        let ready = rocky_core::schedule::Drain::new();
+        let shutdown = rocky_core::schedule::Drain::new();
+        let out = std::sync::Arc::new(RecordingAnnouncer::default());
+        let address = ui_address("127.0.0.1", 8080, "fullscopesecret");
+        let handle = announce_when_ready(
+            ready.clone(),
+            shutdown,
+            Announcement {
+                address: address.clone(),
+                token_origin: TokenOrigin::Generated,
+                operator_mode: true,
+            },
+            out.clone(),
+            None,
+        );
+        ready.signal();
+        handle.await.unwrap();
+
+        let lines = out.0.lock().unwrap();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "out:Rocky UI: http://127.0.0.1:8080/login?t=fullscopesecret"
+        );
+        assert_eq!(lines[2], format!("err:{OPERATOR_MODE_NOTE}"));
+        assert!(lines[2].contains("--read-only"), "{lines:?}");
+        assert!(
+            lines[1..].iter().all(|l| !l.contains("fullscopesecret")),
+            "{lines:?}"
+        );
     }
 
     /// Nothing is printed and nothing opens until the listener is bound. Then
@@ -1329,22 +1487,32 @@ mod tests {
         };
         let full = ServeToken::full("s3cret");
 
-        assert!(validate_ui_flags(false, None, true, false, false).is_ok());
+        use UiExposure::{Fronted, Local, NoUi, Remote};
+        assert!(validate_ui_flags(NoUi, None, true, false, false).is_ok());
+        assert!(validate_ui_flags(NoUi, Some(&full), false, false, true).is_ok());
 
-        let err = validate_ui_flags(true, Some(&read_only), false, false, false).unwrap_err();
+        let err = validate_ui_flags(Local, Some(&read_only), false, false, false).unwrap_err();
         assert!(err.to_string().contains("--features ui"), "{err}");
 
-        let err = validate_ui_flags(true, None, false, false, true).unwrap_err();
+        let err = validate_ui_flags(Remote, None, false, false, true).unwrap_err();
         assert!(err.to_string().contains("without a token"), "{err}");
 
-        let err = validate_ui_flags(true, Some(&full), false, false, true).unwrap_err();
+        // Full scope: operator mode on a local loopback server only.
+        assert!(validate_ui_flags(Local, Some(&full), false, false, true).is_ok());
+        let err = validate_ui_flags(Fronted, Some(&full), false, false, true).unwrap_err();
+        assert!(err.to_string().contains("per-person tokens"), "{err}");
+        let err = validate_ui_flags(Remote, Some(&full), false, false, true).unwrap_err();
         assert!(err.to_string().contains("read-only"), "{err}");
 
-        let err = validate_ui_flags(true, Some(&read_only), true, false, true).unwrap_err();
+        let err = validate_ui_flags(Local, Some(&read_only), true, false, true).unwrap_err();
+        assert!(err.to_string().contains("ROCKY_WEBHOOK_SECRET"), "{err}");
+        let err = validate_ui_flags(Local, Some(&full), true, false, true).unwrap_err();
         assert!(err.to_string().contains("ROCKY_WEBHOOK_SECRET"), "{err}");
 
-        assert!(validate_ui_flags(true, Some(&read_only), true, true, true).is_ok());
-        assert!(validate_ui_flags(true, Some(&read_only), false, false, true).is_ok());
+        for exposure in [Local, Fronted, Remote] {
+            assert!(validate_ui_flags(exposure, Some(&read_only), true, true, true).is_ok());
+            assert!(validate_ui_flags(exposure, Some(&read_only), false, false, true).is_ok());
+        }
     }
 
     /// A token with no scope named keeps the historical behaviour.
@@ -1654,6 +1822,7 @@ mod tests {
             "127.0.0.1",
             Some("s3cret".to_string()),
             None,
+            false,
             Vec::new(),
             false,
             Vec::new(),
@@ -1713,6 +1882,7 @@ mod tests {
             "127.0.0.1",
             Some("s3cret".to_string()),
             None,
+            false,
             Vec::new(),
             false,
             Vec::new(),
@@ -1760,6 +1930,7 @@ mod tests {
                 host,
                 Some("s3cret".to_string()),
                 None,
+                false,
                 Vec::new(),
                 false,
                 // Passed WITHOUT `--ui`, so the guard never exists and the
@@ -1825,6 +1996,7 @@ mod tests {
                 "127.0.0.1",
                 Some("s3cret".to_string()),
                 raw.clone(),
+                false,
                 Vec::new(),
                 false,
                 Vec::new(),
@@ -1850,119 +2022,46 @@ mod tests {
         let err = resolve_serve_token(
             Some("s3cret".into()),
             Some("readonly".into()),
-            MissingToken::Leave,
+            false,
+            UiExposure::NoUi,
         )
         .expect_err("a typo must not resolve to a full-scope token");
         assert!(err.to_string().contains("unknown token scope"), "{err}");
     }
 
-    fn assert_generated_read_only(resolved: (Option<ServeToken>, TokenOrigin)) -> String {
-        let (token, origin) = resolved;
-        let token = token.expect("--ui on loopback with no token gets a generated token");
-        assert_eq!(origin, TokenOrigin::Generated);
-        assert_eq!(token.scope, TokenScope::ReadOnly);
-        token.secret
+    /// `--read-only` is `--token-scope read-only`; with `--token-scope full`
+    /// it is a contradiction and refused.
+    #[test]
+    fn read_only_flag_folds_into_the_scope_and_conflicts_with_full() {
+        assert_eq!(merge_read_only_flag(false, None).unwrap(), None);
+        assert_eq!(
+            merge_read_only_flag(false, Some("full".into())).unwrap(),
+            Some("full".into())
+        );
+        assert_eq!(
+            merge_read_only_flag(true, None).unwrap(),
+            Some("read-only".into())
+        );
+        assert_eq!(
+            merge_read_only_flag(true, Some("read-only".into())).unwrap(),
+            Some("read-only".into())
+        );
+        let err = merge_read_only_flag(true, Some("full".into())).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
     }
 
-    /// `rocky serve --ui` on any loopback name, with no token and no scope,
-    /// generates a read-only token rather than refusing, and that token passes
-    /// the `--ui` rules.
     #[test]
-    fn ui_on_loopback_with_no_token_generates_a_read_only_token() {
+    fn exposure_follows_ui_bind_and_fronting() {
+        use UiExposure::{Fronted, Local, NoUi, Remote};
         for host in ["127.0.0.1", "::1", "localhost"] {
-            let missing = MissingToken::for_bind(true, host);
-            assert_eq!(missing, MissingToken::GenerateForLocalUi, "{host}");
-            let resolved = resolve_token_for_bind(None, None, missing).unwrap();
-            let token = resolved.0.clone().expect("a generated token");
-            assert_generated_read_only(resolved);
-            assert!(validate_ui_flags(true, Some(&token), false, false, true).is_ok());
+            assert_eq!(UiExposure::for_bind(true, host, false), Local, "{host}");
+            assert_eq!(UiExposure::for_bind(true, host, true), Fronted, "{host}");
+            assert_eq!(UiExposure::for_bind(false, host, true), NoUi, "{host}");
         }
-    }
-
-    /// An explicit `--token-scope read-only` with no token is the same request
-    /// made out loud, so it generates too. `--token-scope full` with no token
-    /// is refused: the UI token is read-only, and the message names the fix.
-    #[test]
-    fn ui_on_loopback_with_only_a_scope_generates_read_only_or_refuses_full() {
-        let missing = MissingToken::for_bind(true, "127.0.0.1");
-
-        let resolved = resolve_token_for_bind(None, Some(TokenScope::ReadOnly), missing).unwrap();
-        assert_generated_read_only(resolved);
-
-        let err = resolve_token_for_bind(None, Some(TokenScope::Full), missing)
-            .expect_err("a full-scope UI token must not be generated");
-        let msg = err.to_string();
-        assert!(msg.contains("read-only"), "{msg}");
-        assert!(msg.contains("ROCKY_SERVE_TOKEN_SCOPE"), "{msg}");
-    }
-
-    /// A non-loopback bind never generates: `--ui --host 0.0.0.0` with no
-    /// token still hits the `--ui` refusal, and a scope with no token is
-    /// still the scope-without-token error.
-    #[test]
-    fn ui_on_a_non_loopback_bind_with_no_token_is_still_refused() {
         for host in ["0.0.0.0", "::", "192.168.1.10", "example.test"] {
-            let missing = MissingToken::for_bind(true, host);
-            assert_eq!(missing, MissingToken::Leave, "{host}");
-
-            let (token, origin) = resolve_token_for_bind(None, None, missing).unwrap();
-            assert!(token.is_none(), "{host}");
-            assert_eq!(origin, TokenOrigin::Operator);
-            let err = validate_ui_flags(true, None, false, false, true).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("rocky serve --ui refuses to start without a token"),
-                "{err}"
-            );
-
-            let err = resolve_token_for_bind(None, Some(TokenScope::ReadOnly), missing)
-                .expect_err("a scope with no token stays an error off loopback");
-            assert!(err.to_string().contains("no token was"), "{err}");
+            assert_eq!(UiExposure::for_bind(true, host, false), Remote, "{host}");
+            assert_eq!(UiExposure::for_bind(true, host, true), Remote, "{host}");
         }
-    }
-
-    /// A configured token is used as given, on loopback too: nothing is
-    /// generated over it, and a full-scope one is still refused by `--ui`.
-    #[test]
-    fn an_explicit_token_is_used_and_keeps_the_read_only_rule() {
-        let missing = MissingToken::for_bind(true, "127.0.0.1");
-
-        let (token, origin) =
-            resolve_token_for_bind(Some("s3cret".into()), Some(TokenScope::ReadOnly), missing)
-                .unwrap();
-        let token = token.expect("the configured token");
-        assert_eq!(origin, TokenOrigin::Operator);
-        assert_eq!(token.secret, "s3cret");
-        assert_eq!(token.scope, TokenScope::ReadOnly);
-
-        let (token, origin) = resolve_token_for_bind(Some("s3cret".into()), None, missing).unwrap();
-        let token = token.expect("the configured token");
-        assert_eq!(origin, TokenOrigin::Operator);
-        assert_eq!(token.secret, "s3cret");
-        assert_eq!(token.scope, TokenScope::Full);
-        let err = validate_ui_flags(true, Some(&token), false, false, true).unwrap_err();
-        assert!(err.to_string().contains("read-only"), "{err}");
-    }
-
-    /// Without `--ui` nothing is generated: a loopback server with no token
-    /// keeps the no-auth mode it has always had.
-    #[test]
-    fn no_ui_on_loopback_generates_nothing() {
-        let missing = MissingToken::for_bind(false, "127.0.0.1");
-        assert_eq!(missing, MissingToken::Leave);
-        let (token, origin) = resolve_token_for_bind(None, None, missing).unwrap();
-        assert!(token.is_none());
-        assert_eq!(origin, TokenOrigin::Operator);
-    }
-
-    /// `--ui --scheduler` with a generated token still needs
-    /// `ROCKY_WEBHOOK_SECRET`.
-    #[test]
-    fn a_generated_token_does_not_lift_the_scheduler_rule() {
-        let missing = MissingToken::for_bind(true, "127.0.0.1");
-        let (token, _) = resolve_token_for_bind(None, None, missing).unwrap();
-        let err = validate_ui_flags(true, token.as_ref(), true, false, true).unwrap_err();
-        assert!(err.to_string().contains("ROCKY_WEBHOOK_SECRET"), "{err}");
     }
 
     /// Each generated token is 64 lowercase hex characters (two v4 UUIDs, 244
@@ -1985,66 +2084,23 @@ mod tests {
 
     /// The wire, for the case that can run without the `ui` feature: through
     /// `build_serve_state`, a loopback server with no `--ui` and no token
-    /// installs no auth and reports no generated token. (A `--ui` call needs
-    /// a build that embeds the page, so the generating side is pinned on the
-    /// pure helper above.)
+    /// installs no auth and reports no generated token.
     #[tokio::test]
     async fn build_serve_state_without_ui_generates_nothing() {
-        if std::env::var_os("ROCKY_SERVE_TOKEN").is_some()
-            || std::env::var_os("ROCKY_SERVE_TOKEN_SCOPE").is_some()
-        {
-            eprintln!("skipping: a ROCKY_SERVE_TOKEN* variable is set in this environment");
+        if serve_token_env_is_set() {
             return;
         }
-        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../rocky-compiler/tests/fixtures/simple_project/models");
-        let (state, origin) = build_serve_state(
-            &models,
-            false,
-            None,
-            None,
-            "127.0.0.1",
-            None,
-            None,
-            Vec::new(),
-            false,
-            Vec::new(),
-            false,
-            None,
-            UiBuild::NoFeature,
-        )
+        let (state, origin) = build_ui_matrix_state(UiCase {
+            ui: false,
+            ..UiCase::local()
+        })
         .expect("a loopback serve with no token builds");
         assert!(state.auth.is_none());
         assert_eq!(origin, TokenOrigin::Operator);
-    }
-
-    /// `build_serve_state` with `ui = true` and no token, through the
-    /// [`UiBuild`] seam so it runs without the `ui` feature.
-    fn build_ui_state_with_no_token(
-        host: &str,
-    ) -> Result<(
-        std::sync::Arc<rocky_server::state::ServerState>,
-        TokenOrigin,
-    )> {
-        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../rocky-compiler/tests/fixtures/simple_project/models");
-        build_serve_state(
-            &models,
-            false,
-            None,
-            None,
-            host,
-            None,
-            None,
-            Vec::new(),
-            true,
-            Vec::new(),
-            false,
-            None,
-            UiBuild::Page(std::sync::Arc::new(rocky_server::ui::InMemoryAssets(
-                std::collections::BTreeMap::new(),
-            ))),
-        )
+        assert!(
+            ui_announcement(false, "127.0.0.1", 8080, state.auth.as_ref(), origin).is_none(),
+            "no --ui, nothing to announce"
+        );
     }
 
     fn serve_token_env_is_set() -> bool {
@@ -2056,40 +2112,314 @@ mod tests {
         set
     }
 
-    /// **The wire for generation.** `--ui` on loopback with no token goes
-    /// through the SAME function `run_serve` calls and installs a generated
-    /// read-only token on the state the middleware reads. Catches a caller
-    /// that passes a constant `MissingToken::Leave`, which the pure-helper
-    /// tests cannot see.
-    #[tokio::test]
-    async fn build_serve_state_with_ui_on_loopback_installs_a_generated_read_only_token() {
-        if serve_token_env_is_set() {
-            return;
-        }
-        let (state, origin) =
-            build_ui_state_with_no_token("127.0.0.1").expect("--ui on loopback builds");
-        assert_eq!(origin, TokenOrigin::Generated);
-        let token = state.auth.as_ref().expect("a generated token on the state");
-        assert_eq!(token.scope, TokenScope::ReadOnly);
-        assert_eq!(token.secret.len(), 64);
-        assert!(state.ui.is_some(), "--ui installs the UI");
+    /// One row of the `--ui` token matrix, as raw flags.
+    #[derive(Clone)]
+    struct UiCase {
+        ui: bool,
+        host: &'static str,
+        secret: Option<&'static str>,
+        scope: Option<&'static str>,
+        read_only: bool,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
     }
 
-    /// The same call on a non-loopback host still refuses: no token is
-    /// generated for a LAN-exposed server.
+    impl UiCase {
+        /// `rocky serve --ui` on loopback with no other flag.
+        fn local() -> Self {
+            Self {
+                ui: true,
+                host: "127.0.0.1",
+                secret: None,
+                scope: None,
+                read_only: false,
+                allowed_hosts: Vec::new(),
+                allowed_origins: Vec::new(),
+            }
+        }
+
+        fn fronted_by_host() -> Self {
+            Self {
+                allowed_hosts: vec!["rocky.example.test".to_string()],
+                ..Self::local()
+            }
+        }
+
+        fn fronted_by_origin() -> Self {
+            Self {
+                allowed_origins: vec!["https://portal.example.test".to_string()],
+                ..Self::local()
+            }
+        }
+    }
+
+    /// The SAME function `run_serve` calls, with the raw flags, through the
+    /// [`UiBuild`] seam so it runs without the `ui` feature.
+    fn build_ui_matrix_state(
+        case: UiCase,
+    ) -> Result<(
+        std::sync::Arc<rocky_server::state::ServerState>,
+        TokenOrigin,
+    )> {
+        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+        build_serve_state(
+            &models,
+            false,
+            None,
+            None,
+            case.host,
+            case.secret.map(str::to_string),
+            case.scope.map(str::to_string),
+            case.read_only,
+            case.allowed_origins,
+            case.ui,
+            case.allowed_hosts,
+            false,
+            None,
+            UiBuild::Page(std::sync::Arc::new(rocky_server::ui::InMemoryAssets(
+                std::collections::BTreeMap::new(),
+            ))),
+        )
+    }
+
+    /// What a matrix row installs: the token's scope and origin, or the
+    /// refusal text.
+    fn matrix_outcome(case: UiCase) -> Result<(TokenScope, TokenOrigin), String> {
+        match build_ui_matrix_state(case) {
+            Ok((state, origin)) => {
+                let token = state.auth.as_ref().expect("--ui always installs a token");
+                assert!(state.ui.is_some(), "--ui installs the UI");
+                if origin == TokenOrigin::Generated {
+                    assert_eq!(token.secret.len(), 64);
+                }
+                Ok((token.scope, origin))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// **The `--ui` token matrix, row by row, through `build_serve_state`.**
+    ///
+    /// ```text
+    ///   bind          fronted  secret  scope         -> result
+    ///   loopback      no       none    none or full  -> generated, FULL (operator mode)
+    ///   loopback      no       none    read-only     -> generated, read-only
+    ///   loopback      yes      none    none or r-o   -> generated, read-only
+    ///   loopback      yes      none    full          -> refused
+    ///   loopback      no       given   full          -> accepted
+    ///   loopback      yes      given   full          -> refused
+    ///   loopback      any      given   read-only     -> accepted
+    ///   non-loopback  any      any     full          -> refused
+    ///   non-loopback  any      none    -             -> refused
+    /// ```
     #[tokio::test]
-    async fn build_serve_state_with_ui_on_a_non_loopback_host_still_refuses() {
+    async fn the_ui_token_matrix_through_build_serve_state() {
         if serve_token_env_is_set() {
             return;
         }
-        let Err(err) = build_ui_state_with_no_token("0.0.0.0") else {
-            panic!("--ui on 0.0.0.0 with no token must not start");
+        use TokenOrigin::{Generated, Operator};
+        use TokenScope::{Full, ReadOnly};
+        let fronted = [UiCase::fronted_by_host(), UiCase::fronted_by_origin()];
+
+        // loopback, not fronted, no secret, none or full -> generated FULL.
+        for host in ["127.0.0.1", "::1", "localhost"] {
+            for scope in [None, Some("full")] {
+                let case = UiCase {
+                    host,
+                    scope,
+                    ..UiCase::local()
+                };
+                assert_eq!(
+                    matrix_outcome(case),
+                    Ok((Full, Generated)),
+                    "{host} {scope:?}"
+                );
+            }
+        }
+        // loopback, not fronted, no secret, read-only (either spelling).
+        for (scope, read_only) in [(Some("read-only"), false), (None, true)] {
+            let case = UiCase {
+                scope,
+                read_only,
+                ..UiCase::local()
+            };
+            assert_eq!(matrix_outcome(case), Ok((ReadOnly, Generated)));
+        }
+        for base in fronted.clone() {
+            // fronted, no secret, none or read-only -> generated read-only.
+            for (scope, read_only) in [(None, false), (Some("read-only"), false), (None, true)] {
+                let case = UiCase {
+                    scope,
+                    read_only,
+                    ..base.clone()
+                };
+                assert_eq!(matrix_outcome(case), Ok((ReadOnly, Generated)));
+            }
+            // fronted, no secret, full -> refused.
+            let err = matrix_outcome(UiCase {
+                scope: Some("full"),
+                ..base.clone()
+            })
+            .unwrap_err();
+            assert!(err.contains("per-person tokens"), "{err}");
+            // fronted, given, full (named or defaulted) -> refused.
+            for scope in [None, Some("full")] {
+                let err = matrix_outcome(UiCase {
+                    secret: Some("s3cret"),
+                    scope,
+                    ..base.clone()
+                })
+                .unwrap_err();
+                assert!(err.contains("per-person tokens"), "{err}");
+            }
+            // fronted, given, read-only -> accepted.
+            let case = UiCase {
+                secret: Some("s3cret"),
+                read_only: true,
+                ..base.clone()
+            };
+            assert_eq!(matrix_outcome(case), Ok((ReadOnly, Operator)));
+        }
+        // loopback, not fronted, given, full (named or defaulted) -> accepted.
+        for scope in [None, Some("full")] {
+            let case = UiCase {
+                secret: Some("s3cret"),
+                scope,
+                ..UiCase::local()
+            };
+            assert_eq!(matrix_outcome(case), Ok((Full, Operator)), "{scope:?}");
+        }
+        // loopback, not fronted, given, read-only -> accepted.
+        let case = UiCase {
+            secret: Some("s3cret"),
+            scope: Some("read-only"),
+            ..UiCase::local()
         };
-        assert!(
-            err.to_string()
-                .contains("rocky serve --ui refuses to start without a token"),
-            "{err}"
+        assert_eq!(matrix_outcome(case), Ok((ReadOnly, Operator)));
+
+        for host in ["0.0.0.0", "::", "192.168.1.10"] {
+            let remote = UiCase {
+                host,
+                ..UiCase::local()
+            };
+            // non-loopback, given, full -> refused.
+            for scope in [None, Some("full")] {
+                let err = matrix_outcome(UiCase {
+                    secret: Some("s3cret"),
+                    scope,
+                    ..remote.clone()
+                })
+                .unwrap_err();
+                assert!(
+                    err.contains("non-loopback bind requires a read-only"),
+                    "{err}"
+                );
+            }
+            // non-loopback, no secret -> refused (no scope: the --ui rule;
+            // a scope: the scope-without-token rule).
+            let err = matrix_outcome(remote.clone()).unwrap_err();
+            assert!(err.contains("refuses to start without a token"), "{err}");
+            let err = matrix_outcome(UiCase {
+                read_only: true,
+                ..remote.clone()
+            })
+            .unwrap_err();
+            assert!(err.contains("no token was"), "{err}");
+            // non-loopback, given, read-only -> accepted, as before.
+            let case = UiCase {
+                secret: Some("s3cret"),
+                read_only: true,
+                ..remote
+            };
+            assert_eq!(matrix_outcome(case), Ok((ReadOnly, Operator)));
+        }
+
+        // `--read-only` with `--token-scope full` is a contradiction.
+        let err = matrix_outcome(UiCase {
+            scope: Some("full"),
+            read_only: true,
+            ..UiCase::local()
+        })
+        .unwrap_err();
+        assert!(err.contains("conflicts"), "{err}");
+    }
+
+    /// Without `--ui` nothing changes: `--read-only` is a scope like any
+    /// other, a full token on a non-loopback bind is fine, and a scope with
+    /// no token is still an error.
+    #[tokio::test]
+    async fn without_ui_the_matrix_does_not_apply() {
+        if serve_token_env_is_set() {
+            return;
+        }
+        let no_ui = UiCase {
+            ui: false,
+            ..UiCase::local()
+        };
+        let (state, _) = build_ui_matrix_state(UiCase {
+            host: "0.0.0.0",
+            secret: Some("s3cret"),
+            allowed_origins: vec!["https://portal.example.test".to_string()],
+            ..no_ui.clone()
+        })
+        .expect("a full token, fronted, without --ui builds as before");
+        assert_eq!(state.auth.as_ref().unwrap().scope, TokenScope::Full);
+        let (state, _) = build_ui_matrix_state(UiCase {
+            secret: Some("s3cret"),
+            read_only: true,
+            ..no_ui.clone()
+        })
+        .expect("--read-only without --ui is a scope");
+        assert_eq!(state.auth.as_ref().unwrap().scope, TokenScope::ReadOnly);
+        let err = build_ui_matrix_state(UiCase {
+            read_only: true,
+            ..no_ui
+        })
+        .err()
+        .expect("a scope without a token is still an error without --ui");
+        assert!(err.to_string().contains("no token was"), "{err}");
+    }
+
+    /// `--ui --scheduler` with a generated token still needs
+    /// `ROCKY_WEBHOOK_SECRET`, in operator mode too.
+    #[test]
+    fn a_generated_token_does_not_lift_the_scheduler_rule() {
+        for exposure in [UiExposure::Local, UiExposure::Fronted] {
+            let (token, _) = resolve_token_for_bind(None, None, exposure).unwrap();
+            let err = validate_ui_flags(exposure, token.as_ref(), true, false, true).unwrap_err();
+            assert!(err.to_string().contains("ROCKY_WEBHOOK_SECRET"), "{err}");
+        }
+    }
+
+    /// **Operator mode announces its link, token included** — through the
+    /// state `build_serve_state` installs and the `ui_announcement`
+    /// `run_serve` calls. A read-only UI gets the link and no operator note.
+    #[tokio::test]
+    async fn operator_mode_announces_the_login_link_with_the_token() {
+        if serve_token_env_is_set() {
+            return;
+        }
+        let (state, origin) = build_ui_matrix_state(UiCase::local()).expect("operator mode");
+        let token = state.auth.as_ref().unwrap();
+        let announcement =
+            ui_announcement(true, "127.0.0.1", 8080, Some(token), origin).expect("announced");
+        assert_eq!(
+            announcement.address,
+            format!("http://127.0.0.1:8080/login?t={}", token.secret)
         );
+        assert!(announcement.operator_mode);
+        assert_eq!(announcement.token_origin, TokenOrigin::Generated);
+
+        let (state, origin) = build_ui_matrix_state(UiCase {
+            read_only: true,
+            ..UiCase::local()
+        })
+        .expect("read-only");
+        let announcement =
+            ui_announcement(true, "127.0.0.1", 8080, state.auth.as_ref(), origin).unwrap();
+        assert!(!announcement.operator_mode);
+        assert!(announcement.address.contains("/login?t="));
     }
 }
 

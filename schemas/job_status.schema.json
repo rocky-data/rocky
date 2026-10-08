@@ -24,6 +24,13 @@
             "apply"
           ],
           "type": "string"
+        },
+        {
+          "description": "`rocky review <plan_id> --approve` — writes the sign-off marker that unblocks `apply`. Takes the mutation permit, so an approval cannot land while a run or an apply is in flight.",
+          "enum": [
+            "approve"
+          ],
+          "type": "string"
         }
       ]
     },
