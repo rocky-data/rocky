@@ -19,3 +19,9 @@ Staging: **spine-first** (PR-A → PR-B → PR-F) then the CAS **fast-follow** (
 These ADRs went through three adversarial review rounds (a strategic-plan red team, an independent per-ADR second review, and a red team over the implementation plan); the corrections from all three are folded in.
 
 These three ADRs were authored under adversarial review (Codex, 10 findings dispositioned) and a cross-consistency pass. **Status: Accepted (2026-07-17) — implementation in progress.**
+
+## WP-03 — Type inference semantics (design gate)
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-TYPES.md`](ADR-TYPES.md) | Proposed — awaiting ratification | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |
