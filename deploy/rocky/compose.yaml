@@ -7,7 +7,7 @@
 # contract. Local state only: the state store lives on the mounted volume.
 #
 #   ./project/rocky.toml, ./project/models/  ──►  /data in the container
-#   http://127.0.0.1:8080/ui/#token=...      ◄──  the address the server prints
+#   http://127.0.0.1:8080/login?t=...        ◄──  the address the server prints
 #
 # Start: copy .env.example to .env, fill the two secrets, put a project in
 # ./project, then `docker compose up -d`. The README has every step.

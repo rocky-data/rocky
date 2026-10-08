@@ -38,10 +38,10 @@ rocky serve --ui
 The server prints one address:
 
 ```
-Rocky UI: http://127.0.0.1:8080/ui/#token=<secret>
+Rocky UI: http://127.0.0.1:8080/login?t=<secret>
 ```
 
-Open that address, or add `--open` to open it in your default browser. The page reads the token from the part after `#`, keeps it for the browser tab, and removes it from the address bar. Browsers never send that part to a server, so the token is in no access log.
+Open that address, or add `--open` to open it in your default browser. The link signs you in. See [Sign-in and the session cookie](#sign-in-and-the-session-cookie).
 
 With no token configured, the server generates a per-process token. It works for every request until the server stops. The server prints a note on stderr when it generates one. Each start makes a new token, so an old address stops working after a restart.
 
@@ -61,7 +61,19 @@ rocky serve --ui --token "$(openssl rand -hex 16)" --read-only
 
 The server generates a token only on a loopback host (`127.0.0.1`, `::1` or `localhost`). On any other host, `--ui` refuses to start without `--token` and `--read-only` (or `--token-scope read-only`).
 
-A tab opened without the token shows **No token for this tab**. Open the printed address again to fix it.
+### Sign-in and the session cookie
+
+The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui`. The cookie is `HttpOnly` and `SameSite=Strict`. It ends when the browser closes. The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
+
+The cookie holds a keyed hash of the token, not the token. The key is new for each server process, so a restart ends every browser session. The page never holds the token. Its API calls carry the cookie.
+
+The server logs no request URIs. The `/login` answers send `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. The redirect takes the token out of the address bar. The server never echoes the token.
+
+A reverse proxy in front of the server may log the query string of `/login`. Configure it not to log that query, or use a token you rotate.
+
+A cookie session can also write, but only from the page. A write must carry an allowed `Origin` and the header `X-Rocky-UI: 1`. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
+
+If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **session expired**. Open the newest `Rocky UI:` link from the console.
 
 To run the UI somewhere other than your own machine, use the [container image](/guides/run-the-image/) or the [Helm chart](/guides/kubernetes/). The chart serves the UI by default.
 

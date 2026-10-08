@@ -392,7 +392,7 @@ On your own machine, `--ui` alone is enough:
 
 ```bash
 rocky serve --ui
-# Rocky UI: http://127.0.0.1:8080/ui/#token=<64 hex characters>
+# Rocky UI: http://127.0.0.1:8080/login?t=<64 hex characters>
 ```
 
 With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
@@ -403,7 +403,7 @@ An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detect
 
 ```bash
 rocky serve --ui --token s3cret --read-only
-# Rocky UI: http://127.0.0.1:8080/ui/#token=s3cret
+# Rocky UI: http://127.0.0.1:8080/login?t=s3cret
 ```
 
 ```text
@@ -419,8 +419,8 @@ rocky serve --ui --token s3cret --read-only
 The rules, each refused at start with its fix:
 
 - `--ui` needs a token. On a non-loopback bind, the token must be read-only and you must pass it. On loopback, a server with a token you gave accepts `full` (or no scope, which means full) unless it is fronted. A fronted server refuses a full-scope token, because writes from the UI need a token for each person. One token can plan, approve and apply, as the CLI user can: approving in the UI is not a second person's sign-off.
-- The printed address carries the token in the fragment. Browsers never send a fragment, so the secret is in no access log; the page reads it once, keeps it for the tab, and clears the address.
-- The page and its files are public: they carry no data. Every API call the page makes carries the token.
+- The printed address is `/login?t=<token>`. The server checks the token and answers `303` to `/ui/` with a session cookie, `rocky_ui` (`HttpOnly`, `SameSite=Strict`, a session cookie; `Secure` behind a TLS proxy that sends `X-Forwarded-Proto: https`). The cookie holds a keyed hash of the token, so a restart ends every session. The server logs no request URIs, and the answers send `no-store` and `no-referrer`. A reverse proxy may log the query of `/login`: configure it not to. A bad token gets a `401` page with a token field that posts to `POST /login`, which needs an allowed `Origin`.
+- The page and its files are public: they carry no data. Every API call the page makes carries the cookie. A route accepts `Authorization: Bearer <token>` or the cookie. A write by cookie must also carry an allowed `Origin` and `X-Rocky-UI: 1`, or the answer is `403 ui_write_not_from_ui`. The read-only scope applies to cookie sessions too.
 - With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. Without `--ui` neither check runs. `GET /api/v1/health` skips both checks, so a load balancer or a Kubernetes probe that sends the pod IP as `Host` still gets `200`. The route carries no data.
 - Every UI response carries a Content Security Policy that allows scripts, styles, images, fonts and connections from this server only and forbids framing. The page loads nothing from any other host.
 - `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`: a browser can reach the webhook route.

@@ -22,9 +22,9 @@ npx playwright install chromium     # once; ~95 MB
 
 # In another shell, with a project that has a plan waiting for review:
 ROCKY_SERVE_TOKEN=… ROCKY_SERVE_TOKEN_SCOPE=read-only rocky serve --ui --port 18733
-# it prints:  http://127.0.0.1:18733/ui/#token=…
+# it prints:  http://127.0.0.1:18733/login?t=…
 
-node record.mjs review  --url 'http://127.0.0.1:18733/ui/#token=…'
+node record.mjs review  --url 'http://127.0.0.1:18733/login?t=…'
 node record.mjs samples --url '…'
 node record.mjs journal --url '…'
 ```
@@ -50,9 +50,9 @@ time for the viewer.
 proves that as it goes rather than clicking through the shell.
 
 **It waits for the token to leave the address bar before filming.**
-`rocky serve --ui` prints `http://127.0.0.1:<port>/ui/#token=<secret>`. The SPA
-reads that fragment once, moves it to `sessionStorage`, and rewrites the
-address without it (`engine/ui/src/token.ts`). Every scene waits for the scrub
+`rocky serve --ui` prints `http://127.0.0.1:<port>/login?t=<secret>`. The
+server checks the token, sets a session cookie and redirects to `/ui/`. The
+cookie lasts for the browser context. Every scene waits for the redirect
 first, so no frame carries the secret. Use an obviously fake token when
 recording anyway.
 

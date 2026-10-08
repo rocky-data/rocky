@@ -154,12 +154,12 @@ leak_check 18753 meta brief audit "audit/scorecard?by=principal&window=all" cust
   products/revenue_daily products/revenue_daily/journal
 
 SHOTS="$HERE/browser/screenshots.mjs"
-node "$SHOTS" --url "http://127.0.0.1:18751/ui/#token=$TOKEN" --out "$OUT" \
+node "$SHOTS" --url "http://127.0.0.1:18751/login?t=$TOKEN" --out "$OUT" \
   ui-estate=/ui/estate
-node "$SHOTS" --url "http://127.0.0.1:18752/ui/#token=$TOKEN" --out "$OUT" \
+node "$SHOTS" --url "http://127.0.0.1:18752/login?t=$TOKEN" --out "$OUT" \
   ui-review-queue=/ui/review \
   ui-review="/ui/review/$PLAN"
-node "$SHOTS" --url "http://127.0.0.1:18753/ui/#token=$TOKEN" --out "$OUT" \
+node "$SHOTS" --url "http://127.0.0.1:18753/login?t=$TOKEN" --out "$OUT" \
   ui-governor-brief=/ui/governor \
   ui-governor-custody=/ui/governor/custody/revenue_daily \
   ui-governor-product=/ui/governor/products/revenue_daily
