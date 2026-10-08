@@ -175,6 +175,104 @@ pub fn join_rendered(items: &[EnvString], sep: &str) -> String {
         .join(sep)
 }
 
+/// A map of free-form JSON values (`[adapter.<name>.extra]`) whose printed
+/// form never holds a resolved `${VAR}` value (#1919).
+///
+/// `Debug` and `Serialize` write every string value, at any depth, through
+/// [`crate::secret_registry::render_placeholders`], so a resolved
+/// `keyfile = "${KEYFILE}"` prints as `${KEYFILE}`. The adapters read the
+/// plaintext through [`ExtraMap::expose`], which is greppable. Serializing
+/// inside [`with_env_values_scope`] or
+/// [`crate::redacted::with_unredacted_scope`] writes the plaintext, as for
+/// [`EnvString`].
+///
+/// Limits, by design:
+/// - The registry keeps its 8-byte floor, so a value shorter than
+///   [`crate::secret_registry::SECRET_LENGTH_FLOOR`] (a Postgres `port`
+///   such as `5432`) prints as itself.
+/// - Numbers, booleans and object keys are not rewritten. A `${VAR}` there
+///   is already below the floor or is not secret-shaped.
+///
+/// The JSON schema is the one of the plain map, so generated bindings do not
+/// change. Equality compares the values.
+#[derive(Clone, Default, PartialEq)]
+pub struct ExtraMap(std::collections::BTreeMap<String, serde_json::Value>);
+
+impl ExtraMap {
+    /// An empty map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The plaintext map. The only accessor to the values, so every use is
+    /// greppable. Do not pass the result to a printer.
+    pub fn expose(&self) -> &std::collections::BTreeMap<String, serde_json::Value> {
+        &self.0
+    }
+
+    /// Whether the map has no keys.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The map with each resolved `${VAR}` value in a string replaced by
+    /// `${NAME}`. For printing only.
+    fn rendered(&self) -> std::collections::BTreeMap<&str, serde_json::Value> {
+        self.0
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    crate::secret_registry::render_json_string_values(v.clone()),
+                )
+            })
+            .collect()
+    }
+}
+
+impl From<std::collections::BTreeMap<String, serde_json::Value>> for ExtraMap {
+    fn from(map: std::collections::BTreeMap<String, serde_json::Value>) -> Self {
+        Self(map)
+    }
+}
+
+impl fmt::Debug for ExtraMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.rendered(), f)
+    }
+}
+
+impl Serialize for ExtraMap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if unredacted_scope_active() || env_values_scope_active() {
+            self.0.serialize(serializer)
+        } else {
+            self.rendered().serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtraMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        std::collections::BTreeMap::deserialize(deserializer).map(Self)
+    }
+}
+
+/// Delegates to the plain map, so the exported schema is unchanged.
+impl JsonSchema for ExtraMap {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        <std::collections::BTreeMap<String, serde_json::Value>>::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        <std::collections::BTreeMap<String, serde_json::Value>>::json_schema(generator)
+    }
+}
+
 impl fmt::Display for EnvString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `pad`, not `write_str`, so width and alignment flags still work in
@@ -313,6 +411,36 @@ mod tests {
 
     /// Distinctive, so no other test in this binary registers it.
     const SECRET: &str = "ROCKY-ENVSTRING-TEST-c41e7a09";
+
+    #[test]
+    fn an_extra_map_prints_resolved_values_as_names_and_exposes_plaintext() {
+        let secret = "/secrets/ROCKY-EXTRA-keyfile-77ac19e2.json";
+        register_substitution("ROCKY_EXTRA_KEYFILE", secret);
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("keyfile".to_string(), serde_json::json!(secret));
+        m.insert(
+            "auth".to_string(),
+            serde_json::json!({ "paths": [format!("{secret}.bak")], "n": 5 }),
+        );
+        let extra = ExtraMap::from(m);
+        let printed = [format!("{extra:?}"), serde_json::to_string(&extra).unwrap()];
+        for p in &printed {
+            assert!(!p.contains(secret), "leaked in {p}");
+            assert!(p.contains("${ROCKY_EXTRA_KEYFILE}"), "{p}");
+        }
+        assert!(printed[1].contains("${ROCKY_EXTRA_KEYFILE}.bak"), "nested");
+        assert_eq!(extra.expose()["keyfile"], serde_json::json!(secret));
+        let plain = with_env_values_scope(|| serde_json::to_string(&extra).unwrap());
+        assert!(plain.contains(secret), "{plain}");
+    }
+
+    #[test]
+    fn an_extra_value_under_the_floor_prints_as_itself() {
+        register_substitution("ROCKY_EXTRA_PORT", "5432");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("port".to_string(), serde_json::json!("5432"));
+        assert!(format!("{:?}", ExtraMap::from(m)).contains("5432"));
+    }
 
     #[test]
     fn a_substituted_value_prints_only_as_its_name() {

@@ -9966,6 +9966,41 @@ auto_create_schemas = true
         );
     }
 
+    /// #1919: an env swap in `extra` (a Postgres `port`, a `keyfile`) still
+    /// changes the routing identity, and the identity holds no plaintext.
+    #[test]
+    fn config_identity_changes_when_an_extra_env_value_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter.default]\ntype = \"bigquery\"\nproject_id = \"p\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let with_keyfile = |value: &str| {
+            let mut cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+            let adapter = cfg.adapters.get_mut("default").expect("default adapter");
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("keyfile".to_string(), serde_json::json!(value));
+            adapter.extra = rocky_core::env_string::ExtraMap::from(map);
+            cfg
+        };
+        // Both values are registered, so a printer would render each as `${ROCKY_IDENT_EXTRA}`.
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_IDENT_EXTRA",
+            "/keys/ident-a.json",
+        );
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_IDENT_EXTRA",
+            "/keys/ident-b.json",
+        );
+        let a = super::config_policy_identity(&with_keyfile("/keys/ident-a.json"));
+        let b = super::config_policy_identity(&with_keyfile("/keys/ident-b.json"));
+        assert_ne!(a, b, "an env swap in extra must change the identity");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {

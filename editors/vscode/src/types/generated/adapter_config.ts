@@ -77,7 +77,7 @@ export interface AdapterConfig {
    *
    * [adapter.my_trino.extra] default_schema = "analytics" x_trino_user = "service-account" ```
    *
-   * Top-level typos still error (`tooken = "..."` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.get("...")` and validate them themselves — Rocky doesn't schema-check the contents.
+   * Top-level typos still error (`tooken = "..."` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get("...")` and validate them themselves — Rocky doesn't schema-check the contents.
    *
    * Values are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.
    */

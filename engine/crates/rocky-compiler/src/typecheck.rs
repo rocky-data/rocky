@@ -506,27 +506,50 @@ fn compute_model_typecheck(
     // A nested expression (`CAST(MAX(x) AS BIGINT)`) and a column with no
     // traceable source (`COUNT(*)`) also need it: the edge kind alone cannot
     // type them (#2295).
+    // A set operation takes its type from every branch, but lineage reads only
+    // the first; a model whose columns are all nullable would otherwise skip
+    // inference and keep the first branch's type (#2303 red team). A keyword
+    // match is enough: a false positive only runs inference once more.
+    let mentions_set_operation = model_by_name
+        .get(model_name)
+        .is_some_and(|m| sql_mentions_set_operation(&m.sql));
     let needs_inference = udf_scope.is_active()
+        || mentions_set_operation
         || typed_cols
             .iter()
             .any(|col| match graph.producing_edge(model_name, &col.name) {
                 Some(edge) => {
                     edge.transform.is_cast()
                         || edge.transform == rocky_sql::lineage::TransformKind::Expression
-                        || (!col.nullable
-                            && edge.transform == rocky_sql::lineage::TransformKind::Direct)
+                        || !col.nullable
                 }
                 None => true,
             });
-    let inferred_cols = model_by_name
+    let inference = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
-        .and_then(|model| {
+        .map(|model| {
             infer_select_types_with_lookup(&model.sql, &|name| {
                 typed_models.get(name).map(Vec::as_slice)
             })
             .ok()
         });
+    // Inference was needed and could not answer (a query form it does not
+    // read, mismatched set-operation branches). Lineage then holds only a
+    // guess, so claim nothing it cannot back: every column is nullable, and a
+    // non-`Direct` edge is `Unknown` (#2303).
+    if matches!(inference, Some(None)) {
+        for col in &mut typed_cols {
+            col.nullable = true;
+            let direct = graph
+                .producing_edge(model_name, &col.name)
+                .is_some_and(|edge| edge.transform == rocky_sql::lineage::TransformKind::Direct);
+            if !direct {
+                col.data_type = RockyType::Unknown;
+            }
+        }
+    }
+    let inferred_cols = inference.flatten();
     if let Some(inferred) = &inferred_cols {
         let mut inferred_by_name = HashMap::new();
         for (index, col) in inferred.columns.iter().enumerate() {
@@ -562,6 +585,13 @@ fn compute_model_typecheck(
                 | rocky_sql::lineage::TransformKind::Cast
                 | rocky_sql::lineage::TransformKind::TryCast => {
                     col.nullable |= inferred_col.nullable;
+                    // Lineage reads only the first branch of a set operation.
+                    if inferred.set_operation
+                        && edge.transform == rocky_sql::lineage::TransformKind::Direct
+                    {
+                        col.data_type =
+                            set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    }
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
                 // inference's answer only when the type comes straight from
@@ -579,7 +609,14 @@ fn compute_model_typecheck(
                 }
                 // An aggregate over a bare column: Step 1 already typed it
                 // from the column's type.
-                rocky_sql::lineage::TransformKind::Aggregation(_) => {}
+                // For a set operation another branch may be nullable.
+                rocky_sql::lineage::TransformKind::Aggregation(_) => {
+                    if inferred.set_operation {
+                        col.nullable |= inferred_col.nullable;
+                        col.data_type =
+                            set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    }
+                }
             }
         }
     }
@@ -3104,6 +3141,18 @@ fn infer_case_type(
     (result_type, nullable)
 }
 
+/// Whether `sql` contains a `UNION`, `INTERSECT` or `EXCEPT` keyword as a
+/// whole word, in any case. Over-approximates (a keyword inside a string or
+/// an identifier matches too); the caller only uses it to run inference.
+fn sql_mentions_set_operation(sql: &str) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| {
+            w.eq_ignore_ascii_case("union")
+                || w.eq_ignore_ascii_case("intersect")
+                || w.eq_ignore_ascii_case("except")
+        })
+}
+
 /// Whether a plain `CAST(x AS target)` can return NULL (or fail) for a
 /// non-null `x` of type `source`.
 ///
@@ -3346,6 +3395,9 @@ pub(crate) struct SelectInference {
     exact_type_outputs: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
+    /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
+    /// every branch, while lineage reads only the first (#2303).
+    set_operation: bool,
 }
 
 impl SelectInference {
@@ -3437,11 +3489,95 @@ pub(crate) fn infer_query_types<'a>(
         }
     }
     let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
-    let select = match query.body.as_ref() {
-        SetExpr::Select(select) => select,
-        SetExpr::Query(query) => return infer_query_types(query, &lookup),
-        _ => return Err("unsupported query form".to_string()),
-    };
+    infer_set_expr_types(query.body.as_ref(), &lookup)
+}
+
+/// Infer the output columns of one query body: a `SELECT`, a parenthesised
+/// query, or a set operation over bodies (#2303).
+fn infer_set_expr_types<'a>(
+    body: &SetExpr,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> Result<SelectInference, String> {
+    match body {
+        SetExpr::Select(select) => infer_select_types_in_scope(select, lookup),
+        SetExpr::Query(query) => infer_query_types(query, lookup),
+        SetExpr::SetOperation { left, right, .. } => {
+            let left = infer_set_expr_types(left, lookup)?;
+            let right = infer_set_expr_types(right, lookup)?;
+            combine_set_operation(left, &right)
+        }
+        _ => Err("unsupported query form".to_string()),
+    }
+}
+
+/// Combine the two branches of `UNION` / `INTERSECT` / `EXCEPT` column by
+/// position (#2303). Names come from the left branch.
+///
+/// - **Nullable** when either branch is nullable. `INTERSECT` and `EXCEPT`
+///   could be tighter, but "any branch" is always sound.
+/// - **Type** is the common supertype, `Unknown` when a branch is `Unknown`
+///   or the types have none. (`common_supertype` treats `Unknown` as
+///   compatible with anything; here that would claim a type we cannot back.)
+/// - A type is *exact* only when both branches are exact and agree, since a
+///   widened result (`INT` with `BIGINT`) or a literal branch is a guess.
+///
+/// A different column count is an `Err`: the position pairing is not defined.
+fn combine_set_operation(
+    mut left: SelectInference,
+    right: &SelectInference,
+) -> Result<SelectInference, String> {
+    if left.columns.len() != right.columns.len() {
+        return Err("set operation branches differ in column count".to_string());
+    }
+    let mut exact_type_outputs = HashSet::new();
+    let mut count_outputs = HashSet::new();
+    for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
+        let both_exact =
+            left.exact_type_outputs.contains(&index) && right.exact_type_outputs.contains(&index);
+        let same_type = l.data_type == r.data_type;
+        let data_type = if l.data_type == RockyType::Unknown || r.data_type == RockyType::Unknown {
+            RockyType::Unknown
+        } else {
+            crate::types::common_supertype(&l.data_type, &r.data_type).unwrap_or(RockyType::Unknown)
+        };
+        if both_exact && same_type && data_type != RockyType::Unknown {
+            exact_type_outputs.insert(index);
+        }
+        if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
+            count_outputs.insert(index);
+        }
+        l.data_type = data_type;
+        l.nullable |= r.nullable;
+    }
+    Ok(SelectInference {
+        columns: left.columns,
+        exact_type_outputs,
+        count_outputs,
+        set_operation: true,
+    })
+}
+
+/// The type of a set-operation column whose lineage edge saw only the first
+/// branch. Keep it when the combined type agrees; take the combined type when
+/// it is exact; otherwise a branch changed it and the answer is `Unknown`.
+fn set_operation_column_type(
+    from_lineage: &RockyType,
+    combined: &TypedColumn,
+    exact_type: bool,
+) -> RockyType {
+    if *from_lineage == combined.data_type {
+        from_lineage.clone()
+    } else if exact_type {
+        combined.data_type.clone()
+    } else {
+        RockyType::Unknown
+    }
+}
+
+fn infer_select_types_in_scope<'a>(
+    select: &ast::Select,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> Result<SelectInference, String> {
     let (from_scope, type_scope) = select_type_scope(select, &lookup);
 
     let mut inferred = SelectInference::default();
@@ -4209,6 +4345,209 @@ mod tests {
                 .iter()
                 .any(|d| &*d.code == "E012")
         );
+    }
+
+    /// Typecheck one model over sources `t` and `u`, both `(x INT NOT NULL, n
+    /// STRING NOT NULL, z INT NULL)`.
+    fn typecheck_over_t_and_u(sql: &str) -> Vec<(String, RockyType, bool)> {
+        let schema = || {
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+                ("z", RockyType::Int32, true),
+            ])
+        };
+        let sources = HashMap::from([("t".to_string(), schema()), ("u".to_string(), schema())]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2303: a set operation is typed by combining its branches by
+    /// position. A column is non-null only when it is non-null in every branch.
+    #[test]
+    fn set_operation_nullability_golden() {
+        for (sql, nullable) in [
+            // A fallible cast in the first, the second or both branches.
+            (
+                "SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT CAST(n AS INT) FROM u",
+                true,
+            ),
+            (
+                "SELECT CAST(x AS INT) AS c FROM t UNION ALL SELECT CAST(n AS INT) FROM u",
+                true,
+            ),
+            (
+                "SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT CAST(x AS INT) FROM u",
+                true,
+            ),
+            // Two non-null direct columns stay non-null.
+            ("SELECT x AS c FROM t UNION SELECT x FROM u", false),
+            ("SELECT x AS c FROM t UNION ALL SELECT x FROM u", false),
+            // One nullable branch makes the column nullable, on either side.
+            ("SELECT x AS c FROM t UNION ALL SELECT z FROM u", true),
+            ("SELECT z AS c FROM t UNION ALL SELECT x FROM u", true),
+            // INTERSECT and EXCEPT.
+            ("SELECT x AS c FROM t INTERSECT SELECT x FROM u", false),
+            (
+                "SELECT x AS c FROM t INTERSECT SELECT CAST(n AS INT) FROM u",
+                true,
+            ),
+            ("SELECT x AS c FROM t EXCEPT SELECT x FROM u", false),
+            (
+                "SELECT CAST(n AS INT) AS c FROM t EXCEPT SELECT x FROM u",
+                true,
+            ),
+            // Nested: parenthesised and chained set operations.
+            (
+                "SELECT x AS c FROM t UNION ALL (SELECT x FROM u UNION ALL SELECT CAST(n AS INT) FROM u)",
+                true,
+            ),
+            (
+                "(SELECT x AS c FROM t UNION SELECT x FROM u) EXCEPT SELECT x FROM u",
+                false,
+            ),
+            (
+                "SELECT x AS c FROM t UNION ALL SELECT x FROM u UNION ALL SELECT z FROM u",
+                true,
+            ),
+            // A COUNT in one branch and a nullable SUM in the other.
+            (
+                "SELECT COUNT(x) AS c FROM t UNION ALL SELECT SUM(x) FROM u",
+                true,
+            ),
+            // A set operation inside a CTE.
+            (
+                "WITH w AS (SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT x FROM u) \
+                 SELECT c FROM w",
+                true,
+            ),
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_eq!(rows[0].0, "c", "{sql}: {rows:?}");
+            assert_eq!(rows[0].2, nullable, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2303: the output name comes from the first branch, and the type is
+    /// the common supertype, `Unknown` when the branches have none.
+    #[test]
+    fn set_operation_names_and_types() {
+        let rows = typecheck_over_t_and_u(
+            "SELECT x AS first_name, n AS second_name FROM t \
+             UNION ALL SELECT x AS other, n AS another FROM u",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("first_name".to_string(), RockyType::Int32, false),
+                ("second_name".to_string(), RockyType::String, false),
+            ]
+        );
+        // INT with STRING has no common supertype.
+        let rows = typecheck_over_t_and_u("SELECT x AS c FROM t UNION ALL SELECT n FROM u");
+        assert_eq!(rows[0].1, RockyType::Unknown, "{rows:?}");
+        // A fallible cast to INT in one branch, a plain INT column in the other.
+        let rows =
+            typecheck_over_t_and_u("SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT x FROM u");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
+    /// #2303: branches that cannot be paired by position give no answer. The
+    /// safety net then makes every column nullable and a non-Direct column
+    /// Unknown, so no NOT NULL claim survives.
+    #[test]
+    fn uninferable_query_claims_no_not_null() {
+        // Different column counts.
+        let rows = typecheck_over_t_and_u(
+            "SELECT CAST(n AS INT) AS c, x AS d FROM t UNION ALL SELECT x FROM u",
+        );
+        for (name, ty, nullable) in &rows {
+            assert!(*nullable, "{name}: {rows:?}");
+            if name == "c" {
+                assert_eq!(*ty, RockyType::Unknown, "{rows:?}");
+            }
+        }
+        // A `VALUES` branch is a query form inference does not read.
+        let rows = typecheck_over_t_and_u("SELECT CAST(n AS INT) AS c FROM t UNION ALL VALUES (1)");
+        assert!(rows[0].2, "{rows:?}");
+    }
+
+    /// #2303: a fallible cast inside a UNION fails a `nullable = false`
+    /// contract (E012).
+    #[test]
+    fn fallible_cast_in_union_fails_not_null_contract() {
+        let contract = |nullable| CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: Some("Int32".to_string()),
+                nullable: Some(nullable),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let typed = |sql: &str| {
+            let sources = HashMap::from([(
+                "t".to_string(),
+                source_schema(&[
+                    ("n", RockyType::String, false),
+                    ("x", RockyType::Int32, false),
+                ]),
+            )]);
+            let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            typecheck_project_with_models(&graph, &sources, None, &project.models, None)
+                .typed_models["m"]
+                .clone()
+        };
+        let fallible = typed("SELECT x AS c FROM t UNION ALL SELECT CAST(n AS INT) FROM t");
+        assert!(
+            validate_contract("m", &fallible, &contract(false))
+                .iter()
+                .any(|d| &*d.code == "E012")
+        );
+        let safe = typed("SELECT x AS c FROM t UNION ALL SELECT x FROM t");
+        assert!(
+            !validate_contract("m", &safe, &contract(false))
+                .iter()
+                .any(|d| &*d.code == "E012")
+        );
+    }
+
+    /// #2303 red team: a set operation whose columns are all nullable still
+    /// runs inference, so it does not keep the first branch's concrete type.
+    #[test]
+    fn all_nullable_union_does_not_keep_the_first_branch_type() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("z", RockyType::Int32, true),
+                ("n", RockyType::String, true),
+            ]),
+        )]);
+        let project = Project::from_models(vec![make_model(
+            "m",
+            "SELECT z AS c FROM t UNION ALL SELECT n FROM t",
+        )])
+        .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let typed = typecheck_project_with_models(&graph, &sources, None, &project.models, None)
+            .typed_models["m"]
+            .clone();
+        let c = typed.iter().find(|col| col.name == "c").unwrap();
+        assert_ne!(c.data_type, RockyType::Int32, "{c:?}");
+        assert!(c.nullable);
+        assert!(super::sql_mentions_set_operation(
+            "select a from t Union select b from u"
+        ));
+        assert!(!super::sql_mentions_set_operation(
+            "select unionized from t"
+        ));
     }
 
     /// #2299 at the expression level: decimal narrowing, an unknown input and

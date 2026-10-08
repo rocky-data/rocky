@@ -133,7 +133,7 @@ pub(crate) fn sqlserver_config(
         adapter_cfg.database.expose_opt(),
         &creds,
         Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
-        &adapter_cfg.extra,
+        adapter_cfg.extra.expose(),
     )
     .with_context(|| format!("adapters.{name}: invalid sqlserver configuration"))
 }
@@ -150,6 +150,7 @@ pub(crate) fn sqlserver_dialect_for_config(
     }
     let flavor = adapter_cfg
         .extra
+        .expose()
         .get("flavor")
         .and_then(serde_json::Value::as_str)
         .and_then(|f| rocky_sqlserver::Flavor::parse(f).ok())
@@ -179,7 +180,7 @@ pub(crate) fn postgres_config(
     // `late_binding_views` is a dialect option, not a connection setting;
     // `PgConfig::apply_extra` refuses keys it does not know, so it is
     // peeled off here.
-    let mut extra = adapter_cfg.extra.clone();
+    let mut extra = adapter_cfg.extra.expose().clone();
     extra.remove("late_binding_views");
     let cfg = rocky_postgres::PgConfig::new(
         flavor,
@@ -219,13 +220,13 @@ pub(crate) fn clickhouse_config(
             .map(rocky_core::redacted::RedactedString::expose),
         Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
     )
-    .and_then(|cfg| cfg.apply_extra(&adapter_cfg.extra))
+    .and_then(|cfg| cfg.apply_extra(adapter_cfg.extra.expose()))
     .with_context(|| format!("adapters.{name}: invalid clickhouse configuration"))
 }
 
 /// `[adapter.<name>.extra] late_binding_views` (Redshift only).
 pub(crate) fn redshift_late_binding_views(name: &str, adapter_cfg: &AdapterConfig) -> Result<bool> {
-    match adapter_cfg.extra.get("late_binding_views") {
+    match adapter_cfg.extra.expose().get("late_binding_views") {
         None => Ok(false),
         Some(_) if adapter_cfg.adapter_type != "redshift" => bail!(
             "adapters.{name}: late_binding_views is a redshift option; {} has no late-binding views",
@@ -249,6 +250,7 @@ pub(crate) fn postgres_dialect_for_config(
         "postgres" => {
             let mode = adapter_cfg
                 .extra
+                .expose()
                 .get("merge_mode")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|m| rocky_postgres::MergeMode::parse(m).ok())

@@ -318,7 +318,7 @@ where
 
 /// [`render_placeholders`] over every string value in a JSON document, at any
 /// depth. Object keys are left as they are (see [`render_placeholders_in`]).
-fn render_json_string_values(value: serde_json::Value) -> serde_json::Value {
+pub(crate) fn render_json_string_values(value: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
         Value::String(s) => Value::String(render_placeholders(&s)),
