@@ -49,11 +49,11 @@ use thiserror::Error;
 pub enum LockError {
     /// Valkey / Redis transport failure (connect refused, TLS error,
     /// command timeout).
-    #[error("stampede valkey: {0}")]
+    #[error("stampede valkey: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Valkey(String),
     /// Misconfigured backend — surfaced from `build_stampede_lock`
     /// rather than from a request.
-    #[error("stampede config: {0}")]
+    #[error("stampede config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
 }
 

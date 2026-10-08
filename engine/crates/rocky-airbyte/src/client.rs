@@ -43,20 +43,25 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum AirbyteError {
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
 
-    #[error("API error ({status}): {message}")]
+    #[error(
+        "API error ({status}): {}",
+        rocky_core::secret_registry::render_placeholders(message)
+    )]
     Api { status: u16, message: String },
 
-    #[error("unexpected response format: {0}")]
+    #[error("unexpected response format: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     UnexpectedResponse(String),
 
     #[error("rate limited -- retry after backoff")]
     RateLimited,
 
     #[error(
-        "Airbyte API returned a `next` cursor on a different origin: {next} (base: {base}). Refusing to follow — the Bearer token would otherwise be sent to an unrelated host."
+        "Airbyte API returned a `next` cursor on a different origin: {} (base: {}). Refusing to follow — the Bearer token would otherwise be sent to an unrelated host.",
+        rocky_core::secret_registry::render_placeholders(next),
+        rocky_core::secret_registry::render_placeholders(base)
     )]
     UntrustedNextUrl { base: String, next: String },
 }

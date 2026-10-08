@@ -59,16 +59,22 @@ fn poll_delay(attempt: usize) -> Duration {
 /// Errors surfaced by the Trino connector.
 #[derive(Debug, Error)]
 pub enum TrinoError {
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
 
     #[error("Trino auth error: {0}")]
     Auth(#[from] AuthError),
 
-    #[error("Trino HTTP {status}: {message}")]
+    #[error(
+        "Trino HTTP {status}: {}",
+        rocky_core::secret_registry::render_placeholders(message)
+    )]
     HttpStatus { status: u16, message: String },
 
-    #[error("Trino query failed (state {state}, error_code {error_code}): {message}")]
+    #[error(
+        "Trino query failed (state {state}, error_code {error_code}): {}",
+        rocky_core::secret_registry::render_placeholders(message)
+    )]
     QueryFailed {
         state: String,
         error_code: i64,
@@ -82,11 +88,13 @@ pub enum TrinoError {
         last_state: String,
     },
 
-    #[error("Trino response missing expected field: {0}")]
+    #[error("Trino response missing expected field: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     MalformedResponse(String),
 
     #[error(
-        "Trino coordinator returned a nextUri pointing at a different origin: {next} (coordinator: {coordinator}). Refusing to follow — the Authorization header would otherwise be sent to an unrelated host."
+        "Trino coordinator returned a nextUri pointing at a different origin: {} (coordinator: {}). Refusing to follow — the Authorization header would otherwise be sent to an unrelated host.",
+        rocky_core::secret_registry::render_placeholders(next),
+        rocky_core::secret_registry::render_placeholders(coordinator)
     )]
     UntrustedNextUri { coordinator: String, next: String },
 
@@ -99,7 +107,7 @@ pub enum TrinoError {
     )]
     ArrowEncodingUnavailable,
 
-    #[error("Trino spooled Arrow decode error: {0}")]
+    #[error("Trino spooled Arrow decode error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ArrowDecode(String),
 }
 
@@ -567,6 +575,36 @@ struct QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_text_prints_resolved_var_as_placeholder() {
+        let secret = "trino-1919.internal.example.com";
+        rocky_core::secret_registry::register_substitution("ROCKY_TEST_TRINO_HOST_1919", secret);
+        let status = TrinoError::HttpStatus {
+            status: 502,
+            message: format!("bad gateway from {secret}"),
+        };
+        let shown = status.to_string();
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("${ROCKY_TEST_TRINO_HOST_1919}"), "{shown}");
+        let next = TrinoError::UntrustedNextUri {
+            coordinator: format!("https://{secret}"),
+            next: "https://evil.example.org/x".into(),
+        };
+        let shown = next.to_string();
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("${ROCKY_TEST_TRINO_HOST_1919}"), "{shown}");
+    }
+
+    #[test]
+    fn error_text_keeps_short_values_below_the_floor() {
+        rocky_core::secret_registry::register_substitution("ROCKY_TEST_TRINO_SHORT_1919", "abc");
+        let err = TrinoError::MalformedResponse("catalog abc".into());
+        assert_eq!(
+            err.to_string(),
+            "Trino response missing expected field: catalog abc"
+        );
+    }
 
     fn query_failed(error_name: &str) -> AdapterError {
         AdapterError::new(TrinoError::QueryFailed {

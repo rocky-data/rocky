@@ -98,19 +98,19 @@ pub enum WriteOutcome {
 #[derive(Debug, Error)]
 pub enum CacheError {
     /// Local filesystem I/O failure ([`FileCache`]).
-    #[error("cache I/O: {0}")]
+    #[error("cache I/O: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Io(#[from] std::io::Error),
 
     /// Object-store backend failure ([`ObjectStoreCache`]).
-    #[error("cache object-store: {0}")]
+    #[error("cache object-store: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ObjectStore(#[from] object_store::Error),
 
     /// Object-store URL parsing failure (e.g. unsupported scheme).
-    #[error("cache object-store URL: {0}")]
+    #[error("cache object-store URL: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ObjectStoreUrl(String),
 
     /// Valkey / Redis client failure ([`ValkeyCache`]).
-    #[error("cache valkey: {0}")]
+    #[error("cache valkey: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Valkey(String),
 
     /// JSON serialize / deserialize failure (cache value codec).
@@ -119,7 +119,7 @@ pub enum CacheError {
 
     /// Misconfigured backend — missing required field, etc. Surfaced at
     /// config-load time before any cache I/O is attempted.
-    #[error("cache config: {0}")]
+    #[error("cache config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
 }
 

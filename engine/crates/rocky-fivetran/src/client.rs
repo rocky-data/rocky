@@ -77,13 +77,16 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum FivetranError {
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Http(#[from] reqwest::Error),
 
-    #[error("API error ({code}): {message}")]
+    #[error(
+        "API error ({code}): {}",
+        rocky_core::secret_registry::render_placeholders(message)
+    )]
     Api { code: String, message: String },
 
-    #[error("unexpected response format: {0}")]
+    #[error("unexpected response format: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     UnexpectedResponse(String),
 
     #[error("rate limited — retry after backoff")]

@@ -257,17 +257,17 @@ pub const DEFAULT_MAX_WAKE_SECONDS: u64 = 600;
 #[derive(Debug, Error)]
 pub enum BudgetError {
     /// Local filesystem I/O error (file backend).
-    #[error("ratelimit I/O: {0}")]
+    #[error("ratelimit I/O: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Io(#[from] std::io::Error),
     /// JSON serialize / deserialize failure on the persisted state.
     #[error("ratelimit serialize: {0}")]
     Serialize(#[from] serde_json::Error),
     /// Valkey / Redis transport failure.
-    #[error("ratelimit valkey: {0}")]
+    #[error("ratelimit valkey: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Valkey(String),
     /// Misconfigured backend — surfaced from `build_ratelimit_budget`
     /// rather than from a request.
-    #[error("ratelimit config: {0}")]
+    #[error("ratelimit config: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     Config(String),
 }
 

@@ -544,7 +544,9 @@ fn compute_model_typecheck(
             let direct = graph
                 .producing_edge(model_name, &col.name)
                 .is_some_and(|edge| edge.transform == rocky_sql::lineage::TransformKind::Direct);
-            if !direct {
+            // A `Direct` column of a model with a set operation reads only
+            // the first branch's type, so it is `Unknown` too (#2304).
+            if !direct || mentions_set_operation {
                 col.data_type = RockyType::Unknown;
             }
         }
@@ -585,8 +587,10 @@ fn compute_model_typecheck(
                 | rocky_sql::lineage::TransformKind::Cast
                 | rocky_sql::lineage::TransformKind::TryCast => {
                     col.nullable |= inferred_col.nullable;
-                    // Lineage reads only the first branch of a set operation.
-                    if inferred.set_operation
+                    // Lineage reads only the first branch of a set operation,
+                    // also one inside a CTE or derived table that this
+                    // `Direct` column reads through (#2304).
+                    if (inferred.set_operation || mentions_set_operation)
                         && edge.transform == rocky_sql::lineage::TransformKind::Direct
                     {
                         col.data_type =
@@ -4455,6 +4459,47 @@ mod tests {
         // A fallible cast to INT in one branch, a plain INT column in the other.
         let rows =
             typecheck_over_t_and_u("SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT x FROM u");
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
+    /// #2304: lineage reads a CTE column as the same-named column of a source
+    /// or model, so a CTE that shadows one (`WITH t AS (...) SELECT x FROM t`)
+    /// shows the outer `Direct` column the table's type. With a set operation
+    /// inside the CTE that type can be wrong; without one it must not change.
+    #[test]
+    fn set_operation_in_cte_does_not_keep_the_shadowed_type() {
+        // Not shadowing: lineage has no source column, so the type is Unknown.
+        for sql in [
+            "WITH w AS (SELECT x AS c FROM t UNION ALL SELECT n FROM u) SELECT c FROM w",
+            "SELECT c FROM (SELECT x AS c FROM t UNION ALL SELECT n FROM u) AS w",
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows[0].1, RockyType::Unknown, "{sql}: {rows:?}");
+        }
+        // Shadowing source `t`: INT with STRING has no common type.
+        let rows = typecheck_over_t_and_u(
+            "WITH t AS (SELECT x FROM t UNION ALL SELECT n FROM u) SELECT x FROM t",
+        );
+        assert_eq!(rows[0].1, RockyType::Unknown, "{rows:?}");
+        // Branches that agree keep their type.
+        let rows = typecheck_over_t_and_u(
+            "WITH t AS (SELECT x FROM u UNION ALL SELECT x FROM u) SELECT x FROM t",
+        );
+        assert_eq!(rows, vec![("x".to_string(), RockyType::Int32, false)]);
+        // No set operation: type and nullability do not change.
+        let rows = typecheck_over_t_and_u("WITH t AS (SELECT x FROM u) SELECT x FROM t");
+        assert_eq!(rows, vec![("x".to_string(), RockyType::Int32, false)]);
+    }
+
+    /// #2304: when inference fails, a `Direct` column of a model with a set
+    /// operation does not keep the first branch's type.
+    #[test]
+    fn uninferable_set_operation_types_direct_column_unknown() {
+        let rows = typecheck_over_t_and_u("SELECT x AS c FROM t UNION ALL VALUES ('a')");
+        assert_eq!(rows[0].1, RockyType::Unknown, "{rows:?}");
+        assert!(rows[0].2, "{rows:?}");
+        // Without a set operation a plain query keeps its type.
+        let rows = typecheck_over_t_and_u("SELECT x AS c FROM t");
         assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
     }
 
