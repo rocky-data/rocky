@@ -1170,6 +1170,45 @@ fn lookback_without_unique_key_warns_w046() {
     assert!(!result.has_errors, "{:?}", result.diagnostics);
 }
 
+/// The strict `>` watermark skips a late row whose timestamp equals the
+/// target's `MAX`. With no `lookback` the compiler warns (W056), with or
+/// without `unique_key`: a key only merges rows the filter reads, and the
+/// filter never reads that row. A lookback silences it. Warning, not error.
+#[test]
+fn append_only_incremental_without_lookback_warns_w056() {
+    let sql = "SELECT id, updated_at FROM src WHERE @incremental_filter";
+    let w056 = |strategy: &str| {
+        compile_leaf(strategy, sql)
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W056" && d.model == "leaf")
+            .count()
+    };
+    assert_eq!(w056(INCREMENTAL_WM), 1);
+    assert_eq!(
+        w056("type = \"incremental\"\ntimestamp_column = \"updated_at\"\nlookback = \"0 days\""),
+        1,
+        "a zero lookback is no lookback"
+    );
+    assert_eq!(
+        w056("type = \"incremental\"\ntimestamp_column = \"updated_at\"\nlookback = \"1 day\""),
+        0
+    );
+    assert_eq!(
+        w056("type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]"),
+        1,
+        "unique_key without lookback still loses the late row"
+    );
+    assert_eq!(
+        w056(
+            "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]\n\
+             lookback = \"1 day\""
+        ),
+        0
+    );
+    assert!(!compile_leaf(INCREMENTAL_WM, sql).has_errors);
+}
+
 /// #1996: `type = "ephemeral"` used to be refused outright with E038, because
 /// nothing inlined it. Consumers now inline it as a CTE, so a plain ephemeral
 /// model compiles clean; E038 only marks the uses inlining cannot serve

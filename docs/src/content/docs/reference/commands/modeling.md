@@ -391,7 +391,7 @@ rocky lineage fct.total -o json | jq '.row_selection'
 ]
 ```
 
-Each entry names the `source` column, the `target_model` whose rows it affects, and a `kind`: `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, or `window_order`. A window key also carries `target_column`, the one output column its window feeds. Without `target_column`, the edge affects every column of `target_model`.
+Each entry names the `source` column, the `target_model` whose rows it affects, and a `kind`: `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on`, or `order_limit`. A `distinct_on` key comes from `DISTINCT ON (...)`, or from the `ORDER BY` of a `DISTINCT ON` query, because that order picks which row of each group survives. An `order_limit` key is an `ORDER BY` key in a query that also has `LIMIT`, `FETCH`, or `TOP`. A `NATURAL JOIN` records no join key, because the shared columns are known only to the warehouse catalog. A window key also carries `target_column`, the one output column its window feeds. Without `target_column`, the edge affects every column of `target_model`.
 
 Upstream, `row_selection` lists the row-selection inputs of every model on the value trace. Downstream (`--downstream`), it lists the models whose rows the traced column, or a column derived from it, filters, joins, groups, or partitions. The table output prints the same edges under a `Row selection` heading. `trace` and `edges` stay value-only, so existing consumers see no change. JSON omits `row_selection` when it is empty.
 
@@ -743,6 +743,8 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 | No file at the given path | Renders in DuckDB, the default dialect. |
 | Present, with `${VAR}` placeholders in an adapter's connection fields you have not exported | Renders in the configured dialect. A credential is never sent anywhere, so it does not have to resolve. An unset placeholder anywhere else — an adapter `type`, an `[imports]` path — still refuses, because it changes what the config means. |
 | Present but malformed, or it breaks a config rule | Refuses, and names the file. Rendering a broken Snowflake project in DuckDB would answer a question you did not ask. |
+
+With a config present, `emit-sql` also runs the per-model-target checks of [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile) (E042/E043, E044, E049, E051, E053, E054). It refuses to emit SQL that the pipeline's warehouse cannot run, such as a `merge` model on ClickHouse (E053).
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 

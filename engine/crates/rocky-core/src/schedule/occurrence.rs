@@ -56,16 +56,6 @@ pub fn parse_cron(cron_expr: &str) -> Result<Cron, OccurrenceError> {
     })
 }
 
-/// The first cron occurrence strictly after `after`, evaluated in `tz`.
-///
-/// The search runs in the named timezone so daylight-saving transitions are
-/// honored, then the result is converted back to absolute UTC. `after` is
-/// exclusive: an instant that is itself an occurrence yields the *next* one.
-///
-/// # Errors
-///
-/// Returns [`OccurrenceError::Parse`] for a malformed expression, or
-/// [`OccurrenceError::Search`] if no occurrence can be found.
 /// Estimate the spacing between consecutive `cron` occurrences, in the named
 /// timezone, as of `at` — the "expected interval" `rocky doctor` compares a
 /// scheduler's `last_evaluated_at` staleness against.
@@ -85,6 +75,23 @@ pub fn cron_interval_estimate(
     (occ2 - occ1).to_std().ok()
 }
 
+/// The first cron occurrence strictly after `after`, evaluated in `tz`.
+///
+/// Parses `cron_expr` (a standard 5-field expression, see [`parse_cron`]),
+/// converts `after` to wall-clock time in `tz`, searches forward there, and
+/// converts the match back to absolute UTC. `after` is exclusive: an instant
+/// that is itself an occurrence yields the *next* one.
+///
+/// Daylight-saving transitions follow the cron library's wall-clock rules,
+/// which the tests pin for `Europe/Lisbon`: a wall time skipped by a
+/// spring-forward gap fires once, at the next valid instant, and a wall time
+/// repeated by a fall-back fires on its first occurrence only, never twice.
+///
+/// # Errors
+///
+/// Returns [`OccurrenceError::Parse`] for a malformed expression, or
+/// [`OccurrenceError::Search`] if the library finds no occurrence after
+/// `after`.
 pub fn next_occurrence(
     cron_expr: &str,
     tz: Tz,

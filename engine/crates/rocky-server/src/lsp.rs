@@ -13,7 +13,7 @@
 //! - **Inlay Hints** — inline type annotations
 //! - **Semantic Tokens** — syntax highlighting for models, columns, functions
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -371,6 +371,9 @@ pub struct RockyLsp {
     /// (#1625). See [`RockyLsp::publish_project_config_diagnostic`] for why
     /// the state is tracked rather than republished on every compile.
     config_diagnostic_published: Arc<AtomicBool>,
+    /// The files that carried a compile diagnostic at the last publication,
+    /// and the order publications go out in. See [`PublishedDiagnostics`].
+    published_files: Arc<PublishedDiagnostics>,
     /// Salsa database for incremental DSL parsing — backs `didOpen` /
     /// `didChange` so a parsed `RockyFile` is memoized across keystrokes
     /// and only re-runs when the buffer text actually changes.
@@ -511,14 +514,17 @@ impl RockyLsp {
             external_dependencies: Default::default(),
         };
 
+        let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
                 apply_project_gates(&dir_path, &mut result);
-                self.publish_diagnostics(&result).await;
-                *self.compile_result.write().await = Some(result);
+                self.publish_diagnostics(generation, result).await;
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                // A newer compile that failed still outranks an older one
+                // that may yet succeed: that one must not publish over it.
+                self.published_files.compile_failed(generation).await;
                 // The log line above is the only place this failure went.
                 // The editor was left with NOTHING: no diagnostic (none was
                 // built), no message. A models directory that is a dangling
@@ -831,46 +837,55 @@ impl RockyLsp {
         map
     }
 
-    async fn publish_diagnostics(&self, result: &CompileResult) {
-        let mut diags_by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+    async fn publish_diagnostics(&self, generation: u64, result: CompileResult) -> bool {
+        Self::publish_compile_diagnostics(
+            &self.client,
+            &self.published_files,
+            &self.compile_result,
+            generation,
+            result,
+        )
+        .await
+    }
 
-        for d in &result.diagnostics {
-            let file = if let Some(model) = result.project.model(&d.model) {
-                model.file_path.display().to_string()
-            } else {
-                continue;
-            };
-
-            let severity = match d.severity {
-                rocky_compiler::diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
-                rocky_compiler::diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
-                rocky_compiler::diagnostic::Severity::Info => DiagnosticSeverity::INFORMATION,
-            };
-
-            let range = if let Some(ref span) = d.span {
-                Range::new(
-                    Position::new(span.line.saturating_sub(1) as u32, span.col as u32),
-                    Position::new(span.line.saturating_sub(1) as u32, span.col as u32 + 1),
-                )
-            } else {
-                Range::new(Position::new(0, 0), Position::new(0, 0))
-            };
-
-            diags_by_file.entry(file).or_default().push(Diagnostic {
-                range,
-                severity: Some(severity),
-                code: Some(NumberOrString::String(d.code.to_string())),
-                source: Some("rocky".to_string()),
-                message: d.message.to_string(),
-                ..Default::default()
-            });
+    /// Publish the compile diagnostics, clear the files that had some at
+    /// the last publication and have none now, and store `result` as the
+    /// current compile result in `store`.
+    ///
+    /// `generation` is the value [`PublishedDiagnostics::begin_compile`]
+    /// returned when the compile behind `result` started. A result older
+    /// than the last one published (or than a newer compile that failed, see
+    /// [`PublishedDiagnostics::compile_failed`]) is dropped and not stored: a
+    /// slow compile that finishes after a newer one must not put back a
+    /// diagnostic the newer one cleared, nor replace its stored result. The
+    /// publication lock is held across the sends and the store, so two
+    /// publications never interleave. Returns whether `result` was used.
+    ///
+    /// An associated fn because the debounced `didChange` pass runs in a
+    /// spawned task that holds clones, not `&self`.
+    async fn publish_compile_diagnostics(
+        client: &Client,
+        published: &PublishedDiagnostics,
+        store: &RwLock<Option<CompileResult>>,
+        generation: u64,
+        result: CompileResult,
+    ) -> bool {
+        // Only publishers take this lock; no client handler waits on it, so
+        // holding it across a send cannot block the handler the send needs.
+        // Handlers that read `store` never take it either, so waiting for
+        // the write below cannot deadlock.
+        let mut last = published.state.lock().await;
+        if generation < last.generation {
+            return false;
         }
-
-        for (file, diags) in diags_by_file {
-            if let Ok(uri) = Url::from_file_path(&file) {
-                self.client.publish_diagnostics(uri, diags, None).await;
-            }
+        let (outgoing, now) = plan_publication(&last.files, diagnostics_by_uri(&result));
+        last.files = now;
+        last.generation = generation;
+        for (uri, diags) in outgoing {
+            client.publish_diagnostics(uri, diags, None).await;
         }
+        *store.write().await = Some(result);
+        true
     }
 
     /// Find the model name for a given file URI.
@@ -1386,6 +1401,7 @@ impl LanguageServer for RockyLsp {
             // emitted for the same project.
             let schema_cache_throttle = self.schema_cache_throttle.clone();
             let config_diagnostic_published = self.config_diagnostic_published.clone();
+            let published_files = self.published_files.clone();
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1440,6 +1456,7 @@ impl LanguageServer for RockyLsp {
                 // threads. The incremental path stays inline: it's already
                 // fast (<50 ms on 100-model projects), needs a live borrow
                 // of the previous result, and won't dominate the runtime.
+                let generation = published_files.begin_compile();
                 let use_incremental =
                     changed_file.is_some() && compile_result.read().await.is_some();
                 let new_result = if use_incremental {
@@ -1461,55 +1478,18 @@ impl LanguageServer for RockyLsp {
 
                 if let Some(mut result) = new_result {
                     apply_project_gates(&config.models_dir, &mut result);
-                    let mut diags_by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-                    for d in &result.diagnostics {
-                        let file = if let Some(model) = result.project.model(&d.model) {
-                            model.file_path.display().to_string()
-                        } else {
-                            continue;
-                        };
-
-                        let severity = match d.severity {
-                            rocky_compiler::diagnostic::Severity::Error => {
-                                DiagnosticSeverity::ERROR
-                            }
-                            rocky_compiler::diagnostic::Severity::Warning => {
-                                DiagnosticSeverity::WARNING
-                            }
-                            rocky_compiler::diagnostic::Severity::Info => {
-                                DiagnosticSeverity::INFORMATION
-                            }
-                        };
-
-                        let range = if let Some(ref span) = d.span {
-                            Range::new(
-                                Position::new(span.line.saturating_sub(1) as u32, span.col as u32),
-                                Position::new(
-                                    span.line.saturating_sub(1) as u32,
-                                    span.col as u32 + 1,
-                                ),
-                            )
-                        } else {
-                            Range::new(Position::new(0, 0), Position::new(0, 0))
-                        };
-
-                        diags_by_file.entry(file).or_default().push(Diagnostic {
-                            range,
-                            severity: Some(severity),
-                            code: Some(NumberOrString::String(d.code.to_string())),
-                            source: Some("rocky".to_string()),
-                            message: d.message.to_string(),
-                            ..Default::default()
-                        });
-                    }
-
-                    for (file, diags) in diags_by_file {
-                        if let Ok(uri) = Url::from_file_path(&file) {
-                            client.publish_diagnostics(uri, diags, None).await;
-                        }
-                    }
-
-                    *compile_result.write().await = Some(result);
+                    Self::publish_compile_diagnostics(
+                        &client,
+                        &published_files,
+                        &compile_result,
+                        generation,
+                        result,
+                    )
+                    .await;
+                } else {
+                    // A newer compile that failed still outranks an older
+                    // one that may yet succeed.
+                    published_files.compile_failed(generation).await;
                 }
             });
         }
@@ -4604,6 +4584,153 @@ fn find_last_nonblank_before(lines: &[&str], before_idx: usize) -> usize {
 
 // ── Incremental compilation (Phase 3H) ──────────────────────────────────────
 
+/// `path` with `.` and `..` components folded away, without touching the
+/// filesystem (so a symlinked directory keeps its spelling).
+fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The compile diagnostics grouped by the file they belong on.
+///
+/// A diagnostic that names a model goes on the model's file. E051 and W051
+/// name a user-defined function instead: they go on the function's `.toml`
+/// under `functions/` (the registry knows the path; an invalid definition
+/// that is not in the registry carries it in its span). Anything else that
+/// names no model has no file and is skipped.
+fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
+    let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+
+    for d in &result.diagnostics {
+        let file = if let Some(model) = result.project.model(&d.model) {
+            model.file_path.clone()
+        } else if &*d.code == rocky_compiler::diagnostic::E051
+            || &*d.code == rocky_compiler::diagnostic::W051
+        {
+            let from_registry = result
+                .semantic_graph
+                .functions()
+                .get(&d.model)
+                .map(|f| f.def.file_path.clone());
+            let from_span = d
+                .span
+                .as_ref()
+                .filter(|s| !s.file.is_empty())
+                .map(|s| std::path::PathBuf::from(&s.file));
+            match from_registry.or(from_span) {
+                // The loader reaches `functions/` as `<models>/../functions`;
+                // an editor matches open documents by the plain path.
+                Some(path) => lexically_normalized(&path),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let Ok(uri) = Url::from_file_path(&file) else {
+            continue;
+        };
+
+        let severity = match d.severity {
+            rocky_compiler::diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
+            rocky_compiler::diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
+            rocky_compiler::diagnostic::Severity::Info => DiagnosticSeverity::INFORMATION,
+        };
+
+        let range = if let Some(ref span) = d.span {
+            Range::new(
+                Position::new(span.line.saturating_sub(1) as u32, span.col as u32),
+                Position::new(span.line.saturating_sub(1) as u32, span.col as u32 + 1),
+            )
+        } else {
+            Range::new(Position::new(0, 0), Position::new(0, 0))
+        };
+
+        by_uri.entry(uri).or_default().push(Diagnostic {
+            range,
+            severity: Some(severity),
+            code: Some(NumberOrString::String(d.code.to_string())),
+            source: Some("rocky".to_string()),
+            message: d.message.to_string(),
+            ..Default::default()
+        });
+    }
+
+    by_uri
+}
+
+/// The compile-diagnostic publication state shared by both LSP compile paths
+/// (`recompile` and the debounced `didChange` pass).
+///
+/// Each compile takes a generation number when it starts. Publications are
+/// serialized by an async lock held across their sends, and one older than
+/// the last publication sent is dropped. Without both, a slow compile that
+/// finished after a newer one, or two publications whose sends interleaved,
+/// could leave a stale diagnostic on the editor after the newer clear.
+#[derive(Debug, Default)]
+struct PublishedDiagnostics {
+    /// The last generation handed out by [`Self::begin_compile`].
+    started: std::sync::atomic::AtomicU64,
+    /// Held across a whole publication. Only publishers take it.
+    state: Mutex<PublishedState>,
+}
+
+#[derive(Debug, Default)]
+struct PublishedState {
+    /// The files that carried a compile diagnostic at the last publication.
+    /// The next publication sends an empty list for each that is now clean,
+    /// so a fixed diagnostic on another file (a pipeline changed from
+    /// ClickHouse to DuckDB clears E053 on the models it named) leaves the
+    /// editor.
+    files: HashSet<Url>,
+    /// The generation of the last publication sent.
+    generation: u64,
+}
+
+impl PublishedDiagnostics {
+    /// Take the generation for a compile that starts now.
+    fn begin_compile(&self) -> u64 {
+        self.started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Record that the compile of `generation` failed. It publishes nothing,
+    /// but it is newer than every compile that started before it, so none
+    /// of those may publish or store its result afterwards.
+    async fn compile_failed(&self, generation: u64) {
+        let mut last = self.state.lock().await;
+        last.generation = last.generation.max(generation);
+    }
+}
+
+/// What to send for one publication: the files with diagnostics now, plus an
+/// empty list for each file in `previous` that is clean now. The second
+/// value is the set to remember for the next publication.
+///
+/// Files that were clean and stay clean produce nothing, so an ordinary
+/// compile of a clean project puts nothing on the wire.
+fn plan_publication(
+    previous: &HashSet<Url>,
+    current: HashMap<Url, Vec<Diagnostic>>,
+) -> (Vec<(Url, Vec<Diagnostic>)>, HashSet<Url>) {
+    let now: HashSet<Url> = current.keys().cloned().collect();
+    let mut outgoing: Vec<(Url, Vec<Diagnostic>)> = current.into_iter().collect();
+    for gone in previous.difference(&now) {
+        outgoing.push((gone.clone(), Vec::new()));
+    }
+    (outgoing, now)
+}
+
 /// Run the per-model-target checks of `rocky compile` over a fresh compile
 /// result, so the editor shows the diagnostics the CLI shows for a project
 /// with several pipelines. Both compile paths (`recompile` and the debounced
@@ -4662,6 +4789,7 @@ pub async fn run_lsp() {
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
         schema_cache_throttle: SchemaCacheThrottle::new(),
         config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+        published_files: Arc::default(),
         salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
         salsa_sources: Arc::new(RwLock::new(HashMap::new())),
     });
@@ -4702,6 +4830,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -4815,6 +4944,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -4864,6 +4994,379 @@ mod tests {
     use rocky_compiler::types::{RockyType, TypedColumn};
     use rocky_sql::lineage::TransformKind;
     use std::sync::Arc;
+
+    /// A project with one model `m` and one valid function `dbl` under
+    /// `functions/`, compiled the way the LSP compiles it.
+    fn compile_function_project(root: &std::path::Path) -> CompileResult {
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(root.join("functions")).unwrap();
+        std::fs::write(
+            root.join("functions/dbl.toml"),
+            "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("functions/dbl.sql"), "x * 2\n").unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT dbl(1.0) AS a2").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let config = CompilerConfig {
+            models_dir: models,
+            contracts_dir: None,
+            required_explicit_contract_model: None,
+            source_schemas: Default::default(),
+            mask: Default::default(),
+            allow_unmasked: Vec::new(),
+            project_freshness: Default::default(),
+            run_vars: rocky_core::run_vars::RunVars::new(),
+            source_provenance: Default::default(),
+            preserve_authored_sql: true,
+            external_dependencies: Default::default(),
+        };
+        rocky_compiler::compile::compile(&config).expect("the project compiles")
+    }
+
+    /// E051 names a function, not a model. It used to be dropped because the
+    /// name was not in the model list; it now lands on the function's file.
+    #[test]
+    fn e051_is_published_on_the_function_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut result = compile_function_project(tmp.path());
+        // The shape `rocky-cli`'s adapter check produces: no span.
+        result
+            .diagnostics
+            .push(rocky_compiler::diagnostic::Diagnostic::error(
+                rocky_compiler::diagnostic::E051,
+                "dbl",
+                "function `dbl` cannot be created",
+            ));
+        // A diagnostic that names neither a model nor a function has no file.
+        result
+            .diagnostics
+            .push(rocky_compiler::diagnostic::Diagnostic::error(
+                "E999",
+                "nobody",
+                "names nothing",
+            ));
+
+        let by_uri = diagnostics_by_uri(&result);
+        let function_uri = Url::from_file_path(tmp.path().join("functions/dbl.toml")).unwrap();
+        let on_function = by_uri.get(&function_uri).unwrap_or_else(|| {
+            panic!(
+                "E051 must land on the function's file; got {:?}",
+                by_uri.keys().collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(on_function.len(), 1);
+        assert_eq!(
+            on_function[0].code,
+            Some(NumberOrString::String("E051".to_string()))
+        );
+        assert!(
+            !by_uri.keys().any(|u| u.path().ends_with("nobody")),
+            "a diagnostic with no file stays unpublished"
+        );
+    }
+
+    /// A file that had diagnostics and has none now gets an empty list; a
+    /// file that stays clean gets nothing.
+    #[test]
+    fn plan_publication_clears_files_that_are_clean_now() {
+        let a = Url::parse("file:///p/a.sql").unwrap();
+        let b = Url::parse("file:///p/b.sql").unwrap();
+        let diag = Diagnostic {
+            message: "x".into(),
+            ..Default::default()
+        };
+
+        let previous: HashSet<Url> = [a.clone(), b.clone()].into_iter().collect();
+        let current: HashMap<Url, Vec<Diagnostic>> =
+            [(a.clone(), vec![diag.clone()])].into_iter().collect();
+        let (mut out, now) = plan_publication(&previous, current);
+        out.sort_by_key(|(u, _)| u.to_string());
+        assert_eq!(out.len(), 2);
+        assert_eq!((&out[0].0, out[0].1.len()), (&a, 1));
+        assert_eq!((&out[1].0, out[1].1.len()), (&b, 0), "b is cleared");
+        assert_eq!(now, [a.clone()].into_iter().collect::<HashSet<_>>());
+
+        // Nothing before, nothing now: nothing on the wire.
+        let (out, now) = plan_publication(&HashSet::new(), HashMap::new());
+        assert!(out.is_empty() && now.is_empty());
+    }
+
+    /// The wire: a diagnostic that goes away is cleared on the editor.
+    #[tokio::test]
+    async fn a_fixed_diagnostic_is_cleared_on_the_editor() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let mut result = compile_function_project(&root);
+
+        let (mut service, mut socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+        // Collect what the editor receives; an undrained socket would stall
+        // the handshake.
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "textDocument/publishDiagnostics" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize answers");
+        let initialized = Request::build("initialized")
+            .params(serde_json::json!({}))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialized)
+            .await
+            .expect("initialized answers");
+        // The startup compile's own publications are not under test.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        seen.lock().unwrap().clear();
+        service
+            .inner()
+            .published_files
+            .state
+            .lock()
+            .await
+            .files
+            .clear();
+
+        let model_uri = Url::from_file_path(root.join("models/m.sql")).unwrap();
+        result
+            .diagnostics
+            .push(rocky_compiler::diagnostic::Diagnostic::error(
+                "E053", "m", "no MERGE",
+            ));
+        let generations = &service.inner().published_files;
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), result)
+            .await;
+        // The pipeline was fixed: the next compile has no diagnostic.
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), compile_function_project(&root))
+            .await;
+        // A third, still clean, compile sends nothing more.
+        service
+            .inner()
+            .publish_diagnostics(generations.begin_compile(), compile_function_project(&root))
+            .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let seen = seen.lock().unwrap();
+        let for_model: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|p| p["uri"] == serde_json::json!(model_uri.as_str()))
+            .collect();
+        assert_eq!(
+            for_model.len(),
+            2,
+            "one publish with the diagnostic, one clearing it, none for the clean repeat: {seen:?}"
+        );
+        assert_eq!(for_model[0]["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            for_model[1]["diagnostics"].as_array().unwrap().len(),
+            0,
+            "the fixed diagnostic must be cleared"
+        );
+    }
+
+    /// A compile that started first but finishes last must not put back a
+    /// diagnostic that a newer compile already cleared. Before the
+    /// generation check it was published last, and stuck on the editor.
+    #[tokio::test]
+    async fn a_stale_publication_does_not_restore_a_cleared_diagnostic() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let clean = compile_function_project(&root);
+        let stale = || {
+            let mut stale = compile_function_project(&root);
+            stale
+                .diagnostics
+                .push(rocky_compiler::diagnostic::Diagnostic::error(
+                    "E053", "m", "no MERGE",
+                ));
+            stale
+        };
+
+        let (mut service, mut socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "textDocument/publishDiagnostics" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+
+        // The client drops notifications until the session is initialized.
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        // The startup compile's own publications are not under test.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        seen.lock().unwrap().clear();
+        service
+            .inner()
+            .published_files
+            .state
+            .lock()
+            .await
+            .files
+            .clear();
+
+        let lsp = service.inner();
+        let first = lsp.published_files.begin_compile();
+        let second = lsp.published_files.begin_compile();
+        let third = lsp.published_files.begin_compile();
+        // Generation 1 shows the diagnostic, generation 3 clears it, and
+        // generation 2 — started before 3 — finishes last.
+        assert!(lsp.publish_diagnostics(first, stale()).await);
+        assert!(lsp.publish_diagnostics(third, clean).await);
+        assert!(!lsp.publish_diagnostics(second, stale()).await);
+        // The stale result is not stored over the newer one either: hover,
+        // completion and the next incremental compile read the stored one.
+        let stored = lsp.compile_result.read().await;
+        assert!(
+            stored.as_ref().is_some_and(|r| r.diagnostics.is_empty()),
+            "the stored result is the newer, clean compile"
+        );
+        drop(stored);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let model_uri = Url::from_file_path(root.join("models/m.sql")).unwrap();
+        let seen = seen.lock().unwrap();
+        let for_model: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|p| p["uri"] == serde_json::json!(model_uri.as_str()))
+            .collect();
+        assert_eq!(
+            for_model.len(),
+            2,
+            "the stale publication is dropped: {seen:?}"
+        );
+        assert_eq!(
+            for_model[1]["diagnostics"].as_array().unwrap().len(),
+            0,
+            "the editor ends clear"
+        );
+    }
+
+    /// A newer compile that fails publishes nothing, but an older compile
+    /// that finishes after it must still not publish or store its result:
+    /// the failure is newer information than the older success.
+    #[tokio::test]
+    async fn an_older_compile_does_not_publish_over_a_newer_failed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let older = compile_function_project(&root);
+        let (service, _socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+        let lsp = service.inner();
+        let first = lsp.published_files.begin_compile();
+        let second = lsp.published_files.begin_compile();
+        lsp.published_files.compile_failed(second).await;
+        assert!(
+            !lsp.publish_diagnostics(first, older).await,
+            "the older success is dropped"
+        );
+        assert!(lsp.compile_result.read().await.is_none(), "and not stored");
+    }
 
     /// Both LSP compile paths read the project's `rocky.toml` through one
     /// derivation, so `mask` / `allow_unmasked` / the project `[freshness]`
@@ -5452,6 +5955,7 @@ mod tests {
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
             config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });

@@ -385,10 +385,11 @@ pub const CURRENT_FINGERPRINT_VERSION: u32 = 2;
 /// other kind is `human`.
 fn default_principal_for_kind(kind: &PlanKind) -> PolicyPrincipal {
     match kind {
-        // Both are machine-composed by construction, so an unstamped plan
-        // evaluates as `agent` (never `human`, which would let it escape the
-        // agent-scoped policy rules a governor writes).
-        PlanKind::AiAuthored | PlanKind::Backfill => PolicyPrincipal::Agent,
+        // All three evaluate as `agent`, so an unstamped plan never escapes the
+        // agent-scoped policy rules a governor writes. AiAuthored and Backfill
+        // are machine-composed. Gc is often run unattended (cron, daemon) with
+        // no `ROCKY_PRINCIPAL`, so a `deny agent gc` rule must still fire (#2284).
+        PlanKind::AiAuthored | PlanKind::Backfill | PlanKind::Gc => PolicyPrincipal::Agent,
         _ => PolicyPrincipal::Human,
     }
 }
@@ -422,10 +423,10 @@ impl PersistedPlan {
     ///
     /// - an **agent** running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is gated
     ///   as agent regardless of the plan file (the tamper-proof property), and
-    /// - an `AiAuthored` / `Backfill` plan is gated as agent **by kind** even
+    /// - an `AiAuthored` / `Backfill` / `Gc` plan is gated as agent **by kind** even
     ///   when a human applies it (these are machine-composed by construction).
     ///
-    /// A human applying a `Run` / `Gc` / `Promote` plan resolves to `human`
+    /// A human applying a `Run` / `Promote` plan resolves to `human`
     /// (the "human vouches" model) — the human is the responsible applier.
     pub fn enforcement_principal(&self, runtime: PolicyPrincipal) -> PolicyPrincipal {
         most_restrictive(runtime, default_principal_for_kind(&self.kind))
@@ -1339,6 +1340,25 @@ mod tests {
         Ok(())
     }
 
+    /// #2284: a `gc` plan with no stamp resolves to `agent` by kind, so an
+    /// unattended gc cannot escape an agent-scoped policy rule.
+    #[test]
+    fn unstamped_gc_plan_resolves_to_agent() {
+        let plan = PersistedPlan {
+            plan_id: "x".to_string(),
+            kind: PlanKind::Gc,
+            created_at: Utc::now(),
+            format_version: 1,
+            principal: None,
+            payload: serde_json::json!({}),
+        };
+        assert_eq!(plan.resolved_principal(), PolicyPrincipal::Agent);
+        assert_eq!(
+            plan.enforcement_principal(PolicyPrincipal::Human),
+            PolicyPrincipal::Agent
+        );
+    }
+
     /// A legacy non-AI plan (e.g. a `run` plan) with no principal resolves to
     /// `human` — humans are never gated in v0, so this is the safe default for
     /// the plan kinds that predate agent authorship.
@@ -1399,7 +1419,7 @@ mod tests {
         );
         // Kind-forcing: an AiAuthored / Backfill plan is agent by KIND even when
         // a human applies it.
-        for kind in [PlanKind::AiAuthored, PlanKind::Backfill] {
+        for kind in [PlanKind::AiAuthored, PlanKind::Backfill, PlanKind::Gc] {
             assert_eq!(
                 plan(kind.clone(), Some(PolicyPrincipal::Human))
                     .enforcement_principal(PolicyPrincipal::Human),

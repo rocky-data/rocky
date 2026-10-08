@@ -610,6 +610,64 @@ async fn discover_table_state(
         .map_err(|e| anyhow!("could not discover the table's state from its _delta_log: {e}"))
 }
 
+/// A recipe whose shape `rocky restore` can rebuild: the parsed canonical
+/// `ModelIr` and its content-addressed storage prefix.
+pub(crate) struct RestorableRecipe {
+    pub(crate) ir: ModelIr,
+    pub(crate) storage_prefix: String,
+}
+
+/// The ONE predicate for "can restore rebuild this recorded recipe at all".
+///
+/// It holds every refusal `restore_one` can decide from the recorded recipe
+/// alone, before it touches an object store: the canonical `ModelIr` must
+/// deserialize, and the recipe must be content-addressed, unpartitioned, and
+/// read no recorded upstreams. `rocky gc` calls the same function in its
+/// `recipe_recorded` check, so gc never evicts an artifact that restore
+/// refuses on these grounds. There is no second copy of the rules to drift.
+/// Relax a rule here only when restore can rebuild that shape.
+///
+/// Refusals that need live state (an unreachable object store, partition
+/// columns on the live table, a rebuild hash mismatch, a path outside the
+/// prefix, a lost reinstatement race) cannot be decided at gc time and stay
+/// in `restore_one`.
+pub(crate) fn restorable_recipe(prov: &ProvenanceRecord) -> Result<RestorableRecipe, String> {
+    let ir: ModelIr = serde_json::from_str(&prov.model_ir_canonical_json).map_err(|e| {
+        format!(
+            "the provenance's embedded canonical ModelIr did not deserialize under the \
+             current engine (IR forward-compatibility break): {e}"
+        )
+    })?;
+    let rocky_ir::MaterializationStrategy::ContentAddressed {
+        storage_prefix,
+        partition_columns,
+    } = &ir.materialization
+    else {
+        return Err(
+            "the recorded recipe is not content-addressed — only content-addressed artifacts \
+             carry a whole-output blake3 to rebuild and verify against"
+                .to_string(),
+        );
+    };
+    if !partition_columns.is_empty() {
+        return Err(
+            "partitioned restore is a later phase — the tombstoned hash is per-file and the \
+             recorded recipe re-derives the whole table; refused (fail-closed)"
+                .to_string(),
+        );
+    }
+    if !prov.upstreams.is_empty() {
+        return Err(format!(
+            "the recorded recipe reads {} recorded upstream(s); restoring a multi-input recipe \
+             requires DAG re-derivation from the recorded upstream bytes (a later phase). \
+             Refused rather than substituting current data.",
+            prov.upstreams.len()
+        ));
+    }
+    let storage_prefix = storage_prefix.clone();
+    Ok(RestorableRecipe { ir, storage_prefix })
+}
+
 /// Restore one planned tombstone. Most early exits are refusals that wrote
 /// nothing — the pre-write verification is fail-closed — with ONE exception:
 /// an artifact that re-derived, hash-verified, and was written can still refuse
@@ -690,41 +748,11 @@ async fn restore_one(
     }
     let prov = prov.expect("bind.passed implies provenance is present");
 
-    let ir: ModelIr = match serde_json::from_str(&prov.model_ir_canonical_json) {
-        Ok(ir) => ir,
-        Err(e) => {
-            return refuse(format!(
-                "the provenance's embedded canonical ModelIr did not deserialize under the \
-                 current engine (IR forward-compatibility break): {e}"
-            ));
-        }
+    let RestorableRecipe { ir, storage_prefix } = match restorable_recipe(&prov) {
+        Ok(recipe) => recipe,
+        Err(reason) => return refuse(reason),
     };
-    let rocky_ir::MaterializationStrategy::ContentAddressed {
-        storage_prefix,
-        partition_columns,
-    } = &ir.materialization
-    else {
-        return refuse(
-            "the recorded recipe is not content-addressed — only content-addressed artifacts \
-             carry a whole-output blake3 to rebuild and verify against"
-                .to_string(),
-        );
-    };
-    if !partition_columns.is_empty() {
-        return refuse(
-            "partitioned restore is a later phase — the tombstoned hash is per-file and the \
-             recorded recipe re-derives the whole table; refused (fail-closed)"
-                .to_string(),
-        );
-    }
-    if !prov.upstreams.is_empty() {
-        return refuse(format!(
-            "the recorded recipe reads {} recorded upstream(s); restoring a multi-input recipe \
-             requires DAG re-derivation from the recorded upstream bytes (a later phase). \
-             Refused rather than substituting current data.",
-            prov.upstreams.len()
-        ));
-    }
+    let storage_prefix = &storage_prefix;
 
     // 3. The table's object store + discovered encoding state.
     let obj_store = match stores.store_for(storage_prefix) {
@@ -1244,6 +1272,7 @@ pub(crate) async fn restore_apply_output(
         plan_record.enforcement_principal(runtime_principal),
         actor,
         &touched,
+        crate::commands::apply::EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -1341,6 +1370,7 @@ pub(crate) async fn restore_apply_output(
                 let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
                     Some(&cfg),
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                 ));
@@ -1408,6 +1438,7 @@ pub(crate) async fn restore_apply_output(
                     principal,
                     &actor,
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                     &prior_decisions,
@@ -2097,46 +2128,20 @@ mod tests {
             (wr, obj_path)
         }
 
-        /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc's eviction set is strictly
-        /// larger than restore's recovery set).
+        /// Pins the subset relation: gc's eligible set is a subset of what
+        /// restore can recover (issue #2283).
         ///
-        /// **Current behavior:** an artifact produced by a *multi-input*
-        /// recipe whose every upstream is a content hash has a `strong` input
-        /// closure, so gc's [`check_recipe_recorded`] passes it and it becomes
-        /// eligible for eviction. `restore_one` then refuses that very same
-        /// artifact, because it rejects any recipe with recorded upstreams:
-        /// re-deriving a multi-input recipe from the recorded upstream bytes
-        /// needs DAG re-derivation that is not yet implemented. This test
-        /// drives BOTH sides against ONE artifact and asserts the asymmetry.
-        ///
-        /// **Why this is wrong:** gc's own check detail advertises "every
-        /// upstream is a content hash", explicitly contemplating multi-input
-        /// recipes, and `rocky gc` told users evictions were "always restorable
-        /// from the recorded recipe". They are not — restore covers only the
-        /// zero-upstream, non-partitioned case. The tombstone is durable and
-        /// the custody state still retains the recipe (the canonical `ModelIr`
-        /// and recorded upstreams live in the `ProvenanceRecord` the tombstone
-        /// references), so nothing is destroyed, but the recovery route a user
-        /// is pointed at does not work for these artifacts, and re-running the
-        /// pipeline is not a substitute: it recomputes from current upstreams,
-        /// which need not reproduce the evicted bytes.
-        /// This PR corrects the misleading text; it does not close the gap.
-        ///
-        /// **Expected to invert when the gap is closed — but which half inverts
-        /// depends on the fix.** Two mutually exclusive fixes are possible, and
-        /// choosing between them is an owner decision:
-        /// - Narrow gc's eligibility predicate to reject recorded upstreams (a
-        ///   behavior change to a public surface): the `build_candidate`
-        ///   admission assertion above breaks — gc no longer admits the
-        ///   multi-input recipe — while `restore_one` keeps refusing (its
-        ///   behavior is unchanged).
-        /// - Build multi-input restore (DAG re-derivation from the recorded
-        ///   upstream bytes): the `restore_one` refusal assertion below breaks —
-        ///   restore now succeeds — while gc keeps admitting.
-        /// Either way this test must be revisited and renamed; it does not
-        /// self-adjust.
+        /// An artifact produced by a *multi-input* recipe (two content-hashed
+        /// upstreams, a `strong` closure) used to pass gc's admission while
+        /// `restore_one` refused it, so gc could evict what restore could not
+        /// bring back. gc's `check_recipe_recorded` now calls restore's own
+        /// shape predicate (`restorable_recipe`), so it refuses any recipe
+        /// restore refuses before touching a store. This test drives BOTH
+        /// sides against ONE artifact: gc must NOT admit it, and restore
+        /// refuses it for the multi-input reason. The partitioned case is
+        /// `gc_admission_is_a_subset_of_restore_recovery_partitioned`.
         #[tokio::test]
-        async fn gc_admits_multi_input_recipe_that_restore_refuses_known_gap() {
+        async fn gc_admission_is_a_subset_of_restore_recovery() {
             let dir = TempDir::new().unwrap();
             let root = dir.path();
             let state_path = root.join("state.redb");
@@ -2212,12 +2217,8 @@ mod tests {
                     .unwrap();
             }
 
-            // --- gc side: this artifact passes the FULL 6-check gc admission
-            // (`build_candidate`), not merely the recipe-recorded check — so the
-            // eviction set `rocky gc` actually approves genuinely includes a
-            // multi-input artifact that `restore_one` refuses below. A new
-            // production check that rejected upstream-bearing recipes would flip
-            // `derivable` to false here and fail this assertion.
+            // --- gc side: the FULL 6-check admission (`build_candidate`) rejects
+            // this artifact because it has recorded upstreams.
             //
             // Drive the REAL `classify_model` — the exact verdict `rocky gc`
             // reuses — rather than a hand-fabricated classification. With both
@@ -2269,18 +2270,22 @@ mod tests {
                 "the full admission is six checks"
             );
             assert!(
-                candidate.checks.iter().all(|c| c.passed),
-                "KNOWN GAP: gc's full 6-check admission marks a multi-input recipe derivable \
-                 (eligible for eviction): {:?}",
+                !candidate.derivable,
+                "gc must NOT admit a multi-input recipe restore cannot rebuild: {:?}",
                 candidate.checks
             );
+            let recorded = candidate
+                .checks
+                .iter()
+                .find(|c| c.check == "recipe_recorded")
+                .expect("recipe_recorded check present");
             assert!(
-                candidate.derivable,
-                "the multi-input artifact is admitted for eviction: {:?}",
-                candidate.checks
+                !recorded.passed && recorded.detail.contains("recorded upstream"),
+                "the multi-input refusal comes from check_recipe_recorded: {recorded:?}"
             );
 
-            // Evict it, exactly as an approved gc apply would.
+            // Force the eviction anyway (as a stale or hand-built plan would)
+            // so the restore side is exercised against the same artifact.
             let tomb = TombstoneRecord {
                 size_bytes: wr.size_bytes,
                 commit_version: wr.commit_version,
@@ -2326,8 +2331,8 @@ mod tests {
 
             let RestoreOneOutcome::Refused(refused) = outcome else {
                 panic!(
-                    "KNOWN GAP pin is stale: restore no longer refuses multi-input recipes. If \
-                     multi-input restore has landed, invert this test rather than deleting it."
+                    "restore no longer refuses multi-input recipes. If multi-input restore has \
+                     landed, relax gc's check_recipe_recorded and update this test."
                 );
             };
             assert!(
@@ -2339,6 +2344,134 @@ mod tests {
 
             // Nothing was reinstated — the artifact gc evicted stays unrecovered.
             assert_eq!(store.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
+        }
+
+        /// #2283, partitioned half: `restore_one` refuses any recipe with
+        /// partition columns, and partitioned content-addressed writes are
+        /// live. gc must refuse the same artifact. Drives BOTH sides against
+        /// ONE zero-upstream, partitioned artifact.
+        #[tokio::test]
+        async fn gc_admission_is_a_subset_of_restore_recovery_partitioned() {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path();
+            let state_path = root.join("state.redb");
+            let cas = Arc::new(InMemory::new());
+            seed_bootstrap(&cas).await;
+            let mut ir = orders_ir();
+            let wr = produce_real_bytes(cas.clone(), &ir).await;
+            let rocky_ir::MaterializationStrategy::ContentAddressed {
+                partition_columns, ..
+            } = &mut ir.materialization
+            else {
+                panic!("orders_ir is content-addressed");
+            };
+            partition_columns.push("id".to_string());
+
+            let outputs = vec![OutputArtifact {
+                blake3_hash: wr.blake3_hash.clone(),
+                file_path: wr.file_path.clone(),
+            }];
+            let written = Utc::now() - Duration::days(30);
+            let (entry, prov) =
+                rocky_core::reuse::build_records(&ir, "r1", &[], &outputs, written).unwrap();
+            assert!(
+                prov.upstreams.is_empty(),
+                "single-input: only the partition differs"
+            );
+
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+                .unwrap();
+            let art_record = ArtifactRecord {
+                blake3_hash: wr.blake3_hash.clone(),
+                run_id: "r1".to_string(),
+                model_name: "orders".to_string(),
+                file_path: wr.file_path.clone(),
+                commit_version: wr.commit_version,
+                size_bytes: wr.size_bytes,
+                written_at: written,
+            };
+            store.record_artifact(&art_record).unwrap();
+            record_run(&store, "r1", "orders");
+
+            // --- gc side: the full admission, with the real classification.
+            let class = crate::commands::replay::classify_model(&store, "r1", "orders");
+            assert_eq!(class.verdict, "replayable", "{:?}", class.reasons);
+            let refcount = store.refcount_for_hash(&wr.blake3_hash).unwrap();
+            let candidate = crate::commands::gc::build_candidate(
+                &art_record,
+                refcount,
+                &class,
+                None,
+                Some(&prov),
+                Utc::now(),
+                7,
+                None,
+            );
+            let failing: Vec<&str> = candidate
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| c.check.as_str())
+                .collect();
+            assert_eq!(
+                failing,
+                vec!["recipe_recorded"],
+                "ONLY the restore-shape check refuses it: {:?}",
+                candidate.checks
+            );
+            assert!(!candidate.derivable);
+
+            // --- restore side: refuses the very same artifact, same reason.
+            let tomb = TombstoneRecord {
+                size_bytes: wr.size_bytes,
+                commit_version: wr.commit_version,
+                ..tombstone(
+                    &wr.blake3_hash,
+                    "r1",
+                    "orders",
+                    &wr.file_path,
+                    Some("recipe-orders"),
+                )
+            };
+            store
+                .evict_artifact(&tomb, "r1", "orders", &wr.file_path)
+                .unwrap();
+            let tombstones = store.list_tombstones().unwrap();
+            let planned = RestorePlanRestoration {
+                model_name: "orders".to_string(),
+                run_id: "r1".to_string(),
+                blake3_hash: wr.blake3_hash.clone(),
+                file_path: wr.file_path.clone(),
+                size_bytes: wr.size_bytes,
+                commit_version: wr.commit_version,
+                evicted_at: tomb.evicted_at.to_rfc3339(),
+                gc_plan_id: "gc-plan".to_string(),
+                recipe_hash: Some("recipe-orders".to_string()),
+                input_hash: None,
+                input_proof_class: Some("strong".to_string()),
+            };
+            let outcome = restore_one(
+                &store,
+                &SharedStore(cas.clone()),
+                &fresh_duckdb(),
+                &tombstones,
+                "restore-plan",
+                &planned,
+                Utc::now(),
+                &NoFence,
+                &WrittenObjects::default(),
+            )
+            .await;
+            let RestoreOneOutcome::Refused(refused) = outcome else {
+                panic!("restore no longer refuses partitioned recipes; relax gc with it");
+            };
+            assert!(
+                refused.reason.contains("partitioned restore"),
+                "{}",
+                refused.reason
+            );
         }
 
         /// Regression (a): a tombstone whose claimed hash the recipe cannot
@@ -3664,6 +3797,7 @@ mod tests {
                 let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
                     Some(&cfg),
                     &touched,
+                    crate::commands::apply::EmptyTouched::NoOp,
                     &models_dir,
                     None,
                 ));

@@ -342,6 +342,21 @@ impl ToolError {
     pub fn internal(message: impl Into<String>, hint: impl Into<String>) -> Json<Self> {
         Self::wrap(ToolErrorCode::Internal, message, hint)
     }
+
+    /// [`Self::internal`] for a draft that was rolled back first, because the
+    /// shared ledger could not record its policy decision (#2282). Carries
+    /// `rollback_failed_paths` exactly like
+    /// [`Self::policy_denied_after_rollback`]; `None` (a clean rollback) is
+    /// wire-identical to [`Self::internal`].
+    pub fn internal_after_rollback(
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        rollback_failed_paths: Option<Vec<String>>,
+    ) -> Json<Self> {
+        let mut wrapped = Self::wrap(ToolErrorCode::Internal, message, hint);
+        wrapped.0.rollback_failed_paths = rollback_failed_paths;
+        wrapped
+    }
 }
 
 #[cfg(test)]

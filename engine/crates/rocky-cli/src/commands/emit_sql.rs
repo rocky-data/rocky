@@ -157,7 +157,7 @@ fn emit_models_selected(
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
     };
-    let result = match compile::compile(&config) {
+    let mut result = match compile::compile(&config) {
         Ok(r) => r,
         // A replication-only project has no compiled transformation models —
         // there is no transformation SQL to emit. Return empty with a note
@@ -178,6 +178,19 @@ fn emit_models_selected(
             return Err(anyhow::Error::from(e).context("failed to compile models for emit-sql"));
         }
     };
+
+    // The per-model-target checks `rocky compile` runs (E042/E043, E044, E049,
+    // E051, E053, E054): SQL the pipeline's warehouse cannot run is not
+    // emitted. Needs a loaded config and its path; a standalone project has
+    // no target to judge against.
+    if let (Some(project_config), Some(path)) = (project_config.as_ref(), config_path) {
+        super::apply_model_target_gates(
+            &mut result,
+            project_config,
+            path,
+            rocky_server::project_gates::ModelSqlForm::Inlined,
+        );
+    }
 
     // A successful compile can still carry error diagnostics — e.g. E028 for a
     // required `@var(...)` with no supplied value, which substitutes the
@@ -741,6 +754,55 @@ mod tests {
         assert!(body.lines().next().unwrap().starts_with("-- DROP VIEW"));
         assert!(body.contains("only if the existing object is a view"));
         assert!(body.contains("CREATE OR REPLACE TABLE"));
+    }
+
+    /// `emit-sql` runs the per-model-target checks of `rocky compile`: a merge
+    /// model on a ClickHouse pipeline (E053) is refused, not emitted.
+    #[test]
+    fn emit_sql_refuses_a_model_the_pipeline_warehouse_cannot_run() {
+        let write = |warehouse: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models).unwrap();
+            std::fs::write(models.join("m.sql"), "SELECT 1 AS id, 2 AS v\n").unwrap();
+            std::fs::write(
+                models.join("m.toml"),
+                "name = \"m\"\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\
+                 [target]\ncatalog = \"\"\nschema = \"s\"\ntable = \"m\"\n",
+            )
+            .unwrap();
+            let config = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "[adapter.wh]\n{warehouse}\n[pipeline.trans]\ntype = \"transformation\"\n\
+                     models = \"models/**\"\n[pipeline.trans.target]\nadapter = \"wh\"\n"
+                ),
+            )
+            .unwrap();
+            (dir, models, config)
+        };
+
+        let (_dir, models, config) = write("type = \"clickhouse\"\nhost = \"localhost\"");
+        let err = emit_models(
+            Some(&config),
+            &models,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .err()
+        .expect("a ClickHouse pipeline cannot run a merge model");
+        assert!(format!("{err:#}").contains("E053"), "{err:#}");
+
+        let (_dir, models, config) = write("type = \"duckdb\"");
+        let emitted = emit_models(
+            Some(&config),
+            &models,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("DuckDB runs a merge model");
+        assert_eq!(emitted.models.len(), 1);
     }
 
     #[test]

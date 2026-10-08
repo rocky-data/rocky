@@ -988,6 +988,27 @@ mod tests {
         assert_eq!(value(&db, "memory.s.in_memory"), "2");
     }
 
+    /// A catalog that already resolves is reused, not attached again: data
+    /// already in it survives, and no refusal is raised.
+    #[test]
+    fn a_catalog_that_already_resolves_is_reused_not_reattached() {
+        let dir = project(&[m("kept", "SELECT 2 AS v", ("pre", "s", "kept"))]);
+        let compiled = rocky_compiler::compile::compile(&CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        let db = DuckDbConnector::in_memory().unwrap();
+        db.execute_statement("ATTACH ':memory:' AS pre").unwrap();
+        db.execute_statement("CREATE TABLE pre.main.marker AS SELECT 9 AS v")
+            .unwrap();
+        let result = execute_locally(&compiled, &db);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(value(&db, "pre.s.kept"), "2");
+        // A second ATTACH would have failed or replaced the database.
+        assert_eq!(value(&db, "pre.main.marker"), "9");
+    }
+
     /// A model that reads another model's target by its qualified name runs
     /// after it — the local order includes the physical-read edges — and a
     /// failed producer withholds that reader too.

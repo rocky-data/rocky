@@ -67,18 +67,11 @@
 //! `ModelIr` that will not deserialize, an unreachable object store or table
 //! state, a re-derivation whose blake3 differs from the tombstoned hash, a path
 //! outside the storage prefix, or a lost race on atomic ledger reinstatement).
-//! The eviction checks below admit multi-input recipes (a `strong` closure over
-//! several content-hashed upstreams still passes [`check_recipe_recorded`]), so
-//! gc can evict artifacts restore cannot yet rebuild. The tombstone is still
-//! durable, and the custody state still retains the recipe — the canonical
-//! `ModelIr` and recorded upstreams live in the `ProvenanceRecord` the
-//! tombstone's `(run_id, model_name)` points at, not in the tombstone itself —
-//! but for a multi-input artifact that recipe has no route back to the evicted
-//! bytes today. Re-running the pipeline is not that route: it recomputes from
-//! *current* upstreams, and a recipe is only bit-reproducible against the
-//! inputs it recorded — if any upstream has moved on the re-run yields
-//! different bytes, a new artifact at the same logical path. Until multi-input
-//! restore lands, those exact bytes may be unrecoverable.
+//! So [`check_recipe_recorded`] calls restore's own shape predicate
+//! ([`restorable_recipe`]): a partitioned or multi-input artifact is **not
+//! evicted** until restore can rebuild it. Re-running the pipeline is not a
+//! route back: it recomputes from *current* upstreams, and a recipe is only
+//! bit-reproducible against the inputs it recorded.
 //!
 //! # Reachability
 //!
@@ -109,6 +102,7 @@ use crate::commands::apply::{
     PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy_matching,
 };
 use crate::commands::replay::classify_model;
+use crate::commands::restore::restorable_recipe;
 use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
     GcApplyOutput, GcCandidateOutput, GcCheckOutput, GcEvictedOutput, GcPlan, GcPlanEviction,
@@ -127,36 +121,63 @@ type AdapterCost = (String, WarehouseType, f64, f64);
 // The eligibility checks — each a pure function, each fails closed.
 // ---------------------------------------------------------------------------
 
-/// Check 1 — recipe recorded with a strong (non-weak) input closure.
+/// Check 1 — recipe recorded, strong, and of a shape `rocky restore` rebuilds.
 ///
-/// A provenance record must exist *and* its input closure must be `strong`
-/// (every upstream is a content hash). A `heuristic` closure means at least
-/// one input is a mutable-source freshness signal whose data may have moved
-/// on — such a table is not derivable.
+/// A provenance record must exist *and* its input closure must be `strong`.
+/// A `heuristic` closure means at least one input is a mutable-source
+/// freshness signal whose data may have moved on — such a table is not
+/// derivable.
 ///
-/// **Known gap (asymmetry with `rocky restore`).** A `strong` closure over
-/// *several* content-hashed upstreams passes this check, but `restore` refuses
-/// any recipe with recorded upstreams (multi-input rebuild needs DAG
-/// re-derivation, not yet implemented). So this check's pass set is strictly
-/// larger than restore's recovery set. Pinned by
-/// `gc_admits_multi_input_recipe_that_restore_refuses_known_gap` in
-/// `commands/restore.rs`. Narrowing this predicate is a behavior change
-/// pending a design decision.
-pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
+/// The recipe must also pass [`restorable_recipe`], the same predicate
+/// `rocky restore` uses before it rebuilds: the canonical `ModelIr`
+/// deserializes, the recipe is content-addressed, it has **no partition
+/// columns**, and it reads **no recorded upstreams**. Restore cannot rebuild
+/// a partitioned or multi-input recipe yet, so gc must not evict one. Because
+/// both commands call one function, gc's eligible set stays a subset of
+/// restore's recovery set; pinned by
+/// `gc_admission_is_a_subset_of_restore_recovery` in `commands/restore.rs`.
+pub(crate) fn check_recipe_recorded(
+    class: &ReplayCheckModelOutput,
+    prov: Option<&ProvenanceRecord>,
+) -> GcCheckOutput {
     let strong = class.proof_class.as_deref() == Some("strong");
-    let passed = class.has_provenance && strong;
-    let detail = if !class.has_provenance {
-        "no provenance record — the producing run was not content-addressed, so the recipe was \
-         never captured"
-            .to_string()
-    } else if strong {
-        "recipe + strong input closure recorded (every upstream is a content hash)".to_string()
-    } else {
-        format!(
-            "input closure is weak (proof_class={}) — derived from a mutable source whose inputs \
-             may have moved on",
-            class.proof_class.as_deref().unwrap_or("unknown")
+    let (passed, detail) = if !class.has_provenance {
+        (
+            false,
+            "no provenance record — the producing run was not content-addressed, so the recipe \
+             was never captured"
+                .to_string(),
         )
+    } else if !strong {
+        (
+            false,
+            format!(
+                "input closure is weak (proof_class={}) — derived from a mutable source whose \
+                 inputs may have moved on",
+                class.proof_class.as_deref().unwrap_or("unknown")
+            ),
+        )
+    } else {
+        match prov.map(restorable_recipe) {
+            None => (
+                false,
+                "provenance could not be read for the restore-shape check — not evicted \
+                 (fail-closed)"
+                    .to_string(),
+            ),
+            Some(Err(reason)) => (
+                false,
+                format!(
+                    "`rocky restore` cannot rebuild this recipe, so it is not evicted: {reason}"
+                ),
+            ),
+            Some(Ok(_)) => (
+                true,
+                "recipe recorded with a strong input closure, in a shape `rocky restore` \
+                 rebuilds (content-addressed, unpartitioned, no recorded upstreams)"
+                    .to_string(),
+            ),
+        }
     };
     GcCheckOutput {
         check: "recipe_recorded".to_string(),
@@ -387,7 +408,7 @@ pub(crate) fn build_candidate(
     adapter: Option<&AdapterCost>,
 ) -> GcCandidateOutput {
     let checks = vec![
-        check_recipe_recorded(class),
+        check_recipe_recorded(class, prov),
         check_recipe_produces_output(&artifact.blake3_hash, &artifact.file_path, prov),
         check_replayable(class),
         check_unreferenced(refcount),
@@ -415,21 +436,21 @@ pub(crate) fn build_candidate(
 /// numbers. These are the honesty guardrails the plan mandates.
 fn report_notes(min_age_days: i64) -> Vec<String> {
     vec![
-        "`derivable` means a recipe was recorded and bound to this artifact's bytes — NOT that \
-         the file is safe to delete, and NOT that `rocky restore` can rebuild it (restore covers \
-         only recipes that read no recorded upstreams; see the restore caveat below). `rocky \
+        "`derivable` means a recipe was recorded, bound to this artifact's bytes, and has a \
+         shape `rocky restore` rebuilds — NOT that the file is safe to delete, and NOT that a \
+         restore will succeed (see the restore caveat below). `rocky \
          apply` reclaims an artifact only when its file is a proven `remove` in its table's Delta \
          log and Delta's retention window (`delta.deletedFileRetentionDuration`, default 7 days) \
          has passed since its removal. A derivable file the live table still references is \
          held."
             .to_string(),
-        "Restore coverage is narrower than derivability. `rocky restore` rebuilds an evicted \
-         artifact only from a recipe that is non-partitioned, content-addressed, and reads no \
-         recorded upstreams — and even then it can refuse (missing tombstone/provenance binding, \
-         canonical IR that will not deserialize, unreachable object store or table state, a \
-         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race \
-         on ledger reinstatement). A recipe with ANY recorded upstream cannot be restored today. \
-         Re-running the pipeline is not an equivalent: it recomputes from current upstreams and \
+        "Restore coverage. `rocky restore` rebuilds an evicted artifact only from a recipe \
+         that is non-partitioned, content-addressed, and reads no recorded upstreams. gc applies \
+         that same check (one shared predicate), so it does not mark a partitioned or \
+         multi-input artifact derivable. Restore can still refuse on live state (missing \
+         tombstone/provenance binding, unreachable object store or table state, partition \
+         columns on the live table, a re-derivation whose blake3 differs, a path outside the \
+         storage prefix, or a lost race on ledger reinstatement). Re-running the pipeline is not an equivalent: it recomputes from current upstreams and \
          need not reproduce the evicted bytes."
             .to_string(),
         "Scope: refcounts see Rocky-managed references only. A warehouse-side reference Rocky \
@@ -789,12 +810,11 @@ fn gc_plan_notes() -> Vec<String> {
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
          the ledger row is retired. `rocky restore` attempts a rebuild only for a recipe that is \
-         non-partitioned, content-addressed, and reads no recorded upstreams — and that shape is \
-         necessary, not sufficient: a supported recipe can still refuse (missing \
-         tombstone/provenance binding, canonical IR that will not deserialize, unreachable object \
-         store or table state, a re-derivation whose blake3 differs, a path outside the storage \
-         prefix, or a lost race on ledger reinstatement). A recipe with ANY recorded upstream \
-         CANNOT be restored today (multi-input DAG re-derivation is a later phase). Re-running \
+         non-partitioned, content-addressed, and reads no recorded upstreams, and gc plans only \
+         that shape (one shared check). The shape is necessary, not sufficient: a supported \
+         recipe can still refuse (missing tombstone/provenance binding, unreachable object store \
+         or table state, a re-derivation whose blake3 differs, a path outside the storage \
+         prefix, or a lost race on ledger reinstatement). Re-running \
          the pipeline is not an equivalent — it recomputes from current upstreams and need not \
          reproduce the evicted bytes. What is durably retained is the eviction record plus the \
          provenance the tombstone points at, not a guarantee that these exact bytes stay \
@@ -879,7 +899,8 @@ fn gc_plan_scope_summary(plan: &GcPlan) -> String {
 /// enforce against that stored stamp: the gc apply gate evaluates the
 /// most-restrictive of the *apply-time* runtime principal and the plan-kind
 /// default, so an agent applier (`ROCKY_PRINCIPAL=agent rocky apply`) makes an
-/// agent-scoped `deny agent gc` rule fire, while a human applier vouches. The
+/// agent-scoped `deny agent gc` rule fire. A `Gc` plan is also agent by KIND, so the rule
+/// fires even with no `ROCKY_PRINCIPAL`. The
 /// review gate is unconditional regardless.
 pub fn run_gc_plan(
     state_path: &Path,
@@ -1139,15 +1160,13 @@ fn gc_apply_notes() -> Vec<String> {
         "`rocky restore <target>` writes a review-gated plan that rebuilds the artifact from the \
          recipe its tombstone references and asserts the recomputed blake3 equals the tombstoned \
          hash before any write becomes visible. KNOWN LIMITATION: restore attempts a rebuild only \
-         for non-partitioned, content-addressed recipes that read no recorded upstreams — it \
-         refuses a recipe with ANY recorded upstream rather than substituting current data, so a \
-         multi-input artifact evicted here cannot be restored today. That shape is necessary, not \
-         sufficient: a supported recipe can still refuse on a missing provenance binding, \
-         canonical IR that will not deserialize, unreachable object store or table state, a \
-         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race on \
-         ledger reinstatement. Re-running its pipeline recomputes the model from \
-         current upstreams and need not reproduce the evicted bytes; if those upstreams have \
-         moved on, the exact bytes are unrecoverable until multi-input restore lands."
+         for non-partitioned, content-addressed recipes that read no recorded upstreams. gc uses \
+         the same check, so a partitioned or multi-input artifact is never evicted here. That \
+         shape is necessary, not sufficient: a supported recipe can still refuse on a missing \
+         provenance binding, unreachable object store or table state, a re-derivation whose \
+         blake3 differs, a path outside the storage prefix, or a lost race on ledger \
+         reinstatement. Re-running its pipeline recomputes the model from current upstreams and \
+         need not reproduce the evicted bytes."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1565,6 +1584,8 @@ async fn gc_seam_regate(
         principal,
         actor,
         touched,
+        // gc's touched set is exactly its evictions: empty evicts nothing.
+        crate::commands::apply::EmptyTouched::NoOp,
         models_dir,
         models_glob,
         prior_decisions,
@@ -1600,6 +1621,7 @@ type RegatePolicy = (
 pub(crate) fn resolve_ledger_seam_regate(
     cfg: Option<&rocky_core::config::RockyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: crate::commands::apply::EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
 ) -> ResolvedRegate {
@@ -1607,6 +1629,7 @@ pub(crate) fn resolve_ledger_seam_regate(
         crate::commands::apply::resolve_policy_and_attrs(
             Some(policy),
             touched,
+            empty_touched,
             models_dir,
             models_glob,
         )
@@ -1632,13 +1655,14 @@ pub(crate) async fn ledger_seam_regate(
     principal: rocky_core::config::PolicyPrincipal,
     actor: &rocky_core::config::PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: crate::commands::apply::EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
     fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
-    let resolved = resolve_ledger_seam_regate(cfg, touched, models_dir, models_glob);
+    let resolved = resolve_ledger_seam_regate(cfg, touched, empty_touched, models_dir, models_glob);
     ledger_seam_regate_resolved(
         verb,
         cfg,
@@ -1901,6 +1925,7 @@ pub(crate) async fn run_gc_apply_in_with(
         plan_record.enforcement_principal(runtime_principal),
         actor,
         &touched,
+        crate::commands::apply::EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -1916,8 +1941,8 @@ pub(crate) async fn run_gc_apply_in_with(
         let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
         bail!(
             "policy DENIES gc plan '{plan_id}': model '{model}'{rule} — {reason}. \
-             A deny cannot be satisfied by review; re-scope the reclamation or have a \
-             human apply it."
+             A deny cannot be satisfied by review; re-scope the reclamation or change the rule. \
+             A gc plan is gated as an agent whoever applies it."
         );
     }
 
@@ -1948,8 +1973,8 @@ pub(crate) async fn run_gc_apply_in_with(
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
              record, and the recipe stays in the provenance it references (`rocky restore` \
-             attempts a rebuild only for recipes that read no recorded upstreams, and can still \
-             refuse; a recipe with ANY recorded upstream cannot be restored today, and re-running \
+             attempts a rebuild only for unpartitioned recipes that read no recorded upstreams, \
+             gc evicts only that shape, restore can still refuse, and re-running \
              its pipeline recomputes from current upstreams rather than reproducing the evicted \
              bytes)."
         );
@@ -2187,21 +2212,75 @@ auto_create_schemas = true
 
     // -- individual checks ------------------------------------------------
 
+    /// A provenance record for `x`, written by the production `build_records`
+    /// path, with the given upstreams and partition columns.
+    fn shaped_prov(upstreams: &[UpstreamIdentity], partition_columns: &[&str]) -> ProvenanceRecord {
+        let mut ir = ca_ir("x", "SELECT 1 AS id");
+        ir.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://b/tgt/raw/x".to_string(),
+            partition_columns: partition_columns.iter().map(ToString::to_string).collect(),
+        };
+        let outputs = vec![OutputArtifact {
+            blake3_hash: HA.to_string(),
+            file_path: format!("s3://b/{HA}.parquet"),
+        }];
+        build_records(&ir, "r1", upstreams, &outputs, Utc::now())
+            .unwrap()
+            .1
+    }
+
     #[test]
     fn recipe_recorded_requires_strong_provenance() {
         let mut m = model("x");
-        assert!(check_recipe_recorded(&m).passed);
+        let prov = shaped_prov(&[], &[]);
+        assert!(check_recipe_recorded(&m, Some(&prov)).passed);
 
         m.proof_class = Some("heuristic".to_string());
-        let c = check_recipe_recorded(&m);
+        let c = check_recipe_recorded(&m, Some(&prov));
         assert!(!c.passed);
         assert!(c.detail.contains("weak"));
 
         m.has_provenance = false;
         m.proof_class = None;
-        let c = check_recipe_recorded(&m);
+        let c = check_recipe_recorded(&m, None);
         assert!(!c.passed);
         assert!(c.detail.contains("no provenance"));
+    }
+
+    #[test]
+    fn recipe_recorded_refuses_recorded_upstreams() {
+        let m = model("x");
+        let prov = shaped_prov(
+            &[UpstreamIdentity::Content {
+                upstream_key: "tgt.raw.customers".to_string(),
+                blake3_hash: HB.to_string(),
+            }],
+            &[],
+        );
+        let c = check_recipe_recorded(&m, Some(&prov));
+        assert!(!c.passed, "restore cannot rebuild a multi-input recipe");
+        assert!(c.detail.contains("recorded upstream"), "got: {}", c.detail);
+    }
+
+    /// #2283: restore refuses a partitioned recipe, so gc must too.
+    #[test]
+    fn recipe_recorded_refuses_partitioned_recipe() {
+        let m = model("x");
+        let prov = shaped_prov(&[], &["day"]);
+        let c = check_recipe_recorded(&m, Some(&prov));
+        assert!(!c.passed, "restore cannot rebuild a partitioned recipe");
+        assert!(
+            c.detail.contains("partitioned restore"),
+            "got: {}",
+            c.detail
+        );
+    }
+
+    /// A strong verdict whose provenance could not be read fails closed.
+    #[test]
+    fn recipe_recorded_fails_closed_without_the_provenance_row() {
+        let c = check_recipe_recorded(&model("x"), None);
+        assert!(!c.passed);
     }
 
     #[test]
@@ -2273,7 +2352,9 @@ auto_create_schemas = true
             model_name: art.model_name.clone(),
             input_hash: "ih".to_string(),
             skip_hash: "sh".to_string(),
-            model_ir_canonical_json: "{}".to_string(),
+            // A real content-addressed recipe: check 1 parses it with
+            // restore's shape predicate.
+            model_ir_canonical_json: ca_ir(&art.model_name, "SELECT 1 AS id").canonical_json(),
             upstreams: Vec::new(),
             output_blake3: vec![art.blake3_hash.clone()],
             output_path: vec![art.file_path.clone()],
@@ -3232,6 +3313,47 @@ auto_create_schemas = true
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// #2284: a `deny agent gc` rule refuses a gc plan even when nobody set
+    /// `ROCKY_PRINCIPAL` (an unattended cron or daemon gc). The runtime
+    /// principal here is `Human`, the floor; the plan KIND forces `agent`.
+    /// Before the fix a gc plan defaulted to `human` and the rule never matched.
+    #[tokio::test]
+    async fn deny_agent_gc_refuses_an_unstamped_gc_plan_with_no_principal() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            crate::plan_store::write_plan(dir.path(), PlanKind::Gc, &plan).unwrap()
+        };
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"gc\"\neffect = \"deny\"\nscope = { any = true }\n",
+        )
+        .unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
+
+        let err = run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect_err("a deny agent gc rule must refuse an unattended gc");
+        assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(store.list_tombstones().unwrap().is_empty());
     }
 
     /// S1 (#1089): with a REMOTE `[state]` backend, `gc apply` brackets the
@@ -4591,6 +4713,7 @@ auto_create_schemas = true
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
@@ -4729,10 +4852,11 @@ auto_create_schemas = true
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
                                 keys_recorded: false,
+                                fail_closed: false,
                                 models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),
-                                principal: PolicyPrincipal::Human,
+                                principal: PolicyPrincipal::Agent,
                                 capability: PolicyCapability::Apply,
                                 model: "any".to_string(),
                                 effect: rocky_core::config::PolicyEffect::Deny,
@@ -4952,7 +5076,7 @@ auto_create_schemas = true
                         &self.provider,
                         &rocky_core::freeze_marker::FreezeMarker {
                             freeze_id: "mid-transition".to_string(),
-                            principal: PolicyPrincipal::Human,
+                            principal: PolicyPrincipal::Agent,
                             scope: "any".to_string(),
                             reason: "landed during eviction".to_string(),
                             created_at: Utc::now(),

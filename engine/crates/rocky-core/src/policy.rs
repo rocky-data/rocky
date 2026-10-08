@@ -1695,6 +1695,7 @@ mod tests {
     fn plain_row(plan_id: &str, rule_id: Option<usize>, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: ts,
             plan_id: plan_id.to_string(),
@@ -1715,6 +1716,7 @@ mod tests {
     fn verify_fail_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: ts,
             plan_id: plan_id.to_string(),
@@ -1734,6 +1736,7 @@ mod tests {
     fn verify_pass_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: ts,
             plan_id: plan_id.to_string(),
@@ -1757,6 +1760,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: ts,
             plan_id: format!("{prefix}{}", ts.to_rfc3339()),

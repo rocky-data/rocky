@@ -52,7 +52,7 @@ use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
+use crate::commands::apply::{FAIL_CLOSED_FLOOR_MARKER, ai_plan_is_reviewed, review_marker_path};
 use crate::commands::approval_scope::{
     ApprovalScope, CompiledUnit, NoModels, OwnedScopeIdentities, ScopeUnit, approval_scope,
     scope_fingerprint,
@@ -1288,6 +1288,19 @@ fn build_queue(
     Ok((entries, excluded_non_plan))
 }
 
+/// Whether `d` is an operational `deny` (the fail-closed floor, or a freeze)
+/// rather than a policy verdict.
+///
+/// `fail_closed` answers it for a row this binary wrote. A legacy row (written
+/// before the field, or by an older binary on a shared ledger) has no field
+/// and reads `false`, so the floor's fixed reason text
+/// ([`FAIL_CLOSED_FLOOR_MARKER`]) marks it too. A legacy freeze deny carries
+/// no such fixed text that tells it from a policy deny, so it still reads as
+/// policy.
+fn is_fail_closed_deny(d: &PolicyDecisionRecord) -> bool {
+    d.fail_closed || d.reason.contains(FAIL_CLOSED_FLOOR_MARKER)
+}
+
 /// The pending escalations to surface: the latest `require_review` decision
 /// per `(plan_id, model)` whose plan has not yet been signed off **and whose
 /// plan actually exists to be approved**.
@@ -1315,18 +1328,23 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
-    // A `deny` row is left out of the latest-row pick, so it neither queues
-    // nor supersedes. It cannot supersede: the fail-closed path records a
-    // `deny` when the ledger snapshot could not be read — an operational
-    // refusal, not a policy decision about the plan — and the row cannot say
-    // which kind it is. Letting it supersede hid an escalation the policy
-    // still required until someone retried the mutation (#1815, review round
-    // three). A superseded-by-deny escalation stays approvable, which is what
-    // it was before; approval then meets the deny at apply, loudly.
-    for d in decisions
-        .into_iter()
-        .filter(|d| d.effect != PolicyEffect::Deny)
-    {
+    // A policy `deny` supersedes an older `require_review`: policy tightened
+    // and the plan re-ran, so approving the old escalation is moot (#1829).
+    // Two kinds of `deny` row are left out of the pick, so they neither queue
+    // nor supersede:
+    //   - a fail-closed deny (`fail_closed`): the gate could not read the
+    //     ledger snapshot, or an active freeze forced the deny; neither says
+    //     anything about the plan. Letting it
+    //     supersede hid an escalation the policy still required until someone
+    //     retried the mutation (#1815, review round three);
+    //   - a deny that is not an evaluation (freeze or verify-after custody):
+    //     its `deny` is an administrative or verification verdict.
+    // A row written before `fail_closed` existed (or by an older binary on a
+    // shared ledger) lacks the field; see `is_fail_closed_deny` for how the
+    // floor's own text still marks it.
+    for d in decisions.into_iter().filter(|d| {
+        d.effect != PolicyEffect::Deny || (d.is_evaluation() && !is_fail_closed_deny(d))
+    }) {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
@@ -1339,9 +1357,9 @@ pub(crate) fn select_outstanding<'a>(
     let mut excluded_non_plan: u64 = 0;
     let outstanding = latest
         .into_values()
-        // The LATEST of `require_review` and `allow` per key decides. A
-        // `require_review` that a later `allow` for the same (plan, model)
-        // superseded is history: policy loosened, the plan re-ran, approving
+        // The LATEST of `require_review`, `allow` and a policy `deny` per key
+        // decides. A `require_review` that a later `allow` or policy `deny`
+        // for the same (plan, model) superseded is history: policy loosened, the plan re-ran, approving
         // it is moot. Filtering to `require_review` BEFORE picking the
         // latest kept such rows approvable (#1815, review round two).
         .filter(|d| d.effect == PolicyEffect::RequireReview)
@@ -1435,6 +1453,7 @@ pub(crate) fn record_plan_review_escalation(
     let record = PolicyDecisionRecord {
         // The plan-level writer names its set on purpose.
         keys_recorded: true,
+        fail_closed: false,
         models,
         timestamp: Utc::now(),
         plan_id: plan_id.to_string(),
@@ -2611,6 +2630,7 @@ mod tests {
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -2752,16 +2772,15 @@ mod tests {
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
     }
 
-    /// The latest of `require_review` and `allow` per (plan, model) decides.
-    /// A `require_review` followed by an `allow` (policy loosened, plan
-    /// re-run) is moot and used to stay in the queue, because the effect
-    /// filter ran before the latest-row pick. A later `deny` does NOT
-    /// supersede: a deny may be the fail-closed refusal of an unreadable
-    /// ledger, which says nothing about the plan, and the row cannot tell
-    /// the two apart — so the escalation stays, as it always did. The
-    /// reverse orders queue: the newest row is the escalation.
+    /// The latest of `require_review`, `allow` and a policy `deny` per
+    /// (plan, model) decides. A later `allow` or policy `deny` supersedes an
+    /// older `require_review`. A later fail-closed `deny` (ledger unreadable)
+    /// does NOT: it says nothing about the plan, so the escalation stays.
+    /// The reverse orders queue: the newest row is the escalation.
     #[test]
-    fn a_later_allow_supersedes_an_older_require_review_but_a_deny_does_not() {
+    fn a_later_allow_or_policy_deny_supersedes_but_a_fail_closed_deny_does_not() {
+        let mut fail_closed_deny = qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply);
+        fail_closed_deny.fail_closed = true;
         let decisions = vec![
             qd(
                 1,
@@ -2784,7 +2803,7 @@ mod tests {
                 PolicyEffect::RequireReview,
                 PolicyCapability::Apply,
             ),
-            qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply),
+            fail_closed_deny,
             qd(
                 1,
                 "planC",
@@ -2807,6 +2826,15 @@ mod tests {
                 PolicyEffect::RequireReview,
                 PolicyCapability::Apply,
             ),
+            // A policy deny after the escalation supersedes it.
+            qd(
+                1,
+                "planE",
+                "v",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(5, "planE", "v", PolicyEffect::Deny, PolicyCapability::Apply),
         ];
         let (out, excluded) = select_outstanding(&decisions, |_| false, |_| true);
         assert_eq!(excluded, 0);
@@ -2815,8 +2843,61 @@ mod tests {
         assert_eq!(
             plans,
             vec!["planB", "planC", "planD"],
-            "an allow supersedes; a deny does not; new escalations queue"
+            "an allow or policy deny supersedes; a fail-closed deny does not; new escalations queue"
         );
+    }
+
+    /// #1829, legacy rows: a floor deny written before `fail_closed` existed
+    /// (or by an older binary on a shared ledger) has no field and reads
+    /// `false`. The floor's fixed reason text still marks it, so it does not
+    /// supersede the escalation. A plain policy deny of the same shape does.
+    #[test]
+    fn a_legacy_floor_deny_without_the_field_does_not_supersede() {
+        let legacy_json = |reason: &str| {
+            serde_json::json!({
+                "timestamp": "2026-07-07T00:00:05Z",
+                "plan_id": "planL",
+                "principal": "agent",
+                "capability": "apply",
+                "model": "m",
+                "effect": "deny",
+                "rule_id": null,
+                "reason": reason,
+            })
+        };
+        let floor_reason = format!(
+            "matched rule 0; policy ledger unreadable — freeze/budget state unverifiable, agent \
+             mutation refused {}",
+            crate::commands::apply::FAIL_CLOSED_FLOOR_MARKER
+        );
+        let legacy_floor: PolicyDecisionRecord =
+            serde_json::from_value(legacy_json(&floor_reason)).expect("a legacy row parses");
+        assert!(
+            !legacy_floor.fail_closed,
+            "the field is absent on a legacy row"
+        );
+        let legacy_policy: PolicyDecisionRecord =
+            serde_json::from_value(legacy_json("matched rule 0")).expect("a legacy row parses");
+        let escalation = qd(
+            1,
+            "planL",
+            "m",
+            PolicyEffect::RequireReview,
+            PolicyCapability::Apply,
+        );
+
+        let floor = vec![escalation.clone(), legacy_floor];
+        let (out, _) = select_outstanding(&floor, |_| false, |_| true);
+        assert_eq!(
+            out.len(),
+            1,
+            "the escalation stays after a legacy floor deny"
+        );
+        assert_eq!(out[0].effect, PolicyEffect::RequireReview);
+
+        let policy = vec![escalation, legacy_policy];
+        let (out, _) = select_outstanding(&policy, |_| false, |_| true);
+        assert!(out.is_empty(), "a legacy policy deny still supersedes");
     }
 
     /// FIX: decision-only custody rows (`draft:*`, `autoapply:*`, …) whose
@@ -4026,6 +4107,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &state_path,
             &[],
@@ -4123,6 +4205,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 &rocky_core::config::PrincipalRef::unnamed(),
                 &touched,
+                crate::commands::apply::EmptyTouched::NoOp,
                 &models_dir,
                 None,
                 &ledger,

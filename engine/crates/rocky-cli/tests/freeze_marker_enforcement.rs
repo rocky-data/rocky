@@ -606,6 +606,7 @@ async fn reader_enforces_marker_with_writes_flag_off() {
         PolicyPrincipal::Agent,
         &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
+        rocky_cli::commands::EmptyTouched::NoOp,
         &project.dir.path().join("no-models"),
         &project.state_path,
         &markers,
@@ -655,6 +656,7 @@ async fn marker_only_freeze_denies_gate_with_empty_ledger() {
         PolicyPrincipal::Agent,
         &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
+        rocky_cli::commands::EmptyTouched::NoOp,
         &project.dir.path().join("no-models"),
         &project.state_path,
         &markers,
@@ -699,6 +701,7 @@ async fn pre_reader_pod_ignores_marker_documented() {
         PolicyPrincipal::Human,
         &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
+        rocky_cli::commands::EmptyTouched::NoOp,
         &project.dir.path().join("no-models"),
         &project.state_path,
         &[], // a pre-PR-F pod has no reader code — no projection exists

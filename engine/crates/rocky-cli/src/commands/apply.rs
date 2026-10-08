@@ -512,12 +512,36 @@ async fn run_apply_run_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let executable = if is_replication_only(&loaded.config, &run_plan) {
-        Vec::new()
+    //
+    // #2290: a snapshot, load or quality pipeline runs no models but may still
+    // write; its writes are named in `touched` and the compile is skipped.
+    let no_compiled_models = BTreeSet::new();
+    let (touched, empty_touched, modelless) = if let Some((touched, empty_touched)) =
+        modelless_gate_inputs(&loaded.config, &run_plan, &plan)
+    {
+        (touched, empty_touched, true)
     } else {
-        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
+        let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+            (Vec::new(), EmptyTouched::NoOp)
+        } else {
+            match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+                Some(models) => (models, EmptyTouched::NoOp),
+                // The compile failed, so the executed set is unknown: refuse.
+                None => (Vec::new(), EmptyTouched::Refuse),
+            }
+        };
+        (
+            touched_models_for_run(&plan, &executable),
+            empty_touched,
+            false,
+        )
     };
-    let touched = touched_models_for_run(&plan, &executable);
+    // The write keys of a model-less pipeline are tables, not compiled models.
+    let subjects = if modelless {
+        GateSubjects::Resolved(&no_compiled_models)
+    } else {
+        GateSubjects::CompiledModels
+    };
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
@@ -533,11 +557,12 @@ async fn run_apply_run_plan(
         principal,
         actor,
         &touched,
+        empty_touched,
         &models_dir,
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
-        GateSubjects::CompiledModels,
+        subjects,
     );
     apply_policy_gate(root, plan_id, gate)?;
 
@@ -839,6 +864,96 @@ pub(crate) fn pipeline_is_replication(
     crate::registry::resolve_pipeline(cfg, pipeline_name)
         .map(|(_, p)| matches!(p, rocky_core::config::PipelineConfig::Replication(_)))
         .unwrap_or(false)
+}
+
+/// The writes of a governed `Run` plan whose pipeline executes NO compiled
+/// models but still mutates the warehouse (#2290): a snapshot (its history
+/// table), a load (its target) and a quality pipeline with row quarantine on
+/// (the tables the quarantine mode writes beside the checked tables).
+///
+/// Returns `None` for replication, transformation and any pipeline that does
+/// not resolve: those keep the model path (and stay strict on a failure).
+/// Otherwise returns the table names the gate must name, plus the meaning of
+/// an empty set.
+///
+/// A name is the **bare table name**, the same form the in-run replication
+/// gate (`gate_replication_targets`) uses for a replication target, so one
+/// `models = [...]` rule form covers every pipeline's writes. Where the table
+/// is known only at run time (a load that names no `table` loads one table per
+/// file; a quality entry with no `table` checks the whole schema) the name is
+/// `catalog.schema` instead. A quarantined quality table names what its mode
+/// writes: `split` the `<table><suffix_valid>` and `<table><suffix_quarantine>`
+/// tables, `drop` only the first, `tag` the table itself (rewritten in place).
+/// Every listed table is named, even one with no quarantinable assertion that
+/// the run would leave alone: that over-gates, which is the safe direction.
+/// A quality pipeline with quarantine on but no listed tables has an unknown
+/// write set, so it is [`EmptyTouched::Refuse`]. A quality pipeline without
+/// quarantine only reads (its run record is state, not a warehouse write), so
+/// its empty set is a genuine [`EmptyTouched::NoOp`].
+fn modelless_pipeline_writes(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name: Option<&str>,
+) -> Option<(BTreeSet<String>, EmptyTouched)> {
+    use rocky_core::config::{PipelineConfig, QuarantineMode};
+    let (_, pipeline) = crate::registry::resolve_pipeline(cfg, pipeline_name).ok()?;
+    match pipeline {
+        PipelineConfig::Snapshot(s) => Some((
+            BTreeSet::from([s.target.table.clone()]),
+            EmptyTouched::Refuse,
+        )),
+        PipelineConfig::Load(l) => Some((
+            BTreeSet::from([match &l.target.table {
+                Some(table) => table.clone(),
+                None => format!("{}.{}", l.target.catalog, l.target.schema),
+            }]),
+            EmptyTouched::Refuse,
+        )),
+        PipelineConfig::Quality(q) => {
+            let Some(quarantine) = q.checks.quarantine.as_ref().filter(|c| c.enabled) else {
+                return Some((BTreeSet::new(), EmptyTouched::NoOp));
+            };
+            let mut tables = BTreeSet::new();
+            for t in &q.tables {
+                let Some(table) = &t.table else {
+                    tables.insert(format!("{}.{}", t.catalog, t.schema));
+                    continue;
+                };
+                match quarantine.mode {
+                    QuarantineMode::Split => {
+                        tables.insert(format!("{table}{}", quarantine.suffix_valid));
+                        tables.insert(format!("{table}{}", quarantine.suffix_quarantine));
+                    }
+                    QuarantineMode::Drop => {
+                        tables.insert(format!("{table}{}", quarantine.suffix_valid));
+                    }
+                    QuarantineMode::Tag => {
+                        tables.insert(table.clone());
+                    }
+                }
+            }
+            Some((tables, EmptyTouched::Refuse))
+        }
+        PipelineConfig::Replication(_) | PipelineConfig::Transformation(_) => None,
+    }
+}
+
+/// Fold [`modelless_pipeline_writes`] into a gate's inputs. Returns the
+/// `touched` set (each write named under the bare `apply` verb; no model
+/// compile, since such a pipeline's run arm never executes a model) and the
+/// meaning of an empty set.
+fn modelless_gate_inputs(
+    cfg: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+    plan: &PersistedPlan,
+) -> Option<(BTreeMap<String, PolicyCapability>, EmptyTouched)> {
+    let (writes, empty_touched) = modelless_pipeline_writes(cfg, run_plan.pipeline.as_deref())?;
+    let mut touched = touched_models_for_run(plan, &[]);
+    for table in &writes {
+        touched
+            .entry(table.clone())
+            .or_insert(PolicyCapability::Apply);
+    }
+    Some((touched, empty_touched))
 }
 
 /// A governed `Run` plan that, at apply, executes NO compiled models — a
@@ -1322,6 +1437,22 @@ pub enum PolicyGate {
     },
 }
 
+/// What an empty `touched` set means to the caller of a policy gate.
+///
+/// An empty set skips every rule, so it must never be reached by accident: a
+/// caller with no model set (a pipeline trigger, say) would otherwise pass an
+/// empty map and bypass every `deny` rule. Each caller of the gate names its
+/// meaning explicitly; there is deliberately no `Default`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyTouched {
+    /// The caller builds `touched` from exactly what it will mutate, so an
+    /// empty set means nothing runs. The gate allows (a genuine no-op).
+    NoOp,
+    /// The caller always has something to gate. An empty set means the
+    /// subjects were lost, so the gate denies (fail-closed).
+    Refuse,
+}
+
 // Counts `model_attributes` calls on this thread, so a test can prove how
 // often a gate loads the models directory (#2270). Thread-local because
 // tests run in parallel; a `#[tokio::test]` runs on one thread.
@@ -1748,6 +1879,7 @@ async fn commit_governed_rule_decision(
                     principal,
                     &actor,
                     &touched,
+                    EmptyTouched::NoOp,
                     &models_dir,
                     models_glob.as_deref(),
                     GateLedger::Store(fresh_store),
@@ -1760,6 +1892,310 @@ async fn commit_governed_rule_decision(
         },
     )
     .await
+}
+
+/// Evaluate the agent-policy gate and make its decision rows durable on the
+/// remote `[state]` ledger in the same step (#2282).
+///
+/// A gate that records into the LOCAL file and returns leaves the row exposed:
+/// the next `download_state` (the loop's propose, an apply's pre-gate sync, a
+/// `rocky run` start) replaces the replicated `policy_decisions` table from
+/// remote, and a row that was never uploaded is gone before review, custody or
+/// the brief can read it. Under a remote backend with a `[policy]` block and a
+/// non-empty `touched` set this therefore runs through a
+/// [`rocky_core::state_sync::LedgerSeamSession`], like
+/// [`commit_governed_rule_decision`]: each attempt downloads the remote winner,
+/// evaluates the gate over that fresh ledger (and a fresh freeze-marker LIST),
+/// records its rows into the fresh store, and publishes. A concurrent writer
+/// that wins the compare-and-swap is never overwritten: the whole evaluation
+/// is replayed on the winner (three attempts, then a typed
+/// `LedgerSeamConflict`).
+///
+/// Unlike the apply seam, EVERY verdict is published, `Deny` and
+/// `RequireReview` included: a refused draft or propose still owes the audit
+/// ledger its row. Fail-closed: a download or publish failure is an `Err`.
+///
+/// Otherwise (Local backend, no `[policy]`, empty `touched`) the gate cannot
+/// reach a remote ledger and runs once over the local file with the hoisted
+/// `marker_freezes`, exactly as before.
+///
+/// # Carrying the worker's draft rows (`carry_drafts_for`)
+///
+/// The untrusted fulfill worker (`rocky mcp --profile worker`) never writes
+/// the remote ledger: its `draft_model` gate records its row in the LOCAL
+/// file only. The trusted `propose` that follows publishes those rows for
+/// it. With `carry_drafts_for = Some(models)`, the local draft rows are read
+/// BEFORE the seam's first download replaces the local file (see
+/// [`local_draft_rows_to_carry`] for exactly which rows), and each attempt
+/// writes them into the fresh store AFTER the gate has decided. So a worker
+/// row is published, but it never feeds this verdict, and it never replaces
+/// a row the remote ledger already holds. `None` carries nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn evaluate_apply_policy_durable(
+    cfg: &rocky_core::config::RockyConfig,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    actor: &PrincipalRef,
+    touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
+    models_dir: &Path,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
+    carry_drafts_for: Option<&[String]>,
+) -> Result<PolicyGate> {
+    if remote_state_backend_for_gate(cfg, touched).is_none() {
+        return Ok(evaluate_apply_policy_with_policy_matching_dual(
+            cfg.policy.as_ref(),
+            plan_id,
+            principal,
+            actor,
+            touched,
+            empty_touched,
+            models_dir,
+            None,
+            GateLedger::Path(state_path),
+            marker_freezes,
+            prior_classifications,
+            GateSubjects::CompiledModels,
+        ));
+    }
+    // The attempt future must OWN everything it touches (the session's
+    // `for<'a>` bound); each attempt clones what its future needs.
+    let seam_cfg = cfg.clone();
+    let seam_plan_id = plan_id.to_string();
+    let seam_touched = touched.clone();
+    let seam_models_dir = models_dir.to_path_buf();
+    let seam_actor = actor.clone();
+    let seam_prior = prior_classifications.cloned();
+    // Read BEFORE the seam: its first download replaces the local file.
+    let seam_carried = match carry_drafts_for {
+        Some(models) => local_draft_rows_to_carry(state_path, models, chrono::Utc::now())?,
+        None => Vec::new(),
+    };
+    // A failed seam restores the remote winner into the local file, which
+    // drops the rows read above. Keep a copy to write back, so a retried
+    // propose still carries them.
+    let carried_for_restore = seam_carried.clone();
+    let result = commit_remote_ledger_seam(
+        cfg,
+        state_path,
+        "the policy gate decision",
+        move |fresh_store, _fresh_base| {
+            let cfg = seam_cfg.clone();
+            let plan_id = seam_plan_id.clone();
+            let touched = seam_touched.clone();
+            let models_dir = seam_models_dir.clone();
+            let actor = seam_actor.clone();
+            let prior = seam_prior.clone();
+            let carried = seam_carried.clone();
+            Box::pin(async move {
+                let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
+                    .await
+                    .map_err(|e| seam_transition_error(&e))?;
+                let gate = evaluate_apply_policy_with_policy_matching_dual(
+                    cfg.policy.as_ref(),
+                    &plan_id,
+                    principal,
+                    &actor,
+                    &touched,
+                    empty_touched,
+                    &models_dir,
+                    None,
+                    GateLedger::Store(fresh_store),
+                    &marker_freezes,
+                    prior.as_ref(),
+                    GateSubjects::CompiledModels,
+                );
+                // After the verdict, never before: a worker row is published
+                // but cannot feed the decision it rides on.
+                carry_draft_rows(fresh_store, &carried).map_err(|e| seam_transition_error(&e))?;
+                Ok(gate)
+            })
+        },
+    )
+    .await;
+    match result {
+        Ok(gate) => Ok(gate),
+        Err(e) => match restore_carried_draft_rows(state_path, &carried_for_restore) {
+            Ok(()) => Err(e),
+            Err(restore) => Err(e.context(format!(
+                "and {} worker draft decision row(s) could not be written back to the local \
+                 state file {}, so a retried propose cannot publish them: {restore:#}",
+                carried_for_restore.len(),
+                state_path.display()
+            ))),
+        },
+    }
+}
+
+/// Write the carried draft rows back into the local state file after a
+/// failed seam (#2282).
+///
+/// Every seam failure after the first download restores the remote winner
+/// into the local file, which holds no worker row. Without this a retried
+/// propose would read nothing to carry, and the worker's audit rows would be
+/// lost. The write skips a row the file already holds (a failure before the
+/// first download leaves the file as it was), so it is safe on every error
+/// path. The rows stay local until a propose publishes them.
+fn restore_carried_draft_rows(state_path: &Path, carried: &[PolicyDecisionRecord]) -> Result<()> {
+    if carried.is_empty() {
+        return Ok(());
+    }
+    let store = StateStore::open(state_path).with_context(|| {
+        format!(
+            "failed to open the local state file {} to restore the worker's draft decisions",
+            state_path.display()
+        )
+    })?;
+    carry_draft_rows(&store, carried)
+}
+
+/// The `plan_id` prefixes of the draft tools' decision rows (`draft_model`,
+/// `draft_contract`, `draft_check`, `draft_metadata` in `rocky-mcp`).
+const DRAFT_DECISION_PREFIXES: &[&str] = &[
+    "draft:",
+    "draft-contract:",
+    "draft-check:",
+    "draft-metadata:",
+];
+
+/// The most rows one propose carries for one draft `plan_id` (one draft tool
+/// on one model). The newest are kept.
+const MAX_CARRIED_PER_DRAFT: usize = 4;
+
+/// The most draft rows one propose carries in all. The newest are kept.
+const MAX_CARRIED_DRAFT_ROWS: usize = 64;
+
+/// Whether `row` has the exact shape a draft tool's gate records: a
+/// `plan_id` that is a draft prefix followed by the row's own `model`, an
+/// `agent` `propose` evaluation (not a verify-after custody, freeze or
+/// auto-apply row), about one of `models`.
+///
+/// A worker can write anything into its local file, so this is a shape
+/// filter, not proof of origin. It keeps every row that could act as a
+/// freeze, an unfreeze or a budget failure out of the carried set.
+fn is_carriable_draft_row(row: &PolicyDecisionRecord, models: &[String]) -> bool {
+    DRAFT_DECISION_PREFIXES
+        .iter()
+        .any(|p| row.plan_id.strip_prefix(p) == Some(row.model.as_str()))
+        && row.kind() == rocky_core::state::DecisionKind::Evaluation
+        && row.principal == PolicyPrincipal::Agent
+        && row.capability == PolicyCapability::Propose
+        && row.auto_apply.is_none()
+        && models.contains(&row.model)
+}
+
+/// The draft decision rows in the LOCAL state file that `propose` carries to
+/// the remote ledger for the worker (#2282).
+///
+/// Only rows [`is_carriable_draft_row`] accepts for one of `models` (the
+/// compiled project's models). A draft-prefixed row of any other shape is
+/// dropped with a warning. A missing local file carries nothing. A local file
+/// that cannot be read is an error (fail-closed): the propose refuses rather
+/// than silently losing the worker's audit rows.
+///
+/// The set is bounded, because the worker controls the file: a row dated
+/// after `now` (the propose's clock) is carried with `now` as its timestamp,
+/// so it cannot sort after the propose's own rows; then only the newest
+/// [`MAX_CARRIED_PER_DRAFT`] rows per draft `plan_id` and the newest
+/// [`MAX_CARRIED_DRAFT_ROWS`] in all are kept. The rest are dropped with a
+/// warning that carries the count. An older row the remote ledger already
+/// holds is dropped harmlessly: [`carry_draft_rows`] would skip it anyway.
+pub(crate) fn local_draft_rows_to_carry(
+    state_path: &Path,
+    models: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<PolicyDecisionRecord>> {
+    let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
+        format!(
+            "failed to read the local state file {} for the worker's draft decisions",
+            state_path.display()
+        )
+    })?;
+    let rows = store
+        .list_policy_decisions()
+        .context("failed to list the worker's local draft decisions")?;
+    drop(store);
+    let mut carried = Vec::new();
+    for row in rows {
+        if !DRAFT_DECISION_PREFIXES
+            .iter()
+            .any(|p| row.plan_id.starts_with(p))
+        {
+            continue;
+        }
+        if is_carriable_draft_row(&row, models) {
+            carried.push(row);
+        } else {
+            tracing::warn!(
+                plan_id = %row.plan_id,
+                model = %row.model,
+                "not publishing a local draft decision row of an unexpected shape"
+            );
+        }
+    }
+    let mut clamped = 0usize;
+    for row in &mut carried {
+        if row.timestamp > now {
+            row.timestamp = now;
+            clamped += 1;
+        }
+    }
+    if clamped > 0 {
+        tracing::warn!(
+            rows = clamped,
+            "local draft decision rows dated in the future are carried with the propose's time"
+        );
+    }
+    // Newest first; the tie-breaks keep the order stable.
+    carried.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.plan_id.cmp(&b.plan_id))
+            .then_with(|| a.reason.cmp(&b.reason))
+    });
+    let found = carried.len();
+    let mut per_draft: BTreeMap<String, usize> = BTreeMap::new();
+    carried.retain(|row| {
+        let n = per_draft.entry(row.plan_id.clone()).or_insert(0);
+        *n += 1;
+        *n <= MAX_CARRIED_PER_DRAFT
+    });
+    carried.truncate(MAX_CARRIED_DRAFT_ROWS);
+    if carried.len() < found {
+        tracing::warn!(
+            dropped = found - carried.len(),
+            kept = carried.len(),
+            "not publishing the oldest local draft decision rows: over the per-propose cap"
+        );
+    }
+    Ok(carried)
+}
+
+/// Write `carried` draft rows into `store`, skipping any whose ledger key
+/// (timestamp, plan id, model) the store already holds: a carried row never
+/// replaces a row that is already there.
+fn carry_draft_rows(store: &StateStore, carried: &[PolicyDecisionRecord]) -> Result<()> {
+    if carried.is_empty() {
+        return Ok(());
+    }
+    let existing: std::collections::HashSet<(chrono::DateTime<chrono::Utc>, String, String)> =
+        store
+            .list_policy_decisions()
+            .context("failed to list the fresh ledger before carrying draft rows")?
+            .into_iter()
+            .map(|d| (d.timestamp, d.plan_id, d.model))
+            .collect();
+    for row in carried {
+        if existing.contains(&(row.timestamp, row.plan_id.clone(), row.model.clone())) {
+            continue;
+        }
+        store
+            .record_policy_decision(row)
+            .context("failed to carry a worker draft decision into the shared ledger")?;
+    }
+    Ok(())
 }
 
 /// Finding 3 (post-verify half), migrated to the ledger seam (#1242): make the
@@ -1812,8 +2248,10 @@ async fn commit_verify_after_custody(
 ///
 /// `touched` maps each governed model to the capability that was reviewed at
 /// propose time (the embedded classification, or `schema_change.breaking` when
-/// the classification was unavailable / fail-closed). An empty map means the
-/// plan executes **no models** — a genuine no-op → `Allow`. A no-change plan
+/// the classification was unavailable / fail-closed). With
+/// [`EmptyTouched::NoOp`] an empty map means the plan executes **no models** —
+/// a genuine no-op → `Allow`; with [`EmptyTouched::Refuse`] it is a `Deny`
+/// (the caller always has something to gate). A no-change plan
 /// that still executes models is NOT empty: `EmbeddedCapabilities::touched`
 /// synthesizes a bare-`apply` entry per planned model, so its execution stays
 /// governed (do not pass an empty map for an executing plan or the gate is
@@ -1825,6 +2263,7 @@ pub fn evaluate_apply_policy(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1845,6 +2284,7 @@ pub fn evaluate_apply_policy(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         state_path,
         marker_freezes,
@@ -1871,6 +2311,7 @@ pub fn evaluate_apply_policy_with_policy(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1881,6 +2322,7 @@ pub fn evaluate_apply_policy_with_policy(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         None,
         state_path,
@@ -1896,6 +2338,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     state_path: &Path,
@@ -1908,6 +2351,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         models_glob,
         GateLedger::Path(state_path),
@@ -1968,6 +2412,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
@@ -1983,6 +2428,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         principal,
         actor,
         touched,
+        empty_touched,
         models_dir,
         None,
         GateLedger::Path(state_path),
@@ -2027,6 +2473,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     ledger: GateLedger<'_>,
@@ -2035,7 +2482,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     subjects: GateSubjects<'_>,
 ) -> PolicyGate {
     let (policy, attrs_map) =
-        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+        match resolve_policy_and_attrs(policy, touched, empty_touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
@@ -2269,6 +2716,14 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
 /// not be durably persisted — the autonomy-budget / verify_after pair must be
 /// durable, so the mutation is refused rather than proceeding with an incomplete
 /// budget trail (finding 6).
+/// The fixed text the fail-closed floor in [`evaluate_apply_policy_core`]
+/// writes at the end of its `deny` reason. Unchanged since the floor shipped
+/// (#1084), so the review queue can recognise a floor deny on a ledger row
+/// written before [`PolicyDecisionRecord::fail_closed`] existed, or by an
+/// older binary on a shared ledger. Do not reword it.
+pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
+    "(fail-closed deny; a review marker cannot satisfy it)";
+
 fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &str) -> PolicyGate {
     PolicyGate::Deny {
         model: touched
@@ -2302,6 +2757,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     principal: PolicyPrincipal,
     actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
     ledger: &StateStore,
@@ -2312,7 +2768,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
     // config `run` executed against, not one a mid-run `rocky.toml` swap points at.
     let (policy, attrs_map) =
-        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+        match resolve_policy_and_attrs(policy, touched, empty_touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
@@ -2347,11 +2803,13 @@ pub(crate) fn evaluate_apply_policy_with_store(
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
-/// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy,
-/// `Allow` when `touched` is empty (a genuine no-op executes nothing).
+/// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy;
+/// when `touched` is empty, `Allow` for [`EmptyTouched::NoOp`] (a genuine no-op
+/// executes nothing) and `Deny` for [`EmptyTouched::Refuse`].
 pub(crate) fn resolve_policy_and_attrs(
     policy: Option<&rocky_core::config::PolicyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
+    empty_touched: EmptyTouched,
     models_dir: &Path,
     models_glob: Option<&str>,
 ) -> std::result::Result<
@@ -2364,11 +2822,23 @@ pub(crate) fn resolve_policy_and_attrs(
     let Some(policy) = policy else {
         return Err(PolicyGate::NotConfigured);
     };
-    // An empty touched set means the plan executes no models (a genuine no-op).
-    // A no-change-but-executing plan is never empty here — see the touched-set
-    // synthesis in `EmbeddedCapabilities::touched`.
+    // An empty touched set allows only when the caller vouched that its set
+    // lists exactly what it mutates (`NoOp`: the plan executes nothing). A
+    // no-change-but-executing plan is never empty here — see the touched-set
+    // synthesis in `EmbeddedCapabilities::touched`. Any other caller is refused,
+    // so a caller with no model set cannot skip every `deny` rule by accident.
     if touched.is_empty() {
-        return Err(PolicyGate::Allow);
+        return Err(match empty_touched {
+            EmptyTouched::NoOp => PolicyGate::Allow,
+            EmptyTouched::Refuse => PolicyGate::Deny {
+                model: "*".to_string(),
+                rule_id: None,
+                reason: "fail-closed: the policy gate received an empty touched set from a \
+                         caller that always has something to gate, so no rule could be \
+                         evaluated; the mutation is refused"
+                    .to_string(),
+            },
+        });
     }
     let attrs = match model_attributes(models_dir, models_glob) {
         Ok(attrs) => attrs,
@@ -2487,21 +2957,33 @@ pub(crate) fn evaluate_apply_policy_core(
             reason.push_str("; ");
             reason.push_str(&suffix);
         }
+        // Set only where an operational state, not the policy, turns a
+        // non-deny into a deny: an active freeze (ledger row or marker), or
+        // the floor below. Both are transient and say nothing about whether
+        // the plan needs review, so such a deny must not supersede an older
+        // `require_review` in the queue. A policy `deny` that happens to meet
+        // a freeze or an unreadable ledger stays a policy verdict.
+        let mut fail_closed = decision.effect != PolicyEffect::Deny
+            && effect == PolicyEffect::Deny
+            && matches!(degradation, policy::AutonomyDegradation::Frozen { .. });
         if snapshot_unreadable
             && principal == PolicyPrincipal::Agent
             && effect != PolicyEffect::Deny
         {
             effect = PolicyEffect::Deny;
+            fail_closed = true;
             reason.push_str(
                 "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
-                 refused (fail-closed deny; a review marker cannot satisfy it)",
+                 refused ",
             );
+            reason.push_str(FAIL_CLOSED_FLOOR_MARKER);
         }
 
         record(&PolicyDecisionRecord {
             // The gate decided this set on purpose: an empty one says "no
             // compiled model here", and the queue must not re-resolve it.
             keys_recorded: true,
+            fail_closed,
             models: if compiled_model {
                 vec![model.clone()]
             } else {
@@ -2631,7 +3113,7 @@ fn run_executable_models(
     models_dir: &Path,
     models_glob: Option<&str>,
     run_plan: &RunPlan,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     use rocky_compiler::compile::{self, CompilerConfig};
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -2641,10 +3123,11 @@ fn run_executable_models(
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     };
-    let Ok(result) = result else {
-        return Vec::new();
-    };
-    result
+    // A compile that fails cannot say what the apply will execute. `None`
+    // makes the caller gate with `EmptyTouched::Refuse`: an unknown set is
+    // not an empty one (R12).
+    let result = result.ok()?;
+    let models = result
         .project
         .models
         .iter()
@@ -2655,7 +3138,8 @@ fn run_executable_models(
                 .as_deref()
                 .is_none_or(|target| target == name.as_str())
         })
-        .collect()
+        .collect();
+    Some(models)
 }
 
 /// The `(model, capability)` set the policy plane evaluates for a `Promote`
@@ -3323,6 +3807,8 @@ impl GovernedRunContext<'_> {
             self.principal,
             &self.actor,
             &touched,
+            // Never empty: an empty target set returned above.
+            EmptyTouched::Refuse,
             &models_dir,
             models_glob.as_deref(),
             ledger,
@@ -3427,6 +3913,7 @@ pub(crate) fn gate_promote_plan(
         principal,
         actor,
         &touched,
+        EmptyTouched::NoOp,
         &promote_models_dir,
         promote_models_glob.as_deref(),
         state_path,
@@ -3831,6 +4318,7 @@ pub(crate) async fn gate_maintenance_apply(
         plan.enforcement_principal(runtime_principal),
         actor,
         touched,
+        EmptyTouched::NoOp,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -4091,6 +4579,7 @@ fn evaluate_verify_after(
     });
     let record = PolicyDecisionRecord {
         keys_recorded: false,
+        fail_closed: false,
         models: Vec::new(),
         timestamp: chrono::Utc::now(),
         plan_id: plan_id.to_string(),
@@ -4196,12 +4685,36 @@ async fn run_apply_ai_authored_plan(
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
-    let executable = if is_replication_only(&loaded.config, &run_plan) {
-        Vec::new()
+    //
+    // #2290: a snapshot, load or quality pipeline runs no models but may still
+    // write; its writes are named in `touched` and the compile is skipped.
+    let no_compiled_models = BTreeSet::new();
+    let (touched, empty_touched, modelless) = if let Some((touched, empty_touched)) =
+        modelless_gate_inputs(&loaded.config, &run_plan, &plan)
+    {
+        (touched, empty_touched, true)
     } else {
-        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
+        let (executable, empty_touched) = if is_replication_only(&loaded.config, &run_plan) {
+            (Vec::new(), EmptyTouched::NoOp)
+        } else {
+            match run_executable_models(&models_dir, models_glob.as_deref(), &run_plan) {
+                Some(models) => (models, EmptyTouched::NoOp),
+                // The compile failed, so the executed set is unknown: refuse.
+                None => (Vec::new(), EmptyTouched::Refuse),
+            }
+        };
+        (
+            touched_models_for_run(&plan, &executable),
+            empty_touched,
+            false,
+        )
     };
-    let touched = touched_models_for_run(&plan, &executable);
+    // The write keys of a model-less pipeline are tables, not compiled models.
+    let subjects = if modelless {
+        GateSubjects::Resolved(&no_compiled_models)
+    } else {
+        GateSubjects::CompiledModels
+    };
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
@@ -4216,11 +4729,12 @@ async fn run_apply_ai_authored_plan(
         principal,
         actor,
         &touched,
+        empty_touched,
         &models_dir,
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
-        GateSubjects::CompiledModels,
+        subjects,
     );
     // #1459: human review is a FLOOR for an AI-authored plan, not a
     // policy-dependent extra. This used to run only under
@@ -4598,6 +5112,7 @@ async fn run_apply_backfill_plan(
             plan.enforcement_principal(runtime_principal),
             actor,
             &touched,
+            EmptyTouched::NoOp,
             models_dir,
             state_path,
             &marker_freezes,
@@ -5809,6 +6324,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             dir.path(),
             &dir.path().join("state.redb"),
             &[],
@@ -5838,6 +6354,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             dir.path(),
             &dir.path().join("state.redb"),
             &[],
@@ -6244,6 +6761,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &targets.touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             None,
             &state,
@@ -7289,6 +7807,7 @@ auto_create_schemas = true
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: now,
             plan_id: format!(
@@ -7442,6 +7961,7 @@ default_agent_effect = "require_review"
         // The custody seam downloads first and fails closed on the remote error.
         let record = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: "plan-x".to_string(),
@@ -7503,6 +8023,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &state,
             &[],
@@ -7519,6 +8040,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &state,
             &[],
@@ -7573,6 +8095,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7591,6 +8114,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7647,6 +8171,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7706,6 +8231,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7725,6 +8251,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -7783,6 +8310,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &dir.path().join("state.redb"),
             &[],
@@ -7815,6 +8343,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -7845,6 +8374,7 @@ effect = "deny"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8094,6 +8624,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8129,6 +8660,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8137,6 +8669,87 @@ effect = "deny"
             gate,
             PolicyGate::Allow,
             "an empty touched set executes nothing ⇒ nothing to gate"
+        );
+        Ok(())
+    }
+
+    /// R12: only a caller that vouches its empty set is a no-op reaches the
+    /// empty-set `Allow`. A caller that passes `Refuse` is denied, even under
+    /// a policy that allows every agent apply — an empty map must not skip
+    /// every rule by accident.
+    #[test]
+    fn evaluate_apply_policy_empty_touched_refuse_denies_under_allow_all() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &BTreeMap::new(),
+            super::EmptyTouched::Refuse,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        let PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } = gate
+        else {
+            panic!("an empty set from a Refuse caller must deny, got {gate:?}");
+        };
+        assert_eq!(model, "*");
+        assert_eq!(rule_id, None);
+        assert!(reason.contains("empty touched set"), "reason: {reason}");
+        Ok(())
+    }
+
+    /// R12: the `Refuse` variant changes only the empty case. A `deny` rule
+    /// still denies a non-empty set, by that rule.
+    #[test]
+    fn evaluate_apply_policy_refuse_still_denies_a_non_empty_set_by_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &touched,
+            super::EmptyTouched::Refuse,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        let PolicyGate::Deny { model, rule_id, .. } = gate else {
+            panic!("a deny rule must deny a non-empty set, got {gate:?}");
+        };
+        assert_eq!(model, "m");
+        assert_eq!(
+            rule_id,
+            Some(0),
+            "denied by the rule, not the empty-set guard"
         );
         Ok(())
     }
@@ -8178,6 +8791,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8216,6 +8830,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8248,6 +8863,7 @@ effect = "deny"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8261,6 +8877,20 @@ effect = "deny"
     /// list is EMPTY but whose models dir compiles real models must still gate
     /// the real models. Pre-fix `touched()` read the empty list → gated nothing
     /// → an agent apply executed every real model UNGATED.
+    /// R12 red team: a compile that fails must not collapse the executed set
+    /// to "empty" (which `NoOp` would allow). It is unknown, so `None`.
+    #[test]
+    fn run_executable_models_is_none_when_the_compile_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        std::fs::write(models_dir.join("orders.toml"), "name = [not toml").unwrap();
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.model = None;
+        assert_eq!(super::run_executable_models(&models_dir, None, &rp), None);
+    }
+
     #[test]
     fn run_executable_models_ignores_the_informational_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -8271,7 +8901,7 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = Vec::new(); // the informational list is EMPTY
         rp.model = None;
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         assert!(
             exec.contains(&"orders".to_string()) && exec.contains(&"customers".to_string()),
             "the executable set must come from the compile, not the empty list: {exec:?}"
@@ -8292,7 +8922,7 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string(), "customers".to_string()]; // over-lists
         rp.model = Some("orders".to_string());
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         assert_eq!(
             exec,
             vec!["orders".to_string()],
@@ -8311,7 +8941,7 @@ effect = "deny"
         rp.model = None;
         let glob = models_dir.join("ord*.sql").to_string_lossy().into_owned();
 
-        let exec = super::run_executable_models(&models_dir, Some(&glob), &rp);
+        let exec = super::run_executable_models(&models_dir, Some(&glob), &rp).expect("compiles");
         assert_eq!(
             exec,
             vec!["orders".to_string()],
@@ -8345,7 +8975,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(!touched.is_empty(), "D1: real models must be gated");
         let gate = super::evaluate_apply_policy(
@@ -8354,6 +8984,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &dir.path().join("state.redb"),
             &[],
@@ -8392,7 +9023,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, None, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp).expect("compiles");
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(
             !touched.contains_key("customers"),
@@ -8404,6 +9035,7 @@ effect = "deny"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             &dir.path().join("state.redb"),
             &[],
@@ -8462,6 +9094,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
             &[],
@@ -8512,6 +9145,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8561,6 +9195,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8570,6 +9205,104 @@ effect = "allow"
             "an unreadable ledger must HARD-REFUSE an agent mutation (deny, not require_review), \
              got {gate:?}"
         );
+        Ok(())
+    }
+
+    /// #1829(3): the writer says which kind of `deny` it wrote. The fail-closed
+    /// floor turning an `allow` into a `deny` sets `fail_closed`; a policy
+    /// `deny` does not, even when the ledger is also unreadable.
+    #[test]
+    fn fail_closed_is_set_by_the_floor_and_not_by_a_policy_deny() -> anyhow::Result<()> {
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let run = |effect: &str| -> anyhow::Result<PolicyDecisionRecord> {
+            let dir = tempfile::tempdir()?;
+            let config = write_config(
+                dir.path(),
+                &format!(
+                    "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                     scope = {{ any = true }}\neffect = \"{effect}\"\n"
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&config)?
+                .policy
+                .expect("policy block");
+            let mut rows = Vec::new();
+            super::evaluate_apply_policy_core(
+                &policy,
+                "plan_x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                &BTreeMap::new(),
+                super::GateSubjects::CompiledModels,
+                &[],
+                &[],
+                true,
+                |r| rows.push(r.clone()),
+            );
+            assert_eq!(rows.len(), 1);
+            Ok(rows.remove(0))
+        };
+        let floor = run("allow")?;
+        assert_eq!(floor.effect, PolicyEffect::Deny);
+        assert!(floor.fail_closed, "the floor's deny is operational");
+        let policy_deny = run("deny")?;
+        assert_eq!(policy_deny.effect, PolicyEffect::Deny);
+        assert!(!policy_deny.fail_closed, "a policy deny is a verdict");
+        Ok(())
+    }
+
+    /// A deny forced by an active freeze is operational, like the floor: it
+    /// sets `fail_closed`, so it does not supersede an older escalation in the
+    /// review queue. A policy `deny` that also meets the freeze stays a verdict.
+    #[test]
+    fn a_freeze_deny_is_fail_closed_and_a_policy_deny_under_freeze_is_not() -> anyhow::Result<()> {
+        let touched = BTreeMap::from([("m".to_string(), PolicyCapability::Apply)]);
+        let freeze = rocky_core::freeze_marker::ActiveMarkerFreeze {
+            freeze_id: "f1".to_string(),
+            principal: Some(PolicyPrincipal::Agent),
+            scope: "any".to_string(),
+            reason: "incident".to_string(),
+            created_at: None,
+        };
+        let run = |effect: &str| -> anyhow::Result<PolicyDecisionRecord> {
+            let dir = tempfile::tempdir()?;
+            let config = write_config(
+                dir.path(),
+                &format!(
+                    "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                     scope = {{ any = true }}\neffect = \"{effect}\"\n"
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&config)?
+                .policy
+                .expect("policy block");
+            let mut rows = Vec::new();
+            super::evaluate_apply_policy_core(
+                &policy,
+                "plan_x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                &BTreeMap::new(),
+                super::GateSubjects::CompiledModels,
+                &[],
+                std::slice::from_ref(&freeze),
+                false,
+                |r| rows.push(r.clone()),
+            );
+            assert_eq!(rows.len(), 1);
+            Ok(rows.remove(0))
+        };
+        let frozen = run("allow")?;
+        assert_eq!(frozen.effect, PolicyEffect::Deny);
+        assert!(frozen.fail_closed, "the freeze's deny is operational");
+        let frozen_review = run("require_review")?;
+        assert_eq!(frozen_review.effect, PolicyEffect::Deny);
+        assert!(frozen_review.fail_closed);
+        let policy_deny = run("deny")?;
+        assert_eq!(policy_deny.effect, PolicyEffect::Deny);
+        assert!(!policy_deny.fail_closed, "a policy deny is a verdict");
         Ok(())
     }
 
@@ -8610,6 +9343,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8640,6 +9374,7 @@ effect = "allow"
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -8975,6 +9710,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &actor,
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models_dir,
             None,
             &state,
@@ -9683,6 +10419,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -9838,6 +10575,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &dir.path().join("models"),
             &state,
             &[],
@@ -9897,6 +10635,7 @@ effect = "allow"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -9927,6 +10666,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
+            crate::commands::apply::EmptyTouched::NoOp,
             &models,
             &state,
             &[],
@@ -12373,6 +13113,203 @@ schema_template = "s__{source}"
             "duplicate-name AND-aggregation must surface the failure: {msg}"
         );
     }
+
+    /// #2290: a model-less pipeline that still WRITES (snapshot target, load
+    /// target, quality quarantine tables) used to give an empty `touched` set
+    /// gated as `NoOp`, so a `deny agent apply` rule was skipped. The write
+    /// must be named in the gate; the deny must fire before any warehouse
+    /// statement. A read-only quality pipeline stays a no-op.
+    #[tokio::test]
+    async fn modelless_writing_pipeline_is_denied_by_a_deny_rule() -> anyhow::Result<()> {
+        let quality = |mode: &str| {
+            format!(
+                r#"
+[pipeline.p]
+type = "quality"
+
+[pipeline.p.target]
+
+[[pipeline.p.tables]]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.p.checks]
+enabled = true
+
+[pipeline.p.checks.quarantine]
+enabled = true
+mode = "{mode}"
+"#
+            )
+        };
+        let split = quality("split");
+        let drop = quality("drop");
+        let tag = quality("tag");
+        // Keys are bare table names, as the in-run replication gate keys a
+        // replication target; `catalog.schema` only where the table is known
+        // only at run time.
+        let cases: Vec<(&str, &str, bool, &str)> = vec![
+            (
+                "snapshot",
+                r#"
+[pipeline.p]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.p.source]
+catalog = "c"
+schema = "s"
+table = "src"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "h"
+table = "hist"
+"#,
+                true,
+                "hist",
+            ),
+            (
+                "load into a named table",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+table = "events"
+"#,
+                true,
+                "events",
+            ),
+            (
+                "load with one table per file",
+                r#"
+[pipeline.p]
+type = "load"
+source_dir = "data/"
+
+[pipeline.p.target]
+catalog = "c"
+schema = "raw"
+"#,
+                true,
+                "c.raw",
+            ),
+            (
+                "quality split: quarantine table",
+                &split,
+                true,
+                "t__quarantine",
+            ),
+            ("quality split: valid table", &split, true, "t__valid"),
+            ("quality drop: valid table", &drop, true, "t__valid"),
+            ("quality tag: the table itself", &tag, true, "t"),
+            (
+                "quality read-only",
+                r#"
+[pipeline.p]
+type = "quality"
+
+[pipeline.p.target]
+
+[[pipeline.p.tables]]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.p.checks]
+enabled = true
+"#,
+                false,
+                "t",
+            ),
+        ];
+        for (label, pipeline, writes, key, kind) in cases.into_iter().flat_map(|(l, p, w, k)| {
+            [PlanKind::AiAuthored, PlanKind::Run]
+                .into_iter()
+                .map(move |kind| (l, p, w, k, kind))
+        }) {
+            let dir = tempfile::tempdir()?;
+            let config = dir.path().join("rocky.toml");
+            // The rule names only the table the pipeline writes. An unrelated
+            // compiled model sits in the models dir and is allowed, so the
+            // deny can fire only if the write itself is named in the gate.
+            let policy = format!(
+                "\n[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n\n\
+                 [[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+                 scope = {{ models = [\"{key}\"] }}\neffect = \"deny\"\n"
+            );
+            std::fs::write(
+                &config,
+                format!("[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n{pipeline}{policy}"),
+            )?;
+            let mut rp = minimal_run_plan();
+            rp.pipeline = Some("p".to_string());
+            rp.models = Vec::new();
+            rp.execution_layers = Vec::new();
+            // A models dir with one unrelated model, as in a project that
+            // mixes a snapshot pipeline with transformation models.
+            let models = dir.path().join("models");
+            write_min_model(&models, "other");
+            rp.models_dir = Some(models.to_string_lossy().into_owned());
+            let plan_id = crate::plan_store::write_plan_governed(
+                dir.path(),
+                kind.clone(),
+                &rp,
+                PolicyPrincipal::Agent,
+                crate::plan_store::EmbeddedCapabilities {
+                    models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                    config_identity: Some("reviewed-config".to_string()),
+                    fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+                    reviewed_source_schemas: Some(BTreeMap::new()),
+                    ..Default::default()
+                },
+            )?;
+            super::super::review::write_test_review_marker(dir.path(), &plan_id);
+            let state = dir.path().join("state.redb");
+            let actor = rocky_core::config::PrincipalRef::unnamed();
+            let result = if kind == PlanKind::Run {
+                super::run_apply_run_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    &actor,
+                    true,
+                )
+                .await
+            } else {
+                super::run_apply_ai_authored_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    &actor,
+                    true,
+                )
+                .await
+            };
+            let msg = result.as_ref().err().map(|e| format!("{e:#}"));
+            if writes {
+                let msg = msg.unwrap_or_default();
+                assert!(msg.contains("policy DENIES"), "{label} ({kind:?}): {msg}");
+            } else {
+                let msg = msg.unwrap_or_default();
+                assert!(
+                    !msg.contains("policy DENIES"),
+                    "{label} ({kind:?}): a read-only quality run writes nothing, so no deny applies: {msg}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// #1242: the apply-family ledger seams (governed rule decision, verify-after
@@ -12436,6 +13373,7 @@ autonomy_budget = { failures = 1, window = "7d" }
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: plan_id.to_string(),
@@ -12730,6 +13668,510 @@ autonomy_budget = { failures = 1, window = "7d" }
                 .iter()
                 .all(|d| d.plan_id != "plan-x"),
             "nothing of the losing seam may be published"
+        );
+    }
+
+    const PROPOSE_RULE: &str = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "allow"
+"#;
+
+    const DRAFT_PLAN_ID: &str = "draft:orders";
+
+    fn propose_touched() -> BTreeMap<String, PolicyCapability> {
+        let mut t = BTreeMap::new();
+        t.insert("orders".to_string(), PolicyCapability::Propose);
+        t
+    }
+
+    async fn durable_draft_gate(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+    ) -> super::PolicyGate {
+        super::evaluate_apply_policy_durable(
+            cfg,
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::Refuse,
+            &root.join("models"),
+            state_path,
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("the gate decision must publish")
+    }
+
+    fn draft_rows(rows: &[PolicyDecisionRecord]) -> Vec<&PolicyDecisionRecord> {
+        rows.iter().filter(|d| d.plan_id == DRAFT_PLAN_ID).collect()
+    }
+
+    /// #2282: a worker's `draft_model` decision survives the loop's next
+    /// `download_state` (the one `propose` runs before its gate). The local
+    /// file is replaced by the remote blob on that download, so the row has
+    /// to be on the remote first. Under the old local-only write the row was
+    /// gone after the download.
+    #[tokio::test]
+    async fn a_draft_decision_survives_the_next_download() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        // What `propose_governed_run_plan` does next.
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_b.cfg,
+            &harness.pod_b.state_path,
+            false,
+        )
+        .await
+        .unwrap();
+        let after = StateStore::open(&harness.pod_b.state_path).unwrap();
+        let rows = after.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "the draft decision must survive the download: {rows:?}"
+        );
+    }
+
+    /// A denied draft still owes the ledger its row: every verdict publishes.
+    #[tokio::test]
+    async fn a_denied_draft_decision_is_published_too() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(
+            root.path(),
+            "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"propose\"\n\
+             scope = { any = true }\neffect = \"deny\"\n",
+        );
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+        assert!(
+            matches!(gate, super::PolicyGate::Deny { .. }),
+            "got {gate:?}"
+        );
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        let mine = draft_rows(&rows);
+        assert_eq!(mine.len(), 1, "{rows:?}");
+        assert_eq!(mine[0].effect, PolicyEffect::Deny);
+    }
+
+    /// A concurrent writer wins the compare-and-swap twice: the draft decision
+    /// is replayed on the winner, lands exactly once, and the winner's own
+    /// rows and tables survive. The seam never falls back to an
+    /// unconditional put.
+    #[tokio::test]
+    async fn a_draft_decision_replays_onto_a_concurrent_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        publish_winner(&harness.pod_a, |store| {
+            winner_watermark(store);
+            store
+                .record_policy_decision(&row("other-plan", Some(0), &[], PolicyEffect::Allow))
+                .unwrap();
+        })
+        .await;
+        let key = state_key();
+        let updates = harness.faults.put_count(&key, PutKind::Update);
+        let unconditional = harness.faults.put_count(&key, PutKind::Unconditional);
+        harness.faults.arm_precondition_failures(&key, 2);
+
+        durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+
+        assert_eq!(harness.faults.put_count(&key, PutKind::Update) - updates, 3);
+        assert_eq!(
+            harness.faults.put_count(&key, PutKind::Unconditional) - unconditional,
+            0
+        );
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        let rows = remote.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "exactly one draft row: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|d| d.plan_id == "other-plan").count(),
+            1,
+            "the winner's row must survive: {rows:?}"
+        );
+    }
+
+    /// Fail-closed: when every attempt conflicts the gate returns an error
+    /// (the draft tool rolls the draft back) and the remote winner is kept.
+    #[tokio::test]
+    async fn a_draft_decision_fails_closed_when_the_ledger_cannot_be_published() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_a, winner_watermark).await;
+        harness.faults.arm_precondition_failures(state_key(), 3);
+
+        let result = super::evaluate_apply_policy_durable(
+            &cfg,
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::Refuse,
+            &root.path().join("models"),
+            &harness.pod_b.state_path,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "exhaustion must not yield a verdict");
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        assert!(draft_rows(&remote.list_policy_decisions().unwrap()).is_empty());
+    }
+
+    /// The worker's gate: synchronous, local file only (what `rocky mcp
+    /// --profile worker` runs for `draft_model`).
+    fn worker_local_draft_gate(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+    ) -> super::PolicyGate {
+        super::evaluate_apply_policy_with_policy(
+            cfg.policy.as_ref(),
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::Refuse,
+            &root.join("models"),
+            state_path,
+            &[],
+        )
+    }
+
+    /// The trusted loop's propose gate, carrying the worker's draft rows.
+    async fn propose_gate_carrying(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+        carry: Option<&[String]>,
+    ) -> anyhow::Result<super::PolicyGate> {
+        super::evaluate_apply_policy_durable(
+            cfg,
+            "plan-propose",
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            super::EmptyTouched::NoOp,
+            &root.join("models"),
+            state_path,
+            &[],
+            None,
+            carry,
+        )
+        .await
+    }
+
+    /// #2282 (a): the worker records its `draft_model` row in the LOCAL file
+    /// only. The loop's propose downloads remote state, which would replace
+    /// that file, so the propose seam reads the row first and publishes it
+    /// with its own. Without the carry the row is gone after the download.
+    #[tokio::test]
+    async fn propose_publishes_the_workers_local_draft_row() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let puts_before = harness.faults.count(rocky_core::fault_store::FaultOp::Put);
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        assert_eq!(
+            harness.faults.count(rocky_core::fault_store::FaultOp::Put),
+            puts_before,
+            "the worker's gate writes nothing remote"
+        );
+
+        let models = vec!["orders".to_string()];
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "propose publishes the worker's draft row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|d| d.plan_id == "plan-propose"),
+            "and its own row: {rows:?}"
+        );
+    }
+
+    /// #2282 (c): a worker can write anything into its local file. A forged
+    /// `unfreeze:` row (which would lift a real freeze) and a draft-prefixed
+    /// row shaped as a budget failure are not carried, a forged row cannot
+    /// replace a row the remote already holds, and the propose verdict is
+    /// decided over the remote ledger alone.
+    #[tokio::test]
+    async fn a_forged_worker_row_cannot_change_the_propose_verdict() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        let frozen_at = Utc::now() - chrono::Duration::hours(1);
+        let freeze = PolicyDecisionRecord {
+            timestamp: frozen_at,
+            plan_id: "freeze:real".to_string(),
+            model: "any".to_string(),
+            ..row("freeze:real", None, &[], PolicyEffect::Deny)
+        };
+        let honest_draft = PolicyDecisionRecord {
+            timestamp: frozen_at,
+            capability: PolicyCapability::Propose,
+            model: "orders".to_string(),
+            ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Deny)
+        };
+        let (freeze_seed, draft_seed) = (freeze.clone(), honest_draft.clone());
+        publish_winner(&harness.pod_b, move |store| {
+            store.record_policy_decision(&freeze_seed).unwrap();
+            store.record_policy_decision(&draft_seed).unwrap();
+        })
+        .await;
+
+        // The worker forges its local file.
+        let unfreeze = PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "unfreeze:real".to_string(),
+            model: "any".to_string(),
+            ..row("unfreeze:real", None, &[], PolicyEffect::Allow)
+        };
+        let budget_burn = PolicyDecisionRecord {
+            capability: PolicyCapability::Propose,
+            model: "orders".to_string(),
+            ..row(
+                "draft:orders-burn",
+                Some(0),
+                &["row_count"],
+                PolicyEffect::Deny,
+            )
+        };
+        let overwrite = PolicyDecisionRecord {
+            effect: PolicyEffect::Allow,
+            reason: "forged".to_string(),
+            ..honest_draft.clone()
+        };
+        {
+            let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+            for forged in [&unfreeze, &budget_burn, &overwrite] {
+                local.record_policy_decision(forged).unwrap();
+            }
+        }
+        // Discriminating: had the unfreeze reached the ledger, the freeze
+        // would be lifted.
+        assert!(rocky_core::policy::active_freezes(&[freeze.clone(), unfreeze.clone()]).is_empty());
+
+        let models = vec!["orders".to_string()];
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(
+            matches!(gate, super::PolicyGate::Deny { .. }),
+            "the real freeze still denies: {gate:?}"
+        );
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        assert!(
+            !rows.iter().any(|d| d.plan_id.starts_with("unfreeze:")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|d| d.plan_id == "draft:orders-burn"),
+            "{rows:?}"
+        );
+        let honest: Vec<_> = draft_rows(&rows);
+        assert_eq!(honest.len(), 1, "{rows:?}");
+        assert_eq!(
+            honest[0].effect,
+            PolicyEffect::Deny,
+            "the remote row was not replaced"
+        );
+        assert_eq!(rocky_core::policy::active_freezes(&rows).len(), 1);
+    }
+
+    /// #2282 (A1): a propose that fails after reading the worker's rows
+    /// (here, compare-and-swap exhaustion) used to lose them: the failed seam
+    /// restores the remote winner into the local file. The rows are written
+    /// back, so the retried propose still publishes them.
+    #[tokio::test]
+    async fn a_failed_propose_keeps_the_workers_draft_row_for_the_retry() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        let models = vec!["orders".to_string()];
+        harness.faults.arm_precondition_failures(state_key(), 3);
+        let failed =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await;
+        assert!(failed.is_err(), "exhaustion must refuse the propose");
+        assert!(
+            draft_rows(&published(&harness).await.list_policy_decisions().unwrap()).is_empty(),
+            "nothing of the failed propose is published"
+        );
+
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "the retried propose publishes the worker's draft row: {rows:?}"
+        );
+    }
+
+    /// #2282 (A2): the worker controls its local file, so the carried set is
+    /// bounded. 10,001 future-dated draft rows carry at most the per-draft
+    /// cap, none dated after the propose's clock, and a row whose `plan_id`
+    /// does not name its own model is not carried at all. Reads the file
+    /// directly, so it runs without the remote-test serial guard; the
+    /// published side is
+    /// `a_flood_of_future_dated_draft_rows_is_capped_and_clamped`.
+    #[test]
+    fn the_carried_draft_set_is_capped_clamped_and_shape_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let now = Utc::now();
+        let base = now + chrono::Duration::days(365);
+        {
+            let local = StateStore::open(&state_path).unwrap();
+            for i in 0..10_001i64 {
+                local
+                    .record_policy_decision(&PolicyDecisionRecord {
+                        timestamp: base + chrono::Duration::seconds(i),
+                        capability: PolicyCapability::Propose,
+                        model: "orders".to_string(),
+                        reason: format!("forged {i}"),
+                        ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Allow)
+                    })
+                    .unwrap();
+            }
+            local
+                .record_policy_decision(&PolicyDecisionRecord {
+                    capability: PolicyCapability::Propose,
+                    model: "orders".to_string(),
+                    ..row("draft:other", None, &[], PolicyEffect::Allow)
+                })
+                .unwrap();
+        }
+        let carried =
+            super::local_draft_rows_to_carry(&state_path, &["orders".to_string()], now).unwrap();
+        assert!(!carried.is_empty(), "a well-shaped row is still carried");
+        assert!(
+            carried.len() <= super::MAX_CARRIED_PER_DRAFT,
+            "at most the per-draft cap: {}",
+            carried.len()
+        );
+        assert!(
+            carried.iter().all(|d| d.timestamp <= now),
+            "no carried row is dated after the propose's clock"
+        );
+        assert!(
+            carried.iter().all(|d| d.plan_id == DRAFT_PLAN_ID),
+            "a plan_id that does not name its model is not carried"
+        );
+    }
+
+    /// The published side of the bound: future-dated forged rows reach the
+    /// remote ledger capped and dated no later than the propose.
+    #[tokio::test]
+    async fn a_flood_of_future_dated_draft_rows_is_capped_and_clamped() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let base = Utc::now() + chrono::Duration::days(365);
+        {
+            let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+            for i in 0..20i64 {
+                local
+                    .record_policy_decision(&PolicyDecisionRecord {
+                        timestamp: base + chrono::Duration::seconds(i),
+                        capability: PolicyCapability::Propose,
+                        model: "orders".to_string(),
+                        reason: format!("forged {i}"),
+                        ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Allow)
+                    })
+                    .unwrap();
+            }
+            local
+                .record_policy_decision(&PolicyDecisionRecord {
+                    capability: PolicyCapability::Propose,
+                    model: "orders".to_string(),
+                    ..row("draft:other", None, &[], PolicyEffect::Allow)
+                })
+                .unwrap();
+        }
+
+        let models = vec!["orders".to_string()];
+        propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+            .await
+            .unwrap();
+        let after = Utc::now();
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        let carried = draft_rows(&rows);
+        assert!(!carried.is_empty(), "a well-shaped row is still carried");
+        assert!(
+            carried.len() <= super::MAX_CARRIED_PER_DRAFT,
+            "at most the per-draft cap: {}",
+            carried.len()
+        );
+        assert!(
+            carried.iter().all(|d| d.timestamp <= after),
+            "no carried row is dated after the propose"
+        );
+        assert!(
+            !rows.iter().any(|d| d.plan_id == "draft:other"),
+            "a plan_id that does not name its model is not carried"
         );
     }
 }

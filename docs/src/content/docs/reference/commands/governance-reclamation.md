@@ -37,7 +37,7 @@ rocky gc --derivable
 
 An artifact is *derivable* only when all six checks pass.
 
-1. Its recipe identity was recorded.
+1. Its recipe identity was recorded, with a strong input closure, in a shape `rocky restore` can rebuild: content-addressed, with no partition columns and no recorded upstreams. A partitioned artifact, or one built from other tables (a multi-input recipe), is not evicted yet, because `rocky restore` cannot rebuild it. gc and restore run the same check, so the two cannot disagree.
 2. The recipe's provenance records this artifact's exact output hash. The recipe must be bound to these specific bytes, not to a sibling output and not to a re-materialization at a new hash.
 3. The ledger's replay-check verdict says the artifact is replayable and deterministic.
 4. Nothing references it.
@@ -50,6 +50,8 @@ Every check fails closed. Any doubt keeps the artifact.
 
 A `gc` plan is **unconditionally review-gated**: `rocky apply <plan-id>` refuses it until `rocky review <plan-id> --approve` records a sign-off, and at apply time every eviction is re-verified against the live ledger. An entry that is no longer derivable (for example, a new reference appeared since plan time) is refused, with the failing checks reported.
 
+A `gc` plan is gated as an `agent` whoever applies it, so a `deny` or `require_review` rule scoped to `agent` and `gc` also applies to an interactive `rocky gc`. This keeps an unattended gc (a cron job or a daemon with no `ROCKY_PRINCIPAL`) under the same rules.
+
 Eviction is ledger-only: a durable restore tombstone is written and the ledger row retired in one transaction. No physical byte-delete follows. Reclaiming the bytes safely needs a protocol-aware VACUUM (retention windows plus TOCTOU-safe deletion against concurrent re-adds), which is future work, so `[gc] physical_delete = true` is a hard error rather than a silent no-op.
 
 ### What restore can and cannot undo
@@ -58,7 +60,7 @@ Eviction is ledger-only: a durable restore tombstone is written and the ledger r
 
 `rocky restore` rebuilds an evicted artifact from the recipe its tombstone references. It refuses unless the recomputed content hash matches the tombstoned one.
 
-Restore covers less than gc evicts. It attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstream. A recipe with any recorded upstream is refused outright, because re-deriving a multi-input DAG is a later phase.
+Restore covers the same set gc evicts, or more. Restore attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstream. A partitioned recipe or one with any recorded upstream is refused outright, because partitioned restore and multi-input DAG re-derivation are later phases. gc calls the same check before it marks an artifact derivable, so it does not evict such an artifact until restore can rebuild it.
 
 Even a supported recipe can refuse. Any of these stops it:
 

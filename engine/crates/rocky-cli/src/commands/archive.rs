@@ -894,6 +894,33 @@ adapter = "default"
             );
         }
 
+        /// #1829(6): a two-part `--model` is never a deferred physical
+        /// identifier. It is a model name or it is refused, so the plan's
+        /// `DELETE` always hits the table that the named model declares.
+        #[test]
+        fn a_two_part_name_is_a_model_name_or_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project(dir.path());
+            let models = dir.path().join("models");
+            std::fs::write(models.join("prod_orders.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join("prod_orders.toml"),
+                "name = \"prod.orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"gold\"\ntable = \"shadow_orders\"\n",
+            )
+            .unwrap();
+
+            assert_eq!(
+                super::super::resolve_archive_model_target(&config, Some("prod.orders"))
+                    .unwrap()
+                    .as_deref(),
+                Some("wh.gold.shadow_orders"),
+            );
+            let err = super::super::resolve_archive_model_target(&config, Some("prod.events"))
+                .expect_err("a two-part name no model declares must refuse");
+            assert!(format!("{err:#}").contains("no model by that name"));
+        }
+
         /// Two shapes that must NOT change. A fully qualified name is kept
         /// verbatim so an operator can still name a table directly, and the
         /// project-wide archive (no `--model`) names no table at all.

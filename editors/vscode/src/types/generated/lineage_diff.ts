@@ -108,7 +108,7 @@ export interface LineageConsumerImpact {
   reason: string;
   status: ConsumerImpactStatus;
   /**
-   * How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`).
+   * How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on`, `order_limit`).
    */
   via?: string[];
   [k: string]: unknown;

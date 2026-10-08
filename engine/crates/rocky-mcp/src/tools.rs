@@ -4313,29 +4313,120 @@ impl RockyMcpServer {
     /// this resolves to `NotConfigured` and behaviour is unchanged.
     ///
     /// `marker_freezes` is the durable freeze-marker set hoisted by the async
-    /// tool body (via [`Self::draft_marker_freezes`]) — the evaluation itself
-    /// is synchronous.
-    fn evaluate_draft_policy(
+    /// tool body (via [`Self::draft_marker_freezes`]); the local-backend
+    /// evaluation is synchronous and uses it directly.
+    ///
+    /// Under a remote `[state]` backend with a `[policy]` block, the Default
+    /// and Approver profiles publish the decision row to the shared ledger in
+    /// the same step ([`rocky_cli::commands::evaluate_apply_policy_durable`],
+    /// #2282). A row left only in the local file is replaced by the next
+    /// `download_state` before review ever reads it. That path is
+    /// fail-closed: an unreachable ledger is an `Err` carrying the cause, and
+    /// the caller hands its rollback guard to
+    /// [`Self::ledger_unreachable_after_rollback`]. The Worker profile never publishes:
+    /// it records locally, and the fulfill loop's `propose` carries the row.
+    ///
+    /// `prior_classifications` is the pre-image for the dual evaluation
+    /// (`draft_model` on an existing model); `None` is a plain evaluation.
+    async fn evaluate_draft_policy(
         &self,
         stem: &str,
         decision_id: &str,
         marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
-    ) -> rocky_cli::commands::PolicyGate {
+        prior_classifications: Option<&std::collections::BTreeMap<String, Vec<String>>>,
+    ) -> Result<rocky_cli::commands::PolicyGate, String> {
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
                 stem.to_string(),
                 rocky_core::config::PolicyCapability::Propose,
             ))
             .collect();
-        rocky_cli::commands::evaluate_apply_policy(
-            &self.config_path,
+        let state_path = self.state_path();
+        // A config that does not load cannot name a remote backend; the
+        // synchronous gate answers it exactly (`NotConfigured` for an absent
+        // file, `Unloadable` for a broken one — #1559).
+        //
+        // The WORKER profile always takes the synchronous, local-only gate
+        // (#2282). It is the untrusted fulfill worker: publishing would need
+        // write access to the shared state blob that also carries freezes and
+        // budgets. Its row stays in the local file, and the trusted loop's
+        // `propose` publishes it (`evaluate_apply_policy_durable`'s
+        // `carry_drafts_for`). So the worker never uploads state.
+        let loaded = if self.profile == McpProfile::Worker {
+            None
+        } else {
+            rocky_core::config::load_rocky_config(&self.config_path).ok()
+        };
+        let Some(cfg) = loaded else {
+            return Ok(match prior_classifications {
+                Some(prior) => {
+                    rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
+                        &self.config_path,
+                        decision_id,
+                        rocky_core::config::PolicyPrincipal::Agent,
+                        &self.actor,
+                        &touched,
+                        rocky_cli::commands::EmptyTouched::Refuse,
+                        &self.models_dir,
+                        &state_path,
+                        marker_freezes,
+                        prior,
+                    )
+                }
+                None => rocky_cli::commands::evaluate_apply_policy(
+                    &self.config_path,
+                    decision_id,
+                    rocky_core::config::PolicyPrincipal::Agent,
+                    &self.actor,
+                    &touched,
+                    rocky_cli::commands::EmptyTouched::Refuse,
+                    &self.models_dir,
+                    &state_path,
+                    marker_freezes,
+                ),
+            });
+        };
+        rocky_cli::commands::evaluate_apply_policy_durable(
+            &cfg,
             decision_id,
             rocky_core::config::PolicyPrincipal::Agent,
             &self.actor,
             &touched,
+            rocky_cli::commands::EmptyTouched::Refuse,
             &self.models_dir,
-            &self.state_path(),
+            &state_path,
             marker_freezes,
+            prior_classifications,
+            None,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The draft tools' refusal when the shared ledger could not record the
+    /// decision (`Err` from [`Self::evaluate_draft_policy`]). The draft is
+    /// rolled back HERE, through the same [`rollback_disposition`] the deny
+    /// arms use, so the message says what really happened: "not kept" only
+    /// when the rollback succeeded, and the leftover paths otherwise.
+    fn ledger_unreachable_after_rollback(
+        &self,
+        rollback: DraftRollback,
+        cause: &str,
+    ) -> Json<ToolError> {
+        let (disposition, rollback_failed_paths) = rollback_disposition(
+            &self.root,
+            rollback,
+            "The draft was not kept.",
+            "Rolling the draft back FAILED",
+        );
+        ToolError::internal_after_rollback(
+            format!(
+                "failed to record the policy decision on the shared state ledger: {cause}. \
+                 {disposition}"
+            ),
+            "The remote [state] backend must be reachable so the draft's policy decision \
+             survives to review (fail-closed). Retry once it is reachable.",
+            rollback_failed_paths,
         )
     }
 
@@ -4372,6 +4463,20 @@ impl RockyMcpServer {
                      enforced before authoring into a governed scope (fail-closed).",
                 )
             })
+    }
+
+    /// The logical model name (`ModelConfig.name`) of the model `stem`. A
+    /// model's config may set `name` apart from the file stem, and the compile
+    /// filter, the policy gate and the audit ledger all select by the logical
+    /// name (#1829 item 5). Read through the model loader's own rule
+    /// ([`rocky_core::models::declared_model_name`]: the sidecar, else the
+    /// `---toml` frontmatter, after `${VAR}` substitution) for this one model
+    /// only, so there is no second pass over every model. Falls back to the
+    /// stem when no name is declared or the config does not read: the compile
+    /// that follows reports the real problem.
+    fn logical_model_name(&self, stem: &str) -> String {
+        rocky_core::models::declared_model_name(&self.models_dir, stem)
+            .unwrap_or_else(|| stem.to_string())
     }
 
     /// Compile the project scoped to `stem` and reduce it to the lite
@@ -4567,13 +4672,6 @@ impl RockyMcpServer {
         // A config that EXISTS but fails to load is `Unloadable` instead, and
         // is refused — "no policy" and "could not read the policy" are
         // different answers, and only the first is permission (#1559).
-        let state_path = self.state_path();
-        let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
-            std::iter::once((
-                paths.stem.clone(),
-                rocky_core::config::PolicyCapability::Propose,
-            ))
-            .collect();
         // A draft has no plan; the decision is recorded against a draft-scoped id
         // so the audit ledger stays honest about what it is.
         let decision_id = format!("draft:{}", paths.stem);
@@ -4591,17 +4689,18 @@ impl RockyMcpServer {
         // STRUCTURAL rather than an artifact of the merge staying correct.
         let prior_classifications_by_model: std::collections::BTreeMap<String, Vec<String>> =
             std::iter::once((paths.stem.clone(), prior_classifications)).collect();
-        let gate = rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
-            &self.config_path,
-            &decision_id,
-            rocky_core::config::PolicyPrincipal::Agent,
-            &self.actor,
-            &touched,
-            &self.models_dir,
-            &state_path,
-            &marker_freezes,
-            &prior_classifications_by_model,
-        );
+        let gate = match self
+            .evaluate_draft_policy(
+                &paths.stem,
+                &decision_id,
+                &marker_freezes,
+                Some(&prior_classifications_by_model),
+            )
+            .await
+        {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
 
         match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
@@ -4758,13 +4857,24 @@ impl RockyMcpServer {
 
         // Compile with the write — the contract is validated against the model's
         // inferred schema. A hard compile failure rolls the draft back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-contract:{}", paths.stem);
+        let decision_id = format!("draft-contract:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        let gate = match self
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
+            .await
+        {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -4937,13 +5047,24 @@ impl RockyMcpServer {
             ));
         }
 
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-check:{}", paths.stem);
+        let decision_id = format!("draft-check:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        let gate = match self
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
+            .await
+        {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5170,15 +5291,26 @@ impl RockyMcpServer {
         }
 
         // Compile with the write — a hard failure rolls the patch back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // The gate, the freeze markers and the compile filter all select by
+        // the LOGICAL model name, which the sidecar may set apart from the
+        // file stem (#1829 item 5).
+        let logical = self.logical_model_name(&paths.stem);
+        let compiled = self.compile_drafted(&logical)?;
 
         // ⟦RTL-2⟧ the policy gate runs AFTER the write, so the evaluation
         // compiles the model's attributes AS PATCHED from disk — a patch that
         // first ADDS a governed classification is gated by that
         // classification, not by the pre-patch attribute set.
-        let decision_id = format!("draft-metadata:{}", paths.stem);
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let decision_id = format!("draft-metadata:{logical}");
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        let gate = match self
+            .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)
+            .await
+        {
+            Ok(gate) => gate,
+            Err(cause) => return Err(self.ledger_unreachable_after_rollback(rollback, &cause)),
+        };
+        match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5364,9 +5496,9 @@ impl RockyMcpServer {
             }
             Err(ProposeError::LedgerDownload(inner)) => {
                 return Err(ToolError::internal(
-                    format!("failed to download remote state before the policy gate: {inner}"),
+                    format!("failed to sync remote state around the policy gate: {inner}"),
                     "The remote [state] backend must be reachable so a cross-pod freeze is \
-                     enforced before proposing a plan.",
+                     enforced and the policy decision is recorded before proposing a plan.",
                 ));
             }
             Err(ProposeError::MarkerList(inner)) => {

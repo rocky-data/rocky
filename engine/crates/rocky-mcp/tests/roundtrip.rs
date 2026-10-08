@@ -1797,6 +1797,195 @@ effect = "deny"
     );
 }
 
+/// `[state]` on the in-memory "S3" harness, plus an allow-propose policy.
+const REMOTE_STATE_ALLOW_PROPOSE: &str = r#"[state]
+backend = "s3"
+s3_bucket = "test"
+concurrency_control = "cas"
+
+[state.retry]
+max_retries = 0
+
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "allow"
+"#;
+
+/// Run `draft_model` under `profile` against a remote `[state]` backend and
+/// return the number of object-store PUTs it made, plus the local ledger.
+async fn draft_against_remote_state(
+    profile: rocky_mcp::McpProfile,
+) -> (u64, Vec<rocky_core::state::PolicyDecisionRecord>) {
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    write_target_defaults(dir.path());
+    let state_path = dir.path().join(".rocky").join("state.redb");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let server = RockyMcpServer::new_with_profile(dir.path().join("rocky.toml"), profile)
+        .with_state_path(Some(state_path.clone()));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "daily_revenue",
+                "SELECT 1 AS id",
+                "a draft the policy allows",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(result.is_error, Some(true), "{profile:?}: {result:?}");
+    client.cancel().await.unwrap();
+    let puts = harness.faults.count(rocky_core::fault_store::FaultOp::Put);
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open local ledger");
+    (puts, store.list_policy_decisions().unwrap())
+}
+
+/// #2282 (b): the WORKER profile is the untrusted fulfill worker. Its
+/// `draft_model` records the decision in the local file and writes nothing to
+/// the remote state ledger, so read-only state credentials are enough. The
+/// trusted loop's `propose` publishes the row. The Default profile, used by a
+/// person's agent session, still publishes its own row.
+#[tokio::test]
+async fn worker_draft_model_never_writes_the_remote_state_ledger() {
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+
+    let (puts, rows) = draft_against_remote_state(rocky_mcp::McpProfile::Worker).await;
+    assert_eq!(puts, 0, "the worker made no remote write");
+    assert!(
+        rows.iter().any(|d| d.plan_id == "draft:daily_revenue"),
+        "the worker's row is in the local file for propose to carry: {rows:?}"
+    );
+
+    let (puts, _) = draft_against_remote_state(rocky_mcp::McpProfile::Default).await;
+    assert!(puts > 0, "the Default profile still publishes its own row");
+}
+
+fn remote_state_key() -> String {
+    format!(
+        "v{}/state.redb",
+        rocky_core::state::current_schema_version()
+    )
+}
+
+/// The Default profile publishes its draft decision. When the ledger cannot
+/// take it (every compare-and-swap attempt conflicts), the draft is removed
+/// and the error says so.
+#[tokio::test]
+async fn default_draft_is_removed_when_the_ledger_cannot_record_it() {
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    harness
+        .faults
+        .arm_precondition_failures(remote_state_key(), 100);
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    write_target_defaults(dir.path());
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "daily_revenue",
+                "SELECT 1 AS id",
+                "a draft the ledger cannot record",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    client.cancel().await.unwrap();
+
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("The draft was not kept."), "{message}");
+    assert!(err.get("rollback_failed_paths").is_none(), "{err:?}");
+    assert!(!dir.path().join("models").join("daily_revenue.sql").exists());
+    assert!(
+        !dir.path()
+            .join("models")
+            .join("daily_revenue.toml")
+            .exists()
+    );
+}
+
+/// #2282 item 4: when the ledger cannot record the decision AND the rollback
+/// fails, the error must not claim the draft "was not kept". It used to
+/// return early with that fixed text while the drop guard only logged the
+/// failed rollback. The models directory goes read-only between the write
+/// and the verdict, so the fresh contract cannot be unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ledger_failure_with_a_failed_rollback_reports_the_leftover() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+    let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+    harness
+        .faults
+        .arm_precondition_failures(remote_state_key(), 100);
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        REMOTE_STATE_ALLOW_PROPOSE,
+    );
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    drop(rocky_core::state::StateStore::open(&state_path).expect("pre-create the ledger"));
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let models_at_mutation = models.clone();
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        make_models_read_only(&models_at_mutation)
+    })
+    .await;
+    let Some(result) = result else {
+        eprintln!("skipping: a read-only models directory does not block unlink here (root?)");
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("internal"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "{err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("shared state ledger") && message.contains("could not be removed"),
+        "{message}"
+    );
+    assert!(!message.contains("not kept"), "{message}");
+    assert!(
+        !err["remediation_hint"]
+            .as_str()
+            .unwrap()
+            .contains("not kept"),
+        "{err:?}"
+    );
+    drop(restore);
+    assert!(contract.exists(), "the leftover really is on disk");
+}
+
 /// A `require_review` verdict PERSISTS the draft (it is the reviewable artifact,
 /// mirroring the propose gate) and returns a structured `policy_review_required`
 /// signal that routes the agent to human review.
@@ -3319,6 +3508,140 @@ fn metadata_args(json: serde_json::Value) -> serde_json::Map<String, serde_json:
         serde_json::Value::Object(map) => map,
         other => panic!("metadata_args needs a JSON object, got {other}"),
     }
+}
+
+/// #1829 item 5: the draft tools resolve the model by file stem but gate and
+/// record by the LOGICAL name. `payments.sql` is logically `gold_payments`;
+/// another file, `orders.sql`, is logically `payments`. A metadata patch on
+/// stem `payments` must reach the ledger as `gold_payments`, never as the
+/// unrelated `payments` model.
+#[tokio::test]
+async fn draft_tools_record_the_logical_name_not_the_file_stem() {
+    for tool in ["draft_metadata", "draft_contract", "draft_check"] {
+        let dir = TempDir::new().unwrap();
+        write_project_with_policy(
+            dir.path(),
+            &dir.path().join("test.duckdb"),
+            r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+        );
+        let models = dir.path().join("models");
+        // `orders.sql` is logically `payments` (the unrelated model).
+        let orders_sidecar = std::fs::read_to_string(models.join("orders.toml")).unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            orders_sidecar.replace("name = \"orders\"", "name = \"payments\""),
+        )
+        .unwrap();
+        // `payments.sql` is logically `gold_payments`.
+        std::fs::write(
+            models.join("payments.sql"),
+            "SELECT 1 AS id, 'x' AS email\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("payments.toml"),
+            "name = \"gold_payments\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"gold_payments\"\n",
+        )
+        .unwrap();
+
+        let args = match tool {
+            "draft_metadata" => serde_json::json!({
+                "model": "payments",
+                "classifications": { "email": "pii" },
+            }),
+            "draft_contract" => serde_json::json!({
+                "model": "payments",
+                "spec": "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n",
+            }),
+            _ => serde_json::json!({
+                "model": "payments",
+                "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+            }),
+        };
+        let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+        let client = connect(server).await;
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(metadata_args(args)))
+            .await
+            .expect("draft call");
+        assert_eq!(result.is_error, Some(true), "{tool}: the deny rule fires");
+        client.cancel().await.unwrap();
+
+        let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+        let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+        let decisions = store.list_policy_decisions().expect("list decisions");
+        assert!(
+            decisions.iter().any(|d| d.model == "gold_payments"),
+            "{tool}: the ledger row is keyed by the logical name: {decisions:?}"
+        );
+        assert!(
+            !decisions.iter().any(|d| d.model == "payments"),
+            "{tool}: no row is keyed by the file stem of an unrelated model: {decisions:?}"
+        );
+    }
+}
+
+/// The logical name of an inline model (`---toml` frontmatter, no sidecar)
+/// whose `name` is a `${VAR:-default}` placeholder: resolved the way the
+/// model loader resolves it. Reading only a sidecar, the draft tools fell
+/// back to the file stem here.
+#[tokio::test]
+async fn draft_contract_records_the_logical_name_of_an_inline_model() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    let models = dir.path().join("models");
+    std::fs::write(
+        models.join("payments.sql"),
+        "---toml\nname = \"${ROCKY_T1829_INLINE_UNSET:-gold_payments}\"\n\n[strategy]\n\
+         type = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\n\
+         table = \"gold_payments\"\n---\nSELECT 1 AS id\n",
+    )
+    .unwrap();
+    let args = serde_json::json!({
+        "model": "payments",
+        "spec": "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n",
+    });
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(metadata_args(args)))
+        .await
+        .expect("draft call");
+    assert_eq!(result.is_error, Some(true), "the deny rule fires");
+    client.cancel().await.unwrap();
+
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+    let decisions = store.list_policy_decisions().expect("list decisions");
+    assert!(
+        decisions.iter().any(|d| d.model == "gold_payments"),
+        "{decisions:?}"
+    );
+    assert!(
+        !decisions.iter().any(|d| d.model == "payments"),
+        "{decisions:?}"
+    );
 }
 
 /// Happy path: a structured patch merges `[freshness]` + `[classification]`

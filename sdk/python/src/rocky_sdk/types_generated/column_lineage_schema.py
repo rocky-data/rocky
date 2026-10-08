@@ -18,7 +18,7 @@ class RowSelectionEdgeRecord(BaseModel):
 
     kind: str
     """
-    `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.
+    `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on` or `order_limit`.
     """
     source: LineageQualifiedColumn
     """

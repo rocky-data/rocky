@@ -1921,6 +1921,38 @@ pub fn parse_model_inline_with_context(
     })
 }
 
+/// The `name` that one model's own config declares, read the way the
+/// directory loader reads it, without loading the rest of the directory.
+///
+/// The model is `models_dir/<stem>.{sql,rocky}`. Its config is the
+/// `<stem>.toml` sidecar when one is present, otherwise the `---toml`
+/// frontmatter of `<stem>.sql` (the loader's precedence). `${VAR}` and
+/// `${VAR:-default}` placeholders are resolved before the parse, as the
+/// loader does.
+///
+/// `None` when the config sets no non-empty string `name` (the loader then
+/// names the model after the stem), or when it cannot be read, substituted
+/// or parsed. A caller falls back to the stem; the compile reports the real
+/// problem.
+#[must_use]
+pub fn declared_model_name(models_dir: &Path, stem: &str) -> Option<String> {
+    let toml_path = models_dir.join(format!("{stem}.toml"));
+    let raw = if crate::path_presence::entry_is_present(&toml_path) {
+        read_model_text(&toml_path).ok()?
+    } else {
+        let content = read_model_text(&models_dir.join(format!("{stem}.sql"))).ok()?;
+        split_frontmatter(&content)?.0.to_string()
+    };
+    let substituted = substitute_env_vars(&raw).ok()?;
+    match toml::from_str::<toml::Table>(&substituted)
+        .ok()?
+        .get("name")
+    {
+        Some(toml::Value::String(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Loads all models from a directory.
 ///
 /// Supports two formats (sidecar preferred):
@@ -2419,6 +2451,45 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `declared_model_name` reads one model's name as the loader does:
+    /// sidecar first, then inline frontmatter, after `${VAR}` substitution.
+    #[test]
+    fn declared_model_name_matches_the_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path();
+        // Sidecar with a placeholder (the variable is never set).
+        std::fs::write(models.join("a.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("a.toml"),
+            "name = \"${ROCKY_T_DECLARED_NAME_UNSET:-gold_a}\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        // Inline frontmatter, no sidecar.
+        std::fs::write(
+            models.join("b.sql"),
+            "---toml\nname = \"gold_b\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n---\nSELECT 1 AS id\n",
+        )
+        .unwrap();
+        // No name anywhere.
+        std::fs::write(models.join("c.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("c.toml"),
+            "[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(declared_model_name(models, "a").as_deref(), Some("gold_a"));
+        assert_eq!(declared_model_name(models, "b").as_deref(), Some("gold_b"));
+        assert_eq!(declared_model_name(models, "c"), None);
+        assert_eq!(declared_model_name(models, "missing"), None);
+
+        // The loader agrees on every model that loads.
+        let loaded = load_models_from_dir(models, None).unwrap();
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["c", "gold_a", "gold_b"]);
+    }
 
     /// #1919 follow-up: a strategy prints its structure resolved (the tag,
     /// columns, grain, `first_partition`) because dagster-rocky builds
@@ -2944,6 +3015,65 @@ SELECT 1
         let ir = model.to_model_ir();
         assert_eq!(&*ir.name, "fct_orders");
         assert_eq!(ir.target.table, "fct_orders_v2");
+    }
+
+    /// A derived physical edge is a RUN-time ordering fact, not part of a
+    /// model's logic. It must never enter `skip_hash()`: if it did, adding a
+    /// physical read of another model's table would invalidate the skip key
+    /// (and a content-addressed reuse key built on it) with no change to the
+    /// model's own output.
+    #[test]
+    fn derived_physical_edge_does_not_enter_skip_hash() {
+        use crate::physical_edges::{PhysicalEdgeModel, derive_physical_edges};
+
+        let producer = parse_model_inline(
+            "---toml\nname = \"stg_orders\"\n[target]\ncatalog = \"analytics\"\nschema = \"staging\"\ntable = \"orders\"\n---\nSELECT 1 AS id\n",
+            Path::new("stg_orders.sql"),
+            None,
+        )
+        .unwrap();
+        let mut consumer = parse_model_inline(
+            "---toml\nname = \"fct_orders\"\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"fct_orders\"\n---\nSELECT id FROM analytics.staging.orders\n",
+            Path::new("fct_orders.sql"),
+            None,
+        )
+        .unwrap();
+
+        // The derivation really does produce the edge under test.
+        let inputs = [
+            PhysicalEdgeModel::from_model(&producer),
+            PhysicalEdgeModel::from_model(&consumer),
+        ];
+        let derived = derive_physical_edges(&inputs, &[]);
+        assert_eq!(
+            derived.edges,
+            vec![("fct_orders".to_string(), "stg_orders".to_string())],
+            "fixture must derive the physical edge fct_orders -> stg_orders"
+        );
+
+        let typed = |m: &Model| {
+            let mut ir = m.to_model_ir();
+            ir.typed_columns = vec![rocky_ir::types::TypedColumn {
+                name: "id".into(),
+                data_type: rocky_ir::types::RockyType::Int64,
+                nullable: false,
+            }];
+            ir
+        };
+        let before = typed(&consumer).skip_hash();
+        assert!(before.is_some(), "typed IR must be hashable");
+
+        // Record the derived edge on the consumer the way a declared one is
+        // carried (`depends_on`); the skip key must not move.
+        for (c, p) in &derived.edges {
+            assert_eq!(c, &consumer.config.name);
+            consumer.config.depends_on.push(p.clone());
+        }
+        assert_eq!(
+            before,
+            typed(&consumer).skip_hash(),
+            "a derived physical edge must not change skip_hash"
+        );
     }
 
     // --- Sidecar format tests ---

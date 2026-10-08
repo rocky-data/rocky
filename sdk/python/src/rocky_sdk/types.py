@@ -892,7 +892,7 @@ class RowSelectionEdge(BaseModel):
     #: output column of ``target_model``.
     target_column: str | None = None
     #: ``join_key``, ``filter``, ``group_by``, ``having``, ``qualify``,
-    #: ``window_partition`` or ``window_order``.
+    #: ``window_partition``, ``window_order``, ``distinct_on`` or ``order_limit``.
     kind: str
 
 

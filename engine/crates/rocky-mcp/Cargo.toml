@@ -55,6 +55,9 @@ async-trait = { workspace = true }
 # adapter directly to set up / tear down its fixture table.
 rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-ai = { path = "../rocky-ai" }
+# The in-memory "S3" state harness (`rocky_core::test_harness`): pins that the
+# worker profile never writes the remote state ledger (#2282).
+rocky-core = { path = "../rocky-core", features = ["test-support"] }
 tempfile = "3"
 serde_json = { workspace = true }
 # The served-text golden (`roundtrip.rs`) digests every worded MCP surface so

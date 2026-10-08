@@ -377,7 +377,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Requires `--token` with `--token-scope read-only`, and `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
 | `--allowed-host <HOST>` | `String` (repeatable) | `[]` | With `--ui`: an extra `Host` header value to accept, for a reverse proxy in front of the UI. Loopback names and the bind host are always accepted; any other `Host` is refused `421`. |
-| `--watch` | `bool` | `false` | Watch for file changes and auto-recompile. |
+| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
 | `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
 | `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |

@@ -971,6 +971,16 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   From then on an older binary that ignores the id would decide
 ///   differently, which is the v31 lesson above.
 ///
+/// - **[`PolicyDecisionRecord::fail_closed`]** (#1829, at v32). Marks a
+///   `deny` written by the fail-closed floor (ledger snapshot unreadable) or
+///   forced by an active freeze, rather than by policy. Only the review queue reads it, to let a policy
+///   `deny` supersede an older `require_review`; it is not an enforcement
+///   input, so a binary that ignores it enforces the same. It is omitted when
+///   `false`, so a row without it is byte-identical to an older row. A row
+///   from before the field reads back `false` ("policy"), which is the one
+///   honest default: the older row cannot say. Guarded by
+///   `test_v32_policy_decision_fail_closed_defaults_false_and_round_trips`.
+///
 /// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
 ///   identity of each model output. Nothing read it in P1b; it was recorded
 ///   only. A v31 binary without the field ignores it and drops nothing it
@@ -7867,6 +7877,24 @@ pub struct PolicyDecisionRecord {
     /// rows were offered for sampling (#1815, review round seven).
     #[serde(default)]
     pub keys_recorded: bool,
+    /// Whether this `deny` is operational (the fail-closed floor or a freeze)
+    /// and not a policy verdict.
+    ///
+    /// `true` when the gate denied because it could not read the policy
+    /// ledger snapshot, so an active freeze or an exhausted budget would have
+    /// been invisible, or because an active freeze turned a non-`deny` policy
+    /// effect into `deny`. Both are transient refusals: they say nothing about
+    /// whether the plan needs review. `false` for every policy verdict, for
+    /// every non-`deny` row, and for a row written before this field existed
+    /// (the review queue also recognises a legacy floor row by its reason
+    /// text).
+    ///
+    /// Read by the review queue only, to decide whether a later `deny`
+    /// supersedes an older `require_review` (#1829). No gate reads it, so it
+    /// needs no schema bump; see "Fields added without a bump" above
+    /// [`CURRENT_SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fail_closed: bool,
     /// The resolved verdict.
     pub effect: crate::config::PolicyEffect,
     /// Index of the winning `[[policy.rules]]` entry, or `None` for the
@@ -13550,6 +13578,7 @@ mod tests {
             model: "fct_orders".to_string(),
             models: vec!["fct_orders".to_string()],
             keys_recorded: true,
+            fail_closed: false,
             effect: PolicyEffect::Allow,
             rule_id: None,
             reason: "default posture".to_string(),
@@ -16044,6 +16073,7 @@ mod tests {
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -16061,6 +16091,7 @@ mod tests {
         };
         let later = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
                 .unwrap()
@@ -16102,6 +16133,7 @@ mod tests {
         // A full record serialized with `models` stripped — a v27 blob.
         let record = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: vec!["dim_customer".to_string()],
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00Z")
                 .unwrap()
@@ -16149,6 +16181,7 @@ mod tests {
 
         let record = PolicyDecisionRecord {
             keys_recorded: true,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-09T10:00:00Z")
                 .unwrap()
@@ -16180,6 +16213,45 @@ mod tests {
         );
     }
 
+    /// A row without `fail_closed` (written before the field) reads `false`,
+    /// and `false` is omitted on write, so an old binary sees the old bytes.
+    /// A `true` round-trips. Guards the no-bump decision for `fail_closed`.
+    #[test]
+    fn test_v32_policy_decision_fail_closed_defaults_false_and_round_trips() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let mut record = PolicyDecisionRecord {
+            keys_recorded: true,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-10-08T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_fc".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "ledger unreadable".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        };
+        let plain = serde_json::to_value(&record).unwrap();
+        assert!(
+            plain.get("fail_closed").is_none(),
+            "false is omitted: the bytes equal an older row's"
+        );
+        let read: PolicyDecisionRecord = serde_json::from_value(plain).unwrap();
+        assert!(!read.fail_closed, "an old row reads as a policy verdict");
+
+        record.fail_closed = true;
+        let (store, _dir) = temp_store();
+        store.record_policy_decision(&record).unwrap();
+        assert_eq!(store.list_policy_decisions().unwrap(), vec![record]);
+    }
+
     /// `graph_keys` yields the model set when there is one and the single
     /// `model` when there is not — and NEVER yields nothing.
     ///
@@ -16194,6 +16266,7 @@ mod tests {
 
         let base = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "p".to_string(),
@@ -16222,6 +16295,7 @@ mod tests {
         // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             ..base.clone()
         };
@@ -16233,6 +16307,7 @@ mod tests {
         // An ordinary row: `model` is the graph key and there is no set.
         let ordinary = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             model: "fct_orders".to_string(),
             ..base
@@ -16250,6 +16325,7 @@ mod tests {
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
             keys_recorded: false,
+            fail_closed: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -17046,6 +17122,7 @@ mod tests {
             store
                 .record_policy_decision(&PolicyDecisionRecord {
                     keys_recorded: false,
+                    fail_closed: false,
                     models: Vec::new(),
                     timestamp: Utc::now(),
                     plan_id: "planPre28".to_string(),

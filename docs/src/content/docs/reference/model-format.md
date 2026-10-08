@@ -679,6 +679,7 @@ Rocky can filter the model's output instead of its input. It then runs `SELECT *
 | `E037` | `type = "incremental"` with no `timestamp_column`. Rocky could only append every row again on each run. |
 | `E046` | No placeholder and the watermark is not a provable passthrough. Also: the watermark is missing from the model's output, `timestamp_column` or `filter_column` is not a plain column name, or `@incremental_filter` appears in a model of another strategy. |
 | `W046` | `lookback` without `unique_key`. |
+| `W056` | No `lookback`. The filter is a strict `>`, so a late row whose timestamp equals the target's `MAX` is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads. Set `lookback` with `unique_key`. |
 
 `rocky run` records a refused model as a failed table and leaves its existing table alone. By default, Rocky also withholds every model that depends on it. Set `contain_failures = true` under `[resilience]` to widen that hold. See [`[resilience]`](/reference/configuration/#resilience).
 
