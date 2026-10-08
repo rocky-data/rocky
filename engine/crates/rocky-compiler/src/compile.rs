@@ -335,7 +335,11 @@ fn compile_preloaded_models_inner(
 /// required variable that had no supplied value and no inline default, naming
 /// the variable. A no-op (beyond the per-model regex scan) when no model uses
 /// `@var()`.
-fn substitute_run_vars_into_models(
+///
+/// Public so graph-only callers (`--select` resolution in `rocky-cli`) build
+/// their dependency graph from the same substituted SQL `compile` does,
+/// rather than a second substitution.
+pub fn substitute_run_vars_into_models(
     models: &mut [rocky_core::models::Model],
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Vec<Diagnostic> {

@@ -47,16 +47,42 @@ use crate::registry;
 /// Resolve the model target dialect from the loaded config. Models use the
 /// adapter chosen by `run --model`; a project without pipelines keeps the
 /// standalone preview default.
+///
+/// Also returns the pipeline's configured models glob, so `--pipeline`
+/// without `--models` reads that pipeline's models (the rule `rocky run`
+/// uses). An explicit `--pipeline` that names no transformation pipeline is
+/// an error, never ignored (#2314).
 fn resolve_dialect(
     config: Option<&rocky_core::config::RockyConfig>,
-) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    pipeline_name: Option<&str>,
+) -> Result<(Box<dyn rocky_core::traits::SqlDialect>, Option<String>)> {
+    if let Some(name) = pipeline_name {
+        let cfg = config.ok_or_else(|| {
+            anyhow::anyhow!("--pipeline '{name}' was given, but no rocky.toml was loaded")
+        })?;
+        match cfg.pipelines.get(name) {
+            None => anyhow::bail!(
+                "--pipeline '{name}' does not match any pipeline in rocky.toml (defined: {})",
+                cfg.pipelines
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(rocky_core::config::PipelineConfig::Transformation(_)) => {}
+            Some(other) => anyhow::bail!(
+                "pipeline '{name}' is {}, not transformation; emit-sql emits transformation models",
+                other.pipeline_type_str()
+            ),
+        }
+    }
     if let Some(cfg) = config.filter(|cfg| !cfg.pipelines.is_empty()) {
-        let adapter_name = super::run::resolve_model_run_target(cfg, None)?.0;
+        let (adapter_name, _, glob) = super::run::resolve_model_run_target(cfg, pipeline_name)?;
         let adapter = cfg
             .adapters
             .get(&adapter_name)
             .ok_or_else(|| anyhow::anyhow!("target adapter '{adapter_name}' is not configured"))?;
-        return Ok(dialect_for_adapter(adapter));
+        return Ok((dialect_for_adapter(adapter), glob));
     }
     let adapter_type = config
         .and_then(|cfg| {
@@ -68,7 +94,7 @@ fn resolve_dialect(
                 .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
         })
         .unwrap_or_else(|| "duckdb".to_string());
-    Ok(dialect_for_adapter_type(&adapter_type))
+    Ok((dialect_for_adapter_type(&adapter_type), None))
 }
 
 /// One model's emitted SQL: its name and the joined runnable statement(s).
@@ -111,20 +137,28 @@ fn emit_models(
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<EmitResult> {
-    emit_models_selected(config_path, models_dir, model_filter, run_vars, None)
+    emit_models_selected(
+        config_path,
+        Some(models_dir),
+        model_filter,
+        run_vars,
+        None,
+        None,
+    )
 }
 
 /// [`emit_models`], further narrowed by a `--select` / `--exclude`
 /// selection resolved against the compiled project.
 fn emit_models_selected(
     config_path: Option<&Path>,
-    models_dir: &Path,
+    models_dir: Option<&Path>,
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
     selection: Option<(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    pipeline_name: Option<&str>,
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -139,7 +173,31 @@ fn emit_models_selected(
                     .unwrap_or_default()
             )
         })?;
-    let dialect = resolve_dialect(project_config.as_ref())?;
+    let (dialect, pipeline_glob) = resolve_dialect(project_config.as_ref(), pipeline_name)?;
+
+    // `--models` wins. Otherwise a named `--pipeline` reads that pipeline's own
+    // models glob (as `rocky run` does); with neither, the `models` default.
+    let (models_dir, models_glob) =
+        match (models_dir, pipeline_name.and(pipeline_glob), config_path) {
+            (Some(dir), _, _) => (dir.to_path_buf(), None),
+            (None, Some(glob), Some(cfg_path)) => {
+                let dir = match crate::models_loader::locate_models_dir(&glob, cfg_path)? {
+                    crate::models_loader::ModelsDir::Present(dir) => dir,
+                    // A typo'd `models = "..."` must not read as "nothing to
+                    // emit"; `rocky run --model` refuses the same way.
+                    crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
+                        "models directory '{}' not found (required for --pipeline)",
+                        dir.display()
+                    ),
+                };
+                (
+                    dir,
+                    Some(crate::models_loader::resolved_models_glob(&glob, cfg_path)),
+                )
+            }
+            _ => (std::path::PathBuf::from("models"), None),
+        };
+    let models_dir = models_dir.as_path();
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -157,7 +215,11 @@ fn emit_models_selected(
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
     };
-    let mut result = match compile::compile(&config) {
+    let compiled = match models_glob.as_deref() {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    let mut result = match compiled {
         Ok(r) => r,
         // A replication-only project has no compiled transformation models —
         // there is no transformation SQL to emit. Return empty with a note
@@ -382,7 +444,7 @@ fn is_safe_file_stem(name: &str) -> bool {
 /// `out_dir` when given, otherwise prints the concatenated SQL to stdout.
 pub fn run_emit_sql(
     config_path: Option<&Path>,
-    models_dir: &Path,
+    models_dir: Option<&Path>,
     model_filter: Option<&str>,
     out_dir: Option<&Path>,
     run_vars: &rocky_core::run_vars::RunVars,
@@ -394,13 +456,14 @@ pub fn run_emit_sql(
         out_dir,
         run_vars,
         None,
+        None,
     )
 }
 
 /// [`run_emit_sql`] narrowed by `--select` / `--exclude`.
 pub fn run_emit_sql_with_selection(
     config_path: Option<&Path>,
-    models_dir: &Path,
+    models_dir: Option<&Path>,
     model_filter: Option<&str>,
     out_dir: Option<&Path>,
     run_vars: &rocky_core::run_vars::RunVars,
@@ -408,11 +471,19 @@ pub fn run_emit_sql_with_selection(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    pipeline_name: Option<&str>,
 ) -> Result<()> {
     let EmitResult {
         models,
         mut skipped,
-    } = emit_models_selected(config_path, models_dir, model_filter, run_vars, selection)?;
+    } = emit_models_selected(
+        config_path,
+        models_dir,
+        model_filter,
+        run_vars,
+        selection,
+        pipeline_name,
+    )?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");
@@ -843,6 +914,120 @@ mod tests {
         );
     }
 
+    /// #2314: with several transformation pipelines the bare form refuses and
+    /// the refusal names `--pipeline`; `emit-sql` must accept that flag, and
+    /// the named pipeline's adapter must pick the dialect.
+    #[test]
+    fn multi_pipeline_project_emits_with_pipeline_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("a");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(models.join("m.toml"),
+            "name = \"m\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\n").unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config,
+            "[adapter.duck]\ntype = \"duckdb\"\n[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.p1]\ntype = \"transformation\"\nmodels = \"a/**\"\n[pipeline.p1.target]\nadapter = \"duck\"\n\
+             [pipeline.p2]\ntype = \"transformation\"\nmodels = \"b/**\"\n[pipeline.p2.target]\nadapter = \"snow\"\n").unwrap();
+        let vars = rocky_core::run_vars::RunVars::new();
+        let err = emit_models_selected(Some(&config), Some(&models), None, &vars, None, None)
+            .err()
+            .expect("two transformation pipelines and no --pipeline must refuse");
+        assert!(format!("{err:#}").contains("--pipeline"), "{err:#}");
+        let snow =
+            emit_models_selected(Some(&config), Some(&models), None, &vars, None, Some("p2"))
+                .expect("--pipeline p2 resolves the pipeline");
+        assert!(
+            snow.models[0]
+                .sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"m\""),
+            "{}",
+            snow.models[0].sql
+        );
+    }
+
+    fn two_pipeline_project(dir: &Path) -> std::path::PathBuf {
+        for (folder, name) in [("a", "ma"), ("b", "mb")] {
+            let d = dir.join(folder);
+            std::fs::create_dir(&d).unwrap();
+            write_model(&d, name, "SELECT 1 AS id", "");
+        }
+        let config = dir.join("rocky.toml");
+        std::fs::write(&config,
+            "[adapter.duck]\ntype = \"duckdb\"\n[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.p1]\ntype = \"transformation\"\nmodels = \"a/**\"\n[pipeline.p1.target]\nadapter = \"duck\"\n\
+             [pipeline.p2]\ntype = \"transformation\"\nmodels = \"b/**\"\n[pipeline.p2.target]\nadapter = \"snow\"\n\
+             [pipeline.q]\ntype = \"replication\"\n[pipeline.q.source]\nadapter = \"duck\"\nschema_pattern = { prefix = \"x__\", separator = \"__\", components = [\"tenant\"] }\n[pipeline.q.target]\nadapter = \"duck\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n").unwrap();
+        config
+    }
+
+    /// #2314: `--pipeline p2` without `--models` emits only p2's models.
+    #[test]
+    fn pipeline_flag_without_models_reads_that_pipelines_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = two_pipeline_project(dir.path());
+        let vars = rocky_core::run_vars::RunVars::new();
+        let emitted = emit_models_selected(Some(&config), None, None, &vars, None, Some("p2"))
+            .expect("p2 emits");
+        let names: Vec<&str> = emitted.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["mb"]);
+        let emitted = emit_models_selected(Some(&config), None, None, &vars, None, Some("p1"))
+            .expect("p1 emits");
+        let names: Vec<&str> = emitted.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["ma"]);
+    }
+
+    /// #2314: a `--pipeline` that cannot be honored is an error, not ignored.
+    #[test]
+    fn pipeline_flag_that_matches_nothing_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = two_pipeline_project(dir.path());
+        let vars = rocky_core::run_vars::RunVars::new();
+        let models = dir.path().join("a");
+        let run = |cfg: Option<&Path>, name: &str| {
+            emit_models_selected(cfg, Some(&models), None, &vars, None, Some(name))
+                .err()
+                .map(|e| format!("{e:#}"))
+                .expect("must be refused")
+        };
+        let typo = run(Some(&config), "p3");
+        assert!(typo.contains("does not match any pipeline"), "{typo}");
+        let wrong_kind = run(Some(&config), "q");
+        assert!(wrong_kind.contains("not transformation"), "{wrong_kind}");
+        assert!(!wrong_kind.contains("--model"), "{wrong_kind}");
+        let no_config = run(None, "p1");
+        assert!(no_config.contains("no rocky.toml"), "{no_config}");
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "[adapter]\ntype = \"duckdb\"\n").unwrap();
+        let none = run(Some(&empty), "p1");
+        assert!(none.contains("does not match any pipeline"), "{none}");
+    }
+
+    /// A `--pipeline` whose models directory does not exist is refused, not
+    /// reported as "nothing to emit".
+    #[test]
+    fn pipeline_flag_with_a_missing_models_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.duck]\ntype = \"duckdb\"\n\
+             [pipeline.p1]\ntype = \"transformation\"\nmodels = \"modles/**\"\n\
+             [pipeline.p1.target]\nadapter = \"duck\"\n",
+        )
+        .unwrap();
+        let vars = rocky_core::run_vars::RunVars::new();
+        let err = emit_models_selected(Some(&config), None, None, &vars, None, Some("p1"))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .expect("a missing models directory must be refused");
+        assert!(
+            err.contains("models directory") && err.contains("not found"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn applies_declared_surrogate_key_in_emitted_sql() {
         let dir = tempfile::tempdir().unwrap();
@@ -1092,7 +1277,7 @@ mod tests {
         let out = dir.path().join("sql");
         run_emit_sql(
             None,
-            &models,
+            Some(&models),
             None,
             Some(&out),
             &rocky_core::run_vars::RunVars::new(),

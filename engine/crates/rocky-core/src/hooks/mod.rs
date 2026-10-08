@@ -266,14 +266,22 @@ impl HookContext {
         ctx
     }
 
+    /// `pipeline_complete` for a pipeline type with no table loop
+    /// (transformation, quality, snapshot, load): `duration_ms` is set and
+    /// `metadata.table_count` is absent.
+    pub fn pipeline_complete_untabled(run_id: &str, pipeline: &str, duration_ms: u64) -> Self {
+        let mut ctx = Self::new(HookEvent::PipelineComplete, run_id, pipeline);
+        ctx.duration_ms = Some(duration_ms);
+        ctx
+    }
+
     pub fn pipeline_complete(
         run_id: &str,
         pipeline: &str,
         duration_ms: u64,
         table_count: usize,
     ) -> Self {
-        let mut ctx = Self::new(HookEvent::PipelineComplete, run_id, pipeline);
-        ctx.duration_ms = Some(duration_ms);
+        let mut ctx = Self::pipeline_complete_untabled(run_id, pipeline, duration_ms);
         ctx.metadata.insert(
             "table_count".to_string(),
             serde_json::Value::Number(table_count.into()),

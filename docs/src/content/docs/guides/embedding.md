@@ -134,7 +134,7 @@ The full route reference, request and response schemas, and status codes are pub
 
 ### The browser UI
 
-`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. It needs a read-only token: `rocky serve --ui --token <secret> --token-scope read-only`. The server prints one address, `http://127.0.0.1:8080/ui/#token=<secret>`; the page reads the token from the fragment once, clears it, and sends it on every API call. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. The UI token cannot start a run: run a second sidecar without `--ui` for job submissions.
+`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. It needs a read-only token. On a loopback bind with no token configured, the server generates one for the process; elsewhere pass `rocky serve --ui --token <secret> --token-scope read-only`. The server prints one address, `http://127.0.0.1:8080/ui/#token=<secret>`; the page reads the token from the fragment once, clears it, and sends it on every API call. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. The UI token cannot start a run: run a second sidecar without `--ui` for job submissions.
 
 For the command flags, see [`rocky serve`](/reference/commands/development/). For where the server sits in the engine, see the [architecture overview](/concepts/architecture/).
 

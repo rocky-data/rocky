@@ -35,6 +35,39 @@ pub struct SelectionArgs {
     /// A legacy `--model <name>` folded in by [`Self::with_model`]. It must
     /// name a real model, as `--model` alone requires.
     pub required_model: Option<String>,
+    /// `--var` values. The selector graph substitutes `@var(...)` markers
+    /// (supplied value, else inline default, else `NULL`) before it parses
+    /// model SQL, exactly as `rocky compile` does. Empty = inline defaults.
+    pub run_vars: rocky_core::run_vars::RunVars,
+}
+
+/// Build the dependency graph's [`Project`] from loaded models, after
+/// substituting `@var(...)` markers the way `rocky compile` does. The raw
+/// SQL does not parse (`@var(k, 2)` is not SQL), so a graph built without
+/// this step fails for any project that uses `@var` (#2315).
+///
+/// Substitution diagnostics (a required var with no value) are not errors
+/// here: the graph only needs the SQL to parse, and `compile`/`run` report
+/// E028. They are added to the error only when the graph then fails to build.
+pub fn project_from_models(
+    mut models: Vec<rocky_core::models::Model>,
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<Project> {
+    let diagnostics =
+        rocky_compiler::compile::substitute_run_vars_into_models(&mut models, run_vars);
+    Project::from_models(models).map_err(|e| {
+        // A required `@var` with no value became `NULL`, which can break the
+        // parse (`FROM NULL`). Name the real cause rather than only the parser.
+        let causes: Vec<String> = diagnostics
+            .iter()
+            .map(|d| format!("{}: {} ({})", d.code, d.message, d.model))
+            .collect();
+        if causes.is_empty() {
+            anyhow::anyhow!("{e}")
+        } else {
+            anyhow::anyhow!("{e}\n  likely cause:\n  {}", causes.join("\n  "))
+        }
+    })
 }
 
 impl SelectionArgs {
@@ -375,7 +408,7 @@ pub fn resolve_in_dir(
     models_glob: Option<&str>,
     ctx: &StateContext<'_>,
 ) -> Result<BTreeSet<String>> {
-    let project = load_project(models_dir, models_glob)?;
+    let project = load_project(models_dir, models_glob, &args.run_vars)?;
     resolve(args, &project, models_dir, ctx)
 }
 
@@ -391,7 +424,7 @@ pub fn resolve_buildable_in_dir(
     models_glob: Option<&str>,
     ctx: &StateContext<'_>,
 ) -> Result<BTreeSet<String>> {
-    let project = load_project(models_dir, models_glob)?;
+    let project = load_project(models_dir, models_glob, &args.run_vars)?;
     let mut selected = resolve(args, &project, models_dir, ctx)?;
     let had_models = !selected.is_empty();
     selected.retain(|name| {
@@ -412,12 +445,144 @@ pub fn resolve_buildable_in_dir(
     Ok(selected)
 }
 
-fn load_project(models_dir: &Path, models_glob: Option<&str>) -> Result<Project> {
+fn load_project(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<Project> {
     let models = match models_glob {
         Some(glob) => crate::models_loader::load_project_models_matching(models_dir, glob, None)?,
         None => crate::models_loader::load_project_models(models_dir, None)?,
     };
-    Project::from_models(models)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to resolve the model graph for --select")
+    project_from_models(models, run_vars).context("failed to resolve the model graph for --select")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two models; `m` reads `base` and carries `@var(k, 2)` (#2315).
+    fn write_var_project(dir: &Path) {
+        std::fs::write(dir.join("base.sql"), "SELECT 1 AS id, 10 AS x\n").unwrap();
+        std::fs::write(
+            dir.join("m.sql"),
+            "SELECT id, x * @var(k, 2) AS v FROM base\n",
+        )
+        .unwrap();
+        for name in ["base", "m"] {
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn ctx(dir: &Path) -> StateContext<'_> {
+        StateContext {
+            config_path: dir,
+            state_path: dir,
+            cache_ttl_override: None,
+        }
+    }
+
+    #[test]
+    fn graph_selection_works_when_a_model_uses_var_with_a_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_var_project(dir.path());
+        let args = SelectionArgs {
+            select: vec!["base+".into()],
+            ..Default::default()
+        };
+        let got = resolve_in_dir(&args, dir.path(), None, &ctx(dir.path()))
+            .expect("@var(k, 2) must not break the selection graph");
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            vec!["base".to_string(), "m".to_string()]
+        );
+    }
+
+    /// A supplied `--var` that names a table changes the graph edge. This
+    /// tells "run_vars honored" from "run_vars ignored", which a test whose
+    /// result does not depend on the value cannot.
+    #[test]
+    fn graph_selection_follows_a_supplied_var_that_names_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, sql) in [
+            ("base", "SELECT 1 AS id"),
+            ("other", "SELECT 2 AS id"),
+            ("m", "SELECT id FROM @var(src, base)"),
+        ] {
+            std::fs::write(dir.path().join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let select = |vars: rocky_core::run_vars::RunVars| {
+            let args = SelectionArgs {
+                select: vec!["+m".into()],
+                run_vars: vars,
+                ..Default::default()
+            };
+            resolve_in_dir(&args, dir.path(), None, &ctx(dir.path()))
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(select(Default::default()), vec!["base", "m"]);
+        let mut vars = rocky_core::run_vars::RunVars::new();
+        vars.insert("src", "other");
+        assert_eq!(select(vars), vec!["m", "other"]);
+    }
+
+    /// A required `@var` with no value becomes `NULL`; if that breaks the
+    /// parse, the error must name the variable, not only the parser (#2315).
+    #[test]
+    fn graph_failure_from_a_missing_required_var_names_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.sql"),
+            "SELECT id FROM @var(src) x WHERE (\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "name = \"m\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let args = SelectionArgs {
+            select: vec!["m+".into()],
+            ..Default::default()
+        };
+        let outcome = resolve_in_dir(&args, dir.path(), None, &ctx(dir.path()));
+        {
+            let e = outcome.expect_err("FROM NULL does not resolve");
+            let text = format!("{e:#}");
+            assert!(text.contains("E028") && text.contains("src"), "{text}");
+        }
+    }
+
+    #[test]
+    fn graph_selection_substitutes_supplied_vars_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_var_project(dir.path());
+        let mut run_vars = rocky_core::run_vars::RunVars::new();
+        run_vars.insert("k", "3");
+        let args = SelectionArgs {
+            select: vec!["m".into()],
+            run_vars,
+            ..Default::default()
+        };
+        let got = resolve_buildable_in_dir(&args, dir.path(), None, &ctx(dir.path())).unwrap();
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["m".to_string()]);
+    }
 }

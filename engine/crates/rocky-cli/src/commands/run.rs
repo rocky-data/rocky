@@ -3955,6 +3955,18 @@ pub async fn run_with_explicit_contracts(
     // known limitation that a top-level wrapper could close.
     let hook_registry = std::sync::Arc::new(HookRegistry::from_config(&rocky_cfg.hooks));
 
+    // Transformation, quality, snapshot and load runs fire the same
+    // pipeline-level events as replication (#2317): `pipeline_start` here,
+    // `pipeline_complete` / `pipeline_error` where each arm settles its exit.
+    if !matches!(
+        &pipeline_config,
+        rocky_core::config::PipelineConfig::Replication(_)
+    ) {
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_start(&run_id, pipeline_name))
+            .await;
+    }
+
     // Dispatch by pipeline type. Non-replication types have their own
     // execution paths and don't fall through to the replication logic below.
     //
@@ -3968,6 +3980,18 @@ pub async fn run_with_explicit_contracts(
     // established for `finalize_idempotency`. On delegated `Err`, the
     // `?` propagates out of the async block and the wrapper releases the
     // `InFlight` stamp. FR-004 F2.
+    // Every exit of a non-replication arm, including the early `?` exits
+    // (models-dir lookup, freeze fence, state acquire/open/finalize), settles
+    // here: one `pipeline_complete` or `pipeline_error` for the
+    // `pipeline_start` fired above, then the async webhooks drain (#2317).
+    // Each arm has finalized or abandoned its remote-state session by now, so the
+    // end hook runs after the lock is released. Still to run after it: the
+    // retention sweep and releasing the idempotency claim.
+    if !matches!(
+        &pipeline_config,
+        rocky_core::config::PipelineConfig::Replication(_)
+    ) {
+        let outcome: Result<()> = async {
     match pipeline_config {
         rocky_core::config::PipelineConfig::Transformation(t) => {
             // WP-01 PR-B (2b, RD-003): the transformation arm was a live
@@ -4210,6 +4234,7 @@ pub async fn run_with_explicit_contracts(
                 // executor when a governed plan reviewed a non-empty model set but
                 // its models directory is gone. `false` for a bare run.
                 governed_ctx.is_some_and(|c| c.expects_models),
+                Some(&hook_registry),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -4595,6 +4620,21 @@ pub async fn run_with_explicit_contracts(
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
             return Ok(());
         }
+    }
+            Ok(())
+        }
+        .await;
+        let end_ctx = match &outcome {
+            Ok(()) => HookContext::pipeline_complete_untabled(
+                &run_id,
+                pipeline_name,
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+            Err(error) => HookContext::pipeline_error(&run_id, pipeline_name, &error.to_string()),
+        };
+        let _ = hook_registry.fire(&end_ctx).await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return outcome;
     }
 
     let pipeline = pipeline_config

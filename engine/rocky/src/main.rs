@@ -1531,9 +1531,10 @@ enum Command {
     /// files you can run directly or hand to a dbt / hand-SQL fallback, so
     /// depending on Rocky is never a one-way door.
     EmitSql {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Default: `models`, or the `--pipeline`'s own
+        /// configured models location when `--pipeline` is given.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Filter to a single model (exact name). Cannot be combined with
         /// `--select`.
         #[arg(long)]
@@ -1550,6 +1551,13 @@ enum Command {
         /// the emitted SQL shows the resolved text.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// Transformation pipeline whose target adapter (and so SQL dialect)
+        /// the SQL is emitted for. Required if the project defines more than
+        /// one transformation pipeline. Without `--models`, the pipeline's own
+        /// models location is used.
+        #[arg(long)]
+        pipeline: Option<String>,
     },
 
     /// Emit a project-wide column-level lineage snapshot.
@@ -1856,7 +1864,9 @@ enum Command {
         /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
         /// route); when unset, a loopback server asks no request for a
         /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
-        /// omitted. Required when `--host` is non-loopback, and with `--ui`.
+        /// omitted. Required when `--host` is non-loopback, including with
+        /// `--ui`. With `--ui` on loopback and no token, a per-process
+        /// read-only token is generated.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
@@ -1864,7 +1874,8 @@ enum Command {
         /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
         /// to hand a browser UI, so one leak can't reach a warehouse mutation.
         /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
-        /// token is an error.
+        /// token is an error, except `read-only` with `--ui` on loopback,
+        /// which gets a generated token.
         #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
         token_scope: Option<String>,
         /// CORS allowlist. Repeat for each origin (e.g.
@@ -1873,10 +1884,14 @@ enum Command {
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
         /// Serve the browser UI at `/ui/`. Release binaries carry it; from
-        /// source, build with `--features ui`. Requires a token with
-        /// `--token-scope read-only` (the UI token never reaches a mutating
-        /// route), and `ROCKY_WEBHOOK_SECRET` when combined with
-        /// `--scheduler`. Prints the address to open, token included.
+        /// source, build with `--features ui`. The UI token is read-only, so
+        /// it never reaches a mutating route. On loopback with no token
+        /// configured, a per-process read-only token is generated: a new
+        /// one each time the server starts. It is meant for a single-user
+        /// machine. On a shared host, or any non-loopback host, pass
+        /// `--token` with `--token-scope read-only`. With `--scheduler`,
+        /// `ROCKY_WEBHOOK_SECRET` is required. Prints the address to open,
+        /// token included.
         #[arg(long)]
         ui: bool,
         /// With `--ui`: an extra `Host` header value to accept, for a reverse
@@ -3342,6 +3357,7 @@ impl SelectArgs {
             state_ref: self.state_ref,
             state_working_tree: self.state_working_tree,
             required_model: None,
+            run_vars: Default::default(),
         }
     }
 }
@@ -3353,8 +3369,10 @@ impl SelectArgs {
 fn split_model_and_selection(
     model: Option<String>,
     selection: SelectArgs,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<(Option<String>, Option<rocky_cli::selection::SelectionArgs>)> {
-    let selection = selection.into_selection();
+    let mut selection = selection.into_selection();
+    selection.run_vars = run_vars.clone();
     if !selection.is_active() {
         return Ok((model, None));
     }
@@ -4253,6 +4271,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         state_ref,
                         state_working_tree: false,
                         required_model: None,
+                        run_vars: Default::default(),
                     };
                     let model = if selection.is_active() {
                         anyhow::ensure!(
@@ -4400,7 +4419,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // `--select` / `--exclude`: resolve to model names up front. One
             // model becomes `--model` (the unchanged single-model path); more
             // ride `DeferOptions::selected_models` into the same model-only arm.
-            let selection = selection.into_selection();
+            let mut selection = selection.into_selection();
+            // The selector graph substitutes `@var(...)` before it parses model
+            // SQL, with the same `--var` values the run itself uses (#2315).
+            selection.run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (model, selected_models) = if selection.is_active() {
                 anyhow::ensure!(
                     !dag && !watch
@@ -4830,7 +4853,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 cli.cache_ttl,
                 &run_vars,
                 json,
-                Some(&selection.into_selection()),
+                Some(&{
+                    let mut selection = selection.into_selection();
+                    selection.run_vars = run_vars.clone();
+                    selection
+                }),
             )
         }
         Command::State { action } => match action {
@@ -4897,7 +4924,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             if let Some(dbt_project) = dbt_project {
                 rocky_cli::commands::run_compile_dbt_attach(
                     &dbt_project,
@@ -4963,10 +4990,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             selection,
             out_dir,
             var,
+            pipeline,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             let state_ctx = rocky_cli::selection::StateContext {
                 config_path: &cli.config,
                 state_path: &state_path,
@@ -4974,11 +5002,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             };
             rocky_cli::commands::run_emit_sql_with_selection(
                 Some(cli.config.as_path()),
-                &models,
+                models.as_deref(),
                 model.as_deref(),
                 out_dir.as_deref(),
                 &run_vars,
                 selection.as_ref().map(|s| (s, &state_ctx)),
+                pipeline.as_deref(),
             )
         }
         Command::Catalog {
@@ -5276,7 +5305,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             var,
         } => {
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             if declarative && selection.is_some() {
                 anyhow::bail!(
                     "--select / --exclude are not yet supported with --declarative; use --model"
@@ -5292,8 +5323,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else {
-                let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let state_ctx = rocky_cli::selection::StateContext {
                     config_path: &cli.config,
                     state_path: &state_path,
@@ -7119,6 +7148,17 @@ mod tests {
             result.is_err(),
             "--branch and --shadow must be mutually exclusive"
         );
+    }
+
+    /// #2314: the multi-pipeline refusal tells the operator to pass
+    /// `--pipeline <name>`; `emit-sql` must parse that spelling.
+    #[test]
+    fn emit_sql_accepts_pipeline_flag() {
+        let cli = try_parse_with_big_stack(&["rocky", "emit-sql", "--pipeline", "p2"]);
+        let Command::EmitSql { pipeline, .. } = cli.command else {
+            panic!("expected the emit-sql command");
+        };
+        assert_eq!(pipeline.as_deref(), Some("p2"));
     }
 
     #[test]

@@ -152,6 +152,14 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
         .iter()
         .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
         .collect();
+    // The compiler inlined an ephemeral model's SQL into its readers, so its
+    // bare reads belong to each reader. A reader depends on what the inlined
+    // body reads, through any chain of ephemeral models (#2316).
+    let ephemeral_names: HashSet<&str> = models
+        .iter()
+        .filter(|m| is_ephemeral(m))
+        .map(|m| m.config.name.as_str())
+        .collect();
     // Models that failed or were withheld, with the reason a dependent cites.
     let mut broken: HashMap<String, String> = HashMap::new();
 
@@ -208,10 +216,7 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
             set_search_path(
                 model,
                 &sql,
-                compiled_deps
-                    .get(model_name.as_str())
-                    .copied()
-                    .unwrap_or(&[]),
+                &through_ephemerals(model_name, &compiled_deps, &ephemeral_names),
                 &index,
                 &location_of,
                 &written,
@@ -402,6 +407,30 @@ fn execution_order(
             (name, d)
         })
         .collect())
+}
+
+/// The compile graph's dependencies of `model`, with each ephemeral
+/// dependency replaced by what its inlined body reads, transitively.
+fn through_ephemerals(
+    model: &str,
+    compiled_deps: &HashMap<&str, &[String]>,
+    ephemeral: &HashSet<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = vec![model];
+    while let Some(name) = stack.pop() {
+        for dep in compiled_deps.get(name).copied().unwrap_or(&[]) {
+            if ephemeral.contains(dep.as_str()) {
+                if seen.insert(dep.as_str()) {
+                    stack.push(dep.as_str());
+                }
+            } else if !out.contains(dep) {
+                out.push(dep.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Put the schemas of the producers `model`'s bare reads bind to first on
@@ -770,6 +799,51 @@ mod tests {
         assert_eq!(value(&db, "cat.s.t"), "1");
         assert_eq!(value(&db, "cat.out.reads_real"), "1");
         assert_eq!(value(&db, "cat.out.reads_eph"), "2");
+    }
+
+    /// #2316: an ephemeral model reads a real model by bare name. The
+    /// consumer's inlined SQL carries that read, so it must resolve to the
+    /// real model's table, in a catalog other than the default one.
+    #[test]
+    fn an_ephemeral_models_bare_read_reaches_the_model_the_compiler_bound() {
+        let eph = M {
+            name: "eph",
+            sql: "SELECT v FROM base",
+            target: ("t", "main", "eph"),
+            extra: "[strategy]\ntype = \"ephemeral\"",
+        };
+        let (result, db, _) = run(
+            &[
+                m("base", "SELECT 7 AS v", ("t", "main", "base")),
+                eph,
+                m("use_eph", "SELECT v FROM eph", ("t", "main", "use_eph")),
+            ],
+            "",
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(value(&db, "t.main.use_eph"), "7");
+    }
+
+    /// #2316: the same read through a chain of two ephemeral models.
+    #[test]
+    fn a_bare_read_through_chained_ephemerals_reaches_the_bound_model() {
+        let eph = |name, sql| M {
+            name,
+            sql,
+            target: ("t", "main", name),
+            extra: "[strategy]\ntype = \"ephemeral\"",
+        };
+        let (result, db, _) = run(
+            &[
+                m("base", "SELECT 7 AS v", ("t", "main", "base")),
+                eph("eph_a", "SELECT v FROM base"),
+                eph("eph_b", "SELECT v FROM eph_a"),
+                m("use_eph", "SELECT v FROM eph_b", ("t", "main", "use_eph")),
+            ],
+            "",
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(value(&db, "t.main.use_eph"), "7");
     }
 
     /// Shape 3: the same table name in two schemas. The bare read reaches the

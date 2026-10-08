@@ -4942,6 +4942,54 @@ mod tests {
         }
     }
 
+    /// #2318: an outer MAX / SUM over a CTE column built from an expression
+    /// must not take the type of the one column that expression reads.
+    #[test]
+    fn an_outer_aggregate_over_a_cte_expression_is_not_typed_from_its_input() {
+        let sql = "WITH c AS (SELECT CASE WHEN x > 0 THEN 'hi' ELSE 'lo' END AS label, \
+                   x * 1.5 AS amt FROM t) \
+                   SELECT MAX(label) AS a, SUM(amt) AS b, CAST(amt AS BIGINT) AS d FROM c";
+        let typed = typecheck_over_t("t", sql);
+        let by_name: HashMap<_, _> = typed.iter().map(|(n, t, _)| (n.as_str(), t)).collect();
+        // `x` is INT: neither result may be an integer. Unknown or the
+        // inferred type are both sound.
+        assert!(
+            matches!(by_name["a"], RockyType::Unknown | RockyType::String),
+            "{:?}",
+            by_name["a"]
+        );
+        // `b` (SUM over `x * 1.5`) is typed by expression inference, which
+        // reads the arithmetic as an integer: not asserted; the edge kind is
+        // pinned in rocky-sql.
+        // Scenarios A and B: a wrapper over a cast or an aggregate column.
+        {
+            let typed = typecheck_over_t(
+                "t",
+                "WITH c AS (SELECT CAST(x AS VARCHAR) AS s, COUNT(n) AS k, MAX(x) AS mx FROM t) \
+             SELECT MAX(s) AS a, MAX(k) AS b, SUM(k) AS e, CAST(mx AS BIGINT) AS f FROM c",
+            );
+            let by_name: HashMap<_, _> = typed
+                .iter()
+                .map(|(n, t, nl)| (n.as_str(), (t, *nl)))
+                .collect();
+            assert!(!by_name["a"].0.is_integer(), "{:?}", by_name["a"]);
+            assert!(
+                !matches!(by_name["b"].0, RockyType::String),
+                "{:?}",
+                by_name["b"]
+            );
+            assert!(
+                !matches!(by_name["e"].0, RockyType::String),
+                "{:?}",
+                by_name["e"]
+            );
+            // MAX(x) is NULL over zero rows, so the cast of it is nullable even
+            // though `x` is NOT NULL.
+            assert!(by_name["f"].1, "{:?}", by_name["f"]);
+        }
+        assert_eq!(by_name["d"], &RockyType::Int64);
+    }
+
     /// Golden table for #2298: expression -> (type, nullable) through direct
     /// inference. Source `t` has `x INT NOT NULL`, `n STRING NOT NULL`,
     /// `y INT NOT NULL`, plus nullable `nx INT`, `nn STRING`.
