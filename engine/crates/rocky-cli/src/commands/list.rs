@@ -182,8 +182,7 @@ pub fn list_models_selected(
         return list_models(models_dir, json);
     }
     let models = load_all_models(models_dir)?;
-    let project = rocky_compiler::project::Project::from_models(models.clone())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let project = crate::selection::project_from_models(models.clone(), &selection.run_vars)?;
     let selected = crate::selection::resolve(selection, &project, models_dir, ctx)?;
     let models: Vec<_> = models
         .into_iter()
@@ -368,6 +367,41 @@ pub fn list_consumers(model_name: &str, models_dir: &Path, json: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2315: `rocky list -s 'm+'` failed with a SQL parse error when a model
+    /// used `@var(k, 2)`, because the graph was built from unsubstituted SQL.
+    #[test]
+    fn list_with_selection_survives_a_model_that_uses_var() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path();
+        std::fs::write(models.join("base.sql"), "SELECT 1 AS id, 10 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.sql"),
+            "SELECT id, x * @var(k, 2) AS v FROM base\n",
+        )
+        .unwrap();
+        for name in ["base", "m"] {
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let selection = crate::selection::SelectionArgs {
+            select: vec!["m+".into()],
+            ..Default::default()
+        };
+        let ctx = crate::selection::StateContext {
+            config_path: models,
+            state_path: models,
+            cache_ttl_override: None,
+        };
+        list_models_selected(models, true, &selection, &ctx)
+            .expect("@var(k, 2) must not break `list --select`");
+    }
 
     /// #1919: `rocky list adapters | sources | models --output json` print a
     /// resolved `${VAR}` value as `${NAME}`, never the value. A model's

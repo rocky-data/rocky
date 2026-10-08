@@ -59,8 +59,8 @@ pub fn run_docs(
     let all_models = models;
     let models = match selection {
         Some(args) if args.is_active() => {
-            let project = rocky_compiler::project::Project::from_models(all_models.clone())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let project =
+                crate::selection::project_from_models(all_models.clone(), &args.run_vars)?;
             let selected = crate::selection::resolve(
                 args,
                 &project,

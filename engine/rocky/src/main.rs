@@ -3356,6 +3356,7 @@ impl SelectArgs {
             state_ref: self.state_ref,
             state_working_tree: self.state_working_tree,
             required_model: None,
+            run_vars: Default::default(),
         }
     }
 }
@@ -3367,8 +3368,10 @@ impl SelectArgs {
 fn split_model_and_selection(
     model: Option<String>,
     selection: SelectArgs,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<(Option<String>, Option<rocky_cli::selection::SelectionArgs>)> {
-    let selection = selection.into_selection();
+    let mut selection = selection.into_selection();
+    selection.run_vars = run_vars.clone();
     if !selection.is_active() {
         return Ok((model, None));
     }
@@ -4267,6 +4270,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         state_ref,
                         state_working_tree: false,
                         required_model: None,
+                        run_vars: Default::default(),
                     };
                     let model = if selection.is_active() {
                         anyhow::ensure!(
@@ -4414,7 +4418,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // `--select` / `--exclude`: resolve to model names up front. One
             // model becomes `--model` (the unchanged single-model path); more
             // ride `DeferOptions::selected_models` into the same model-only arm.
-            let selection = selection.into_selection();
+            let mut selection = selection.into_selection();
+            // The selector graph substitutes `@var(...)` before it parses model
+            // SQL, with the same `--var` values the run itself uses (#2315).
+            selection.run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (model, selected_models) = if selection.is_active() {
                 anyhow::ensure!(
                     !dag && !watch
@@ -4844,7 +4852,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 cli.cache_ttl,
                 &run_vars,
                 json,
-                Some(&selection.into_selection()),
+                Some(&{
+                    let mut selection = selection.into_selection();
+                    selection.run_vars = run_vars.clone();
+                    selection
+                }),
             )
         }
         Command::State { action } => match action {
@@ -4911,7 +4923,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             if let Some(dbt_project) = dbt_project {
                 rocky_cli::commands::run_compile_dbt_attach(
                     &dbt_project,
@@ -4981,7 +4993,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             let state_ctx = rocky_cli::selection::StateContext {
                 config_path: &cli.config,
                 state_path: &state_path,
@@ -5292,7 +5304,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             var,
         } => {
-            let (model, selection) = split_model_and_selection(model, selection)?;
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (model, selection) = split_model_and_selection(model, selection, &run_vars)?;
             if declarative && selection.is_some() {
                 anyhow::bail!(
                     "--select / --exclude are not yet supported with --declarative; use --model"
@@ -5308,8 +5322,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else {
-                let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let state_ctx = rocky_cli::selection::StateContext {
                     config_path: &cli.config,
                     state_path: &state_path,
