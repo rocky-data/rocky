@@ -333,12 +333,30 @@ pub async fn require_bearer_token(
                 return unauthorized_response();
             }
             if !is_safe_method(request.method()) {
-                // Present AND allowed: a missing Origin is refused too.
-                let origin_ok = request
+                // Present AND this server's own origin: a missing Origin is
+                // refused too. Stricter than the `--ui` Origin guard, which
+                // accepts any port on a loopback host: a page served by
+                // another local app shares this cookie (cookies do not
+                // separate ports), so only the exact `scheme://Host` the
+                // request names, or an `--allowed-origin` entry, may write.
+                let host = request
                     .headers()
-                    .get(header::ORIGIN)
-                    .and_then(|o| o.to_str().ok())
-                    .is_some_and(|o| ui.origin_allowed(o, &state.allowed_origins));
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(str::to_owned)
+                    .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
+                let origin_ok = ui.host_allowed(host.as_deref().unwrap_or(""))
+                    && request
+                        .headers()
+                        .get(header::ORIGIN)
+                        .and_then(|o| o.to_str().ok())
+                        .is_some_and(|o| {
+                            crate::ui_session::write_origin_allowed(
+                                o,
+                                host.as_deref(),
+                                &state.allowed_origins,
+                            )
+                        });
                 let marker_ok = request
                     .headers()
                     .get(crate::ui_session::UI_WRITE_HEADER)

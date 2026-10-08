@@ -3429,10 +3429,28 @@ fn job_subprocess_command(
     // --approve` stamps `ApproverSource::HttpApi` and refuses to fall back
     // to an `unknown` approver. It labels the channel, not the person.
     cmd.env(HTTP_API_SESSION_SOURCE_ENV, HTTP_API_SESSION_SOURCE);
-    for arg in job_subprocess_args(kind, config_path, state_path, request) {
+    // The child runs in the project root: the directory of the bound
+    // `rocky.toml`, the same root the review and product GET routes read
+    // (`project_root_for`). `plan`, `review --approve` and `apply` keep their
+    // plans and markers under `<cwd>/.rocky/plans`, so a server started from
+    // another directory would otherwise write a marker where its own routes
+    // never look. The paths are made absolute first, so moving the child's
+    // cwd cannot change what a relative `--config` or `--state-path` names.
+    let config_path = config_path.map(absolute_path);
+    let state_path = absolute_path(state_path);
+    if let Some(root) = config_path.as_deref().and_then(std::path::Path::parent) {
+        cmd.current_dir(root);
+    }
+    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, request) {
         cmd.arg(arg);
     }
     cmd
+}
+
+/// `path` made absolute against this process's cwd, or `path` as given when
+/// that cannot be read (the child then resolves it as before).
+fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `GET /api/v1/jobs/{id}` — job status, with the embedded canonical result once
@@ -10896,7 +10914,7 @@ adapter = "db"
         assert_eq!(resp.headers()["cache-control"], "no-store");
         assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
         let cookie = resp.headers()["set-cookie"].to_str().unwrap();
-        assert!(cookie.starts_with("rocky_ui="), "{cookie}");
+        assert!(cookie.starts_with("rocky_ui_"), "{cookie}");
         for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
             assert!(cookie.contains(attr), "{cookie}");
         }
@@ -10979,7 +10997,7 @@ adapter = "db"
             resp.headers()["set-cookie"]
                 .to_str()
                 .unwrap()
-                .starts_with("rocky_ui=")
+                .starts_with("rocky_ui_")
         );
         let resp = post(Some(&base), "t=wrong".to_string()).await.unwrap();
         assert_eq!(resp.status(), 401);
@@ -11026,6 +11044,13 @@ adapter = "db"
             assert_eq!(body.code, "ui_write_not_from_ui");
             let resp = write(Some("https://evil.example"), true).await.unwrap();
             assert_eq!(resp.status(), 403, "{scope:?}: a foreign Origin");
+            // Another local page: it passes the `--ui` Origin guard (any port
+            // on a loopback host) and its browser sends the cookie (cookies do
+            // not separate ports), but it is not this server's origin.
+            let resp = write(Some("http://127.0.0.1:1"), true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: another local port");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
 
             let resp = write(Some(&base), true).await.unwrap();
             assert_eq!(resp.status(), write_status, "{scope:?}: both present");
@@ -11055,10 +11080,30 @@ adapter = "db"
         let client = no_redirect_client();
         let foreign = login_cookie(&client, &other).await;
         let good = login_cookie(&client, &base).await;
+        let (name, _) = good.split_once('=').unwrap();
+        let (foreign_name, foreign_value) = foreign.split_once('=').unwrap();
+        assert_ne!(
+            name, foreign_name,
+            "two servers on one host use two cookie names"
+        );
+        // Both sessions can live in one browser: each server reads its own.
+        let both = format!("{foreign}; {good}");
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .header("cookie", &both)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "the other server's cookie does not get in the way"
+        );
         for cookie in [
             foreign.as_str(),
-            &format!("rocky_ui={OPERATOR_TOKEN}"),
-            "rocky_ui=",
+            &format!("{name}={foreign_value}"),
+            &format!("{name}={OPERATOR_TOKEN}"),
+            &format!("{name}="),
         ] {
             let resp = client
                 .get(format!("{base}/api/v1/meta"))
@@ -11364,5 +11409,57 @@ adapter = "db"
                 "{kind:?}"
             );
         }
+    }
+
+    /// A job child runs in the project root (the bound config's directory),
+    /// where the review GET routes read plans and markers, with absolute
+    /// `--config` and `--state-path`, whatever the server's own cwd is.
+    #[test]
+    fn job_children_run_in_the_project_root_with_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("proj").join("rocky.toml");
+        let request = JobRequest {
+            plan_id: Some("e".repeat(64)),
+            ..JobRequest::default()
+        };
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Approve,
+            Some(&config),
+            std::path::Path::new("relative-state.redb"),
+            &request,
+        );
+        let std = command.as_std();
+        assert_eq!(
+            std.get_current_dir(),
+            Some(dir.path().join("proj").as_path())
+        );
+        let args: Vec<PathBuf> = std.get_args().map(PathBuf::from).collect();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(args.contains(&config), "{args:?}");
+        assert!(args.contains(&cwd.join("relative-state.redb")), "{args:?}");
+
+        // A relative config is resolved against the server's cwd first.
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Run,
+            Some(std::path::Path::new("sub/rocky.toml")),
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(cwd.join("sub").as_path())
+        );
+
+        // No config bound: the child keeps the server's cwd.
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Run,
+            None,
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        assert_eq!(command.as_std().get_current_dir(), None);
     }
 }

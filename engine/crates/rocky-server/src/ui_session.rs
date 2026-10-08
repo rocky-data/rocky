@@ -19,12 +19,19 @@
 //! The cookie is `HttpOnly` (no script reads it), `SameSite=Strict` (no other
 //! site's request carries it) and a session cookie (no `Max-Age`). Because a
 //! browser adds a cookie by itself, a cookie-authenticated request with a
-//! non-safe method must also carry an allowed `Origin` and `X-Rocky-UI: 1`;
-//! see [`crate::auth::require_bearer_token`].
+//! non-safe method must also carry this server's exact `Origin` and
+//! `X-Rocky-UI: 1` ([`write_origin_allowed`]); see
+//! [`crate::auth::require_bearer_token`]. Browsers send a cookie to every
+//! port of a host, so the name carries a per-server tag
+//! ([`UiSessionKey::cookie_name`]) and the value is useless to any other
+//! server.
 
 use crate::auth::{ServeToken, TokenScope};
 
-/// The cookie's name.
+/// The prefix of the cookie's name. The full name adds a tag derived from the
+/// per-process key ([`UiSessionKey::cookie_name`]): a cookie is shared by
+/// every port of a host, so two `rocky serve --ui` on one machine would
+/// otherwise overwrite each other's session.
 pub const UI_SESSION_COOKIE: &str = "rocky_ui";
 
 /// The header a cookie-authenticated write must carry. A cross-site form
@@ -51,6 +58,15 @@ impl UiSessionKey {
         hasher.update(uuid::Uuid::new_v4().as_bytes());
         Self(*hasher.finalize().as_bytes())
     }
+
+    /// This process's cookie name: `rocky_ui_<12 hex>`, a keyed tag that
+    /// names no secret and differs per server.
+    pub fn cookie_name(&self) -> String {
+        let mut hasher = blake3::Hasher::new_keyed(&self.0);
+        hasher.update(b"rocky-ui-cookie-name-v1");
+        let tag = hasher.finalize().to_hex();
+        format!("{UI_SESSION_COOKIE}_{}", &tag[..12])
+    }
 }
 
 /// The cookie value for `token`: hex of a keyed blake3 over a domain tag, the
@@ -68,7 +84,7 @@ pub fn session_cookie_value(key: &UiSessionKey, token: &ServeToken) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Whether any `Cookie` header carries a `rocky_ui` value that matches
+/// Whether any `Cookie` header carries this server's cookie with a value that matches
 /// `token` under `key`. Every candidate is compared in constant time.
 pub fn cookie_authenticates(
     key: &UiSessionKey,
@@ -76,13 +92,14 @@ pub fn cookie_authenticates(
     cookie_headers: &[&str],
 ) -> bool {
     let expected = session_cookie_value(key, token);
+    let cookie_name = key.cookie_name();
     let mut matched = false;
     for header in cookie_headers {
         for pair in header.split(';') {
             let Some((name, value)) = pair.trim().split_once('=') else {
                 continue;
             };
-            if name.trim() == UI_SESSION_COOKIE
+            if name.trim() == cookie_name
                 && crate::auth::constant_time_eq(value.trim().as_bytes(), expected.as_bytes())
             {
                 matched = true;
@@ -90,6 +107,31 @@ pub fn cookie_authenticates(
         }
     }
     matched
+}
+
+/// Whether `origin` may make a cookie-authenticated write: an exact
+/// `--allowed-origin` entry, or `http://<host>` / `https://<host>` where
+/// `<host>` is the request's own `Host` (port included). Any other port on
+/// the same host is refused, because a cookie is shared across ports.
+pub fn write_origin_allowed(origin: &str, host: Option<&str>, allowed_origins: &[String]) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    if allowed_origins
+        .iter()
+        .any(|allowed| allowed.trim_end_matches('/').eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    let Some(host) = host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && authority.trim_end_matches('/').eq_ignore_ascii_case(host)
 }
 
 /// Whether a presented login token is the configured one (constant time).
@@ -102,7 +144,8 @@ pub fn login_token_matches(token: &ServeToken, presented: &str) -> bool {
 pub fn set_cookie_header(key: &UiSessionKey, token: &ServeToken, secure: bool) -> String {
     let value = session_cookie_value(key, token);
     let secure = if secure { "; Secure" } else { "" };
-    format!("{UI_SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/{secure}")
+    let name = key.cookie_name();
+    format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/{secure}")
 }
 
 #[cfg(test)]
@@ -138,14 +181,38 @@ mod tests {
     fn a_cookie_header_authenticates_only_with_the_right_value() {
         let key = UiSessionKey::generate();
         let t = token(TokenScope::Full);
-        let good = format!(
-            "other=1; {UI_SESSION_COOKIE}={}",
-            session_cookie_value(&key, &t)
-        );
+        let name = key.cookie_name();
+        let value = session_cookie_value(&key, &t);
+        let good = format!("other=1; {name}={value}");
         assert!(cookie_authenticates(&key, &t, &[good.as_str()]));
-        assert!(!cookie_authenticates(&key, &t, &["rocky_ui=s3cret-token"]));
-        assert!(!cookie_authenticates(&key, &t, &["rocky_ui="]));
+        // The right value under another server's name does not count.
+        let other = format!("{}={value}", UiSessionKey::generate().cookie_name());
+        assert!(!cookie_authenticates(&key, &t, &[other.as_str()]));
+        assert!(!cookie_authenticates(
+            &key,
+            &t,
+            &[&format!("{name}=s3cret-token")]
+        ));
+        assert!(!cookie_authenticates(&key, &t, &[&format!("{name}=")]));
         assert!(!cookie_authenticates(&key, &t, &[]));
+    }
+
+    #[test]
+    fn a_cookie_write_needs_this_servers_exact_origin() {
+        let host = Some("127.0.0.1:8080");
+        assert!(write_origin_allowed("http://127.0.0.1:8080", host, &[]));
+        assert!(write_origin_allowed("https://127.0.0.1:8080/", host, &[]));
+        // Another port on the same host shares the cookie; it may not write.
+        assert!(!write_origin_allowed("http://127.0.0.1:3000", host, &[]));
+        assert!(!write_origin_allowed("http://localhost:8080", host, &[]));
+        assert!(!write_origin_allowed("null", host, &[]));
+        assert!(!write_origin_allowed("http://127.0.0.1:8080", None, &[]));
+        let allowed = vec!["https://portal.example.test".to_string()];
+        assert!(write_origin_allowed(
+            "https://portal.example.test",
+            host,
+            &allowed
+        ));
     }
 
     #[test]

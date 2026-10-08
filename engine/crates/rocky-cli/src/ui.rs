@@ -121,13 +121,16 @@ async fn login_form(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let Some(ui) = state.ui.as_ref() else {
+    if state.ui.is_none() {
         return ui_disabled();
-    };
+    }
+    // This server's own origin (or an `--allowed-origin` entry), exactly as
+    // for a cookie write: the `--ui` guard alone accepts any loopback port.
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let origin_ok = headers
         .get(header::ORIGIN)
         .and_then(|o| o.to_str().ok())
-        .is_some_and(|o| ui.origin_allowed(o, &state.allowed_origins));
+        .is_some_and(|o| ui_session::write_origin_allowed(o, host, &state.allowed_origins));
     if !origin_ok {
         let body = serde_json::json!({
             "code": "origin_not_allowed",

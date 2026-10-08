@@ -98,6 +98,10 @@ fn project_with_a_backfill_plan(dir: &Path) -> (std::path::PathBuf, String) {
 
 /// `rocky serve` on a free loopback port, no token, with `gitconfig` as the
 /// only git configuration the server and its children can see.
+///
+/// Started from the directory ABOVE the project, with `--config` naming the
+/// project's `rocky.toml`: the approve child must still write its marker in
+/// the project root, where the review routes read it.
 fn serve(dir: &Path, root: &Path, gitconfig: &Path) -> (Server, u16) {
     let port = TcpListener::bind("127.0.0.1:0")
         .expect("bind")
@@ -106,7 +110,7 @@ fn serve(dir: &Path, root: &Path, gitconfig: &Path) -> (Server, u16) {
         .port();
     let server = Server(
         rocky()
-            .current_dir(root)
+            .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", dir)
@@ -209,6 +213,14 @@ fn the_approve_job_stamps_http_api_and_the_identity_or_refuses_without_one() {
     assert_eq!(written["plan_id"], plan_id.as_str());
     assert_eq!(written["approver"]["source"], "http_api");
     assert_eq!(written["approver"]["email"], "operator@example.com");
+    assert!(
+        !dir.path()
+            .join(".rocky")
+            .join("plans")
+            .join(format!("{plan_id}.reviewed.json"))
+            .exists(),
+        "the marker belongs in the project root, not the server's cwd"
+    );
 
     let (status, body) = http(port, "GET", &format!("/api/v1/review/{plan_id}/status"), "");
     assert!(status.contains("200"), "{status}: {body}");
