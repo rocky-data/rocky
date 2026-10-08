@@ -264,6 +264,10 @@ pub struct TableReference {
     /// that owns the model/source graph (e.g. the semantic-graph builder) can
     /// resolve the inner star transitively. Empty for plain table references
     /// and for derived tables that already resolved their columns.
+    ///
+    /// For a [`TableBinding::Cte`] reference whose body is an unresolved
+    /// `SELECT *`, this lists the physical tables the star passes through,
+    /// resolved through any chain of CTEs (#2307).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_sources: Vec<String>,
     /// For a [`TableBinding::Cte`] reference: the CTE body's output columns,

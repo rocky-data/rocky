@@ -4440,6 +4440,32 @@ mod tests {
         }
     }
 
+    /// #2307: a transform inside the CTE body reaches the outer column's
+    /// type; the outer column never copies the pre-transform source type.
+    #[test]
+    fn a_transform_in_a_cte_body_types_the_outer_column() {
+        for (sql, want) in [
+            (
+                "WITH c AS (SELECT CAST(n AS INT) AS x FROM u) SELECT x FROM c",
+                RockyType::Int32,
+            ),
+            (
+                "WITH c AS (SELECT TRY_CAST(n AS INT) AS x FROM u) SELECT x FROM c",
+                RockyType::Int32,
+            ),
+            (
+                "WITH c AS (SELECT SUM(z) AS s FROM u) SELECT s FROM c",
+                RockyType::Int64,
+            ),
+        ] {
+            let rows = typecheck_over_t_and_u(sql);
+            assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+            assert_eq!(rows[0].1, want, "{sql}: {rows:?}");
+            // A cast can fail and a SUM over no rows is NULL.
+            assert!(rows[0].2, "{sql}: {rows:?}");
+        }
+    }
+
     /// #2307: `SELECT *` over an import CTE (`WITH orders AS (SELECT * FROM
     /// orders)`) expands the upstream model's columns with their types, so a
     /// `time_column` the upstream projects does not raise E020.

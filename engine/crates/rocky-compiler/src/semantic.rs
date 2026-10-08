@@ -987,6 +987,36 @@ mod tests {
         assert!(!names.contains(&"source_only_col"), "{names:?}");
     }
 
+    /// #2307: a star over an import CTE (`WITH t AS (SELECT * FROM t)`)
+    /// passes the same-named external source through, with an edge per column.
+    #[test]
+    fn a_star_over_an_import_cte_expands_the_sources_columns() {
+        let models = vec![make_model(
+            "reader",
+            "WITH t AS (SELECT * FROM t) SELECT * FROM t",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let sources = HashMap::from([(
+            "t".to_string(),
+            vec![ColumnInfo {
+                name: "source_col".to_string(),
+                data_type: "INT".to_string(),
+                nullable: true,
+            }],
+        )]);
+        let graph = build_semantic_graph(&project, &sources).unwrap();
+        let reader = graph.model_schema("reader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["source_col"]);
+        let trace = graph.trace_column("reader", "source_col");
+        assert!(
+            trace
+                .iter()
+                .any(|e| &*e.source.model == "t" && &*e.source.column == "source_col"),
+            "{trace:?}"
+        );
+    }
+
     /// The expansion must not depend on which model the topological walk
     /// reaches first.
     ///
