@@ -1550,6 +1550,13 @@ enum Command {
         /// the emitted SQL shows the resolved text.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// Transformation pipeline whose target adapter (and so SQL dialect)
+        /// the SQL is emitted for. Required if the project defines more than
+        /// one transformation pipeline. Pair it with `--models` to point at
+        /// that pipeline's models directory.
+        #[arg(long)]
+        pipeline: Option<String>,
     },
 
     /// Emit a project-wide column-level lineage snapshot.
@@ -4970,6 +4977,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             selection,
             out_dir,
             var,
+            pipeline,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -4986,6 +4994,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 out_dir.as_deref(),
                 &run_vars,
                 selection.as_ref().map(|s| (s, &state_ctx)),
+                pipeline.as_deref(),
             )
         }
         Command::Catalog {
@@ -7126,6 +7135,17 @@ mod tests {
             result.is_err(),
             "--branch and --shadow must be mutually exclusive"
         );
+    }
+
+    /// #2314: the multi-pipeline refusal tells the operator to pass
+    /// `--pipeline <name>`; `emit-sql` must parse that spelling.
+    #[test]
+    fn emit_sql_accepts_pipeline_flag() {
+        let cli = try_parse_with_big_stack(&["rocky", "emit-sql", "--pipeline", "p2"]);
+        let Command::EmitSql { pipeline, .. } = cli.command else {
+            panic!("expected the emit-sql command");
+        };
+        assert_eq!(pipeline.as_deref(), Some("p2"));
     }
 
     #[test]

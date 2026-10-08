@@ -49,9 +49,10 @@ use crate::registry;
 /// standalone preview default.
 fn resolve_dialect(
     config: Option<&rocky_core::config::RockyConfig>,
+    pipeline_name: Option<&str>,
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
     if let Some(cfg) = config.filter(|cfg| !cfg.pipelines.is_empty()) {
-        let adapter_name = super::run::resolve_model_run_target(cfg, None)?.0;
+        let adapter_name = super::run::resolve_model_run_target(cfg, pipeline_name)?.0;
         let adapter = cfg
             .adapters
             .get(&adapter_name)
@@ -111,7 +112,7 @@ fn emit_models(
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<EmitResult> {
-    emit_models_selected(config_path, models_dir, model_filter, run_vars, None)
+    emit_models_selected(config_path, models_dir, model_filter, run_vars, None, None)
 }
 
 /// [`emit_models`], further narrowed by a `--select` / `--exclude`
@@ -125,6 +126,7 @@ fn emit_models_selected(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    pipeline_name: Option<&str>,
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -139,7 +141,7 @@ fn emit_models_selected(
                     .unwrap_or_default()
             )
         })?;
-    let dialect = resolve_dialect(project_config.as_ref())?;
+    let dialect = resolve_dialect(project_config.as_ref(), pipeline_name)?;
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -394,6 +396,7 @@ pub fn run_emit_sql(
         out_dir,
         run_vars,
         None,
+        None,
     )
 }
 
@@ -408,11 +411,19 @@ pub fn run_emit_sql_with_selection(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    pipeline_name: Option<&str>,
 ) -> Result<()> {
     let EmitResult {
         models,
         mut skipped,
-    } = emit_models_selected(config_path, models_dir, model_filter, run_vars, selection)?;
+    } = emit_models_selected(
+        config_path,
+        models_dir,
+        model_filter,
+        run_vars,
+        selection,
+        pipeline_name,
+    )?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");
@@ -840,6 +851,38 @@ mod tests {
             all.models[0]
                 .sql
                 .contains("DROP VIEW \"warehouse\".\"prod\".\"switch\"")
+        );
+    }
+
+    /// #2314: with several transformation pipelines the bare form refuses and
+    /// the refusal names `--pipeline`; `emit-sql` must accept that flag, and
+    /// the named pipeline's adapter must pick the dialect.
+    #[test]
+    fn multi_pipeline_project_emits_with_pipeline_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("a");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(models.join("m.toml"),
+            "name = \"m\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\n").unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config,
+            "[adapter.duck]\ntype = \"duckdb\"\n[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.p1]\ntype = \"transformation\"\nmodels = \"a/**\"\n[pipeline.p1.target]\nadapter = \"duck\"\n\
+             [pipeline.p2]\ntype = \"transformation\"\nmodels = \"b/**\"\n[pipeline.p2.target]\nadapter = \"snow\"\n").unwrap();
+        let vars = rocky_core::run_vars::RunVars::new();
+        let err = emit_models_selected(Some(&config), &models, None, &vars, None, None)
+            .err()
+            .expect("two transformation pipelines and no --pipeline must refuse");
+        assert!(format!("{err:#}").contains("--pipeline"), "{err:#}");
+        let snow = emit_models_selected(Some(&config), &models, None, &vars, None, Some("p2"))
+            .expect("--pipeline p2 resolves the pipeline");
+        assert!(
+            snow.models[0]
+                .sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"m\""),
+            "{}",
+            snow.models[0].sql
         );
     }
 
