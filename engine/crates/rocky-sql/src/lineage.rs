@@ -589,7 +589,7 @@ fn resolve_through_ctes(result: &mut LineageResult, ctes: &CteScope) {
                 for (i, (t, c, inner_kind)) in inner.into_iter().enumerate() {
                     let mut entry = col.clone();
                     entry.extra_source |= i > 0;
-                    entry.transform = if many {
+                    entry.transform = if many || inner_kind == TransformKind::Expression {
                         compose_multi_origin_transform(&col.transform)
                     } else {
                         compose_transform(&col.transform, &inner_kind)
@@ -1015,9 +1015,13 @@ fn extract_select_columns(
                 // A parenthesised item is not traced either: it stays as it was
                 // before #2318 (unresolved, no entry), so a model's column set
                 // does not change under it.
+                // An `Expression` edge (`amount * 100`) is skipped too: the
+                // source column's name is not the output's, and pushing it
+                // would invent or duplicate an output column.
                 if !matches!(expr, Expr::Nested(_))
                     && let [lineage] =
                         extract_expr_lineage(expr, alias_map, source_tables).as_slice()
+                    && lineage.transform != TransformKind::Expression
                 {
                     columns.push(lineage.clone());
                 }
@@ -2956,5 +2960,69 @@ mod tests {
                 (Some("b".into()), "y".into(), "amount".into()),
             ]
         );
+    }
+
+    /// Transform of each edge into `amount`, in source order.
+    fn amount_kinds(sql: &str) -> Vec<TransformKind> {
+        extract_lineage(sql)
+            .unwrap()
+            .columns
+            .into_iter()
+            .filter(|c| c.target_column == "amount" || c.target_column == "m")
+            .map(|c| c.transform)
+            .collect()
+    }
+
+    #[test]
+    fn an_outer_function_or_cast_over_a_cte_expression_is_an_expression() {
+        let cte = "WITH c AS (SELECT x * 1.5 AS amt FROM t) ";
+        let kinds = |outer: &str| amount_kinds(&format!("{cte}{outer} FROM c"));
+        assert_eq!(
+            kinds("SELECT MAX(amt) AS m"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            kinds("SELECT SUM(amt) AS m"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            kinds("SELECT CAST(amt AS INT) AS m"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(kinds("SELECT amt AS m"), vec![TransformKind::Expression]);
+        assert_eq!(
+            kinds("SELECT COUNT(amt) AS m"),
+            vec![TransformKind::Aggregation("COUNT".into())]
+        );
+        assert_eq!(
+            kinds("SELECT TRY_CAST(amt AS INT) AS m"),
+            vec![TransformKind::TryCast]
+        );
+        // Two origins: the same rules.
+        let two = "WITH c AS (SELECT a.x * b.y AS amt FROM a JOIN b ON a.id = b.id) \
+                   SELECT SUM(amt) AS m FROM c";
+        assert_eq!(
+            amount_kinds(two),
+            vec![TransformKind::Expression, TransformKind::Expression]
+        );
+        // A bare column through a CTE stays what the body did.
+        assert_eq!(
+            amount_kinds("WITH c AS (SELECT x AS amount FROM t) SELECT MAX(amount) AS m FROM c"),
+            vec![TransformKind::Aggregation("MAX".into())]
+        );
+    }
+
+    #[test]
+    fn an_unnamed_expression_adds_no_output_column() {
+        let names = |sql: &str| -> Vec<String> {
+            extract_lineage(sql)
+                .unwrap()
+                .columns
+                .into_iter()
+                .map(|c| c.target_column)
+                .collect()
+        };
+        assert_eq!(names("SELECT id, amount * 100 FROM orders"), vec!["id"]);
+        assert_eq!(names("SELECT x, x + 1 FROM orders"), vec!["x"]);
     }
 }
