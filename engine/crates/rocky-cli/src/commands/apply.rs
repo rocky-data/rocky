@@ -3525,6 +3525,13 @@ impl ExecutionExtras {
 /// executed. The residual still tracked under #1120 is state-object durability
 /// (compare-and-swap on the remote `state.redb`), not config-swap.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
+    // A `${VAR}` connection field must hash by its VALUE, so an env swap that
+    // re-routes the apply changes the identity (#1919). Credentials still
+    // serialize as "***" inside this scope.
+    rocky_core::env_string::with_env_values_scope(|| config_policy_identity_inner(cfg))
+}
+
+fn config_policy_identity_inner(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
         .iter()
@@ -9877,6 +9884,29 @@ auto_create_schemas = true
     /// change there refuses; but a CREDENTIAL change (token/password, a
     /// `RedactedString`) does NOT, because it serializes to `"***"`. This is the
     /// corrected equality (round-5 wrongly treated `path` as a secret).
+    /// #1919 red team: a `${VAR}` connection field hashes by its value, so an
+    /// env swap between plan and apply changes the routing identity.
+    #[test]
+    fn config_identity_changes_when_only_an_env_value_changes() {
+        use rocky_core::env_string::EnvString;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let with_db = |value: &str| {
+            let mut cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+            let adapter = cfg.adapters.get_mut("default").expect("default adapter");
+            adapter.path = Some(EnvString::substituted("ROCKY_IDENTITY_DB", value));
+            cfg
+        };
+        let a = super::config_policy_identity(&with_db("a.duckdb"));
+        let b = super::config_policy_identity(&with_db("b.duckdb"));
+        assert_ne!(a, b, "an env value swap re-routes the apply and must change the identity");
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {
