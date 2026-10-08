@@ -15,8 +15,9 @@
 //!
 //! - A pointer pins no data. `rocky gc`, run-history retention and Delta
 //!   `VACUUM` can remove a version an environment points to. Pinning is RV1-P5.
-//! - A pointer controls no warehouse object (no view swap, no clone). That is
-//!   RV1-P3 / RV1-P4.
+//! - A state-only publish controls no warehouse object (no view swap, no
+//!   clone). The table publish in [`crate::table_publish`] (RV1-P3) moves
+//!   Delta tables, one commit per table; views are RV1-P4.
 //! - There is no rollback verb and no CLI verb yet.
 //!
 //! Concurrency. The local store serializes writers through one redb write

@@ -932,6 +932,11 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   table change (the v22 shape). Both tables replicate. Guarded by
 ///   `test_v31_opens_and_creates_environment_tables`.
 ///
+///   RV1-P3 added `EnvironmentRecord::publishing`,
+///   `PublishRecord::tables` and `PublishScope::DeltaPerTable` to these
+///   tables before any release wrote them, so no older reader exists. The
+///   two fields are omitted when `None`, so a state-only row is unchanged.
+///
 ///   **Why it is a bump and not a rider.** A publish reads
 ///   [`ModelExecution::output_version`] and refuses a model without one. That
 ///   gate is a decision, so the field it reads is no longer "recorded only"
