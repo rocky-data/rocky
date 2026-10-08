@@ -407,6 +407,8 @@ fn hash_arrow_column(field: &Field, array: &ArrayRef) -> Result<String> {
 ///   `refcount_for_hash` ≥ 2 — shared bytes, not copied).
 #[derive(Debug, Clone)]
 pub struct PointerInputs {
+    /// The commit version `recovered_add` was read from.
+    pub commit_version: u64,
     /// `R`'s `add` action object, lifted verbatim.
     pub recovered_add: serde_json::Map<String, serde_json::Value>,
     /// The content-addressed parquet path the commit references
@@ -639,6 +641,8 @@ impl UniformWriter {
     ///
     /// [`UniformWriterError::DeltaLog`] when the recovered commit carries no
     /// `add` action; the object-store GET error when the log file is missing.
+    /// The deletion-vector and shape checks run later, in
+    /// [`Self::commit_pointer_with_state`].
     pub async fn recover_pointer_inputs(
         &self,
         commit_version: u64,
@@ -659,6 +663,7 @@ impl UniformWriter {
             })?
             .to_string();
         Ok(PointerInputs {
+            commit_version,
             recovered_add,
             add_file_path,
             blake3_hash,
@@ -697,6 +702,11 @@ impl UniformWriter {
     ///
     /// - [`UniformWriterError::PartitionedUnsupported`] / a `DeltaLog` error
     ///   when the table is partitioned or rowTracking;
+    /// - [`UniformWriterError::DeletionVectorsUnsupported`] when R's `add`
+    ///   carries a deletion vector;
+    /// - [`UniformWriterError::PublishSourceUnavailable`] when R's `add` came
+    ///   before the latest protocol, schema, partitioning or column-mapping
+    ///   change (like [`Self::restore_content_addressed`]);
     /// - [`UniformWriterError::CheckpointPresent`] when the log has a
     ///   checkpoint;
     /// - [`UniformWriterError::CondPutRetryExhausted`] when the version race
@@ -723,6 +733,19 @@ impl UniformWriter {
             ));
         }
         let live = self.live_set().await?;
+        // Same refusal as `restore_content_addressed`: a file added before the
+        // latest protocol, schema, partitioning or column-mapping-mode change
+        // may not read the way the recorded output did.
+        if pointer.commit_version < live.shape_version {
+            return Err(UniformWriterError::PublishSourceUnavailable {
+                table: self.config.fqtn(),
+                detail: format!(
+                    "`{}` was added at commit {}, before the protocol, schema, partitioning \
+                     or column mapping changed at commit {}",
+                    pointer.add_file_path, pointer.commit_version, live.shape_version
+                ),
+            });
+        }
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
         let add = commit::lift_add_action(&pointer.recovered_add, modification_time_millis)?;
         let staged = StagedFile {
@@ -2109,6 +2132,7 @@ mod tests {
         let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
         let state = writer.discover().await.unwrap();
         let pointer = PointerInputs {
+            commit_version: 0,
             recovered_add: serde_json::Map::new(),
             add_file_path: "x.parquet".into(),
             blake3_hash: "deadbeef".into(),
@@ -2130,6 +2154,7 @@ mod tests {
         let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
         let state = writer.discover().await.unwrap();
         let pointer = PointerInputs {
+            commit_version: 0,
             recovered_add: serde_json::Map::new(),
             add_file_path: "x.parquet".into(),
             blake3_hash: "deadbeef".into(),
@@ -3733,6 +3758,74 @@ mod tests {
         )
         .await;
         assert_restore_refused(&writer, &store, &a, 5).await;
+    }
+
+    /// A point-to of a file added before a column-mapping-mode change is
+    /// refused, like a publish, and writes no commit.
+    #[tokio::test]
+    async fn point_to_refuses_a_file_written_before_a_shape_change() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        let mut meta = commit_lines(&store, "tbl", 0)
+            .await
+            .into_iter()
+            .find(|l| l.get("metaData").is_some())
+            .unwrap();
+        meta["metaData"]["configuration"]["delta.columnMapping.mode"] = Value::from("id");
+        put_commit(&store, "tbl", 3, &[meta]).await;
+        let pointer = writer.recover_pointer_inputs(1, a, 10, 1).await.unwrap();
+        let state = writer.discover().await.unwrap();
+        let err = writer
+            .commit_pointer_with_state(&pointer, state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, UniformWriterError::PublishSourceUnavailable { detail, .. } if detail.contains("before the protocol")),
+            "{err}"
+        );
+        assert!(!commit_exists(&store, "tbl", 4).await);
+    }
+
+    /// A point-to of an `add` that carries a deletion vector is refused.
+    #[tokio::test]
+    async fn point_to_refuses_an_add_that_carries_a_deletion_vector() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = table_writer(&store, "tbl", Arc::new(PanicSqlClient));
+        let (a, _) = two_builds(&writer).await;
+        let mut add = commit_lines(&store, "tbl", 1)
+            .await
+            .into_iter()
+            .find(|l| l.get("add").is_some())
+            .unwrap();
+        add["add"]["deletionVector"] = serde_json::json!({
+            "storageType": "u", "pathOrInlineDv": "ab", "offset": 1,
+            "sizeInBytes": 36, "cardinality": 2
+        });
+        let path = add["add"]["path"].clone();
+        put_commit(&store, "tbl", 3, &[add]).await;
+        // Commit 4 retires the file again, so the live set holds no vector
+        // and only the point-to check can refuse.
+        put_commit(
+            &store,
+            "tbl",
+            4,
+            &[serde_json::json!({"remove": {"path": path, "dataChange": true}})],
+        )
+        .await;
+        let pointer = writer.recover_pointer_inputs(3, a, 10, 1).await.unwrap();
+        let state = writer.discover().await.unwrap();
+        let err = writer
+            .commit_pointer_with_state(&pointer, state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UniformWriterError::DeletionVectorsUnsupported),
+            "{err}"
+        );
+        assert!(!commit_exists(&store, "tbl", 5).await);
     }
 
     fn content_addressed(hash: &str, version: u64) -> rocky_core::state::OutputVersion {

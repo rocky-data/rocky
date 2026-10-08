@@ -225,6 +225,12 @@ pub fn set_row_tracking(add: &mut Map<String, Value>, base_row_id: u64, commit_v
 ///   needs a *freshly re-allocated* `baseRowId` range; `R`'s cannot be lifted
 ///   verbatim — deferred).
 ///
+/// Returns [`UniformWriterError::DeletionVectorsUnsupported`] when the `add`
+/// carries a deletion vector: the vector would hide rows of the file, and
+/// Rocky never writes one, so the `add` is not Rocky's output as recorded.
+/// The protocol and column-mapping checks need the table's log, so they sit
+/// in [`super::UniformWriter::commit_pointer_with_state`].
+///
 /// The runner's decision gate already restricts point-to to unpartitioned,
 /// non-rowTracking tables; this refusal is the defence-in-depth guard so a
 /// mis-routed call can never silently emit a structurally wrong commit.
@@ -248,6 +254,12 @@ pub fn lift_add_action(
              rowTracking point-to is a deferred follow-up"
                 .to_string(),
         ));
+    }
+    if recovered_add
+        .get("deletionVector")
+        .is_some_and(|dv| !dv.is_null())
+    {
+        return Err(UniformWriterError::DeletionVectorsUnsupported);
     }
     let mut add_obj = recovered_add.clone();
     add_obj.insert(
@@ -910,6 +922,25 @@ mod tests {
             }
             other => panic!("expected DeltaLog refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lift_add_refuses_an_add_with_a_deletion_vector() {
+        let mut add = recovered_unpartitioned_add();
+        add.insert(
+            "deletionVector".into(),
+            serde_json::json!({"storageType": "u", "pathOrInlineDv": "ab", "offset": 1,
+                               "sizeInBytes": 36, "cardinality": 2}),
+        );
+        assert!(matches!(
+            lift_add_action(&add, 0),
+            Err(UniformWriterError::DeletionVectorsUnsupported)
+        ));
+        add.insert("deletionVector".into(), Value::Null);
+        assert!(
+            lift_add_action(&add, 0).is_ok(),
+            "a null vector is no vector"
+        );
     }
 
     #[test]

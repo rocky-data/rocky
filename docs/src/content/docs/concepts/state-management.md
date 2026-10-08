@@ -82,7 +82,7 @@ The engine API `table_publish::publish_tables` moves each model's Delta table to
   begin   CAS on the head        prod#1  started   (environment marked "publishing")
     │ head moved? refused, no table touched
     ▼
-  fence ─▶ commit table a ─▶ fence ─▶ commit table b ─▶ ...   stop at the first failure
+  fence ─▶ commit table a ─▶ commit table b ─▶ ... ─▶ fence ─▶ ...   stop at the first failure
     │ another publish took over? stop, no more tables
     ▼
   finish                         prod#2  finished  (one outcome per table)
@@ -98,13 +98,15 @@ The engine API `table_publish::publish_tables` moves each model's Delta table to
   - `unknown`: the commit write returned an error that does not say whether the commit was stored (for example a timeout);
   - `not_attempted`: an earlier table failed or ended `unknown`.
 - The head's pointers move only for `moved`, `already_current` and `sync_failed`. The other tables keep their old version, so the environment is part published until you publish again. A publish is complete only when every table is `moved` or `already_current`.
+- After `unknown`, the table may already serve the new version while the head still names the old one. Rollback planning reads the head, so it sees the old version until a retry reconciles.
 - Publish again to reconcile. A table whose `unknown` commit did land is then `already_current`. A table that is `sync_failed` is synced again, because the sync also runs on an already-current table.
 - If the process dies between two commits, nothing records which tables moved. The environment stays `publishing`. A new publish that names that head and asks to take over moves every table again. A table already at its version gets no new commit.
-- Take over only when the first publisher is dead. Before each table, a publish reads the head again (a fence). If another publish took over, it stops with `Fenced` and moves no more tables. A wrongly taken-over publisher that is still alive can still move the one table it was committing.
+- Take over only when the first publisher is dead. A publish reads the head again (a fence) before the first table, before every eighth table after it, and before the last table. If another publish took over, it stops with `Fenced` and moves no more tables. The fence is spaced because the state store has no partial read: on S3, GCS or Valkey, each fence downloads the whole state blob. A wrongly taken-over publisher that is still alive can move up to eight tables before the next fence stops it. A fence that cannot read the head fails closed: the table is not moved.
 - Only `content_addressed` outputs of unpartitioned tables can be published. A partitioned output, a `delta_observed` version (it names a table version, not files Rocky wrote), and a table with no configured writer are refused before anything is written.
 - The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), a version written before the table's protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
 - A run is not ordered with a publish. If another commit changes the table's files after the publish read them and before it commits, the publish fails for that table and writes nothing. It never removes files it did not see. Otherwise the later commit wins.
-- The publish moves the model's own table, which every environment that holds the model shares. So it refuses when another environment's head, or the plan of its unfinished table publish, points the same table at a different version. The error names that environment. The `allow_shared_tables` option publishes anyway.
+- The publish moves the model's own table, which every environment that holds the model shares. So it refuses when another environment's head, or the plan of its unfinished table publish, points the same table at a different version. The error names that environment. The `allow_shared_tables` option publishes anyway. Then the other environment's head is no longer true: it names the old version, but the shared table serves the new one. Rocky does not update that head.
+- The shared-table check runs once, when the publish begins. A state-only publish into another environment after that can still point the same table at a different version. Rocky does not stop it.
 
 ## Per-namespace state files
 
