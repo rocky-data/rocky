@@ -6892,11 +6892,11 @@ mod tests {
         assert_eq!(banana.status(), 404);
     }
 
-    /// Two files sharing a model name in two pipelines' directories: the
-    /// server compile refuses with the same error `dag_output` (the function
-    /// behind `rocky dag`) returns for the project, and serves no model list.
+    /// Two files sharing a model name in two pipelines' directories: `rocky
+    /// dag` refuses the project, but the server keeps serving `models/` and
+    /// reports the same error as a diagnostic (#2011).
     #[tokio::test]
-    async fn a_duplicate_model_name_across_pipelines_fails_the_compile_like_rocky_dag() {
+    async fn a_duplicate_model_name_across_pipelines_falls_back_to_models_dir() {
         let (dir, config_path) = two_root_project();
         write_root_model(&dir.path().join("reporting"), "stg");
         let state_path = pinned_state_path(dir.path());
@@ -6906,18 +6906,30 @@ mod tests {
             &state_path,
         );
         let outcome = state.recompile().await;
-        let compile_error = outcome.compile_error.expect("the compile must fail");
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
         let dag_error = dag_output(&config_path, &state_path, None, None, None, false, None)
             .expect_err("`rocky dag` refuses the same project");
-        assert_eq!(compile_error, format!("{dag_error:#}"));
+        let dag_error = format!("{dag_error:#}");
         assert!(
-            compile_error.contains("duplicate model name 'stg'"),
-            "{compile_error}"
+            dag_error.contains("duplicate model name 'stg'"),
+            "{dag_error}"
         );
+        {
+            let guard = state.compile_result.read().await;
+            let result = guard.as_ref().expect("models/ is still compiled");
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains(&dag_error)),
+                "the dag error is reported: {:?}",
+                result.diagnostics
+            );
+        }
 
         let base = spawn_router(state.clone()).await;
         let list = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
-        assert_eq!(list.status(), 503);
+        assert_eq!(list.status(), 200);
     }
 
     /// A project whose transformation pipeline declares a **custom** model root,
