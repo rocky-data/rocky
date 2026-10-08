@@ -1856,7 +1856,9 @@ enum Command {
         /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
         /// route); when unset, a loopback server asks no request for a
         /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
-        /// omitted. Required when `--host` is non-loopback, and with `--ui`.
+        /// omitted. Required when `--host` is non-loopback, including with
+        /// `--ui`. With `--ui` on loopback and no token, a one-time read-only
+        /// token is generated for the process.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
@@ -1864,7 +1866,8 @@ enum Command {
         /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
         /// to hand a browser UI, so one leak can't reach a warehouse mutation.
         /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
-        /// token is an error.
+        /// token is an error, except `read-only` with `--ui` on loopback,
+        /// which gets a generated token.
         #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
         token_scope: Option<String>,
         /// CORS allowlist. Repeat for each origin (e.g.
@@ -1873,10 +1876,13 @@ enum Command {
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
         /// Serve the browser UI at `/ui/`. Release binaries carry it; from
-        /// source, build with `--features ui`. Requires a token with
-        /// `--token-scope read-only` (the UI token never reaches a mutating
-        /// route), and `ROCKY_WEBHOOK_SECRET` when combined with
-        /// `--scheduler`. Prints the address to open, token included.
+        /// source, build with `--features ui`. The UI token is read-only, so
+        /// it never reaches a mutating route. On loopback with no token
+        /// configured, a one-time read-only token is generated for this
+        /// process; it changes on restart. On any other host, pass `--token`
+        /// with `--token-scope read-only`. With `--scheduler`,
+        /// `ROCKY_WEBHOOK_SECRET` is required. Prints the address to open,
+        /// token included.
         #[arg(long)]
         ui: bool,
         /// With `--ui`: an extra `Host` header value to accept, for a reverse

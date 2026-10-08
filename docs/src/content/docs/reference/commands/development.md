@@ -331,7 +331,7 @@ rocky serve [flags]
 
 - **No token configured (the loopback default)** — nothing checks a Bearer token: the middleware passes every request to its handler. Any process on the machine can read model SQL, run history and the governor ledger, and can call the mutating routes. A handler's own checks still apply — a body it cannot parse is `400`, a second `run` while one is in flight is `409`, and the webhook route still verifies its HMAC when `ROCKY_WEBHOOK_SECRET` is set. This is the development posture. It is refused on a non-loopback bind, so a misconfigured network cannot expose the server this way.
 - **A token configured** — `--token <secret>`, or the `ROCKY_SERVE_TOKEN` env var. The Bearer check runs on every request whose path is not exempt. Two paths are exempt, whatever the method: `/api/v1/health`, and `/api/v1/hooks/trigger/{pipeline}` (exactly one path segment after the prefix), where the handler verifies an `X-Rocky-Signature` HMAC instead — and accepts an unsigned `POST` only on a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET` (the edge below). Two more things carry no token by design: a CORS preflight (`OPTIONS`) is answered before the check runs, and the browser UI's own files under `/ui/` are public — they carry no data.
-- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires a token**; `rocky serve` refuses to start otherwise. `--ui` requires a token on any bind, and requires it to be read-only.
+- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires a token**; `rocky serve` refuses to start otherwise. `--ui` requires a read-only token. On a loopback bind with no token configured, `--ui` generates one for the process; on any other bind you must pass it.
 
 A token is full-scope by default: it reaches every route. `--token-scope read-only` narrows it. A read-only token authenticates the same way, then gets `403` on any non-exempt request that is not `GET`, `HEAD`, or `OPTIONS`. Give that token to a browser UI, so a leaked token cannot start a run:
 
@@ -372,10 +372,10 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
-| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, and with `--ui`.** |
-| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. |
+| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a one-time read-only token. |
+| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. The one exception is `read-only` with `--ui` on loopback, which gets a generated token. |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
-| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Requires `--token` with `--token-scope read-only`, and `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
+| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Needs a read-only token: on loopback with no token, the server generates one for the process; on any other host, pass `--token` with `--token-scope read-only`. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
 | `--allowed-host <HOST>` | `String` (repeatable) | `[]` | With `--ui`: an extra `Host` header value to accept, for a reverse proxy in front of the UI. Loopback names and the bind host are always accepted; any other `Host` is refused `421`. |
 | `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added to `rocky.toml` later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
@@ -387,14 +387,30 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 
 `rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries (cargo feature `ui`; a plain `cargo build` has no UI and refuses the flag with the build command to run).
 
+On your own machine, `--ui` alone is enough:
+
+```bash
+rocky serve --ui
+# Rocky UI: http://127.0.0.1:8080/ui/#token=<64 hex characters>
+```
+
+With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a read-only token for this process. It prints that token only in the `Rocky UI:` address on stdout, and a note on stderr. The token changes on every restart. To keep one token, or to serve on any other host, choose it yourself:
+
 ```bash
 rocky serve --ui --token s3cret --token-scope read-only
 # Rocky UI: http://127.0.0.1:8080/ui/#token=s3cret
 ```
 
+```text
+--ui, no --token and no ROCKY_SERVE_TOKEN:
+  loopback bind                         → generates a read-only token
+  loopback bind + --token-scope full    → refuses to start
+  non-loopback bind                     → refuses to start
+```
+
 The rules, each refused at start with its fix:
 
-- `--ui` needs a token, and the token must be read-only. The page holds it, and a page must never reach a mutating route. One server has one token, so for job submissions run a second sidecar without `--ui`, or use the CLI.
+- `--ui` needs a token, and the token must be read-only. The page holds it, and a page must never reach a mutating route. Only a loopback bind generates one by itself. One server has one token, so for job submissions run a second sidecar without `--ui`, or use the CLI.
 - The printed address carries the token in the fragment. Browsers never send a fragment, so the secret is in no access log; the page reads it once, keeps it for the tab, and clears the address.
 - The page and its files are public: they carry no data. Every API call the page makes carries the token.
 - With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. Without `--ui` neither check runs. `GET /api/v1/health` skips both checks, so a load balancer or a Kubernetes probe that sends the pod IP as `Host` still gets `200`. The route carries no data.

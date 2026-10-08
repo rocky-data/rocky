@@ -198,6 +198,127 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
     );
 }
 
+/// `rocky serve --ui` with no token flags, on loopback: the server generates
+/// a read-only token, prints it only in the address line, says so on stderr
+/// without the secret, and the token authenticates reads but not writes. On a
+/// non-loopback bind the same command still refuses to start.
+///
+/// Needs the embedded page, like the test above, so it skips without
+/// `engine/ui/dist`.
+#[test]
+fn ui_on_loopback_with_no_token_generates_one_and_a_wide_bind_still_refuses() {
+    let dist_index = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/dist/index.html");
+    if !dist_index.is_file() {
+        eprintln!(
+            "skipping: {} is absent, so the binary embeds no page",
+            dist_index.display()
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = root.join("rocky.toml");
+    let serve = |extra: &[&str]| {
+        let mut command = rocky();
+        command
+            .current_dir(&root)
+            .env_remove("ROCKY_SERVE_TOKEN")
+            .env_remove("ROCKY_SERVE_TOKEN_SCOPE")
+            .args(["--config", config.to_str().unwrap(), "serve", "--ui"])
+            .args(extra);
+        command
+    };
+
+    // A non-loopback bind with no token is refused, as before.
+    let refused = serve(&["--host", "0.0.0.0", "--port", "0"])
+        .output()
+        .expect("spawn rocky serve");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("refuses to start without a token"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // `--token-scope full` alone is refused: the UI token is read-only.
+    let refused = serve(&["--token-scope", "full", "--port", "0"])
+        .output()
+        .expect("spawn rocky serve");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("read-only"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let stderr_path = dir.path().join("serve.stderr");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let mut child = serve(&["--port", &port.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).expect("stderr file"))
+        .spawn()
+        .expect("spawn rocky serve --ui");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let server = Server(child);
+
+    let mut first_line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut first_line)
+        .expect("read the banner");
+    let prefix = format!("Rocky UI: http://127.0.0.1:{port}/ui/#token=");
+    let token = first_line
+        .trim()
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("the banner is the address line: {first_line}"))
+        .to_string();
+    assert_eq!(token.len(), 64, "{token}");
+    assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{token}");
+
+    wait_for_health(port);
+
+    let auth = format!("Authorization: Bearer {token}\r\n");
+    let (status, _, body) = http_get(port, "/api/v1/meta", "");
+    assert!(status.contains("401"), "{status}: {body}");
+    let (status, _, body) = http_get(port, "/api/v1/meta", &auth);
+    assert!(status.contains("200"), "{status}: {body}");
+
+    // Read-only: a write with the generated token is refused.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        stream,
+        "POST /api/v1/compile HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\n\r\n"
+    )
+    .expect("request");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("response");
+    assert!(
+        raw.starts_with("HTTP/1.0 403") || raw.starts_with("HTTP/1.1 403"),
+        "{raw}"
+    );
+
+    drop(server);
+    let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
+    assert!(stderr.contains("one-time read-only token"), "{stderr}");
+    assert!(
+        !stderr.contains(&token),
+        "the token must appear only on stdout: {stderr}"
+    );
+}
+
 /// The click path, against the live API rather than a fixture.
 ///
 /// The SPA's DAG panel opens a model's pane by asking

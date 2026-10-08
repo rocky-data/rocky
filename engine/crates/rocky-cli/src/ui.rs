@@ -153,7 +153,7 @@ fn ui_disabled() -> Response {
     let body = serde_json::json!({
         "code": "ui_disabled",
         "message": "this server was started without --ui",
-        "remediation_hint": "start it with `rocky serve --ui --token <secret> --token-scope read-only`",
+        "remediation_hint": "start it with `rocky serve --ui`",
     });
     (StatusCode::NOT_FOUND, Json(body)).into_response()
 }
