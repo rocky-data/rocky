@@ -123,7 +123,12 @@ Rocky marks direct references and ordinary casts of those references from the ri
 Aliases remain distinct in self-joins, and downstream models inherit the resulting nullability.
 A `nullable = false` contract on an affected column with a known type raises `E012`.
 This analysis is conservative: a later `WHERE` filter does not narrow nullability.
-It does not change the existing nullability inference for casts of computed expressions.
+
+A cast keeps its operand's nullability only when the operand is a column.
+A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGINT)` and `CAST(NULLIF(x, 0) AS INT)` are nullable even when `x` is not.
+An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
+`COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
+An aggregate over a computed argument takes its type from that argument only when the argument's type comes from the SQL itself (a cast target): `SUM(CAST(y AS DOUBLE))` is `Float64`. Otherwise it stays `Unknown`: `MAX(LENGTH(n))` is `Unknown`, because the width of `LENGTH` differs between warehouses.
 
 For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from qualified references to either input.
 

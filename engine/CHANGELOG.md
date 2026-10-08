@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Inferred column types and nullability of nested expressions (#2295).** Lineage used to give a nested call the outer call's edge kind, so the column took the bare input column's type and NOT NULL. Over `x INT NOT NULL`: `CAST(NULLIF(x, 0) AS INT)` is now nullable (was NOT NULL); `CAST(MAX(x) AS BIGINT)` is now nullable (was NOT NULL); `MAX(LENGTH(n))` is now `Unknown` (was `n`'s type); `SUM(CAST(y AS DOUBLE))` is now `Float64` (was `y`'s integer type); `COUNT(*)` is now a non-null `Int64` (was `Unknown`, nullable). A division or modulo is now nullable, because division by zero returns NULL in several dialects. `rocky lineage` shows `expression` for a nested call (was `aggregation: <outer>`) and for an infallible cast over a call (was `cast`). **Behavior change:** a contract with `nullable = false` on a cast over an aggregate, such as `CAST(SUM(x) AS BIGINT)`, now fails with `E012`, as a bare `SUM(x)` already did. A contract on a `COUNT(*)` column is now type-checked instead of skipped with `I003`.
 - **An empty policy-gate subject set no longer allows by default (R12).** The `rocky-cli` gate functions (`evaluate_apply_policy` and its variants) take a new `EmptyTouched` argument. `NoOp` keeps today's `Allow` for a caller whose set lists exactly what it mutates. `Refuse` denies an empty set, so a future caller with no model set cannot skip every `deny` rule. No current command changes behavior.
 
 ## [1.77.0] — 2026-10-07
