@@ -264,6 +264,18 @@ pub struct WriteResult {
     pub size_bytes: u64,
 }
 
+/// What [`UniformWriter::commit_replace`] does when a conditional PUT loses
+/// to another commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnConflict {
+    /// Re-read the live set and recompute the removes against the new head.
+    /// A build replaces the table's content, so the winner's files go too.
+    Recompute,
+    /// Refuse when the new head's live files differ from the ones the first
+    /// attempt saw. A table publish must not remove files it never saw.
+    RefuseIfFilesChanged,
+}
+
 /// Result of one replace: the table's live set now equals the files written
 /// by the call.
 ///
@@ -720,9 +732,15 @@ impl UniformWriter {
             num_records: pointer.num_records,
             size_bytes: pointer.size_bytes,
         };
-        self.commit_replace(vec![staged], live, state, modification_time_millis)
-            .await?
-            .into_single()
+        self.commit_replace(
+            vec![staged],
+            live,
+            state,
+            modification_time_millis,
+            OnConflict::Recompute,
+        )
+        .await?
+        .into_single()
     }
 
     /// Make the table serve an earlier content-addressed output again
@@ -835,8 +853,14 @@ impl UniformWriter {
                 size_bytes,
             });
         }
-        self.commit_replace(staged, live, state, modification_time_millis)
-            .await
+        self.commit_replace(
+            staged,
+            live,
+            state,
+            modification_time_millis,
+            OnConflict::RefuseIfFilesChanged,
+        )
+        .await
     }
 
     /// Whether a prior run `R`'s content-addressed file is **still live** in
@@ -989,8 +1013,14 @@ impl UniformWriter {
         }
 
         // 3. One replace commit.
-        self.commit_replace(staged, live, state, modification_time_millis)
-            .await
+        self.commit_replace(
+            staged,
+            live,
+            state,
+            modification_time_millis,
+            OnConflict::Recompute,
+        )
+        .await
     }
 
     /// Make the live set equal `staged`, in at most one commit.
@@ -1011,12 +1041,19 @@ impl UniformWriter {
     /// protocol and the metadata are read again. The removes then reflect the
     /// new head, a schema or protocol change refuses, and the retry may turn
     /// into a no-op when the winner already wrote this exact output.
+    ///
+    /// With [`OnConflict::RefuseIfFilesChanged`] (a table publish) a conflict
+    /// whose winner changed the live files refuses instead: recomputing the
+    /// removes against the new head would silently remove the winner's
+    /// files. That includes a winner that wrote this exact output; the next
+    /// publish then finds the table already current.
     async fn commit_replace(
         &self,
         staged: Vec<StagedFile>,
         mut live: discover::LiveSet,
         state: UniformTableState,
         modification_time_millis: i64,
+        on_conflict: OnConflict,
     ) -> Result<ReplaceOutcome> {
         use std::collections::{BTreeMap, BTreeSet};
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
@@ -1039,6 +1076,7 @@ impl UniformWriter {
         }
         let expected_shape = discover::TableShape::of_state(&state);
         let first_snapshot = (live.protocol.clone(), live.metadata.clone());
+        let first_files: BTreeSet<String> = live.files.keys().cloned().collect();
 
         for attempt in 0..COND_PUT_RETRY_BUDGET {
             // The prepared files match the shape discover() saw. A schema,
@@ -1170,6 +1208,22 @@ impl UniformWriter {
                     // set, protocol, metadata and row-id high-water mark in
                     // one replay so the next attempt reflects the new head.
                     live = self.live_set().await?;
+                    match on_conflict {
+                        OnConflict::Recompute => {}
+                        OnConflict::RefuseIfFilesChanged => {
+                            let now: BTreeSet<String> = live.files.keys().cloned().collect();
+                            if now != first_files {
+                                return Err(UniformWriterError::TableChangedDuringWrite {
+                                    table: self.config.fqtn(),
+                                    what: format!(
+                                        "a concurrent commit (now at version {}) changed the \
+                                         table's files, so this publish would remove them",
+                                        live.head_version
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     tracing::warn!(
                         attempt = attempt + 1,
                         previous_target = target_version,
@@ -2497,7 +2551,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0)
+            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
             .await
             .unwrap();
         assert_eq!(outcome.table_version, 3, "the 412 at v2 retried at v3");
@@ -2555,7 +2609,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0)
+            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
             .await
             .unwrap();
         assert!(!outcome.committed);
@@ -2785,7 +2839,10 @@ mod tests {
             num_records: 1,
             size_bytes: 11,
         };
-        match writer.commit_replace(vec![staged], stale, state, 0).await {
+        match writer
+            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
+            .await
+        {
             Err(UniformWriterError::TableChangedDuringWrite { .. }) => {}
             other => panic!("expected TableChangedDuringWrite, got {other:?}"),
         }
@@ -3312,7 +3369,7 @@ mod tests {
             size_bytes: 11,
         };
         let outcome = writer
-            .commit_replace(vec![staged], stale, state, 0)
+            .commit_replace(vec![staged], stale, state, 0, OnConflict::Recompute)
             .await
             .unwrap();
         assert_eq!(outcome.table_version, 2, "the 412 at v1 retried at v2");
@@ -3560,23 +3617,16 @@ mod tests {
         )
     }
 
-    /// End to end on the in-memory store and a local state store: publish
-    /// the earlier run's output through `rocky_core::table_publish`. One
-    /// Delta commit moves the table, the Iceberg sync runs once, and the
-    /// publish history records the move with its commit version.
-    #[tokio::test]
-    async fn a_table_publish_moves_the_delta_table_and_records_the_commit() {
-        use rocky_core::environments::{
-            EnvironmentName, PublishRequest, PublishSource, TableMoveOutcome,
-        };
+    /// Record two runs of `orders` (outputs `a` then `b`) in a fresh local
+    /// state store and publish the first one to `prod` through `writer`.
+    async fn publish_first_build(
+        writer: UniformWriter,
+        a: &str,
+        b: &str,
+    ) -> rocky_core::table_publish::TablePublishReport {
+        use rocky_core::environments::{EnvironmentName, PublishRequest, PublishSource};
         use rocky_core::state::StateStore;
         use rocky_core::table_publish::publish_tables;
-
-        let store: Arc<InMemory> = Arc::new(InMemory::new());
-        seed_bootstrap(&store, "tbl").await;
-        let sql = Arc::new(RecordingSqlClient::default());
-        let writer = table_writer(&store, "tbl", sql.clone());
-        let (a, b) = two_builds(&writer).await;
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(".rocky-state.redb");
@@ -3584,13 +3634,13 @@ mod tests {
         state
             .record_run(&rocky_core::state::run_with_output_versions(
                 "r1",
-                &[("orders", Some(content_addressed(&a, 1)))],
+                &[("orders", Some(content_addressed(a, 1)))],
             ))
             .unwrap();
         state
             .record_run(&rocky_core::state::run_with_output_versions(
                 "r2",
-                &[("orders", Some(content_addressed(&b, 2)))],
+                &[("orders", Some(content_addressed(b, 2)))],
             ))
             .unwrap();
         drop(state);
@@ -3610,9 +3660,25 @@ mod tests {
             principal: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: None,
         };
-        let report = publish_tables(&session, &request, &publisher, false)
+        publish_tables(&session, &request, &publisher, false)
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    /// End to end on the in-memory store and a local state store: publish
+    /// the earlier run's output through `rocky_core::table_publish`. One
+    /// Delta commit moves the table, the Iceberg sync runs once, and the
+    /// publish history records the move with its commit version.
+    #[tokio::test]
+    async fn a_table_publish_moves_the_delta_table_and_records_the_commit() {
+        use rocky_core::environments::TableMoveOutcome;
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let sql = Arc::new(RecordingSqlClient::default());
+        let writer = table_writer(&store, "tbl", sql.clone());
+        let (a, b) = two_builds(&writer).await;
+        let report = publish_first_build(writer, &a, &b).await;
 
         assert!(report.is_complete());
         assert_eq!(
@@ -3631,6 +3697,177 @@ mod tests {
             *sql.log.lock().unwrap(),
             vec!["MSCK REPAIR TABLE c.s.t SYNC METADATA".to_string()]
         );
+    }
+
+    /// What [`Interposed`] does to one `_delta_log` create.
+    #[derive(Debug)]
+    enum Interpose {
+        /// Land `body` at `version` first, as a concurrent writer would, so
+        /// the create loses.
+        CompetitorFirst { version: u64, body: String },
+    }
+
+    impl Interpose {
+        fn version(&self) -> u64 {
+            match self {
+                Self::CompetitorFirst { version, .. } => *version,
+            }
+        }
+    }
+
+    /// An in-memory store that interposes once on a `_delta_log` create.
+    #[derive(Debug)]
+    struct Interposed {
+        inner: Arc<InMemory>,
+        prefix: String,
+        once: std::sync::Mutex<Option<Interpose>>,
+    }
+
+    impl std::fmt::Display for Interposed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Interposed({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Interposed {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let hit = {
+                let mut once = self.once.lock().unwrap();
+                let target = once.as_ref().map(|i| {
+                    Path::from(format!(
+                        "{}/_delta_log/{:020}.json",
+                        self.prefix,
+                        i.version()
+                    ))
+                });
+                if target.as_ref() == Some(location) {
+                    once.take()
+                } else {
+                    None
+                }
+            };
+            match hit {
+                Some(Interpose::CompetitorFirst { body, .. }) => {
+                    self.inner
+                        .put(location, PutPayload::from(Bytes::from(body.into_bytes())))
+                        .await?;
+                    self.inner.put_opts(location, payload, opts).await
+                }
+                None => self.inner.put_opts(location, payload, opts).await,
+            }
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A writer for table `c.s.t` under `tbl` whose store interposes once.
+    fn interposed_writer(store: &Arc<InMemory>, interpose: Interpose) -> UniformWriter {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: "tbl".into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            Arc::new(Interposed {
+                inner: store.clone(),
+                prefix: "tbl".into(),
+                once: std::sync::Mutex::new(Some(interpose)),
+            }) as Arc<dyn ObjectStore>,
+            Arc::new(RecordingSqlClient::default()),
+        )
+    }
+
+    /// A concurrent append lands at the version the publish's commit
+    /// targets, after the publish read the live set. The publish must not
+    /// recompute its removes against the new head (that would remove the
+    /// append): it fails for the table, and the append stays live.
+    #[tokio::test]
+    async fn a_publish_that_loses_to_a_concurrent_append_fails_and_keeps_the_append() {
+        use rocky_core::environments::TableMoveOutcome;
+
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let (a, b) = two_builds(&table_writer(&store, "tbl", Arc::new(PanicSqlClient))).await;
+        let append = concat!(
+            "{\"commitInfo\":{}}\n",
+            "{\"add\":{\"path\":\"appended.parquet\",\"partitionValues\":{},",
+            "\"size\":7,\"modificationTime\":0,\"dataChange\":true}}\n"
+        )
+        .to_string();
+        let writer = interposed_writer(
+            &store,
+            Interpose::CompetitorFirst {
+                version: 3,
+                body: append,
+            },
+        );
+        let report = publish_first_build(writer, &a, &b).await;
+
+        assert!(!report.is_complete());
+        assert!(
+            matches!(
+                &report.moves()[0].outcome,
+                TableMoveOutcome::Failed { error } if error.contains("concurrent commit")
+            ),
+            "{:?}",
+            report.moves()
+        );
+        assert_eq!(
+            replay_live_paths(&store, "tbl").await,
+            std::collections::BTreeSet::from([
+                format!("{b}.parquet"),
+                "appended.parquet".to_string()
+            ]),
+            "the concurrent append survives and nothing else changed"
+        );
+        assert!(!commit_exists(&store, "tbl", 4).await);
     }
 
     /// The backend refuses, before anything is written, a version it cannot
