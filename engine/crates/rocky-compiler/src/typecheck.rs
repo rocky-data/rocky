@@ -2656,7 +2656,9 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
                     // ANSI off, and some dialects' `::`, return NULL on a value
                     // that does not convert (#2299). Say nullable unless the
                     // cast provably cannot fail.
-                    source_nullable || cast_can_fail(&source, data_type, &target)
+                    source_nullable
+                        || (cast_can_fail(&source, data_type, &target)
+                            && !integer_literal_fits(expr, data_type, &target))
                 }
                 ast::CastKind::TryCast | ast::CastKind::SafeCast => true,
             };
@@ -3148,6 +3150,43 @@ fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyT
         (T::Date, T::Timestamp | T::TimestampNtz) => false,
         (T::Timestamp | T::TimestampNtz, T::Date | T::Timestamp | T::TimestampNtz) => false,
         _ => true,
+    }
+}
+
+/// Whether `expr` is an integer literal that fits the cast target, so the cast
+/// cannot fail (`CAST(0 AS DECIMAL(18,2))`, `CAST(1 AS SMALLINT)`).
+fn integer_literal_fits(expr: &Expr, target_sql: &ast::DataType, target: &RockyType) -> bool {
+    match expr {
+        Expr::Nested(inner) => integer_literal_fits(inner, target_sql, target),
+        Expr::Value(val) => {
+            let ast::Value::Number(text, _) = &val.value else {
+                return false;
+            };
+            let Ok(value) = text.parse::<i128>() else {
+                return false;
+            };
+            let in_range = |min: i128, max: i128| (min..=max).contains(&value);
+            match target_sql {
+                ast::DataType::TinyInt(_) => in_range(i8::MIN.into(), i8::MAX.into()),
+                ast::DataType::SmallInt(_) => in_range(i16::MIN.into(), i16::MAX.into()),
+                ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::MediumInt(_) => {
+                    in_range(i32::MIN.into(), i32::MAX.into())
+                }
+                ast::DataType::BigInt(_) => in_range(i64::MIN.into(), i64::MAX.into()),
+                _ => match target {
+                    RockyType::Decimal { precision, scale } => {
+                        let integer_digits = if value == 0 {
+                            0
+                        } else {
+                            value.unsigned_abs().to_string().len()
+                        };
+                        integer_digits + usize::from(*scale) <= usize::from(*precision)
+                    }
+                    _ => false,
+                },
+            }
+        }
+        _ => false,
     }
 }
 
@@ -4204,6 +4243,14 @@ mod tests {
             ("CAST(b AS INT)", false),
             ("CAST(u AS INT)", true),
             ("CAST(u AS STRING)", false),
+            ("CAST(0 AS DECIMAL(18,2))", false),
+            ("CAST(1000 AS DECIMAL(5,2))", true),
+            ("CAST(100 AS DECIMAL(5,2))", false),
+            ("CAST(99 AS DECIMAL(5,2))", false),
+            ("CAST(300 AS TINYINT)", true),
+            ("CAST(100 AS TINYINT)", false),
+            ("CAST(3000000000 AS INT)", true),
+            ("CAST(7 AS INT)", false),
         ] {
             let (_, got) = infer_expr_type(&parse_expr(expr), &scope);
             assert_eq!(got, nullable, "{expr}");
