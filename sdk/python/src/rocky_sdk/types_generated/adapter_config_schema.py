@@ -357,6 +357,8 @@ class AdapterConfig(BaseModel):
     The `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.
 
     Credential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.
+
+    The DuckDB, Databricks and Snowflake connection fields (`path`, `host`, `http_path`, `client_id`, `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`) are [`EnvString`]s. A resolved `${VAR}` value in one of them prints only as `${NAME}` (#1919). The adapter connect path reads the plaintext with [`EnvString::expose`].
     """
 
     model_config = ConfigDict(
