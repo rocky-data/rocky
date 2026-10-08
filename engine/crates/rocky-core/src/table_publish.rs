@@ -31,10 +31,11 @@
 //! - Take-over is for a dead publisher. A publisher that is slow but alive
 //!   reads the head again (a fence) and stops when another publish took
 //!   over. The state sync has no partial read: a remote fence downloads the
-//!   whole state blob. So the fence runs before the first table, before
-//!   every [`FENCE_EVERY`]th table after it, and before the last table, not
-//!   before every move. A publisher that lost the environment can still move
-//!   up to [`FENCE_EVERY`] tables before the next fence stops it.
+//!   whole state blob. [`publish_tables`] fences before every table, so a
+//!   publisher that lost the environment moves at most the table in flight.
+//!   [`publish_tables_fenced_every`] spaces the fence (for example every
+//!   [`FENCE_EVERY`] tables) and then such a publisher can move up to that
+//!   many tables first.
 //! - A run that writes a table while a publish moves it is not serialized
 //!   with the publish. A commit that lands between the publish's read of
 //!   the table and its commit makes that table's move fail (the Delta
@@ -239,9 +240,11 @@ pub enum TablePublishError {
     },
 }
 
-/// Tables between two fences. The fence downloads the whole remote state
-/// blob, so it cannot run before every move on a large publish. A fenced
-/// publisher can move at most this many tables before a fence stops it.
+/// A suggested fence spacing for a large publish on a remote state store,
+/// where each fence downloads the whole state blob. Opt in with
+/// [`publish_tables_fenced_every`]: a fenced publisher can then move up to
+/// this many tables before a fence stops it. [`publish_tables`] fences
+/// before every table.
 pub const FENCE_EVERY: usize = 8;
 
 /// Whether the fence runs before the table at `index` of `total`: the first,
@@ -293,14 +296,13 @@ async fn fence(session: &LedgerSeamSession, request: &PublishRequest, started: &
 /// `options.take_over` starts from a head whose own table publish never
 /// finished. It is for a **dead** publisher. See
 /// [`crate::state::StateStore::begin_table_publish`]. The publish reads the
-/// head again (a fence) before the first table, before every
-/// [`FENCE_EVERY`]th table and before the last. The state sync has no
-/// partial read, so a remote fence downloads the whole state blob; fencing
-/// every move would cost tables times blob size. When a fence finds that
-/// another publish took over, the publish stops and moves no more tables. A
-/// wrongly taken-over live publisher can move at most [`FENCE_EVERY`] tables
-/// before then. A fence that cannot read the head fails closed: the table is
-/// not moved.
+/// head again (a fence) before every table. When a fence finds that another
+/// publish took over, the publish stops and moves no more tables, so a
+/// wrongly taken-over live publisher moves at most the table already in
+/// flight. A remote fence downloads the whole state blob; a large publish
+/// can trade that guarantee for cost with [`publish_tables_fenced_every`]
+/// and [`FENCE_EVERY`]. A fence that cannot read the head fails closed: the
+/// table is not moved.
 ///
 /// `options.allow_shared_tables` lets the publish move a table that another
 /// environment points at a different version; without it the begin step
@@ -318,7 +320,7 @@ pub async fn publish_tables(
     backend: &dyn TablePointerBackend,
     options: TablePublishOptions,
 ) -> Result<TablePublishReport, TablePublishError> {
-    publish_tables_fenced_every(session, request, backend, options, FENCE_EVERY).await
+    publish_tables_fenced_every(session, request, backend, options, 1).await
 }
 
 /// [`publish_tables`] with the number of tables between fences set by the
@@ -997,7 +999,7 @@ mod tests {
             session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
             tables: FakeTables::default(),
         };
-        let err = publish_tables_fenced_every(&session, &req(None, ABC), &backend, NEW, 1)
+        let err = publish_tables(&session, &req(None, ABC), &backend, NEW)
             .await
             .unwrap_err();
         let TablePublishError::Fenced {
@@ -1064,9 +1066,10 @@ mod tests {
                 .unwrap();
         }
         let sources: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "r9")).collect();
-        let err = publish_tables(&session, &req(None, &sources), &backend, NEW)
-            .await
-            .unwrap_err();
+        let err =
+            publish_tables_fenced_every(&session, &req(None, &sources), &backend, NEW, FENCE_EVERY)
+                .await
+                .unwrap_err();
         let TablePublishError::Fenced { moves, .. } = &err else {
             panic!("expected Fenced, got {err:?}");
         };
@@ -1088,9 +1091,10 @@ mod tests {
             session: LedgerSeamSession::new(&StateConfig::default(), &path, false),
             tables: FakeTables::default(),
         };
-        let err = publish_tables(&session, &req(None, ABC), &backend, NEW)
-            .await
-            .unwrap_err();
+        let err =
+            publish_tables_fenced_every(&session, &req(None, ABC), &backend, NEW, FENCE_EVERY)
+                .await
+                .unwrap_err();
         assert!(matches!(err, TablePublishError::Fenced { .. }));
         assert_eq!(backend.tables.calls(), vec!["a", "b"]);
     }
