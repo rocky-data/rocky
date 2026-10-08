@@ -2714,11 +2714,13 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
             substring_for,
             ..
         } => {
+            // Postgres regex forms (`FROM 'pattern'`, `SIMILAR`) return NULL
+            // on no match, so the start and length must be integer typed.
             let nullable = infer_expr_type(expr, scope).1
                 || [substring_from, substring_for]
                     .into_iter()
                     .flatten()
-                    .any(|e| infer_expr_type(e, scope).1);
+                    .any(|e| !is_non_null_of(e, scope, RockyType::is_integer));
             (RockyType::String, nullable)
         }
         Expr::Ceil { expr, field } | Expr::Floor { expr, field } => {
@@ -2727,8 +2729,8 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
                 ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)
             ) {
                 let (ty, nullable) = infer_expr_type(expr, scope);
-                let decimal = matches!(ty, RockyType::Decimal { .. });
-                (ty, nullable || decimal)
+                let exact = ty.is_integer() || ty.is_float();
+                (ty, nullable || !exact)
             } else {
                 (RockyType::Unknown, true)
             }
@@ -2820,7 +2822,10 @@ fn infer_binary_op_type(
 /// - `LENGTH`, `CHAR_LENGTH`, `CHARACTER_LENGTH`, `OCTET_LENGTH`: return a
 ///   count; NULL only for a NULL argument.
 /// - `SUBSTRING`, `SUBSTR`: an out-of-range start gives an empty string, not
-///   NULL (ANSI, DuckDB, Spark, Snowflake, Trino, BigQuery).
+///   NULL (ANSI, DuckDB, Spark, Snowflake, Trino, BigQuery). Only when the
+///   start and length are inferred integers: Postgres regex forms
+///   (`SUBSTRING(x FROM 'pat')`, `SUBSTRING(x, 'pat')`, `SIMILAR`) return NULL
+///   on no match.
 /// - `LPAD`, `RPAD`: NULL only for a NULL argument. A bad pad (empty string in
 ///   BigQuery or Trino) raises an error; it does not return NULL.
 /// - `CONCAT`: Postgres, DuckDB and Snowflake-style `CONCAT` skip NULL
@@ -2829,9 +2834,15 @@ fn infer_binary_op_type(
 ///   is needed. `CONCAT_WS` is left out: with a NULL separator it returns NULL
 ///   and the dialects disagree on the rest.
 /// - `ABS`, `SIGN`, `CEIL`, `CEILING`, `FLOOR`, `ROUND`: NULL only for a NULL
-///   argument over float and integer types. Over `DECIMAL`, Spark with ANSI mode
-///   off returns NULL when the rounded value overflows the precision, so a
-///   decimal first argument stays nullable (see `args_all_non_null`).
+///   argument over inferred integer and float types. Over `DECIMAL`, Spark with
+///   ANSI mode off returns NULL when the rounded value overflows the precision.
+///   Over a string, Spark with ANSI off casts a non-numeric value to NULL.
+///   Unknown proves nothing. All three stay nullable (see `args_all_non_null`).
+///
+/// Dialects checked: ANSI, DuckDB, Spark/Databricks, Snowflake, Trino, BigQuery
+/// and Postgres (regex SUBSTRING). SQL Server and ClickHouse were not checked
+/// against these rules; the type guards (integer or float arguments only) are
+/// what keep the claim narrow there.
 ///
 /// Not listed, so nullable: `LEFT`/`RIGHT` (a negative length is NULL in some
 /// dialects), `REPLACE`, `INITCAP`, `TRUNC`/`TRUNCATE` (date forms), `POSITION`
@@ -2861,12 +2872,19 @@ const NULL_PRESERVING_SCALARS: &[&str] = &[
     "ROUND",
 ];
 
+/// True when `expr` is non-null and its inferred type satisfies `accept`.
+/// `Unknown` is never accepted by the integer and float predicates.
+fn is_non_null_of(expr: &ast::Expr, scope: &TypeScope, accept: fn(&RockyType) -> bool) -> bool {
+    let (ty, nullable) = infer_expr_type(expr, scope);
+    !nullable && accept(&ty)
+}
+
 /// True when `name` is a null-preserving scalar and the call is a plain
 /// scalar call whose every argument is a non-null expression.
 ///
 /// Anything unusual (no arguments, a named or wildcard argument, an `OVER`,
-/// `FILTER` or `WITHIN GROUP` clause, a `DECIMAL` first argument to a numeric
-/// function) returns false, which keeps the result nullable.
+/// `FILTER` or `WITHIN GROUP` clause, a non-integer/float argument to a numeric
+/// function, a non-integer substring or pad length) returns false, which keeps the result nullable.
 fn args_all_non_null(name: &str, func: &ast::Function, scope: &TypeScope) -> bool {
     if !NULL_PRESERVING_SCALARS.contains(&name)
         || func.over.is_some()
@@ -2889,13 +2907,24 @@ fn args_all_non_null(name: &str, func: &ast::Function, scope: &TypeScope) -> boo
         name,
         "ABS" | "SIGN" | "CEIL" | "CEILING" | "FLOOR" | "ROUND"
     );
-    arg_list.args.iter().all(|arg| {
+    arg_list.args.iter().enumerate().all(|(i, arg)| {
         let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
             return false;
         };
-        let (ty, nullable) = infer_expr_type(expr, scope);
-        let decimal_numeric = numeric && matches!(ty, RockyType::Decimal { .. });
-        !nullable && !decimal_numeric
+        // Numeric functions: every argument must be an inferred integer or
+        // float. Spark with ANSI off casts a non-numeric string to NULL, a
+        // decimal can overflow to NULL, and Unknown proves nothing.
+        // SUBSTRING/SUBSTR start and length, and LPAD/RPAD length, must be
+        // integers: Postgres `SUBSTRING(x, 'pattern')` returns NULL on no match.
+        if numeric {
+            is_non_null_of(expr, scope, |t| t.is_integer() || t.is_float())
+        } else if matches!(name, "SUBSTRING" | "SUBSTR") && i > 0
+            || matches!(name, "LPAD" | "RPAD") && i == 1
+        {
+            is_non_null_of(expr, scope, RockyType::is_integer)
+        } else {
+            !infer_expr_type(expr, scope).1
+        }
     })
 }
 
@@ -4060,6 +4089,7 @@ mod tests {
                 ("y", RockyType::Int32, false),
                 ("nx", RockyType::Int32, true),
                 ("nn", RockyType::String, true),
+                ("f", RockyType::Float64, false),
                 (
                     "d",
                     RockyType::Decimal {
@@ -4129,6 +4159,24 @@ mod tests {
                 },
                 true,
             ),
+            // regex SUBSTRING returns NULL on no match: nullable
+            ("SUBSTRING(n FROM 'a+')", s.clone(), true),
+            ("SUBSTRING(n, 'a+')", s.clone(), true),
+            ("SUBSTRING(n FROM 'a' FOR '#')", s.clone(), true),
+            // a string start is nullable; an integer FROM/FOR form is not
+            ("SUBSTRING(n, n)", s.clone(), true),
+            ("SUBSTR(n, '1')", s.clone(), true),
+            ("SUBSTRING(n FROM 1 FOR 2)", s.clone(), false),
+            ("LPAD(n, '5', '0')", s.clone(), true),
+            // ANSI-off Spark: a non-numeric string casts to NULL
+            ("ABS(n)", s.clone(), true),
+            ("FLOOR(n)", s.clone(), true),
+            ("ROUND(n, 1)", s.clone(), true),
+            // Unknown never qualifies
+            ("ABS(UNKNOWN_FN(x))", RockyType::Unknown, true),
+            ("ABS((SELECT 1))", RockyType::Unknown, true),
+            // float input stays non-null
+            ("ABS(f)", RockyType::Float64, false),
             // not in the table: stay nullable
             ("NULLIF(x, 0)", i32t.clone(), true),
             ("x / y", i32t.clone(), true),
