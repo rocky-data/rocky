@@ -376,13 +376,50 @@ fn hoist_into(text: &str, out: &mut Vec<String>) -> Option<String> {
     };
     for cte in &leading {
         let inner = hoist_into(&text[cte.inner.0..cte.inner.1], out)?;
+        let inner = strip_unbounded_order_by(&inner);
         out.push(format!(
             "{}{}\n)",
             &text[cte.head.0..cte.head.1],
-            trim_newlines(&inner)
+            trim_newlines(inner)
         ));
     }
     hoist_nested(&text[body_start..], out)
+}
+
+/// `inner` without a trailing `ORDER BY`, when T-SQL would refuse it.
+///
+/// T-SQL rejects `ORDER BY` in a CTE unless `TOP`, `OFFSET` or `FOR` appears
+/// with it (error 1033). A CTE has no defined row order, so dropping a bare
+/// one changes no result. An inlined ephemeral model is the usual source.
+/// Only a top-level `ORDER BY` goes: one inside `OVER (…)` or a subquery sits
+/// in parentheses. Any top-level `TOP`, `OFFSET`, `FETCH` or `FOR` keeps the
+/// text as written.
+fn strip_unbounded_order_by(inner: &str) -> &str {
+    let toks = scan(inner);
+    let mut depth = 0usize;
+    let mut order_at = None;
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            Kind::Open => depth += 1,
+            Kind::Close => depth = depth.saturating_sub(1),
+            Kind::Word if depth == 0 => {
+                if ["TOP", "OFFSET", "FETCH", "FOR"]
+                    .iter()
+                    .any(|w| is_word(inner, t, w))
+                {
+                    return inner;
+                }
+                if order_at.is_none()
+                    && is_word(inner, t, "ORDER")
+                    && toks.get(i + 1).is_some_and(|n| is_word(inner, n, "BY"))
+                {
+                    order_at = Some(t.start);
+                }
+            }
+            _ => {}
+        }
+    }
+    order_at.map_or(inner, |at| inner[..at].trim_end())
 }
 
 /// Replace every outermost `( WITH … )` group in `text` with its CTE-free
@@ -452,6 +489,37 @@ mod tests {
 
     fn hoist(sql: &str) -> Hoisted {
         hoist_ctes(sql).expect("hoistable")
+    }
+
+    /// An ephemeral model is inlined as a CTE. T-SQL refuses `ORDER BY` in a
+    /// CTE unless `TOP`, `OFFSET` or `FOR` is also given (error 1033), so the
+    /// hoisted definition must not carry a bare trailing `ORDER BY`. A CTE's
+    /// row order is not defined anyway.
+    #[test]
+    fn a_bare_order_by_in_a_cte_is_dropped() {
+        let h = hoist(
+            "WITH __rocky_ephemeral__e AS (SELECT a, b FROM t ORDER BY a DESC)\n\
+             SELECT a FROM __rocky_ephemeral__e ORDER BY a",
+        );
+        assert!(
+            !h.with_clause.to_uppercase().contains("ORDER BY"),
+            "{}",
+            h.with_clause
+        );
+        // The statement's own ORDER BY is untouched.
+        assert!(h.body.contains("ORDER BY a"), "{}", h.body);
+    }
+
+    #[test]
+    fn order_by_in_a_cte_is_kept_when_top_offset_or_window_needs_it() {
+        for cte in [
+            "SELECT TOP (5) a FROM t ORDER BY a",
+            "SELECT a FROM t ORDER BY a OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t",
+        ] {
+            let h = hoist(&format!("WITH c AS ({cte}) SELECT * FROM c"));
+            assert!(h.with_clause.contains(cte), "{}", h.with_clause);
+        }
     }
 
     #[test]
