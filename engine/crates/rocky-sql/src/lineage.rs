@@ -94,7 +94,8 @@ pub enum RowSelectionKind {
     WindowPartition,
     /// A window function's `ORDER BY` key.
     WindowOrder,
-    /// A `DISTINCT ON (...)` key: it picks one row per key value.
+    /// A `DISTINCT ON (...)` key, which picks one row per key value, or an
+    /// `ORDER BY` key of a `DISTINCT ON` query, which picks which row that is.
     DistinctOn,
     /// An `ORDER BY` key of a query that also has `LIMIT`, `FETCH` or `TOP`:
     /// the order decides which rows survive the cut.
@@ -389,20 +390,32 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
 }
 
 /// `ORDER BY` keys of a query that also cuts its rows (`LIMIT`, `FETCH`,
-/// `TOP`). Without a cut the order only arranges rows, so no edge is made.
+/// `TOP`, kind `order_limit`) or uses `DISTINCT ON (...)` (kind
+/// `distinct_on`: the order picks the row kept per key). Without either, the
+/// order only arranges rows, so no edge is made.
 fn extract_order_limit(
     query: &Query,
     select: &Select,
     source_tables: &[TableReference],
 ) -> Vec<RowSelectionLineage> {
     let cuts = query.limit_clause.is_some() || query.fetch.is_some() || select.top.is_some();
+    // `DISTINCT ON (...)` keeps the first row of each key group in `ORDER BY`
+    // order, so the order keys also decide which row survives.
+    let distinct_on = matches!(select.distinct, Some(Distinct::On(_)));
     let Some(order_by) = &query.order_by else {
         return Vec::new();
     };
     let OrderByKind::Expressions(keys) = &order_by.kind else {
         return Vec::new();
     };
-    if !cuts {
+    let mut kinds: Vec<RowSelectionKind> = Vec::new();
+    if distinct_on {
+        kinds.push(RowSelectionKind::DistinctOn);
+    }
+    if cuts {
+        kinds.push(RowSelectionKind::OrderLimit);
+    }
+    if kinds.is_empty() {
         return Vec::new();
     }
     let alias_map = build_alias_map(source_tables);
@@ -410,14 +423,17 @@ fn extract_order_limit(
     let mut out: Vec<RowSelectionLineage> = Vec::new();
     for key in keys {
         for (qualifier, column) in refs_with_projection_substitution(&key.expr, &projection, true) {
-            let edge = RowSelectionLineage {
-                source_table: resolve_ref_table(qualifier.as_deref(), &alias_map, source_tables),
-                source_column: column,
-                kind: RowSelectionKind::OrderLimit,
-                target_column: None,
-            };
-            if !out.contains(&edge) {
-                out.push(edge);
+            let source_table = resolve_ref_table(qualifier.as_deref(), &alias_map, source_tables);
+            for kind in &kinds {
+                let edge = RowSelectionLineage {
+                    source_table: source_table.clone(),
+                    source_column: column.clone(),
+                    kind: *kind,
+                    target_column: None,
+                };
+                if !out.contains(&edge) {
+                    out.push(edge);
+                }
             }
         }
     }
@@ -1917,7 +1933,16 @@ mod tests {
             RowSelectionKind::DistinctOn,
             None
         ));
-        // No LIMIT: the ORDER BY alone is not a row selection.
+        // The ORDER BY keys pick which row of each customer_id group survives,
+        // so they are DISTINCT ON edges too.
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "created_at",
+            RowSelectionKind::DistinctOn,
+            None
+        ));
+        // No LIMIT: no order_limit edge.
         assert!(!edges.iter().any(|e| e.2 == RowSelectionKind::OrderLimit));
     }
 
