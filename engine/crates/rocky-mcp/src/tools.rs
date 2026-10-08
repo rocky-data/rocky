@@ -4863,7 +4863,7 @@ impl RockyMcpServer {
         let logical = self.logical_model_name(&paths.stem);
         let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-contract:{}", paths.stem);
+        let decision_id = format!("draft-contract:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
@@ -5053,7 +5053,7 @@ impl RockyMcpServer {
         let logical = self.logical_model_name(&paths.stem);
         let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-check:{}", paths.stem);
+        let decision_id = format!("draft-check:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
@@ -5301,7 +5301,7 @@ impl RockyMcpServer {
         // compiles the model's attributes AS PATCHED from disk — a patch that
         // first ADDS a governed classification is gated by that
         // classification, not by the pre-patch attribute set.
-        let decision_id = format!("draft-metadata:{}", paths.stem);
+        let decision_id = format!("draft-metadata:{logical}");
         let marker_freezes = self.draft_marker_freezes(&logical).await?;
         let gate = match self
             .evaluate_draft_policy(&logical, &decision_id, &marker_freezes, None)

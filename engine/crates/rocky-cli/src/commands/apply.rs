@@ -1970,10 +1970,14 @@ pub async fn evaluate_apply_policy_durable(
     let seam_prior = prior_classifications.cloned();
     // Read BEFORE the seam: its first download replaces the local file.
     let seam_carried = match carry_drafts_for {
-        Some(models) => local_draft_rows_to_carry(state_path, models)?,
+        Some(models) => local_draft_rows_to_carry(state_path, models, chrono::Utc::now())?,
         None => Vec::new(),
     };
-    commit_remote_ledger_seam(
+    // A failed seam restores the remote winner into the local file, which
+    // drops the rows read above. Keep a copy to write back, so a retried
+    // propose still carries them.
+    let carried_for_restore = seam_carried.clone();
+    let result = commit_remote_ledger_seam(
         cfg,
         state_path,
         "the policy gate decision",
@@ -2010,7 +2014,41 @@ pub async fn evaluate_apply_policy_durable(
             })
         },
     )
-    .await
+    .await;
+    match result {
+        Ok(gate) => Ok(gate),
+        Err(e) => match restore_carried_draft_rows(state_path, &carried_for_restore) {
+            Ok(()) => Err(e),
+            Err(restore) => Err(e.context(format!(
+                "and {} worker draft decision row(s) could not be written back to the local \
+                 state file {}, so a retried propose cannot publish them: {restore:#}",
+                carried_for_restore.len(),
+                state_path.display()
+            ))),
+        },
+    }
+}
+
+/// Write the carried draft rows back into the local state file after a
+/// failed seam (#2282).
+///
+/// Every seam failure after the first download restores the remote winner
+/// into the local file, which holds no worker row. Without this a retried
+/// propose would read nothing to carry, and the worker's audit rows would be
+/// lost. The write skips a row the file already holds (a failure before the
+/// first download leaves the file as it was), so it is safe on every error
+/// path. The rows stay local until a propose publishes them.
+fn restore_carried_draft_rows(state_path: &Path, carried: &[PolicyDecisionRecord]) -> Result<()> {
+    if carried.is_empty() {
+        return Ok(());
+    }
+    let store = StateStore::open(state_path).with_context(|| {
+        format!(
+            "failed to open the local state file {} to restore the worker's draft decisions",
+            state_path.display()
+        )
+    })?;
+    carry_draft_rows(&store, carried)
 }
 
 /// The `plan_id` prefixes of the draft tools' decision rows (`draft_model`,
@@ -2022,9 +2060,17 @@ const DRAFT_DECISION_PREFIXES: &[&str] = &[
     "draft-metadata:",
 ];
 
+/// The most rows one propose carries for one draft `plan_id` (one draft tool
+/// on one model). The newest are kept.
+const MAX_CARRIED_PER_DRAFT: usize = 4;
+
+/// The most draft rows one propose carries in all. The newest are kept.
+const MAX_CARRIED_DRAFT_ROWS: usize = 64;
+
 /// Whether `row` has the exact shape a draft tool's gate records: a
-/// draft-prefixed `plan_id`, an `agent` `propose` evaluation (not a
-/// verify-after custody, freeze or auto-apply row), about one of `models`.
+/// `plan_id` that is a draft prefix followed by the row's own `model`, an
+/// `agent` `propose` evaluation (not a verify-after custody, freeze or
+/// auto-apply row), about one of `models`.
 ///
 /// A worker can write anything into its local file, so this is a shape
 /// filter, not proof of origin. It keeps every row that could act as a
@@ -2032,7 +2078,7 @@ const DRAFT_DECISION_PREFIXES: &[&str] = &[
 fn is_carriable_draft_row(row: &PolicyDecisionRecord, models: &[String]) -> bool {
     DRAFT_DECISION_PREFIXES
         .iter()
-        .any(|p| row.plan_id.starts_with(p))
+        .any(|p| row.plan_id.strip_prefix(p) == Some(row.model.as_str()))
         && row.kind() == rocky_core::state::DecisionKind::Evaluation
         && row.principal == PolicyPrincipal::Agent
         && row.capability == PolicyCapability::Propose
@@ -2048,9 +2094,18 @@ fn is_carriable_draft_row(row: &PolicyDecisionRecord, models: &[String]) -> bool
 /// dropped with a warning. A missing local file carries nothing. A local file
 /// that cannot be read is an error (fail-closed): the propose refuses rather
 /// than silently losing the worker's audit rows.
+///
+/// The set is bounded, because the worker controls the file: a row dated
+/// after `now` (the propose's clock) is carried with `now` as its timestamp,
+/// so it cannot sort after the propose's own rows; then only the newest
+/// [`MAX_CARRIED_PER_DRAFT`] rows per draft `plan_id` and the newest
+/// [`MAX_CARRIED_DRAFT_ROWS`] in all are kept. The rest are dropped with a
+/// warning that carries the count. An older row the remote ledger already
+/// holds is dropped harmlessly: [`carry_draft_rows`] would skip it anyway.
 pub(crate) fn local_draft_rows_to_carry(
     state_path: &Path,
     models: &[String],
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<PolicyDecisionRecord>> {
     let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
         format!(
@@ -2079,6 +2134,41 @@ pub(crate) fn local_draft_rows_to_carry(
                 "not publishing a local draft decision row of an unexpected shape"
             );
         }
+    }
+    let mut clamped = 0usize;
+    for row in &mut carried {
+        if row.timestamp > now {
+            row.timestamp = now;
+            clamped += 1;
+        }
+    }
+    if clamped > 0 {
+        tracing::warn!(
+            rows = clamped,
+            "local draft decision rows dated in the future are carried with the propose's time"
+        );
+    }
+    // Newest first; the tie-breaks keep the order stable.
+    carried.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.plan_id.cmp(&b.plan_id))
+            .then_with(|| a.reason.cmp(&b.reason))
+    });
+    let found = carried.len();
+    let mut per_draft: BTreeMap<String, usize> = BTreeMap::new();
+    carried.retain(|row| {
+        let n = per_draft.entry(row.plan_id.clone()).or_insert(0);
+        *n += 1;
+        *n <= MAX_CARRIED_PER_DRAFT
+    });
+    carried.truncate(MAX_CARRIED_DRAFT_ROWS);
+    if carried.len() < found {
+        tracing::warn!(
+            dropped = found - carried.len(),
+            kept = carried.len(),
+            "not publishing the oldest local draft decision rows: over the per-propose cap"
+        );
     }
     Ok(carried)
 }
@@ -13931,5 +14021,152 @@ effect = "allow"
             "the remote row was not replaced"
         );
         assert_eq!(rocky_core::policy::active_freezes(&rows).len(), 1);
+    }
+
+    /// #2282 (A1): a propose that fails after reading the worker's rows
+    /// (here, compare-and-swap exhaustion) used to lose them: the failed seam
+    /// restores the remote winner into the local file. The rows are written
+    /// back, so the retried propose still publishes them.
+    #[tokio::test]
+    async fn a_failed_propose_keeps_the_workers_draft_row_for_the_retry() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = worker_local_draft_gate(&cfg, root.path(), &harness.pod_b.state_path);
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        let models = vec!["orders".to_string()];
+        harness.faults.arm_precondition_failures(state_key(), 3);
+        let failed =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await;
+        assert!(failed.is_err(), "exhaustion must refuse the propose");
+        assert!(
+            draft_rows(&published(&harness).await.list_policy_decisions().unwrap()).is_empty(),
+            "nothing of the failed propose is published"
+        );
+
+        let gate =
+            propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+                .await
+                .unwrap();
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "the retried propose publishes the worker's draft row: {rows:?}"
+        );
+    }
+
+    /// #2282 (A2): the worker controls its local file, so the carried set is
+    /// bounded. 10,001 future-dated draft rows carry at most the per-draft
+    /// cap, none dated after the propose's clock, and a row whose `plan_id`
+    /// does not name its own model is not carried at all. Reads the file
+    /// directly, so it runs without the remote-test serial guard; the
+    /// published side is
+    /// `a_flood_of_future_dated_draft_rows_is_capped_and_clamped`.
+    #[test]
+    fn the_carried_draft_set_is_capped_clamped_and_shape_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let now = Utc::now();
+        let base = now + chrono::Duration::days(365);
+        {
+            let local = StateStore::open(&state_path).unwrap();
+            for i in 0..10_001i64 {
+                local
+                    .record_policy_decision(&PolicyDecisionRecord {
+                        timestamp: base + chrono::Duration::seconds(i),
+                        capability: PolicyCapability::Propose,
+                        model: "orders".to_string(),
+                        reason: format!("forged {i}"),
+                        ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Allow)
+                    })
+                    .unwrap();
+            }
+            local
+                .record_policy_decision(&PolicyDecisionRecord {
+                    capability: PolicyCapability::Propose,
+                    model: "orders".to_string(),
+                    ..row("draft:other", None, &[], PolicyEffect::Allow)
+                })
+                .unwrap();
+        }
+        let carried =
+            super::local_draft_rows_to_carry(&state_path, &["orders".to_string()], now).unwrap();
+        assert!(!carried.is_empty(), "a well-shaped row is still carried");
+        assert!(
+            carried.len() <= super::MAX_CARRIED_PER_DRAFT,
+            "at most the per-draft cap: {}",
+            carried.len()
+        );
+        assert!(
+            carried.iter().all(|d| d.timestamp <= now),
+            "no carried row is dated after the propose's clock"
+        );
+        assert!(
+            carried.iter().all(|d| d.plan_id == DRAFT_PLAN_ID),
+            "a plan_id that does not name its model is not carried"
+        );
+    }
+
+    /// The published side of the bound: future-dated forged rows reach the
+    /// remote ledger capped and dated no later than the propose.
+    #[tokio::test]
+    async fn a_flood_of_future_dated_draft_rows_is_capped_and_clamped() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let base = Utc::now() + chrono::Duration::days(365);
+        {
+            let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+            for i in 0..20i64 {
+                local
+                    .record_policy_decision(&PolicyDecisionRecord {
+                        timestamp: base + chrono::Duration::seconds(i),
+                        capability: PolicyCapability::Propose,
+                        model: "orders".to_string(),
+                        reason: format!("forged {i}"),
+                        ..row(DRAFT_PLAN_ID, None, &[], PolicyEffect::Allow)
+                    })
+                    .unwrap();
+            }
+            local
+                .record_policy_decision(&PolicyDecisionRecord {
+                    capability: PolicyCapability::Propose,
+                    model: "orders".to_string(),
+                    ..row("draft:other", None, &[], PolicyEffect::Allow)
+                })
+                .unwrap();
+        }
+
+        let models = vec!["orders".to_string()];
+        propose_gate_carrying(&cfg, root.path(), &harness.pod_b.state_path, Some(&models))
+            .await
+            .unwrap();
+        let after = Utc::now();
+        let rows = published(&harness).await.list_policy_decisions().unwrap();
+        let carried = draft_rows(&rows);
+        assert!(!carried.is_empty(), "a well-shaped row is still carried");
+        assert!(
+            carried.len() <= super::MAX_CARRIED_PER_DRAFT,
+            "at most the per-draft cap: {}",
+            carried.len()
+        );
+        assert!(
+            carried.iter().all(|d| d.timestamp <= after),
+            "no carried row is dated after the propose"
+        );
+        assert!(
+            !rows.iter().any(|d| d.plan_id == "draft:other"),
+            "a plan_id that does not name its model is not carried"
+        );
     }
 }
