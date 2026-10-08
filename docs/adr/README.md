@@ -19,3 +19,21 @@ Staging: **spine-first** (PR-A → PR-B → PR-F) then the CAS **fast-follow** (
 These ADRs went through three adversarial review rounds (a strategic-plan red team, an independent per-ADR second review, and a red team over the implementation plan); the corrections from all three are folded in.
 
 These three ADRs were authored under adversarial review (Codex, 10 findings dispositioned) and a cross-consistency pass. **Status: Accepted (2026-07-17) — implementation in progress.**
+
+## WP-03 / WP-04 — Contract semantics (design gate)
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-CONTRACTS.md`](ADR-CONTRACTS.md) | Accepted (ratified 2026-10-08) | RD-011 (recursive contract compatibility, `Unknown` policy), RD-012 (default-breaking classification), RD-013 (promotion fails closed). Sets the contract semantics WP-04 builds on. |
+
+## WP-00 / WP-04 / WP-07 / WP-08 — Identity, approval and trust boundaries (design gate)
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-TRUST.md`](ADR-TRUST.md) | Accepted (ratified 2026-10-08) | The design half of RD-026, RD-035, RD-043 and RD-045. Defines verified principals, signed approvals, the worker / loop / operator boundary, and break-glass (ADR-CONTRACTS Open question E). |
+
+## WP-03 — Type inference semantics (design gate)
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-TYPES.md`](ADR-TYPES.md) | Accepted (ratified 2026-10-08) | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |
