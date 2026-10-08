@@ -3074,13 +3074,19 @@ pub(crate) struct SelectInference {
 
 impl SelectInference {
     fn push_expression(&mut self, name: String, expr: &Expr, scope: &TypeScope) {
-        if has_exact_type(expr) {
+        let (data_type, nullable) = infer_expr_type(expr, scope);
+        let function = function_name(expr);
+        // `SUM` / `AVG` of a DECIMAL widens the precision by a
+        // dialect-dependent amount (DuckDB DECIMAL(38, s), Databricks
+        // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
+        let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
+            && matches!(data_type, RockyType::Decimal { .. });
+        if has_exact_type(expr) && !widened_decimal {
             self.exact_type_outputs.insert(self.columns.len());
         }
-        if function_name(expr).as_deref() == Some("COUNT") {
+        if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
-        let (data_type, nullable) = infer_expr_type(expr, scope);
         self.columns.push(TypedColumn {
             name,
             data_type,
@@ -3867,8 +3873,8 @@ mod tests {
             let sql = format!(
                 "SELECT CAST(NULLIF(x, 0) AS INT) AS a, CAST(MAX(x) AS BIGINT) AS b, \
                  MAX(LENGTH(n)) AS c, SUM(CAST(y AS DOUBLE)) AS d, COUNT(*) AS e, \
-                 COUNT(x) AS f, COUNT(DISTINCT x) AS g, MAX(CAST(y AS BIGINT)) AS h \
-                 FROM {source}"
+                 COUNT(x) AS f, COUNT(DISTINCT x) AS g, MAX(CAST(y AS BIGINT)) AS h, \
+                 SUM(CAST(y AS DECIMAL(10,2))) AS i FROM {source}"
             );
             let expected = vec![
                 // old: (Int32, false) — unsound, NULL when x = 0
@@ -3888,6 +3894,9 @@ mod tests {
                 ("g".to_string(), RockyType::Int64, false),
                 // old: (Int32, true) — y's type, not the cast target
                 ("h".to_string(), RockyType::Int64, true),
+                // old: (Int64, true) — y's integer type. SUM widens a
+                // DECIMAL by a dialect-dependent amount: Unknown.
+                ("i".to_string(), RockyType::Unknown, true),
             ];
             assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
         }
