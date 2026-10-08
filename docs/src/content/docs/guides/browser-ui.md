@@ -63,7 +63,7 @@ The server generates a token only on a loopback host (`127.0.0.1`, `::1` or `loc
 
 ### Sign-in and the session cookie
 
-The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui`. The cookie is `HttpOnly` and `SameSite=Strict`. It ends when the browser closes. The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
+The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui_<tag>` (the tag differs per server). The cookie is `HttpOnly` and `SameSite=Strict`. It ends when the browser closes. The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
 
 The cookie holds a keyed hash of the token, not the token. The key is new for each server process, so a restart ends every browser session. The page never holds the token. Its API calls carry the cookie.
 
@@ -71,7 +71,7 @@ The server logs no request URIs. The `/login` answers send `Cache-Control: no-st
 
 A reverse proxy in front of the server may log the query string of `/login`. Configure it not to log that query, or use a token you rotate.
 
-A cookie session can also write, but only from the page. A write must carry an allowed `Origin` and the header `X-Rocky-UI: 1`. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
+A cookie session can also write, but only from the page. A write must carry an `Origin` header that names this server exactly (the same host and port), or an `--allowed-origin` entry, and the header `X-Rocky-UI: 1`. Another page on the same machine shares the cookie, because cookies do not separate ports, so it is refused. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
 
 If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **session expired**. Open the newest `Rocky UI:` link from the console.
 
@@ -183,6 +183,8 @@ Know these limits:
 - **A server behind a proxy is shared.** With `--allowed-host` or `--allowed-origin`, the server stays read-only. It generates a read-only token. It refuses `--token-scope full`. Writes from the UI need a token for each person.
 - **A tunnel looks local.** An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detected. The server still looks local. Use `--read-only` whenever someone else can reach your port.
 - **`--open` shows the token.** It puts the address, token included, in the opener's command line. At full scope, another local OS user who reads the process list could act with it. On a shared machine, pass `--token` and use `--read-only`.
+- **The link stays in browser history.** The `/login?t=` link, token included, is kept in history and may sync to your other devices. It works until the server stops. Restart the server to end it.
+- **Other local pages get the cookie.** Browsers do not separate cookies by port, so a page from another server on this machine receives the session cookie. That server's owner could replay it. The cookie cannot write from such a page, because a write needs this server's exact origin and `X-Rocky-UI: 1`. Each server uses its own cookie name, so two `rocky serve --ui` on one machine do not end each other's sessions.
 - **One token does everything.** It can plan, approve and apply, as the CLI user can. Approving in the UI is not a second person's sign-off.
 - **The webhook route has its own secret.** `/api/v1/hooks/trigger/{pipeline}` checks an HMAC signature. It is the one write route outside the Bearer token.
 
