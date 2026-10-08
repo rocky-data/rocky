@@ -201,7 +201,7 @@ impl TablePublishReport {
 pub enum TablePublishError {
     /// The begin step failed. No table was touched.
     #[error("table publish refused before any table moved: {0}")]
-    Begin(#[source] StateSyncError),
+    Begin(#[source] Box<StateSyncError>),
     /// Tables may have moved, but the outcome could not be recorded. The
     /// environment stays `publishing`; `moves` is the only record of what
     /// happened.
@@ -216,7 +216,7 @@ pub enum TablePublishError {
         moves: Vec<TableMove>,
         /// The state error.
         #[source]
-        source: StateSyncError,
+        source: Box<StateSyncError>,
     },
     /// Another publish took over the environment while this one ran. This
     /// publish stopped before its next table; `moves` records the tables it
@@ -302,7 +302,7 @@ pub async fn publish_tables(
     let check = |p: &EnvPointer| backend.check(p);
     let started = state_sync::begin_table_publish(session, request, options, &check)
         .await
-        .map_err(TablePublishError::Begin)?;
+        .map_err(|e| TablePublishError::Begin(Box::new(e)))?;
 
     let planned: Vec<&EnvPointer> = started.to.values().collect();
     let mut moves = Vec::with_capacity(planned.len());
@@ -376,13 +376,21 @@ pub async fn publish_tables(
     .map_err(|source| TablePublishError::RecordFailed {
         started: started.publish_id.clone(),
         moves: moves.clone(),
-        source,
+        source: Box::new(source),
     })?;
     Ok(TablePublishReport { started, finished })
 }
 
 #[cfg(test)]
 mod tests {
+    /// The begin error behind a boxed [`TablePublishError::Begin`].
+    fn begin_error(err: &TablePublishError) -> Option<&StateSyncError> {
+        match err {
+            TablePublishError::Begin(e) => Some(e),
+            TablePublishError::RecordFailed { .. } | TablePublishError::Fenced { .. } => None,
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -564,8 +572,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(
-                &err,
-                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                begin_error(&err),
+                Some(StateSyncError::State(StateError::Environment(
                     EnvironmentError::Refused {
                         model,
                         reason: PublishRefusal::TableSharedWithEnvironment { other, table, .. },
@@ -633,8 +641,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(
-                &err,
-                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                begin_error(&err),
+                Some(StateSyncError::State(StateError::Environment(
                     EnvironmentError::Refused {
                         reason: PublishRefusal::TableSharedWithEnvironment { other, publish_id, .. },
                         ..
@@ -831,8 +839,8 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                &err,
-                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                begin_error(&err),
+                Some(StateSyncError::State(StateError::Environment(
                     EnvironmentError::Refused {
                         model,
                         reason: PublishRefusal::BackendRefused { .. },
@@ -867,8 +875,8 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                &err,
-                TablePublishError::Begin(StateSyncError::State(StateError::Environment(
+                begin_error(&err),
+                Some(StateSyncError::State(StateError::Environment(
                     EnvironmentError::PublishInProgress { publish_id, .. }
                 ))) if publish_id == "prod#1"
             ),
@@ -1026,8 +1034,8 @@ mod tests {
         };
         assert!(
             matches!(
-                &loser_err,
-                TablePublishError::Begin(StateSyncError::PublishConflict { found: Some(_), .. })
+                begin_error(&loser_err),
+                Some(StateSyncError::PublishConflict { found: Some(_), .. })
             ),
             "{loser_err:?}"
         );
