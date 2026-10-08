@@ -82,20 +82,29 @@ The engine API `table_publish::publish_tables` moves each model's Delta table to
   begin   CAS on the head        prod#1  started   (environment marked "publishing")
     │ head moved? refused, no table touched
     ▼
-  commit table a ──▶ commit table b ──▶ ...   stop at the first failure
+  fence ─▶ commit table a ─▶ fence ─▶ commit table b ─▶ ...   stop at the first failure
+    │ another publish took over? stop, no more tables
     ▼
-  finish                         prod#2  finished  (per table: moved, already current, failed, not tried)
+  finish                         prod#2  finished  (one outcome per table)
 ```
 
 - The begin step claims the environment before any table moves. When two publishers start from the same head, one gets a publish conflict and moves no table.
 - While a publish is in progress, every other publish to that environment is refused with `PublishInProgress`. That includes a state-only publish.
-- A failure stops the publish. The finished row names each table: `moved` (with its commit version), `already_current`, `failed` (with the error) or `not_attempted`. The head's pointers move only for the tables that now serve the version. The other tables keep their old version, so the environment is part published until you publish again.
-- If the process dies between two commits, nothing records which tables moved. The environment stays `publishing`. A new publish that names that head and asks to take over moves every table again. A table already at its version gets no new commit. Take over only when the first publisher is dead.
+- A failure stops the publish. The finished row names one outcome per table:
+  - `moved`: one commit moved it (with its commit version), and the Iceberg sync ran;
+  - `already_current`: it already served the version, so no commit was written;
+  - `sync_failed`: the Delta table serves the version, but the Iceberg sync failed;
+  - `failed`: no commit was written (with the error);
+  - `unknown`: the commit write returned an error that does not say whether the commit was stored (for example a timeout);
+  - `not_attempted`: an earlier table failed or ended `unknown`.
+- The head's pointers move only for `moved`, `already_current` and `sync_failed`. The other tables keep their old version, so the environment is part published until you publish again. A publish is complete only when every table is `moved` or `already_current`.
+- Publish again to reconcile. A table whose `unknown` commit did land is then `already_current`. A table that is `sync_failed` is synced again, because the sync also runs on an already-current table.
+- If the process dies between two commits, nothing records which tables moved. The environment stays `publishing`. A new publish that names that head and asks to take over moves every table again. A table already at its version gets no new commit.
+- Take over only when the first publisher is dead. Before each table, a publish reads the head again (a fence). If another publish took over, it stops with `Fenced` and moves no more tables. A wrongly taken-over publisher that is still alive can still move the one table it was committing.
 - Only `content_addressed` outputs of unpartitioned tables can be published. A partitioned output, a `delta_observed` version (it names a table version, not files Rocky wrote), and a table with no configured writer are refused before anything is written.
-- The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), and a version written before the table's schema or partitioning changed.
-- A run that writes the same table while a publish moves it is not ordered with the publish. The later commit wins.
-- The publish moves the model's own table. Two environments that both hold a model move the same table, and neither sees the other's publish. Rocky does not check this yet, so publish a model's table from one environment only.
-- After each commit, Rocky runs `MSCK REPAIR TABLE ... SYNC METADATA` so Iceberg readers see the change. If that step fails, the table still moved, and the outcome carries a warning.
+- The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), a version written before the table's protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
+- A run is not ordered with a publish. If another commit changes the table's files after the publish read them and before it commits, the publish fails for that table and writes nothing. It never removes files it did not see. Otherwise the later commit wins.
+- The publish moves the model's own table, which every environment that holds the model shares. So it refuses when another environment's head, or the plan of its unfinished table publish, points the same table at a different version. The error names that environment. The `allow_shared_tables` option publishes anyway.
 
 ## Per-namespace state files
 

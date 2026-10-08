@@ -33,10 +33,16 @@
 //!   another publish took over, so it can move at most the one table that
 //!   was in flight.
 //! - A run that writes a table while a publish moves it is not serialized
-//!   with the publish. The later commit wins.
-//! - On Delta, a publish moves the model's own table. Two environments that
-//!   both hold a model move the same table, and their compare-and-swap
-//!   tokens are separate. Rocky does not check this yet.
+//!   with the publish. A commit that lands between the publish's read of
+//!   the table and its commit makes that table's move fail (the Delta
+//!   backend never removes files it did not see); otherwise the later
+//!   commit wins.
+//! - On Delta, a publish moves the model's own table, which every
+//!   environment holding the model shares. The begin step refuses when
+//!   another environment points that table at a different version, unless
+//!   [`TablePublishOptions::allow_shared_tables`] is set. The check reads
+//!   the other environments once, in the begin transaction; a state-only
+//!   publish into another environment afterwards is not stopped.
 //! - A pointer pins no data: `VACUUM` can remove the files of a version an
 //!   environment points to.
 //!
