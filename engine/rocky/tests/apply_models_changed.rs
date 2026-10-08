@@ -1,5 +1,5 @@
-//! `rocky apply` re-checks the models a plan fingerprinted, for every
-//! principal, on the real binary.
+//! `rocky apply` re-checks the models a plan fingerprinted, for a person's
+//! apply too, on the real binary.
 //!
 //! Apply does not replay stored SQL: `run` recompiles the models on disk. So
 //! a plan applied after its models were edited would run the edit. A plan
@@ -120,6 +120,62 @@ fn cli_apply_refuses_a_plan_whose_models_changed_and_applies_an_unchanged_one() 
 
     std::fs::write(&path, original).unwrap();
     ok(&cli_apply(dir.path(), &root, &plan_id));
+}
+
+/// A backfill planned, reviewed and applied from the directory ABOVE the
+/// project, with `--config project/rocky.toml` and a relative
+/// `--models project/models`. Apply anchors the backfill's persisted models
+/// directory at the project root it runs in (the directory holding
+/// `.rocky/plans`), as review does, so the check compiles the same models.
+#[test]
+fn backfill_applied_with_config_from_another_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _) = project_with_an_approved_backfill(dir.path());
+    // The warehouse file must not depend on the cwd either.
+    let config = root.join("rocky.toml");
+    let toml = std::fs::read_to_string(&config).unwrap();
+    let absolute = toml.replacen(
+        "path = \"playground.duckdb\"",
+        &format!("path = \"{}\"", root.join("playground.duckdb").display()),
+        1,
+    );
+    assert_ne!(
+        absolute, toml,
+        "the playground config names playground.duckdb"
+    );
+    std::fs::write(&config, absolute).unwrap();
+    let state = dir.path().join("state.redb");
+    let from_above = |args: &[&str]| -> Output {
+        rocky(dir.path())
+            .current_dir(dir.path())
+            .args(["-o", "json", "--config", "project/rocky.toml"])
+            .args(["--state-path", state.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = from_above(&[
+        "backfill",
+        "--models",
+        "project/models",
+        "--model",
+        "revenue_summary",
+    ]);
+    ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json_start = stdout.find("\n{").map_or(0, |i| i + 1);
+    let plan: serde_json::Value = serde_json::from_str(&stdout[json_start..]).unwrap();
+    let plan_id = plan["plan_id"].as_str().expect("a plan id").to_string();
+    ok(&from_above(&["review", &plan_id, "--approve"]));
+
+    let (path, original) = edit_model(&root);
+    let out = from_above(&["apply", &plan_id]);
+    assert!(!out.status.success(), "an edited plan must not apply");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CODE), "{stderr}");
+
+    std::fs::write(&path, original).unwrap();
+    ok(&from_above(&["apply", &plan_id]));
 }
 
 /// A child killed when the test ends, pass or fail.

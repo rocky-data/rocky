@@ -547,8 +547,8 @@ pub(crate) fn verify_plan_models_for_apply(
     let snapshot_missing = |what: &str| {
         anyhow::anyhow!(
             "{PLAN_SNAPSHOT_MISSING}: refusing to apply plan '{plan_id}': the plan predates the \
-             check apply runs on a plan's models (it has no {what}), so apply cannot tell \
-             whether its models changed. Plan again with `rocky plan` (and review the new \
+             check apply runs on a plan's models (it has no {what}), so apply cannot compare \
+             them with the models on disk. Plan again with `rocky plan` (and review the new \
              plan if it needs approval)."
         )
     };

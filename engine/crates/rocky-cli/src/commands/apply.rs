@@ -11218,15 +11218,31 @@ autonomy_budget = { failures = 3, window = "7d" }
         kind: PlanKind,
         principal: PolicyPrincipal,
     ) -> anyhow::Result<String> {
-        let rp = RunPlan {
+        write_pipeline_plan_with(root, config, kind, principal, |_| {})
+    }
+
+    fn gold_run_plan() -> RunPlan {
+        RunPlan {
             pipeline: Some("gold".to_string()),
             models: vec!["totals".to_string()],
             execution_layers: vec![vec!["totals".to_string()]],
             ..minimal_run_plan()
-        };
+        }
+    }
+
+    /// [`write_pipeline_plan_of`], with `edit` applied to the capabilities
+    /// before the plan is written (to model a plan an older binary wrote).
+    fn write_pipeline_plan_with(
+        root: &Path,
+        config: &Path,
+        kind: PlanKind,
+        principal: PolicyPrincipal,
+        edit: impl FnOnce(&mut crate::plan_store::EmbeddedCapabilities),
+    ) -> anyhow::Result<String> {
+        let rp = gold_run_plan();
         let cfg = rocky_core::config::load_optional_project_config(Some(config))?;
         let scope = super::super::approval_scope::approval_scope(cfg.as_ref(), config, &rp)?;
-        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+        let mut capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
             config,
             Some(&scope),
             "HEAD",
@@ -11235,7 +11251,117 @@ autonomy_budget = { failures = 3, window = "7d" }
             false,
         )?;
         assert!(capabilities.models_fingerprint.is_some());
+        assert!(capabilities.models_only_fingerprint.is_some());
+        edit(&mut capabilities);
         crate::plan_store::write_plan_governed(root, kind, &rp, principal, capabilities)
+    }
+
+    /// Run the apply-time models check on a persisted plan as `principal`.
+    fn check_plan_models(
+        root: &Path,
+        config: &Path,
+        plan_id: &str,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<()> {
+        let plan = crate::plan_store::read_plan(root, plan_id)?;
+        let cfg = rocky_core::config::load_rocky_config(config)?;
+        super::super::approval_scope::verify_plan_models_for_apply(
+            &plan,
+            plan_id,
+            Some(&cfg),
+            config,
+            root,
+            &gold_run_plan(),
+            principal,
+        )
+    }
+
+    /// The split by principal. A config change that leaves the models alone
+    /// (here an unrelated pipeline's settings) passes a person's check, and
+    /// refuses an agent's with `plan_config_changed`, not
+    /// `plan_models_changed`. A model edit refuses both with
+    /// `plan_models_changed`.
+    #[test]
+    fn a_config_only_change_refuses_an_agent_but_not_a_person() -> anyhow::Result<()> {
+        use super::super::approval_scope::{PLAN_CONFIG_CHANGED, PLAN_MODELS_CHANGED};
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Human)?;
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Agent)?;
+
+        let toml = std::fs::read_to_string(&config)?;
+        let edited = toml.replacen(
+            "[pipeline.silver.target.governance]\nauto_create_catalogs = true",
+            "[pipeline.silver.target.governance]\nauto_create_catalogs = false",
+            1,
+        );
+        assert_ne!(edited, toml, "the fixture must change");
+        std::fs::write(&config, edited)?;
+
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Human)
+            .expect("a person's check compares the models only");
+        let msg = format!(
+            "{:#}",
+            check_plan_models(root, &config, &plan_id, PolicyPrincipal::Agent)
+                .expect_err("an agent's check compares the config too")
+        );
+        assert!(msg.starts_with(PLAN_CONFIG_CHANGED), "{msg}");
+
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            let msg = format!(
+                "{:#}",
+                check_plan_models(root, &config, &plan_id, principal).expect_err("edited")
+            );
+            assert!(msg.starts_with(PLAN_MODELS_CHANGED), "{principal:?}: {msg}");
+        }
+        Ok(())
+    }
+
+    /// A plan with a fingerprint but no source-schema snapshot predates the
+    /// check: it refuses with `plan_snapshot_missing` and says to plan again
+    /// because of that, not "models changed". So does a person's apply of a
+    /// plan with no models-only fingerprint. An agent's apply of that plan
+    /// still runs the full check, which passes.
+    #[test]
+    fn a_plan_that_predates_the_check_refuses_with_snapshot_missing() -> anyhow::Result<()> {
+        use super::super::approval_scope::PLAN_SNAPSHOT_MISSING;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+
+        let no_snapshot =
+            write_pipeline_plan_with(root, &config, PlanKind::Run, PolicyPrincipal::Human, |c| {
+                c.reviewed_source_schemas = None;
+            })?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            let msg = format!(
+                "{:#}",
+                check_plan_models(root, &config, &no_snapshot, principal).expect_err("no snapshot")
+            );
+            assert!(
+                msg.starts_with(PLAN_SNAPSHOT_MISSING),
+                "{principal:?}: {msg}"
+            );
+            assert!(msg.contains("predates"), "{msg}");
+            assert!(!msg.contains("models changed"), "{msg}");
+        }
+
+        let no_models_only =
+            write_pipeline_plan_with(root, &config, PlanKind::Run, PolicyPrincipal::Human, |c| {
+                c.models_only_fingerprint = None;
+            })?;
+        let msg = format!(
+            "{:#}",
+            check_plan_models(root, &config, &no_models_only, PolicyPrincipal::Human)
+                .expect_err("no models-only fingerprint")
+        );
+        assert!(msg.starts_with(PLAN_SNAPSHOT_MISSING), "{msg}");
+        check_plan_models(root, &config, &no_models_only, PolicyPrincipal::Agent)
+            .expect("an agent's full check does not need the models-only fingerprint");
+        Ok(())
     }
 
     /// The AI-authored apply path re-checks too, after its review-marker
@@ -11271,7 +11397,7 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// **Apply re-checks the reviewed models for every principal.** A human
+    /// **Apply re-checks the reviewed models for a person too.** A human
     /// apply of a plain run plan whose model was edited, added or removed
     /// after planning refuses with `plan_models_changed`, before the policy
     /// gate and before the warehouse is opened. `run` recompiles the models
