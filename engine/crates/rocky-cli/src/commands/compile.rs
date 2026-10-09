@@ -434,23 +434,11 @@ fn compile_inner(
     // Uses hardcoded stub statistics for leaf nodes — real catalog stats
     // (per-adapter `DESCRIBE DETAIL` / Iceberg snapshot summary) will replace
     // these stubs in a follow-up that wires the adapter registry here.
-    let cost_estimates = {
-        use rocky_core::cost::{TableStats, WarehouseType, propagate_costs};
-        let dag_nodes = &result.project.dag_nodes;
-        let mut base_stats = std::collections::HashMap::new();
-        for node in dag_nodes {
-            if node.depends_on.is_empty() {
-                base_stats.insert(
-                    node.name.clone(),
-                    TableStats {
-                        row_count: 10_000,
-                        avg_row_bytes: 256,
-                    },
-                );
-            }
-        }
-        propagate_costs(dag_nodes, &base_stats, WarehouseType::Databricks).unwrap_or_default()
-    };
+    // `rocky plan`'s cost preview uses the same heuristic.
+    let cost_estimates = super::plan_cost::heuristic_cost_estimates(
+        &result.project.dag_nodes,
+        rocky_core::cost::WarehouseType::Databricks,
+    );
 
     // Check per-model cost ceilings and emit E027 diagnostics for breaches.
     let ceiling_diagnostics =

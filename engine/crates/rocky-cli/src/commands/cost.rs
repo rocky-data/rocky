@@ -432,7 +432,9 @@ fn print_table(output: &CostOutput) {
 /// The loader is the credential-tolerant one: `rocky cost` reads the state
 /// store and prices from the run record, and opens no warehouse connection.
 /// Adapters are read for their `type` only.
-fn adapter_pricing(config_path: &Path) -> Result<Option<(String, WarehouseType, f64, f64)>> {
+pub(crate) fn adapter_pricing(
+    config_path: &Path,
+) -> Result<Option<(String, WarehouseType, f64, f64)>> {
     let Some(cfg) = load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
     else {

@@ -109,6 +109,7 @@ pub async fn plan(
     semantic: bool,
     base_ref: &str,
     state_path: &Path,
+    cost_estimate: super::plan_cost::CostEstimateMode,
     output_json: bool,
 ) -> Result<()> {
     if let Some(branch_name) = run_options.branch.as_deref() {
@@ -617,6 +618,26 @@ pub async fn plan(
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
                 run_plan_persisted = true;
+                // Report-only, computed after the plan is persisted so it
+                // can never enter `plan_id`.
+                let adapter_type = rocky_cfg
+                    .adapters
+                    .get(&pipeline.target.adapter)
+                    .map_or("", |a| a.adapter_type.as_str());
+                output.cost_preview = Some(
+                    super::plan_cost::compute_plan_cost_preview(
+                        super::plan_cost::PlanCostContext {
+                            config_path,
+                            models_dir: &blueprint_models_dir,
+                            state_path,
+                            pipeline_name: name,
+                            adapter_type,
+                            models: &output.models,
+                            mode: cost_estimate,
+                        },
+                    )
+                    .await,
+                );
             }
             Ok(Some(RunPlanBuild::Refused(refused))) => {
                 compile_refused = true;
@@ -731,6 +752,7 @@ pub async fn plan(
         }
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
+        render_cost_preview_text(&output);
         render_semantic_verdict_text(&output);
         if let Some(check) = &output.intent_check {
             super::intent_check::render_text(check);
@@ -2896,6 +2918,35 @@ fn render_budget_diagnostics_text(output: &PlanOutput) {
     }
 }
 
+/// Render the cost preview under the text output mode.
+fn render_cost_preview_text(output: &PlanOutput) {
+    let Some(preview) = &output.cost_preview else {
+        return;
+    };
+    let source = match preview.source {
+        crate::output::CostEstimateSource::Heuristic => "heuristic",
+        crate::output::CostEstimateSource::Adapter => "adapter",
+        crate::output::CostEstimateSource::Mixed => "mixed",
+    };
+    println!("-- cost preview (estimate, source: {source}) --");
+    println!("models to rebuild: {}", preview.models_to_rebuild);
+    if let Some(bytes) = preview.estimated_bytes_scanned {
+        println!("estimated bytes scanned: {bytes}");
+    }
+    if let Some(cost) = preview.estimated_cost_usd {
+        println!("estimated cost: ${cost:.6}");
+    }
+    if let Some(previous) = preview.previous_cost_usd {
+        println!("previous production cost: ${previous:.6}");
+    }
+    if let Some(delta) = preview.cost_delta_usd {
+        println!("cost delta: ${delta:+.6}");
+    }
+    for note in &preview.notes {
+        println!("  note: {note}");
+    }
+}
+
 /// Compute the decision-support semantic verdict for `rocky plan --semantic`.
 ///
 /// Compiles the **working tree** (head) and the project as it stood at
@@ -3428,6 +3479,7 @@ mod tests {
             false,
             "main",
             &state,
+            Default::default(),
             false,
         )
         .await
@@ -3462,6 +3514,7 @@ mod tests {
             false,
             "main",
             &temp.path().join("missing.redb"),
+            Default::default(),
             false,
         )
         .await
@@ -4260,6 +4313,7 @@ auto_create_schemas = true
             false,
             "HEAD",
             &state_path,
+            Default::default(),
             false,
         )
         .await;
@@ -4364,6 +4418,7 @@ threshold = 0
             false,
             "HEAD",
             &state_path,
+            Default::default(),
             false,
         )
         .await;
@@ -4482,6 +4537,7 @@ threshold = 0
             false,
             "HEAD",
             &dir.path().join("state.redb"),
+            Default::default(),
             false,
         )
         .await

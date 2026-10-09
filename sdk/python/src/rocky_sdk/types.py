@@ -656,6 +656,12 @@ class PlanResult(BaseModel):
     #: ``dict`` — the nested shape lives on the generated
     #: ``PlanOutput.intent_check``.
     intent_check: dict | None = None
+    #: Report-only cost preview: rebuild scope (``models_to_rebuild``) and
+    #: estimated bytes and cost, each marked with its ``source``
+    #: (``heuristic`` / ``adapter`` / ``mixed``). Present when the plan covers
+    #: transformation models. Kept as a loose ``dict`` — the nested shape lives
+    #: on the generated ``PlanOutput.cost_preview``.
+    cost_preview: dict | None = None
     #: Budget diagnostics raised at plan time. Empty when no ``[budget]`` block
     #: is configured.
     budget_diagnostics: list[Diagnostic] = []

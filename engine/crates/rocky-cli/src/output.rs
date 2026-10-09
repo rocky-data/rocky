@@ -1890,6 +1890,98 @@ pub struct PlanOutput {
     /// `plan_id`. See [`IntentCheckOutput`] and its `caveat`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_check: Option<IntentCheckOutput>,
+
+    // ---- Cost preview (report-only) -------------------------------------
+    /// What applying this plan would rebuild and roughly cost, computed
+    /// before any model runs. Present when the plan covers transformation
+    /// models. Every figure is an estimate: see [`PlanCostPreview::source`].
+    /// REPORT-ONLY: it never changes `models`, `skipped`, the budget fields,
+    /// or the exit code, and it is not part of the persisted plan, so it does
+    /// not enter `plan_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_preview: Option<PlanCostPreview>,
+}
+
+/// Where a `rocky plan` cost estimate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CostEstimateSource {
+    /// Rocky's offline cost model over the compiled DAG. It uses fixed
+    /// placeholder statistics for source tables and never contacts the
+    /// warehouse. Good for comparing plans, not for budgeting.
+    Heuristic,
+    /// The warehouse's own estimate (`EXPLAIN` or a dry run) for the
+    /// generated SQL. Requested with `rocky plan --cost-estimate adapter`.
+    Adapter,
+    /// Totals that combine both sources, because the adapter could not
+    /// estimate some models.
+    Mixed,
+}
+
+/// The cost preview on [`PlanOutput::cost_preview`].
+///
+/// `estimated_*` totals are sums over the models that have the figure. They
+/// are `None` when no model has it. `cost_delta_usd` compares an adapter
+/// estimate with the observed cost of the last successful production run
+/// of the same models. It is `None` unless every model has both.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlanCostPreview {
+    /// Always `true`. Every figure in this object is an estimate made before
+    /// execution, not a measurement.
+    pub is_estimate: bool,
+    /// Where the totals came from.
+    pub source: CostEstimateSource,
+    /// Number of models the plan rebuilds (the rebuild scope).
+    pub models_to_rebuild: usize,
+    /// Estimated bytes the rebuild reads, summed over the models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes_scanned: Option<u64>,
+    /// Estimated cost of the rebuild in USD, summed over the models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    /// Observed cost in USD of the same models in the last successful
+    /// production run, priced from the state store. `None` when the state
+    /// has no such run for every model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_cost_usd: Option<f64>,
+    /// `estimated_cost_usd - previous_cost_usd`. Present only when the
+    /// estimate came from the adapter for every model and every model has a
+    /// previous cost. A heuristic estimate is never compared with an
+    /// observed cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_delta_usd: Option<f64>,
+    /// One row per rebuilt model, in plan order.
+    pub models: Vec<PlanModelCost>,
+    /// Why a figure is missing, for example an adapter estimate that failed
+    /// for one model. Empty when nothing is missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// One model's row in [`PlanCostPreview::models`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlanModelCost {
+    /// Model name.
+    pub model: String,
+    /// Where this model's estimate came from (`heuristic` or `adapter`).
+    pub source: CostEstimateSource,
+    /// Estimated rows the model produces (heuristic) or reads (adapter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_rows: Option<u64>,
+    /// Estimated bytes the model reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes_scanned: Option<u64>,
+    /// Estimated cost in USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    /// `"low"` for a heuristic estimate, whose source statistics are
+    /// placeholders. `None` for an adapter estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Observed cost in USD of this model in the last successful production
+    /// run that built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_cost_usd: Option<f64>,
 }
 
 /// The closed list of intents `rocky plan --intent` accepts.
@@ -6361,6 +6453,7 @@ impl PlanOutput {
             execution_layers: vec![],
             breaking_verdict: None,
             intent_check: None,
+            cost_preview: None,
         }
     }
 }

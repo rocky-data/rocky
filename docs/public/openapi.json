@@ -5941,6 +5941,32 @@
         ],
         "type": "object"
       },
+      "CostEstimateSource": {
+        "description": "Where a `rocky plan` cost estimate came from.",
+        "oneOf": [
+          {
+            "description": "Rocky's offline cost model over the compiled DAG. It uses fixed placeholder statistics for source tables and never contacts the warehouse. Good for comparing plans, not for budgeting.",
+            "enum": [
+              "heuristic"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The warehouse's own estimate (`EXPLAIN` or a dry run) for the generated SQL. Requested with `rocky plan --cost-estimate adapter`.",
+            "enum": [
+              "adapter"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Totals that combine both sources, because the adapter could not estimate some models.",
+            "enum": [
+              "mixed"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "CostGroup": {
         "description": "One grouped row in [`CostOutput::groups`], emitted when `rocky cost` is run with `--by <dimension>`.\n\nEach group sums the per-model figures of the executions that share the grouping key (a tenant, or a model name). The cost roll-up uses the same `compute_observed_cost_usd` figures as [`PerModelCostHistorical`], so a `--by tenant` total equals the sum of its members' `cost_usd`.",
         "properties": {
@@ -14025,6 +14051,83 @@
         ],
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
+      "PlanCostPreview": {
+        "description": "The cost preview on [`PlanOutput::cost_preview`].\n\n`estimated_*` totals are sums over the models that have the figure. They are `None` when no model has it. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.",
+        "properties": {
+          "cost_delta_usd": {
+            "description": "`estimated_cost_usd - previous_cost_usd`. Present only when the estimate came from the adapter for every model and every model has a previous cost. A heuristic estimate is never compared with an observed cost.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "estimated_bytes_scanned": {
+            "description": "Estimated bytes the rebuild reads, summed over the models.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "estimated_cost_usd": {
+            "description": "Estimated cost of the rebuild in USD, summed over the models.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "is_estimate": {
+            "description": "Always `true`. Every figure in this object is an estimate made before execution, not a measurement.",
+            "type": "boolean"
+          },
+          "models": {
+            "description": "One row per rebuilt model, in plan order.",
+            "items": {
+              "$ref": "#/components/schemas/PlanModelCost"
+            },
+            "type": "array"
+          },
+          "models_to_rebuild": {
+            "description": "Number of models the plan rebuilds (the rebuild scope).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "notes": {
+            "description": "Why a figure is missing, for example an adapter estimate that failed for one model. Empty when nothing is missing.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previous_cost_usd": {
+            "description": "Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when the state has no such run for every model.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CostEstimateSource"
+              }
+            ],
+            "description": "Where the totals came from."
+          }
+        },
+        "required": [
+          "is_estimate",
+          "models",
+          "models_to_rebuild",
+          "source"
+        ],
+        "type": "object"
+      },
       "PlanIntent": {
         "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
         "oneOf": [
@@ -14036,6 +14139,69 @@
             "type": "string"
           }
         ]
+      },
+      "PlanModelCost": {
+        "description": "One model's row in [`PlanCostPreview::models`].",
+        "properties": {
+          "confidence": {
+            "description": "`\"low\"` for a heuristic estimate, whose source statistics are placeholders. `None` for an adapter estimate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "estimated_bytes_scanned": {
+            "description": "Estimated bytes the model reads.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "estimated_cost_usd": {
+            "description": "Estimated cost in USD.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "estimated_rows": {
+            "description": "Estimated rows the model produces (heuristic) or reads (adapter).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Model name.",
+            "type": "string"
+          },
+          "previous_cost_usd": {
+            "description": "Observed cost in USD of this model in the last successful production run that built it.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CostEstimateSource"
+              }
+            ],
+            "description": "Where this model's estimate came from (`heuristic` or `adapter`)."
+          }
+        },
+        "required": [
+          "model",
+          "source"
+        ],
+        "type": "object"
       },
       "PlanOutput": {
         "properties": {
@@ -14066,6 +14232,17 @@
           },
           "command": {
             "type": "string"
+          },
+          "cost_preview": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanCostPreview"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What applying this plan would rebuild and roughly cost, computed before any model runs. Present when the plan covers transformation models. Every figure is an estimate: see [`PlanCostPreview::source`]. REPORT-ONLY: it never changes `models`, `skipped`, the budget fields, or the exit code, and it is not part of the persisted plan, so it does not enter `plan_id`."
           },
           "created_at": {
             "description": "UTC timestamp when the plan was persisted. Present when `plan_id` is present.",

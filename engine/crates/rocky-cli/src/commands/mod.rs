@@ -58,6 +58,7 @@ pub mod package;
 #[cfg(test)]
 mod pipes_guard_tests;
 pub mod plan;
+pub mod plan_cost;
 mod playground;
 mod policy;
 mod preview;
@@ -217,6 +218,7 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use defer_state::{DeferStateError, DeferStateSource};
+pub use plan_cost::CostEstimateMode;
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,

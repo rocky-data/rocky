@@ -141,6 +141,10 @@ export type BreakingSeverity = "breaking" | "warning" | "info";
  */
 export type Severity = "Error" | "Warning" | "Info";
 /**
+ * Where a `rocky plan` cost estimate came from.
+ */
+export type CostEstimateSource = "heuristic" | "adapter" | "mixed";
+/**
  * The closed list of intents `rocky plan --intent` accepts.
  *
  * Version 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.
@@ -178,6 +182,10 @@ export interface PlanOutput {
    */
   classification_actions?: ClassificationAction[];
   command: string;
+  /**
+   * What applying this plan would rebuild and roughly cost, computed before any model runs. Present when the plan covers transformation models. Every figure is an estimate: see [`PlanCostPreview::source`]. REPORT-ONLY: it never changes `models`, `skipped`, the budget fields, or the exit code, and it is not part of the persisted plan, so it does not enter `plan_id`.
+   */
+  cost_preview?: PlanCostPreview | null;
   /**
    * UTC timestamp when the plan was persisted. Present when `plan_id` is present.
    */
@@ -318,6 +326,84 @@ export interface ClassificationAction {
    * Free-form classification tag (e.g. `"pii"`, `"confidential"`).
    */
   tag: string;
+  [k: string]: unknown;
+}
+/**
+ * The cost preview on [`PlanOutput::cost_preview`].
+ *
+ * `estimated_*` totals are sums over the models that have the figure. They are `None` when no model has it. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.
+ */
+export interface PlanCostPreview {
+  /**
+   * `estimated_cost_usd - previous_cost_usd`. Present only when the estimate came from the adapter for every model and every model has a previous cost. A heuristic estimate is never compared with an observed cost.
+   */
+  cost_delta_usd?: number | null;
+  /**
+   * Estimated bytes the rebuild reads, summed over the models.
+   */
+  estimated_bytes_scanned?: number | null;
+  /**
+   * Estimated cost of the rebuild in USD, summed over the models.
+   */
+  estimated_cost_usd?: number | null;
+  /**
+   * Always `true`. Every figure in this object is an estimate made before execution, not a measurement.
+   */
+  is_estimate: boolean;
+  /**
+   * One row per rebuilt model, in plan order.
+   */
+  models: PlanModelCost[];
+  /**
+   * Number of models the plan rebuilds (the rebuild scope).
+   */
+  models_to_rebuild: number;
+  /**
+   * Why a figure is missing, for example an adapter estimate that failed for one model. Empty when nothing is missing.
+   */
+  notes?: string[];
+  /**
+   * Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when the state has no such run for every model.
+   */
+  previous_cost_usd?: number | null;
+  /**
+   * Where the totals came from.
+   */
+  source: CostEstimateSource;
+  [k: string]: unknown;
+}
+/**
+ * One model's row in [`PlanCostPreview::models`].
+ */
+export interface PlanModelCost {
+  /**
+   * `"low"` for a heuristic estimate, whose source statistics are placeholders. `None` for an adapter estimate.
+   */
+  confidence?: string | null;
+  /**
+   * Estimated bytes the model reads.
+   */
+  estimated_bytes_scanned?: number | null;
+  /**
+   * Estimated cost in USD.
+   */
+  estimated_cost_usd?: number | null;
+  /**
+   * Estimated rows the model produces (heuristic) or reads (adapter).
+   */
+  estimated_rows?: number | null;
+  /**
+   * Model name.
+   */
+  model: string;
+  /**
+   * Observed cost in USD of this model in the last successful production run that built it.
+   */
+  previous_cost_usd?: number | null;
+  /**
+   * Where this model's estimate came from (`heuristic` or `adapter`).
+   */
+  source: CostEstimateSource;
   [k: string]: unknown;
 }
 /**

@@ -1008,6 +1008,17 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, default_value = "main", global = false)]
         base: String,
+        /// How the plan's `cost_preview` is estimated.
+        ///
+        /// `heuristic` (default) uses Rocky's offline cost model over the
+        /// compiled DAG and never contacts the warehouse. `adapter` asks the
+        /// warehouse to estimate each planned model's generated SQL
+        /// (`EXPLAIN` or a dry run, as `rocky estimate` does) and falls back
+        /// to the heuristic for any model it cannot estimate. Either way the
+        /// preview is report-only and never changes the plan or the exit code.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_enum, default_value = "heuristic", global = false)]
+        cost_estimate: rocky_cli::commands::CostEstimateMode,
     },
 
     /// Execute the full pipeline in one step: discover → drift → create → copy → check.
@@ -4232,6 +4243,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             semantic,
             intent,
             base,
+            cost_estimate,
         } => {
             // #1550: a default-plan flag alongside a plan subcommand used to be
             // ACCEPTED and then silently discarded — the dispatch below reads
@@ -4270,6 +4282,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--semantic", semantic),
                     ("--intent", intent.is_some()),
                     ("--base", base != "main"),
+                    (
+                        "--cost-estimate",
+                        cost_estimate != rocky_cli::commands::CostEstimateMode::Heuristic,
+                    ),
                 ])
             {
                 anyhow::bail!(
@@ -4371,6 +4387,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         semantic,
                         &base,
                         &state_path,
+                        cost_estimate,
                         json,
                     )
                     .await
@@ -7078,6 +7095,7 @@ mod tests {
                 select: _,
                 exclude: _,
                 state_ref: _,
+                cost_estimate: _,
             } => extract(
                 filter,
                 pipeline,
