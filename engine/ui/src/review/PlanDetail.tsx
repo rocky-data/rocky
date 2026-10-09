@@ -297,7 +297,7 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
       {entries.map((entry) => (
         <div key={entry.decision_ref} className="space-y-2">
           <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-t border-zinc-100 pt-3 text-sm text-zinc-700 sm:grid-cols-5 dark:border-zinc-800 dark:text-zinc-300">
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-t border-zinc-100 pt-3 text-sm text-zinc-700 sm:grid-cols-5 dark:border-zinc-800 dark:text-zinc-300 [&_dd]:break-words [&>div]:min-w-0">
             <div>
               <dt className="text-xs text-zinc-500 dark:text-zinc-400">model</dt>
               <dd className="font-mono break-all">{entry.model}</dd>
@@ -547,7 +547,7 @@ function CommandLine({ command }: { command: string }) {
   const canCopy = typeof navigator !== "undefined" && navigator.clipboard !== undefined;
   return (
     <div className="flex items-start gap-2 rounded-md bg-zinc-50 p-2 dark:bg-zinc-950">
-      <pre className="min-w-0 flex-1 overflow-x-auto py-1 pl-1 font-mono text-xs text-zinc-800 dark:text-zinc-200">
+      <pre className="min-w-0 flex-1 py-1 pl-1 font-mono text-xs break-all whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">
         {command}
       </pre>
       {canCopy && (
@@ -745,7 +745,9 @@ export function PlanDetail({
         </dl>
       </section>
 
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+      {/* `minmax(0, 1fr)` below lg too: an unsized track grows to its widest
+          child, and the terminal command then pushed the page sideways. */}
+      <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
         <div className="min-w-0 space-y-4">
           {diff.kind === "ready" ? (
             <>
