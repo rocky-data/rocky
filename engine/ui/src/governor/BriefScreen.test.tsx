@@ -183,6 +183,44 @@ describe("BriefScreen", () => {
     expect(load).toHaveBeenCalledWith("7d");
   });
 
+  it("leads with one summary line, an inbox card per escalation and an effect bar", async () => {
+    render(<BriefScreen load={async () => BRIEF} now={NOW} />);
+    const summary = await screen.findByRole("list", { name: "Summary" });
+    expect(within(summary).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "1 decision waits on you",
+      "1 partial of 3 runs",
+      "1 freeze(s), 1 degraded rule(s)",
+    ]);
+
+    // The card opens the plan in Review, and still cites its custody chain:
+    // the link shows a cut id and keeps the whole one as its name.
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    expect(within(needs).getByRole("link", { name: "Review plan" })).toHaveAttribute(
+      "href",
+      `/ui/review/${PLAN}`,
+    );
+    expect(within(needs).getByRole("link", { name: PLAN }).textContent).toBe(`${"a".repeat(12)}…`);
+
+    const activity = screen.getByRole("region", { name: "Agent activity" });
+    expect(within(activity).getByRole("img")).toHaveAccessibleName(
+      "1 allowed, 1 needed review, 0 denied",
+    );
+  });
+
+  it("never counts a section it could not read in the summary line", async () => {
+    render(
+      <BriefScreen
+        load={async () => ({
+          ...BRIEF,
+          escalations: { ...BRIEF.escalations, availability: "unavailable", total: 0, pending: [] },
+        })}
+        now={NOW}
+      />,
+    );
+    const summary = await screen.findByRole("list", { name: "Summary" });
+    expect(summary.textContent).not.toMatch(/waits on you/);
+  });
+
   it("renders a hostile reason as text, never as markup", async () => {
     const { container } = render(<BriefScreen load={async () => BRIEF} now={NOW} />);
     expect(await screen.findByText("<img src=x onerror=alert(1)> hostile reason")).toBeInTheDocument();

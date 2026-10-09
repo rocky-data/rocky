@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { Dialog, DialogBackdrop, DialogPanel, useClose } from "@headlessui/react";
-import { Bars3Icon, XMarkIcon } from "@heroicons/react/24/outline";
+import { Bars3Icon, ChevronRightIcon, XMarkIcon } from "@heroicons/react/24/outline";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, SESSION_EXPIRED_EVENT, apiGet } from "./api";
 import {
@@ -314,15 +314,19 @@ function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: A
 
 /**
  * The eleven areas: first the five that open a screen, then the six that do
- * not, under a heading, each with its reason as plain text. A disabled entry
- * is not a link — no tab stop — and says so to assistive technology.
+ * not, folded under one "Coming later" disclosure. Six disabled rows with a
+ * sentence each filled half the rail and pushed the five real areas into a
+ * minority of it; folded, they cost one row, and each reason is one click
+ * away. A disabled entry is not a link — no tab stop — and says so to
+ * assistive technology. The disclosure is a native `<details>`: keyboard and
+ * screen-reader behaviour come from the browser, with no state here.
  */
 function AreaNav({ current }: { current: AreaId }) {
   const open = AREAS.filter((area) => area.kind === "link");
   const notYet = AREAS.filter((area) => area.kind === "disabled");
   return (
     <nav aria-label="Areas" className="flex flex-1 flex-col">
-      <ul className="flex flex-1 flex-col gap-y-7">
+      <ul className="flex flex-1 flex-col gap-y-6">
         <li>
           <ul className="-mx-2 space-y-1">
             {open.map((area) => (
@@ -332,28 +336,35 @@ function AreaNav({ current }: { current: AreaId }) {
             ))}
           </ul>
         </li>
-        <li>
-          <div className="text-xs/6 font-semibold text-zinc-500 dark:text-zinc-400">
-            {NOT_YET_HEADING}
-          </div>
-          <ul className="-mx-2 mt-2 space-y-1">
-            {notYet.map((area) => (
-              <li key={area.id}>
-                <span
-                  aria-disabled="true"
-                  className="flex gap-x-3 rounded-md p-2 text-sm/6 text-zinc-400 dark:text-zinc-500"
-                >
-                  <area.icon aria-hidden="true" className="size-6 shrink-0 text-zinc-300 dark:text-zinc-600" />
-                  <span>
-                    <span className="font-semibold">{area.label}</span>
-                    <span className="block text-xs text-zinc-500 dark:text-zinc-400">
-                      {area.kind === "disabled" ? area.reason : ""}
+        <li className="border-t border-zinc-200 pt-4 dark:border-white/10">
+          <details className="group/later -mx-2">
+            <summary className="flex cursor-pointer list-none items-center gap-x-2 rounded-md p-2 text-xs/6 font-semibold text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-white [&::-webkit-details-marker]:hidden">
+              <ChevronRightIcon
+                aria-hidden="true"
+                className="size-4 shrink-0 transition-transform group-open/later:rotate-90"
+              />
+              <span className="flex-1">{NOT_YET_HEADING}</span>
+              <span className="font-normal tabular-nums">{notYet.length}</span>
+            </summary>
+            <ul className="mt-1 space-y-1">
+              {notYet.map((area) => (
+                <li key={area.id}>
+                  <span
+                    aria-disabled="true"
+                    className="flex gap-x-3 rounded-md p-2 text-sm/6 text-zinc-500 dark:text-zinc-400"
+                  >
+                    <area.icon aria-hidden="true" className="mt-0.5 size-5 shrink-0 text-zinc-400 dark:text-zinc-500" />
+                    <span>
+                      <span className="font-semibold">{area.label}</span>
+                      <span className="block text-xs text-zinc-500 dark:text-zinc-400">
+                        {area.kind === "disabled" ? area.reason : ""}
+                      </span>
                     </span>
                   </span>
-                </span>
-              </li>
-            ))}
-          </ul>
+                </li>
+              ))}
+            </ul>
+          </details>
         </li>
       </ul>
     </nav>

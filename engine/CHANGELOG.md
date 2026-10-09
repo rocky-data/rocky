@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The browser UI is easier to scan and to act on.** Needs you opens with a summary line: how many decisions wait on you, how the runs went, and whether a freeze or a degraded rule is in force. Each pending plan is a row with a **Review plan** button, and a bar shows the agents' allowed, review and denied decisions. On a plan, the approval sits in its own panel beside the evidence, with three steps: Proposed, Approved, Applied. Applied shows as done only after an apply from that page succeeds. Otherwise it shows as not known, because the plan status records approval, not apply. The Estate project strip is one row of facts instead of five cards, and the runs and digest tables are larger and padded. The six areas with no screen fold under **Coming later** in the sidebar. The operator-mode notice is a smaller label at the top, with the same words, and still always shown. Run, Approve and Apply are solid orange; other writes keep the amber outline, so a write still never looks like a read. Status cards mark their tone with a dot instead of a colored left edge. No route, API read or message changed.
+
 ## [1.80.0] — 2026-10-09
 
 `rocky compile` now checks function names on every warehouse that has a function list, types more casts, and can refuse a contract type it cannot check. The release also adds downstream consumers and fixes Spark snapshots with hard deletes.

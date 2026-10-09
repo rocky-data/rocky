@@ -201,10 +201,13 @@ describe("App", () => {
     window.history.pushState(null, "", "/ui/estate");
     render(<App fetchMeta={readyMeta} {...slots} />);
     const nav = liveAreasNav();
-    // Five that open a screen, then the six that do not, under their heading.
-    // Queried as its own element, not as page text: three of the six reasons
-    // also begin "No page yet", so a `toContain` passes with the heading gone.
-    expect(within(nav).getByText(NOT_YET_HEADING, { selector: "div" })).toBeInTheDocument();
+    // Five that open a screen, then the six that do not, folded under one
+    // disclosure. Queried as its own element, not as page text, so the test
+    // fails if the summary goes and only a reason still names it.
+    const later = within(nav).getByText(NOT_YET_HEADING, { selector: "span" }).closest("summary");
+    expect(later).not.toBeNull();
+    // Folded by default: the five real areas own the rail.
+    expect(later?.closest("details")).not.toHaveAttribute("open");
     expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Needs you",
       "Estate",

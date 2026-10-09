@@ -12,6 +12,7 @@
  * the whole time operator mode is on (`OperatorBanner`).
  */
 
+import { EyeIcon, ShieldExclamationIcon } from "@heroicons/react/20/solid";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { MetaTokenScope } from "@rocky-types/meta";
@@ -58,26 +59,37 @@ export const OPERATOR_MODE_LABEL = "Operator mode — changes run as this server
 /**
  * Always visible while the page can change things, so a write never looks
  * like a read. Read-only says so too, more quietly.
+ *
+ * Drawn as a pill at the end of a slim bar, not as a full-width amber band:
+ * the band read as an alarm on every screen, and an alarm that never goes
+ * away stops being read. The pill keeps the same words, the same role and
+ * the same place — the sticky top, above every lane — and stays amber.
  */
 export function OperatorBanner({ access }: { access: WriteAccess }) {
   if (access.kind === "operator") {
     return (
-      <div
-        role="status"
-        aria-label="Operator mode"
-        className="border-b border-amber-300 bg-amber-100 px-4 py-1.5 text-center text-xs font-semibold text-amber-900 dark:border-amber-700 dark:bg-amber-900/60 dark:text-amber-100"
-      >
-        {OPERATOR_MODE_LABEL}
+      <div className="flex justify-end border-b border-zinc-200 bg-white/90 px-4 py-1.5 backdrop-blur-sm sm:px-6 lg:px-8 dark:border-white/10 dark:bg-zinc-950/90">
+        <div
+          role="status"
+          aria-label="Operator mode"
+          className="inline-flex items-center gap-1.5 rounded-full border border-amber-400 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/60 dark:text-amber-200"
+        >
+          <ShieldExclamationIcon aria-hidden="true" className="size-3.5 shrink-0" />
+          {OPERATOR_MODE_LABEL}
+        </div>
       </div>
     );
   }
   return (
-    <div
-      role="status"
-      aria-label="Read-only"
-      className="border-b border-zinc-200 bg-zinc-100 px-4 py-1 text-center text-xs text-zinc-600 dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-300"
-    >
-      Read-only. {access.reason}
+    <div className="flex justify-end border-b border-zinc-200 bg-white/90 px-4 py-1.5 backdrop-blur-sm sm:px-6 lg:px-8 dark:border-white/10 dark:bg-zinc-950/90">
+      <div
+        role="status"
+        aria-label="Read-only"
+        className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 px-2.5 py-0.5 text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
+      >
+        <EyeIcon aria-hidden="true" className="size-3.5 shrink-0" />
+        Read-only. {access.reason}
+      </div>
     </div>
   );
 }
@@ -204,12 +216,19 @@ export function WriteButton({
   busy = false,
   disabledReason,
   onClick,
+  primary = false,
 }: {
   label: string;
   busy?: boolean;
   /** A reason this action cannot run now, beyond read-only mode. */
   disabledReason?: string;
   onClick: () => void;
+  /**
+   * The one action the screen exists for (Run, Approve, Apply): solid
+   * orange. Every other write keeps the amber outline. Both stay apart from
+   * the neutral grey of a read, so a write never looks like a read.
+   */
+  primary?: boolean;
 }) {
   const access = useWriteAccess();
   const readOnlyReason = access.kind === "read_only" ? access.reason : undefined;
@@ -223,12 +242,16 @@ export function WriteButton({
         disabled={disabled}
         aria-busy={busy}
         title={readOnlyReason ?? disabledReason}
-        className="rounded border border-amber-400 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:border-zinc-300 disabled:bg-zinc-100 disabled:text-zinc-400 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100 dark:disabled:border-zinc-700 dark:disabled:bg-zinc-900 dark:disabled:text-zinc-500"
+        className={`inline-flex h-9 items-center rounded-md border px-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 disabled:cursor-not-allowed disabled:border-zinc-300 disabled:bg-zinc-100 disabled:text-zinc-400 dark:disabled:border-zinc-700 dark:disabled:bg-zinc-900 dark:disabled:text-zinc-500 ${
+          primary
+            ? "border-orange-500 bg-orange-500 text-zinc-950 hover:bg-orange-400"
+            : "border-amber-400 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100 dark:hover:bg-amber-900"
+        }`}
       >
         {busy ? `${label}: ${RUNNING_LABEL}` : label}
       </button>
       {ownReason !== undefined && (
-        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{ownReason}</span>
+        <span className="max-w-xs text-xs text-zinc-500 dark:text-zinc-400">{ownReason}</span>
       )}
     </span>
   );

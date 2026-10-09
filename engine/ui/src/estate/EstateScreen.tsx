@@ -7,7 +7,8 @@ import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
-import { StatusCard } from "../components";
+import { ArrowPathIcon } from "@heroicons/react/20/solid";
+import { READ_BUTTON, ScreenHeader, StatusCard } from "../components";
 import type { JobClient } from "../operator";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
@@ -130,20 +131,14 @@ export function EstateScreen({
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-medium uppercase tracking-wide text-zinc-500">Estate</h2>
-        <div className="flex items-start gap-3">
-          <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
-        <button
-          type="button"
-          onClick={refreshAll}
-          className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-        >
+    <div className="space-y-8">
+      <ScreenHeader title="Estate" detail="The project, its models, and what ran.">
+        <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
+        <button type="button" onClick={refreshAll} className={READ_BUTTON}>
+          <ArrowPathIcon aria-hidden="true" className="size-4" />
           Refresh
         </button>
-        </div>
-      </div>
+      </ScreenHeader>
 
       <Panel title="Project" producer="GET /api/v1/project">
         <Loaded resource={project}>{(value) => <ProjectStrip project={value} now={now} />}</Loaded>
@@ -152,7 +147,7 @@ export function EstateScreen({
       <Panel title="DAG" producer="GET /api/v1/dag + GET /api/v1/models">
         <Loaded resource={dag}>
           {(value) => (
-            <div className={shown ? "grid gap-3 lg:grid-cols-[1fr_360px]" : ""}>
+            <div className={shown ? "grid gap-4 lg:grid-cols-[1fr_360px]" : ""}>
               <div>
                 <DagPanel dag={value} compiled={compiled} onSelect={setSelected} />
                 <UnknownCompile models={models} />
@@ -217,7 +212,7 @@ function Panel({ title, producer, children }: { title: string; producer: string;
         unused `title` already becomes the accessible description.
       */}
       <h3
-        className="mb-2 text-base font-semibold text-zinc-900 dark:text-zinc-100"
+        className="mb-3 text-base font-semibold text-zinc-900 dark:text-zinc-100"
         title={producer}
         aria-describedby={descriptionId}
       >

@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { SectionAvailability } from "@rocky-types/brief";
+import { TABLE } from "../components";
 import { NOT_RECORDED } from "../format";
 
 /**
@@ -31,7 +32,7 @@ export function SectionCard({
       break;
     case "no_data":
       body = (
-        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
           {emptyLine}
           {note ? ` (${note})` : ""}
         </p>
@@ -39,7 +40,7 @@ export function SectionCard({
       break;
     case "unavailable":
       body = (
-        <p className="text-xs text-amber-700 dark:text-amber-400">
+        <p className="text-sm text-amber-700 dark:text-amber-400">
           {NOT_RECORDED}
           {note ? `: ${note}` : ""}
         </p>
@@ -49,13 +50,19 @@ export function SectionCard({
   return (
     <section
       aria-label={title}
-      className="rounded-md border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900"
+      className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900"
     >
-      <div className="mb-2 flex items-baseline justify-between gap-3">
-        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
-        <div className="flex items-baseline gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
+        <div className="flex items-baseline gap-2 text-xs text-zinc-500 dark:text-zinc-400">
           {availability === "available" && summary != null && <span>{summary}</span>}
-          <span className="uppercase tracking-wide">{availability.replace("_", " ")}</span>
+          {/* "available" is the normal case and goes unsaid; the other two
+              change how the body reads, so they are named. */}
+          {availability !== "available" && (
+            <span className="rounded-full border border-zinc-300 px-2 py-0.5 dark:border-zinc-700">
+              {availability.replace("_", " ")}
+            </span>
+          )}
         </div>
       </div>
       {body}
@@ -77,26 +84,26 @@ export function Rows({
     // The scroller is on the table, not the page: without it the widest cell
     // pushes the whole page body sideways on a phone.
     <div
-      className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
+      className={TABLE.scroller}
       tabIndex={0}
       role="group"
       aria-label={`${ariaLabel}, scrollable`}
     >
-    <table className="w-full min-w-max text-left text-xs" aria-label={ariaLabel}>
-      <thead className="text-zinc-500 dark:text-zinc-400">
+    <table className={TABLE.table} aria-label={ariaLabel}>
+      <thead className={TABLE.head}>
         <tr>
           {columns.map((column) => (
-            <th key={column} className="pr-3 font-medium">
-              {column}
+            <th key={column} className={TABLE.th}>
+              <span className="inline-block first-letter:uppercase">{column}</span>
             </th>
           ))}
         </tr>
       </thead>
       <tbody className="text-zinc-900 dark:text-zinc-100">
         {rows.map((row, index) => (
-          <tr key={index} className="border-t border-zinc-100 align-top dark:border-zinc-800">
+          <tr key={index} className={TABLE.row}>
             {row.map((cell, cellIndex) => (
-              <td key={cellIndex} className="pr-3 break-all">
+              <td key={cellIndex} className={`${TABLE.td} max-w-md break-all`}>
                 {cell}
               </td>
             ))}

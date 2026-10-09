@@ -79,11 +79,13 @@ To run the UI somewhere other than your own machine, use the [container image](/
 
 ## Needs you
 
-The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). It has a card for each part of the digest. The first card, which gives the area its name, is what needs you. The rest are the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler.
+The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: how many decisions wait on you, how the runs went, and whether a freeze or a degraded rule is in force. Then there is a card for each part of the digest.
+
+The first card, which gives the area its name, is what needs you. Each pending plan is its own row, with a **Review plan** button that opens it in Review. The rest are the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler. A bar over the policy decisions shows how many were allowed, needed review, or were denied.
 
 ![The brief: one pending plan under Needs you, ten agent decisions with their capability, effect and rule, two successful runs, no degraded autonomy, and a cost card](/ui-governor-brief.png)
 
-Each card says whether its data was available. A signal the ledger does not hold shows as **not recorded**, never as a zero.
+A card says so when its data was not available. A signal the ledger does not hold shows as **not recorded**, never as a zero. The summary line leaves out a part it could not read; it never counts it as zero.
 
 ## Estate
 
@@ -113,7 +115,7 @@ The plan screen shows:
   What is left is refused: a tag with no `[mask]` entry that the list does not name, and a tag answered only under `[mask.<env>]`, which this path does not read.
 
   The button appears only when the plan names exactly one model to sample.
-- **How to approve.** The command to copy.
+- **Approval.** A panel beside the evidence, or under it on a narrow screen. It shows three steps: Proposed, Approved and Applied. Then the Approve and Apply buttons, and the command to copy.
 
 In operator mode, the plan screen can approve and apply the plan. With a read-only token, the buttons are disabled and say why. You can always approve in a terminal:
 
@@ -122,6 +124,8 @@ rocky review <plan-id> --approve
 ```
 
 A plan bound to a data product shows no Apply button. Apply it in a terminal. The spec digest must come from you, not from the plan.
+
+The plan status records approval, not apply. So the Applied step shows as done only after an apply from this page succeeds. Otherwise, once the plan is approved, Applied shows as not known. The page cannot tell an applied plan from one that waits. The run itself is on Estate.
 
 Apply runs the models as they are on disk, not SQL stored in the plan. So it checks the plan's models before it runs them. If a model was added, removed or edited after the plan was made, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. A person's apply compares the models only, so a different environment or an edit to another pipeline does not refuse it. It also means a config edit made after approval is not caught. The models can still change between this check and the run's own compile. An agent's apply is checked again inside the run. A plan whose models did not compile at plan time has no fingerprint and is not checked. A plan made before this check refuses with `plan_snapshot_missing`; plan again.
 
@@ -151,7 +155,7 @@ The audit tab is the whole policy decision ledger, oldest first. Filter it to on
 
 ## Areas without a screen
 
-Six of the eleven areas open nothing today. The sidebar shows each name with the reason under it, as plain text. A reason says where the same information is now, when it is somewhere:
+Six of the eleven areas open nothing today. The sidebar folds them under **Coming later**, so the five areas that work come first. Open it to see each name with the reason under it, as plain text. A reason says where the same information is now, when it is somewhere:
 
 | Area | What the sidebar says |
 |---|---|
@@ -166,7 +170,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The banner gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 `rocky serve --ui` turns it on by itself when all of these hold:
 

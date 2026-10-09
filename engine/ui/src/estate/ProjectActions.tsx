@@ -77,6 +77,7 @@ export function ProjectActions({
         <WriteButton
           label={model === undefined ? "Run" : "Run this model"}
           busy={jobBusy(run.view)}
+          primary={model === undefined}
           onClick={() => run.start(body)}
         />
       </div>

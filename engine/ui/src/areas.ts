@@ -135,8 +135,8 @@ export const AREAS: readonly Area[] = [
   },
 ];
 
-/** The label above the areas that open nothing yet. */
-export const NOT_YET_HEADING = "No page yet";
+/** The disclosure that folds the areas that open nothing yet. */
+export const NOT_YET_HEADING = "Coming later";
 
 /**
  * Whether an area's screen carries its own tab bar. Governance does: its

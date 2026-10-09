@@ -222,7 +222,7 @@ describe("EstateScreen", () => {
       ["unreadable demands", "1"],
       ["quarantined", "2"],
     ]) {
-      const card = within(group).getByText(label).parentElement as HTMLElement;
+      const card = within(group).getByText(label).closest("[data-tone]") as HTMLElement;
       expect(within(card).getByText(value)).toBeInTheDocument();
     }
   });
