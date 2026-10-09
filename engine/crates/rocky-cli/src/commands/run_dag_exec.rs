@@ -137,6 +137,20 @@ fn default_sub_runner(
     sub_runner_with_contracts(actor, external_dependencies, None, None)
 }
 
+/// The options every `--dag` sub-run carries. The graph judged `consumers/`
+/// and logged each problem once, so a sub-run does not log them again.
+fn sub_run_defer_options(
+    external_dependencies: &std::collections::BTreeSet<String>,
+    project: Option<rocky_compiler::compile::ProjectContext>,
+) -> super::run::DeferOptions {
+    super::run::DeferOptions {
+        external_dependencies: external_dependencies.clone(),
+        project,
+        consumers_logged_by_caller: true,
+        ..super::run::DeferOptions::default()
+    }
+}
+
 /// [`default_sub_runner`] with `rocky run --dag --contracts <DIR>`: every
 /// sub-run compiles against `contracts_dir` instead of the project
 /// `contracts/` directory. A contract error on a model still keeps that node
@@ -158,11 +172,7 @@ fn sub_runner_with_contracts(
               shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
             let contracts_dir = contracts_dir.clone();
-            let defer_opts = super::run::DeferOptions {
-                external_dependencies: (*external_dependencies).clone(),
-                project: project.clone(),
-                ..super::run::DeferOptions::default()
-            };
+            let defer_opts = sub_run_defer_options(&external_dependencies, project.clone());
             Box::pin(async move {
                 super::run::run_with_explicit_contracts(
                     &config_path,
@@ -1127,6 +1137,12 @@ impl NodeDispatcher for CliDispatcher {
 
 #[cfg(test)]
 mod run_opts_threading_tests {
+    #[test]
+    fn a_dag_sub_run_does_not_log_consumer_problems_again() {
+        let options = super::sub_run_defer_options(&std::collections::BTreeSet::new(), None);
+        assert!(options.consumers_logged_by_caller);
+    }
+
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 

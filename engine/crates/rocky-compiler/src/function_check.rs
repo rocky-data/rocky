@@ -196,7 +196,20 @@ impl FunctionDialect {
     fn knows(self, lower_name: &str) -> bool {
         self.list().contains(lower_name)
             || SPECIAL_FORMS.contains(&lower_name)
-            || (self == Self::DuckDb && DUCKDB_ONLY_FORMS.contains(&lower_name))
+            || self.own_forms().contains(&lower_name)
+    }
+
+    /// Call-position forms this dialect's grammar accepts that are not in its
+    /// catalog list and that other dialects reject.
+    fn own_forms(self) -> &'static [&'static str] {
+        match self {
+            Self::DuckDb => DUCKDB_ONLY_FORMS,
+            Self::Spark | Self::Databricks => SPARK_GRAMMAR_FORMS,
+            Self::Snowflake => SNOWFLAKE_GRAMMAR_FORMS,
+            Self::Trino => &["table"],
+            Self::BigQuery => &["struct"],
+            Self::Postgres | Self::Redshift => &[],
+        }
     }
 }
 
@@ -207,17 +220,13 @@ impl FunctionDialect {
 const SPECIAL_FORMS: &[&str] = &[
     "coalesce",
     "if",
-    "iff",
     "ifnull",
     "nullif",
-    "nvl",
-    "nvl2",
     "greatest",
     "least",
     "grouping",
     "grouping_id",
     "row",
-    "struct",
     "map",
     "array",
     "list",
@@ -242,9 +251,16 @@ const SPECIAL_FORMS: &[&str] = &[
     "current_schema",
     "session_user",
     "user",
-    "identifier",
-    "table",
 ];
+
+/// Spark grammar functions that `SHOW FUNCTIONS` omits: the parser handles
+/// `TIMESTAMPADD(unit, n, ts)` and `TIMESTAMPDIFF(unit, a, b)` itself, and
+/// `IDENTIFIER('name')` and `TABLE(...)` are clauses. Shared by Spark and
+/// Databricks.
+const SPARK_GRAMMAR_FORMS: &[&str] = &["timestampadd", "timestampdiff", "identifier", "table"];
+
+/// Snowflake `IDENTIFIER('name')` and `TABLE(...)` clauses.
+const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 
 /// Special forms only DuckDB has.
 const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try"];
@@ -704,9 +720,7 @@ mod tests {
         ] {
             assert_eq!(dialect.tier(), Tier::Documented, "{dialect:?}");
         }
-        for dialect in [FunctionDialect::DuckDb] {
-            assert_eq!(dialect.tier(), Tier::Verified, "{dialect:?}");
-        }
+        assert_eq!(FunctionDialect::DuckDb.tier(), Tier::Verified);
     }
 
     #[test]
@@ -772,6 +786,62 @@ mod tests {
                 assert!(dialect.knows(name), "{dialect:?}: {name}");
             }
         }
+    }
+
+    #[test]
+    fn duckdb_refuses_forms_it_does_not_have() {
+        // Live DuckDB 1.5 rejects each of these as an unknown function.
+        let registry = FunctionRegistry::default();
+        for call in [
+            "nvl(a, 0)",
+            "nvl2(a, 1, 0)",
+            "iff(a, 1, 0)",
+            "struct(a)",
+            "identifier('t')",
+        ] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert_eq!(diags.len(), 1, "{call}: {diags:?}");
+            assert_eq!(&*diags[0].code, "E057", "{call}");
+        }
+    }
+
+    #[test]
+    fn dialects_that_have_a_form_accept_it() {
+        let registry = FunctionRegistry::default();
+        let on = |dialect: Option<OperandDialect>, call: &str| {
+            run(
+                &format!("SELECT {call} AS c FROM t"),
+                &dialect.into(),
+                &registry,
+            )
+        };
+        for (target, call) in [
+            (Some(OperandDialect::Snowflake), "nvl(a, 0)"),
+            (Some(OperandDialect::Snowflake), "iff(a, 1, 0)"),
+            (Some(OperandDialect::Databricks), "nvl2(a, 1, 0)"),
+            (Some(OperandDialect::Databricks), "iff(a, 1, 0)"),
+            (Some(OperandDialect::Redshift), "nvl(a, 0)"),
+            (Some(OperandDialect::BigQuery), "struct(a)"),
+        ] {
+            assert!(on(target, call).is_empty(), "{target:?}: {call}");
+        }
+        let spark = run("SELECT nvl(a, 0) AS c FROM t", &spark(), &registry);
+        assert!(spark.is_empty(), "{spark:?}");
+        // Postgres has neither.
+        let diags = on(Some(OperandDialect::Postgres), "nvl(a, 0)");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+    }
+
+    #[test]
+    fn spark_and_databricks_accept_grammar_level_functions() {
+        let registry = FunctionRegistry::default();
+        let sql = "SELECT timestampadd(DAY, 1, d) AS a, timestampdiff(DAY, d, e) AS b FROM t";
+        for target in [spark(), Some(OperandDialect::Databricks).into()] {
+            let diags = run(sql, &target, &registry);
+            assert!(diags.is_empty(), "{diags:?}");
+        }
+        // Not a function on DuckDB.
+        assert!(!run(sql, &duckdb(), &registry).is_empty());
     }
 
     #[test]

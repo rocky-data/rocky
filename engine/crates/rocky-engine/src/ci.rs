@@ -111,6 +111,33 @@ pub fn run_ci_with(inputs: TestRunInputs<'_>) -> anyhow::Result<CiResult> {
 mod tests {
     use super::*;
 
+    /// `rocky ci` fails on a bad consumer record (E060) but reports it as a
+    /// diagnostic: the model tests ran and passed, and no model failed.
+    #[test]
+    fn a_bad_consumer_record_fails_ci_without_failing_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("consumers")).unwrap();
+        std::fs::write(
+            dir.path().join("consumers").join("board.toml"),
+            "depends_on = [\"nowhere\"]\n",
+        )
+        .unwrap();
+        let result = run_ci(&models, None, &rocky_core::run_vars::RunVars::new()).unwrap();
+        assert!(!result.compile_ok);
+        assert_eq!(result.exit_code(), 1);
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.tests_passed, 1);
+        assert_eq!(result.models_compiled, 1);
+    }
+
     #[test]
     fn test_exit_codes() {
         let ok = CiResult {

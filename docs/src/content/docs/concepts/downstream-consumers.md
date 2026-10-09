@@ -66,10 +66,14 @@ error[E060]: consumer `weekly_board` depends on `fct_order`, which is not a mode
 `depends_on` takes model names only. A source table or a seed is not a model.
 This check is what catches a dashboard that still reads a model someone removed.
 
-`E060` is an ordinary compile error. `rocky compile` and `rocky ci` fail on it,
-and so do strict compiles.
+`E060` is an ordinary compile error. `rocky compile`, `rocky ci` and
+`rocky test` fail on it, and so do strict compiles. `rocky ci` and `rocky test`
+report it as a diagnostic, not as a failed model: it never appears in
+`model_results`, and the model tests still run before the command exits with an
+error.
 
-`rocky run`, `rocky run --select` and `rocky run --dag` do not stop for it. A
+`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan` and
+`rocky propose` do not stop for it. A
 consumer is metadata about the readers of your models, so a wrong record cannot
 make a model unsafe to write. The run writes the models, does not count the
 consumer as a failed table, and lists each problem in the

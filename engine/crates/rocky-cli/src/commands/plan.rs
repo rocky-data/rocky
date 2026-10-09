@@ -1728,6 +1728,30 @@ fn plan_preview_output_for_pipeline(
 /// Captures the full `rocky run` flag surface from `run_options` so apply-time
 /// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
 /// as booleans; the actual state-store lookup happens at apply time.
+/// The compile errors that stop a run plan from being persisted.
+///
+/// A consumer record problem (`E060`) is about a dashboard's `depends_on`, not
+/// a model, so it never blocks a plan that writes models. `rocky compile` and
+/// `rocky ci` still refuse on it.
+fn run_plan_refusals(
+    diagnostics: &[rocky_compiler::diagnostic::Diagnostic],
+    model: Option<&str>,
+    needed: &BTreeSet<String>,
+) -> Vec<SkippedModel> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.is_error()
+                && !rocky_compiler::consumers::is_consumer_diagnostic(diagnostic)
+                && (model.is_none() || needed.contains(&diagnostic.model))
+        })
+        .map(|diagnostic| SkippedModel {
+            model: diagnostic.model.clone(),
+            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_and_persist_run_plan(
     config_path: &Path,
@@ -1784,18 +1808,7 @@ fn build_and_persist_run_plan(
             }
         }
     }
-    let refused: Vec<SkippedModel> = result
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.is_error()
-                && (run_options.model.is_none() || needed.contains(&diagnostic.model))
-        })
-        .map(|diagnostic| SkippedModel {
-            model: diagnostic.model.clone(),
-            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
-        })
-        .collect();
+    let refused = run_plan_refusals(&result.diagnostics, run_options.model.as_deref(), &needed);
     if !refused.is_empty() {
         return Ok(Some(RunPlanBuild::Refused(refused)));
     }
@@ -3714,6 +3727,21 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_consumer_diagnostic_does_not_refuse_a_run_plan() {
+        use rocky_compiler::diagnostic::{Diagnostic, E060};
+        let diagnostics = vec![
+            Diagnostic::error(E060, "consumer:board", "depends_on names no model"),
+            Diagnostic::error("E001", "orders", "broken"),
+        ];
+        let needed = std::collections::BTreeSet::new();
+        let refused = super::run_plan_refusals(&diagnostics, None, &needed);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].model, "orders");
+        let only_consumer = &diagnostics[..1];
+        assert!(super::run_plan_refusals(only_consumer, None, &needed).is_empty());
+    }
 
     #[tokio::test]
     async fn plan_branch_refuses_hyphen_before_config_io() {

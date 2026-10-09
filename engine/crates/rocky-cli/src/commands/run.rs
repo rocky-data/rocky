@@ -1128,6 +1128,10 @@ pub struct DeferOptions {
     /// consumers against that part alone. `None` outside a project run (the
     /// compile then reads the sibling of the models directory).
     pub project: Option<rocky_compiler::compile::ProjectContext>,
+    /// The caller (`rocky run --dag`) judged `consumers/` once for the whole
+    /// graph and already logged each problem, so a sub-run does not log them
+    /// again.
+    pub consumers_logged_by_caller: bool,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -1198,6 +1202,7 @@ fn suppress_deferred_selected_e039(
 pub(crate) fn take_consumer_diagnostics(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     output: &mut RunOutput,
+    log: bool,
 ) {
     let (consumer, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut compile_result.diagnostics)
         .into_iter()
@@ -1208,12 +1213,14 @@ pub(crate) fn take_consumer_diagnostics(
         .iter()
         .any(rocky_compiler::diagnostic::Diagnostic::is_error);
     for diagnostic in consumer {
-        warn!(
-            consumer = diagnostic.model.as_str(),
-            code = &*diagnostic.code,
-            message = &*diagnostic.message,
-            "consumer record problem — reported, the run is not stopped"
-        );
+        if log {
+            warn!(
+                consumer = diagnostic.model.as_str(),
+                code = &*diagnostic.code,
+                message = &*diagnostic.message,
+                "consumer record problem — reported, the run is not stopped"
+            );
+        }
         output.consumer_diagnostics.push(diagnostic);
     }
 }
@@ -12645,7 +12652,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // model: its problems (`E060`) are reported on the run output and never
     // stop a model from being written or count as a failed table. Take them
     // out before anything below sorts diagnostics into failures.
-    take_consumer_diagnostics(&mut compile_result, output);
+    take_consumer_diagnostics(
+        &mut compile_result,
+        output,
+        !defer_opts.consumers_logged_by_caller,
+    );
 
     // `--model <function>` selects a user-defined function (`functions/`):
     // create it and the functions it calls, and build no model.
@@ -34030,6 +34041,52 @@ backend = "local"
         )
         .unwrap();
         models
+    }
+
+    /// `log = false` (a `--dag` sub-run) keeps the log quiet; the diagnostic
+    /// still lands on the output.
+    #[test]
+    fn consumer_problems_are_logged_once() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let models = write_consumer_project(dir.path(), "\"nowhere\"");
+        let compile = || {
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models.clone(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        for (log, expected) in [(true, 1), (false, 0)] {
+            let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let mut output = RunOutput::new(String::new(), 0, 0);
+            tracing::subscriber::with_default(subscriber, || {
+                take_consumer_diagnostics(&mut compile(), &mut output, log);
+            });
+            let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.matches("consumer record problem").count(),
+                expected,
+                "{text}"
+            );
+            assert_eq!(output.consumer_diagnostics.len(), 1);
+        }
     }
 
     /// A consumer record with a bad `depends_on` (E060) must not stop a model

@@ -275,6 +275,15 @@ pub fn run_test_with_selection(
     if !result.failures.is_empty() || unit_failed > 0 {
         anyhow::bail!("test failures detected");
     }
+    // A consumer record error (E060) is reported as a diagnostic, after the
+    // model tests have run. It still fails this check command.
+    if result
+        .diagnostics
+        .iter()
+        .any(rocky_compiler::consumers::is_consumer_diagnostic)
+    {
+        anyhow::bail!("consumer record errors detected (E060)");
+    }
 
     Ok(())
 }

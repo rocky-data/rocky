@@ -289,7 +289,9 @@ pub(crate) fn build_ai_run_plan(
     let errors: Vec<String> = result
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.is_error())
+        .filter(|diagnostic| {
+            diagnostic.is_error() && !rocky_compiler::consumers::is_consumer_diagnostic(diagnostic)
+        })
         .map(|diagnostic| {
             format!(
                 "{} [{}] {}",
@@ -1165,6 +1167,37 @@ pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_consumer_record_does_not_refuse_an_ai_run_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models_dir = root.join("models");
+        write_file(&models_dir.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models_dir.join("orders.toml"),
+            b"name = \"orders\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"orders\"\n",
+        );
+        write_file(
+            &root.join("consumers").join("board.toml"),
+            b"depends_on = [\"nowhere\"]\n",
+        );
+        let result = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        })
+        .expect("compile");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::consumers::is_consumer_diagnostic),
+            "{:?}",
+            result.diagnostics
+        );
+        let plan = build_ai_run_plan(None, &result, None, None, None);
+        assert!(plan.is_ok(), "{plan:?}");
+    }
 
     #[tokio::test]
     async fn propose_refuses_compile_diagnostics_before_plan_write() {

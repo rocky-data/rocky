@@ -2691,7 +2691,8 @@ fn edge_input_is_known(
 
 /// Whether the nullable bit of `(model, column)` rests on known types: every
 /// lineage edge on the way back to its sources reads a column whose type is
-/// known. A column with no edges (a literal, a constant expression) is proven.
+/// known. A column with no edges (a literal, a cast of a literal) has nothing
+/// to prove its nullable bit, so it is not proven.
 ///
 /// A column typed by a cast over an unknown input has a type but only a
 /// guessed nullable bit (nullable, the safe answer for a contract or a
@@ -2705,10 +2706,11 @@ fn nullability_is_proven(
     model: &str,
     column: &str,
 ) -> bool {
-    graph
-        .trace_column(model, column)
-        .into_iter()
-        .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
+    let edges = graph.trace_column(model, column);
+    !edges.is_empty()
+        && edges
+            .into_iter()
+            .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
 }
 
 /// Refine explicit casts by parsing their target types from the model SQL.
@@ -3575,7 +3577,7 @@ impl SelectInference {
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
-        if is_cast_expr(expr) {
+        if is_cast_expr(expr) && cast_target_is_warehouse_independent(expr) {
             self.cast_outputs.insert(self.columns.len());
         }
 
@@ -3584,6 +3586,47 @@ impl SelectInference {
             data_type,
             nullable,
         });
+    }
+}
+
+/// Whether the cast `expr` names a target type that means the same thing on
+/// every warehouse Rocky targets. Only then may a cast over an input Rocky
+/// cannot type take the target as its output type.
+///
+/// `sql_type_to_rocky` reads `FLOAT` / `REAL` as 32-bit and `INT` / `INTEGER`
+/// as 32-bit, but Snowflake's `FLOAT` is 64-bit and its `INTEGER` is
+/// `NUMBER(38,0)`, PostgreSQL's `FLOAT` is `DOUBLE PRECISION`, and Snowflake's
+/// bare `TIMESTAMP` is `TIMESTAMP_NTZ`. Those names, and any name not listed
+/// here, stay `Unknown`, like a bare `DECIMAL`.
+fn cast_target_is_warehouse_independent(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => cast_target_is_warehouse_independent(inner),
+        Expr::Cast { data_type, .. } => matches!(
+            data_type,
+            ast::DataType::Boolean
+                | ast::DataType::BigInt(_)
+                | ast::DataType::Int64
+                | ast::DataType::Double(_)
+                | ast::DataType::DoublePrecision
+                | ast::DataType::Float64
+                | ast::DataType::Decimal(
+                    ast::ExactNumberInfo::Precision(_)
+                        | ast::ExactNumberInfo::PrecisionAndScale(_, _)
+                )
+                | ast::DataType::Numeric(
+                    ast::ExactNumberInfo::Precision(_)
+                        | ast::ExactNumberInfo::PrecisionAndScale(_, _)
+                )
+                | ast::DataType::Varchar(_)
+                | ast::DataType::Char(_)
+                | ast::DataType::Text
+                | ast::DataType::String(_)
+                | ast::DataType::Binary(_)
+                | ast::DataType::Varbinary(_)
+                | ast::DataType::Blob(_)
+                | ast::DataType::Date
+        ),
+        _ => false,
     }
 }
 
@@ -6372,6 +6415,33 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_to_a_warehouse_dependent_type_stays_unknown_over_unknown_input() {
+        // FLOAT / REAL / INT / INTEGER / SMALLINT / TIMESTAMP mean different
+        // widths on Snowflake, PostgreSQL and Databricks. Without a known
+        // input the cast must not pick one.
+        for projection in [
+            "CAST(id AS FLOAT) AS id",
+            "CAST(id AS REAL) AS id",
+            "CAST(id AS INTEGER) AS id",
+            "id::INT AS id",
+            "CAST(id AS SMALLINT) AS id",
+            "CAST(id AS TIMESTAMP) AS id",
+            "TRY_CAST(id AS FLOAT) AS id",
+        ] {
+            let col = first_column_over(projection, None);
+            assert_eq!(col.data_type, RockyType::Unknown, "{projection}");
+        }
+        for (projection, expected) in [
+            ("CAST(id AS DOUBLE) AS id", RockyType::Float64),
+            ("CAST(id AS BIGINT) AS id", RockyType::Int64),
+            ("CAST(id AS DATE) AS id", RockyType::Date),
+        ] {
+            let col = first_column_over(projection, None);
+            assert_eq!(col.data_type, expected, "{projection}");
+        }
+    }
+
+    #[test]
     fn test_try_cast_over_unknown_input_is_typed_and_nullable() {
         let col = first_column_over("TRY_CAST(id AS BIGINT) AS id", None);
         assert_eq!(col.data_type, RockyType::Int64);
@@ -8941,6 +9011,20 @@ mod tests {
         let col = column(&result, "m", "order_date");
         assert_eq!(col.data_type, RockyType::Date);
         assert!(col.nullable);
+        assert!(!has_code(&result, "E022"), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_cast_of_a_literal_time_column_does_not_raise_e022() {
+        // The cast has no source column, so lineage has no edge to prove its
+        // nullable bit (a cast over an unknown input is nullable by default).
+        let sql = "SELECT CAST('2024-01-01' AS DATE) AS order_date FROM raw.orders \
+                   WHERE order_date >= @start_date AND order_date < @end_date";
+        let result = time_interval_compile(sql, HashMap::new());
+        assert_eq!(
+            column(&result, "m", "order_date").data_type,
+            RockyType::Date
+        );
         assert!(!has_code(&result, "E022"), "{:?}", result.diagnostics);
     }
 
