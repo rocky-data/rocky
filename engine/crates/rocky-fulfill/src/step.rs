@@ -678,8 +678,8 @@ impl Runner {
             None,
         ) {
             Ok(output) => compile_gate(
-                output.model_error_lines(),
-                output.consumer_problem_lines(),
+                &output.model_error_lines(),
+                &output.consumer_problem_lines(),
                 &mut detail,
             ),
             Err(err) => {
@@ -1950,8 +1950,8 @@ struct ApprovedSpec {
 /// the product's model, so it is reported in the detail but never turns the
 /// gate red; otherwise a bad dashboard file would stall the loop.
 fn compile_gate(
-    model_errors: Vec<String>,
-    consumer_problems: Vec<String>,
+    model_errors: &[String],
+    consumer_problems: &[String],
     detail: &mut Vec<String>,
 ) -> bool {
     if !consumer_problems.is_empty() {
@@ -2387,8 +2387,8 @@ mod compile_gate_tests {
     fn a_consumer_problem_is_reported_and_does_not_block() {
         let mut detail = Vec::new();
         let green = compile_gate(
-            vec![],
-            vec!["E060: consumer `board` depends on `nowhere`".to_string()],
+            &[],
+            &["E060: consumer `board` depends on `nowhere`".to_string()],
             &mut detail,
         );
         assert!(green, "{detail:?}");
@@ -2400,8 +2400,8 @@ mod compile_gate_tests {
     fn a_model_error_blocks_even_beside_a_consumer_problem() {
         let mut detail = Vec::new();
         let green = compile_gate(
-            vec!["E001: bad".to_string()],
-            vec!["E060: board".to_string()],
+            &["E001: bad".to_string()],
+            &["E060: board".to_string()],
             &mut detail,
         );
         assert!(!green);
