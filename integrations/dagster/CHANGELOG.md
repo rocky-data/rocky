@@ -11,7 +11,7 @@ Pairs with engine 1.80.0. Works with `rocky-sdk` 0.18.0 or later.
 
 ### Fixed
 
-- **Strict contracts fail the contract check.** With `--strict-contracts` or `[contracts] strict = true`, engine 1.80.0 reports a contract type it cannot check as the error `E059`. The contract checks map it to `contract_column_constraints`. Without the mapping, the check passed on a run Rocky refused.
+- **Strict contracts fail the contract check.** With `--strict-contracts` or `[contracts] strict = true`, engine 1.80.0 reports a contract type it cannot check as the error `E059`. The contract checks map it to `contract_column_constraints`. Without the mapping, the check passed although the compile reported the error.
 
 ## [1.69.0] — 2026-10-07
 

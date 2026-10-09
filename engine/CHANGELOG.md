@@ -13,9 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Read these first. Each one can change what an existing project does.
 
-- **New `W057` warnings off DuckDB.** A PostgreSQL, Snowflake, Databricks, Spark, BigQuery, Trino or Redshift model that calls a function not on that warehouse's list now gets `W057`. It is a warning, so a compile still passes, unless you pass `--deny-warnings W057`. A UDF or extension function gets it too; call it schema-qualified, or declare it in `functions/`.
+- **New `W057` warnings off DuckDB.** A PostgreSQL, Snowflake, Databricks, Spark, BigQuery, Trino or Redshift model that calls a function not on that warehouse's list now gets `W057`. It is a warning, so a compile still passes, unless you pass `--deny-warnings W057`. A UDF or extension function gets it too; call it schema-qualified, or declare it in `functions/`. A project with `[portability] target_dialect` was not checked at all before; it is now checked against that warehouse, so it can get `W057`, or `E057` on DuckDB.
 - **`E011` where there was `I003`.** A cast such as `CAST(x AS DECIMAL(12, 2))` now gives the column its target type even when `x` has no known type. A contract that declares a different type for that column now fails with `E011`. Before, the check was skipped with the `I003` note. Newly typed columns can also bring new `E042`, `E043` or `W043` diagnostics.
-- **A `consumers/` directory is now read.** If the project root already has a `consumers/` directory for something else, `rocky compile` and `rocky ci` refuse each `.toml` file in it that is not a consumer record, with `E060`. Other files are ignored. `rocky run` and `rocky plan` do not stop for it.
+- **A `consumers/` directory is now read.** If the project root already has a `consumers/` directory for something else, `rocky compile`, `rocky ci`, and a `rocky test` of the whole project refuse each `.toml` file anywhere under it, subdirectories included, that is not a consumer record, with `E060`. Other files are ignored. `rocky run` and `rocky plan` do not stop for it.
 
 ### Added
 
