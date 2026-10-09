@@ -45,13 +45,14 @@ export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1
 # A baseline `rocky run` in <dir>. Both the exit code and the JSON must say
 # success: status `Success` and no failed table. A partial failure exits 2
 # and a total one exits 1; the JSON check does not rely on that mapping.
-# The output stays in <dir> for the failure message.
+# The output goes beside <dir>, not into it, so the workspace the UI shows
+# stays as the POC left it.
 baseline_run() { # <dir>
-  local status=0
-  (cd "$1" && rocky --output json run >baseline-run.json 2>baseline-run.err) || status=$?
+  local status=0 out="$1.baseline-run"
+  (cd "$1" && rocky --output json run >"$out.json" 2>"$out.err") || status=$?
   if [ "$status" -ne 0 ] ||
-    ! jq -e '.status == "Success" and .tables_failed == 0' "$1/baseline-run.json" >/dev/null 2>&1; then
-    echo "FAIL: the baseline run in $1 failed (exit $status); see $1/baseline-run.json and $1/baseline-run.err" >&2
+    ! jq -e '.status == "Success" and .tables_failed == 0' "$out.json" >/dev/null 2>&1; then
+    echo "FAIL: the baseline run in $1 failed (exit $status); see $out.json and $out.err" >&2
     exit 1
   fi
 }
