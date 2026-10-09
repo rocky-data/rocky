@@ -2428,12 +2428,12 @@ pub(crate) fn settings_output(
     SettingsOutput {
         bind_host: snapshot.bind_host.clone(),
         // What the guard ENFORCES. `--allowed-host` is only wired into a guard
-        // under `--ui`, so with no UI there is no list -- reporting the flags
-        // anyway would claim a check that is not running.
+        // on a loopback or `--ui` bind, so with no guard there is no list --
+        // reporting the flags anyway would claim a check that is not running.
         allowed_hosts: state
-            .ui
+            .host_guard
             .as_ref()
-            .map(|ui| ui.allowed_hosts.clone())
+            .map(|guard| guard.allowed_hosts.clone())
             .unwrap_or_default(),
         // The ENFORCED allowlist, not the typed one: `build_cors_layer` drops
         // an origin that is not a valid header value, so the raw list can name
@@ -6340,9 +6340,11 @@ mod tests {
             None,
             None,
             Some(UiConfig {
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            Some(rocky_server::ui::HostGuard {
                 bind_host: "127.0.0.1".to_string(),
                 allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
-                assets: Arc::new(InMemoryAssets(files)),
             }),
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
@@ -6785,7 +6787,8 @@ mod tests {
     /// The host guard: a foreign `Host` is 421 and a foreign or opaque
     /// `Origin` is 403, on UI files and API alike, before routing; the
     /// server's own names, an allowed host and an allowed origin pass; a
-    /// request with no `Origin` passes; without `--ui` the guard is off.
+    /// request with no `Origin` passes; a state with no guard (what a
+    /// non-loopback bind without `--ui` gets) checks no `Host`.
     #[tokio::test]
     async fn ui_mode_refuses_foreign_hosts_and_origins_before_routing() {
         let base = spawn_router(ui_state(&["ui.internal"], &["https://app.example"])).await;
@@ -6881,7 +6884,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "without --ui the guard is off");
+        assert_eq!(resp.status(), 200, "with no host guard, no Host is checked");
     }
 
     /// Raw HTTP requests exercise the parser and the outer Host/Origin guard
@@ -7229,6 +7232,7 @@ mod tests {
             None,
             Vec::new(),
             Some(state_path),
+            None,
             None,
             None,
             rocky_server::state::SettingsSnapshot::default(),
@@ -8081,6 +8085,7 @@ mod tests {
                 rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(10.0),
             }),
             None,
+            None,
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
                 scheduler: true,
@@ -8344,6 +8349,7 @@ mod tests {
                     Some(fifo.clone()),
                     None,
                     Vec::new(),
+                    None,
                     None,
                     None,
                     None,
@@ -8685,8 +8691,9 @@ mod tests {
         }
     }
 
-    /// `--allowed-host` only becomes a guard under `--ui`. Reporting the flag
-    /// list without the UI would name a check that is not running.
+    /// `--allowed-host` only becomes a guard on a loopback or `--ui` bind.
+    /// Reporting the flag list without a guard would name a check that is
+    /// not running.
     #[tokio::test]
     async fn allowed_hosts_report_the_guard_not_the_flags() {
         let (_dir, state) = project_with_three_secrets();
@@ -8696,9 +8703,10 @@ mod tests {
         );
 
         assert!(!output.ui, "this fixture has no UI");
+        assert!(state.host_guard.is_none(), "this fixture has no host guard");
         assert!(
             output.allowed_hosts.is_empty(),
-            "with no UI there is no host guard, so there is no list to report"
+            "with no host guard there is no list to report"
         );
         // The CORS allowlist is a different mechanism and does apply.
         assert_eq!(output.allowed_origins, ["https://example.test"]);
@@ -10845,6 +10853,7 @@ adapter = "db"
             None,
             Some(ingress),
             None,
+            None,
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
                 scheduler: true,
@@ -11159,9 +11168,11 @@ adapter = "db"
             None,
             ingress,
             Some(UiConfig {
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            Some(rocky_server::ui::HostGuard {
                 bind_host: "127.0.0.1".to_string(),
                 allowed_hosts: Vec::new(),
-                assets: Arc::new(InMemoryAssets(files)),
             }),
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),

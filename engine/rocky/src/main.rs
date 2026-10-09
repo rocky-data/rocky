@@ -1926,7 +1926,8 @@ enum Command {
         /// Bearer token. When set, every request must carry it except the
         /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
         /// route); when unset, a loopback server asks no request for a
-        /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
+        /// token, but still refuses a request whose `Host` does not name it
+        /// (see `--allowed-host`). Falls back to the `ROCKY_SERVE_TOKEN` env var when
         /// omitted. Required when `--host` is non-loopback, including with
         /// `--ui`. With `--ui` on loopback and no token, a per-process token
         /// is generated: full scope (operator mode) unless `--read-only`,
@@ -1967,10 +1968,13 @@ enum Command {
         /// token included.
         #[arg(long)]
         ui: bool,
-        /// With `--ui`: an extra `Host` header value to accept, for a reverse
-        /// proxy in front of the UI. Repeat for each. Loopback names and the
-        /// bind host are always accepted; any other `Host` is refused `421`.
-        /// Marks the server as shared, so `--ui` keeps a read-only token.
+        /// An extra `Host` header value to accept, for a reverse proxy in
+        /// front of the server. Repeat for each. The `Host` check runs on
+        /// every loopback bind and on every `--ui` bind: loopback names and
+        /// the bind host are always accepted; any other `Host` is refused
+        /// `421`. A non-loopback bind without `--ui` runs no `Host` check.
+        /// With `--ui`, marks the server as shared, so the UI keeps a
+        /// read-only token.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_hosts: Vec<String>,
         /// With `--ui`: open the printed address in the default browser once

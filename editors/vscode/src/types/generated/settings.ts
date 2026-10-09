@@ -55,9 +55,9 @@ export type WebhookSecretStatus = "present" | "absent" | "set_but_unusable";
  */
 export interface SettingsOutput {
   /**
-   * Extra `Host` header values the UI guard accepts.
+   * Extra `Host` header values the `Host`/`Origin` guard accepts.
    *
-   * This is what is **enforced**, not what was typed: `--allowed-host` is only wired into a guard when `--ui` is on, so this is `[]` whenever `ui` is `false`. Reporting the raw flag list would claim a guard that is not running.
+   * This is what is **enforced**, not what was typed: the guard runs on a loopback bind and on a `--ui` bind, so this is `[]` on a non-loopback bind without `--ui`, whatever `--allowed-host` said. Reporting the raw flag list would claim a guard that is not running.
    */
   allowed_hosts: string[];
   /**

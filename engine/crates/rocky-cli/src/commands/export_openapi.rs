@@ -1332,7 +1332,7 @@ fn route_table() -> Vec<Route> {
             tag: "meta",
             summary: "Server posture",
             description: "How this server is bound and what it will accept: bind host, the \
-                 CORS allowlist, the `Host` values the UI guard accepts, whether the \
+                 CORS allowlist, the `Host` values the Host guard accepts, whether the \
                  scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a \
                  webhook, and the token's scope. An allowlist, not a config dump — no \
                  secret appears, and nothing is reached through serde of `RockyConfig`. \
