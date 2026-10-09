@@ -5,16 +5,12 @@
   "execution_layers": 1,
   "diagnostics": [
     {
-      "severity": "Info",
-      "code": "I002",
-      "message": "3 column(s) have unknown types \u2014 provide source schemas for full type checking",
-      "span": {
-        "file": "models/fct_daily_orders.sql",
-        "line": 1,
-        "col": 1
-      },
+      "severity": "Warning",
+      "code": "W005",
+      "message": "model 'fct_daily_orders' has temporal column(s) (order_date) but no `freshness` block declared",
+      "span": null,
       "model": "fct_daily_orders",
-      "suggestion": null
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"order_date\"`"
     }
   ],
   "has_errors": false,
