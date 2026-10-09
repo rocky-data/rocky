@@ -99,7 +99,7 @@ The Review screen lists the plans that the policy plane sent to a human, by a ru
 
 Open a plan to see why it waits:
 
-![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, and the rocky review --approve command to copy](/ui-review.png)
+![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, an Approve button, and the rocky review --approve command to copy](/ui-review.png)
 
 The plan screen shows:
 
