@@ -5476,6 +5476,13 @@ pub struct DocsOutput {
     pub models_count: usize,
     pub pipelines_count: usize,
     pub duration_ms: u64,
+    /// What was written: `site` (a directory), `html` (one file) or
+    /// `parquet` (a directory of tables).
+    pub format: String,
+    /// External tables the models read.
+    pub sources_count: usize,
+    /// Files written, relative to `output_path` (for `html`, the file name).
+    pub files: Vec<String>,
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

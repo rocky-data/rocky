@@ -7239,6 +7239,17 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "files": {
+            "description": "Files written, relative to `output_path` (for `html`, the file name).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "description": "What was written: `site` (a directory), `html` (one file) or `parquet` (a directory of tables).",
+            "type": "string"
+          },
           "models_count": {
             "format": "uint",
             "minimum": 0.0,
@@ -7252,6 +7263,12 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "sources_count": {
+            "description": "External tables the models read.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "version": {
             "type": "string"
           }
@@ -7259,9 +7276,12 @@
         "required": [
           "command",
           "duration_ms",
+          "files",
+          "format",
           "models_count",
           "output_path",
           "pipelines_count",
+          "sources_count",
           "version"
         ],
         "type": "object"

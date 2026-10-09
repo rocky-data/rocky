@@ -1379,14 +1379,29 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Generate project documentation (HTML catalog)
+    /// Generate project documentation: a static site, or Parquet tables
+    ///
+    /// The default writes a navigable site (model and source pages, search,
+    /// an interactive lineage graph) into a directory. It needs no server and
+    /// makes no network requests. `--output-path` ending in `.html` writes a
+    /// single-page catalog instead. `--format parquet` writes the compiled
+    /// project graph as Parquet tables (models, columns, edges,
+    /// column_lineage, tests, contracts, sources) that DuckDB can query.
     Docs {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
-        /// Output file path (default: docs/catalog.html)
-        #[arg(long = "output-path", default_value = "docs/catalog.html")]
+        /// Output directory for the site and for Parquet tables, or a file
+        /// ending in `.html` for a single-page catalog (default: docs/site)
+        #[arg(long = "output-path", default_value = "docs/site")]
         output_path: PathBuf,
+        /// Output shape: `site` (default) or `parquet`
+        #[arg(long, value_enum, default_value = "site")]
+        format: rocky_cli::commands::DocsFormat,
+        /// Directory of `<model>.contract.toml` files to show as contracts,
+        /// in addition to contracts that sit next to a model
+        #[arg(long)]
+        contracts: Option<PathBuf>,
         /// Per-run variable substituted into model SQL (repeatable), as in
         /// `rocky compile --var`. Column metadata comes from an offline
         /// compile; a required `@var(name)` left unset is a compile error,
@@ -4840,6 +4855,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Docs {
             models,
             output_path,
+            format,
+            contracts,
             var,
             selection,
         } => {
@@ -4858,6 +4875,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     selection.run_vars = run_vars.clone();
                     selection
                 }),
+                format,
+                contracts.as_deref(),
             )
         }
         Command::State { action } => match action {
