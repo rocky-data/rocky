@@ -1390,6 +1390,24 @@ mod tests {
         );
     }
 
+    /// On a dependency cycle every unit test fails, naming E058, instead of
+    /// the whole run failing with the bare cycle error.
+    #[test]
+    fn a_dependency_cycle_fails_every_unit_test() {
+        let (_dir, models) = scaffold_unit_test_project(true);
+        std::fs::write(models.join("orders.sql"), "SELECT id, amount FROM flagged").unwrap();
+        let run = run_unit_tests(&models, None).unwrap();
+        assert_eq!(run.results.len(), 1, "{:?}", run.results);
+        let result = &run.results[0];
+        assert_eq!(result.model, "flagged");
+        assert!(!result.passed);
+        assert!(
+            result.error.as_deref().is_some_and(|e| e.contains("E058")),
+            "{:?}",
+            result.error
+        );
+    }
+
     /// An error the caller's gates add fails the run before any model
     /// executes; a gate that adds nothing leaves the run as it was.
     #[test]
