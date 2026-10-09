@@ -4672,6 +4672,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-spark"
+version = "1.78.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "prost",
+ "rocky-core",
+ "rocky-databricks",
+ "rocky-ir",
+ "rocky-sql",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rocky-sql"
 version = "1.78.0"
 dependencies = [

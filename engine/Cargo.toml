@@ -12,6 +12,7 @@ members = [
     "crates/rocky-postgres",
     "crates/rocky-clickhouse",
     "crates/rocky-sqlserver",
+    "crates/rocky-spark",
     "crates/rocky-ai",
     "crates/rocky-server",
     "crates/rocky-engine",
@@ -292,6 +293,10 @@ tracing-opentelemetry = "0.34"
 # See the `rustls` note above.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "transport", "tls-aws-lc", "tls-webpki-roots"] }
 prost = "0.14"
+# The prost codec tonic 0.14 split out of its core crate. `rocky-spark`
+# hand-declares the Spark Connect messages it sends with `prost` derives and
+# calls the RPC through this codec, so no `protoc` or build script is needed.
+tonic-prost = "0.14"
 # Auto-generated tonic client for the BigQuery Storage Read API
 # (`google.cloud.bigquery.storage.v1`). Tracks the workspace tonic +
 # prost majors exactly.
