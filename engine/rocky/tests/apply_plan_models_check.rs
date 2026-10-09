@@ -228,3 +228,48 @@ fn a_mask_change_for_a_used_tag_refuses_a_person() {
     edit_config(root, "pii = \"hash\"", "pii = \"hash\"\nunused = \"none\"");
     assert_applied(&apply(root, &plan_id, None, &other_env));
 }
+
+/// (g) A `--all --env prod` plan binds the mask its models use as the
+/// `[mask.prod]` override resolves it, including a `${VAR}` in it, which is
+/// read from the environment at plan and at apply. A person's apply refuses
+/// when the override's strategy for a used tag changes, or when the `${VAR}`
+/// resolves to another strategy. It applies when only an unused tag
+/// changes, or when another `${VAR}` (the adapter path) has a different
+/// value.
+#[test]
+fn a_mask_env_override_binds_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    replication_project(root, "${ROCKY_TEST_DB}", true);
+    edit_config(
+        root,
+        "pii = \"hash\"\n",
+        "pii = \"none\"\n\n[mask.prod]\npii = \"${ROCKY_TEST_MASK}\"\n",
+    );
+    let plan_env = [
+        ("ROCKY_TEST_DB", "fixture.duckdb"),
+        ("ROCKY_TEST_MASK", "hash"),
+    ];
+    let plan_id = plan(root, &["--all", "--env", "prod"], &plan_env);
+    let other_db = [
+        ("ROCKY_TEST_DB", "./fixture.duckdb"),
+        ("ROCKY_TEST_MASK", "hash"),
+    ];
+
+    let original = edit_config(root, "pii = \"${ROCKY_TEST_MASK}\"", "pii = \"redact\"");
+    assert_refused(&apply(root, &plan_id, None, &other_db), MODELS_CHANGED);
+    std::fs::write(root.join("rocky.toml"), &original).unwrap();
+
+    let other_mask = [
+        ("ROCKY_TEST_DB", "fixture.duckdb"),
+        ("ROCKY_TEST_MASK", "redact"),
+    ];
+    assert_refused(&apply(root, &plan_id, None, &other_mask), MODELS_CHANGED);
+
+    edit_config(
+        root,
+        "pii = \"${ROCKY_TEST_MASK}\"",
+        "pii = \"${ROCKY_TEST_MASK}\"\nunused = \"none\"",
+    );
+    assert_applied(&apply(root, &plan_id, None, &other_db));
+}

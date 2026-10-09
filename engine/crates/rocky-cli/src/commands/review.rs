@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{FAIL_CLOSED_FLOOR_MARKER, ai_plan_is_reviewed, review_marker_path};
 use crate::commands::approval_scope::{
-    ApprovalScope, CompiledUnit, NoModels, ScopeUnit, approval_scope, scope_fingerprint,
+    ApprovalScope, CompiledUnit, NoModels, ScopeUnit, approval_scope_at, scope_fingerprint,
 };
 use crate::commands::audit::{blast_radius_union, compile_project_with_schemas, plan_file_path};
 use crate::output::{
@@ -429,12 +429,7 @@ async fn compute_review_with_disclosure_and_seam(
         }
     } else {
         let cfg = rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
-        super::approval_scope::approval_scope_at(
-            cfg.as_ref(),
-            root,
-            &resolved_config_path,
-            &run_plan,
-        )?
+        approval_scope_at(cfg.as_ref(), root, &resolved_config_path, &run_plan)?
     };
     let findings = if scope.dag {
         dag_review_findings(
@@ -1659,6 +1654,7 @@ fn render_excluded_note(excluded: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::approval_scope::approval_scope;
     use crate::output::ApproverSource;
 
     fn git_identity_for_test() -> Result<ApproverIdentity> {
