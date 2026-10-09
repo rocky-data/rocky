@@ -262,7 +262,7 @@ mod tests {
         assert!(!contract.toml.contains("nullable = false"));
     }
 
-    fn node_with(columns: serde_json::Value) -> DbtManifestNode {
+    fn node_with(columns: &serde_json::Value) -> DbtManifestNode {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": { "model.p.m": {
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn float_and_timestamp_are_read_for_the_adapter() {
-        let node = node_with(serde_json::json!({
+        let node = node_with(&serde_json::json!({
             "amount": { "name": "amount", "data_type": "float" },
             "at": { "name": "at", "data_type": "timestamp" },
             "n": { "name": "n", "data_type": "integer" },

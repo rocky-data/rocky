@@ -2213,8 +2213,12 @@ fn capabilities_and_fill_previews(
         Err(error) => return Err(error),
     };
     // The first-run fills this plan shows, over every model apply executes.
-    let fill_previews =
-        first_run_fill_previews(heads.iter().flat_map(|unit| unit.models()), state_path);
+    let fill_previews = first_run_fill_previews(
+        heads
+            .iter()
+            .flat_map(super::approval_scope::CompiledUnit::models),
+        state_path,
+    );
     let first_run_fills: std::collections::BTreeSet<String> = fill_previews
         .iter()
         .filter(|preview| preview.fills)
