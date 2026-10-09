@@ -1519,6 +1519,20 @@ pub(crate) struct ExecutionContext<'a> {
         &'a std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
     /// `rocky run --full-refresh`: rebuild table-writing models from scratch.
     pub full_refresh: bool,
+    /// Under an agent's apply: the plan and the models whose first-run fill
+    /// it recorded. A first-run fill of any other model refuses. `None` on
+    /// every other run.
+    pub reviewed_first_run_fills: Option<ReviewedFirstRunFills<'a>>,
+}
+
+/// The first-run fills a governed plan recorded; see
+/// [`ExecutionContext::reviewed_first_run_fills`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReviewedFirstRunFills<'a> {
+    /// The plan id, for the refusal message.
+    pub plan_id: &'a str,
+    /// The models the plan showed filling from `first_partition`.
+    pub models: &'a std::collections::BTreeSet<String>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -13151,6 +13165,10 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         model_timings: &compile_result.model_timings,
         surrogate_keys: &surrogate_keys,
         full_refresh: skip_gate.full_refresh,
+        reviewed_first_run_fills: exec_fp_gate.map(|gate| ReviewedFirstRunFills {
+            plan_id: &gate.plan_id,
+            models: &gate.reviewed_first_run_fills,
+        }),
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -16218,6 +16236,19 @@ async fn execute_time_interval_model(
     };
     let plans = match first_fill {
         rocky_core::plan_partition::FirstRunFill::Fill(plans) => {
+            if let Some(review) = exec_ctx.reviewed_first_run_fills
+                && !review.models.contains(model_name)
+            {
+                let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+                anyhow::bail!(
+                    "refusing to execute plan '{}': model '{model_name}' has no recorded \
+                     partition, so this run would fill {partitions} partitions from its \
+                     first_partition, and the plan did not show that fill. Plan again with \
+                     `rocky plan` (and review the new plan) to apply the fill, or run the model \
+                     with a partition flag.",
+                    review.plan_id
+                );
+            }
             info!(
                 model = model_name,
                 partitions = plans.len(),
@@ -19680,6 +19711,7 @@ max_retries = 0
         .unwrap();
 
         let ctx = crate::commands::apply::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: rocky_core::config::PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "record-not-persisted-transformation-plan",
@@ -24747,6 +24779,7 @@ auto_create_schemas = true
 
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -24770,6 +24803,7 @@ auto_create_schemas = true
         let model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28139,6 +28173,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28222,6 +28257,7 @@ email = "pii"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28389,6 +28425,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28519,6 +28556,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28597,6 +28635,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28757,6 +28796,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28885,6 +28925,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28986,6 +29027,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -29098,6 +29140,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -29141,6 +29184,116 @@ table = "fct_daily"
             second_run.partition_summaries[0].partitions_planned, 1,
             "a later run builds only the latest partition"
         );
+    }
+
+    /// Under an agent's apply, a first-run fill runs only when the plan
+    /// recorded it. A plan that did not show the fill refuses before any
+    /// partition is built; one that did fills as a bare run does.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_first_run_fill_needs_the_plan_to_record_it() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let today = Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().to_string();
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let no_flags = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+        let not_recorded = std::collections::BTreeSet::new();
+        let recorded = std::collections::BTreeSet::from(["fct_daily_orders".to_string()]);
+        let ctx = |models| super::ExecutionContext {
+            reviewed_first_run_fills: Some(super::ReviewedFirstRunFills {
+                plan_id: "plan-x",
+                models,
+            }),
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+
+        let mut refused = RunOutput::new(String::new(), 0, 1);
+        let error = super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "unreviewed",
+            &mut refused,
+            &ctx(&not_recorded),
+        )
+        .await
+        .expect_err("a fill the plan did not show must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("plan-x"), "{message}");
+        assert!(message.contains("would fill 2 partitions"), "{message}");
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty(),
+            "nothing is built before the refusal"
+        );
+
+        let mut filled = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "reviewed",
+            &mut filled,
+            &ctx(&recorded),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filled.partition_summaries[0].partitions_planned, 2);
     }
 
     /// Inverse-design property: a *transient* target-probe failure must not be
@@ -29205,6 +29358,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -29327,6 +29481,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -29426,6 +29581,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -33553,6 +33709,7 @@ backend = "local"
 
         // (2) unchanged apply with a MATCHING gate → must NOT refuse.
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -33871,6 +34028,7 @@ backend = "local"
     ) -> Result<super::GovernanceSnapshot> {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -34114,6 +34272,7 @@ backend = "local"
             }],
         )]);
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -34204,6 +34363,7 @@ backend = "local"
             ("confidential".to_string(), MaskStrategy::Redact),
         ]);
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(fp),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -34263,6 +34423,7 @@ backend = "local"
         write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
         let db = dir.path().join("wh.duckdb");
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -43113,6 +43274,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -43258,6 +43420,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -48981,6 +49144,7 @@ timestamp_column = "ts"
         governed: bool,
     ) -> anyhow::Result<()> {
         let ctx = crate::commands::apply::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: rocky_core::config::PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "checkpoint-ordering-legacy-plan",

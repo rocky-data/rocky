@@ -662,6 +662,12 @@ class PlanResult(BaseModel):
     #: transformation models. Kept as a loose ``dict`` — the nested shape lives
     #: on the generated ``PlanOutput.cost_preview``.
     cost_preview: dict | None = None
+    #: The ``time_interval`` models whose first run fills from
+    #: ``first_partition`` when the plan is applied: one row per model with
+    #: ``model``, ``partitions``, ``from``, ``to`` and ``fills``. Empty when no
+    #: model fills. Kept as loose ``dict`` rows — the nested shape lives on the
+    #: generated ``PlanOutput.first_run_fills``.
+    first_run_fills: list[dict] = []
     #: Budget diagnostics raised at plan time. Empty when no ``[budget]`` block
     #: is configured.
     budget_diagnostics: list[Diagnostic] = []

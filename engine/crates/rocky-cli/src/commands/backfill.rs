@@ -315,6 +315,7 @@ pub(crate) fn run_backfill_in(
         &resolved_mask,
     );
     let capabilities = EmbeddedCapabilities {
+        first_run_fills: Default::default(),
         diff_available: true,
         changed: ordered
             .iter()

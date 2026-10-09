@@ -233,6 +233,70 @@ pub fn plan_first_run_fill(model: &Model, state: &StateStore) -> Result<FirstRun
     Ok(FirstRunFill::Fill(plans))
 }
 
+/// What [`plan_first_run_fill`] would do for one model, for `rocky plan` to
+/// report before the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstRunFillPreview {
+    /// The model.
+    pub model: String,
+    /// Partitions from `first_partition` up to the current partition.
+    pub partitions: usize,
+    /// The first partition key of the range.
+    pub from: String,
+    /// The last partition key of the range: the current partition when the
+    /// preview was made. A later run reaches a later partition.
+    pub to: String,
+    /// `true` when the first run fills the range. `false` when the range is
+    /// over [`FIRST_RUN_FILL_LIMIT`]: the run builds only the latest
+    /// partition.
+    pub fills: bool,
+}
+
+/// Preview the first-run fill of `model`, or `None` when its next run with
+/// no partition flag is not a first-run fill (not a first run, no
+/// `first_partition`, or a `first_partition` after the current partition).
+pub fn preview_first_run_fill(
+    model: &Model,
+    state: &StateStore,
+) -> Result<Option<FirstRunFillPreview>, PlanError> {
+    match plan_first_run_fill(model, state)? {
+        FirstRunFill::NotApplicable => Ok(None),
+        FirstRunFill::Fill(plans) => {
+            let (Some(first), Some(last)) = (plans.first(), plans.last()) else {
+                return Ok(None);
+            };
+            Ok(Some(FirstRunFillPreview {
+                model: model.config.name.clone(),
+                partitions: plans.iter().map(|p| 1 + p.batch_with.len()).sum(),
+                from: first.partition_key.clone(),
+                to: last
+                    .batch_with
+                    .last()
+                    .unwrap_or(&last.partition_key)
+                    .clone(),
+                fills: true,
+            }))
+        }
+        FirstRunFill::TooMany { partitions } => {
+            let StrategyConfig::TimeInterval {
+                first_partition: Some(first),
+                granularity,
+                ..
+            } = &model.config.strategy
+            else {
+                return Ok(None);
+            };
+            Ok(Some(FirstRunFillPreview {
+                model: model.config.name.clone(),
+                partitions,
+                from: first.clone(),
+                to: granularity.format_key(granularity.truncate(chrono::Utc::now())),
+                fills: false,
+            }))
+        }
+    }
+}
+
 /// Resolve a `PartitionSelection` to a Vec of canonical partition keys,
 /// validated against the grain.
 fn resolve_selection(
@@ -657,6 +721,37 @@ mod tests {
         };
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].partition_key, today);
+    }
+
+    #[test]
+    fn preview_reports_the_fill_range_and_the_limit() {
+        let model = make_model("m", TimeGrain::Day, 0, 2, Some("2026-04-01"));
+        let (state, _dir) = temp_state();
+        let preview = preview_first_run_fill(&model, &state)
+            .unwrap()
+            .expect("a never-run model fills");
+        let today = TimeGrain::Day.format_key(TimeGrain::Day.truncate(chrono::Utc::now()));
+        assert!(preview.fills);
+        assert_eq!(preview.from, "2026-04-01");
+        assert_eq!(preview.to, today, "the batch's last key ends the range");
+        let FirstRunFill::Fill(plans) = plan_first_run_fill(&model, &state).unwrap() else {
+            panic!("fills");
+        };
+        let keys: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+        assert_eq!(preview.partitions, keys);
+
+        let hourly = make_model("h", TimeGrain::Hour, 0, 1, Some("2020-01-01T00"));
+        let preview = preview_first_run_fill(&hourly, &state)
+            .unwrap()
+            .expect("over the limit is still reported");
+        assert!(!preview.fills);
+        assert!(preview.partitions > FIRST_RUN_FILL_LIMIT);
+        assert_eq!(preview.from, "2020-01-01T00");
+
+        state
+            .record_partition(&recorded("m", "2026-04-02", PartitionStatus::Computed))
+            .unwrap();
+        assert_eq!(preview_first_run_fill(&model, &state).unwrap(), None);
     }
 
     #[test]

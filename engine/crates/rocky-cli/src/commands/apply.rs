@@ -863,6 +863,7 @@ fn governed_run_context<'a>(
         // preflight (`preflight_snapshot`), not folded into this flag.
         require_fingerprint: embedded.fingerprint_version >= 1,
         reviewed_source_schemas: embedded.reviewed_source_schemas,
+        reviewed_first_run_fills: embedded.first_run_fills,
         replication_verify_after: Mutex::new(BTreeSet::new()),
     })
 }
@@ -3714,6 +3715,11 @@ pub struct ExecFingerprintGate {
     /// (v2 governed) plan with `None` REFUSES. Carried here because
     /// `execute_models` has no plan handle.
     pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The models the plan showed filling from `first_partition` on their
+    /// first run (`EmbeddedCapabilities::first_run_fills`). A first-run fill
+    /// of any other model refuses at execution. Carried here because
+    /// `execute_models` has no plan handle.
+    pub reviewed_first_run_fills: BTreeSet<String>,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
@@ -3813,6 +3819,9 @@ pub struct GovernedRunContext<'a> {
     /// REFUSES (fail-closed).
     pub reviewed_source_schemas:
         Option<std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The models the plan showed filling from `first_partition`; see
+    /// [`ExecFingerprintGate::reviewed_first_run_fills`].
+    pub reviewed_first_run_fills: BTreeSet<String>,
     /// `true` when the plan REVIEWED a non-empty model set (`!run_plan.models
     /// .is_empty()`). Finding #2 (missing-dir): threaded to the executor legs so a
     /// governed model-executing apply whose reviewed models directory is deleted
@@ -3865,6 +3874,7 @@ impl GovernedRunContext<'_> {
             exec_control_identity: execution_control_identity(cfg),
             resolved_mask: cfg.resolve_mask_for_env(env),
             reviewed_source_schemas: self.reviewed_source_schemas.clone(),
+            reviewed_first_run_fills: self.reviewed_first_run_fills.clone(),
             plan_id: self.plan_id.to_string(),
             require: self.require_fingerprint,
         }
@@ -8989,6 +8999,7 @@ effect = "deny"
         // A no-change plan: diff available, zero changed models, but planned
         // models exist → touched under the bare `apply` verb.
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
@@ -9030,6 +9041,7 @@ effect = "deny"
         seed_agent_freeze(&state, "any")?;
 
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
@@ -9064,6 +9076,7 @@ effect = "deny"
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path(), "")?;
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
@@ -9290,6 +9303,7 @@ effect = "allow"
 "#,
         )?;
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: {
                 let mut c = BTreeMap::new();
@@ -10280,6 +10294,7 @@ auto_create_schemas = true
         let expected = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
         // Genuinely-legacy (no fingerprint, not required) → allowed.
         super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10293,6 +10308,7 @@ auto_create_schemas = true
         .expect("a legacy plan without a fingerprint is allowed through");
         // NEW plan whose fingerprint could not be produced (required) → REFUSE.
         let err = super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10307,6 +10323,7 @@ auto_create_schemas = true
         assert!(err.to_string().contains("could not be produced"), "{err}");
         // Matching → ok; live mismatch → refuse.
         super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(expected.clone()),
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10320,6 +10337,7 @@ auto_create_schemas = true
         .expect("a matching fingerprint applies");
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected.clone()),
                 config_identity: "DIFFERENT".to_string(),
                 governance_identity: "g".to_string(),
@@ -10336,6 +10354,7 @@ auto_create_schemas = true
         // A GOVERNANCE-identity change must refuse too (mask / roles / cache).
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected),
                 config_identity: "c".to_string(),
                 governance_identity: "DIFFERENT".to_string(),
@@ -10355,6 +10374,7 @@ auto_create_schemas = true
         let expected_ec = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected_ec),
                 config_identity: "c".to_string(),
                 governance_identity: "g".to_string(),
@@ -10442,6 +10462,7 @@ auto_create_schemas = true
         let cfg_b = cfg(dir.path(), "b.duckdb");
         let config_path = dir.path().join("rocky.toml");
         let mk = |expected: Option<String>, require: bool| super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10548,6 +10569,7 @@ auto_create_schemas = true
                   snapshot: Option<
             std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
         >| super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "p",
@@ -10613,6 +10635,7 @@ auto_create_schemas = true
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10664,6 +10687,7 @@ effect = "deny"
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10714,6 +10738,7 @@ effect = "allow"
         // Simulate `run` holding a live write handle for the whole invocation.
         let held = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10770,6 +10795,7 @@ effect = "allow"
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10813,6 +10839,7 @@ verify_after = ["row_count"]
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",

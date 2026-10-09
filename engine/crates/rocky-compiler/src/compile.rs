@@ -982,7 +982,10 @@ fn load_contract_map(
             )));
         }
         for name in explicit.keys() {
-            files.insert(name.clone(), contracts::contract_file_in(contracts_dir, name));
+            files.insert(
+                name.clone(),
+                contracts::contract_file_in(contracts_dir, name),
+            );
         }
         contract_map.extend(explicit);
     } else if let Some(project_dir) = contracts::project_contracts_dir_for(&config.models_dir) {
@@ -1257,8 +1260,16 @@ mod tests {
             "a project contract for a model outside this compile is skipped silently"
         );
         assert_eq!(
-            broken.contract_files.get("m00").map(|p| p.canonicalize().unwrap()),
-            Some(project_dir.join("m00.contract.toml").canonicalize().unwrap()),
+            broken
+                .contract_files
+                .get("m00")
+                .map(|p| p.canonicalize().unwrap()),
+            Some(
+                project_dir
+                    .join("m00.contract.toml")
+                    .canonicalize()
+                    .unwrap()
+            ),
             "the compile records the file each contract came from"
         );
         assert!(
@@ -1319,7 +1330,10 @@ mod tests {
         std::fs::write(&in_dir, "[rules]\nrequired = []\n").expect("directory contract");
         let result = compile(&config).expect("compile");
         assert_eq!(
-            result.contract_files.get("m00").map(|p| p.canonicalize().unwrap()),
+            result
+                .contract_files
+                .get("m00")
+                .map(|p| p.canonicalize().unwrap()),
             Some(in_dir.canonicalize().unwrap())
         );
     }

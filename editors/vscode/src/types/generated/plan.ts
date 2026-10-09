@@ -200,6 +200,10 @@ export interface PlanOutput {
   execution_layers?: string[][];
   filter: string;
   /**
+   * The `time_interval` models whose first run fills from `first_partition` when this plan is applied: no partition is recorded for them in the state store, and the plan names no partition flag. One row per model, the over-the-limit case included. The persisted plan records which models fill, and an agent's apply refuses a fill its plan did not record.
+   */
+  first_run_fills?: PlanFirstRunFill[];
+  /**
    * `true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = "error"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.
    */
   has_budget_errors?: boolean;
@@ -404,6 +408,32 @@ export interface PlanModelCost {
    * Where this model's estimate came from (`heuristic` or `adapter`).
    */
   source: CostEstimateSource;
+  [k: string]: unknown;
+}
+/**
+ * One row of [`PlanOutput::first_run_fills`].
+ */
+export interface PlanFirstRunFill {
+  /**
+   * `true` when the first run builds every partition in the range. `false` when the range is over the first-run limit (1000 partitions): the run then builds only the latest partition.
+   */
+  fills: boolean;
+  /**
+   * The first partition key: the model's `first_partition`.
+   */
+  from: string;
+  /**
+   * The model.
+   */
+  model: string;
+  /**
+   * Partitions from `from` to `to`, both included.
+   */
+  partitions: number;
+  /**
+   * The last partition key: the partition current when the plan was made. An apply on a later day or hour fills up to its own current partition.
+   */
+  to: string;
   [k: string]: unknown;
 }
 /**

@@ -180,6 +180,10 @@ A model that sets `first_partition` and has no recorded partition has never run.
 
 The fill has a limit of 1000 partitions. If `first_partition` is further back than that (an hourly model that starts years ago), the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. Every later run, with at least one partition recorded, builds the latest partition as before. A model with no `first_partition` always builds the latest partition. So does a first run whose `first_partition` is after the current partition: there is nothing to fill yet.
 
+`rocky plan` reports each fill before it runs. The JSON field `first_run_fills` has one row per model: `model`, `partitions`, `from`, `to`, and `fills` (`false` when the range is over the limit, so the run builds only the latest partition). The text output prints a `-- first-run fills --` block, and the cost preview adds a note, because its estimate is for one run of the model, not the fill. A plan with a partition flag or `--lookback` starts no fill and reports none.
+
+The plan also records which models fill. An agent's `rocky apply` refuses to start a fill that its plan did not record, for example when the state store lost the model's partitions after the plan was made. Plan again and review the new plan. The recorded fill does not fix its end: a fill applied on a later day reaches that day's partition. A `rocky apply` of a `--dag` plan does not run this check.
+
 ```bash
 # Run today's partition
 rocky run --filter client=acme

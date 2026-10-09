@@ -1007,6 +1007,41 @@
       ],
       "type": "object"
     },
+    "PlanFirstRunFill": {
+      "description": "One row of [`PlanOutput::first_run_fills`].",
+      "properties": {
+        "fills": {
+          "description": "`true` when the first run builds every partition in the range. `false` when the range is over the first-run limit (1000 partitions): the run then builds only the latest partition.",
+          "type": "boolean"
+        },
+        "from": {
+          "description": "The first partition key: the model's `first_partition`.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The model.",
+          "type": "string"
+        },
+        "partitions": {
+          "description": "Partitions from `from` to `to`, both included.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "to": {
+          "description": "The last partition key: the partition current when the plan was made. An apply on a later day or hour fills up to its own current partition.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fills",
+        "from",
+        "model",
+        "partitions",
+        "to"
+      ],
+      "type": "object"
+    },
     "PlanIntent": {
       "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
       "oneOf": [
@@ -1273,6 +1308,13 @@
     },
     "filter": {
       "type": "string"
+    },
+    "first_run_fills": {
+      "description": "The `time_interval` models whose first run fills from `first_partition` when this plan is applied: no partition is recorded for them in the state store, and the plan names no partition flag. One row per model, the over-the-limit case included. The persisted plan records which models fill, and an agent's apply refuses a fill its plan did not record.",
+      "items": {
+        "$ref": "#/definitions/PlanFirstRunFill"
+      },
+      "type": "array"
     },
     "has_budget_errors": {
       "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",

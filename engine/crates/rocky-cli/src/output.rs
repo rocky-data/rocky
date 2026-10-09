@@ -1900,6 +1900,34 @@ pub struct PlanOutput {
     /// not enter `plan_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_preview: Option<PlanCostPreview>,
+
+    // ---- First-run fills -------------------------------------------------
+    /// The `time_interval` models whose first run fills from
+    /// `first_partition` when this plan is applied: no partition is recorded
+    /// for them in the state store, and the plan names no partition flag.
+    /// One row per model, the over-the-limit case included. The persisted
+    /// plan records which models fill, and an agent's apply refuses a fill
+    /// its plan did not record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_run_fills: Vec<PlanFirstRunFill>,
+}
+
+/// One row of [`PlanOutput::first_run_fills`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlanFirstRunFill {
+    /// The model.
+    pub model: String,
+    /// Partitions from `from` to `to`, both included.
+    pub partitions: usize,
+    /// The first partition key: the model's `first_partition`.
+    pub from: String,
+    /// The last partition key: the partition current when the plan was made.
+    /// An apply on a later day or hour fills up to its own current partition.
+    pub to: String,
+    /// `true` when the first run builds every partition in the range.
+    /// `false` when the range is over the first-run limit (1000 partitions):
+    /// the run then builds only the latest partition.
+    pub fills: bool,
 }
 
 /// Where a `rocky plan` cost estimate came from.
@@ -6530,6 +6558,7 @@ impl PlanOutput {
             breaking_verdict: None,
             intent_check: None,
             cost_preview: None,
+            first_run_fills: vec![],
         }
     }
 }

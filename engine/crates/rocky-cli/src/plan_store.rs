@@ -87,7 +87,7 @@
 //! authority — apply re-verifies its integrity and gates on the runtime
 //! principal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -382,6 +382,17 @@ pub struct EmbeddedCapabilities {
     /// production capture failure and the governed apply REFUSES (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The `time_interval` models whose next run with no partition flag fills
+    /// from `first_partition`, because the state store held no partition for
+    /// them when the plan was made. `rocky plan` reports each fill
+    /// (`PlanOutput.first_run_fills`). An agent's apply refuses to start a
+    /// first-run fill for a model not named here, so an approval never covers
+    /// more partitions than its plan showed. The range is not bound: the fill
+    /// still ends at the partition current at apply time. Bound into the
+    /// `plan_id`; empty (and omitted) on a plan with no such model and on a
+    /// plan written before this field existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub first_run_fills: BTreeSet<String>,
 }
 
 /// The fingerprint feature version this binary stamps onto every plan it writes.
@@ -1000,6 +1011,7 @@ mod tests {
             statement_count: 1,
         };
         let caps = EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: Some("fp".to_string()),
@@ -1549,6 +1561,7 @@ mod tests {
     #[test]
     fn no_change_plan_touches_planned_models_under_apply() {
         let caps = EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
@@ -1572,6 +1585,7 @@ mod tests {
     #[test]
     fn no_planned_models_touches_nothing() {
         let caps = EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
@@ -1597,6 +1611,7 @@ mod tests {
             PolicyCapability::SchemaChangeAdditive,
         );
         let caps = EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed,
             models_fingerprint: None,
@@ -1627,6 +1642,7 @@ mod tests {
             PolicyCapability::SchemaChangeBreaking,
         );
         let caps = EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed,
             models_fingerprint: None,

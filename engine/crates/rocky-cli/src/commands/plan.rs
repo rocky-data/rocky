@@ -573,7 +573,12 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
+            Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
+                run_plan,
+                plan_id,
+                persisted_at,
+                first_run_fills,
+            }))) => {
                 if let Some(model) = run_plan.model.as_deref()
                     && let Some(shadow) = shadow_config_for_run_plan(state_path, &run_plan)?
                 {
@@ -614,6 +619,7 @@ pub async fn plan(
                 }
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
+                output.first_run_fills = first_run_fills;
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
@@ -624,20 +630,22 @@ pub async fn plan(
                     .adapters
                     .get(&pipeline.target.adapter)
                     .map_or("", |a| a.adapter_type.as_str());
-                output.cost_preview = Some(
-                    super::plan_cost::compute_plan_cost_preview(
-                        super::plan_cost::PlanCostContext {
-                            config_path,
-                            models_dir: &blueprint_models_dir,
-                            state_path,
-                            pipeline_name: name,
-                            adapter_type,
-                            models: &output.models,
-                            mode: cost_estimate,
-                        },
-                    )
-                    .await,
-                );
+                let mut cost_preview = super::plan_cost::compute_plan_cost_preview(
+                    super::plan_cost::PlanCostContext {
+                        config_path,
+                        models_dir: &blueprint_models_dir,
+                        state_path,
+                        pipeline_name: name,
+                        adapter_type,
+                        models: &output.models,
+                        mode: cost_estimate,
+                    },
+                )
+                .await;
+                cost_preview
+                    .notes
+                    .extend(first_run_fill_notes(&output.first_run_fills));
+                output.cost_preview = Some(cost_preview);
             }
             Ok(Some(RunPlanBuild::Refused(refused))) => {
                 compile_refused = true;
@@ -752,6 +760,7 @@ pub async fn plan(
         }
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
+        render_first_run_fills_text(&output);
         render_cost_preview_text(&output);
         render_semantic_verdict_text(&output);
         if let Some(check) = &output.intent_check {
@@ -1833,7 +1842,12 @@ fn build_and_persist_run_plan(
         intent: run_options.intent,
     };
 
-    let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+    #[allow(clippy::type_complexity)]
+    let plan_id = (|| -> Result<(
+        String,
+        chrono::DateTime<Utc>,
+        Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+    )> {
         let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
         // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
@@ -1878,7 +1892,7 @@ fn build_and_persist_run_plan(
                 None
             }
         };
-        let capabilities = compute_embedded_capabilities_for_scope(
+        let (capabilities, fill_previews) = capabilities_and_fill_previews(
             config_path,
             scope.as_ref(),
             base_ref,
@@ -1888,18 +1902,58 @@ fn build_and_persist_run_plan(
         )?;
         let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
             .context("failed to write run plan")?;
-        Ok((plan_id, Utc::now()))
+        Ok((plan_id, Utc::now(), fill_previews))
     })()?;
-    Ok(Some(RunPlanBuild::Persisted(
-        Box::new(run_plan),
+    let (plan_id, persisted_at, fill_previews) = plan_id;
+    let fills = first_run_fills_for_output(&run_plan, fill_previews);
+    Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
+        run_plan: Box::new(run_plan),
         plan_id,
         persisted_at,
-    )))
+        first_run_fills: fills,
+    })))
+}
+
+/// The first-run fills `rocky apply <plan>` would start, as `PlanOutput`
+/// reports them. A run with a partition flag or `--lookback` never fills,
+/// and a `--model` run fills only that model.
+fn first_run_fills_for_output(
+    run_plan: &RunPlan,
+    previews: Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+) -> Vec<crate::output::PlanFirstRunFill> {
+    let partition_flag = run_plan.partition.is_some()
+        || run_plan.partition_from.is_some()
+        || run_plan.partition_to.is_some()
+        || run_plan.latest
+        || run_plan.missing
+        || run_plan.lookback.is_some();
+    if partition_flag {
+        return Vec::new();
+    }
+    previews
+        .into_iter()
+        .filter(|p| run_plan.model.as_deref().is_none_or(|m| m == p.model))
+        .map(|p| crate::output::PlanFirstRunFill {
+            model: p.model,
+            partitions: p.partitions,
+            from: p.from,
+            to: p.to,
+            fills: p.fills,
+        })
+        .collect()
+}
+
+/// A run plan `rocky plan` wrote, with what its output reports about it.
+struct PersistedRunPlan {
+    run_plan: Box<RunPlan>,
+    plan_id: String,
+    persisted_at: chrono::DateTime<Utc>,
+    first_run_fills: Vec<crate::output::PlanFirstRunFill>,
 }
 
 enum RunPlanBuild {
     Refused(Vec<SkippedModel>),
-    Persisted(Box<RunPlan>, String, chrono::DateTime<Utc>),
+    Persisted(PersistedRunPlan),
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed
@@ -1953,6 +2007,22 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     base_ref: &str,
     state_path: Option<&Path>,
     env: Option<&str>,
+    bind_masks: bool,
+) -> anyhow::Result<EmbeddedCapabilities> {
+    capabilities_and_fill_previews(config_path, scope, base_ref, state_path, env, bind_masks)
+        .map(|(capabilities, _)| capabilities)
+}
+
+/// [`compute_embedded_capabilities_for_scope`], with the first-run fill
+/// preview of every model in the scope (over the limit included), for
+/// `rocky plan` to report. The capabilities' `first_run_fills` is the set of
+/// previews that fill.
+fn capabilities_and_fill_previews(
+    config_path: &Path,
+    scope: Option<&super::approval_scope::ApprovalScope>,
+    base_ref: &str,
+    state_path: Option<&Path>,
+    env: Option<&str>,
     // Finding #4: whether the mask enters the fingerprint — `true` iff the apply
     // reaches the mask-reconciling path (a full run of a REPLICATION pipeline that
     // hits the model leg). The CALLER computes this from the resolved pipeline +
@@ -1969,7 +2039,10 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     // the plan was persisted with no surrogate key in its fingerprint at all —
     // and the comment below claimed the gate "must keep hashing the resolved
     // whole" while that call made it false.
-) -> anyhow::Result<EmbeddedCapabilities> {
+) -> anyhow::Result<(
+    EmbeddedCapabilities,
+    Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+)> {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
 
     // Load the config first — reused for cached source schemas AND the routing
@@ -2043,10 +2116,11 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
         reviewed_source_schemas: None,
+        first_run_fills: std::collections::BTreeSet::new(),
     };
 
     let Some(scope) = scope else {
-        return Ok(failed(config_identity)); // fail-closed: scope unresolved
+        return Ok((failed(config_identity), Vec::new())); // fail-closed: scope unresolved
     };
 
     let identity = config_identity.clone().unwrap_or_default();
@@ -2081,7 +2155,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     // A unit that does not compile (or a plain plan's absent directory) means
     // no fingerprint, so a review-gated apply refuses (fail-closed).
     let Ok(heads) = scope.compile(&source_schemas, super::approval_scope::NoModels::Error) else {
-        return Ok(failed(config_identity));
+        return Ok((failed(config_identity), Vec::new()));
     };
     // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
     // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
@@ -2134,10 +2208,18 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         // review-gated apply then refuses it.
         Err(error) if scope.dag => {
             tracing::warn!(error = %format!("{error:#}"), "--dag plan carries no fingerprint");
-            return Ok(failed(config_identity));
+            return Ok((failed(config_identity), Vec::new()));
         }
         Err(error) => return Err(error),
     };
+    // The first-run fills this plan shows, over every model apply executes.
+    let fill_previews =
+        first_run_fill_previews(heads.iter().flat_map(|unit| unit.models()), state_path);
+    let first_run_fills: std::collections::BTreeSet<String> = fill_previews
+        .iter()
+        .filter(|preview| preview.fills)
+        .map(|preview| preview.model.clone())
+        .collect();
 
     // Classify each unit against `base_ref` through the same directory and
     // glob. Any unit without a base costs the per-model classification for
@@ -2155,15 +2237,19 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             unit.unit.models_glob.as_deref(),
             None,
         ) else {
-            return Ok(EmbeddedCapabilities {
-                diff_available: false,
-                changed: std::collections::BTreeMap::new(),
-                models_fingerprint,
-                models_only_fingerprint,
-                config_identity,
-                fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-                reviewed_source_schemas,
-            });
+            return Ok((
+                EmbeddedCapabilities {
+                    diff_available: false,
+                    changed: std::collections::BTreeMap::new(),
+                    models_fingerprint,
+                    models_only_fingerprint,
+                    config_identity,
+                    fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+                    reviewed_source_schemas,
+                    first_run_fills,
+                },
+                fill_previews,
+            ));
         };
 
         let base_ir = super::ci_diff::project_ir_from_compile(&base);
@@ -2187,15 +2273,68 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         }
     }
 
-    Ok(EmbeddedCapabilities {
-        diff_available: true,
-        changed,
-        models_fingerprint,
-        models_only_fingerprint,
-        config_identity,
-        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-        reviewed_source_schemas,
-    })
+    Ok((
+        EmbeddedCapabilities {
+            diff_available: true,
+            changed,
+            models_fingerprint,
+            models_only_fingerprint,
+            config_identity,
+            fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            reviewed_source_schemas,
+            first_run_fills,
+        },
+        fill_previews,
+    ))
+}
+
+/// The first-run fill of each `time_interval` model in `models` whose next
+/// run with no partition flag fills from `first_partition`, or would but is
+/// over the limit. Read from the state store at `state_path`; with no state
+/// store every model with a `first_partition` has never run.
+///
+/// A model whose partitions cannot be planned (a malformed `first_partition`)
+/// is left out: its run fails before it builds anything.
+pub(crate) fn first_run_fill_previews<'a>(
+    models: impl IntoIterator<Item = &'a rocky_core::models::Model>,
+    state_path: Option<&Path>,
+) -> Vec<rocky_core::plan_partition::FirstRunFillPreview> {
+    let mut models = models
+        .into_iter()
+        .filter(|m| {
+            matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::TimeInterval {
+                    first_partition: Some(_),
+                    ..
+                }
+            )
+        })
+        .peekable();
+    if models.peek().is_none() {
+        return Vec::new();
+    }
+    let temp_dir;
+    let store = match state_path {
+        Some(path) => rocky_core::state::StateStore::open_read_only_or_empty(path),
+        None => {
+            let Ok(dir) = tempfile::TempDir::new() else {
+                return Vec::new();
+            };
+            temp_dir = dir;
+            rocky_core::state::StateStore::open(&temp_dir.path().join("state.redb"))
+        }
+    };
+    let Ok(store) = store else {
+        tracing::warn!("cannot read the state store; the plan reports no first-run fill");
+        return Vec::new();
+    };
+    let mut previews: Vec<_> = models
+        .filter_map(|m| rocky_core::plan_partition::preview_first_run_fill(m, &store).ok()?)
+        .collect();
+    previews.sort_by(|a, b| a.model.cmp(&b.model));
+    previews.dedup_by(|a, b| a.model == b.model);
+    previews
 }
 
 /// Build a canonical, sorted source-state snapshot from the discovered
@@ -2938,6 +3077,43 @@ fn render_budget_diagnostics_text(output: &PlanOutput) {
 }
 
 /// Render the cost preview under the text output mode.
+fn render_first_run_fills_text(output: &PlanOutput) {
+    if output.first_run_fills.is_empty() {
+        return;
+    }
+    println!("-- first-run fills --");
+    for fill in &output.first_run_fills {
+        if fill.fills {
+            println!(
+                "{}: first run fills {} partitions, {} to {}",
+                fill.model, fill.partitions, fill.from, fill.to
+            );
+        } else {
+            println!(
+                "{}: {} partitions from {} to {} are over the first-run limit; the run \
+                 builds only the latest partition",
+                fill.model, fill.partitions, fill.from, fill.to
+            );
+        }
+    }
+}
+
+/// The cost-preview note for each first-run fill: the estimate prices one run
+/// of each model, and a fill runs the model once per partition batch.
+fn first_run_fill_notes(fills: &[crate::output::PlanFirstRunFill]) -> Vec<String> {
+    fills
+        .iter()
+        .filter(|fill| fill.fills)
+        .map(|fill| {
+            format!(
+                "model '{}': its first run fills {} partitions ({} to {}); the estimate is for \
+                 one run of the model, not the fill",
+                fill.model, fill.partitions, fill.from, fill.to
+            )
+        })
+        .collect()
+}
+
 fn render_cost_preview_text(output: &PlanOutput) {
     let Some(preview) = &output.cost_preview else {
         return;
