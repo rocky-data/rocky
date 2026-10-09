@@ -42,8 +42,23 @@ export USER=demo USERNAME=demo LOGNAME=demo
 export GIT_CONFIG_GLOBAL="$SCRATCH/home/gitconfig" GIT_CONFIG_NOSYSTEM=1
 export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1
 
+# A baseline `rocky run` in <dir>. Both the exit code and the JSON must say
+# success: status `Success` and no failed table. A partial failure exits 2
+# and a total one exits 1; the JSON check does not rely on that mapping.
+# The output stays in <dir> for the failure message.
+baseline_run() { # <dir>
+  local status=0
+  (cd "$1" && rocky --output json run >baseline-run.json 2>baseline-run.err) || status=$?
+  if [ "$status" -ne 0 ] ||
+    ! jq -e '.status == "Success" and .tables_failed == 0' "$1/baseline-run.json" >/dev/null 2>&1; then
+    echo "FAIL: the baseline run in $1 failed (exit $status); see $1/baseline-run.json and $1/baseline-run.err" >&2
+    exit 1
+  fi
+}
+
 echo "▶ workspace 1: playground quickstart"
-(cd "$SCRATCH" && rocky playground estate >/dev/null && cd estate && rocky --output json run >/dev/null)
+(cd "$SCRATCH" && rocky playground estate >/dev/null)
+baseline_run "$SCRATCH/estate"
 
 echo "▶ workspace 2: an agent's breaking change waiting for review"
 mkdir -p "$SCRATCH/review"
@@ -52,7 +67,7 @@ cp -R "$POCS/04-governance/11-agent-policy/models" "$SCRATCH/review/"
 (
   cd "$SCRATCH/review"
   git init -q -b main && git add -A && git commit -q -m baseline
-  rocky --output json run >/dev/null
+  baseline_run "$SCRATCH/review"
   printf 'SELECT 1 AS id\n' > models/dim_customer.sql   # the agent drops `email`
   rocky --output json plan --principal agent --base HEAD --model dim_customer > plan.json
   plan="$(jq -er '.plan_id' plan.json)"

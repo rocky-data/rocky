@@ -11432,8 +11432,11 @@ pub(crate) fn model_phase_ok<T>(
 /// (#1292/#1348), and the pipeline picked chooses the adapter the model
 /// MATERIALIZES on — so a wrong guess is wrong-adapter DDL, not a wrong flag.
 ///
-/// A project with no transformation pipeline keeps its prior answer: the
-/// first replication adapter, governance off, no glob.
+/// A project with no transformation pipeline answers from its first
+/// replication pipeline: that pipeline's adapter and its
+/// `auto_create_schemas`, and no glob. The `--all` model leg builds the same
+/// models under the same pipeline's governance, so `--model` must not
+/// disagree with it about creating a missing target schema (#2324).
 pub(crate) fn resolve_model_run_target(
     rocky_cfg: &rocky_core::config::RockyConfig,
     pipeline_name_arg: Option<&str>,
@@ -11475,20 +11478,18 @@ pub(crate) fn resolve_model_run_target(
                 Some(t.models.clone()),
             ));
         }
-        Ok((
-            rocky_cfg
-                .pipelines
-                .values()
-                .find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Replication(r) => {
-                        Some(r.target.adapter.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "default".to_string()),
-            false,
-            None,
-        ))
+        let replication = rocky_cfg.pipelines.values().find_map(|p| match p {
+            rocky_core::config::PipelineConfig::Replication(r) => Some(r),
+            _ => None,
+        });
+        Ok(match replication {
+            Some(r) => (
+                r.target.adapter.clone(),
+                r.target.governance.auto_create_schemas,
+                None,
+            ),
+            None => ("default".to_string(), false, None),
+        })
     }
 }
 
@@ -27220,6 +27221,100 @@ schema = "mart"
         );
     }
 
+    /// #2324: a project with only a replication pipeline that opts into
+    /// `auto_create_schemas`. `run --all` builds its models under that
+    /// pipeline's governance and creates their target schemas; `run --model`
+    /// must too. It used to answer governance OFF here and fail with
+    /// "Schema with name mart does not exist".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_model_run_creates_its_schema_under_the_replication_pipelines_governance() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let duckdb_path = config_dir.join("warehouse.duckdb");
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.r]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.r.source.discovery]
+adapter = "default"
+
+[pipeline.r.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.r.target]
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.r.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        let models_dir = config_dir.join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("summary.sql"), "SELECT 1 AS one\n")
+            .expect("write summary.sql");
+        std::fs::write(
+            models_dir.join("summary.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"mart\"\n",
+        )
+        .expect("write summary.toml");
+
+        super::run(
+            &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
+            None,
+            None,
+            &config_dir.join("state.redb"),
+            None,
+            true,
+            Some(&models_dir),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            Some("summary"),
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await
+        .expect("a --model run must create the missing target schema");
+        let conn = rocky_duckdb::DuckDbConnector::open(&duckdb_path).expect("open db");
+        assert_eq!(
+            conn.execute_sql("SELECT one FROM mart.summary")
+                .expect("mart.summary exists")
+                .rows,
+            vec![vec![serde_json::json!("1")]]
+        );
+    }
+
     // -----------------------------------------------------------------
     // Auto-sweep at end-of-run
     // -----------------------------------------------------------------
@@ -35899,13 +35994,14 @@ auto_create_schemas = true
         assert!(explicit.1, "naming the pipeline honors its governance");
     }
 
-    /// The third arm is unchanged by #1350: with no transformation pipeline
-    /// to attribute the model to, the fallback still answers with the first
-    /// replication adapter, governance OFF, and no glob. Extracting the
-    /// resolver rewrote this arm from an `or_else` chain into an `else`, so
-    /// "prior answer preserved" is pinned rather than asserted in prose.
+    /// With no transformation pipeline to attribute the model to, the
+    /// fallback answers with the first replication pipeline's adapter, ITS
+    /// `auto_create_schemas`, and no glob. #1350 pinned governance OFF here
+    /// to preserve a prior answer, but the `--all` model leg builds the same
+    /// models under that pipeline's governance, so `run --all` created a
+    /// missing target schema and `run --model` failed on it (#2324).
     #[test]
-    fn replication_only_fallback_keeps_the_adapter_with_governance_off() {
+    fn replication_only_fallback_uses_the_replication_pipelines_governance() {
         let toml = r#"
 [adapter.db]
 type = "duckdb"
@@ -35932,10 +36028,18 @@ auto_create_schemas = true
         let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("config");
         assert_eq!(
             super::resolve_model_run_target(&cfg, None).expect("fallback"),
+            ("db".to_string(), true, None),
+            "no transformation pipeline: the first replication pipeline's adapter and \
+             governance, no glob"
+        );
+        let off: rocky_core::config::RockyConfig = toml::from_str(
+            &toml.replace("auto_create_schemas = true", "auto_create_schemas = false"),
+        )
+        .expect("config");
+        assert_eq!(
+            super::resolve_model_run_target(&off, None).expect("fallback"),
             ("db".to_string(), false, None),
-            "no transformation pipeline: first replication adapter, governance off, no glob \
-             — and governance stays off even though the replication pipeline enables it, \
-             because there is no transformation pipeline whose grant it could be"
+            "a replication pipeline that does not opt in creates no schema"
         );
     }
 
