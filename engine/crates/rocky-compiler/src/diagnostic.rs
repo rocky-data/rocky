@@ -239,9 +239,10 @@ pub const E041: &str = "E041";
 ///
 /// Emitted by `rocky compile` (and the compile `rocky run` performs before it
 /// executes) from [`crate::source_refs::check_source_table_refs`]. The table
-/// list counts as complete when every table of the schema was introspected
-/// live during this invocation, or when strict sources are on
-/// (`rocky compile --strict-sources` or `[cache.schemas] strict_sources`).
+/// list counts as complete when strict sources are on
+/// (`rocky compile --strict-sources` or `[cache.schemas] strict_sources`), or
+/// when every table of the schema was introspected live during this
+/// invocation (an embedding caller; no CLI command does this yet).
 /// It never fires for a schema Rocky has no source schema in, or for a schema
 /// a model of the project writes to.
 pub const E045: &str = "E045";

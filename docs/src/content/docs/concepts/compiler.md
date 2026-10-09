@@ -274,7 +274,7 @@ for that schema is:
 
 | Where the table list came from | Without strict sources | With strict sources |
 |---|---|---|
-| Every table read from the warehouse during this invocation | `E045` (error) | `E045` |
+| Every table read from the warehouse during this invocation (an embedding caller; no CLI command does this for a compile yet) | `E045` (error) | `E045` |
 | Seed file (`--with-seed`) or schema cache | `W045` (warning) | `E045` |
 
 A seed or the cache lists only the tables it was given, so by default these
@@ -370,7 +370,8 @@ a CTE, or a subquery in `FROM`. These stay silent:
 - A name merged by `USING (…)`. A scope with `NATURAL`, semi, anti or
   `ARRAY JOIN`, or `LATERAL VIEW` is not checked.
 - A name that is also a `SELECT` alias, or the output name of a qualified
-  projection such as `c.customer_id`.
+  projection such as `c.customer_id`. `ORDER BY` is not checked when the
+  `SELECT` list has a star.
 - A relation binding name (a whole-row reference), a quoted name, a date-part
   keyword, or a niladic keyword such as `current_date`.
 - A scope that uses `->`. A lambda parses as that operator, so its parameter

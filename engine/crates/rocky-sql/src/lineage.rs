@@ -692,10 +692,25 @@ fn expression_subquery_reads(select: &Select, ctes: &CteScope) -> Vec<String> {
     inner_queries.extend(immediate_subqueries(&select.having));
     inner_queries.extend(immediate_subqueries(&select.qualify));
     inner_queries.extend(immediate_subqueries(&select.group_by));
-    for table in &select.from {
-        for join in &table.joins {
-            inner_queries.extend(immediate_subqueries(&join.join_operator));
+    fn join_conditions(table: &TableWithJoins, out: &mut Vec<Query>) {
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = &table.relation
+        {
+            join_conditions(table_with_joins, out);
         }
+        for join in &table.joins {
+            out.extend(immediate_subqueries(&join.join_operator));
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = &join.relation
+            {
+                join_conditions(table_with_joins, out);
+            }
+        }
+    }
+    for table in &select.from {
+        join_conditions(table, &mut inner_queries);
     }
     let mut found = Vec::new();
     for inner in &inner_queries {
@@ -1031,6 +1046,21 @@ fn extract_table_factor(
                 derived_sources,
                 cte_columns: Vec::new(),
             });
+        }
+        // A parenthesised join, `FROM (a JOIN b ON …) JOIN c`. Its relations
+        // are dependencies, recorded by name only: they are not added to
+        // `tables`, so alias resolution and star expansion are unchanged.
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            let (inner, inner_nested) =
+                extract_tables(std::slice::from_ref(table_with_joins.as_ref()), ctes);
+            for t in &inner {
+                if t.binding == TableBinding::Physical && t.name != "(subquery)" {
+                    nested.push(t.name.to_lowercase());
+                }
+            }
+            nested.extend(inner_nested);
         }
         _ => {}
     }
@@ -2465,6 +2495,10 @@ mod tests {
             (
                 "SELECT id FROM a WHERE id IN (SELECT id FROM b WHERE b.k IN (SELECT k FROM deep))",
                 &["a", "b", "deep"],
+            ),
+            (
+                "SELECT a.id FROM (a JOIN b ON b.k IN (SELECT k FROM keys)) JOIN c ON c.id = a.id",
+                &["a", "b", "c", "keys"],
             ),
         ];
         for (sql, expected) in cases {

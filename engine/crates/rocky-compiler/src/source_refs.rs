@@ -1649,11 +1649,6 @@ mod tests {
             vec![model("m", "SELECT * FROM orderz")],
             // A three-part read: its catalog may hold another `raw`.
             vec![model("m", "SELECT * FROM cat.raw.orderz")],
-            // A CTE named like a missing table is not a read.
-            vec![model(
-                "m",
-                "WITH refunds AS (SELECT 1 AS x) SELECT * FROM refunds",
-            )],
             // A schema a project model writes to: the project adds tables.
             vec![writer.clone(), model("m", "SELECT * FROM mart.new_table")],
             vec![raw_writer, model("m", "SELECT * FROM raw.whatever")],

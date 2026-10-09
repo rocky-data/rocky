@@ -19,7 +19,8 @@
 //!   `NATURAL` join, a semi or anti join, an `ARRAY JOIN` or a `LATERAL VIEW`
 //!   is not checked at all: those change which names are visible.
 //! - A name that equals a `SELECT` alias or the output name of a qualified
-//!   projection (`c.customer_id`) is not reported: it may be a lateral alias
+//!   projection (`c.customer_id`) is not reported, and `ORDER BY` is not
+//!   judged when the projection has a star: it may be a lateral alias
 //!   or an `ORDER BY` / `GROUP BY` reference to the output, and dialects
 //!   differ on precedence. Neither is a name that equals a relation's binding
 //!   (a whole-row reference), a lambda parameter, a date-part keyword, a
@@ -306,10 +307,18 @@ fn check_select(
             let _ = on.visit(&mut names);
         }
     }
+    // A bare `ORDER BY` name resolves to an output column first. A star can
+    // output any name, so with a star in the projection it is not judged.
+    let projects_a_star = select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+        )
+    });
     if let Some(ast::OrderBy {
         kind: ast::OrderByKind::Expressions(items),
         ..
-    }) = order_by
+    }) = order_by.filter(|_| !projects_a_star)
     {
         for item in items {
             let _ = item.expr.visit(&mut names);
@@ -527,6 +536,9 @@ mod tests {
             "SELECT c, l FROM customers c JOIN ltv l ON true",
             // Semi and anti joins expose only the left side.
             "SELECT customer_id FROM customers SEMI JOIN ltv ON customers.customer_id = ltv.customer_id",
+            // A star outputs one `customer_id`; ORDER BY means that output.
+            "SELECT c.*, l.lifetime_value FROM customers c JOIN ltv l \
+             ON c.customer_id = l.customer_id ORDER BY customer_id",
             // A set operation's branches are separate scopes.
             "SELECT customer_id FROM customers UNION ALL SELECT customer_id FROM ltv",
         ] {
