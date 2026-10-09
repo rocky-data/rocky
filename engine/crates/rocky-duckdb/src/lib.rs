@@ -18,7 +18,7 @@ use std::path::Path;
 
 use duckdb::{Connection, params, types::Value};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum DuckDbError {
@@ -53,6 +53,37 @@ pub struct QueryResult {
     pub rows: Vec<Vec<serde_json::Value>>,
 }
 
+/// Loads DuckDB's `icu` extension before the connection runs any statement.
+///
+/// The bundled DuckDB does not link `icu` statically (the `duckdb` crate's
+/// `icu` feature needs a DuckDB source checkout and CMake). Without it,
+/// `current_date`, `today()` and the time-zone-aware date arithmetic come
+/// from an autoload that fires in the middle of binding the statement that
+/// first uses them. In DuckDB 1.5.6 that autoload invalidates the operator
+/// the binder is resolving, so `current_date + 1` failed with
+/// `No function matches ... '(DATE, INTEGER_LITERAL)'` and an empty or
+/// unrelated candidate list (#2325). Loading `icu` here, between
+/// statements, removes the mid-bind load.
+///
+/// `LOAD` reads the local extension cache. When the cache has no `icu`,
+/// `INSTALL` downloads it from the DuckDB extension repository, which is
+/// what the autoload did before. A failure is logged, not returned: a
+/// project that never uses these functions must still open offline, and
+/// one that does use them gets DuckDB's own "exists in the icu extension"
+/// error at the statement.
+fn load_icu(conn: &Connection) {
+    if conn.execute_batch("LOAD icu").is_ok() {
+        return;
+    }
+    if let Err(err) = conn.execute_batch("INSTALL icu; LOAD icu") {
+        warn!(
+            error = %err,
+            "could not load the DuckDB icu extension; `current_date` and time-zone \
+             functions will fail to bind until it is installed"
+        );
+    }
+}
+
 /// DuckDB local connector for testing and development.
 pub struct DuckDbConnector {
     conn: Connection,
@@ -62,12 +93,14 @@ impl DuckDbConnector {
     /// Creates an in-memory DuckDB database.
     pub fn in_memory() -> Result<Self, DuckDbError> {
         let conn = Connection::open_in_memory()?;
+        load_icu(&conn);
         Ok(DuckDbConnector { conn })
     }
 
     /// Opens or creates a persistent DuckDB database file.
     pub fn open(path: &Path) -> Result<Self, DuckDbError> {
         let conn = Connection::open(path)?;
+        load_icu(&conn);
         Ok(DuckDbConnector { conn })
     }
 
@@ -282,6 +315,47 @@ impl DuckDbConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `current_date + 1` must bind as the FIRST statement on a fresh
+    /// connection. `current_date` lives in DuckDB's `icu` extension; when
+    /// its autoload fired while DuckDB was binding the `+`, the `+` had no
+    /// overloads left and the statement failed with
+    /// `No function matches ... '(DATE, INTEGER_LITERAL)'` (#2325). The
+    /// expected value is computed inside the same statement, so the test
+    /// does not depend on the clock or the session time zone.
+    #[test]
+    fn current_date_plus_one_binds_on_a_fresh_connection() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT (current_date + 1) - current_date AS days")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "1");
+    }
+
+    /// The same failure with an interval: the recorded dbt Stripe package
+    /// builds its date spine from `current_date + interval 1 month`.
+    #[test]
+    fn current_date_plus_an_interval_binds_on_a_fresh_connection() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql(
+                "SELECT date_diff('month', current_date, current_date + interval 1 month) AS months",
+            )
+            .unwrap();
+        assert_eq!(result.rows[0][0], "1");
+    }
+
+    /// A file-backed database goes through `open`, not `in_memory`; both
+    /// must load `icu` the same way.
+    #[test]
+    fn current_date_plus_one_binds_on_a_fresh_file_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DuckDbConnector::open(&dir.path().join("fresh.duckdb")).unwrap();
+        let result = db
+            .execute_sql("SELECT (current_date + 1) - current_date AS days")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "1");
+    }
 
     /// A `DATE` is the shape `run_content_addressed` parses back, and the
     /// shape a person reads in `rocky preview rows`. Before the `Date32` arm
