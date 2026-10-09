@@ -12557,6 +12557,15 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         source_provenance,
         external_dependencies: defer_opts.external_dependencies.clone(),
         project: defer_opts.project.clone(),
+        // Every model of this run executes on `warehouse`: a `CAST` whose
+        // width differs between warehouses is typed for it, so the contract
+        // gate checks the type the warehouse writes (#2333).
+        target_dialects: rocky_compiler::operand_check::TargetDialects::uniform(
+            rocky_compiler::operand_check::OperandDialect::from_adapter_type(
+                warehouse.dialect().name(),
+            )
+            .into(),
+        ),
         ..Default::default()
     };
 

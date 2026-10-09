@@ -514,6 +514,9 @@ impl RockyLsp {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
+            // The language server and `rocky serve` do not resolve each model's
+            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            target_dialects: Default::default(),
         };
 
         let generation = self.published_files.begin_compile();
@@ -1496,6 +1499,9 @@ impl LanguageServer for RockyLsp {
                     preserve_authored_sql: true,
                     external_dependencies: Default::default(),
                     project: None,
+                    // The language server and `rocky serve` do not resolve each model's
+                    // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+                    target_dialects: Default::default(),
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -5102,6 +5108,9 @@ mod tests {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
+            // The language server and `rocky serve` do not resolve each model's
+            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            target_dialects: Default::default(),
         };
         rocky_compiler::compile::compile(&config).expect("the project compiles")
     }
@@ -7360,6 +7369,9 @@ mod tests {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
+            // The language server and `rocky serve` do not resolve each model's
+            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            target_dialects: Default::default(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

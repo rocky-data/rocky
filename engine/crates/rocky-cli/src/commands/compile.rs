@@ -405,6 +405,14 @@ fn compile_inner(
         ),
     };
 
+    // The warehouses each model runs on, from the pipelines that target
+    // them (not every configured adapter). The compile types a `CAST` for
+    // them, and the adapter gates below judge each model against them,
+    // refusing when any one refuses.
+    let model_targets = project_config
+        .as_ref()
+        .map(|config| ModelTargets::resolve(config, config_file_path));
+
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
@@ -424,6 +432,11 @@ fn compile_inner(
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
         project: None,
+        target_dialects: target_dialects_of(
+            target_dialect,
+            project_config.as_ref(),
+            model_targets.as_ref(),
+        ),
     };
 
     // Without `--models`, one compile over every transformation pipeline's
@@ -485,13 +498,6 @@ fn compile_inner(
             && selected.as_ref().is_none_or(|set| set.contains(name))
     };
     let scoped = model_filter.is_some() || selected.is_some();
-
-    // The warehouses each model runs on, from the pipelines that target
-    // them (not every configured adapter). The adapter gates below judge
-    // each model against these, and refuse when any one refuses.
-    let model_targets = project_config
-        .as_ref()
-        .map(|config| ModelTargets::resolve(config, config_file_path));
 
     if let Some(targets) = &model_targets {
         apply_adapter_gates(&mut result, targets);
@@ -931,33 +937,82 @@ fn operand_target_for(
     targets: Option<&ModelTargets<'_>>,
     model: &str,
 ) -> rocky_compiler::operand_check::OperandTarget {
+    operand_target_of(
+        target_dialect,
+        config,
+        targets.map(|targets| targets.for_model(model)),
+    )
+}
+
+/// The warehouse each model runs on, for the compile itself: a `CAST` to a
+/// type whose width differs between warehouses is typed for it (#2333). The
+/// same precedence as the operand checks ([`operand_target_for`]), so both
+/// read one answer.
+pub(crate) fn target_dialects(
+    target_dialect: Option<Dialect>,
+    config: Option<&rocky_config::RockyConfig>,
+    config_path: &Path,
+) -> rocky_compiler::operand_check::TargetDialects {
+    let targets = config.map(|config| ModelTargets::resolve(config, config_path));
+    target_dialects_of(target_dialect, config, targets.as_ref())
+}
+
+/// [`target_dialects`] given the resolved [`ModelTargets`].
+fn target_dialects_of(
+    target_dialect: Option<Dialect>,
+    config: Option<&rocky_config::RockyConfig>,
+    targets: Option<&ModelTargets<'_>>,
+) -> rocky_compiler::operand_check::TargetDialects {
+    use rocky_compiler::operand_check::TargetDialects;
+
+    let mut out = TargetDialects::uniform(operand_target_of(
+        target_dialect,
+        config,
+        targets.map(ModelTargets::for_unlisted_model),
+    ));
+    if let Some(targets) = targets {
+        for model in targets.by_model.keys() {
+            out.set(
+                model.clone(),
+                operand_target_for(target_dialect, config, Some(targets), model),
+            );
+        }
+    }
+    out
+}
+
+/// [`operand_target_for`] given the warehouses the model runs on.
+fn operand_target_of(
+    target_dialect: Option<Dialect>,
+    config: Option<&rocky_config::RockyConfig>,
+    adapters: Option<Vec<&rocky_config::AdapterConfig>>,
+) -> rocky_compiler::operand_check::OperandTarget {
     use rocky_compiler::operand_check::{OperandDialect, OperandTarget};
 
     if let Some(dialect) = target_dialect {
         return Some(OperandDialect::from(dialect)).into();
     }
-    if let Some(targets) = targets {
-        let adapters = targets.for_model(model);
-        if !adapters.is_empty() {
-            let mut dialects = Vec::new();
-            let mut unruled = Vec::new();
-            for adapter in adapters {
-                match OperandDialect::from_adapter_type(&adapter.adapter_type) {
-                    Some(d) if !dialects.contains(&d) => dialects.push(d),
-                    Some(_) => {}
-                    None if !unruled.contains(&adapter.adapter_type) => {
-                        unruled.push(adapter.adapter_type.clone());
-                    }
-                    None => {}
+    if let Some(adapters) = adapters
+        && !adapters.is_empty()
+    {
+        let mut dialects = Vec::new();
+        let mut unruled = Vec::new();
+        for adapter in adapters {
+            match OperandDialect::from_adapter_type(&adapter.adapter_type) {
+                Some(d) if !dialects.contains(&d) => dialects.push(d),
+                Some(_) => {}
+                None if !unruled.contains(&adapter.adapter_type) => {
+                    unruled.push(adapter.adapter_type.clone());
                 }
+                None => {}
             }
-            if dialects.is_empty()
-                && let Some(d) = config.and_then(|c| c.portability.target_dialect)
-            {
-                return Some(OperandDialect::from(d)).into();
-            }
-            return OperandTarget::Targets { dialects, unruled };
         }
+        if dialects.is_empty()
+            && let Some(d) = config.and_then(|c| c.portability.target_dialect)
+        {
+            return Some(OperandDialect::from(d)).into();
+        }
+        return OperandTarget::Targets { dialects, unruled };
     }
     config
         .and_then(|c| c.portability.target_dialect)
@@ -1136,11 +1191,21 @@ impl<'c> ModelTargets<'c> {
 
     /// The warehouses `model` can run on. Empty when nothing is configured.
     fn for_model(&self, model: &str) -> Vec<&'c rocky_config::AdapterConfig> {
-        let mut out = self
-            .by_model
-            .get(model)
-            .cloned()
-            .unwrap_or_else(|| self.unclaimed.clone());
+        match self.by_model.get(model) {
+            Some(claimed) => self.with_everywhere(claimed.clone()),
+            None => self.for_unlisted_model(),
+        }
+    }
+
+    /// The warehouses a model no pipeline lists by name can run on.
+    fn for_unlisted_model(&self) -> Vec<&'c rocky_config::AdapterConfig> {
+        self.with_everywhere(self.unclaimed.clone())
+    }
+
+    fn with_everywhere(
+        &self,
+        mut out: Vec<&'c rocky_config::AdapterConfig>,
+    ) -> Vec<&'c rocky_config::AdapterConfig> {
         for adapter in &self.everywhere {
             push_unique(&mut out, adapter);
         }
@@ -2350,6 +2415,52 @@ schema_template = "s"
         assert_eq!(ch[0].0, "W042", "{ch:?}");
         assert!(ch[0].1.contains("no operand rules"), "{ch:?}");
         assert!(!ch[0].1.contains("no target dialect configured"), "{ch:?}");
+    }
+
+    /// #2333: `rocky compile` types a cast for the warehouse the model's
+    /// pipeline writes to. `FLOAT` is 64-bit on PostgreSQL, so a `Float64`
+    /// contract passes; `--target-dialect duckdb` makes it 32-bit (`E011`);
+    /// on ClickHouse, which has no width table, the type is not checked
+    /// (`I003`).
+    #[test]
+    fn a_cast_is_typed_for_the_warehouse_the_model_runs_on() {
+        let contract_codes = |adapters: &str, target_dialect: Option<Dialect>| {
+            let dir = TempDir::new().unwrap();
+            let config = adapter_project(dir.path(), adapters);
+            fs::create_dir_all(dir.path().join("data")).unwrap();
+            fs::write(
+                dir.path().join("data/seed.sql"),
+                "CREATE SCHEMA raw; CREATE TABLE raw.t (id INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let models = dir.path().join("models");
+            write_model(&models, "m", "SELECT CAST(id AS FLOAT) AS f FROM raw.t");
+            fs::write(
+                models.join("m.contract.toml"),
+                "[[columns]]\nname = \"f\"\ntype = \"Float64\"\n",
+            )
+            .unwrap();
+            compile_output(
+                Some(&config),
+                &dir.path().join("state.redb"),
+                &models,
+                None,
+                None,
+                false,
+                target_dialect,
+                true,
+                None,
+            )
+            .unwrap()
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.model == "m" && matches!(&*d.code, "E011" | "I003" | "E059"))
+            .map(|d| d.code.to_string())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(contract_codes(PG, None), Vec::<String>::new());
+        assert_eq!(contract_codes(PG, Some(Dialect::DuckDB)), vec!["E011"]);
+        assert_eq!(contract_codes(CH, None), vec!["I003"]);
     }
 
     /// `--deny-warnings` refuses codes that name no warning.

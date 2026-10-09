@@ -489,7 +489,10 @@ fn decimal_family_type(upper: &str) -> RockyType {
             Some((precision, scale)) => (precision.trim(), scale.trim()),
             None => (params.trim(), "0"),
         };
-        if let (Ok(precision), Ok(scale)) = (precision.parse(), scale.parse()) {
+        // A scale above the precision (`DECIMAL(10,11)`) is no type.
+        if let (Ok(precision), Ok(scale)) = (precision.parse::<u8>(), scale.parse::<u8>())
+            && scale <= precision
+        {
             return RockyType::Decimal { precision, scale };
         }
         return RockyType::Unknown;
@@ -1115,6 +1118,9 @@ mod tests {
         for malformed in [
             "NUMBER(nope)",
             "DECIMAL(10,2,3)",
+            // A scale above the precision.
+            "DECIMAL(10,11)",
+            "NUMBER(2, 3)",
             "NUMBERWANG",
             "DECIMALX",
             "NUMERIC()",

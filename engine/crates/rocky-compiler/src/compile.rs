@@ -178,6 +178,11 @@ pub struct CompilerConfig {
     /// [`ProjectContext::model_names`]. With `None`, `consumers/` is the
     /// sibling of `models_dir` and only the compiled models count.
     pub project: Option<ProjectContext>,
+    /// The warehouse each model runs on. Typecheck reads it for a `CAST` to
+    /// a type whose width differs between warehouses (`INT`, `FLOAT`,
+    /// `TIMESTAMP`, …): such a cast is typed for the model's warehouse, and
+    /// stays `Unknown` when it is not known (#2333). The default knows none.
+    pub target_dialects: crate::operand_check::TargetDialects,
 }
 
 /// Result of compilation.
@@ -453,12 +458,12 @@ pub fn compile_project(
     // 3. Type check (with model SQL/paths for reference tracking)
     let join_keys_acc = Arc::new(AtomicU64::new(0));
     let tc_start = Instant::now();
-    let mut type_check = typecheck::typecheck_project_with_models(
+    let mut type_check = typecheck::typecheck_project_for_targets(
         &semantic_graph,
         &config.source_schemas,
-        None,
         &project.models,
         Some(&join_keys_acc),
+        &config.target_dialects,
     );
     timings.typecheck_ms = tc_start.elapsed().as_millis() as u64;
     timings.typecheck_join_keys_ms = join_keys_acc.load(Ordering::Relaxed);
@@ -474,7 +479,9 @@ pub fn compile_project(
             validate_all_contracts(
                 &contracts,
                 &type_check.typed_models,
-                config.strict_contracts.then_some(&semantic_graph),
+                config
+                    .strict_contracts
+                    .then_some((&semantic_graph, &config.target_dialects)),
             )
         };
         (diagnostics, files)
@@ -660,7 +667,8 @@ pub fn compile_incremental(
     // (It used to name a second field too; that field is now derived from this
     // one, so there is only one thing to hold steady.) Source-schema
     // changes affect every downstream model, so if they shift the caller
-    // must invoke `compile` directly rather than this path.
+    // must invoke `compile` directly rather than this path. The same holds
+    // for `config.target_dialects`: a changed target retypes every cast.
     // The LSP constructs `CompilerConfig` once per workspace-init
     // (see `RockyLsp::config_for_compile`), so this invariant holds in
     // practice.
@@ -762,6 +770,7 @@ pub fn compile_incremental(
         &affected,
         &previous.type_check,
         Some(&join_keys_acc),
+        &config.target_dialects,
     );
     let typecheck_ms = tc_start.elapsed().as_millis() as u64;
     let typecheck_join_keys_ms = join_keys_acc.load(Ordering::Relaxed);
@@ -778,7 +787,9 @@ pub fn compile_incremental(
             validate_all_contracts(
                 &contracts,
                 &type_check.typed_models,
-                config.strict_contracts.then_some(&semantic_graph),
+                config
+                    .strict_contracts
+                    .then_some((&semantic_graph, &config.target_dialects)),
             )
         };
         (diagnostics, files)
@@ -1052,12 +1063,34 @@ fn load_contract_map(
     })
 }
 
+/// Why a `CAST` target has no type, for the `E059` message. The width names
+/// matter only when the model's warehouse is not known (#2333).
+fn cast_target_reason(target: &crate::operand_check::OperandTarget) -> String {
+    const DIGITS: &str = "a bare DECIMAL names no digits, DECIMAL digits must satisfy \
+                          1 <= p <= 38 and 0 <= s <= p";
+    let dialects = target.known_dialects();
+    if dialects.is_empty() {
+        format!(
+            "TINYINT, SMALLINT, INT, INTEGER, BIGINT, FLOAT, REAL and TIMESTAMP differ by \
+             warehouse and the model's warehouse is not known, {DIGITS}, and the type name \
+             may not be one Rocky maps"
+        )
+    } else {
+        let names: Vec<&str> = dialects.iter().map(|d| d.name()).collect();
+        format!(
+            "{DIGITS}, the type name may not be one Rocky maps, or it has no single type on {}",
+            names.join(", ")
+        )
+    }
+}
+
 /// Why `column` of `model` has no known type, for the `E059` message.
 fn unknown_type_reason(
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     model: &str,
     column: &str,
+    target: &crate::operand_check::OperandTarget,
 ) -> String {
     use rocky_sql::lineage::TransformKind;
     let Some(edge) = graph.producing_edge(model, column) else {
@@ -1077,20 +1110,17 @@ fn unknown_type_reason(
             format!("it reads `{source}.{source_column}` and Rocky has no schema for `{source}`")
         }
         (Some(RockyType::Unknown), TransformKind::Cast | TransformKind::TryCast) => format!(
-            "its CAST target is not one Rocky types over an unknown input (INT, INTEGER, BIGINT, FLOAT, \
-             REAL, TIMESTAMP and a bare DECIMAL differ by warehouse; DECIMAL digits must satisfy \
-             1 <= p <= 38 and 0 <= s <= p), and `{source}.{source_column}` is also \
-             of unknown type"
+            "its CAST target has no type Rocky knows ({}), and `{source}.{source_column}` is \
+             also of unknown type",
+            cast_target_reason(target)
         ),
         (Some(RockyType::Unknown), _) => {
             format!("it reads `{source}.{source_column}`, whose type is unknown")
         }
-        (Some(_), TransformKind::Cast | TransformKind::TryCast) => {
-            "its CAST target has no fixed type: INT, INTEGER, BIGINT, FLOAT, REAL, TIMESTAMP and a bare \
-             DECIMAL differ by warehouse, DECIMAL digits must satisfy 1 <= p <= 38 and 0 <= s <= p, \
-             and the type name may not be one Rocky maps"
-                .to_string()
-        }
+        (Some(_), TransformKind::Cast | TransformKind::TryCast) => format!(
+            "its CAST target has no type Rocky knows: {}",
+            cast_target_reason(target)
+        ),
         (Some(_), _) => format!(
             "the result type of the expression over `{source}.{source_column}` depends on the \
              warehouse (for example AVG over a DECIMAL), so Rocky does not state one"
@@ -1103,7 +1133,7 @@ fn unknown_type_reason(
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    strict_graph: Option<&SemanticGraph>,
+    strict_graph: Option<(&SemanticGraph, &crate::operand_check::TargetDialects)>,
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
@@ -1119,9 +1149,11 @@ fn validate_all_contracts(
         let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
             let diags = match strict_graph {
-                Some(graph) => {
-                    let reason =
-                        |column: &str| unknown_type_reason(graph, typed_models, model_name, column);
+                Some((graph, targets)) => {
+                    let target = targets.for_model(model_name);
+                    let reason = |column: &str| {
+                        unknown_type_reason(graph, typed_models, model_name, column, target)
+                    };
                     contracts::validate_contract_with(model_name, schema, contract, Some(&reason))
                 }
                 None => contracts::validate_contract(model_name, schema, contract),
@@ -1216,7 +1248,10 @@ fn decimal_family_type(upper: &str) -> RockyType {
             Some((precision, scale)) => (precision.trim(), scale.trim()),
             None => (params.trim(), "0"),
         };
-        if let (Ok(precision), Ok(scale)) = (precision.parse(), scale.parse()) {
+        // A scale above the precision (`DECIMAL(10,11)`) is no type.
+        if let (Ok(precision), Ok(scale)) = (precision.parse::<u8>(), scale.parse::<u8>())
+            && scale <= precision
+        {
             return RockyType::Decimal { precision, scale };
         }
         return RockyType::Unknown;
@@ -1970,6 +2005,110 @@ mod tests {
         }
     }
 
+    /// #2333: `CAST(amount AS FLOAT)` is 64-bit on Snowflake, so a `Float64`
+    /// contract passes there. On DuckDB `FLOAT` is 32-bit and the contract is
+    /// refused (E011). With no known warehouse the width is not known: the
+    /// type is not checked (I003), and strict contracts refuse it (E059)
+    /// with a reason that says the warehouse is not known.
+    #[test]
+    fn a_cast_over_a_typed_column_is_checked_against_the_models_warehouse() {
+        use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "name = \"m\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.sql"),
+            "SELECT CAST(amount AS FLOAT) AS f, CAST(id AS INTEGER) AS i FROM raw.orders",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.contract.toml"),
+            "[[columns]]\nname = \"f\"\ntype = \"Float64\"\n\n\
+             [[columns]]\nname = \"i\"\ntype = \"Decimal(38,0)\"\n",
+        )
+        .unwrap();
+        let config = |target: OperandTarget, strict_contracts| CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([(
+                "raw.orders".to_string(),
+                vec![
+                    TypedColumn {
+                        name: "amount".to_string(),
+                        data_type: RockyType::Float64,
+                        nullable: false,
+                    },
+                    TypedColumn {
+                        name: "id".to_string(),
+                        data_type: RockyType::Int64,
+                        nullable: false,
+                    },
+                ],
+            )]),
+            target_dialects: TargetDialects::uniform(target),
+            strict_contracts,
+            ..Default::default()
+        };
+        let codes = |result: &CompileResult| -> Vec<(String, String)> {
+            let mut codes: Vec<(String, String)> = result
+                .contract_diagnostics
+                .iter()
+                .map(|d| (d.code.to_string(), d.message.to_string()))
+                .collect();
+            codes.sort();
+            codes
+        };
+
+        let snowflake = compile(&config(Some(OperandDialect::Snowflake).into(), true)).unwrap();
+        let columns = &snowflake.type_check.typed_models["m"];
+        assert_eq!(
+            (columns[0].data_type.clone(), columns[0].nullable),
+            (RockyType::Float64, false)
+        );
+        assert_eq!(
+            (columns[1].data_type.clone(), columns[1].nullable),
+            (
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0
+                },
+                false
+            )
+        );
+        assert!(codes(&snowflake).is_empty(), "{:?}", codes(&snowflake));
+
+        let duckdb = compile(&config(Some(OperandDialect::DuckDb).into(), false)).unwrap();
+        let columns = &duckdb.type_check.typed_models["m"];
+        assert_eq!(columns[0].data_type, RockyType::Float32);
+        assert_eq!(columns[1].data_type, RockyType::Int32);
+        let e011: Vec<String> = codes(&duckdb)
+            .into_iter()
+            .filter(|(code, _)| code == "E011")
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(e011.len(), 2, "{e011:?}");
+
+        let unknown = compile(&config(OperandTarget::Unconfigured, false)).unwrap();
+        let columns = &unknown.type_check.typed_models["m"];
+        assert_eq!(columns[0].data_type, RockyType::Unknown);
+        assert_eq!(columns[1].data_type, RockyType::Unknown);
+        let found: Vec<String> = codes(&unknown).into_iter().map(|(code, _)| code).collect();
+        assert_eq!(found, vec!["I003", "I003"]);
+
+        let strict = compile(&config(OperandTarget::Unconfigured, true)).unwrap();
+        let e059: Vec<(String, String)> = codes(&strict);
+        assert_eq!(e059.len(), 2, "{e059:?}");
+        for (code, message) in &e059 {
+            assert_eq!(code, "E059");
+            assert!(
+                message.contains("the model's warehouse is not known"),
+                "{message}"
+            );
+        }
+    }
+
     #[test]
     fn cast_over_grouped_aggregate_is_nullable_under_outer_join_propagation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1993,6 +2132,10 @@ mod tests {
                     nullable: false,
                 }],
             )]),
+            // `BIGINT` is typed only for a known warehouse (#2333).
+            target_dialects: crate::operand_check::TargetDialects::uniform(
+                Some(crate::operand_check::OperandDialect::DuckDb).into(),
+            ),
             ..Default::default()
         };
         for join in ["", "LEFT JOIN raw.orders r ON o.id = r.id"] {
@@ -2062,6 +2205,9 @@ mod tests {
         for malformed in [
             "DECIMAL(a,b)",
             "DECIMAL(10,2,3)",
+            // A scale above the precision.
+            "DECIMAL(10,11)",
+            "NUMERIC(2, 3)",
             "NUMERIC()",
             "NUMERICWANG",
             "DECIMALX",
@@ -2131,6 +2277,7 @@ mod tests {
             "DECIMAL(10)",
             "DECIMAL(a,b)",
             "DECIMAL(10,2,3)",
+            "DECIMAL(10,11)",
             "NUMERIC()",
             "NUMERICWANG",
             "DECIMALX",

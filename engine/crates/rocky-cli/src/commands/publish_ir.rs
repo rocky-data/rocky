@@ -144,6 +144,7 @@ pub fn run_publish_ir(
     };
 
     let config = CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),

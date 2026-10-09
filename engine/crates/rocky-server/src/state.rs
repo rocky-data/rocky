@@ -593,6 +593,9 @@ impl ServerState {
             preserve_authored_sql: false,
             external_dependencies: Default::default(),
             project: None,
+            // The language server and `rocky serve` do not resolve each model's
+            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            target_dialects: Default::default(),
         };
 
         // The compile pass walks the model directory, parses every

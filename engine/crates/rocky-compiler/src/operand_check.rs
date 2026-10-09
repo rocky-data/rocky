@@ -126,7 +126,8 @@ use sqlparser::parser::Parser;
 use crate::diagnostic::{Diagnostic, E042, E043, SourceSpan, W042, W043};
 use crate::semantic::SemanticGraph;
 use crate::typecheck::{
-    TypeScope, infer_expr_type, infer_query_types, rename_relation_columns, select_type_scope,
+    InferEnv, RelationRef, TypeScope, infer_expr_type, infer_query_types, rename_relation_columns,
+    select_type_scope,
 };
 use crate::types::{RockyType, TypedColumn};
 
@@ -367,6 +368,48 @@ impl From<Option<OperandDialect>> for OperandTarget {
     }
 }
 
+impl OperandTarget {
+    /// The dialects a model runs on, when every one of them is known. Empty
+    /// when no target is configured, or when one target is a warehouse this
+    /// crate has no rules for (ClickHouse, Spark): a type that depends on the
+    /// warehouse is then not known.
+    pub fn known_dialects(&self) -> &[OperandDialect] {
+        match self {
+            Self::Targets { dialects, unruled } if unruled.is_empty() => dialects,
+            Self::Targets { .. } | Self::Unconfigured => &[],
+        }
+    }
+}
+
+/// The warehouse each model runs on, for the passes that need it inside the
+/// compile: today the type of a `CAST` target whose width differs between
+/// warehouses (#2333). The default knows no target for any model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetDialects {
+    by_model: std::collections::HashMap<String, OperandTarget>,
+    otherwise: OperandTarget,
+}
+
+impl TargetDialects {
+    /// Every model runs on `target`.
+    pub fn uniform(target: OperandTarget) -> Self {
+        Self {
+            by_model: std::collections::HashMap::new(),
+            otherwise: target,
+        }
+    }
+
+    /// `model` runs on `target`, whatever the default says.
+    pub fn set(&mut self, model: impl Into<String>, target: OperandTarget) {
+        self.by_model.insert(model.into(), target);
+    }
+
+    /// The target of `model`.
+    pub fn for_model(&self, model: &str) -> &OperandTarget {
+        self.by_model.get(model).unwrap_or(&self.otherwise)
+    }
+}
+
 /// Resolve the verdict, and the dialect that gives it when the target is
 /// known: the most severe verdict across the target dialects, or the least
 /// severe one across every dialect when no ruled target is known.
@@ -582,7 +625,12 @@ fn walk_query<'a>(
             let cte_lookup =
                 |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
             walk_query(&cte.query, &cte_lookup, ctx);
-            let mut columns = infer_query_types(&cte.query, &cte_lookup)
+            let relation = |name: &str| cte_lookup(name).map(RelationRef::from);
+            let env = InferEnv {
+                lookup: &relation,
+                target: &ctx.target,
+            };
+            let mut columns = infer_query_types(&cte.query, env)
                 .unwrap_or_default()
                 .columns;
             rename_relation_columns(&mut columns, &cte.alias);
@@ -678,7 +726,12 @@ fn walk_select<'a>(
         }
         join_on_constraints(from, &mut on_exprs);
     }
-    let (_, scope) = select_type_scope(select, lookup);
+    let relation = |name: &str| lookup(name).map(RelationRef::from);
+    let env = InferEnv {
+        lookup: &relation,
+        target: &ctx.target,
+    };
+    let (_, scope) = select_type_scope(select, env);
 
     for item in &select.projection {
         match item {
