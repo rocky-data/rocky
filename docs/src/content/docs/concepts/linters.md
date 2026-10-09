@@ -18,7 +18,7 @@ Both run as part of `rocky compile`. Both also appear as inline diagnostics in t
 
 ## Semantic lints, not style lints
 
-A SQL style linter such as SQLFluff checks the text of a query: indentation, alias conventions, ambiguous references, unused columns. That work is worth doing, and Rocky does not replace it. Run a style linter alongside Rocky if you want consistent formatting.
+A SQL style linter such as SQLFluff checks the text of a query: indentation, alias conventions, ambiguous references, unused columns. [`rocky lint`](/reference/commands/modeling/#rocky-lint) covers a small set of these rules, such as bare joins and unqualified columns. It is not a full SQLFluff replacement. Run a style linter alongside Rocky if you want more.
 
 Rocky's lints answer a different question. P001 and P002 are **semantic**. They read the compiled model graph, not one query in isolation, so they see breakage a style linter cannot. P001 knows a construct will not run on your target warehouse. P002 knows a `SELECT *` will pass an upstream schema change straight through to a named downstream consumer. A query can be perfectly formatted and still fail both.
 

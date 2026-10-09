@@ -2,9 +2,10 @@
 //
 //   node screenshots.mjs --url <printed-url> --out <dir> <name>=<ui-path> [...]
 //
-// `<printed-url>` is the address `rocky serve --ui` printed, token fragment
-// and all. The page is opened once with it, so the SPA moves the token into
-// sessionStorage; every later shot navigates inside the same tab by address.
+// `<printed-url>` is the address `rocky serve --ui` printed
+// (http://127.0.0.1:<port>/login?t=<secret>). The page is opened once with it,
+// so the server sets the session cookie and redirects to /ui/; every later
+// shot navigates inside the same browser context by address.
 //
 // Each shot waits until the page text stops changing and no "loading" text is
 // left. A console error or an uncaught exception fails the run, as in
@@ -44,7 +45,7 @@ page.on("console", (msg) => msg.type() === "error" && errors.push(msg.text()));
 page.on("pageerror", (err) => errors.push(String(err)));
 
 await page.goto(url);
-await page.waitForFunction(() => !location.hash.includes("token"), null, { timeout: 10_000 });
+await page.waitForURL(/\/ui\//, { timeout: 10_000 });
 const origin = new URL(url).origin;
 
 // The lanes' in-flight lines all end in an ellipsis: "Loading the digest…",

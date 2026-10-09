@@ -272,7 +272,12 @@ fn is_webhook_trigger_path(path: &str) -> bool {
 /// request
 ///   ├─ exempt path? ────────────────► handler   (health, HMAC webhook)
 ///   ├─ no token configured? ────────► handler   (loopback-only mode)
-///   ├─ token missing / wrong? ──────► 401 unauthorized
+///   ├─ Bearer header present
+///   │    └─ wrong? ─────────────────► 401 unauthorized
+///   ├─ no Bearer header (--ui only): the session cookie
+///   │    ├─ missing / wrong? ───────► 401 unauthorized
+///   │    └─ unsafe method without an allowed Origin
+///   │       AND `X-Rocky-UI: 1`? ───► 403 ui_write_not_from_ui
 ///   ├─ scope Full ──────────────────► handler
 ///   └─ scope ReadOnly
 ///        ├─ GET / HEAD / OPTIONS ───► handler
@@ -299,18 +304,75 @@ pub async fn require_bearer_token(
         return next.run(request).await;
     };
 
-    let provided = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    let Some(provided) = provided else {
-        return unauthorized_response();
-    };
-
-    if !constant_time_eq(provided.as_bytes(), token.secret.as_bytes()) {
-        return unauthorized_response();
+    let authorization = request.headers().get(header::AUTHORIZATION);
+    match authorization {
+        // A Bearer header decides on its own: a wrong one is a 401 even when
+        // a valid cookie rides along, so one request never mixes credentials.
+        Some(value) => {
+            let Some(provided) = value.to_str().ok().and_then(|h| h.strip_prefix("Bearer ")) else {
+                return unauthorized_response();
+            };
+            if !constant_time_eq(provided.as_bytes(), token.secret.as_bytes()) {
+                return unauthorized_response();
+            }
+        }
+        // No Bearer header: the `--ui` session cookie, if this server has a
+        // UI. A browser adds a cookie by itself, so a cookie-authenticated
+        // write must also prove it came from this server's own page.
+        None => {
+            let Some(ui) = state.ui.as_ref() else {
+                return unauthorized_response();
+            };
+            let cookies: Vec<&str> = request
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if !crate::ui_session::cookie_authenticates(&state.ui_session_key, token, &cookies) {
+                return unauthorized_response();
+            }
+            if !is_safe_method(request.method()) {
+                // Present AND this server's own origin: a missing Origin is
+                // refused too. Stricter than the `--ui` Origin guard, which
+                // accepts any port on a loopback host: a page served by
+                // another local app shares this cookie (cookies do not
+                // separate ports), so only the exact `scheme://Host` the
+                // request names, or an `--allowed-origin` entry, may write.
+                let host = request
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(str::to_owned)
+                    .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
+                let origin_ok = ui.host_allowed(host.as_deref().unwrap_or(""))
+                    && request
+                        .headers()
+                        .get(header::ORIGIN)
+                        .and_then(|o| o.to_str().ok())
+                        .is_some_and(|o| {
+                            crate::ui_session::write_origin_allowed(
+                                o,
+                                host.as_deref(),
+                                &state.allowed_origins,
+                            )
+                        });
+                let marker_ok = request
+                    .headers()
+                    .get(crate::ui_session::UI_WRITE_HEADER)
+                    .is_some_and(|v| v.as_bytes() == b"1");
+                if !(origin_ok && marker_ok) {
+                    return envelope_response(
+                        StatusCode::FORBIDDEN,
+                        "ui_write_not_from_ui",
+                        "a write with the UI session cookie must carry this server's Origin \
+                         and `X-Rocky-UI: 1`",
+                        "make changes from the page this server serves, or send \
+                         `Authorization: Bearer <token>` instead of the cookie",
+                    );
+                }
+            }
+        }
     }
 
     // Authenticated. Now: is this token allowed to do what it is asking?
@@ -447,7 +509,7 @@ fn envelope_response(status: StatusCode, code: &str, message: &str, hint: &str) 
 /// Constant-time byte comparison. Returns `true` only if both slices have
 /// the same length *and* every byte matches; runtime is independent of
 /// the position of the first mismatch.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -686,6 +748,81 @@ mod tests {
         // Doesn't panic; the layer rejects cross-origin without an
         // explicit allow_origin call.
         let _layer = build_cors_layer(&[]);
+    }
+
+    /// Send a CORS preflight asking to send `X-Rocky-UI` from `origin`
+    /// through [`build_cors_layer`], and return the response headers.
+    async fn preflight_for_x_rocky_ui(allowed: &[String], origin: &str) -> axum::http::HeaderMap {
+        use tower::ServiceExt as _;
+        let app = axum::Router::new()
+            .route("/api/v1/jobs/apply", axum::routing::post(|| async { "ok" }))
+            .layer(build_cors_layer(allowed));
+        let request = axum::http::Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/v1/jobs/apply")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-rocky-ui")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap().headers().clone()
+    }
+
+    /// **A cross-origin page cannot preflight `X-Rocky-UI`.** A cookie write
+    /// needs that header, and a browser sends a custom header cross-origin
+    /// only after a preflight that allows it. So the preflight must never
+    /// allow it:
+    ///
+    /// - no `--allowed-origin`: no `Access-Control-Allow-Origin` and no
+    ///   `Access-Control-Allow-Headers` at all;
+    /// - one allowed origin, asked from another origin: no
+    ///   `Access-Control-Allow-Origin` (so the browser refuses);
+    /// - one allowed origin, asked from that origin: the origin is allowed
+    ///   (that is what the flag is for), but the allowed headers stay
+    ///   `authorization, content-type`, without `x-rocky-ui`, so the browser
+    ///   still refuses to send it. tower-http answers the configured header
+    ///   list whatever is asked, so the list itself is what is pinned.
+    #[tokio::test]
+    async fn cors_preflight_never_allows_x_rocky_ui() {
+        let headers = preflight_for_x_rocky_ui(&[], "https://evil.example").await;
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{headers:?}"
+        );
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none(),
+            "{headers:?}"
+        );
+
+        let allowed = ["https://portal.example.test".to_string()];
+        let headers = preflight_for_x_rocky_ui(&allowed, "https://evil.example").await;
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{headers:?}"
+        );
+
+        let headers = preflight_for_x_rocky_ui(&allowed, "https://portal.example.test").await;
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://portal.example.test"),
+            "{headers:?}"
+        );
+        let allow_headers: Vec<String> = headers
+            .get_all(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .iter()
+            .flat_map(|v| v.to_str().unwrap_or("").split(','))
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
+        assert!(
+            !allow_headers.iter().any(|h| h == "x-rocky-ui" || h == "*"),
+            "{allow_headers:?}"
+        );
+        assert!(
+            allow_headers.contains(&"authorization".to_string()),
+            "{allow_headers:?}"
+        );
     }
 
     #[test]

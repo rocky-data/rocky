@@ -122,12 +122,12 @@ pub(crate) fn check_group_by(
 
 /// CTEs visible at a point in the query, innermost last.
 #[derive(Clone, Default)]
-struct Env {
-    ctes: Vec<(String, Option<HashSet<String>>)>,
+pub(crate) struct Env {
+    pub(crate) ctes: Vec<(String, Option<HashSet<String>>)>,
 }
 
 impl Env {
-    fn lookup(&self, name: &str) -> Option<&Option<HashSet<String>>> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<&Option<HashSet<String>>> {
         self.ctes
             .iter()
             .rev()
@@ -137,11 +137,11 @@ impl Env {
 }
 
 /// A relation bound in one `FROM` clause.
-struct Binding {
+pub(crate) struct Binding {
     /// The name a qualifier uses: the alias, or the table's last name part.
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Output names known to exist. `None` when the relation is unknown.
-    columns: Option<HashSet<String>>,
+    pub(crate) columns: Option<HashSet<String>>,
 }
 
 struct Finding {
@@ -191,7 +191,7 @@ impl Finding {
     }
 }
 
-fn lower(ident: &ast::Ident) -> String {
+pub(crate) fn lower(ident: &ast::Ident) -> String {
     ident.value.to_lowercase()
 }
 
@@ -440,7 +440,7 @@ fn collect_names(expr: &Expr, into: &mut HashSet<String>) {
 
 /// The output names a query certainly produces. Partial knowledge is fine:
 /// the set is only ever used to prove that a name exists.
-fn query_output_names(query: &Query) -> Option<HashSet<String>> {
+pub(crate) fn query_output_names(query: &Query) -> Option<HashSet<String>> {
     fn body_names(body: &SetExpr) -> Option<HashSet<String>> {
         match body {
             SetExpr::Select(select) => {
@@ -471,7 +471,7 @@ fn query_output_names(query: &Query) -> Option<HashSet<String>> {
     body_names(&query.body)
 }
 
-fn collect_bindings(
+pub(crate) fn collect_bindings(
     factor: &TableFactor,
     env: &Env,
     relation_columns: &dyn Fn(&str) -> Option<Vec<String>>,
@@ -562,7 +562,7 @@ fn collect_bindings(
 }
 
 /// Queries directly nested in `node`, not counting queries nested in those.
-fn immediate_subqueries<T: Visit>(node: &T) -> Vec<Query> {
+pub(crate) fn immediate_subqueries<T: Visit>(node: &T) -> Vec<Query> {
     struct Collector {
         depth: usize,
         found: Vec<Query>,
@@ -1015,7 +1015,7 @@ fn is_scalar(name: &str) -> bool {
 
 /// Date-part keywords that appear as bare identifiers in function arguments
 /// (`DATEADD(day, 1, d)`, `DATE_TRUNC(month, d)`). They are not columns.
-fn is_date_part(name: &str) -> bool {
+pub(crate) fn is_date_part(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "year"
@@ -1049,7 +1049,7 @@ fn is_date_part(name: &str) -> bool {
 }
 
 /// Unquoted names that are niladic functions, not columns.
-fn is_keyword_value(name: &str) -> bool {
+pub(crate) fn is_keyword_value(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "current_date"

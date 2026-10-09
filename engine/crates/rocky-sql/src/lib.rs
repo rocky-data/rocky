@@ -12,6 +12,7 @@ pub mod normalize;
 pub mod parser;
 pub mod portability;
 pub mod pragma;
+pub mod style_lint;
 pub mod transpile;
 pub mod udf_body;
 pub mod validation;

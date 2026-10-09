@@ -43,7 +43,7 @@ docker run --rm \
   serve --host 0.0.0.0 --ui
 ```
 
-The server prints one line with the address to open, `Rocky UI: http://localhost:8080/ui/#token=...`. Open it. The token travels in the URL fragment, which never reaches the server, and the page clears it after reading it once.
+The server prints one line with the address to open, `Rocky UI: http://localhost:8080/login?t=...`. Open it. The server checks the token, sets a session cookie, and redirects to `/ui/`. A proxy in front may log the query of `/login`: configure it not to. See [sign-in](/guides/browser-ui/#sign-in-and-the-session-cookie).
 
 ```
  browser ── http://localhost:8080/ui/ ──► host :8080 ──► container :8080 (rocky serve)

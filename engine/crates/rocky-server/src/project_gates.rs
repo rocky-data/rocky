@@ -12,6 +12,9 @@
 //!
 //! With nothing installed (the standalone `rocky-lsp` binary, unit tests) the
 //! compile result is left as the compiler produced it.
+//!
+//! `rocky ci` calls the same `rocky-cli` function directly, through the gate
+//! hook of `rocky_engine::test_runner::TestRunInputs`.
 
 use std::path::Path;
 use std::sync::OnceLock;

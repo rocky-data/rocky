@@ -4,9 +4,11 @@
 //! output against contracts, and reports pass/fail.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rocky_compiler::compile::CompilerConfig;
+use rocky_compiler::compile::{CompilerConfig, default_type_mapper};
+use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
+use rocky_compiler::types::TypedColumn;
 use rocky_core::models::load_unit_tests_from_tree;
 use rocky_core::unit_test::{
     MismatchKind, RowMismatch, UnitTestDef, UnitTestResult, fixture_to_sql, json_to_sql_literal,
@@ -62,32 +64,247 @@ pub struct TestResult {
     pub all_models: Vec<String>,
 }
 
-/// Run tests on a project.
+/// The models a test run compiles and executes.
+#[derive(Debug)]
+pub enum TestModels {
+    /// Every model under the run's `models_dir`.
+    Dir,
+    /// A model set the caller already loaded, such as every transformation
+    /// pipeline's models joined into one project graph. The run's
+    /// `models_dir` still anchors `functions/` and the compiler config.
+    Preloaded(Vec<rocky_core::models::Model>),
+}
+
+/// Everything one local test run reads.
+pub struct TestRunInputs<'a> {
+    /// The models directory. Anchors `functions/` beside it.
+    pub models_dir: &'a Path,
+    /// The project root. The seed file is `<project_root>/data/seed.sql`.
+    pub project_root: &'a Path,
+    /// Which models to compile and execute.
+    pub models: TestModels,
+    /// An explicit contracts directory, if any.
+    pub contracts_dir: Option<&'a Path>,
+    /// Report only this model (its dependencies still execute).
+    pub model_filter: Option<&'a str>,
+    /// Per-run `@var(name)` substitutions.
+    pub run_vars: &'a rocky_core::run_vars::RunVars,
+    /// The project's compile checks, run on the compile result before any
+    /// model executes. An error they add fails the run without executing a
+    /// model, as a compiler error does.
+    ///
+    /// The result still holds each model's authored SQL: ephemeral upstreams
+    /// are inlined after the checks run, as `rocky compile` orders them.
+    /// `rocky ci` and `rocky test` pass the per-model-target checks of
+    /// `rocky compile` here; `None` runs none.
+    pub gates: Option<&'a CompileGates<'a>>,
+    /// Checks that judge the SQL each model executes, run after ephemeral
+    /// upstreams are inlined (`rocky compile`'s `E054` on SQL Server). An
+    /// error they add fails the run without executing a model. `None` runs
+    /// none.
+    pub inlined_gates: Option<&'a CompileGates<'a>>,
+}
+
+/// Checks a caller runs over a test run's compile result. See
+/// [`TestRunInputs::gates`].
+pub type CompileGates<'a> = dyn Fn(&mut rocky_compiler::compile::CompileResult) + 'a;
+
+impl std::fmt::Debug for TestRunInputs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestRunInputs")
+            .field("models_dir", &self.models_dir)
+            .field("project_root", &self.project_root)
+            .field("models", &self.models)
+            .field("contracts_dir", &self.contracts_dir)
+            .field("model_filter", &self.model_filter)
+            .field("run_vars", &self.run_vars)
+            .field("gates", &self.gates.is_some())
+            .field("inlined_gates", &self.inlined_gates.is_some())
+            .finish()
+    }
+}
+
+/// The seed file of a project: `<project_root>/data/seed.sql`.
+pub fn seed_path(project_root: &Path) -> PathBuf {
+    project_root.join("data").join("seed.sql")
+}
+
+/// Read the column schema of every user table in `db`, keyed
+/// `"<schema>.<table>"`.
 ///
-/// 1. Compile models
-/// 2. Execute each model locally via DuckDB (dependencies always run, even
-///    when `model_filter` is set, so the filtered model's SQL can resolve)
-/// 3. Validate output against contracts (if present)
-/// 4. Report results (filtered to `model_filter` when set)
+/// The key is the shape the SQL lineage extractor produces from a model's
+/// `FROM <schema>.<table>` clause, so the compiler lands the types on the
+/// source a model reads. Called on a database a seed file was just run in,
+/// so a compile is typed from the same tables the models execute on.
 ///
-/// `run_vars` supplies per-run `@var(name)` substitutions so a required-var
-/// model compiles under `rocky test --var name=value`; pass
-/// [`rocky_core::run_vars::RunVars::new`] when the caller has none.
+/// # Errors
+///
+/// Returns an error when the `information_schema` query fails.
+pub fn source_schemas_from_db(
+    db: &DuckDbConnector,
+) -> anyhow::Result<HashMap<String, Vec<TypedColumn>>> {
+    // One round-trip pulls every (schema, table, column, type, nullable)
+    // tuple. Filtering out DuckDB's internal schemas keeps the map scoped to
+    // user-created tables.
+    let info_sql = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
+                    FROM information_schema.columns \
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
+                    ORDER BY table_schema, table_name, ordinal_position";
+    let result = db
+        .execute_sql(info_sql)
+        .map_err(|e| anyhow::anyhow!("information_schema query failed: {e}"))?;
+
+    let mut by_table: HashMap<String, Vec<TypedColumn>> = HashMap::new();
+    for row in &result.rows {
+        let schema = row[0].as_str().unwrap_or_default();
+        let table = row[1].as_str().unwrap_or_default();
+        let column = row[2].as_str().unwrap_or_default();
+        let data_type = row[3].as_str().unwrap_or_default();
+        let nullable = row[4]
+            .as_str()
+            .is_none_or(|s| s.eq_ignore_ascii_case("yes") || s == "true" || s == "1");
+        if schema.is_empty() || table.is_empty() || column.is_empty() {
+            continue;
+        }
+        by_table
+            .entry(format!("{schema}.{table}"))
+            .or_default()
+            .push(TypedColumn {
+                name: column.to_string(),
+                data_type: default_type_mapper(data_type),
+                nullable,
+            });
+    }
+    Ok(by_table)
+}
+
+/// Run tests on the models under `models_dir`, with the seed file at
+/// `data/seed.sql` beside it. See [`run_tests_with`].
 pub fn run_tests(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> anyhow::Result<TestResult> {
+    run_tests_with(TestRunInputs {
+        models_dir,
+        project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+        models: TestModels::Dir,
+        contracts_dir,
+        model_filter,
+        run_vars,
+        gates: None,
+        inlined_gates: None,
+    })
+}
+
+/// Run tests on a project.
+///
+/// 1. Run the project's seed file, when it has one, in a fresh in-memory
+///    DuckDB, and read the schemas of the tables it made
+/// 2. Compile the models, typed from those schemas, so a contract type
+///    mismatch or a missing source column is found before execution
+/// 3. Execute each model in that same database (dependencies always run,
+///    even when `model_filter` is set, so the filtered model's SQL can
+///    resolve)
+/// 4. Report results (filtered to `model_filter` when set)
+///
+/// `run_vars` supplies per-run `@var(name)` substitutions so a required-var
+/// model compiles under `rocky test --var name=value`; pass
+/// [`rocky_core::run_vars::RunVars::new`] when the caller has none.
+pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
+    let TestRunInputs {
+        models_dir,
+        project_root,
+        models,
+        contracts_dir,
+        model_filter,
+        run_vars,
+        gates,
+        inlined_gates,
+    } = inputs;
+
+    // The seed runs before the compile, so the compile is typed from the
+    // tables the models then execute on. A seed that fails is reported after
+    // any compile error, as it was when the seed ran second.
+    let db = DuckDbConnector::in_memory()?;
+    let seed_file = seed_path(project_root);
+    let seeded = seed_file.exists();
+    let seed_error: Option<String> = if seeded {
+        let seed_sql = std::fs::read_to_string(&seed_file)?;
+        match db.execute_statement(&seed_sql) {
+            Ok(()) => {
+                info!(path = %seed_file.display(), "loaded seed data");
+                None
+            }
+            Err(e) => Some(format!("failed to load data/seed.sql: {e}")),
+        }
+    } else {
+        None
+    };
+    // A failure to read the seeded schemas is reported like a seed that
+    // failed, not as an error of the whole run.
+    let (source_schemas, seed_error) = match (seeded, seed_error) {
+        (true, None) => match source_schemas_from_db(&db) {
+            Ok(schemas) => (schemas, None),
+            Err(e) => (
+                HashMap::new(),
+                Some(format!("failed to read the seeded tables: {e:#}")),
+            ),
+        },
+        (_, error) => (HashMap::new(), error),
+    };
+    let source_provenance =
+        SourceProvenance::uniform(source_schemas.keys(), &SourceSchemaOrigin::Seed);
+
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
-        source_schemas: HashMap::new(),
+        source_schemas,
+        source_provenance,
         run_vars: run_vars.clone(),
+        // The checks in `gates` judge the authored SQL; ephemeral upstreams
+        // are inlined after them, below.
+        preserve_authored_sql: true,
         ..Default::default()
     };
 
-    let compile_result = rocky_compiler::compile::compile(&config)?;
+    let compiled = match models {
+        TestModels::Dir => rocky_compiler::compile::compile(&config),
+        TestModels::Preloaded(models) => {
+            rocky_compiler::compile::compile_preloaded_models(models, &config)
+        }
+    };
+    let mut compile_result = match compiled {
+        Ok(result) => result,
+        // A dependency cycle leaves no execution order: report its E058
+        // diagnostics as compile errors, and execute nothing.
+        Err(error) => match error.cycle_diagnostics() {
+            Some(diagnostics) => {
+                let all_models = error.cycle_models().unwrap_or_default().to_vec();
+                return Ok(cycle_result(diagnostics, all_models, model_filter));
+            }
+            None => return Err(error.into()),
+        },
+    };
+    if let Some(gates) = gates {
+        gates(&mut compile_result);
+        compile_result.has_errors |= compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
+    // The statement each model executes inlines its ephemeral upstreams. The
+    // E038 diagnostics this returns were already reported by the compile.
+    let _already_reported =
+        rocky_compiler::ephemeral::apply_ephemerals(&mut compile_result.project, true);
+    if let Some(gates) = inlined_gates {
+        gates(&mut compile_result);
+        compile_result.has_errors |= compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
 
     let mut result = TestResult {
         total: 0,
@@ -124,31 +341,16 @@ pub fn run_tests(
         return Ok(result);
     }
 
-    // Execute locally
-    let db = DuckDbConnector::in_memory()?;
-
-    // Auto-load seed data if a `data/seed.sql` file exists alongside `models/`.
-    // Lets `rocky test` work on projects (like the playground) that ship inline
-    // seed SQL without requiring users to load it manually.
-    if let Some(project_root) = models_dir.parent() {
-        let seed_path = project_root.join("data").join("seed.sql");
-        if seed_path.exists() {
-            let seed_sql = std::fs::read_to_string(&seed_path)?;
-            if let Err(e) = db.execute_statement(&seed_sql) {
-                result.failures.push((
-                    "seed".to_string(),
-                    format!("failed to load data/seed.sql: {e}"),
-                ));
-                result.model_results.push(ModelTestResult {
-                    model: "seed".to_string(),
-                    status: ModelTestStatus::Fail,
-                    error: Some(format!("failed to load data/seed.sql: {e}")),
-                });
-                result.total = result.model_results.len();
-                return Ok(result);
-            }
-            info!(path = %seed_path.display(), "loaded seed data");
-        }
+    // A seed that failed leaves nothing for the models to read.
+    if let Some(error) = seed_error {
+        result.failures.push(("seed".to_string(), error.clone()));
+        result.model_results.push(ModelTestResult {
+            model: "seed".to_string(),
+            status: ModelTestStatus::Fail,
+            error: Some(error),
+        });
+        result.total = result.model_results.len();
+        return Ok(result);
     }
 
     // Always execute every model so a filtered model's upstream dependencies
@@ -191,6 +393,37 @@ pub fn run_tests(
     );
 
     Ok(result)
+}
+
+/// The result of a run refused by a dependency cycle: every E058 diagnostic,
+/// and a failure for each model on the cycle (filtered to `model_filter`).
+fn cycle_result(
+    diagnostics: &[rocky_compiler::diagnostic::Diagnostic],
+    all_models: Vec<String>,
+    model_filter: Option<&str>,
+) -> TestResult {
+    let mut result = TestResult {
+        total: 0,
+        passed: 0,
+        failures: Vec::new(),
+        model_results: Vec::new(),
+        diagnostics: diagnostics.to_vec(),
+        all_models,
+    };
+    for d in diagnostics {
+        if include_model(model_filter, &d.model) {
+            result
+                .failures
+                .push((d.model.clone(), d.message.to_string()));
+            result.model_results.push(ModelTestResult {
+                model: d.model.clone(),
+                status: ModelTestStatus::Fail,
+                error: Some(d.message.to_string()),
+            });
+        }
+    }
+    result.total = result.model_results.len();
+    result
 }
 
 /// Filter helper: include a model when there's no filter, or when the filter
@@ -246,11 +479,37 @@ pub fn run_unit_tests(
         models_dir: models_dir.to_path_buf(),
         ..Default::default()
     };
-    let compile_result = rocky_compiler::compile::compile(&config)?;
+    let compiled = rocky_compiler::compile::compile(&config);
 
     // Stable, name-sorted iteration so output order is deterministic.
     let mut names: Vec<&String> = unit_tests.keys().collect();
     names.sort();
+
+    // A dependency cycle fails every unit test. [`run_tests_with`] reports
+    // the cycle itself, as E058 diagnostics.
+    let compile_result = match compiled {
+        Ok(result) => result,
+        Err(error) if error.cycle_diagnostics().is_some() => {
+            let results = names
+                .into_iter()
+                .filter(|name| include_model(model_filter, name))
+                .flat_map(|name| {
+                    unit_tests[name].iter().map(move |test| UnitTestResult {
+                        model: name.clone(),
+                        test: test.name.clone(),
+                        passed: false,
+                        error: Some(format!(
+                            "model '{name}' is not run: the project has a dependency cycle \
+                             (E058)"
+                        )),
+                        mismatches: Vec::new(),
+                    })
+                })
+                .collect();
+            return Ok(UnitTestRun { results });
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let mut results = Vec::new();
     for name in names {
@@ -907,5 +1166,377 @@ mod tests {
             run.results[0].error
         );
         assert!(run.results[0].passed);
+    }
+
+    fn write_full_refresh(dir: &Path, name: &str, sql: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+    }
+
+    /// A seed with one `src.orders` table, and `models/stg` reading it.
+    fn scaffold_seeded_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(
+            seed_path(dir.path()),
+            "CREATE SCHEMA src;\n\
+             CREATE TABLE src.orders AS SELECT 1::BIGINT AS id, 'a' AS status;\n",
+        )
+        .unwrap();
+        write_full_refresh(
+            &dir.path().join("models"),
+            "stg",
+            "SELECT id, status FROM src.orders",
+        );
+        dir
+    }
+
+    /// Two model roots joined into one preloaded set run in one database, in
+    /// dependency order: `reporting/rep` reads `models/stg`'s output. Alone,
+    /// `reporting/` cannot see it.
+    #[test]
+    fn preloaded_models_from_two_roots_run_in_one_database() {
+        let dir = scaffold_seeded_project();
+        let reporting = dir.path().join("reporting");
+        write_full_refresh(&reporting, "rep", "SELECT id FROM stg");
+        let models_dir = dir.path().join("models");
+
+        let mut models = rocky_compiler::models_loader::load_project_models(&models_dir, None)
+            .expect("load models");
+        models.extend(
+            rocky_compiler::models_loader::load_project_models(&reporting, None)
+                .expect("load reporting"),
+        );
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Preloaded(models),
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
+            inlined_gates: None,
+        })
+        .unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.passed, 2, "{:?}", result.model_results);
+
+        let alone = run_tests(
+            &reporting,
+            None,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            alone.failures.iter().any(|(name, _)| name == "rep"),
+            "reporting/ alone should not see stg: {:?}",
+            alone.model_results
+        );
+    }
+
+    /// The compile is typed from the seed the models run on, so a contract
+    /// that declares the wrong type is E011 before anything executes.
+    /// Without the seed every column was Unknown and the type check skipped.
+    #[test]
+    fn contract_type_mismatch_is_found_from_the_seed() {
+        let dir = scaffold_seeded_project();
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::write(
+            contracts.join("stg.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"String\"\nnullable = true\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+
+        let result = run_tests(
+            &models_dir,
+            Some(&contracts),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            result.diagnostics.iter().any(|d| &*d.code == "E011"),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(!result.failures.is_empty());
+    }
+
+    /// The control: the contract's type matches the seed, so the grounded
+    /// compile is clean and both models pass.
+    #[test]
+    fn contract_with_the_seed_type_passes() {
+        let dir = scaffold_seeded_project();
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::write(
+            contracts.join("stg.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+
+        let result = run_tests(
+            &models_dir,
+            Some(&contracts),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::diagnostic::Diagnostic::is_error),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.passed, 1);
+    }
+
+    /// A stale seed table with a model's name does not shadow the model: a
+    /// reader of `stg` gets the model's columns, not the seed table's.
+    #[test]
+    fn a_seed_table_named_like_a_model_does_not_shadow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(
+            seed_path(dir.path()),
+            "CREATE TABLE main.stg AS SELECT 'stale' AS other;\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        write_full_refresh(&models_dir, "stg", "SELECT 1::BIGINT AS id");
+        write_full_refresh(&models_dir, "rep", "SELECT id FROM stg");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::write(
+            contracts.join("rep.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n\n\
+             [rules]\nrequired = [\"id\"]\n",
+        )
+        .unwrap();
+
+        let result = run_tests(
+            &models_dir,
+            Some(&contracts),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::diagnostic::Diagnostic::is_error),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+    }
+
+    /// A model reading a column the seed's table lacks gets W041 from the
+    /// grounded compile, which names the missing column.
+    #[test]
+    fn a_column_the_seed_lacks_is_w041() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        write_full_refresh(&models_dir, "stg", "SELECT id, segment FROM src.orders");
+
+        let result = run_tests(
+            &models_dir,
+            None,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "W041" && d.message.contains("segment")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    /// A dependency cycle is reported as E058 compile errors, one per model
+    /// on it, and no model executes.
+    #[test]
+    fn a_dependency_cycle_is_e058_and_executes_nothing() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        write_full_refresh(
+            &models_dir,
+            "fct",
+            "SELECT id FROM stg WHERE id IN (SELECT id FROM ltv)",
+        );
+        write_full_refresh(&models_dir, "ltv", "SELECT id FROM fct");
+
+        let result = run_tests(
+            &models_dir,
+            None,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        let mut cycle: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == rocky_compiler::diagnostic::E058 && d.is_error())
+            .map(|d| d.model.as_str())
+            .collect();
+        cycle.sort_unstable();
+        assert_eq!(cycle, ["fct", "ltv"], "{:?}", result.diagnostics);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failures.len(), 2, "{:?}", result.failures);
+        assert!(
+            result.all_models.iter().any(|m| m == "stg"),
+            "every loaded model is listed: {:?}",
+            result.all_models
+        );
+    }
+
+    /// On a dependency cycle every unit test fails, naming E058, instead of
+    /// the whole run failing with the bare cycle error.
+    #[test]
+    fn a_dependency_cycle_fails_every_unit_test() {
+        let (_dir, models) = scaffold_unit_test_project(true);
+        std::fs::write(models.join("orders.sql"), "SELECT id, amount FROM flagged").unwrap();
+        let run = run_unit_tests(&models, None).unwrap();
+        assert_eq!(run.results.len(), 1, "{:?}", run.results);
+        let result = &run.results[0];
+        assert_eq!(result.model, "flagged");
+        assert!(!result.passed);
+        assert!(
+            result.error.as_deref().is_some_and(|e| e.contains("E058")),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// An error the caller's gates add fails the run before any model
+    /// executes; a gate that adds nothing leaves the run as it was.
+    #[test]
+    fn a_gate_error_fails_the_run_before_execution() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        let refuse = |result: &mut rocky_compiler::compile::CompileResult| {
+            result
+                .diagnostics
+                .push(rocky_compiler::diagnostic::Diagnostic::error(
+                    "E042", "stg", "refused",
+                ));
+        };
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&refuse),
+            inlined_gates: None,
+        })
+        .unwrap();
+        assert_eq!(result.passed, 0, "{:?}", result.model_results);
+        assert_eq!(
+            result.failures,
+            [("stg".to_string(), "refused".to_string())]
+        );
+        assert!(result.diagnostics.iter().any(|d| &*d.code == "E042"));
+
+        let silent = |_: &mut rocky_compiler::compile::CompileResult| {};
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&silent),
+            inlined_gates: None,
+        })
+        .unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.passed, 1);
+
+        // An error the inlined gates add fails the run the same way.
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
+            inlined_gates: Some(&refuse),
+        })
+        .unwrap();
+        assert_eq!(result.passed, 0, "{:?}", result.model_results);
+        assert_eq!(
+            result.failures,
+            [("stg".to_string(), "refused".to_string())]
+        );
+    }
+
+    /// The gates see each model's authored SQL; the inlined gates see the
+    /// SQL the model executes, with its ephemeral upstream inlined.
+    #[test]
+    fn gates_see_authored_sql_and_inlined_gates_see_the_executed_sql() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            models_dir.join("eph.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+        write_full_refresh(&models_dir, "mart", "SELECT id FROM eph");
+        let seen = std::cell::RefCell::new(String::new());
+        let record = |result: &mut rocky_compiler::compile::CompileResult| {
+            let mart = result.project.model("mart").unwrap();
+            *seen.borrow_mut() = mart.sql.clone();
+        };
+        let seen_inlined = std::cell::RefCell::new(String::new());
+        let record_inlined = |result: &mut rocky_compiler::compile::CompileResult| {
+            let mart = result.project.model("mart").unwrap();
+            *seen_inlined.borrow_mut() = mart.sql.clone();
+        };
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&record),
+            inlined_gates: Some(&record_inlined),
+        })
+        .unwrap();
+        assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");
+        assert!(
+            seen_inlined.borrow().contains("WITH"),
+            "the inlined gates see the ephemeral inlined: {}",
+            seen_inlined.borrow()
+        );
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(
+            result
+                .model_results
+                .iter()
+                .any(|m| m.model == "mart" && m.status == ModelTestStatus::Pass),
+            "{:?}",
+            result.model_results
+        );
     }
 }

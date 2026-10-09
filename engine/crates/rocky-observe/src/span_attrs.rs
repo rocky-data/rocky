@@ -224,6 +224,7 @@ pub const WAREHOUSE_NAMES: &[&str] = &[
     "redshift",
     "clickhouse",
     "sqlserver",
+    "spark",
 ];
 
 #[cfg(test)]

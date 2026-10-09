@@ -982,11 +982,12 @@
         "type": "object"
       },
       "ApproverSource": {
-        "description": "Where the approval signature was produced.\n\nReserved for future CI / OIDC paths. Today only the `Local` variant is emitted by the CLI.",
+        "description": "Where the approval signature was produced.\n\n`Local` is a CLI or MCP sign-off on this machine. `HttpApi` is a sign-off made through `POST /api/v1/jobs/approve`: the child `rocky review --approve` runs with `ROCKY_SESSION_SOURCE=http_api`. It names the channel, not the person. The identity beside it is the server's git identity, and nothing proves a browser made the call. `CiOidc` and `Pat` are reserved for future CI / OIDC paths.",
         "enum": [
           "local",
           "ci_oidc",
-          "pat"
+          "pat",
+          "http_api"
         ],
         "type": "string"
       },
@@ -5941,6 +5942,32 @@
         ],
         "type": "object"
       },
+      "CostEstimateSource": {
+        "description": "Where a `rocky plan` cost estimate came from.",
+        "oneOf": [
+          {
+            "description": "Rocky's offline cost model over the compiled DAG. It uses fixed placeholder statistics for source tables and never contacts the warehouse. Good for comparing plans, not for budgeting.",
+            "enum": [
+              "heuristic"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The warehouse's own estimate (`EXPLAIN` or a dry run) for the generated SQL. Requested with `rocky plan --cost-estimate adapter`.",
+            "enum": [
+              "adapter"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Totals that combine both sources, because the adapter could not estimate some models.",
+            "enum": [
+              "mixed"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "CostGroup": {
         "description": "One grouped row in [`CostOutput::groups`], emitted when `rocky cost` is run with `--by <dimension>`.\n\nEach group sums the per-model figures of the executions that share the grouping key (a tenant, or a model name). The cost roll-up uses the same `compute_observed_cost_usd` figures as [`PerModelCostHistorical`], so a `--by tenant` total equals the sum of its members' `cost_usd`.",
         "properties": {
@@ -7239,6 +7266,17 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "files": {
+            "description": "Files written, relative to `output_path` (for `html`, the file name).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "description": "What was written: `site` (a directory), `html` (one file) or `parquet` (a directory of tables).",
+            "type": "string"
+          },
           "models_count": {
             "format": "uint",
             "minimum": 0.0,
@@ -7252,6 +7290,12 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "sources_count": {
+            "description": "External tables the models read.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "version": {
             "type": "string"
           }
@@ -7259,9 +7303,12 @@
         "required": [
           "command",
           "duration_ms",
+          "files",
+          "format",
           "models_count",
           "output_path",
           "pipelines_count",
+          "sources_count",
           "version"
         ],
         "type": "object"
@@ -9755,7 +9802,7 @@
           },
           "contracts_dropped": {
             "default": 0,
-            "description": "Number of dbt models whose enforced `contract` (column `data_type`s / `constraints`) was dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate.",
+            "description": "Number of dbt models whose enforced `contract` was written to a `{model}.contract.toml` but not fully: a column type Rocky has no name for, or a constraint Rocky does not check (`unique`, `check`, ...).",
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
@@ -10120,7 +10167,7 @@
             "type": "object"
           },
           {
-            "description": "A dbt model `contract` (`enforced: true`), column `data_type`s, and/or `constraints` were dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate; the user must hand-author it. Visibility only — no stub generated.",
+            "description": "A dbt model `contract` (`enforced: true`) was written to `{model}.contract.toml`, but part of it has no Rocky check. `typed_columns` counts columns whose `data_type` is left unchecked (no Rocky type for it on the manifest's warehouse). `not_null_constraints` counts `not_null` and `primary_key` constraints, which are not checked because Rocky cannot prove a column NOT NULL from the sources. `constraints` counts the others (`unique`, `check`, ...). Review the generated file.",
             "properties": {
               "constraints": {
                 "format": "uint",
@@ -10139,6 +10186,11 @@
               "model": {
                 "type": "string"
               },
+              "not_null_constraints": {
+                "format": "uint",
+                "minimum": 0.0,
+                "type": "integer"
+              },
               "typed_columns": {
                 "format": "uint",
                 "minimum": 0.0,
@@ -10150,6 +10202,7 @@
               "contract_path",
               "kind",
               "model",
+              "not_null_constraints",
               "typed_columns"
             ],
             "type": "object"
@@ -10447,6 +10500,13 @@
               "apply"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky review <plan_id> --approve` — writes the sign-off marker that unblocks `apply`. Takes the mutation permit, so an approval cannot land while a run or an apply is in flight.",
+            "enum": [
+              "approve"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10487,7 +10547,7 @@
           },
           "plan_id": {
             "default": null,
-            "description": "The positional `<plan_id>` for `apply`.",
+            "description": "The positional `<plan_id>` for `apply` and `approve`: required there, and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.",
             "type": [
               "string",
               "null"
@@ -10890,6 +10950,198 @@
           "model"
         ],
         "type": "object"
+      },
+      "LintConfig": {
+        "additionalProperties": false,
+        "description": "`[lint]` — style-lint settings for `rocky lint`.\n\n```toml [lint] disable = [\"S003\"]\n\n[lint.severity] S001 = \"error\" ```",
+        "properties": {
+          "disable": {
+            "default": [],
+            "description": "Rule codes that do not run, e.g. `[\"S003\", \"S004\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "severity": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LintSeverity"
+            },
+            "default": {},
+            "description": "Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "LintCounts": {
+        "description": "Finding counts by severity for `rocky lint`.",
+        "properties": {
+          "error": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "info": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "warning": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "error",
+          "info",
+          "warning"
+        ],
+        "type": "object"
+      },
+      "LintFinding": {
+        "description": "One `rocky lint` finding.",
+        "properties": {
+          "code": {
+            "description": "Rule code, e.g. `S001`.",
+            "type": "string"
+          },
+          "col": {
+            "description": "1-based column, counted in characters.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "file": {
+            "type": "string"
+          },
+          "fixable": {
+            "description": "`true` when `rocky lint --fix` can rewrite this finding.",
+            "type": "boolean"
+          },
+          "hint": {
+            "description": "Short suggestion for the fix.",
+            "type": "string"
+          },
+          "line": {
+            "description": "1-based line.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "rule": {
+            "description": "Short rule name, e.g. `ambiguous-column`.",
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/LintSeverity"
+          }
+        },
+        "required": [
+          "code",
+          "col",
+          "file",
+          "fixable",
+          "hint",
+          "line",
+          "message",
+          "rule",
+          "severity"
+        ],
+        "type": "object"
+      },
+      "LintOutput": {
+        "description": "JSON output for `rocky lint`.",
+        "properties": {
+          "ast_rules_skipped": {
+            "description": "Files whose SQL did not parse. The AST rules (`S001`, `S003`, `S004`) did not run on them; the text rules did.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "counts": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LintCounts"
+              }
+            ],
+            "description": "Finding counts by severity."
+          },
+          "files_checked": {
+            "description": "Number of `.sql` files read.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "files_fixed": {
+            "description": "Files `--fix` changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "findings": {
+            "description": "Findings left after any `--fix` pass, ordered by file, line and column.",
+            "items": {
+              "$ref": "#/components/schemas/LintFinding"
+            },
+            "type": "array"
+          },
+          "fixed": {
+            "description": "Findings `--fix` rewrote. `0` without `--fix`.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ast_rules_skipped",
+          "command",
+          "counts",
+          "files_checked",
+          "files_fixed",
+          "findings",
+          "fixed",
+          "version"
+        ],
+        "type": "object"
+      },
+      "LintSeverity": {
+        "description": "Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.",
+        "oneOf": [
+          {
+            "description": "Fails the run (non-zero exit).",
+            "enum": [
+              "error"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Reported; does not fail the run.",
+            "enum": [
+              "warning"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Reported; does not fail the run.",
+            "enum": [
+              "info"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "ListAdapterEntry": {
         "properties": {
@@ -11721,6 +11973,17 @@
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "token_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MetaTokenScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the server's bearer token may do: `full` reaches every route, `read_only` only safe methods. `null` when no token is configured (a loopback server without `--ui`, which asks no request for one). The UI reads it to enable or disable its write controls. Never the secret."
           }
         },
         "required": [
@@ -11731,6 +11994,25 @@
           "state_schema_version"
         ],
         "type": "object"
+      },
+      "MetaTokenScope": {
+        "description": "The scope of the token a `rocky serve` was started with, as `GET /api/v1/meta` reports it.",
+        "oneOf": [
+          {
+            "description": "Every route, mutating ones included.",
+            "enum": [
+              "full"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`GET`, `HEAD` and `OPTIONS` only.",
+            "enum": [
+              "read_only"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "MetadataColumnConfig": {
         "additionalProperties": false,
@@ -14025,6 +14307,118 @@
         ],
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
+      "PlanCostPreview": {
+        "description": "The cost preview on [`PlanOutput::cost_preview`].\n\nEach total is the sum over every model, and is `None` when any model lacks the figure, so a total never covers only part of the plan. A total with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.",
+        "properties": {
+          "cost_delta_usd": {
+            "description": "`estimated_cost_usd - previous_cost_usd`. Present only when the estimate came from the adapter for every model and every model has a previous cost. A heuristic estimate is never compared with an observed cost.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "estimated_bytes_scanned": {
+            "description": "Estimated bytes the rebuild reads, summed over every model.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "estimated_cost_usd": {
+            "description": "Estimated cost of the rebuild in USD, summed over every model.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "is_estimate": {
+            "description": "Always `true`. Every figure in this object is an estimate made before execution, not a measurement.",
+            "type": "boolean"
+          },
+          "models": {
+            "description": "One row per rebuilt model, in plan order.",
+            "items": {
+              "$ref": "#/components/schemas/PlanModelCost"
+            },
+            "type": "array"
+          },
+          "models_to_rebuild": {
+            "description": "Number of models the plan rebuilds (the rebuild scope).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "notes": {
+            "description": "Why a figure is missing, for example an adapter estimate that failed for one model. Empty when nothing is missing.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "previous_cost_usd": {
+            "description": "Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when any model has no such run.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CostEstimateSource"
+              }
+            ],
+            "description": "Where the totals came from."
+          }
+        },
+        "required": [
+          "is_estimate",
+          "models",
+          "models_to_rebuild",
+          "source"
+        ],
+        "type": "object"
+      },
+      "PlanFirstRunFill": {
+        "description": "One row of [`PlanOutput::first_run_fills`].",
+        "properties": {
+          "fills": {
+            "description": "`true` when the first run builds every partition in the range. `false` when the range is over the first-run limit (1000 partitions): the run then builds only the latest partition.",
+            "type": "boolean"
+          },
+          "from": {
+            "description": "The first partition key: the model's `first_partition`.",
+            "type": "string"
+          },
+          "model": {
+            "description": "The model.",
+            "type": "string"
+          },
+          "partitions": {
+            "description": "Partitions from `from` to `to`, both included.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "to": {
+            "description": "The last partition key: the partition current when the plan was made. An apply on a later day or hour fills up to its own current partition.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fills",
+          "from",
+          "model",
+          "partitions",
+          "to"
+        ],
+        "type": "object"
+      },
       "PlanIntent": {
         "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
         "oneOf": [
@@ -14036,6 +14430,69 @@
             "type": "string"
           }
         ]
+      },
+      "PlanModelCost": {
+        "description": "One model's row in [`PlanCostPreview::models`].",
+        "properties": {
+          "confidence": {
+            "description": "`\"low\"` for a heuristic estimate, whose source statistics are placeholders. `None` for an adapter estimate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "estimated_bytes_scanned": {
+            "description": "Estimated bytes the model reads.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "estimated_cost_usd": {
+            "description": "Estimated cost in USD.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "estimated_rows": {
+            "description": "Estimated rows the model produces (heuristic) or reads (adapter).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Model name.",
+            "type": "string"
+          },
+          "previous_cost_usd": {
+            "description": "Observed cost in USD of this model in the last successful production run that built it.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CostEstimateSource"
+              }
+            ],
+            "description": "Where this model's estimate came from (`heuristic` or `adapter`)."
+          }
+        },
+        "required": [
+          "model",
+          "source"
+        ],
+        "type": "object"
       },
       "PlanOutput": {
         "properties": {
@@ -14067,6 +14524,17 @@
           "command": {
             "type": "string"
           },
+          "cost_preview": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlanCostPreview"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What applying this plan would rebuild and roughly cost, computed before any model runs. Present when the plan covers transformation models. Every figure is an estimate: see [`PlanCostPreview::source`]. REPORT-ONLY: it never changes `models`, `skipped`, the budget fields, or the exit code, and it is not part of the persisted plan, so it does not enter `plan_id`."
+          },
           "created_at": {
             "description": "UTC timestamp when the plan was persisted. Present when `plan_id` is present.",
             "format": "date-time",
@@ -14094,6 +14562,13 @@
           },
           "filter": {
             "type": "string"
+          },
+          "first_run_fills": {
+            "description": "The `time_interval` models whose first run fills from `first_partition` when this plan is applied: no partition is recorded for them in the state store, and the plan names no partition flag. One row per model, the over-the-limit case included. The persisted plan records which models fill, and an agent's apply refuses a fill its plan did not record.",
+            "items": {
+              "$ref": "#/components/schemas/PlanFirstRunFill"
+            },
+            "type": "array"
           },
           "has_budget_errors": {
             "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",
@@ -19657,6 +20132,18 @@
             "description": "Imported producer-project snapshots, keyed by import name.\n\nEach `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.",
             "type": "object"
           },
+          "lint": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LintConfig"
+              }
+            ],
+            "default": {
+              "disable": [],
+              "severity": {}
+            },
+            "description": "Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides."
+          },
           "mask": {
             "additionalProperties": {
               "$ref": "#/components/schemas/MaskEntry"
@@ -19774,6 +20261,14 @@
               "timezone": "UTC"
             },
             "description": "Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`]."
+          },
+          "selectors": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Saved selectors: a name mapped to a `--select` expression. Use one with `--select selector:<name>` on any command that takes `--select` (or `--exclude selector:<name>`). A saved selector may use graph operators, `state:` and other `selector:` terms; a loop is an error.\n\n```toml [selectors] nightly = \"tag:nightly+ config.materialized:incremental\" finance = \"path:marts/finance,tag:certified\" ```",
+            "type": "object"
           },
           "state": {
             "allOf": [
@@ -21173,7 +21668,7 @@
           },
           "strict_sources": {
             "default": false,
-            "description": "Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.\n\nA direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict \"refuse what you cannot prove\" posture. `rocky compile --strict-sources` sets it for one invocation.",
+            "description": "Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.\n\nA direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict \"refuse what you cannot prove\" posture. It also escalates `W045` (a read of a table missing from a known schema's seed or cache table list) to the `E045` error. `rocky compile --strict-sources` sets it for one invocation.",
             "type": "boolean"
           },
           "trusted_max_age_seconds": {
@@ -25324,7 +25819,7 @@
     },
     "/api/v1/jobs/apply": {
       "post": {
-        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409.",
+        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409. `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`).",
         "operationId": "submitApplyJob",
         "parameters": [
           {
@@ -25389,6 +25884,78 @@
           }
         },
         "summary": "Submit an apply job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/approve": {
+      "post": {
+        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply or approve holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
+        "operationId": "submitApproveJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit an approve job",
         "tags": [
           "jobs"
         ]

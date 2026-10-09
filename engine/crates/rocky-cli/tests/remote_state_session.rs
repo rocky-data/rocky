@@ -189,6 +189,7 @@ async fn drive_run(
 async fn drive_run_governed(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
     let root = config_path.parent().expect("project root").to_path_buf();
     let ctx = rocky_cli::commands::apply::GovernedRunContext {
+        reviewed_first_run_fills: Default::default(),
         principal: rocky_core::config::PolicyPrincipal::Agent,
         actor: rocky_core::config::PrincipalRef::unnamed(),
         plan_id: "plan-durability-redteam",

@@ -7,7 +7,7 @@
 # contract. Local state only: the state store lives on the mounted volume.
 #
 #   ./project/rocky.toml, ./project/models/  ──►  /data in the container
-#   http://127.0.0.1:8080/ui/#token=...      ◄──  the address the server prints
+#   http://127.0.0.1:8080/login?t=...        ◄──  the address the server prints
 #
 # Start: copy .env.example to .env, fill the two secrets, put a project in
 # ./project, then `docker compose up -d`. The README has every step.
@@ -23,8 +23,8 @@ services:
 
     # `--host 0.0.0.0`: inside a container the server must bind every
     # interface to be reachable through the published port; the port mapping
-    # below keeps it on the host's loopback. `--ui` needs the read-only token
-    # scope, set in the environment. `--ui --scheduler` needs the webhook
+    # below keeps it on the host's loopback. On a non-loopback bind, `--ui`
+    # needs the read-only token scope, set in the environment. `--ui --scheduler` needs the webhook
     # secret, so the scheduler's ingress cannot be reached with the browser
     # token. Drop `--scheduler` for a read-only sidecar.
     command: ["serve", "--host", "0.0.0.0", "--ui", "--scheduler"]

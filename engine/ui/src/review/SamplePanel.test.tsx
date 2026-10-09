@@ -171,11 +171,10 @@ describe("SamplePanel", () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     await apiGet("review/queue", {
       fetch: fetchMock as unknown as typeof fetch,
-      storage: { getItem: () => "tok" },
     });
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const headers = init.headers as Record<string, string>;
     expect(headers["X-Rocky-Allow-Warehouse"]).toBeUndefined();
-    expect(headers.Authorization).toBe("Bearer tok");
+    expect(init.credentials).toBe("same-origin");
   });
 });

@@ -176,6 +176,23 @@ encrypt = "mandatory"         # mandatory (default) | strict | optional
 ```
 
 </TabItem>
+<TabItem label="Spark">
+
+Apache Spark is Beta. Rocky talks to a Spark Connect server (Spark 4.0, port `15002`) with Delta Lake or Iceberg in the session catalog:
+
+```toml
+[adapter.prod]
+type = "spark"
+host = "sc://${SPARK_CONNECT_HOST}:15002"
+token = "${SPARK_CONNECT_TOKEN}"   # optional; turns TLS on
+
+[adapter.prod.extra]
+table_format = "delta"             # delta (default) | iceberg
+```
+
+See the [Spark page](/reference/adapters/spark/#strategies) for what runs.
+
+</TabItem>
 <TabItem label="DuckDB">
 
 DuckDB runs inside the Rocky process and needs no credentials. It backs the playground and `rocky test`. Use it for local development against a file:
@@ -190,7 +207,7 @@ path = "warehouse.duckdb"
 </Tabs>
 
 :::note[Adapter status]
-Databricks is GA (live-tested). PostgreSQL is tested live against PostgreSQL 16. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. Redshift is Beta too, and its SQL has not yet run against a live cluster. SQL Server is Beta: tested live against SQL Server 2022; Azure SQL and Fabric Warehouse are not run live. ClickHouse is Beta and tested live against ClickHouse 26.10. See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
+Databricks is GA (live-tested). PostgreSQL is tested live against PostgreSQL 16. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. Redshift is Beta too, and its SQL has not yet run against a live cluster. SQL Server is Beta: tested live against SQL Server 2022; Azure SQL and Fabric Warehouse are not run live. ClickHouse is Beta and tested live against ClickHouse 26.10. Spark is Beta and tested live against Spark 4.0.1 with Delta Lake 4.0.0. See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 :::
 
 ## Run against it
@@ -208,7 +225,7 @@ rocky apply "$plan_id"
 
 For a replication pipeline, scope the run with `--filter`. For example, `rocky plan --filter tenant=acme` plans one tenant.
 
-Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [ClickHouse](/reference/adapters/clickhouse/), [SQL Server](/reference/adapters/sqlserver/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
+Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [ClickHouse](/reference/adapters/clickhouse/), [SQL Server](/reference/adapters/sqlserver/), [Spark](/reference/adapters/spark/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
 
 ## Next steps
 

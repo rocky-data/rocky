@@ -14,7 +14,7 @@
       "sql": "CREATE OR REPLACE TABLE staging__orders.orders AS\nSELECT *\nFROM raw__orders.orders"
     }
   ],
-  "plan_id": "36674d19057adcee8f30a93855c209b70bec6c67b6172382027e2721ed08257e",
+  "plan_id": "c3c67da4bd160e2a2451f173d2dd1110442d4b425966e55f68b26e84b9bd7f93",
   "plan_kind": "run",
   "created_at": "2000-01-01T00:00:00Z",
   "models": [
@@ -32,5 +32,38 @@
     [
       "revenue_summary"
     ]
-  ]
+  ],
+  "cost_preview": {
+    "is_estimate": true,
+    "source": "heuristic",
+    "models_to_rebuild": 3,
+    "estimated_bytes_scanned": 7168000,
+    "estimated_cost_usd": 0.0,
+    "models": [
+      {
+        "model": "raw_orders",
+        "source": "heuristic",
+        "estimated_rows": 10000,
+        "estimated_bytes_scanned": 2560000,
+        "estimated_cost_usd": 0.0,
+        "confidence": "low"
+      },
+      {
+        "model": "revenue_summary",
+        "source": "heuristic",
+        "estimated_rows": 6400,
+        "estimated_bytes_scanned": 2048000,
+        "estimated_cost_usd": 0.0,
+        "confidence": "low"
+      },
+      {
+        "model": "customer_orders",
+        "source": "heuristic",
+        "estimated_rows": 8000,
+        "estimated_bytes_scanned": 2560000,
+        "estimated_cost_usd": 0.0,
+        "confidence": "low"
+      }
+    ]
+  }
 }

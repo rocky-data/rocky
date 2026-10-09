@@ -481,6 +481,41 @@ impl std::fmt::Display for PartialFailure {
 
 impl std::error::Error for PartialFailure {}
 
+/// How an explicit `rocky run --contracts <DIR>` applies to a run.
+///
+/// Without the flag every compile reads the project `contracts/` directory
+/// (see `rocky_compiler::contracts::project_contracts_dir_for`), and a model
+/// with a contract error is not written on any run path.
+#[derive(Debug, Clone, Copy)]
+pub enum RunContracts<'a> {
+    /// `--contracts` with `--model` and `--pipeline` outside `--dag`: the
+    /// selected model must have a contract in the directory, and the run is
+    /// limited to a fresh `full_refresh` rebuild of that one model.
+    SelectedModelGuard(&'a Path),
+    /// `--contracts` on any other run shape: the directory replaces the
+    /// project `contracts/` directory for every compile of this run.
+    Directory(&'a Path),
+}
+
+impl<'a> RunContracts<'a> {
+    /// The contracts directory.
+    #[must_use]
+    pub fn dir(self) -> &'a Path {
+        match self {
+            Self::SelectedModelGuard(dir) | Self::Directory(dir) => dir,
+        }
+    }
+
+    /// Whether this is the selected-model guard.
+    #[must_use]
+    pub fn is_guard(self) -> bool {
+        match self {
+            Self::SelectedModelGuard(_) => true,
+            Self::Directory(_) => false,
+        }
+    }
+}
+
 /// Sentinel error signalling that `rocky run` completed its terminal state
 /// writes with no successful materialization (`RunStatus::Failure`). The
 /// message keeps the generic exit-1 contract (no `main.rs` mapping); the
@@ -490,10 +525,17 @@ impl std::error::Error for PartialFailure {}
 /// ride the terminal upload via `finalize` — from a pre-terminal hard error,
 /// which must abandon the session without uploading.
 #[derive(Debug, thiserror::Error)]
-#[error("{count} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)")]
+#[error(
+    "{count} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output){}",
+    first_error.as_deref().map(|e| format!("; first error: {e}")).unwrap_or_default()
+)]
 pub struct RunFailed {
     pub count: usize,
     pub run_id: String,
+    /// The first recorded error, as `<model>: <error>`. A `rocky run --dag`
+    /// node prints only this message, not the sub-run's JSON, so this is
+    /// where its diagnostic code (for example `E012`) reaches the operator.
+    pub first_error: Option<String>,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; the exit code is 1 either way.
     pub custody: RecordCustody,
@@ -682,6 +724,10 @@ pub(crate) fn run_status_exit_result(
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            first_error: output
+                .errors
+                .first()
+                .map(|e| format!("{}: {}", e.asset_key.join("."), e.error)),
             custody,
         }
         .into()),
@@ -1053,6 +1099,12 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// `--defer-to-state <PATH>` (and optional `--defer-run-id`). When set,
+    /// each unbuilt upstream a selected model reads resolves to the table a
+    /// production run in that state store recorded for it, and the run
+    /// refuses with a [`super::DeferStateError`] when the state cannot
+    /// answer. Mutually exclusive with [`Self::defer_to`].
+    pub defer_state: Option<super::DeferStateSource>,
     /// Multi-model graph selection (`--select` / `--exclude`), already
     /// resolved to model names. `None` (every caller that does not pass a
     /// selector) keeps today's behavior. When `Some`, `rocky run` takes the
@@ -1075,9 +1127,12 @@ pub struct DeferOptions {
 /// rewritten the selected model's exact in-project references to external
 /// targets. Other diagnostics on the selected model remain errors.
 ///
-/// E039's emitter admits exactly one plain in-project relation binding. Under
-/// the single-model defer path that binding is necessarily unselected and the
-/// successful rewrite externalizes it. The external target's schema remains
+/// E039's emitter binds only bare reads of in-project models (never a
+/// qualified target name), in any clause. Under the single-model defer path
+/// every such model is unselected, so every E039 on the selected model is
+/// dropped, including one from a read the rewrite did not externalize (for
+/// example inside a CTE, if the rewrite skips it); that read then fails at
+/// warehouse execution instead. The external target's schema remains
 /// unknown here: an invalid column still fails at warehouse execution.
 ///
 /// With a multi-model selection a selected model may read another selected
@@ -1464,6 +1519,20 @@ pub(crate) struct ExecutionContext<'a> {
         &'a std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
     /// `rocky run --full-refresh`: rebuild table-writing models from scratch.
     pub full_refresh: bool,
+    /// Under an agent's apply: the plan and the models whose first-run fill
+    /// it recorded. A first-run fill of any other model refuses. `None` on
+    /// every other run.
+    pub reviewed_first_run_fills: Option<ReviewedFirstRunFills<'a>>,
+}
+
+/// The first-run fills a governed plan recorded; see
+/// [`ExecutionContext::reviewed_first_run_fills`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReviewedFirstRunFills<'a> {
+    /// The plan id, for the refusal message.
+    pub plan_id: &'a str,
+    /// The models the plan showed filling from `first_partition`.
+    pub models: &'a std::collections::BTreeSet<String>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -3232,7 +3301,7 @@ pub async fn run_with_explicit_contracts(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
-    contracts_dir: Option<&Path>,
+    contracts: Option<RunContracts<'_>>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows
     // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
     // custody rows are still evaluated as the `agent` class.
@@ -3261,7 +3330,8 @@ pub async fn run_with_explicit_contracts(
     // it before the idempotency claim, state session, adapter, or warehouse
     // work. In particular, an old idempotency key must never skip reading a
     // changed model or contract while reporting a guarded success.
-    if contracts_dir.is_some() {
+    let contracts_guard = contracts.is_some_and(RunContracts::is_guard);
+    if contracts_guard {
         anyhow::ensure!(
             model_name_filter.is_some() && pipeline_name_arg.is_some(),
             "--contracts requires both --model and --pipeline"
@@ -3486,7 +3556,7 @@ pub async fn run_with_explicit_contracts(
     // forces the gate inert regardless of the flag / config.
     let mut skip_gate =
         SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
-    if contracts_dir.is_some() {
+    if contracts_guard {
         skip_gate.force_rebuild = true;
     }
 
@@ -3713,13 +3783,13 @@ pub async fn run_with_explicit_contracts(
             // not passed (clause 1 of the fail-closed decision). `--no-reuse`
             // suppresses the whole reuse path for this invocation — both the
             // point-to decision and the spine population it would feed.
-            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && contracts_dir.is_none(),
+            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && !contracts_guard,
             // Content-addressed column-level skip — its own `[reuse]` sub-key,
             // orthogonal to the point-to switch above but also disabled by
             // `--no-reuse`: the flag is the documented "force every
             // content-addressed model to BUILD" escape hatch, and a column
             // skip is a content-addressed non-build.
-            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && contracts_dir.is_none(),
+            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && !contracts_guard,
             run_vars,
             rocky_cfg.resilience.clone(),
             rocky_cfg.run.strict_scheduling,
@@ -3728,7 +3798,7 @@ pub async fn run_with_explicit_contracts(
             Some(&freeze_fence),
             // Finding #4: the `--model` path reconciles no masks.
             false,
-            contracts_dir,
+            contracts,
         )
         .await;
 
@@ -4235,6 +4305,7 @@ pub async fn run_with_explicit_contracts(
                 // its models directory is gone. `false` for a bare run.
                 governed_ctx.is_some_and(|c| c.expects_models),
                 Some(&hook_registry),
+                contracts.map(RunContracts::dir),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -7327,7 +7398,7 @@ pub async fn run_with_explicit_contracts(
             // fresh disk compile.
             let exec_result: Result<GovernanceSnapshot> = async {
                 let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
-                execute_models(
+                execute_models_with_explicit_contracts(
                     mdir,
                     None,
                     warehouse.as_ref(),
@@ -7363,6 +7434,7 @@ pub async fn run_with_explicit_contracts(
                     Some(&freeze_fence),
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
+                    contracts,
                 )
                 .await
             }
@@ -10121,16 +10193,63 @@ fn apply_defer_rewrite(
     // for a `--select` that resolved to more than one model.
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
+    // `--defer-to-state`: resolve each unselected upstream a selected model
+    // reads from the recorded production state, before any SQL is touched.
+    // Every needed upstream must resolve, or the run refuses.
+    let state_targets = match &defer_opts.defer_state {
+        Some(source) => {
+            anyhow::ensure!(
+                defer_opts.defer_to.is_none(),
+                "--defer-to and --defer-to-state cannot be combined"
+            );
+            let needed = deferred_upstreams_needed(
+                compile_result,
+                &selected_set,
+                dialect_case_rules(dialect)?,
+                dialect_recursive_cte_visibility(dialect),
+            );
+            Some(super::defer_state::resolve_deferred_upstreams(
+                source, &needed,
+            )?)
+        }
+        None => None,
+    };
+
     // The deferred set = every compiled model not in the selection, mapped to
     // its qualified defer target. `--defer-to` overrides the schema part;
     // catalog + table always come from the upstream's own configured target.
+    // Under `--defer-to-state` all three parts come from the recorded state,
+    // and an unselected model no selected model reads is left out.
     let mut deferred: HashMap<String, rocky_sql::defer::DeferTarget> = HashMap::new();
     for model in &compile_result.project.models {
         let name = model.config.name.as_str();
         if selected_set.contains(name) {
             continue;
         }
-        let target = &model.config.target;
+        let recorded;
+        let target = match &state_targets {
+            Some(targets) => {
+                let Some(resolved) = targets.get(name) else {
+                    continue;
+                };
+                recorded = rocky_core::models::TargetConfig {
+                    catalog: resolved.target.catalog.clone(),
+                    schema: resolved.target.schema.clone(),
+                    table: resolved.target.table.clone(),
+                };
+                tracing::info!(
+                    upstream = name,
+                    run_id = %resolved.run_id,
+                    target = %format!(
+                        "{}.{}.{}",
+                        recorded.catalog, recorded.schema, recorded.table
+                    ),
+                    "--defer-to-state: deferred upstream resolved from recorded state"
+                );
+                &recorded
+            }
+            None => &model.config.target,
+        };
         let schema = defer_opts
             .defer_to
             .clone()
@@ -10232,6 +10351,76 @@ fn apply_defer_rewrite(
     Ok(())
 }
 
+/// For each selected model, the unselected project models it reads. These
+/// are the upstreams `--defer-to-state` must resolve.
+///
+/// Two sources, unioned: the compiled DAG's `depends_on`, and every bare
+/// reference the defer rewrite itself would qualify. The second matters
+/// because `depends_on` can lack a name the SQL reads (the compiler drops an
+/// auto-binding that would close a cycle). Leaving such a reference out would
+/// let it stay bare and read the working schema. A selected model whose SQL
+/// does not parse adds nothing here; the rewrite itself then refuses it.
+fn deferred_upstreams_needed(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: &std::collections::HashSet<&str>,
+    case_rules: rocky_sql::defer::IdentifierCaseRules,
+    recursive_visibility: rocky_sql::defer::RecursiveCteVisibility,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let unselected: std::collections::HashSet<&str> = compile_result
+        .project
+        .models
+        .iter()
+        .map(|model| model.config.name.as_str())
+        .filter(|name| !selected.contains(name))
+        .collect();
+    // Every unselected model mapped to a placeholder: the probe only asks
+    // which names the rewrite would touch, and its SQL is discarded.
+    let probe: std::collections::HashMap<String, rocky_sql::defer::DeferTarget> = unselected
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                rocky_sql::defer::DeferTarget {
+                    catalog: String::new(),
+                    schema: "probe".to_string(),
+                    table: "probe".to_string(),
+                    quote_style: None,
+                },
+            )
+        })
+        .collect();
+    let mut needed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in &compile_result.project.dag_nodes {
+        if !selected.contains(node.name.as_str()) {
+            continue;
+        }
+        needed.entry(node.name.clone()).or_default().extend(
+            node.depends_on
+                .iter()
+                .filter(|dep| unselected.contains(dep.as_str()))
+                .cloned(),
+        );
+    }
+    for model in &compile_result.project.models {
+        if !selected.contains(model.config.name.as_str()) {
+            continue;
+        }
+        if let Ok(outcome) = rocky_sql::defer::qualify_deferred_refs(
+            &model.sql,
+            &probe,
+            case_rules,
+            recursive_visibility,
+        ) {
+            needed
+                .entry(model.config.name.clone())
+                .or_default()
+                .extend(outcome.qualified);
+        }
+    }
+    needed.retain(|_, upstreams| !upstreams.is_empty());
+    needed
+}
+
 /// Identifier quoting a rewritten upstream reference must use so that it names
 /// the same object the producer's DDL creates.
 ///
@@ -10262,7 +10451,7 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" | "spark" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
@@ -10476,6 +10665,14 @@ pub(crate) fn dialect_case_rules(
         // `orders` and `Orders` are two tables —
         // clickhouse.com/docs/sql-reference/syntax#identifiers
         "clickhouse" => Ok(uniform(true)),
+        // Spark: identifier case follows the session's `spark.sql.caseSensitive`
+        // (off by default, so `orders` and `Orders` resolve to one table) —
+        // spark.apache.org/docs/latest/sql-ref-identifier.html
+        // The setting is server state this function does not read, so this
+        // assumes case-sensitive, the fail-closed answer for the redirect
+        // question (same narrow reading as the BigQuery / Snowflake note
+        // above).
+        "spark" => Ok(uniform(true)),
         // SQL Server: identifier case follows the database COLLATION, quoted or
         // not — the default `SQL_Latin1_General_CP1_CI_AS` folds case, a `_CS_`
         // or `_BIN2` collation does not —
@@ -11868,6 +12065,133 @@ pub(crate) async fn reconcile_model_governance(
     }
 }
 
+/// Move each `E011` the source-typed compile found into the compile that
+/// executes, replacing the `I003` it resolves for the same model and column.
+///
+/// Nothing else crosses over: the executing compile keeps its own SQL,
+/// graph and every other diagnostic.
+fn adopt_contract_type_errors(
+    executing: &mut rocky_compiler::compile::CompileResult,
+    typed: rocky_compiler::compile::CompileResult,
+) {
+    let new_errors: Vec<rocky_compiler::diagnostic::Diagnostic> = typed
+        .contract_diagnostics
+        .into_iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::E011)
+        .collect();
+    if new_errors.is_empty() {
+        return;
+    }
+    // `I003` and `E011` name the column in the same quoted form.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    let resolved: BTreeSet<(String, Option<String>)> = new_errors
+        .iter()
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
+    let keep = |d: &rocky_compiler::diagnostic::Diagnostic| {
+        d.code.as_ref() != rocky_compiler::diagnostic::I003
+            || !resolved.contains(&(d.model.clone(), column_of(&d.message)))
+    };
+    executing.diagnostics.retain(keep);
+    executing.contract_diagnostics.retain(keep);
+    executing.diagnostics.extend(new_errors.iter().cloned());
+    executing.contract_diagnostics.extend(new_errors);
+    executing.has_errors = true;
+}
+
+/// Describe the external sources behind each contract type the compile could
+/// not check.
+///
+/// Starts from every model with an `I003` diagnostic and walks its upstream
+/// models. Each upstream that is not a project model, has no known schema and
+/// is not satisfied outside the compile is described on `warehouse`. The
+/// result is keyed by the exact upstream name, which is how the type checker
+/// looks a source up. A source that cannot be described is left out: the
+/// contract type then stays unchecked, as it was.
+///
+/// The entries carry no provenance, so the missing-source-column check
+/// (`E041` / `W041`) stays off for them.
+async fn describe_sources_for_unchecked_contract_types(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    known: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    external_dependencies: &BTreeSet<String>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+) -> std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+    let mut described = std::collections::HashMap::new();
+    let mut pending: Vec<&str> = compile_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::I003)
+        .map(|d| d.model.as_str())
+        .collect();
+    if pending.is_empty() {
+        return described;
+    }
+    let graph = &compile_result.semantic_graph;
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut sources: BTreeSet<String> = BTreeSet::new();
+    while let Some(model) = pending.pop() {
+        if !visited.insert(model) {
+            continue;
+        }
+        if let Some(schema) = graph.model_schema(model) {
+            pending.extend(schema.upstream.iter().map(String::as_str));
+        }
+        let Some(project_model) = compile_result.project.model(model) else {
+            continue;
+        };
+        // A model whose SQL does not parse here contributes no sources; its
+        // contract types stay unchecked, as before.
+        let Ok(tables) = rocky_sql::lineage::referenced_tables(&project_model.sql) else {
+            continue;
+        };
+        for table in tables {
+            if table.contains('.')
+                && compile_result.project.model(&table).is_none()
+                && !known.contains_key(&table)
+                && !external_dependencies.contains(&table)
+            {
+                sources.insert(table);
+            }
+        }
+    }
+    for source in &sources {
+        let source = source.as_str();
+        let parts: Vec<&str> = source.split('.').collect();
+        let table = match parts.as_slice() {
+            [schema, table] => rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            },
+            [catalog, schema, table] => rocky_ir::TableRef {
+                catalog: (*catalog).to_string(),
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            },
+            _ => continue,
+        };
+        match warehouse.describe_table(&table).await {
+            Ok(columns) if !columns.is_empty() => {
+                let typed = columns
+                    .into_iter()
+                    .map(|c| rocky_compiler::types::TypedColumn {
+                        data_type: rocky_compiler::compile::default_type_mapper(&c.data_type),
+                        name: c.name,
+                        nullable: c.nullable,
+                    })
+                    .collect();
+                described.insert(source.to_string(), typed);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!(source, error = %e, "could not describe source for a contract type check");
+            }
+        }
+    }
+    described
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
     models_dir: &Path,
@@ -12032,7 +12356,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // that path never masks would falsely refuse. The plan side computes the same
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
-    contracts_dir: Option<&Path>,
+    contracts: Option<RunContracts<'_>>,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -12118,8 +12442,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: contracts_dir.map(Path::to_path_buf),
-        required_explicit_contract_model: contracts_dir
+        contracts_dir: contracts.map(|c| c.dir().to_path_buf()),
+        required_explicit_contract_model: contracts
+            .filter(|c| c.is_guard())
             .and_then(|_| model_name_filter.map(str::to_string)),
         source_schemas,
         // W004 wiring happens on the governance compile path later in
@@ -12132,10 +12457,40 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         ..Default::default()
     };
 
-    let compile = match models_glob {
-        Some(glob) => rocky_compiler::compile::compile_matching(&compile_config, glob),
-        None => rocky_compiler::compile::compile(&compile_config),
+    let run_compile = |config: &rocky_compiler::compile::CompilerConfig| match models_glob {
+        Some(glob) => rocky_compiler::compile::compile_matching(config, glob),
+        None => rocky_compiler::compile::compile(config),
     };
+    let mut compile = run_compile(&compile_config);
+    // A contract that declares a column type the compile could not infer
+    // (`I003`) was not checked. The usual cause is an external source with no
+    // known schema: no seed, no schema cache entry. The warehouse is right
+    // here, so describe those sources and compile a second time to check the
+    // contract types before any write. A governed apply replays its reviewed
+    // source snapshot and never takes this path.
+    //
+    // Only the second compile's `E011` (contract type mismatch) is kept. The
+    // first compile stays the one that executes, so the new source types
+    // cannot raise any other error and refuse a run that was valid before.
+    // Nullability is not taken from the describe either: some adapters
+    // report every column as nullable, which would be a false `E012`.
+    if exec_fp_gate.is_none()
+        && let Ok(first) = &mut compile
+        && let described = describe_sources_for_unchecked_contract_types(
+            first,
+            &compile_config.source_schemas,
+            &compile_config.external_dependencies,
+            warehouse,
+        )
+        .await
+        && !described.is_empty()
+    {
+        let mut typed_config = compile_config.clone();
+        typed_config.source_schemas.extend(described);
+        if let Ok(typed) = run_compile(&typed_config) {
+            adopt_contract_type_errors(first, typed);
+        }
+    }
     let mut compile_result = match compile {
         Ok(r) => r,
         Err(e) => {
@@ -12222,7 +12577,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             "[E038] model '{name}' is ephemeral: it is inlined as a CTE into each model that \
              reads it and has nothing to build on its own. Run a model that reads it instead"
         );
-        if contracts_dir.is_some() {
+        if contracts.is_some_and(RunContracts::is_guard) {
             anyhow::ensure!(
                 matches!(
                     selected.config.strategy,
@@ -12258,7 +12613,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         })
         .context("invalid surrogate_key configuration")?;
     if let Some(name) = model_name_filter
-        && contracts_dir.is_some()
+        && contracts.is_some_and(RunContracts::is_guard)
     {
         anyhow::ensure!(
             !surrogate_keys.contains_key(name),
@@ -12294,6 +12649,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
             &compile_result.project.models,
+            &compile_result.contract_files,
             mask_for_extras,
         );
         gate.verify(&compile_result.project.models, &extras)?;
@@ -12377,6 +12733,30 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         return Ok(GovernanceSnapshot::default());
     }
 
+    // An agent's apply refuses a first-run fill its plan did not record
+    // before any model writes. The set is the run's selection minus the
+    // models that failed to compile. Models withheld later (descendants of a
+    // runtime or function-creation failure, or by failure containment) are
+    // still counted, so this can refuse a run that would never have reached
+    // the fill. That errs on the side of refusing.
+    if let Some(gate) = exec_fp_gate {
+        refuse_unreviewed_first_run_fills(
+            compile_result
+                .project
+                .models
+                .iter()
+                .filter(|model| model_name_filter.is_none_or(|target| target == model.config.name))
+                .filter(|model| model_set.is_none_or(|set| set.contains(&model.config.name)))
+                .filter(|model| !compile_excluded_models.contains(&model.config.name)),
+            partition_opts,
+            state_store,
+            ReviewedFirstRunFills {
+                plan_id: &gate.plan_id,
+                models: &gate.reviewed_first_run_fills,
+            },
+        )?;
+    }
+
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
     // `time_interval` model whose `time_column` is absent from its SELECT
@@ -12403,14 +12783,14 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     //     `DagExecutor` then skipped the healthy descendants of nodes that had
     //     actually materialized successfully. The broken model's OWN node
     //     still reports it, which is where it belongs.
-    // W041 (a source column missing from a possibly-stale cached schema) does
-    // not block execution — the warehouse may have the column — but say so
-    // before the warehouse is touched, so a failure that follows is explained.
-    for d in compile_result
-        .diagnostics
-        .iter()
-        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::W041)
-    {
+    // W041 (a source column missing from a possibly-stale cached schema) and
+    // W045 (a source table missing from a possibly-incomplete table list) do
+    // not block execution — the warehouse may have it — but say so before the
+    // warehouse is touched, so a failure that follows is explained.
+    for d in compile_result.diagnostics.iter().filter(|d| {
+        d.code.as_ref() == rocky_compiler::diagnostic::W041
+            || d.code.as_ref() == rocky_compiler::diagnostic::W045
+    }) {
         warn!(
             model = d.model.as_str(),
             code = &*d.code,
@@ -12809,6 +13189,10 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         model_timings: &compile_result.model_timings,
         surrogate_keys: &surrogate_keys,
         full_refresh: skip_gate.full_refresh,
+        reviewed_first_run_fills: exec_fp_gate.map(|gate| ReviewedFirstRunFills {
+            plan_id: &gate.plan_id,
+            models: &gate.reviewed_first_run_fills,
+        }),
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -13611,6 +13995,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                                     &model_ir, &summary,
                                 ),
                             ),
+                            output_target: Some(recorded_output_target(&model_ir)),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -15512,7 +15897,19 @@ async fn execute_one_plain_model(
         // Consumer baseline is content-addressed-path only.
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(&model_ir)),
     })
+}
+
+/// The model and table a transformation materialization wrote, for the
+/// persisted run record. `rocky run --defer-state` reads it back.
+fn recorded_output_target(model_ir: &rocky_ir::ModelIr) -> rocky_core::state::RecordedTarget {
+    rocky_core::state::RecordedTarget {
+        model: model_ir.name.to_string(),
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    }
 }
 
 /// The run note for an incremental load against an existing target. The
@@ -15773,6 +16170,7 @@ async fn execute_snapshot_model(
         output_column_hashes: None,
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(model_ir)),
     })
 }
 
@@ -15796,6 +16194,70 @@ async fn execute_snapshot_model(
 /// 4. Build a `PartitionInfo` per materialization and a single
 ///    `PartitionSummary` per model and push them to the run output.
 ///
+/// The refusal for a first-run fill an agent's plan did not record.
+fn unreviewed_first_run_fill_error(
+    plan_id: &str,
+    model_name: &str,
+    partitions: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to execute plan '{plan_id}': model '{model_name}' has no recorded \
+         partition, so this run would fill {partitions} partitions from its \
+         first_partition, and the plan did not show that fill. Plan again with \
+         `rocky plan` (and review the new plan) to apply the fill, or run the model \
+         with a partition flag."
+    )
+}
+
+/// Under an agent's apply, refuse before the first warehouse write when a
+/// model about to run would fill from `first_partition` and the plan did not
+/// record that fill. Without this, the refusal in
+/// [`execute_time_interval_model`] fires only when that model's turn comes,
+/// after earlier models already wrote.
+///
+/// Uses the same rule as the run: no partition flag and no `--lookback`, and
+/// no partition recorded for the model. With no state store every model has
+/// never run, as in [`execute_time_interval_model`].
+fn refuse_unreviewed_first_run_fills<'m>(
+    models: impl IntoIterator<Item = &'m rocky_core::models::Model>,
+    partition_opts: &PartitionRunOptions,
+    state_store: Option<&StateStore>,
+    review: ReviewedFirstRunFills<'_>,
+) -> Result<()> {
+    if partition_opts.to_selection().is_some() || partition_opts.lookback.is_some() {
+        return Ok(());
+    }
+    let temp_state_dir;
+    let local_state;
+    let state: &StateStore = match state_store {
+        Some(s) => s,
+        None => {
+            temp_state_dir = tempfile::TempDir::new()
+                .context("failed to allocate temp state store for partition planning")?;
+            local_state = StateStore::open(&temp_state_dir.path().join("partitions.redb"))
+                .context("failed to open temp state store")?;
+            &local_state
+        }
+    };
+    for model in models {
+        let model_name = model.config.name.as_str();
+        if review.models.contains(model_name) {
+            continue;
+        }
+        let fill = rocky_core::plan_partition::plan_first_run_fill(model, state)
+            .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
+        if let rocky_core::plan_partition::FirstRunFill::Fill(plans) = fill {
+            let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+            return Err(unreviewed_first_run_fill_error(
+                review.plan_id,
+                model_name,
+                partitions,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Errors propagate to the caller; the state-store row records the
 /// `Failed` status before bubbling so a subsequent `--missing` run can
 /// pick up where this one left off.
@@ -15829,8 +16291,9 @@ async fn execute_time_interval_model(
     // Default selection: --latest. Matches the plan: "Default behavior when
     // running a time_interval model with no flags: --latest, with lookback
     // from the TOML applied."
-    let selection = partition_opts
-        .to_selection()
+    let explicit_selection = partition_opts.to_selection();
+    let selection = explicit_selection
+        .clone()
         .unwrap_or(PartitionSelection::Latest);
 
     // plan_partitions needs a state-store reference for --missing discovery.
@@ -15850,8 +16313,50 @@ async fn execute_time_interval_model(
         &local_state
     };
 
-    let plans = plan_partitions(model, &selection, partition_opts.lookback, state_ref)
-        .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
+    // With no partition flag, the first run of a model that sets
+    // `first_partition` fills from there up to now, as a dbt microbatch model
+    // fills from `begin`. A later run builds the latest partition.
+    let first_fill = if explicit_selection.is_none() && partition_opts.lookback.is_none() {
+        rocky_core::plan_partition::plan_first_run_fill(model, state_ref)
+            .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?
+    } else {
+        rocky_core::plan_partition::FirstRunFill::NotApplicable
+    };
+    let plans = match first_fill {
+        rocky_core::plan_partition::FirstRunFill::Fill(plans) => {
+            // `refuse_unreviewed_first_run_fills` already refused this before
+            // the first write; kept here as defense in depth.
+            if let Some(review) = exec_ctx.reviewed_first_run_fills
+                && !review.models.contains(model_name)
+            {
+                let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+                return Err(unreviewed_first_run_fill_error(
+                    review.plan_id,
+                    model_name,
+                    partitions,
+                ));
+            }
+            info!(
+                model = model_name,
+                partitions = plans.len(),
+                "first run: filling from first_partition"
+            );
+            plans
+        }
+        other => {
+            if let rocky_core::plan_partition::FirstRunFill::TooMany { partitions } = other {
+                warn!(
+                    model = model_name,
+                    partitions,
+                    limit = rocky_core::plan_partition::FIRST_RUN_FILL_LIMIT,
+                    "first_partition is more than the first-run limit back; building only the \
+                     latest partition. Pass --missing, or --from and --to, to fill the history"
+                );
+            }
+            plan_partitions(model, &selection, partition_opts.lookback, state_ref)
+                .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?
+        }
+    };
 
     info!(
         model = model_name,
@@ -16272,6 +16777,7 @@ async fn run_one_partition(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: Some(recorded_output_target(&tplan_ir)),
         }),
     }
 }
@@ -17747,6 +18253,7 @@ async fn process_table(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -19291,6 +19798,7 @@ max_retries = 0
         .unwrap();
 
         let ctx = crate::commands::apply::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: rocky_core::config::PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "record-not-persisted-transformation-plan",
@@ -24037,6 +24545,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 
@@ -24357,6 +24866,7 @@ auto_create_schemas = true
 
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -24380,6 +24890,7 @@ auto_create_schemas = true
         let model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -27749,6 +28260,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -27832,6 +28344,7 @@ email = "pii"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -27999,6 +28512,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28129,6 +28643,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28207,6 +28722,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28367,6 +28883,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28495,6 +29012,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28596,6 +29114,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28651,6 +29170,339 @@ table = "fct_daily"
         assert!(!replanned.contains(&&first));
         assert!(!replanned.contains(&&middle));
         assert!(!replanned.contains(&&last));
+    }
+
+    /// With no partition flag, the first run of a model that sets
+    /// `first_partition` fills from there; the next run builds only the latest.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn first_time_interval_run_fills_from_first_partition() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let today = Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().pred_opt().unwrap().to_string();
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let no_flags = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+
+        let mut first_run = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "first-run",
+            &mut first_run,
+            &exec_ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_run.partition_summaries[0].partitions_planned, 3);
+        assert_eq!(state.list_partitions("fct_daily_orders").unwrap().len(), 3);
+
+        let mut second_run = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "second-run",
+            &mut second_run,
+            &exec_ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second_run.partition_summaries[0].partitions_planned, 1,
+            "a later run builds only the latest partition"
+        );
+    }
+
+    /// Under an agent's apply, a first-run fill runs only when the plan
+    /// recorded it. A plan that did not show the fill refuses before any
+    /// partition is built; one that did fills as a bare run does.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_first_run_fill_needs_the_plan_to_record_it() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let today = Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().to_string();
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let no_flags = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+        let not_recorded = std::collections::BTreeSet::new();
+        let recorded = std::collections::BTreeSet::from(["fct_daily_orders".to_string()]);
+        let ctx = |models| super::ExecutionContext {
+            reviewed_first_run_fills: Some(super::ReviewedFirstRunFills {
+                plan_id: "plan-x",
+                models,
+            }),
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+
+        let mut refused = RunOutput::new(String::new(), 0, 1);
+        let error = super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "unreviewed",
+            &mut refused,
+            &ctx(&not_recorded),
+        )
+        .await
+        .expect_err("a fill the plan did not show must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("plan-x"), "{message}");
+        assert!(message.contains("would fill 2 partitions"), "{message}");
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty(),
+            "nothing is built before the refusal"
+        );
+
+        let mut filled = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "reviewed",
+            &mut filled,
+            &ctx(&recorded),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filled.partition_summaries[0].partitions_planned, 2);
+    }
+
+    /// An agent's apply refuses an unrecorded first-run fill before the first
+    /// write, not when that model's turn comes. `a_orders` (no fill) would run
+    /// first; `fct_daily_orders` fills from `first_partition` and its plan did
+    /// not record that, so the run refuses and `a_orders` is not built.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_unrecorded_fill_refuses_before_any_model_writes() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let first = Utc::now().date_naive().pred_opt().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wh.duckdb");
+        let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("a_orders.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("a_orders.toml"),
+            "name = \"a_orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"a_orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        // A legacy-shaped gate (no fingerprint, not required) so only the
+        // first-run-fill check can refuse.
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
+            expected: None,
+            config_identity: String::new(),
+            governance_identity: String::new(),
+            exec_control_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
+            plan_id: "plan-x".to_string(),
+            require: false,
+        };
+        let opts = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let error = super::execute_models(
+            &models,
+            None,
+            &warehouse as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &opts,
+            "unrecorded-fill",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true, // auto_create_schemas
+            None, // shadow_config (test)
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling
+            true,
+            Some(&gate),
+            None, // freeze_fence (test)
+            false,
+        )
+        .await
+        .expect_err("an unrecorded first-run fill must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("plan-x"), "{message}");
+        assert!(message.contains("fct_daily_orders"), "{message}");
+        assert!(output.materializations.is_empty(), "no model was built");
+        let result = warehouse
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name IN ('a_orders', 'fct_daily_orders')",
+            )
+            .await
+            .unwrap();
+        let count = result.rows[0][0]
+            .as_u64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+        assert_eq!(count, Some(0), "nothing is written before the refusal");
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Inverse-design property: a *transient* target-probe failure must not be
@@ -28715,6 +29567,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28837,6 +29690,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -28936,6 +29790,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -30917,6 +31772,7 @@ backend = "local"
             anyhow::Error::from(RunFailed {
                 count: 1,
                 run_id: "r".to_string(),
+                first_error: None,
                 custody,
             })
         };
@@ -32224,7 +33080,7 @@ backend = "local"
             None,
             None,
             false,
-            Some(&contracts),
+            Some(super::RunContracts::SelectedModelGuard(&contracts)),
         )
         .await;
         result.expect("compile rejection is carried in RunOutput");
@@ -32250,6 +33106,166 @@ backend = "local"
             .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
             .expect("original table must still have amount");
         assert_eq!(rows.rows.len(), 1, "the original row must survive");
+    }
+
+    /// A project `contracts/` directory beside the models directory is read
+    /// with no flag. On a full run, the model that breaks its contract is not
+    /// written, its existing table stays, its downstream model is withheld,
+    /// and an unrelated model still builds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn project_contracts_dir_guards_a_full_run_without_a_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "protected", "SELECT 8 AS id");
+        write_plain_model(&models, "child", "SELECT id FROM protected");
+        write_plain_model(&models, "other", "SELECT 1 AS id");
+        std::fs::write(
+            contracts.join("protected.contract.toml"),
+            "[rules]\nrequired = [\"id\", \"amount\"]\n",
+        )
+        .expect("contract");
+        // A contract for a model this compile does not own (another
+        // pipeline's) is skipped without W011.
+        std::fs::write(
+            contracts.join("elsewhere.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("foreign contract");
+
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE TABLE main.protected AS SELECT 7 AS id, 99 AS amount")
+                .expect("existing table");
+        }
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["protected".to_string()]
+                    && e.failure_kind == crate::output::FailureKind::CompileError
+                    && e.error.contains("E010")),
+            "E010 must reach the run's errors: {:?}",
+            output.errors
+        );
+        assert!(
+            !output.errors.iter().any(|e| e.error.contains("W011")),
+            "a contract for a model outside this compile is not a warning: {:?}",
+            output.errors
+        );
+        assert!(
+            output.contained.iter().any(|c| c.model == "child"),
+            "the downstream model is withheld: {:?}",
+            output.contained
+        );
+        let built: Vec<String> = output
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(built, vec!["other".to_string()]);
+
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
+            .expect("the existing table must still be there");
+        assert_eq!(rows.rows.len(), 1, "the existing row must survive");
+        assert!(
+            conn.execute_sql("SELECT id FROM main.child").is_err(),
+            "the withheld downstream model must not be written"
+        );
+    }
+
+    /// Writes a model that reads the external source `src.orders`, a
+    /// contract that declares `order_id` as `contract_type`, and the source
+    /// table itself, with no seed and no schema cache entry.
+    #[cfg(feature = "duckdb")]
+    fn described_source_fixture(contract_type: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "fct", "SELECT order_id FROM src.orders");
+        std::fs::write(
+            contracts.join("fct.contract.toml"),
+            format!("[[columns]]\nname = \"order_id\"\ntype = \"{contract_type}\"\n"),
+        )
+        .expect("contract");
+        let conn =
+            rocky_duckdb::DuckDbConnector::open(&dir.path().join("t.duckdb")).expect("open db");
+        conn.execute_sql("CREATE SCHEMA src").expect("schema");
+        conn.execute_sql("CREATE TABLE src.orders AS SELECT CAST(1 AS BIGINT) AS order_id")
+            .expect("source");
+        conn.execute_sql("CREATE TABLE main.fct AS SELECT 'kept' AS order_id")
+            .expect("existing table");
+        (dir, models)
+    }
+
+    /// With no known source schema the compile cannot infer `order_id`, so
+    /// the contract type is `I003`, unchecked. The run describes the source
+    /// on its warehouse and checks the type before writing: a mismatch is
+    /// `E011` and the existing table stays.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_describes_sources_to_check_a_contract_type() {
+        let (dir, models) = described_source_fixture("String");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        assert!(
+            output.errors.iter().any(|e| e.error.contains("E011")),
+            "the described source type must be checked: {:?}",
+            output.errors
+        );
+        assert!(output.materializations.is_empty());
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.fct WHERE order_id = 'kept'")
+            .expect("the existing table must still be there");
+        assert_eq!(rows.rows.len(), 1, "the existing row must survive");
+    }
+
+    /// Control for the test above: the same described source with a contract
+    /// type that matches builds cleanly.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_described_source_with_matching_contract_type_builds() {
+        let (dir, models) = described_source_fixture("Int64");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("a clean run");
+        assert!(output.errors.is_empty(), "no errors: {:?}", output.errors);
+        assert_eq!(output.materializations.len(), 1);
+    }
+
+    /// A `rocky run --dag` node prints only the error message, so a failed
+    /// run's message carries its first error and code.
+    #[test]
+    fn run_failed_message_names_the_first_error() {
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.tables_failed = 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["fct_orders".to_string()],
+            error: "[E012] column 'customer_id' must be non-nullable".to_string(),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+        let err = super::run_status_exit_result(&output, "r", super::RecordCustody::Persisted)
+            .expect_err("a failed run");
+        let message = format!("{err:#}");
+        assert!(message.contains("1 model(s) failed"), "{message}");
+        assert!(
+            message.contains("first error: fct_orders: [E012]"),
+            "{message}"
+        );
     }
 
     /// When every model fails to compile, the run is a total `Failure`:
@@ -32902,6 +33918,7 @@ backend = "local"
 
         // (2) unchanged apply with a MATCHING gate → must NOT refuse.
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -33048,6 +34065,7 @@ backend = "local"
         let extras = crate::commands::apply::ExecutionExtras::build(
             &sk,
             &result.project.models,
+            &result.contract_files,
             resolved_mask,
         );
         crate::commands::apply::execution_ir_fingerprint(
@@ -33219,6 +34237,7 @@ backend = "local"
     ) -> Result<super::GovernanceSnapshot> {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -33462,6 +34481,7 @@ backend = "local"
             }],
         )]);
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -33552,6 +34572,7 @@ backend = "local"
             ("confidential".to_string(), MaskStrategy::Redact),
         ]);
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(fp),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -33611,6 +34632,7 @@ backend = "local"
         write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
         let db = dir.path().join("wh.duckdb");
         let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
@@ -34445,6 +35467,96 @@ backend = "local"
         assert!(!sql("mart").contains("prod."), "{}", sql("mart"));
         assert!(sql("wide").contains("prod.orders"), "{}", sql("wide"));
         assert!(!sql("wide").contains("prod.stg"), "{}", sql("wide"));
+    }
+
+    /// `--defer-to-state` resolves every upstream the SQL reads, even one the
+    /// compiled DAG's `depends_on` lacks, and refuses when the state has no
+    /// table for it. Without the SQL probe the reference would stay bare and
+    /// read the working schema.
+    #[test]
+    fn defer_to_state_resolves_sql_references_missing_from_depends_on() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "dev", "orders");
+        write_model_with_target(&models_dir, "stg", "SELECT id FROM orders", "dev", "stg");
+        let compile = || {
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir: models_dir.clone(),
+                    ..Default::default()
+                })
+                .expect("compile models");
+            // Simulate a dropped auto-binding: the DAG no longer lists the
+            // edge the SQL still reads.
+            for node in &mut compiled.project.dag_nodes {
+                node.depends_on.clear();
+            }
+            compiled
+        };
+        let selected: BTreeSet<String> = ["stg".to_string()].into();
+        let state_dir = tempfile::TempDir::new().expect("state dir");
+        let state = super::super::defer_state::tests::store_recording(
+            state_dir.path(),
+            "orders",
+            "prod",
+            "orders_t",
+        );
+
+        let mut compiled = compile();
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: state,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect("defer rewrite");
+        let stg = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "stg")
+            .expect("stg");
+        assert!(stg.sql.contains("prod.orders_t"), "{}", stg.sql);
+
+        // A state that never built `orders` refuses rather than leaving the
+        // reference bare.
+        let empty_dir = tempfile::TempDir::new().expect("empty state dir");
+        let empty = super::super::defer_state::tests::store_recording(
+            empty_dir.path(),
+            "other",
+            "prod",
+            "other",
+        );
+        let mut compiled = compile();
+        let err = super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: empty,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect_err("orders has no recorded table");
+        assert!(
+            matches!(
+                err.downcast_ref::<super::super::DeferStateError>(),
+                Some(super::super::DeferStateError::UpstreamMissing { upstream, .. }) if upstream == "orders"
+            ),
+            "{err:#}"
+        );
     }
 
     /// #1350: the model-only fallback answers identically to naming the
@@ -38013,6 +39125,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -40413,6 +41526,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -40614,6 +41728,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -40747,6 +41862,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
             attempts: Vec::new(),
+            output_target: None,
         };
         let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
             "run_id": "run-prod",
@@ -40890,6 +42006,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -41873,6 +42990,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -42179,6 +43297,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {
@@ -42364,6 +43483,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -42509,6 +43629,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
@@ -48232,6 +49353,7 @@ timestamp_column = "ts"
         governed: bool,
     ) -> anyhow::Result<()> {
         let ctx = crate::commands::apply::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: rocky_core::config::PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "checkpoint-ordering-legacy-plan",

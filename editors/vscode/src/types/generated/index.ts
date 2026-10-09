@@ -37,6 +37,8 @@ export type { CiOutput } from "./ci";
 export type { CiDiffOutput, DiffResult, DiffSummary } from "./ci_diff";
 
 // Lineage Diff (per-changed-column downstream blast-radius for PR review)
+export type { LintCounts, LintFinding, LintOutput, LintSeverity } from "./lint";
+
 export type {
   LineageColumnChange,
   LineageDiffOutput,

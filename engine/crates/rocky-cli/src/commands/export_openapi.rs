@@ -781,7 +781,27 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit an apply job",
             description: "Submit a mutating `apply` job. Takes the single-mutating-job \
-                 permit; a second run/apply while one is held returns 409.",
+                 permit; a second run/apply while one is held returns 409. `plan_id` \
+                 must be 64 lowercase hex characters (400 `invalid_plan_id`).",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/approve",
+            operation_id: "submitApproveJob",
+            tag: "jobs",
+            summary: "Submit an approve job",
+            description: "Approve a plan: runs `rocky review <plan_id> --approve` as a job. \
+                 Takes the single-mutating-job permit (409 while a run, apply or approve \
+                 holds it). `plan_id` must be 64 lowercase hex characters (400 \
+                 `invalid_plan_id`). The marker records approver source `http_api` and the \
+                 server's git identity; with no git identity the job fails with \
+                 `approver_identity_unresolved`.",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],

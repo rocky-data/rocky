@@ -141,6 +141,11 @@ pub(crate) async fn run_apply_core_in(
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
+    // One resolution of the config path for every gate and check below: the
+    // policy gate and the models check read the same file. `Path::join`
+    // keeps an absolute path, and the CLI passes the absolute cwd as `root`,
+    // so a CLI apply resolves exactly as before.
+    let config_path = &root.join(config_path);
     // A run plan can sync or write policy state before it delegates to run().
     // The binary checks this too; keep the direct apply API fail-fast.
     crate::pipes::PipesEmitter::validate_requested()?;
@@ -508,7 +513,8 @@ async fn run_apply_run_plan(
     // #2239: before the ledger sync, the policy gate, or any decision row.
     refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
     verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
-    let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
+    let (models_dir, models_glob) =
+        run_model_selection_at(&loaded.config, root, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
@@ -565,6 +571,16 @@ async fn run_apply_run_plan(
         subjects,
     );
     apply_policy_gate(root, plan_id, gate)?;
+    verify_plan_models_before_execution(
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        root,
+        &run_plan,
+        modelless,
+        principal,
+    )?;
 
     // Resolve the post-apply verification checks *before* the run plan is moved
     // into execution (the run plan owns the models_dir the resolver reads).
@@ -847,6 +863,7 @@ fn governed_run_context<'a>(
         // preflight (`preflight_snapshot`), not folded into this flag.
         require_fingerprint: embedded.fingerprint_version >= 1,
         reviewed_source_schemas: embedded.reviewed_source_schemas,
+        reviewed_first_run_fills: embedded.first_run_fills,
         replication_verify_after: Mutex::new(BTreeSet::new()),
     })
 }
@@ -1480,7 +1497,8 @@ thread_local! {
 /// Build the apply-time [`ModelAttributes`] for every compiled model under
 /// `models_dir`, mirroring `rocky policy check`: `classifications` is the
 /// distinct column-classification set, `layer` is the `layer` tag, and
-/// `contracted` is the presence of a sibling `.contract.toml`.
+/// `contracted` is whether the compile read a contract for the model (a
+/// sibling `.contract.toml` or a file in the project `contracts/` directory).
 fn model_attributes(
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1529,7 +1547,9 @@ fn model_attributes(
         let name = model.config.name.clone();
         let classifications = model.config.classification.values().cloned().collect();
         let layer = model.config.tags.get("layer").cloned();
-        let contracted = model.contract_path.is_some();
+        // The merged contract set the compile checked: a sidecar or a file
+        // in the project `contracts/` directory.
+        let contracted = result.contract_files.contains_key(&name);
         let downstreams = result
             .project
             .models
@@ -3188,6 +3208,29 @@ pub(crate) fn run_model_selection(
     ))
 }
 
+/// [`run_model_selection`] for a project at `root`, anchoring a directory the
+/// plan names itself (`--models`, or the `models` default) at `root` exactly
+/// once, as [`super::approval_scope::approval_scope_at`] does for the
+/// pre-execution check. A directory resolved from the config is already
+/// anchored by `config_path`; an absolute directory is kept as is. The CLI
+/// passes the absolute cwd as `root`, so its behaviour does not change.
+fn run_model_selection_at(
+    config: &rocky_core::config::RockyConfig,
+    root: &Path,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<(PathBuf, Option<String>)> {
+    let (models_dir, models_glob) = run_model_selection(config, config_path, run_plan)?;
+    // A glob comes back exactly when the directory was resolved from a
+    // pipeline in the config.
+    let models_dir = if models_glob.is_none() {
+        root.join(models_dir)
+    } else {
+        models_dir
+    };
+    Ok((models_dir, models_glob))
+}
+
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
 /// execute, using the same directory, file glob, and `--model` selection.
 ///
@@ -3371,8 +3414,10 @@ pub(crate) fn execution_ir_fingerprint(
 ///   NOT by the compiler, so they are absent from `ModelConfig` and invisible to
 ///   the config+SQL projection. A model that gains/changes a surrogate key wraps
 ///   its SELECT at materialization time — a different physical write.
-/// - **Contracts (#3).** `contract_path` lives on `Model`, outside
-///   `ModelConfig`, so contract presence and contents are unfingerprinted — yet
+/// - **Contracts (#3).** A contract lives outside `ModelConfig` (a sidecar
+///   `.contract.toml`, or a file in the project `contracts/` directory, as the
+///   compile's `contract_files` records), so contract presence and contents
+///   are unfingerprinted by the projection — yet
 ///   contract PRESENCE is authorization-relevant (the `contracted` policy
 ///   attribute) and its contents constrain the model's output. Keyed by model
 ///   name; the value is a content hash. An absent key means "no contract", so
@@ -3436,15 +3481,19 @@ pub(crate) fn resolved_surrogate_keys(
 
 impl ExecutionExtras {
     /// Assemble the extras from the already-loaded surrogate-key map, the
-    /// compiled models (for `contract_path`s + classification tags), and the
-    /// env-resolved mask map. Called identically at plan time and at the apply
-    /// choke-point over the same `models_dir` / resolved mask.
+    /// compiled models (for classification tags), the contract file the
+    /// compile read for each contracted model
+    /// ([`CompileResult::contract_files`](rocky_compiler::compile::CompileResult::contract_files):
+    /// a sidecar or a `contracts/` directory file), and the env-resolved mask
+    /// map. Called identically at plan time and at the apply choke-point over
+    /// the same `models_dir` / resolved mask.
     pub(crate) fn build(
         surrogate_keys: &std::collections::HashMap<
             String,
             Vec<rocky_core::models::SurrogateKeySpec>,
         >,
         models: &[rocky_core::models::Model],
+        contract_files: &BTreeMap<String, std::path::PathBuf>,
         resolved_mask: &BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> Self {
         let surrogate_keys: BTreeMap<String, Vec<rocky_core::models::SurrogateKeySpec>> =
@@ -3455,7 +3504,7 @@ impl ExecutionExtras {
         let mut contracts = BTreeMap::new();
         let mut effective_masks = BTreeMap::new();
         for m in models {
-            if let Some(path) = &m.contract_path {
+            if let Some(path) = contract_files.get(&m.config.name) {
                 // Hash the CONTENTS. A read failure at apply that succeeded at
                 // plan yields a distinct stable sentinel → the fingerprint moves
                 // → refuse (fail-closed); it only silently matches when the
@@ -3666,6 +3715,11 @@ pub struct ExecFingerprintGate {
     /// (v2 governed) plan with `None` REFUSES. Carried here because
     /// `execute_models` has no plan handle.
     pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The models the plan showed filling from `first_partition` on their
+    /// first run (`EmbeddedCapabilities::first_run_fills`). A first-run fill
+    /// of any other model refuses at execution. Carried here because
+    /// `execute_models` has no plan handle.
+    pub reviewed_first_run_fills: BTreeSet<String>,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
@@ -3765,6 +3819,9 @@ pub struct GovernedRunContext<'a> {
     /// REFUSES (fail-closed).
     pub reviewed_source_schemas:
         Option<std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The models the plan showed filling from `first_partition`; see
+    /// [`ExecFingerprintGate::reviewed_first_run_fills`].
+    pub reviewed_first_run_fills: BTreeSet<String>,
     /// `true` when the plan REVIEWED a non-empty model set (`!run_plan.models
     /// .is_empty()`). Finding #2 (missing-dir): threaded to the executor legs so a
     /// governed model-executing apply whose reviewed models directory is deleted
@@ -3817,6 +3874,7 @@ impl GovernedRunContext<'_> {
             exec_control_identity: execution_control_identity(cfg),
             resolved_mask: cfg.resolve_mask_for_env(env),
             reviewed_source_schemas: self.reviewed_source_schemas.clone(),
+            reviewed_first_run_fills: self.reviewed_first_run_fills.clone(),
             plan_id: self.plan_id.to_string(),
             require: self.require_fingerprint,
         }
@@ -4778,7 +4836,8 @@ async fn run_apply_ai_authored_plan(
     // #2239: before the ledger sync, the policy gate, or any decision row.
     refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
     verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
-    let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
+    let (models_dir, models_glob) =
+        run_model_selection_at(&loaded.config, root, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
@@ -4875,6 +4934,16 @@ async fn run_apply_ai_authored_plan(
             );
         }
     }
+    verify_plan_models_before_execution(
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        root,
+        &run_plan,
+        modelless,
+        principal,
+    )?;
 
     // Resolve the post-apply verification checks before the run plan is moved.
     let verify_checks = required_verify_after(
@@ -4989,7 +5058,7 @@ fn refuse_governed_dag_apply(
 /// runs, in every pipeline's directory, still matches the fingerprint the plan
 /// and its approval recorded. Runs whoever applies the plan, as late as
 /// possible before execution. A plan without `--dag`, or one that is not
-/// review-gated, is unaffected.
+/// review-gated, is checked later by [`verify_plan_models_before_execution`].
 fn verify_reviewed_dag_scope(
     plan: &PersistedPlan,
     plan_id: &str,
@@ -4997,10 +5066,52 @@ fn verify_reviewed_dag_scope(
     config_path: &Path,
     run_plan: &RunPlan,
 ) -> Result<()> {
-    if !run_plan.dag || !super::review::plan_is_reviewable(plan) {
+    if !reviewed_dag_plan(plan, run_plan) {
         return Ok(());
     }
     super::approval_scope::verify_dag_scope_for_apply(plan, plan_id, config, config_path, run_plan)
+}
+
+fn reviewed_dag_plan(plan: &PersistedPlan, run_plan: &RunPlan) -> bool {
+    run_plan.dag && super::review::plan_is_reviewable(plan)
+}
+
+/// A run plan executes only if the models it would run still match the
+/// fingerprint the plan (and any approval of it) recorded. `run` recompiles
+/// the models on disk; before this, only an agent's apply was re-checked
+/// (inside `run`), so a person's apply ran models edited after the plan was
+/// made. A person's apply compares the models alone; an agent's compares the
+/// models and the config they run under (see
+/// [`super::approval_scope::verify_plan_models_for_apply`]).
+///
+/// Called after the policy and review gates, so their refusals keep their
+/// precedence, and before any warehouse statement. Skipped where nothing
+/// would be re-checked twice or nothing compiled runs: a reviewed `--dag`
+/// plan ([`verify_reviewed_dag_scope`] already ran), a model-less pipeline
+/// (snapshot, load, quality) and a replication-only plan.
+#[allow(clippy::too_many_arguments)]
+fn verify_plan_models_before_execution(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    root: &Path,
+    run_plan: &RunPlan,
+    modelless: bool,
+    principal: PolicyPrincipal,
+) -> Result<()> {
+    if reviewed_dag_plan(plan, run_plan) || modelless || is_replication_only(config, run_plan) {
+        return Ok(());
+    }
+    super::approval_scope::verify_plan_models_for_apply(
+        plan,
+        plan_id,
+        Some(config),
+        config_path,
+        root,
+        run_plan,
+        principal,
+    )
 }
 
 fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
@@ -5232,6 +5343,18 @@ async fn run_apply_backfill_plan(
         if set.is_empty() {
             bail!("backfill plan '{plan_id}' names no models to rebuild");
         }
+        // The models the backfill rebuilds must still match the fingerprint
+        // its approval covered. `execute_backfill_set` recompiles them from
+        // disk. A backfill is agent-by-kind, so this is the full check.
+        super::approval_scope::verify_plan_models_for_apply(
+            &plan,
+            plan_id,
+            cfg.as_ref().map(|l| &l.config),
+            config_path,
+            root,
+            &run_plan,
+            plan.enforcement_principal(runtime_principal),
+        )?;
 
         // A half-open window must never execute: `to_selection` only yields a
         // Range when BOTH bounds are present, so a lone bound would silently fall
@@ -6195,7 +6318,7 @@ pub async fn run_apply_inline_for_run(
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
-    contracts_dir: Option<&Path>,
+    contracts: Option<crate::commands::run::RunContracts<'_>>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
     actor: &PrincipalRef,
     // `--refuse-hooks` (#2162): refuse a config that would fire hooks.
@@ -6244,7 +6367,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
-        contracts_dir,
+        contracts,
         actor,
         None,
     )
@@ -7283,6 +7406,7 @@ mod tests {
             PolicyPrincipal::Agent,
             crate::plan_store::EmbeddedCapabilities {
                 models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                models_only_fingerprint: None,
                 config_identity: Some("reviewed-config".to_string()),
                 fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
                 reviewed_source_schemas: Some(BTreeMap::new()),
@@ -8875,9 +8999,11 @@ effect = "deny"
         // A no-change plan: diff available, zero changed models, but planned
         // models exist → touched under the bare `apply` verb.
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -8915,9 +9041,11 @@ effect = "deny"
         seed_agent_freeze(&state, "any")?;
 
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -8948,9 +9076,11 @@ effect = "deny"
         let dir = tempfile::tempdir()?;
         let config = write_config(dir.path(), "")?;
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -9173,6 +9303,7 @@ effect = "allow"
 "#,
         )?;
         let caps = crate::plan_store::EmbeddedCapabilities {
+            first_run_fills: Default::default(),
             diff_available: true,
             changed: {
                 let mut c = BTreeMap::new();
@@ -9180,6 +9311,7 @@ effect = "allow"
                 c
             },
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -10162,6 +10294,7 @@ auto_create_schemas = true
         let expected = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
         // Genuinely-legacy (no fingerprint, not required) → allowed.
         super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10175,6 +10308,7 @@ auto_create_schemas = true
         .expect("a legacy plan without a fingerprint is allowed through");
         // NEW plan whose fingerprint could not be produced (required) → REFUSE.
         let err = super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10189,6 +10323,7 @@ auto_create_schemas = true
         assert!(err.to_string().contains("could not be produced"), "{err}");
         // Matching → ok; live mismatch → refuse.
         super::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
             expected: Some(expected.clone()),
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
@@ -10202,6 +10337,7 @@ auto_create_schemas = true
         .expect("a matching fingerprint applies");
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected.clone()),
                 config_identity: "DIFFERENT".to_string(),
                 governance_identity: "g".to_string(),
@@ -10218,6 +10354,7 @@ auto_create_schemas = true
         // A GOVERNANCE-identity change must refuse too (mask / roles / cache).
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected),
                 config_identity: "c".to_string(),
                 governance_identity: "DIFFERENT".to_string(),
@@ -10237,6 +10374,7 @@ auto_create_schemas = true
         let expected_ec = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
         assert!(
             super::ExecFingerprintGate {
+                reviewed_first_run_fills: Default::default(),
                 expected: Some(expected_ec),
                 config_identity: "c".to_string(),
                 governance_identity: "g".to_string(),
@@ -10324,6 +10462,7 @@ auto_create_schemas = true
         let cfg_b = cfg(dir.path(), "b.duckdb");
         let config_path = dir.path().join("rocky.toml");
         let mk = |expected: Option<String>, require: bool| super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10430,6 +10569,7 @@ auto_create_schemas = true
                   snapshot: Option<
             std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
         >| super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "p",
@@ -10495,6 +10635,7 @@ auto_create_schemas = true
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10546,6 +10687,7 @@ effect = "deny"
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10596,6 +10738,7 @@ effect = "allow"
         // Simulate `run` holding a live write handle for the whole invocation.
         let held = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10652,6 +10795,7 @@ effect = "allow"
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -10695,6 +10839,7 @@ verify_after = ["row_count"]
         let state = dir.path().join("state.redb");
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
+            reviewed_first_run_fills: Default::default(),
             principal: PolicyPrincipal::Agent,
             actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
@@ -11092,20 +11237,434 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// #2239: a human-authored `--dag` plan is not review-gated, so the scope
-    /// check does not run and an edit after planning still applies, exactly as
-    /// before.
+    /// A human-authored `--dag` plan is not review-gated, but it carries a
+    /// models fingerprint, so an edit after planning now refuses the apply
+    /// (`plan_models_changed`) instead of running the edited models. Before
+    /// this, only a reviewed plan or an agent's apply was re-checked.
     #[tokio::test]
-    async fn human_authored_dag_plan_is_not_scope_checked() -> anyhow::Result<()> {
+    async fn human_authored_dag_plan_refuses_when_its_models_changed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let config = two_pipeline_dag_project(root)?;
         let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Human)?;
         std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
 
+        let err = apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect_err("a human apply of a changed plan must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("models changed since this plan was made; plan again"),
+            "{msg}"
+        );
+        assert!(
+            !root.join("proj.duckdb").exists(),
+            "refused before the warehouse is opened"
+        );
+        Ok(())
+    }
+
+    /// A plain (non-`--dag`) run plan for one transformation pipeline,
+    /// persisted through the production capability path as `principal`.
+    fn write_pipeline_plan(
+        root: &Path,
+        config: &Path,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
+        write_pipeline_plan_of(root, config, PlanKind::Run, principal)
+    }
+
+    fn write_pipeline_plan_of(
+        root: &Path,
+        config: &Path,
+        kind: PlanKind,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
+        write_pipeline_plan_with(root, config, kind, principal, |_| {})
+    }
+
+    fn gold_run_plan() -> RunPlan {
+        RunPlan {
+            pipeline: Some("gold".to_string()),
+            models: vec!["totals".to_string()],
+            execution_layers: vec![vec!["totals".to_string()]],
+            ..minimal_run_plan()
+        }
+    }
+
+    /// [`write_pipeline_plan_of`], with `edit` applied to the capabilities
+    /// before the plan is written (to model a plan an older binary wrote).
+    fn write_pipeline_plan_with(
+        root: &Path,
+        config: &Path,
+        kind: PlanKind,
+        principal: PolicyPrincipal,
+        edit: impl FnOnce(&mut crate::plan_store::EmbeddedCapabilities),
+    ) -> anyhow::Result<String> {
+        let rp = gold_run_plan();
+        let cfg = rocky_core::config::load_optional_project_config(Some(config))?;
+        let scope = super::super::approval_scope::approval_scope(cfg.as_ref(), config, &rp)?;
+        let mut capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        assert!(capabilities.models_only_fingerprint.is_some());
+        edit(&mut capabilities);
+        crate::plan_store::write_plan_governed(root, kind, &rp, principal, capabilities)
+    }
+
+    /// Run the apply-time models check on a persisted plan as `principal`.
+    fn check_plan_models(
+        root: &Path,
+        config: &Path,
+        plan_id: &str,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<()> {
+        let plan = crate::plan_store::read_plan(root, plan_id)?;
+        let cfg = rocky_core::config::load_rocky_config(config)?;
+        super::super::approval_scope::verify_plan_models_for_apply(
+            &plan,
+            plan_id,
+            Some(&cfg),
+            config,
+            root,
+            &gold_run_plan(),
+            principal,
+        )
+    }
+
+    /// The split by principal. A config change that leaves the models alone
+    /// (here an unrelated pipeline's settings) passes a person's check, and
+    /// refuses an agent's with `plan_config_changed`, not
+    /// `plan_models_changed`. A model edit refuses both with
+    /// `plan_models_changed`.
+    #[test]
+    fn a_config_only_change_refuses_an_agent_but_not_a_person() -> anyhow::Result<()> {
+        use super::super::approval_scope::{PLAN_CONFIG_CHANGED, PLAN_MODELS_CHANGED};
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Human)?;
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Agent)?;
+
+        let toml = std::fs::read_to_string(&config)?;
+        let edited = toml.replacen(
+            "[pipeline.silver.target.governance]\nauto_create_catalogs = true",
+            "[pipeline.silver.target.governance]\nauto_create_catalogs = false",
+            1,
+        );
+        assert_ne!(edited, toml, "the fixture must change");
+        std::fs::write(&config, edited)?;
+
+        check_plan_models(root, &config, &plan_id, PolicyPrincipal::Human)
+            .expect("a person's check compares the models only");
+        let msg = format!(
+            "{:#}",
+            check_plan_models(root, &config, &plan_id, PolicyPrincipal::Agent)
+                .expect_err("an agent's check compares the config too")
+        );
+        assert!(msg.starts_with(PLAN_CONFIG_CHANGED), "{msg}");
+
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            let msg = format!(
+                "{:#}",
+                check_plan_models(root, &config, &plan_id, principal).expect_err("edited")
+            );
+            assert!(msg.starts_with(PLAN_MODELS_CHANGED), "{principal:?}: {msg}");
+        }
+        Ok(())
+    }
+
+    /// A relative project root other than `.` is joined to the scope once.
+    /// The config-derived directory (`<root>/gold`) is already anchored by
+    /// the config path; anchoring it again (`<root>/<root>/gold`) finds no
+    /// models and refuses an unchanged plan.
+    #[test]
+    fn a_relative_root_anchors_the_scope_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        // The same directory, spelled relative to the process cwd without
+        // changing it: climb to `/`, then descend into the temp dir.
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        assert!(root.is_relative() && root != Path::new("."));
+        let config = two_pipeline_dag_project(&root)?;
+        assert!(config.is_relative());
+        let plan_id = write_pipeline_plan(&root, &config, PolicyPrincipal::Human)?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            check_plan_models(&root, &config, &plan_id, principal)
+                .map_err(|e| anyhow::anyhow!("{principal:?}: {e:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// `rocky apply` called with a project root that is not the process cwd
+    /// (as `rocky fulfill`'s typed apply can be) and a relative config path
+    /// resolves the config once, against the root, for the policy gate, the
+    /// models check and the run. The test process runs in the crate
+    /// directory, which has no `rocky.toml` and no `gold/`: resolved against
+    /// the cwd, the config does not load.
+    #[tokio::test]
+    async fn a_relative_config_path_resolves_against_the_project_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+        let cwd = std::env::current_dir()?;
+        assert!(
+            !cwd.join("rocky.toml").exists() && !cwd.join("gold").exists(),
+            "the cwd must hold neither the config nor the models"
+        );
+        super::run_apply_core_in(
+            root,
+            Path::new("rocky.toml"),
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A plan that names its own relative `--models` directory, applied with
+    /// a relative project root that is not the process cwd (as `rocky
+    /// fulfill`'s typed apply can be): the policy gate and the models check
+    /// both read `<root>/gold`. Read against the cwd, the gate compiles a
+    /// directory that does not exist and the `[policy]` block refuses the
+    /// apply.
+    #[tokio::test]
+    async fn a_plan_named_models_dir_is_read_under_the_project_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        assert!(root.is_relative() && root != Path::new("."));
+        assert!(
+            !cwd.join("gold").exists(),
+            "the cwd must not hold the plan's models directory"
+        );
+        let config = two_pipeline_dag_project(&root)?;
+        let mut toml = std::fs::read_to_string(&config)?;
+        toml.push_str("[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n");
+        std::fs::write(&config, toml)?;
+
+        let rp = RunPlan {
+            model: Some("totals".to_string()),
+            models_dir: Some("gold".to_string()),
+            ..gold_run_plan()
+        };
+        let cfg = rocky_core::config::load_rocky_config(&config)?;
+        let scope =
+            super::super::approval_scope::approval_scope_at(Some(&cfg), &root, &config, &rp)?;
+        assert_eq!(scope.units[0].models_dir, root.join("gold"));
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let plan_id = crate::plan_store::write_plan_governed(
+            &root,
+            PlanKind::Run,
+            &rp,
+            PolicyPrincipal::Human,
+            capabilities,
+        )?;
+
+        // The gate and the check pass. The run itself still reads the plan's
+        // `--models` directory against the cwd, so it stops there: that is
+        // the first step after both, and the only one left unanchored.
+        let error = super::run_apply_core_in(
+            &root,
+            &config,
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("the run reads `gold` against the cwd");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("models directory 'gold' not found (required for --model)"),
+            "the gate and the models check must pass before the run: {msg}"
+        );
+        Ok(())
+    }
+
+    /// A plan with a fingerprint but no source-schema snapshot predates the
+    /// check: it refuses with `plan_snapshot_missing` and says to plan again
+    /// because of that, not "models changed". So does a person's apply of a
+    /// plan with no models-only fingerprint. An agent's apply of that plan
+    /// still runs the full check, which passes.
+    #[test]
+    fn a_plan_that_predates_the_check_refuses_with_snapshot_missing() -> anyhow::Result<()> {
+        use super::super::approval_scope::PLAN_SNAPSHOT_MISSING;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+
+        let no_snapshot =
+            write_pipeline_plan_with(root, &config, PlanKind::Run, PolicyPrincipal::Human, |c| {
+                c.reviewed_source_schemas = None;
+            })?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            let msg = format!(
+                "{:#}",
+                check_plan_models(root, &config, &no_snapshot, principal).expect_err("no snapshot")
+            );
+            assert!(
+                msg.starts_with(PLAN_SNAPSHOT_MISSING),
+                "{principal:?}: {msg}"
+            );
+            assert!(msg.contains("predates"), "{msg}");
+            assert!(!msg.contains("models changed"), "{msg}");
+        }
+
+        let no_models_only =
+            write_pipeline_plan_with(root, &config, PlanKind::Run, PolicyPrincipal::Human, |c| {
+                c.models_only_fingerprint = None;
+            })?;
+        let msg = format!(
+            "{:#}",
+            check_plan_models(root, &config, &no_models_only, PolicyPrincipal::Human)
+                .expect_err("no models-only fingerprint")
+        );
+        assert!(msg.starts_with(PLAN_SNAPSHOT_MISSING), "{msg}");
+        check_plan_models(root, &config, &no_models_only, PolicyPrincipal::Agent)
+            .expect("an agent's full check does not need the models-only fingerprint");
+        Ok(())
+    }
+
+    /// The AI-authored apply path re-checks too, after its review-marker
+    /// gate: an approved AI plan whose model was edited afterwards refuses
+    /// with `plan_models_changed` for a human applier.
+    #[tokio::test]
+    async fn approved_ai_authored_plan_refuses_when_its_models_changed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id =
+            write_pipeline_plan_of(root, &config, PlanKind::AiAuthored, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+
+        let err = super::run_apply_ai_authored_plan(
+            root,
+            &config,
+            &plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            false,
+        )
+        .await
+        .expect_err("a changed AI plan must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+            "{msg}"
+        );
+        assert!(!root.join("proj.duckdb").exists());
+        Ok(())
+    }
+
+    /// **Apply re-checks the reviewed models for a person too.** A human
+    /// apply of a plain run plan whose model was edited, added or removed
+    /// after planning refuses with `plan_models_changed`, before the policy
+    /// gate and before the warehouse is opened. `run` recompiles the models
+    /// on disk, so without this the edited model would run.
+    #[tokio::test]
+    async fn human_apply_refuses_a_plan_whose_models_changed() -> anyhow::Result<()> {
+        type Edit = fn(&Path) -> std::io::Result<()>;
+        let edits: [(&str, Edit); 3] = [
+            ("changed", |root| {
+                std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")
+            }),
+            ("added", |root| {
+                std::fs::write(root.join("gold/extra.sql"), "SELECT 4 AS v\n")?;
+                std::fs::write(
+                    root.join("gold/extra.toml"),
+                    std::fs::read_to_string(root.join("gold/totals.toml"))?
+                        .replace("table = \"totals\"", "table = \"extra\""),
+                )
+            }),
+            ("removed", |root| {
+                std::fs::remove_file(root.join("gold/totals.sql"))?;
+                std::fs::remove_file(root.join("gold/totals.toml"))
+            }),
+        ];
+        for (label, edit) in edits {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            let config = two_pipeline_dag_project(root)?;
+            let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+            edit(root)?;
+
+            let err = apply_dag_plan_as_human(root, &config, &plan_id)
+                .await
+                .expect_err("a human apply of a changed plan must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.starts_with(super::super::approval_scope::PLAN_MODELS_CHANGED),
+                "{label}: {msg}"
+            );
+            assert!(
+                !root.join("proj.duckdb").exists(),
+                "{label}: refused before the warehouse is opened"
+            );
+        }
+        Ok(())
+    }
+
+    /// The other half: an unchanged plain run plan applies for a human, and
+    /// builds its model. The re-check must not refuse a plan whose models
+    /// still match.
+    #[tokio::test]
+    async fn human_apply_of_an_unchanged_plan_proceeds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+
         apply_dag_plan_as_human(root, &config, &plan_id)
             .await
-            .expect("a human-authored --dag plan applies the current models");
+            .expect("an unchanged plan must apply");
+
+        let adapter =
+            rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&root.join("proj.duckdb"))?;
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard.execute_sql("SELECT v FROM proj.marts.totals")?;
+        assert_eq!(rows.rows.len(), 1, "totals materialized");
         Ok(())
     }
 
@@ -13497,6 +14056,7 @@ enabled = true
                 PolicyPrincipal::Agent,
                 crate::plan_store::EmbeddedCapabilities {
                     models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                    models_only_fingerprint: None,
                     config_identity: Some("reviewed-config".to_string()),
                     fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
                     reviewed_source_schemas: Some(BTreeMap::new()),

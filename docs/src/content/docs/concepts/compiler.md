@@ -89,6 +89,28 @@ them into three kinds:
 Rocky merges any explicit `depends_on` entries from the model config with the
 dependencies it resolved. It then drops self-references and duplicates.
 
+#### Dependency cycles (`E058`)
+
+A cycle is a set of models that depend on each other, so no model can run
+first. For example, `fct_orders` reads `customer_ltv` in a `WHERE` sub-query,
+and `customer_ltv` reads `fct_orders`:
+
+```sql
+-- fct_orders.sql. E058: fct_orders depends on customer_ltv, which depends on fct_orders
+SELECT order_id, customer_id, amount
+FROM raw.orders
+WHERE customer_id IN (SELECT customer_id FROM customer_ltv)
+```
+
+`rocky compile`, `rocky test` and `rocky ci` report `E058` once for each model
+on the cycle. Each diagnostic names the models on the cycle and points at the
+line of the read that closes it. A dependency that only `depends_on` declares
+has no line to point at. The JSON output is printed as for any other error,
+and the command exits `1`. No later compile step runs, so a cycle hides other
+diagnostics until you remove it.
+
+`rocky run` refuses a project with a cycle before it writes anything.
+
 ### 3. Build semantic graph
 
 Rocky walks the models in topological order. For each one it pulls column-level
@@ -131,6 +153,9 @@ A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGIN
 An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
 A `UNION`, `INTERSECT` or `EXCEPT` is typed from all its branches, paired by position. The column name comes from the first branch. A column is non-null only if it is non-null in every branch, and its type is the common supertype of the branches (`Unknown` if there is none). If Rocky cannot type the query (for example branches with different column counts, or a `VALUES` branch), every column is nullable and computed columns are `Unknown`.
+A cast of a column Rocky can type is the cast's target type: `CAST(o.quantity * p.price AS DECIMAL(12, 2))` is `Decimal(12, 2)`. A cast of a column Rocky cannot type stays `Unknown`, because Rocky cannot say whether it is nullable. A bare `DECIMAL` with no precision stays `Unknown`.
+A `CASE` or `COALESCE` takes a type when its branches agree exactly. Each branch must be a column, a cast, `COUNT`, a text or boolean literal, or `NULL`, and every branch must have the same type. `CASE WHEN price < 20 THEN 'budget' ELSE 'premium' END` is `String`, and `COALESCE(order_count, 0)` over a `BIGINT` is `Int64`. An integer literal counts only when it does not change the type, so `COALESCE(qty, 0)` over an `INT` stays `Unknown`. A branch with a fraction (`1.5`) or two branches of different widths also leave the result `Unknown`.
+Date arithmetic is `Unknown`, because warehouses disagree on its type: `DATE - DATE` is a `BIGINT` in DuckDB and an interval in Databricks.
 An aggregate over a computed argument takes its type from that argument only when the argument's type comes from the SQL itself (a cast target): `SUM(CAST(y AS DOUBLE))` is `Float64`. Otherwise it stays `Unknown`: `MAX(LENGTH(n))` is `Unknown`, because the width of `LENGTH` differs between warehouses. `SUM` or `AVG` over a cast to `DECIMAL` is also `Unknown`, because each warehouse widens the precision differently.
 
 For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from qualified references to either input.
@@ -148,6 +173,10 @@ For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from quali
   `VARCHAR` column casts the text on every row on DuckDB, Snowflake,
   Databricks, SQL Server and Redshift. The query fails on the first value that does not parse, so Rocky
   reports `W043`. BigQuery, Trino and PostgreSQL refuse the pair outright: `E043`.
+- **Dates against numbers.** `order_date > 5` compares a `DATE` or `TIMESTAMP`
+  with a number. DuckDB, PostgreSQL, BigQuery and Trino have no such
+  comparison, so Rocky reports `E043`. On Snowflake, Databricks, SQL Server and
+  Redshift it is `W043`, because Rocky has not verified their rule.
 
 The warehouse comes from, in order: `--target-dialect`, the adapter `type` of
 the warehouse each model runs on, then `[portability] target_dialect`. A model
@@ -162,6 +191,8 @@ These stay clean, so valid SQL is never refused:
 - An operand whose type Rocky does not know.
 - A string literal that parses as a number, such as `10::BIGINT = '10'::VARCHAR`.
 - A string literal compared with a date, such as `order_date >= '2024-01-01'`.
+- Date arithmetic, such as `order_date >= CURRENT_DATE - 5`. Rocky does not
+  type it, so it is never compared with a number.
 - `DATE` compared with `TIMESTAMP`, and numbers of different widths.
 - `MIN`, `MAX`, `COUNT(*)` and `COUNT(DISTINCT x)` over any type.
 
@@ -171,10 +202,45 @@ reported once, as `E001` or `W001`.
 To fail the compile on the warnings, run
 `rocky compile --deny-warnings W042,W043`.
 
+#### Unknown functions
+
+Rocky reports `E057` when a model calls a function that the target warehouse
+does not have and that the project does not declare in `functions/`:
+
+```sql
+-- E057: function `SUMM` does not exist in DuckDB and is not a project function in `functions/`
+SELECT customer_id, SUMM(amount) AS lifetime_value FROM fct_orders GROUP BY customer_id
+```
+
+The message suggests close names (`did you mean sum?`). The check runs only for
+models that run on DuckDB, because only DuckDB has a complete function list in
+Rocky. The list holds DuckDB's built-in functions and the functions its
+extensions load on first use. Other warehouses are not checked, and neither is
+a project whose `[portability] target_dialect` names another warehouse.
+
+These calls are never reported:
+
+- A schema-qualified call, such as `main.my_macro(x)`. Use this form for a
+  macro or an extension function that you load outside Rocky.
+- A quoted function name.
+- A function declared in `functions/`.
+
 ### 5. Validate contracts
 
-If a contracts directory exists, Rocky loads the `.contract.toml` files and
-checks resolvable facts against the inferred schemas. The
+Rocky loads the `.contract.toml` files and checks resolvable facts against
+the inferred schemas. It reads a `<model>.contract.toml` next to a model file,
+then the project `contracts/` directory beside the models directory. A
+`--contracts <DIR>` flag replaces the project directory. A file in the
+directory wins over a file next to the model.
+
+One `contracts/` directory serves every pipeline. A compile skips a file
+for a model it does not include. If that file does not parse, the compile
+logs a warning and goes on. A file that does not parse for a model in the
+compile is an error.
+
+A `rocky plan` fingerprints the contract file of each model it covers, from
+either place. If that file changes or is deleted before `rocky apply`, the
+apply refuses with `plan_models_changed`. The
 [Testing and Contracts](/concepts/testing) page has the contract format.
 
 ### 6. Lint passes and merge
@@ -212,15 +278,31 @@ what it had. A missing reference and unsupported inference can both lead to
 so checks that need the type can remain unresolved. A declared type does not
 validate an unresolved reference.
 
-Rocky reports `E039` for one bounded missing-reference shape. The consumer must
-directly project a name from one complete in-project model. The name must be
-absent from that model's output. Other shapes can remain `Unknown`. `E039`
-does not validate them.
+Rocky reports `E039` when a model reads a column that an upstream model does
+not output. The read can be in any clause: the `SELECT` list, `WHERE`, join
+`ON`, `GROUP BY`, `HAVING`, a `CASE`, a function argument, a subquery or a CTE
+body. A qualified read such as `p.category` counts too.
 
-`E039` covers in-project models only. Incomplete scopes, duplicate output
-names, struct field reads, and warehouse metadata columns remain conservative.
-The upstream output must use plain column projections or aliased columns and
-literals. Functions and other expressions remain conservative.
+```sql
+-- E039: column 'stats' does not exist in complete upstream model 'int_order_lines'
+SELECT order_id FROM int_order_lines WHERE stats = 'completed'
+```
+
+Rocky reports the name only when absence is a fact:
+
+- The model depends on the upstream model and reads it by its bare name.
+  The upstream model writes a table of that name, or is ephemeral. A
+  qualified read of its target, such as `main.int_order_lines`, is not
+  checked.
+- The upstream output is complete. Every projection item is a column or has an
+  alias, with no `SELECT *` and no set operation. An alias over a function that
+  can return several columns, such as `unnest`, `explode` or `COLUMNS`, does
+  not count.
+- No two upstream output names differ only in case.
+
+The binding rules are the ones for external sources below. A CTE, derived
+table, unknown relation, `SELECT` alias, struct field read, quoted name or
+warehouse metadata column keeps the name `Unknown`.
 
 ### Missing columns in external sources (`E041` / `W041`)
 
@@ -264,6 +346,34 @@ the name `Unknown`:
 `rocky run` compiles against the schema cache before it executes. An `E041`
 model is excluded like any model with an error, before Rocky touches the
 warehouse. A `W041` is logged as a warning and the model runs.
+
+### Missing tables in external sources (`E045` / `W045`)
+
+A two-part read such as `FROM staging.orderz` names a schema and a table. When
+Rocky has source schemas for other tables in `staging`, but none for `orderz`,
+the table may not exist. The code depends on how complete Rocky's table list
+for that schema is:
+
+| Where the table list came from | Without strict sources | With strict sources |
+|---|---|---|
+| Every table read from the warehouse during this invocation (an embedding caller; no CLI command does this for a compile yet) | `E045` (error) | `E045` |
+| Seed file (`--with-seed`) or schema cache | `W045` (warning) | `E045` |
+
+A seed or the cache lists only the tables it was given, so by default these
+only warn, and the compile exits `0`. `--strict-sources` and
+`[cache.schemas] strict_sources = true` turn every `W045` into `E045`. The
+message suggests a close table name, or lists the schema's known tables.
+
+These reads stay silent:
+
+- A schema Rocky has no source schema in.
+- A schema that a model of the project writes to. The project adds tables
+  that no source schema lists.
+- A one-part name (a model, a CTE, or a table on the search path) and a
+  three-part name (its catalog may hold a different schema of that name).
+- A name bound by `WITH`.
+
+`rocky run` logs a `W045` as a warning and the model runs.
 
 During `rocky run`, a selected model with an `Error` diagnostic records a
 `compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
@@ -315,6 +425,41 @@ These shapes stay silent:
 - `QUALIFY`, and outer references inside a subquery.
 - Names Rocky cannot place: unknown relations, stale schemas, session
   variables.
+
+Each subquery and CTE is checked as its own query.
+
+### Ambiguous column names (`E029`)
+
+Rocky reports `E029` when a bare column name could come from two relations in
+the same `FROM` clause. Every warehouse Rocky targets refuses such a query.
+
+```sql
+-- E029: column 'customer_id' is ambiguous: the joined relations 'c', 'l' all have a column called 'customer_id'
+SELECT customer_id, c.name
+FROM stg_customers AS c
+LEFT JOIN customer_ltv AS l ON c.customer_id = l.customer_id
+```
+
+Fix it by qualifying the name (`c.customer_id`), or join with
+`USING (customer_id)` when the columns are the same key.
+
+`E029` fires only when Rocky knows that both relations have the column: each
+is an upstream model, a source schema from `--with-seed` or the schema cache,
+a CTE, or a subquery in `FROM`. These stay silent:
+
+- A relation whose columns Rocky does not know, such as an external table
+  with no source schema, or a model of another pipeline compiled separately.
+- A name merged by `USING (…)`. A scope with `NATURAL`, semi, anti or
+  `ARRAY JOIN`, or `LATERAL VIEW` is not checked.
+- A name that is also a `SELECT` alias, or the output name of a qualified
+  projection such as `c.customer_id`. `ORDER BY` is not checked when the
+  `SELECT` list has a star.
+- A relation binding name (a whole-row reference), a quoted name, a date-part
+  keyword, or a niladic keyword such as `current_date`.
+- A scope that uses `->`. A lambda parses as that operator, so its parameter
+  looks like a column.
+- A name inside a subquery that the subquery's own `FROM` does not bind. It
+  resolves to the outer query (a correlated reference).
 
 Each subquery and CTE is checked as its own query.
 
@@ -411,11 +556,15 @@ span, and sometimes a suggested fix.
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
 | `E038` | An `ephemeral` model is used in a way inlining cannot serve: it declares `[[tests]]`, another model reads its nominal target by a qualified name, a consumer's SQL cannot be rewritten, or `rocky run --model` selects it directly |
-| `E039` | A direct projection names a column absent from a complete in-project upstream model |
+| `E039` | A model reads a column absent from a complete in-project upstream model. See [The type system](#the-type-system) |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
+| `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
+| `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
+| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB only). See [Unknown functions](#unknown-functions) |
+| `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
-| `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery |
+| `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
 | `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server) |
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
@@ -446,6 +595,7 @@ span, and sometimes a suggested fix.
 | `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
 | `W044` | `E044`'s finding on a model that runs only on PostgreSQL, which accepts a column that depends on a grouped primary key (escalate with `--deny-warnings W044`) |
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
+| `W045` | A two-part read names a table absent from a known schema whose table list came from a seed or the schema cache (escalate with `--strict-sources`) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |

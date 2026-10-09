@@ -187,14 +187,15 @@ pub fn inline_mask_expr(
         // Constant; valid in every dialect.
         MaskStrategy::Redact => Some("'***'".to_string()),
         MaskStrategy::Hash => match adapter_type {
-            // Same `sha2(v, 256)` form Rocky's masking policies use.
-            "databricks" | "snowflake" => Some(format!("sha2({column}, 256)")),
+            // Same `sha2(v, 256)` form Rocky's masking policies use; a Spark
+            // built-in too.
+            "databricks" | "snowflake" | "spark" => Some(format!("sha2({column}, 256)")),
             // DuckDB's hex-returning sha256 over a cast-to-text operand.
             "duckdb" => Some(format!("sha256(CAST({column} AS VARCHAR))")),
             _ => None,
         },
         MaskStrategy::Partial => match adapter_type {
-            "databricks" | "snowflake" | "duckdb" => Some(partial_mask_expr_for(column)),
+            "databricks" | "snowflake" | "duckdb" | "spark" => Some(partial_mask_expr_for(column)),
             _ => None,
         },
     }

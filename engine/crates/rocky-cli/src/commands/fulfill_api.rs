@@ -416,9 +416,31 @@ pub async fn propose_governed_run_plan(
     // Embed the propose-time change-classification so the reviewed
     // capabilities bind to the plan_id (a creds-free / non-git project
     // fails closed — every model classified breaking).
-    let capabilities = super::compute_embedded_capabilities(
+    //
+    // Fingerprint the scope `rocky apply` executes for this plan, resolved
+    // by the same `approval_scope` plan and apply use: the pipeline's
+    // directory and file glob, not `models_dir` without a glob. Otherwise
+    // plan and apply hash different model sets and the apply refuses an
+    // unchanged plan. An unresolvable scope refuses the propose.
+    //
+    // Resolved against the config path joined to `root`, as review does, so
+    // the directory and the glob are both anchored at the project root. A
+    // relative glob over a root-anchored directory matches nothing.
+    let scope_config_path = root.join(config_path);
+    let scope = rocky_core::config::load_optional_project_config(Some(&scope_config_path))
+        .map_err(anyhow::Error::from)
+        .and_then(|cfg| {
+            super::approval_scope::approval_scope_at(
+                cfg.as_ref(),
+                root,
+                &scope_config_path,
+                &run_plan,
+            )
+        })
+        .map_err(|e| ProposeError::Compile(format!("{e:#}")))?;
+    let capabilities = super::plan::compute_embedded_capabilities_for_scope(
         config_path,
-        models_dir,
+        Some(&scope),
         "main",
         Some(state_path),
         None, // no `--env`; governance identity binds defaults
@@ -1234,6 +1256,97 @@ mod tests {
             .map(|d| d.filter_map(std::result::Result::ok).count())
             .unwrap_or(0);
         assert_eq!(written, 0, "a refused propose must not persist a plan");
+    }
+
+    /// A proposed plan fingerprints the models `rocky apply` runs: the
+    /// pipeline's directory and file glob, not the whole `models_dir`. With a
+    /// narrow glob (`models/marts/**`), an unchanged plan applies even after
+    /// an edit to a model outside the glob, and an edit inside it refuses
+    /// with `plan_models_changed`. Before, propose hashed every model under
+    /// `models_dir` without the glob, so apply refused an unchanged plan.
+    #[tokio::test]
+    async fn a_proposed_plan_fingerprints_the_pipeline_glob_apply_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models_dir = root.join("models");
+        let model = |sub: &str, name: &str, value: u32| {
+            write_file(
+                &models_dir.join(sub).join(format!("{name}.sql")),
+                format!("SELECT {value} AS v\n").as_bytes(),
+            );
+            write_file(
+                &models_dir.join(sub).join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"proj\"\n\
+                     schema = \"{sub}\"\ntable = \"{name}\"\n"
+                )
+                .as_bytes(),
+            );
+        };
+        model("marts", "totals", 2);
+        model("staging", "orders", 1);
+        let config_path = root.join("rocky.toml");
+        write_file(
+            &config_path,
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/marts/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"local\"\n\n\
+                 [pipeline.t.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                root.join("proj.duckdb").display()
+            )
+            .as_bytes(),
+        );
+        let state_path = root.join("state.redb");
+
+        let outcome = propose_governed_run_plan(ProposeRequest {
+            root,
+            config_path: &config_path,
+            models_dir: &models_dir,
+            state_path: &state_path,
+            model: None,
+            product: None,
+            idempotency_key: None,
+            actor: &rocky_core::config::PrincipalRef::unnamed(),
+        })
+        .await
+        .expect("propose");
+        let ProposeOutcome::Written { plan_id, .. } = outcome else {
+            panic!("expected a written plan, got {outcome:?}");
+        };
+        crate::commands::review::write_test_review_marker(root, &plan_id);
+        let actor = rocky_core::config::PrincipalRef::unnamed();
+        // Boxed: the apply future is too large for a test thread's stack.
+        let apply = || {
+            Box::pin(crate::commands::apply::run_apply_in(
+                root,
+                &config_path,
+                &plan_id,
+                &state_path,
+                PolicyPrincipal::Human,
+                &actor,
+                None,
+                false,
+            ))
+        };
+
+        let inside = models_dir.join("marts/totals.sql");
+        std::fs::write(&inside, "SELECT 3 AS v\n").unwrap();
+        let msg = format!(
+            "{:#}",
+            apply().await.expect_err("an edit in the glob refuses")
+        );
+        assert!(
+            msg.starts_with(crate::commands::approval_scope::PLAN_MODELS_CHANGED),
+            "{msg}"
+        );
+        std::fs::write(&inside, "SELECT 2 AS v\n").unwrap();
+
+        std::fs::write(models_dir.join("staging/orders.sql"), "SELECT 9 AS v\n").unwrap();
+        apply()
+            .await
+            .expect("an edit outside the glob does not refuse an unchanged plan");
     }
 
     fn write_file(path: &Path, bytes: &[u8]) {

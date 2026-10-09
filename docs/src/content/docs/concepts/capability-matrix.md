@@ -39,7 +39,7 @@ Four more words appear across the rows, always with the same meaning:
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E013). An opt-in selected-model run checks its contract in its own compile. Other run routes do not. |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E013) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
@@ -60,7 +60,7 @@ runs, and fails on any of these four errors:
 - `E012`: the contract says non-nullable, the model output is nullable.
 - `E013`: a protected column was removed.
 
-`rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` checks one selected `full_refresh` model in the compile that supplies its SQL. A contract error prevents that model's table write. The guard does not cover a whole pipeline, DAG, `rocky apply`, branches, or deferred runs. It refuses models with a post-compile surrogate key. A failed run can still record state and history.
+Every `rocky run` reads the project `contracts/` directory and checks each contract in the compile that supplies the model SQL. A contract error keeps that model's existing table and withholds its downstream models. `rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` also requires the selected model to have a contract. A failed run can still record state and history.
 
 Two limits, stated plainly:
 
@@ -70,14 +70,13 @@ Two limits, stated plainly:
   column as `I003` at info severity, naming the column and the type the
   contract declares. Info changes no exit code: `rocky compile`, `rocky test`
   and `rocky ci` all still pass. To make the check run, give the compiler
-  source schemas. `rocky compile --with-seed` reads them from
-  `data/seed.sql` and works for every pipeline type. For a replication
-  pipeline, `rocky discover --with-schemas` (or `rocky run`) fills the schema
-  cache that `rocky compile` reads. `discover` refuses a transformation-only
-  pipeline, so for those use `--with-seed`. Two limits on that. `rocky test` and `rocky ci` always compile with no source schemas, so
-  every column that takes its type from a source table is `Unknown` under
-  them. And an expression whose result type depends on the warehouse — `AVG`
-  over a `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
+  source schemas. `rocky compile`, `rocky test` and `rocky ci` read them from
+  `data/seed.sql` when the project has one, for every pipeline type. For a
+  replication pipeline, `rocky discover --with-schemas` (or `rocky run`)
+  fills the schema cache that `rocky compile` reads. `discover` refuses a
+  transformation-only pipeline, so for those use a seed. One limit on that:
+  an expression whose result type depends on the warehouse — `AVG` over a
+  `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
   to clear an `I003`. A cast takes its type from the target, not from the
   value, so it reports whatever you cast to whether or not the data matches.
   It silences the message and checks nothing.

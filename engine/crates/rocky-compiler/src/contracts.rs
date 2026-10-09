@@ -7,7 +7,7 @@
 //! This complements the runtime contract validation in `rocky_core::contracts`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,27 @@ pub struct ContractRules {
     pub no_new_nullable: bool,
 }
 
+/// The project contracts directory that belongs to a models directory.
+///
+/// Same convention as `functions/` and `macros/`: a `contracts/` directory
+/// beside the models directory, which in the usual layout is the directory
+/// that holds `rocky.toml`. Every compile that is not given an explicit
+/// contracts directory reads this one, so `rocky compile`, `rocky ci`,
+/// `rocky test`, `rocky run` (every shape, `--dag` included) and the language
+/// server check the same contracts.
+///
+/// Returns `None` when the directory does not exist, and for an empty
+/// `models_dir` (a compile over preloaded models), so a caller never
+/// resolves `../contracts` against the process working directory.
+#[must_use]
+pub fn project_contracts_dir_for(models_dir: &Path) -> Option<PathBuf> {
+    if models_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let dir = models_dir.join("../contracts");
+    dir.is_dir().then_some(dir)
+}
+
 /// Load contracts from a directory.
 ///
 /// Each file named `{model_name}.contract.toml` defines a contract for that model.
@@ -89,6 +110,58 @@ pub fn load_contracts(dir: &Path) -> Result<HashMap<String, CompilerContract>, S
         }
     }
 
+    Ok(contracts)
+}
+
+/// The path of `model_name`'s contract in a contracts directory.
+#[must_use]
+pub fn contract_file_in(dir: &Path, model_name: &str) -> PathBuf {
+    dir.join(format!("{model_name}.contract.toml"))
+}
+
+/// Load the project `contracts/` directory for one compile.
+///
+/// Returns each in-scope model's contract with the file it was read from.
+/// `in_scope` names the models the compile includes. One directory serves
+/// every pipeline, so a file for a model outside the compile is skipped. If
+/// that file does not parse, Rocky logs a warning and goes on: the compile
+/// that includes the model reports it. A file for an in-scope model that
+/// cannot be read or parsed is an error.
+pub fn load_project_contracts(
+    dir: &Path,
+    in_scope: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, (PathBuf, CompilerContract)>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read contracts directory {}: {e}", dir.display()))?;
+    let mut contracts = HashMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(model_name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".contract.toml"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))
+            .and_then(|content| {
+                toml::from_str::<CompilerContract>(&content)
+                    .map_err(|e| format!("failed to parse {}: {e}", path.display()))
+            });
+        if !in_scope(&model_name) {
+            if let Err(error) = parsed {
+                tracing::warn!(
+                    model = %model_name,
+                    "skipping a contract for a model outside this compile: {error}"
+                );
+            }
+            continue;
+        }
+        contracts.insert(model_name, (path, parsed?));
+    }
     Ok(contracts)
 }
 
@@ -195,12 +268,12 @@ pub fn validate_contract(
                             // that manufactures the answer is worse than no
                             // advice (#1721).
                             .with_suggestion(format!(
-                                "give `rocky compile` source schemas so `{0}`'s type resolves — \
-                                 `rocky compile --with-seed` reads them from `data/seed.sql`; \
-                                 for a replication pipeline, `rocky discover --with-schemas` \
-                                 fills the schema cache (it refuses transformation-only \
-                                 pipelines); `rocky test` and `rocky ci` always compile without \
-                                 them. Do not add a CAST to silence this: a cast \
+                                "give the compiler source schemas so `{0}`'s type resolves — \
+                                 `rocky compile`, `rocky test` and `rocky ci` read them from \
+                                 `data/seed.sql` when the project has one; for a replication \
+                                 pipeline, `rocky discover --with-schemas` fills the schema \
+                                 cache (it refuses transformation-only pipelines). Do not add \
+                                 a CAST to silence this: a cast \
                                  takes its type from the target, so it would report {1} whatever \
                                  the column actually holds",
                                 contract_col.name, expected_type
@@ -423,6 +496,31 @@ fn decimal_type_matches(precision: u8, scale: u8, type_name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::diagnostic::Severity;
+
+    #[test]
+    fn project_contracts_dir_for_is_the_models_sibling_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).expect("models dir");
+        assert_eq!(project_contracts_dir_for(&models), None, "absent directory");
+        assert_eq!(
+            project_contracts_dir_for(Path::new("")),
+            None,
+            "no models dir"
+        );
+        std::fs::write(tmp.path().join("contracts"), "not a directory").expect("file");
+        assert_eq!(
+            project_contracts_dir_for(&models),
+            None,
+            "a file is not a directory"
+        );
+        std::fs::remove_file(tmp.path().join("contracts")).expect("remove file");
+        std::fs::create_dir(tmp.path().join("contracts")).expect("contracts dir");
+        assert_eq!(
+            project_contracts_dir_for(&models),
+            Some(models.join("../contracts"))
+        );
+    }
 
     fn typed_col(name: &str, ty: RockyType, nullable: bool) -> TypedColumn {
         TypedColumn {

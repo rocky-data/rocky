@@ -214,9 +214,12 @@ pub struct LineageResult {
     /// what the query's own `FROM` clause names. A nested read is a dependency,
     /// not a relation the outer query can select from.
     ///
-    /// **Best-effort, not complete.** It covers derived tables and `WITH`
-    /// bodies. It does not cover a sub-query in `WHERE`, `HAVING`, `GROUP BY`,
-    /// a qualifier or a function argument. `crate::lineage_complete` is the
+    /// **Best-effort, not complete.** It covers derived tables, `WITH`
+    /// bodies, and expression sub-queries (a scalar sub-query, `IN (SELECT …)`,
+    /// `EXISTS (…)`) in the projection, `WHERE`, `HAVING`, `QUALIFY`,
+    /// `GROUP BY`, a join condition, a function argument or `ORDER BY`. It does
+    /// not cover a sub-query in a table function's arguments, `PIVOT` or other
+    /// table factors the extractor does not read. `crate::lineage_complete` is the
     /// only correct answer to "is this set exhaustive", and it stays exactly as
     /// strict — do not read a non-empty value here as completeness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -673,6 +676,79 @@ fn walk_cte_bodies(query: &Query, outer: &CteScope) -> (Vec<String>, CteScope) {
     (found, visible)
 }
 
+/// The tables read inside expression sub-queries of `select`: a scalar
+/// sub-query in the projection, an `IN (SELECT …)` or `EXISTS (…)` in `WHERE`,
+/// `HAVING`, `QUALIFY`, `GROUP BY` or a join condition, and a sub-query passed
+/// as a function argument. A model that reads another only there still
+/// depends on it, so these reads are dependencies like a derived table's.
+///
+/// Derived tables in `FROM` are not visited here: [`extract_tables`] already
+/// returns their reads. Each sub-query is read with the enclosing CTE scope,
+/// so a `WITH`-bound name it reads is not reported (#1892), and its own nested
+/// sub-queries are reached by the same recursion.
+fn expression_subquery_reads(select: &Select, ctes: &CteScope) -> Vec<String> {
+    let mut inner_queries = immediate_subqueries(&select.projection);
+    inner_queries.extend(immediate_subqueries(&select.selection));
+    inner_queries.extend(immediate_subqueries(&select.having));
+    inner_queries.extend(immediate_subqueries(&select.qualify));
+    inner_queries.extend(immediate_subqueries(&select.group_by));
+    fn join_conditions(table: &TableWithJoins, out: &mut Vec<Query>) {
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = &table.relation
+        {
+            join_conditions(table_with_joins, out);
+        }
+        for join in &table.joins {
+            out.extend(immediate_subqueries(&join.join_operator));
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = &join.relation
+            {
+                join_conditions(table_with_joins, out);
+            }
+        }
+    }
+    for table in &select.from {
+        join_conditions(table, &mut inner_queries);
+    }
+    let mut found = Vec::new();
+    for inner in &inner_queries {
+        if let Ok(result) = extract_query_lineage(inner, ctes) {
+            collect_nested(&result, &mut found);
+        }
+    }
+    found
+}
+
+/// Queries directly nested in `node`, not counting queries nested in those.
+fn immediate_subqueries<T: Visit>(node: &T) -> Vec<Query> {
+    struct Collector {
+        depth: usize,
+        found: Vec<Query>,
+    }
+    impl Visitor for Collector {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if self.depth == 0 {
+                self.found.push(query.clone());
+            }
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+    }
+    let mut collector = Collector {
+        depth: 0,
+        found: Vec::new(),
+    };
+    let _ = node.visit(&mut collector);
+    collector.found
+}
+
 /// Fold one inner query's reads into a nested-source list.
 ///
 /// Takes NAMES only. An inner query's `has_star` and `unresolved_projections`
@@ -690,6 +766,18 @@ fn collect_nested(inner: &LineageResult, out: &mut Vec<String>) {
 fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<LineageResult, String> {
     let (nested_sources, ctes) = walk_cte_bodies(query, outer_ctes);
     let mut result = extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)?;
+    if let Some(order_by) = &query.order_by {
+        let before = result.nested_sources.len();
+        for inner in immediate_subqueries(order_by) {
+            if let Ok(inner) = extract_query_lineage(&inner, &ctes) {
+                collect_nested(&inner, &mut result.nested_sources);
+            }
+        }
+        if result.nested_sources.len() != before {
+            result.nested_sources.sort();
+            result.nested_sources.dedup();
+        }
+    }
     if let SetExpr::Select(select) = query.body.as_ref() {
         let edges = extract_order_limit(query, select, &result.source_tables);
         for edge in edges {
@@ -778,6 +866,7 @@ fn extract_set_expr_lineage(
             // object, so the names inside it are what a consumer depends on.
             let (source_tables, derived_reads) = extract_tables(&select.from, ctes);
             nested_sources.extend(derived_reads);
+            nested_sources.extend(expression_subquery_reads(select, ctes));
             nested_sources.sort();
             nested_sources.dedup();
             let alias_map = build_alias_map(&source_tables);
@@ -957,6 +1046,21 @@ fn extract_table_factor(
                 derived_sources,
                 cte_columns: Vec::new(),
             });
+        }
+        // A parenthesised join, `FROM (a JOIN b ON …) JOIN c`. Its relations
+        // are dependencies, recorded by name only: they are not added to
+        // `tables`, so alias resolution and star expansion are unchanged.
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            let (inner, inner_nested) =
+                extract_tables(std::slice::from_ref(table_with_joins.as_ref()), ctes);
+            for t in &inner {
+                if t.binding == TableBinding::Physical && t.name != "(subquery)" {
+                    nested.push(t.name.to_lowercase());
+                }
+            }
+            nested.extend(inner_nested);
         }
         _ => {}
     }
@@ -2355,6 +2459,65 @@ mod tests {
             vec!["orders".to_string()],
             "the marker is gone and the real read is there"
         );
+    }
+
+    /// A table read only inside an expression sub-query is a dependency too:
+    /// `IN (SELECT …)`, `EXISTS`, a scalar sub-query in the projection, a
+    /// join condition, `HAVING` and `ORDER BY`, nested to any depth.
+    #[test]
+    fn an_expression_subquery_read_is_a_dependency() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT id FROM orders WHERE customer_id IN (SELECT customer_id FROM ltv)",
+                &["ltv", "orders"],
+            ),
+            (
+                "SELECT id FROM orders o WHERE EXISTS (SELECT 1 FROM refunds r WHERE r.id = o.id)",
+                &["orders", "refunds"],
+            ),
+            (
+                "SELECT c.id, (SELECT COUNT(*) FROM orders AS so WHERE so.cid = c.id) AS n \
+                 FROM customers AS c",
+                &["customers", "orders"],
+            ),
+            (
+                "SELECT a.id FROM a JOIN b ON a.id = b.id AND b.k IN (SELECT k FROM keys)",
+                &["a", "b", "keys"],
+            ),
+            (
+                "SELECT id, COUNT(*) FROM a GROUP BY id HAVING COUNT(*) > (SELECT MIN(n) FROM caps)",
+                &["a", "caps"],
+            ),
+            (
+                "SELECT id FROM a ORDER BY (SELECT MAX(x) FROM rank_src) LIMIT 1",
+                &["a", "rank_src"],
+            ),
+            (
+                "SELECT id FROM a WHERE id IN (SELECT id FROM b WHERE b.k IN (SELECT k FROM deep))",
+                &["a", "b", "deep"],
+            ),
+            (
+                "SELECT a.id FROM (a JOIN b ON b.k IN (SELECT k FROM keys)) JOIN c ON c.id = a.id",
+                &["a", "b", "c", "keys"],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let mut want: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            want.sort();
+            assert_eq!(referenced_tables(sql).unwrap(), want, "{sql}");
+        }
+    }
+
+    /// A `WITH`-bound name read inside an expression sub-query is not a read
+    /// (#1892), and the outer query's own columns stay as they were.
+    #[test]
+    fn an_expression_subquery_read_of_a_cte_is_not_a_dependency() {
+        let sql = "WITH ltv AS (SELECT 1 AS customer_id) \
+                   SELECT id FROM orders WHERE customer_id IN (SELECT customer_id FROM ltv)";
+        assert_eq!(referenced_tables(sql).unwrap(), vec!["orders".to_string()]);
+        let result = extract_lineage(sql).unwrap();
+        assert_eq!(result.source_tables.len(), 1);
+        assert_eq!(result.columns.len(), 1);
     }
 
     /// The same for a `WITH` body. The CTE's own name stays out — it names no

@@ -16,9 +16,10 @@
 //!
 //! Since #1867 it does descend into derived tables and `WITH` bodies, carrying
 //! what it finds on `LineageResult::nested_sources`. That is a **widening, not
-//! completeness**, and this gate must not be relaxed for it. Still not reached:
-//! a sub-query in `WHERE`, `HAVING`, `GROUP BY`, a qualifier or a function
-//! argument, and any body that is a set operation (`extract_query_lineage`
+//! completeness**, and this gate must not be relaxed for it. Expression
+//! sub-queries (`WHERE … IN (SELECT …)`, scalar sub-queries) are now read too.
+//! Still not reached: a sub-query inside a table function or other table
+//! factor the extractor does not read, and any body that is a set operation (`extract_query_lineage`
 //! returns `Err` for `SetExpr::SetOperation`, so a `UNION` CTE body is skipped
 //! entirely). Partial coverage that reads as complete is exactly the silent
 //! staleness this gate exists to prevent.

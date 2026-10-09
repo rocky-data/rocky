@@ -2,12 +2,21 @@ import { useCallback } from "react";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
 import type { BreakingFinding, ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_queue";
-import type { ReviewStatusOutput } from "@rocky-types/review_status";
+import type { ApproverIdentity, ReviewStatusOutput } from "@rocky-types/review_status";
 import { apiGet } from "../api";
 import { Clip, StatusCard } from "../components";
 import { type Resource, useResource } from "../estate/useResource";
 import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
+import {
+  JobLine,
+  WriteButton,
+  defaultJobClient,
+  jobBusy,
+  useJob,
+  useWriteAccess,
+  type JobClient,
+} from "../operator";
 import { ResourceState } from "./ResourceState";
 import { SamplePanel } from "./SamplePanel";
 
@@ -320,37 +329,133 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
   );
 }
 
-function HowToApprove({
+/**
+ * Who approved, through which channel, said only as far as the marker says.
+ * `http_api` names the channel (the server's job API), not the person, and
+ * never "the browser": anything holding the token can call that route.
+ */
+export function approverLine(approver: ApproverIdentity | null | undefined): string {
+  if (approver === null || approver === undefined) return "approved; the marker names no approver";
+  const who = approver.email;
+  switch (approver.source) {
+    case "http_api":
+      return `approved over the HTTP API by ${who}`;
+    case "local":
+      return `approved locally by ${who}`;
+    case "ci_oidc":
+      return `approved from CI (OIDC) by ${who}`;
+    case "pat":
+      return `approved with a personal access token by ${who}`;
+  }
+}
+
+/** The terminal command a product-bound apply needs. The digest is the reader's. */
+function productApplyCommand(planId: string): string {
+  return `rocky apply ${planId} --expect-spec-digest <the spec digest you approved>`;
+}
+
+/**
+ * Approve and Apply, or the reason they are not available.
+ *
+ * In operator mode the buttons submit `POST /api/v1/jobs/approve` and
+ * `/jobs/apply` and follow the job. The terminal command stays visible as a
+ * secondary hint. A read-only page draws the buttons disabled with the
+ * reason. A plan bound to a data product has no Apply button at all: its
+ * apply needs the spec digest the reader approved, and the page must never
+ * read that digest back from the plan it is checking.
+ */
+function Approval({
   status,
   entries,
+  jobs,
+  onChanged,
 }: {
   status: ReviewStatusOutput;
   entries: ReviewQueueEntry[];
+  jobs: JobClient;
+  onChanged: () => void;
 }) {
-  if (status.reviewed) {
-    return (
-      <StatusCard
-        label="approval"
-        value="signed off"
-        sub={`${status.approver?.name ?? "someone"} on ${formatInstant(
-          status.reviewed_at ?? null,
-        )}. ${status.breaking_change_count ?? 0} breaking finding(s) were signed off.`}
-      />
-    );
-  }
+  const access = useWriteAccess();
+  const approve = useJob("approve", jobs, onChanged);
+  const apply = useJob("apply", jobs, onChanged);
+  const planId = status.plan_id;
+  const productBound = status.product_id !== null && status.product_id !== undefined;
   // Every row of one plan carries the same command: approval is per plan.
-  const command = entries[0]?.approve_command ?? `rocky review ${status.plan_id} --approve`;
+  const command = entries[0]?.approve_command ?? `rocky review ${planId} --approve`;
+
   return (
-    <section aria-label="How to approve" className="space-y-2">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">How to approve</h3>
-      <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        Approving happens in a terminal, on purpose: the marker records a git identity, and this
-        page holds a read-only token. Copy the command.
-        {entries.length > 1 ? ` It clears every one of the ${entries.length} escalations above.` : ""}
-      </p>
-      <pre className="overflow-x-auto rounded bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-800">
-        {command}
-      </pre>
+    <section aria-label="Approval" className="space-y-2">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Approval</h3>
+      {status.reviewed ? (
+        <StatusCard
+          label="approval"
+          value="signed off"
+          sub={`${approverLine(status.approver)} on ${formatInstant(
+            status.reviewed_at ?? null,
+          )}. ${status.breaking_change_count ?? 0} breaking finding(s) were signed off.`}
+        />
+      ) : (
+        <div className="space-y-1">
+          {access.kind === "operator" && (
+            <p className="text-xs text-zinc-600 dark:text-zinc-300">
+              Approving records this server's git identity as the approver, over the HTTP API.
+            </p>
+          )}
+          {entries.length > 1 && (
+            <p className="text-xs text-zinc-600 dark:text-zinc-300">
+              Approving clears every one of the {entries.length} escalations above.
+            </p>
+          )}
+          <WriteButton
+            label="Approve"
+            busy={jobBusy(approve.view)}
+            onClick={() => approve.start({ plan_id: planId })}
+          />
+          <JobLine label="Approve" view={approve.view} />
+        </div>
+      )}
+
+      {productBound ? (
+        <StatusCard
+          label="apply"
+          value="apply in a terminal"
+          sub={
+            <>
+              This plan is bound to a data product. Its apply must carry the spec digest you
+              approved, and that digest must come from you, not from the plan. Run{" "}
+              <code className="break-all">{productApplyCommand(planId)}</code>.
+            </>
+          }
+        />
+      ) : (
+        <div className="space-y-1">
+          <WriteButton
+            label="Apply"
+            busy={jobBusy(apply.view)}
+            disabledReason={status.reviewed ? undefined : "Approve the plan first."}
+            onClick={() => apply.start({ plan_id: planId })}
+          />
+          <JobLine label="Apply" view={apply.view} />
+          {status.reviewed && (
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+              Apply runs the models on disk, and first checks they still match this plan. If
+              you edited them after the plan, apply refuses (plan_models_changed): plan and
+              approve again.
+            </p>
+          )}
+        </div>
+      )}
+
+      {!status.reviewed && (
+        <div className="space-y-1">
+          <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+            Or approve in a terminal:
+          </p>
+          <pre className="overflow-x-auto rounded bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-800">
+            {command}
+          </pre>
+        </div>
+      )}
     </section>
   );
 }
@@ -424,20 +529,22 @@ function SampleFallback({
 }
 
 /**
- * One plan, read-only: what it is, what it would break, why policy stopped it,
- * whether the spec moved under it, a sample of the data, and the command that
- * would approve it.
+ * One plan: what it is, what it would break, why policy stopped it, whether
+ * the spec moved under it, a sample of the data, and its approval.
  *
- * There is no control here that changes anything. The engine holds that too —
- * the UI token is read-only — but the screen is built as if it did not,
- * because a control that cannot be pressed is worse than one that is absent.
+ * In operator mode the approval section can approve and apply; on a
+ * read-only page the same buttons are disabled with the reason. The engine
+ * enforces that too: a read-only session gets `403` on any job route.
  */
 export function PlanDetail({
   planId,
   loaders = defaultPlanLoaders,
+  jobs = defaultJobClient,
 }: {
   planId: string;
   loaders?: PlanLoaders;
+  /** Where Approve and Apply submit their jobs. Tests hand in a fake. */
+  jobs?: JobClient;
 }) {
   const loadStatus = useCallback(() => loaders.status(planId), [loaders, planId]);
   const loadDiff = useCallback(() => loaders.diff(planId), [loaders, planId]);
@@ -550,7 +657,15 @@ export function PlanDetail({
       )}
 
       {(status.value.reviewed || diff.kind === "ready") && (
-        <HowToApprove status={status.value} entries={entries} />
+        <Approval
+          status={status.value}
+          entries={entries}
+          jobs={jobs}
+          onChanged={() => {
+            status.reload();
+            queue.reload();
+          }}
+        />
       )}
     </div>
   );

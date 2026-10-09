@@ -28,8 +28,9 @@ function decodeSegment(segment: string): string {
  * The review lane: the queue at `/ui/review`, one plan at
  * `/ui/review/{plan_id}`.
  *
- * Read-only, all the way down. The lane offers no control that changes
- * anything — approving is a command the plan page shows you to copy.
+ * The queue only reads. The plan page can approve and apply in operator mode
+ * (a full-scope session); on a read-only page those buttons are disabled
+ * with the reason, and the terminal command stays on the page either way.
  */
 export function ReviewScreen({
   queueLoad,

@@ -243,6 +243,9 @@ _LAZY: dict[str, tuple[str, str]] = {
     "LoadOutput": ("load_schema", "LoadOutput"),
     "MaterializationMetadata": ("run_schema", "MaterializationMetadata"),
     "MaterializationOutput": ("run_schema", "MaterializationOutput"),
+    "LintCounts": ("lint_schema", "LintCounts"),
+    "LintFinding": ("lint_schema", "LintFinding"),
+    "LintOutput": ("lint_schema", "LintOutput"),
     "MetaOutput": ("meta_schema", "MetaOutput"),
     "MetricsAlert": ("metrics_schema", "MetricsAlert"),
     "MetricsOutput": ("metrics_schema", "MetricsOutput"),
@@ -451,6 +454,7 @@ if TYPE_CHECKING:
     from .column_lineage_schema import ColumnLineageOutput
     from .error_envelope_schema import ErrorEnvelope
     from .job_status_schema import JobStatus
+    from .lint_schema import LintCounts, LintFinding, LintOutput
     from .meta_schema import MetaOutput
     from .health_schema import HealthOutput
     from .project_schema import (
@@ -904,6 +908,9 @@ __all__ = [
     "DocsOutput",
     "ErrorEnvelope",
     "JobStatus",
+    "LintCounts",
+    "LintFinding",
+    "LintOutput",
     "MetaOutput",
     "DagEdgeOutput",
     "DagExecutionOutput",

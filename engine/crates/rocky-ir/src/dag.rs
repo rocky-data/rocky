@@ -6,8 +6,16 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DagError {
-    #[error("circular dependency detected involving: {nodes:?}")]
-    CyclicDependency { nodes: Vec<String> },
+    #[error("circular dependency detected involving: {cycle:?}")]
+    CyclicDependency {
+        /// Every node that could not be ordered: the nodes on a cycle and
+        /// every node downstream of one. A caller that must not run any of
+        /// them uses this set.
+        nodes: Vec<String>,
+        /// The nodes on or between cycles, without the ones that only read
+        /// from a cycle. The message names these.
+        cycle: Vec<String>,
+    },
 
     #[error(
         "unknown dependency '{dependency}' referenced by '{node}'{}",
@@ -128,17 +136,52 @@ pub fn topological_sort(nodes: &[DagNode]) -> Result<Vec<String>, DagError> {
     }
 
     if result.len() != nodes.len() {
-        // Nodes not in result are part of a cycle
         let in_result: HashSet<&str> = result.iter().map(std::string::String::as_str).collect();
-        let cyclic: Vec<String> = nodes
+        let stuck: Vec<String> = nodes
             .iter()
             .filter(|n| !in_result.contains(n.name.as_str()))
             .map(|n| n.name.clone())
             .collect();
-        return Err(DagError::CyclicDependency { nodes: cyclic });
+        let cycle = nodes_on_cycles(nodes, &in_result);
+        return Err(DagError::CyclicDependency {
+            nodes: stuck,
+            cycle,
+        });
     }
 
     Ok(result)
+}
+
+/// The nodes Kahn's algorithm could not order that lie on or between cycles.
+///
+/// A node left unordered either sits on a cycle or only depends on one. The
+/// second kind is pruned: repeatedly drop a leftover node that no other
+/// leftover node depends on and that is not its own dependency. What remains
+/// names the cycle, not everything downstream of it.
+fn nodes_on_cycles(nodes: &[DagNode], ordered: &HashSet<&str>) -> Vec<String> {
+    let mut left: HashSet<&str> = nodes
+        .iter()
+        .map(|n| n.name.as_str())
+        .filter(|n| !ordered.contains(n))
+        .collect();
+    loop {
+        let needed: HashSet<&str> = nodes
+            .iter()
+            .filter(|n| left.contains(n.name.as_str()))
+            .flat_map(|n| n.depends_on.iter().map(String::as_str))
+            .filter(|d| left.contains(d))
+            .collect();
+        let before = left.len();
+        left.retain(|n| needed.contains(n));
+        if left.len() == before {
+            break;
+        }
+    }
+    nodes
+        .iter()
+        .filter(|n| left.contains(n.name.as_str()))
+        .map(|n| n.name.clone())
+        .collect()
 }
 
 /// Resolves execution layers (parallelizable groups).
@@ -263,6 +306,41 @@ mod tests {
         ];
         let result = topological_sort(&nodes);
         assert!(matches!(result, Err(DagError::CyclicDependency { .. })));
+    }
+
+    /// The refusal names the models on the cycle, not the models that only
+    /// read from it.
+    #[test]
+    fn a_cycle_error_names_only_the_cycle() {
+        let node = |name: &str, deps: &[&str]| DagNode {
+            name: name.into(),
+            depends_on: deps.iter().map(|d| (*d).into()).collect(),
+        };
+        let nodes = vec![
+            node("lines", &[]),
+            node("fct_orders", &["lines", "customer_ltv"]),
+            node("customer_ltv", &["fct_orders"]),
+            node("top_customers", &["customer_ltv"]),
+            node("report", &["top_customers"]),
+        ];
+        let err = topological_sort(&nodes).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"circular dependency detected involving: ["fct_orders", "customer_ltv"]"#
+        );
+        let DagError::CyclicDependency {
+            nodes: stuck,
+            cycle,
+        } = err
+        else {
+            panic!("expected a cycle");
+        };
+        assert_eq!(cycle, vec!["fct_orders", "customer_ltv"]);
+        assert_eq!(
+            stuck,
+            vec!["fct_orders", "customer_ltv", "top_customers", "report"],
+            "the full set that cannot run stays available to callers"
+        );
     }
 
     #[test]

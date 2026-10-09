@@ -92,6 +92,10 @@ export type FulfillDriverConfig =
 export type WebhookConfigOrList = WebhookConfig | WebhookConfig[];
 export type FailureAction = "abort" | "warn" | "ignore";
 /**
+ * Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.
+ */
+export type LintSeverity = "error" | "warning" | "info";
+/**
  * One entry in the top-level `[mask]` block. A scalar value (`pii = "hash"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = "none"`) overrides strategies for a specific environment.
  *
  * Serde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `"mask"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for.
@@ -488,6 +492,10 @@ export interface RockyConfig {
     [k: string]: ImportEntry;
   };
   /**
+   * Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides.
+   */
+  lint?: LintConfig;
+  /**
    * Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:
    *
    * ```toml [mask] pii = "hash"            # default strategy for "pii" classification confidential = "redact" # default strategy for "confidential"
@@ -543,6 +551,14 @@ export interface RockyConfig {
    * Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
    */
   schedule?: ScheduleDefaultsConfig;
+  /**
+   * Saved selectors: a name mapped to a `--select` expression. Use one with `--select selector:<name>` on any command that takes `--select` (or `--exclude selector:<name>`). A saved selector may use graph operators, `state:` and other `selector:` terms; a loop is an error.
+   *
+   * ```toml [selectors] nightly = "tag:nightly+ config.materialized:incremental" finance = "path:marts/finance,tag:certified" ```
+   */
+  selectors?: {
+    [k: string]: string;
+  };
   /**
    * Global state persistence configuration.
    */
@@ -977,7 +993,7 @@ export interface SchemaCacheConfig {
   /**
    * Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
    *
-   * A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+   * A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. It also escalates `W045` (a read of a table missing from a known schema's seed or cache table list) to the `E045` error. `rocky compile --strict-sources` sets it for one invocation.
    */
   strict_sources?: boolean;
   /**
@@ -1171,6 +1187,25 @@ export interface ImportEntry {
    * Filename of the producer's current published snapshot, relative to `path`.
    */
   snapshot: string;
+}
+/**
+ * `[lint]` — style-lint settings for `rocky lint`.
+ *
+ * ```toml [lint] disable = ["S003"]
+ *
+ * [lint.severity] S001 = "error" ```
+ */
+export interface LintConfig {
+  /**
+   * Rule codes that do not run, e.g. `["S003", "S004"]`.
+   */
+  disable?: string[];
+  /**
+   * Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.
+   */
+  severity?: {
+    [k: string]: LintSeverity;
+  };
 }
 /**
  * Replication pipeline configuration.

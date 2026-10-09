@@ -157,8 +157,8 @@ Declare a connection once, then reference it by name from any number of pipeline
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"postgres"`, `"redshift"`, `"clickhouse"`, `"sqlserver"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
-| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks`, `snowflake`, `postgres`, `redshift`, `clickhouse` and `sqlserver`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
+| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"postgres"`, `"redshift"`, `"clickhouse"`, `"sqlserver"`, `"spark"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks`, `snowflake`, `postgres`, `redshift`, `clickhouse`, `sqlserver` and `spark`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -187,6 +187,7 @@ The connection fields, authentication, and examples for each adapter type live o
 - [Redshift](/reference/adapters/redshift/) (Beta) — the PostgreSQL adapter's fields plus dist/sort keys and late-binding views
 - [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
 - [SQL Server](/reference/adapters/sqlserver/) (Beta) — SQL Server, Azure SQL and Fabric Warehouse; SQL auth or Entra ID
+- [Spark](/reference/adapters/spark/) (Beta) — Spark Connect with an optional bearer token, on Delta Lake or Iceberg tables
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
 
 `type = "trino"`, `type = "airbyte"`, and `type = "iceberg"` are accepted by the config parser but have no dedicated page yet; configure adapter-specific keys through [`[adapter.NAME.extra]`](#adaptername).
@@ -1214,6 +1215,27 @@ See [Linters](/concepts/linters/) for the full list of covered constructs and th
 
 ---
 
+## `[lint]`
+
+Tune the style rules that `rocky lint` runs. Rocky rejects an unknown field here, and an unknown rule code is an error.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `disable` | list of string | `[]` | Rule codes that do not run, such as `["S003"]`. |
+| `severity` | table | `{}` | Severity per rule code: `"error"`, `"warning"` or `"info"`. A rule keeps its default severity if it has no entry. |
+
+```toml
+[lint]
+disable = ["S004"]
+
+[lint.severity]
+S001 = "error"
+```
+
+`rocky lint` exits with code `1` when a finding has `error` severity. See [`rocky lint`](/reference/commands/modeling/#rocky-lint) for the rules.
+
+---
+
 ## `[retry]`
 
 Share one retry budget across every adapter in a run, instead of giving each its own. Rocky builds a single counter and passes it to all of them; once it runs out, no adapter retries again. This stops one failing endpoint from consuming retries the other adapters would have used. Omit the block and each `[adapter.NAME.retry]` keeps its own independent budget.
@@ -1324,6 +1346,16 @@ The v1 Databricks implementation validates each `rocky_role_<name>` principal ag
 :::
 
 ---
+
+## `[selectors]`
+
+Saved selectors. Each entry maps a name to a `--select` expression. Use one with `--select selector:<name>` (or `--exclude selector:<name>`) on any command that takes `--select`. See [Saved selectors](/reference/node-selection/#saved-selectors).
+
+```toml
+[selectors]
+nightly = "tag:nightly+ config.materialized:incremental"
+finance = "path:marts/finance,tag:certified"
+```
 
 ## `[freshness]`
 

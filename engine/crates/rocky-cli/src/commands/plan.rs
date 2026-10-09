@@ -109,6 +109,7 @@ pub async fn plan(
     semantic: bool,
     base_ref: &str,
     state_path: &Path,
+    cost_estimate: super::plan_cost::CostEstimateMode,
     output_json: bool,
 ) -> Result<()> {
     if let Some(branch_name) = run_options.branch.as_deref() {
@@ -572,7 +573,13 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
+            Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
+                run_plan,
+                plan_id,
+                persisted_at,
+                first_run_fills,
+                first_run_fills_unknown,
+            }))) => {
                 if let Some(model) = run_plan.model.as_deref()
                     && let Some(shadow) = shadow_config_for_run_plan(state_path, &run_plan)?
                 {
@@ -613,10 +620,38 @@ pub async fn plan(
                 }
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
+                output.first_run_fills = first_run_fills;
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
                 run_plan_persisted = true;
+                // Report-only, computed after the plan is persisted so it
+                // can never enter `plan_id`.
+                let adapter_type = rocky_cfg
+                    .adapters
+                    .get(&pipeline.target.adapter)
+                    .map_or("", |a| a.adapter_type.as_str());
+                let mut cost_preview = super::plan_cost::compute_plan_cost_preview(
+                    super::plan_cost::PlanCostContext {
+                        config_path,
+                        models_dir: &blueprint_models_dir,
+                        state_path,
+                        pipeline_name: name,
+                        adapter_type,
+                        models: &output.models,
+                        mode: cost_estimate,
+                    },
+                )
+                .await;
+                cost_preview
+                    .notes
+                    .extend(first_run_fill_notes(&output.first_run_fills));
+                if first_run_fills_unknown {
+                    cost_preview
+                        .notes
+                        .push(FIRST_RUN_FILLS_UNKNOWN_NOTE.to_string());
+                }
+                output.cost_preview = Some(cost_preview);
             }
             Ok(Some(RunPlanBuild::Refused(refused))) => {
                 compile_refused = true;
@@ -731,6 +766,8 @@ pub async fn plan(
         }
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
+        render_first_run_fills_text(&output);
+        render_cost_preview_text(&output);
         render_semantic_verdict_text(&output);
         if let Some(check) = &output.intent_check {
             super::intent_check::render_text(check);
@@ -793,6 +830,7 @@ pub(crate) fn dialect_for_adapter_type(
         "redshift" => Box::new(rocky_postgres::RedshiftDialect::new()),
         "clickhouse" => Box::new(rocky_clickhouse::ClickHouseDialect::new()),
         "sqlserver" => Box::new(rocky_sqlserver::SqlServerDialect::new()),
+        "spark" => Box::new(rocky_spark::SparkDialect::new()),
         #[cfg(feature = "duckdb")]
         "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
         other => {
@@ -808,13 +846,14 @@ pub(crate) fn dialect_for_adapter_type(
 
 /// [`dialect_for_adapter_type`] for a whole `[adapter]` block, so options
 /// that change the rendered SQL (`postgres` `merge_mode`, `redshift`
-/// `late_binding_views`, `sqlserver` `flavor`) reach the preview exactly as
-/// `rocky run` will use them.
+/// `late_binding_views`, `sqlserver` `flavor`, `spark` `table_format`) reach
+/// the preview exactly as `rocky run` will use them.
 pub(crate) fn dialect_for_adapter(
     adapter: &rocky_core::config::AdapterConfig,
 ) -> Box<dyn rocky_core::traits::SqlDialect> {
     crate::registry::postgres_dialect_for_config(adapter)
         .or_else(|| crate::registry::sqlserver_dialect_for_config(adapter))
+        .or_else(|| crate::registry::spark_dialect_for_config(adapter))
         .unwrap_or_else(|| dialect_for_adapter_type(&adapter.adapter_type))
 }
 
@@ -1809,7 +1848,8 @@ fn build_and_persist_run_plan(
         intent: run_options.intent,
     };
 
-    let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+    #[allow(clippy::type_complexity)]
+    let plan_id = (|| -> Result<(String, chrono::DateTime<Utc>, FirstRunFillPreviews)> {
         let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
         // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
@@ -1854,7 +1894,7 @@ fn build_and_persist_run_plan(
                 None
             }
         };
-        let capabilities = compute_embedded_capabilities_for_scope(
+        let (capabilities, fill_previews) = capabilities_and_fill_previews(
             config_path,
             scope.as_ref(),
             base_ref,
@@ -1864,18 +1904,70 @@ fn build_and_persist_run_plan(
         )?;
         let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
             .context("failed to write run plan")?;
-        Ok((plan_id, Utc::now()))
+        Ok((plan_id, Utc::now(), fill_previews))
     })()?;
-    Ok(Some(RunPlanBuild::Persisted(
-        Box::new(run_plan),
+    let (plan_id, persisted_at, fill_previews) = plan_id;
+    // A plan with a partition flag never fills, so unknown fills do not
+    // matter to its apply.
+    let first_run_fills_unknown = fill_previews.unknown && !names_partition_flag(&run_plan);
+    let fills = first_run_fills_for_output(&run_plan, fill_previews.previews);
+    Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
+        run_plan: Box::new(run_plan),
         plan_id,
         persisted_at,
-    )))
+        first_run_fills: fills,
+        first_run_fills_unknown,
+    })))
+}
+
+/// The first-run fills `rocky apply <plan>` would start, as `PlanOutput`
+/// reports them. A run with a partition flag or `--lookback` never fills,
+/// and a `--model` run fills only that model.
+fn first_run_fills_for_output(
+    run_plan: &RunPlan,
+    previews: Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+) -> Vec<crate::output::PlanFirstRunFill> {
+    if names_partition_flag(run_plan) {
+        return Vec::new();
+    }
+    previews
+        .into_iter()
+        .filter(|p| run_plan.model.as_deref().is_none_or(|m| m == p.model))
+        .map(|p| crate::output::PlanFirstRunFill {
+            model: p.model,
+            partitions: p.partitions,
+            from: p.from,
+            to: p.to,
+            fills: p.fills,
+        })
+        .collect()
+}
+
+/// `true` when the plan names a partition flag or `--lookback`: its apply
+/// never starts a first-run fill.
+fn names_partition_flag(run_plan: &RunPlan) -> bool {
+    run_plan.partition.is_some()
+        || run_plan.partition_from.is_some()
+        || run_plan.partition_to.is_some()
+        || run_plan.latest
+        || run_plan.missing
+        || run_plan.lookback.is_some()
+}
+
+/// A run plan `rocky plan` wrote, with what its output reports about it.
+struct PersistedRunPlan {
+    run_plan: Box<RunPlan>,
+    plan_id: String,
+    persisted_at: chrono::DateTime<Utc>,
+    first_run_fills: Vec<crate::output::PlanFirstRunFill>,
+    /// The state store could not be read, so the first-run fills are not
+    /// known and the plan records none.
+    first_run_fills_unknown: bool,
 }
 
 enum RunPlanBuild {
     Refused(Vec<SkippedModel>),
-    Persisted(Box<RunPlan>, String, chrono::DateTime<Utc>),
+    Persisted(PersistedRunPlan),
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed
@@ -1929,6 +2021,22 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     base_ref: &str,
     state_path: Option<&Path>,
     env: Option<&str>,
+    bind_masks: bool,
+) -> anyhow::Result<EmbeddedCapabilities> {
+    capabilities_and_fill_previews(config_path, scope, base_ref, state_path, env, bind_masks)
+        .map(|(capabilities, _)| capabilities)
+}
+
+/// [`compute_embedded_capabilities_for_scope`], with the first-run fill
+/// preview of every model in the scope (over the limit included), for
+/// `rocky plan` to report. The capabilities' `first_run_fills` is the set of
+/// previews that fill.
+fn capabilities_and_fill_previews(
+    config_path: &Path,
+    scope: Option<&super::approval_scope::ApprovalScope>,
+    base_ref: &str,
+    state_path: Option<&Path>,
+    env: Option<&str>,
     // Finding #4: whether the mask enters the fingerprint — `true` iff the apply
     // reaches the mask-reconciling path (a full run of a REPLICATION pipeline that
     // hits the model leg). The CALLER computes this from the resolved pipeline +
@@ -1945,7 +2053,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     // the plan was persisted with no surrogate key in its fingerprint at all —
     // and the comment below claimed the gate "must keep hashing the resolved
     // whole" while that call made it false.
-) -> anyhow::Result<EmbeddedCapabilities> {
+) -> anyhow::Result<(EmbeddedCapabilities, FirstRunFillPreviews)> {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
 
     // Load the config first — reused for cached source schemas AND the routing
@@ -2014,14 +2122,16 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         diff_available: false,
         changed: std::collections::BTreeMap::new(),
         models_fingerprint: None,
+        models_only_fingerprint: None,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
         reviewed_source_schemas: None,
+        first_run_fills: std::collections::BTreeSet::new(),
     };
 
     let Some(scope) = scope else {
-        return Ok(failed(config_identity)); // fail-closed: scope unresolved
+        return Ok((failed(config_identity), FirstRunFillPreviews::default())); // fail-closed: scope unresolved
     };
 
     let identity = config_identity.clone().unwrap_or_default();
@@ -2056,7 +2166,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     // A unit that does not compile (or a plain plan's absent directory) means
     // no fingerprint, so a review-gated apply refuses (fail-closed).
     let Ok(heads) = scope.compile(&source_schemas, super::approval_scope::NoModels::Error) else {
-        return Ok(failed(config_identity));
+        return Ok((failed(config_identity), FirstRunFillPreviews::default()));
     };
     // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
     // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
@@ -2088,17 +2198,48 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             resolved_mask: &resolved_mask,
         },
     );
-    let models_fingerprint = match models_fingerprint {
-        Ok(fingerprint) => fingerprint,
+    // The models-only fingerprint a person's apply compares: the same scope,
+    // compile and mask, with no config, governance or execution-control
+    // identity, so a different environment does not read as a change but a
+    // `[mask]` strategy change for a tag the models use does.
+    let fingerprints = models_fingerprint.and_then(|full| {
+        let models_only =
+            super::approval_scope::scope_models_only_fingerprint(scope, &heads, &resolved_mask)?;
+        // Both or neither: a plan never carries a models-only fingerprint
+        // its full one could not back.
+        Ok(match full {
+            Some(full) => (Some(full), models_only),
+            None => (None, None),
+        })
+    });
+    let (models_fingerprint, models_only_fingerprint) = match fingerprints {
+        Ok(fingerprints) => fingerprints,
         // A `--dag` run refuses a seeds directory it cannot discover, so the
         // plan carries no fingerprint rather than failing to persist; a
         // review-gated apply then refuses it.
         Err(error) if scope.dag => {
             tracing::warn!(error = %format!("{error:#}"), "--dag plan carries no fingerprint");
-            return Ok(failed(config_identity));
+            return Ok((failed(config_identity), FirstRunFillPreviews::default()));
         }
         Err(error) => return Err(error),
     };
+    // The first-run fills this plan shows, over every model apply executes.
+    // The persisted set covers every model in scope, whatever `--model` or
+    // partition flag the plan names; `first_run_fills_for_output` filters
+    // only what `rocky plan` displays. A superset is safe: apply refuses
+    // only a fill missing from this set.
+    let fill_previews = first_run_fill_previews(
+        heads
+            .iter()
+            .flat_map(super::approval_scope::CompiledUnit::models),
+        state_path,
+    );
+    let first_run_fills: std::collections::BTreeSet<String> = fill_previews
+        .previews
+        .iter()
+        .filter(|preview| preview.fills)
+        .map(|preview| preview.model.clone())
+        .collect();
 
     // Classify each unit against `base_ref` through the same directory and
     // glob. Any unit without a base costs the per-model classification for
@@ -2116,14 +2257,19 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             unit.unit.models_glob.as_deref(),
             None,
         ) else {
-            return Ok(EmbeddedCapabilities {
-                diff_available: false,
-                changed: std::collections::BTreeMap::new(),
-                models_fingerprint,
-                config_identity,
-                fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-                reviewed_source_schemas,
-            });
+            return Ok((
+                EmbeddedCapabilities {
+                    diff_available: false,
+                    changed: std::collections::BTreeMap::new(),
+                    models_fingerprint,
+                    models_only_fingerprint,
+                    config_identity,
+                    fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+                    reviewed_source_schemas,
+                    first_run_fills,
+                },
+                fill_previews,
+            ));
         };
 
         let base_ir = super::ci_diff::project_ir_from_compile(&base);
@@ -2147,15 +2293,98 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
         }
     }
 
-    Ok(EmbeddedCapabilities {
-        diff_available: true,
-        changed,
-        models_fingerprint,
-        config_identity,
-        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-        reviewed_source_schemas,
-    })
+    Ok((
+        EmbeddedCapabilities {
+            diff_available: true,
+            changed,
+            models_fingerprint,
+            models_only_fingerprint,
+            config_identity,
+            fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            reviewed_source_schemas,
+            first_run_fills,
+        },
+        fill_previews,
+    ))
 }
+
+/// The first-run fill of each `time_interval` model in `models` whose next
+/// run with no partition flag fills from `first_partition`, or would but is
+/// over the limit. Read from the state store at `state_path`; with no state
+/// store every model with a `first_partition` has never run.
+///
+/// A model whose partitions cannot be planned (a malformed `first_partition`)
+/// is left out: its run fails before it builds anything.
+pub(crate) fn first_run_fill_previews<'a>(
+    models: impl IntoIterator<Item = &'a rocky_core::models::Model>,
+    state_path: Option<&Path>,
+) -> FirstRunFillPreviews {
+    let mut models = models
+        .into_iter()
+        .filter(|m| {
+            matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::TimeInterval {
+                    first_partition: Some(_),
+                    ..
+                }
+            )
+        })
+        .peekable();
+    if models.peek().is_none() {
+        return FirstRunFillPreviews::default();
+    }
+    let temp_dir;
+    let store = match state_path {
+        Some(path) => rocky_core::state::StateStore::open_read_only_or_empty(path),
+        None => {
+            let Ok(dir) = tempfile::TempDir::new() else {
+                return FirstRunFillPreviews::unknown();
+            };
+            temp_dir = dir;
+            rocky_core::state::StateStore::open(&temp_dir.path().join("state.redb"))
+        }
+    };
+    let Ok(store) = store else {
+        tracing::warn!("cannot read the state store; the plan reports no first-run fill");
+        return FirstRunFillPreviews::unknown();
+    };
+    let mut previews: Vec<_> = models
+        .filter_map(|m| rocky_core::plan_partition::preview_first_run_fill(m, &store).ok()?)
+        .collect();
+    previews.sort_by(|a, b| a.model.cmp(&b.model));
+    previews.dedup_by(|a, b| a.model == b.model);
+    FirstRunFillPreviews {
+        previews,
+        unknown: false,
+    }
+}
+
+/// What [`first_run_fill_previews`] found.
+#[derive(Debug, Default)]
+pub(crate) struct FirstRunFillPreviews {
+    /// One preview per model whose next run fills, or would but is over the
+    /// limit, sorted by model.
+    pub previews: Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+    /// `true` when the state store could not be read, so the fills are not
+    /// known and `previews` is empty.
+    pub unknown: bool,
+}
+
+impl FirstRunFillPreviews {
+    fn unknown() -> Self {
+        Self {
+            previews: Vec::new(),
+            unknown: true,
+        }
+    }
+}
+
+/// The plan note when the first-run fills could not be computed.
+const FIRST_RUN_FILLS_UNKNOWN_NOTE: &str = "the state store could not be read, so this plan \
+     could not compute first-run fills and records none. An agent's apply of it refuses any \
+     time_interval model whose first run would fill from first_partition. Plan again when the \
+     state store can be read";
 
 /// Build a canonical, sorted source-state snapshot from the discovered
 /// connectors. Used both at plan time (to build the `ReplicationPlan`
@@ -2896,6 +3125,72 @@ fn render_budget_diagnostics_text(output: &PlanOutput) {
     }
 }
 
+/// Render the cost preview under the text output mode.
+fn render_first_run_fills_text(output: &PlanOutput) {
+    if output.first_run_fills.is_empty() {
+        return;
+    }
+    println!("-- first-run fills --");
+    for fill in &output.first_run_fills {
+        if fill.fills {
+            println!(
+                "{}: first run fills {} partitions, {} to {}",
+                fill.model, fill.partitions, fill.from, fill.to
+            );
+        } else {
+            println!(
+                "{}: {} partitions from {} to {} are over the first-run limit; the run \
+                 builds only the latest partition",
+                fill.model, fill.partitions, fill.from, fill.to
+            );
+        }
+    }
+}
+
+/// The cost-preview note for each first-run fill: the estimate prices one run
+/// of each model, and a fill runs the model once per partition batch.
+fn first_run_fill_notes(fills: &[crate::output::PlanFirstRunFill]) -> Vec<String> {
+    fills
+        .iter()
+        .filter(|fill| fill.fills)
+        .map(|fill| {
+            format!(
+                "model '{}': its first run fills {} partitions ({} to {}); the estimate is for \
+                 one run of the model, not the fill",
+                fill.model, fill.partitions, fill.from, fill.to
+            )
+        })
+        .collect()
+}
+
+fn render_cost_preview_text(output: &PlanOutput) {
+    let Some(preview) = &output.cost_preview else {
+        return;
+    };
+    let source = match preview.source {
+        crate::output::CostEstimateSource::Heuristic => "heuristic",
+        crate::output::CostEstimateSource::Adapter => "adapter",
+        crate::output::CostEstimateSource::Mixed => "mixed",
+    };
+    println!("-- cost preview (estimate, source: {source}) --");
+    println!("models to rebuild: {}", preview.models_to_rebuild);
+    if let Some(bytes) = preview.estimated_bytes_scanned {
+        println!("estimated bytes scanned: {bytes}");
+    }
+    if let Some(cost) = preview.estimated_cost_usd {
+        println!("estimated cost: ${cost:.6}");
+    }
+    if let Some(previous) = preview.previous_cost_usd {
+        println!("previous production cost: ${previous:.6}");
+    }
+    if let Some(delta) = preview.cost_delta_usd {
+        println!("cost delta: ${delta:+.6}");
+    }
+    for note in &preview.notes {
+        println!("  note: {note}");
+    }
+}
+
 /// Compute the decision-support semantic verdict for `rocky plan --semantic`.
 ///
 /// Compiles the **working tree** (head) and the project as it stood at
@@ -3428,6 +3723,7 @@ mod tests {
             false,
             "main",
             &state,
+            Default::default(),
             false,
         )
         .await
@@ -3462,6 +3758,7 @@ mod tests {
             false,
             "main",
             &temp.path().join("missing.redb"),
+            Default::default(),
             false,
         )
         .await
@@ -4260,6 +4557,7 @@ auto_create_schemas = true
             false,
             "HEAD",
             &state_path,
+            Default::default(),
             false,
         )
         .await;
@@ -4364,6 +4662,7 @@ threshold = 0
             false,
             "HEAD",
             &state_path,
+            Default::default(),
             false,
         )
         .await;
@@ -4482,6 +4781,7 @@ threshold = 0
             false,
             "HEAD",
             &dir.path().join("state.redb"),
+            Default::default(),
             false,
         )
         .await
@@ -5862,5 +6162,36 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
             verdict.is_none(),
             "an unresolvable base ref must omit the verdict (no fabricated baseline)",
         );
+    }
+
+    /// A state store that cannot be read leaves the first-run fills unknown,
+    /// so `rocky plan` can say so, rather than reporting that nothing fills.
+    #[test]
+    fn unreadable_state_store_leaves_first_run_fills_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("m.sql"), "SELECT CURRENT_DATE AS d").unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"time_interval\"\ntime_column = \"d\"\n\
+             granularity = \"day\"\nfirst_partition = \"2026-01-01\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let model = rocky_core::models::load_model_pair(
+            &dir.path().join("m.sql"),
+            &dir.path().join("m.toml"),
+            None,
+        )
+        .unwrap();
+
+        let known = super::first_run_fill_previews([&model], None);
+        assert!(!known.unknown);
+        assert_eq!(known.previews.len(), 1, "a never-run model fills");
+
+        let garbage = dir.path().join("state.redb");
+        std::fs::write(&garbage, b"not a state store").unwrap();
+        let unknown = super::first_run_fill_previews([&model], Some(&garbage));
+        assert!(unknown.unknown);
+        assert!(unknown.previews.is_empty());
     }
 }

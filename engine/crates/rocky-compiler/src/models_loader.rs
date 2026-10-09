@@ -560,6 +560,41 @@ pub fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeli
     all
 }
 
+/// The models a command reads when no `--models` directory was named: every
+/// transformation pipeline's own models, joined by name into one set.
+///
+/// One compile over this set is one project graph. A model of one pipeline
+/// that reads another pipeline's output resolves to that model and gets its
+/// column types, which two separate compiles cannot do.
+///
+/// Returns `Ok(None)` when the project declares no transformation pipeline,
+/// or when no pipeline's root holds a model. The caller then reads its
+/// default models directory, as before.
+///
+/// # Errors
+///
+/// Returns the [`load_transformation_models`] refusal: two distinct files
+/// that share a model name, a malformed sidecar, or a `models` glob that
+/// resolves outside the project.
+pub fn whole_project_models(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Result<Option<Vec<Model>>> {
+    if !cfg
+        .pipelines
+        .values()
+        .any(|pipeline| pipeline.as_transformation().is_some())
+    {
+        return Ok(None);
+    }
+    let loaded = load_transformation_models(config_path, cfg)?;
+    let models = union_by_model_name(&loaded.by_pipeline);
+    if models.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(models))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,6 +1061,71 @@ mod tests {
         assert!(
             format!("{err:#}").contains("outside the project root"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    const TWO_PIPELINES: &str = "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+        [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+        [pipeline.transform.target]\n\n\
+        [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\
+        [pipeline.reporting.target]\n";
+
+    /// Without `--models`, a command reads every transformation pipeline's
+    /// models, not `models/` alone.
+    #[test]
+    fn whole_project_models_joins_every_transformation_pipeline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, TWO_PIPELINES).expect("write config");
+        write_model(&root.join("models"), "stg");
+        write_model(&root.join("reporting"), "report");
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+
+        let models = whole_project_models(&config, &cfg)
+            .expect("load")
+            .expect("models");
+        let names: Vec<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
+        assert_eq!(names, ["report", "stg"]);
+    }
+
+    /// No transformation pipeline: the caller keeps its default directory.
+    #[test]
+    fn whole_project_models_is_none_without_a_transformation_pipeline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n[pipeline.dq.target]\nadapter = \"default\"\n\
+             [pipeline.dq.checks]\nenabled = true\n\
+             [[pipeline.dq.tables]]\n\
+             catalog = \"w\"\nschema = \"s\"\ntable = \"t\"\n",
+        )
+        .expect("write config");
+        write_model(&root.join("models"), "stg");
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+
+        assert!(whole_project_models(&config, &cfg).expect("load").is_none());
+    }
+
+    /// Two files sharing one model name across pipelines are refused by name,
+    /// not silently narrowed to one.
+    #[test]
+    fn whole_project_models_refuses_a_name_shared_across_pipelines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, TWO_PIPELINES).expect("write config");
+        write_model(&root.join("models"), "dup");
+        write_model(&root.join("reporting"), "dup");
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+
+        let err = whole_project_models(&config, &cfg).expect_err("duplicate name");
+        assert!(
+            format!("{err:#}").contains("duplicate model name 'dup'"),
+            "{err:#}"
         );
     }
 }
