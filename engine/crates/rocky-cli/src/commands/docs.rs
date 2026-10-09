@@ -148,7 +148,7 @@ pub fn run_docs(
         lineage,
         compiled.is_some(),
     )
-    .with_consumers(&load_doc_consumers(models_dir));
+    .with_consumers(&load_doc_consumers(config_path));
     let index = &docs.index;
 
     // A `[columns]` description whose column the compile step cannot see
@@ -274,9 +274,10 @@ fn write_site(docs: &ProjectDocs, dir: &Path) -> Result<Vec<String>> {
 }
 
 /// Downstream consumers for the docs. A file that cannot be read is skipped
-/// with a warning, as for contracts; `rocky compile` reports it as `E059`.
-fn load_doc_consumers(models_dir: &Path) -> Vec<rocky_core::consumers::Consumer> {
-    let loaded = rocky_core::consumers::load_consumers_for_models_dir(models_dir);
+/// with a warning, as for contracts; `rocky compile` reports it as `E060`.
+fn load_doc_consumers(config_path: &Path) -> Vec<rocky_core::consumers::Consumer> {
+    let root = config_path.parent().unwrap_or_else(|| Path::new(""));
+    let loaded = rocky_core::consumers::load_consumers_for_root(root);
     for error in &loaded.errors {
         warn!(
             file = %error.file_path.display(),
@@ -404,6 +405,7 @@ fn compile_for_docs(
         source_provenance: Default::default(),
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
+        project: None,
     };
     // The models are already loaded (and were loaded strictly), so compile
     // them directly instead of re-reading the directory — one load, and the
@@ -418,7 +420,7 @@ fn compile_for_docs(
             return None;
         }
     };
-    if result.has_errors {
+    if rocky_compiler::consumers::has_model_errors(&result) {
         let first = result
             .diagnostics
             .iter()

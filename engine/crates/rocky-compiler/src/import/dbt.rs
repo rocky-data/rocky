@@ -494,14 +494,17 @@ fn extract_tail(id: &str) -> String {
 /// Turn each dbt exposure into a downstream consumer.
 ///
 /// A consumer keeps a dependency only when it names a model that was imported,
-/// because a name that is not a model is an `E059` compile error and the
+/// because a name that is not a model is an `E060` compile error and the
 /// emitted repo has to compile. Everything else an exposure reads (a source, a
 /// seed, a model that failed to import) is listed in the migration notes. An
 /// exposure whose name is not a valid consumer name is listed and not written.
 fn import_exposures(manifest: &DbtManifest, result: &mut ImportResult) {
     let imported: std::collections::HashSet<String> =
         result.imported.iter().map(|m| m.name.clone()).collect();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Keyed by lowercase name: `Board.toml` and `board.toml` are one file on a
+    // case-insensitive filesystem (macOS and Windows defaults), so the second
+    // would silently overwrite the first.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for exposure in &manifest.exposures {
         let mut note = |construct: &str, detail: String| {
             result.constructs_dropped += 1;
@@ -522,13 +525,21 @@ fn import_exposures(manifest: &DbtManifest, result: &mut ImportResult) {
             );
             continue;
         }
-        if !seen.insert(exposure.name.clone()) {
-            note(
-                "exposure",
-                "another exposure already has this name".to_string(),
-            );
+        if let Some(first) = seen.get(&exposure.name.to_ascii_lowercase()) {
+            let detail = if *first == exposure.name {
+                "another exposure already has this name".to_string()
+            } else {
+                format!(
+                    "its name differs from exposure `{first}` only by letter case, so on a \
+                     case-insensitive filesystem both would be the one file consumers/{}.toml; \
+                     not written. Rename one and add its file under consumers/ by hand",
+                    exposure.name.to_ascii_lowercase()
+                )
+            };
+            note("exposure", detail);
             continue;
         }
+        seen.insert(exposure.name.to_ascii_lowercase(), exposure.name.clone());
         let mut depends_on = Vec::new();
         let mut not_carried: Vec<String> = exposure.other_dependencies.clone();
         for id in &exposure.models {
@@ -5025,6 +5036,30 @@ WHERE e.id > 0
             result.consumers[0].kind,
             rocky_core::consumers::ConsumerKind::Other
         );
+    }
+
+    /// Two exposures that differ only by letter case would share one file on a
+    /// case-insensitive filesystem. The second is refused, with a note.
+    #[test]
+    fn test_manifest_exposures_differing_only_by_case_are_not_both_written() {
+        let mut manifest = exposure_manifest();
+        manifest["exposures"] = serde_json::json!({
+            "exposure.p.Board": { "name": "Board", "type": "dashboard" },
+            "exposure.p.board": { "name": "board", "type": "dashboard" }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.consumers.len(), 1, "{:?}", result.consumers);
+        let lowered: std::collections::HashSet<String> = result
+            .consumers
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        assert_eq!(lowered.len(), result.consumers.len());
+        assert!(result.structured_warnings.iter().any(|w| matches!(
+            w,
+            ImportDbtStructuredWarning::DroppedConstruct { detail, .. }
+                if detail.contains("only by letter case")
+        )));
     }
 
     #[test]

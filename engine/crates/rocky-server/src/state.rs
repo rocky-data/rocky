@@ -583,6 +583,7 @@ impl ServerState {
             source_provenance: Default::default(),
             preserve_authored_sql: false,
             external_dependencies: Default::default(),
+            project: None,
         };
 
         // The compile pass walks the model directory, parses every

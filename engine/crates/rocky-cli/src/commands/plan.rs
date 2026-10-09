@@ -1234,6 +1234,7 @@ pub(crate) fn conditional_drops_for_run_plan(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let compiled = match models_glob {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -1462,6 +1463,7 @@ fn plan_preview_output_for_pipeline(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -1749,6 +1751,7 @@ fn build_and_persist_run_plan(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -2760,6 +2763,7 @@ pub fn populate_governance_actions(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     })
     .context("failed to compile project for governance preview")?;
 
@@ -2865,6 +2869,7 @@ async fn check_plan_budget(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,

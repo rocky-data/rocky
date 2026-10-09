@@ -164,6 +164,17 @@ impl SelectorGraph {
         self
     }
 
+    /// Whether `method` is a `consumer:` atom naming a consumer that exists
+    /// in the project and reads no model of it.
+    fn consumer_exists_reading_nothing(&self, method: &Method) -> bool {
+        let Method::Consumer(pattern) = method else {
+            return false;
+        };
+        self.consumers
+            .iter()
+            .any(|(name, models)| models.is_empty() && glob_match(pattern, name))
+    }
+
     /// Every node name, sorted.
     pub fn names(&self) -> BTreeSet<String> {
         self.nodes.keys().cloned().collect()
@@ -305,6 +316,10 @@ pub struct Resolution {
     /// `config.`). Matching nothing there means the named thing does not
     /// exist: almost always a typo.
     pub unmatched_named: Vec<String>,
+    /// `consumer:<name>` atoms (as written) that name a consumer that exists
+    /// but reads no model of this project. These are not in
+    /// [`Self::unmatched_named`]: the name is right, its `depends_on` is not.
+    pub empty_consumers: Vec<String>,
 }
 
 impl Method {
@@ -583,13 +598,16 @@ impl Selector {
                         let nested = inner.resolve(graph, state)?;
                         out.unmatched.extend(nested.unmatched);
                         out.unmatched_named.extend(nested.unmatched_named);
+                        out.empty_consumers.extend(nested.empty_consumers);
                         nested.selected
                     }
                     _ => match_method(atom, graph, state)?,
                 };
                 if matched.is_empty() {
                     out.unmatched.push(atom.raw.clone());
-                    if atom.method.names_project_entity() {
+                    if graph.consumer_exists_reading_nothing(&atom.method) {
+                        out.empty_consumers.push(atom.raw.clone());
+                    } else if atom.method.names_project_entity() {
                         out.unmatched_named.push(atom.raw.clone());
                     }
                 }
@@ -763,6 +781,9 @@ pub struct Selection {
     /// `--select` atoms that name a model, tag, path, file or source that
     /// matches nothing in the project. The CLI refuses these.
     pub unmatched_named: Vec<String>,
+    /// `consumer:<name>` atoms naming a consumer that exists but reads no
+    /// known model. The CLI refuses these with their own message.
+    pub empty_consumers: Vec<String>,
 }
 
 /// Resolve `select` (all models when empty) minus `exclude`.
@@ -774,6 +795,7 @@ pub fn select(
 ) -> Result<Selection, SelectorError> {
     let mut warnings = Vec::new();
     let mut unmatched_named = Vec::new();
+    let mut empty_consumers = Vec::new();
     let mut models = if select.is_empty() {
         graph.names()
     } else {
@@ -782,6 +804,7 @@ pub fn select(
             format!("The selection criterion '{raw}' does not match any enabled nodes")
         }));
         unmatched_named = r.unmatched_named;
+        empty_consumers = r.empty_consumers;
         r.selected
     };
     if !exclude.is_empty() {
@@ -795,6 +818,7 @@ pub fn select(
         models,
         warnings,
         unmatched_named,
+        empty_consumers,
     })
 }
 
@@ -1038,6 +1062,19 @@ mod tests {
         let r = select(&g, &s, &Selector::default(), None).unwrap();
         assert!(r.models.is_empty());
         assert_eq!(r.unmatched_named, vec!["consumer:borad".to_string()]);
+        assert!(r.empty_consumers.is_empty());
+    }
+
+    /// A consumer whose `depends_on` names no model is a real consumer: it is
+    /// reported as reading nothing, not as a typo'd name.
+    #[test]
+    fn a_consumer_that_reads_no_known_model_is_not_a_missing_name() {
+        let g = diamond().with_consumers(vec![("orphan".to_string(), vec!["gone".to_string()])]);
+        let s = parse(&["consumer:orphan".into()]).unwrap();
+        let r = select(&g, &s, &Selector::default(), None).unwrap();
+        assert!(r.models.is_empty());
+        assert!(r.unmatched_named.is_empty());
+        assert_eq!(r.empty_consumers, vec!["consumer:orphan".to_string()]);
     }
 
     #[test]

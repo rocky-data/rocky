@@ -1,5 +1,5 @@
 //! Downstream-consumer records in the compile: load `consumers/`, check every
-//! `depends_on` entry names a model (`E059`), and hand the records to the
+//! `depends_on` entry names a model (`E060`), and hand the records to the
 //! project graph.
 //!
 //! The record and its loader live in [`rocky_core::consumers`]. This module
@@ -10,12 +10,88 @@ use std::path::Path;
 
 use rocky_core::consumers::{Consumer, ConsumerLoadError, LoadedConsumers};
 
-use crate::diagnostic::{Diagnostic, E059, SourceSpan};
+use rocky_core::models::Model;
+
+use crate::compile::CompilerConfig;
+use crate::diagnostic::{Diagnostic, E060, SourceSpan};
+
+/// Load and check the consumers of a compile.
+///
+/// With [`CompilerConfig::project`] set, the directory is the project root's
+/// `consumers/` and a `depends_on` entry is valid when it names a model
+/// anywhere in the project, not only one of the `models` this compile holds.
+/// Without it, this is [`load_and_check`] over the compiled models.
+#[must_use]
+pub fn load_and_check_project(
+    config: &CompilerConfig,
+    models: &[Model],
+) -> (Vec<Consumer>, Vec<Diagnostic>) {
+    let mut names: BTreeSet<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
+    match &config.project {
+        Some(project) => {
+            names.extend(project.model_names.iter().map(String::as_str));
+            check(
+                &rocky_core::consumers::load_consumers_for_root(&project.root),
+                &names,
+            )
+        }
+        None => load_and_check(&config.models_dir, &names),
+    }
+}
+
+/// The project a compile belongs to, for a command that holds the project's
+/// `rocky.toml`.
+///
+/// `root` is the directory of the config file. The model names come from the
+/// same loader `rocky dag` and `rocky run --dag` use, so a consumer is judged
+/// against every transformation pipeline's models. They are read only when a
+/// `consumers/` directory exists: a project with no consumers pays nothing,
+/// and a loader failure leaves the set empty (the models themselves report
+/// that failure).
+#[must_use]
+pub fn project_context(
+    config_path: &Path,
+    config: &rocky_core::config::RockyConfig,
+) -> crate::compile::ProjectContext {
+    let root = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+    let model_names = if rocky_core::consumers::consumers_dir_for_root(&root).exists() {
+        match crate::models_loader::whole_project_models(config_path, config) {
+            Ok(Some(models)) => model_name_set(&models),
+            Ok(None) | Err(_) => BTreeSet::new(),
+        }
+    } else {
+        BTreeSet::new()
+    };
+    crate::compile::ProjectContext { root, model_names }
+}
+
+/// Check a project's `consumers/` on its own, without compiling any model.
+///
+/// For a command that runs the project's models in many compiles (`rocky run
+/// --dag`) and wants the consumer problems once.
+#[must_use]
+pub fn diagnose_project(project: &crate::compile::ProjectContext) -> Vec<Diagnostic> {
+    let names: BTreeSet<&str> = project.model_names.iter().map(String::as_str).collect();
+    check(
+        &rocky_core::consumers::load_consumers_for_root(&project.root),
+        &names,
+    )
+    .1
+}
+
+/// The names of `models`, as a [`ProjectContext`](crate::compile::ProjectContext)
+/// holds them.
+#[must_use]
+pub fn model_name_set(models: &[Model]) -> BTreeSet<String> {
+    models.iter().map(|m| m.config.name.clone()).collect()
+}
 
 /// Load the `consumers/` directory beside `models_dir` and check it against
 /// the project's models.
 ///
-/// Returns the consumers that loaded, and one `E059` error per problem:
+/// Returns the consumers that loaded, and one `E060` error per problem:
 /// a file that does not parse, a name used twice, or a `depends_on` entry
 /// that names no model. A consumer with an unknown `depends_on` entry stays
 /// in the returned list without that entry, so the rest of its edges still
@@ -50,7 +126,7 @@ pub fn check(
         if holders[consumer.name.as_str()] > 1 {
             diagnostics.push(
                 Diagnostic::error(
-                    E059,
+                    E060,
                     &subject(&consumer.name),
                     format!(
                         "consumer `{}` is declared more than once; consumer names must be unique",
@@ -70,7 +146,7 @@ pub fn check(
                 continue;
             }
             let mut diagnostic = Diagnostic::error(
-                E059,
+                E060,
                 &subject(&consumer.name),
                 format!(
                     "consumer `{}` depends on `{dep}`, which is not a model in this project",
@@ -96,11 +172,42 @@ pub fn check(
 /// keyed on its name, so a consumer called `orders` must not read as the model
 /// `orders`. `:` cannot appear in either name, so the keys never collide.
 fn subject(consumer: &str) -> String {
-    format!("consumer:{consumer}")
+    format!("{SUBJECT_PREFIX}{consumer}")
+}
+
+const SUBJECT_PREFIX: &str = "consumer:";
+
+/// Whether a diagnostic's `model` field names a consumer rather than a model.
+///
+/// Readers that count failures per model (`rocky run`) must use this instead
+/// of a hand-written prefix test, so the writer's keying and the reader's
+/// classification cannot drift apart.
+#[must_use]
+pub fn is_consumer_subject(model: &str) -> bool {
+    model.starts_with(SUBJECT_PREFIX)
+}
+
+/// Whether the compile has an error that is not about a consumer record.
+///
+/// For a command that uses the compiled models and has no reason to stop for
+/// a wrong dashboard record (`rocky docs`, `rocky emit-sql`). `rocky compile`
+/// and `rocky ci` use `has_errors`, which includes the consumer errors.
+#[must_use]
+pub fn has_model_errors(result: &crate::compile::CompileResult) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .any(|d| d.is_error() && !is_consumer_diagnostic(d))
+}
+
+/// Whether a diagnostic is about a consumer record.
+#[must_use]
+pub fn is_consumer_diagnostic(diagnostic: &Diagnostic) -> bool {
+    &*diagnostic.code == E060 && is_consumer_subject(&diagnostic.model)
 }
 
 fn load_error(error: &ConsumerLoadError) -> Diagnostic {
-    Diagnostic::error(E059, &subject(&error.name), error.message.clone())
+    Diagnostic::error(E060, &subject(&error.name), error.message.clone())
         .with_span(span(&error.file_path, None))
 }
 
@@ -175,7 +282,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         let d = &diagnostics[0];
         assert!(d.is_error());
-        assert_eq!(&*d.code, "E059");
+        assert_eq!(&*d.code, "E060");
         // Keyed so it can never be mistaken for a model of the same name.
         assert_eq!(&*d.model, "consumer:board");
         assert!(d.message.contains("`fct_order`"), "{}", d.message);
@@ -211,6 +318,6 @@ mod tests {
         };
         let (_, diagnostics) = check(&loaded, &models());
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(&*diagnostics[0].code, "E059");
+        assert_eq!(&*diagnostics[0].code, "E060");
     }
 }

@@ -1475,14 +1475,14 @@ mod tests {
             result.consumers[0].description
         );
 
-        // The emitted repo compiles with no E059.
+        // The emitted repo compiles with no E060.
         let compiled = crate::compile::compile(&crate::compile::CompilerConfig {
             models_dir: out_dir.path().join("models"),
             ..Default::default()
         })
         .unwrap();
         assert!(
-            !compiled.diagnostics.iter().any(|d| &*d.code == "E059"),
+            !compiled.diagnostics.iter().any(|d| &*d.code == "E060"),
             "{:?}",
             compiled.diagnostics
         );

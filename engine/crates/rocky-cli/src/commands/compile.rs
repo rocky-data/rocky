@@ -406,6 +406,7 @@ fn compile_inner(
         // is written back after them, for `--expand-macros`.
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
+        project: None,
     };
 
     // Without `--models`, one compile over every transformation pipeline's
@@ -418,6 +419,17 @@ fn compile_inner(
         }
         (ModelScope::WholeProject, None) | (ModelScope::Dir, _) => None,
     };
+    // `consumers/` belongs to the project, not to whichever models this
+    // compile covers: read it from the config's directory and judge it against
+    // every model in the project. A whole-project compile already holds them.
+    let mut config = config;
+    if let Some(project) = &project_config {
+        let mut context = rocky_compiler::consumers::project_context(config_file_path, project);
+        if let Some(models) = &whole_project {
+            context.model_names = rocky_compiler::consumers::model_name_set(models);
+        }
+        config.project = Some(context);
+    }
     let compiled = match whole_project {
         Some(models) => compile::compile_preloaded_models(models, &config),
         None => compile::compile(&config),
@@ -3531,6 +3543,54 @@ schema_template = "s"
             "{:?}",
             one_dir.diagnostics
         );
+    }
+
+    /// A consumer that reads a model of another pipeline is not an E060 when
+    /// the compile covers one directory: `consumers/` is the project's and is
+    /// judged against every model in it. A name that is a model nowhere is
+    /// still an E060, scoped or not.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn consumers_are_judged_against_the_whole_project_in_a_scoped_compile() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        fs::create_dir_all(root.join("consumers")).unwrap();
+        fs::write(
+            root.join("consumers").join("board.toml"),
+            "depends_on = [\"stg\", \"rep\"]\n",
+        )
+        .unwrap();
+        let e060 = |o: &CompileOutput| {
+            o.diagnostics
+                .iter()
+                .filter(|d| &*d.code == "E060")
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let one_dir = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(one_dir.models, 1);
+        assert!(e060(&one_dir).is_empty(), "{:?}", one_dir.diagnostics);
+
+        fs::write(
+            root.join("consumers").join("board.toml"),
+            "depends_on = [\"stg\", \"nowhere\"]\n",
+        )
+        .unwrap();
+        let broken = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
+        let messages = e060(&broken);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("`nowhere`"), "{}", messages[0]);
     }
 
     /// The control: with a contract that matches, the whole-project compile

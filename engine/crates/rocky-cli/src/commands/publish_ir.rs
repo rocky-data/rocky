@@ -155,10 +155,11 @@ pub fn run_publish_ir(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
 
     let result = compile::compile(&config)?;
-    if result.has_errors {
+    if rocky_compiler::consumers::has_model_errors(&result) {
         anyhow::bail!(
             "cannot publish IR: producer project failed to compile ({} diagnostic(s))",
             result.diagnostics.len()

@@ -24,7 +24,7 @@
 //!
 //! This module owns loading and the shape of the record. The check that
 //! every `depends_on` entry names a model lives in `rocky-compiler`
-//! (`E059`), because only the compiler knows the model set.
+//! (`E060`), because only the compiler knows the model set.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,17 @@ pub fn consumers_dir_for(models_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(models_dir.join("../consumers"))
+}
+
+/// The `consumers/` directory of a project, given the project root (the
+/// directory that holds `rocky.toml`).
+///
+/// Unlike [`consumers_dir_for`] this does not depend on which models
+/// directory a command was pointed at, so `--models models/marts` and a
+/// pipeline `models` glob read the same consumers as a whole-project compile.
+#[must_use]
+pub fn consumers_dir_for_root(project_root: &Path) -> PathBuf {
+    project_root.join("consumers")
 }
 
 /// What kind of thing a consumer is. Informational: nothing in the engine
@@ -160,13 +171,27 @@ pub struct LoadedConsumers {
 
 /// Load every `*.toml` file under `dir` (subdirectories included).
 ///
-/// A missing directory is an empty result. Malformed files are returned in
+/// A directory that is provably absent is an empty result. A directory that
+/// cannot be read (permissions, a link to nowhere, a regular file in its
+/// place) is an error, not an empty project: reading it as empty would drop
+/// every consumer silently. Malformed files are returned in
 /// [`LoadedConsumers::errors`] rather than failing the scan, so the compiler
 /// can report each one as a diagnostic.
 #[must_use]
 pub fn load_consumers_from_dir(dir: &Path) -> LoadedConsumers {
     let mut loaded = LoadedConsumers::default();
-    if !dir.is_dir() {
+    if let Ok(metadata) = std::fs::metadata(dir)
+        && !metadata.is_dir()
+    {
+        loaded.errors.push(ConsumerLoadError {
+            name: dir.display().to_string(),
+            file_path: dir.to_path_buf(),
+            message: format!(
+                "{} exists but is not a directory; consumers are read from a directory of \
+                 `<name>.toml` files",
+                dir.display()
+            ),
+        });
         return loaded;
     }
     let (dirs, walk_errors) = crate::model_walk::walk_model_dirs(dir);
@@ -184,14 +209,11 @@ pub fn load_consumers_from_dir(dir: &Path) -> LoadedConsumers {
                 .map(|e| e.path())
                 .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "toml"))
                 .collect(),
-            Err(e) => {
-                loaded.errors.push(ConsumerLoadError {
-                    name: sub.display().to_string(),
-                    file_path: sub.clone(),
-                    message: format!("failed to read consumers directory: {e}"),
-                });
-                continue;
-            }
+            // The walk above read this directory first. It treats an absent
+            // one as the empty root and has already reported every other
+            // failure (permissions, a link to nowhere), so a repeat here
+            // would only double the diagnostic.
+            Err(_) => continue,
         };
         tomls.sort();
         for toml_path in tomls {
@@ -202,6 +224,12 @@ pub fn load_consumers_from_dir(dir: &Path) -> LoadedConsumers {
         }
     }
     loaded
+}
+
+/// Load the consumers of the project rooted at `project_root`.
+#[must_use]
+pub fn load_consumers_for_root(project_root: &Path) -> LoadedConsumers {
+    load_consumers_from_dir(&consumers_dir_for_root(project_root))
 }
 
 /// Load the consumers that belong to `models_dir`, or none when the project
@@ -313,6 +341,53 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let loaded = load_consumers_from_dir(&tmp.path().join("nope"));
         assert!(loaded.consumers.is_empty() && loaded.errors.is_empty());
+    }
+
+    #[test]
+    fn a_file_where_the_directory_should_be_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("consumers");
+        std::fs::write(&path, "not a directory").unwrap();
+        let loaded = load_consumers_from_dir(&path);
+        assert!(loaded.consumers.is_empty());
+        assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
+        assert!(loaded.errors[0].message.contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_where_the_directory_should_be_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("consumers");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &path).unwrap();
+        let loaded = load_consumers_from_dir(&path);
+        assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_an_error_not_an_empty_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("consumers");
+        write(&dir, "board.toml", "depends_on = []\n");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&dir).is_ok();
+        let loaded = load_consumers_from_dir(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return; // running as a user the mode does not bind (root)
+        }
+        assert!(loaded.consumers.is_empty());
+        assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
+    }
+
+    #[test]
+    fn the_root_directory_is_the_project_root_consumers() {
+        assert_eq!(
+            consumers_dir_for_root(Path::new("proj")),
+            PathBuf::from("proj/consumers")
+        );
     }
 
     #[test]

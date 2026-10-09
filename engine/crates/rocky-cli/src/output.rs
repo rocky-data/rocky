@@ -428,6 +428,14 @@ pub struct RunOutput {
     /// no overrides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_warnings: Vec<OverrideWarningOutput>,
+    /// Problems in the project's `consumers/` records (`E060`): a file that
+    /// does not load, a duplicate name, a `depends_on` entry that names no
+    /// model, or an unreadable directory. A consumer is metadata about readers
+    /// of the models, so these never stop a model from being written and are
+    /// never counted as a failed table. `rocky compile` and `rocky ci` do
+    /// refuse on them. Empty (and omitted) when the records are sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
 /// Soft warning surfaced on
@@ -6093,6 +6101,7 @@ impl RunOutput {
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            consumer_diagnostics: vec![],
         }
     }
 
@@ -6843,6 +6852,11 @@ pub struct DagRunOutput {
     pub duration_ms: u64,
     /// Per-node execution records, sorted by (layer, id).
     pub nodes: Vec<DagRunNodeOutput>,
+    /// Problems in the project's `consumers/` records (`E060`). Reported once
+    /// for the whole graph; they never fail a node. Empty (and omitted) when
+    /// the records are sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
 /// Per-node record in a [`DagRunOutput`].

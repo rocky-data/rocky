@@ -227,11 +227,12 @@ pub const E058: &str = "E058";
 /// name is offered when there is one.
 ///
 /// Emitted by `rocky compile` (and so by `rocky ci` and strict compiles) from
-/// [`crate::consumers`]. `rocky run` does not stop for it: a run keys error
-/// diagnostics on model names, and a consumer is not a model. A consumer that points at a model that
-/// no longer exists is the failure this exists to catch: the dashboard would
+/// [`crate::consumers`]. `rocky run` does not stop for it and does not count
+/// it as a failed table: a consumer is not a model, so the run reports it in
+/// `consumer_diagnostics` and writes the models. A consumer that points at a
+/// model that no longer exists is the failure this exists to catch: the dashboard would
 /// otherwise keep reading a table nobody maintains.
-pub const E059: &str = "E059";
+pub const E060: &str = "E060";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

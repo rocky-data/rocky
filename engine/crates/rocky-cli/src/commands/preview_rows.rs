@@ -218,6 +218,7 @@ fn prepare_preview(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let result = compile::compile(&compiler_cfg)
         .map_err(|e| fail("compile_error", &format!("compile failed: {e}"), None))?;
