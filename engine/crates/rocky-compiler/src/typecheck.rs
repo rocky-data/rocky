@@ -454,7 +454,7 @@ fn compute_model_typecheck(
     };
 
     // A qualified read of an upstream model's own target table
-    // (`FROM tour.main.customer_ltv`) types from that model.
+    // (`FROM analytics.main.customer_ltv`) types from that model.
     let relation_key = |name: &str| -> String {
         qualified_upstream_model(name, &model_schema.upstream, model_by_name)
             .map_or_else(|| name.to_string(), str::to_string)
