@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.79.0] — 2026-10-09
+
+The headline change is operator mode: on your own machine, `rocky serve --ui` can now make changes from the browser. The release also checks the whole project by default, enforces contracts on every `rocky run` route, and adds `rocky lint`, a `rocky docs` site, saved selectors, a plan cost preview and an Apache Spark adapter (Beta).
+
+Read these first. Each one can change what an existing project does.
+
+- `rocky serve --ui` on a loopback bind with no `--token`, `--allowed-host` or `--allowed-origin` is now operator mode. The browser opens it through the `/login?t=` link that the server prints, and it can run, plan, approve and apply as the OS user who started the server. Pass `--read-only` for a view-only UI.
+- A person's `rocky apply`, and an apply from the browser or `POST /api/v1/jobs/apply`, now refuses a plan whose models changed after the plan was made (`plan_models_changed`). Every plan id changes. A plan made before 1.79.0 is refused with `plan_snapshot_missing`: run `rocky plan` again, and get it approved again if it needs approval.
+- Contracts are enforced on every `rocky run` route, with no flag. Every compile reads the project `contracts/` directory. A model with a contract error (`E010` to `E013`) is not written, and its old table stays.
+- With no `--models`, `rocky compile` and `rocky ci` cover every transformation pipeline, not only `models/`. They also type the models from `data/seed.sql` when it exists. Expect new diagnostics on a project that compiled clean before.
+- New compile errors: `E029` (ambiguous column), `E039` in every clause, `E043` (date or timestamp compared with a number), `E057` (a function DuckDB does not have) and `E058` (a dependency cycle). A read inside a `WHERE`, `HAVING` or `SELECT`-list subquery is now a dependency, so it can close a cycle. `W045` (missing source table) fails a run that uses `--deny-warnings`.
+- The first run of a `time_interval` model with a `first_partition` now fills every partition from `first_partition` up to now, up to 1000 partitions. Before, it built only the latest partition.
+- `rocky docs` writes a site directory, `docs/site`, by default. A script that reads `docs/catalog.html` must pass `--output-path docs/catalog.html`.
+- `rocky ci`'s JSON `exit_code` is now the code the process exits with. A clean run with warnings reports `0`, not `4`.
+- Hooks now fire for transformation, quality, snapshot and load runs, not only for replication runs.
+
 ### Added
 
 - **Saved selectors: `[selectors]` in `rocky.toml` and `--select selector:<name>`.** Each entry maps a name to a `--select` expression. `selector:<name>` works in `--select` and `--exclude` on every command that takes them, like dbt's `selector:` method. A saved selector may use graph operators, `state:` and other `selector:` terms, and it keeps its own union and intersection as one unit. Graph operators outside it apply to its result (`+selector:finance`). An unknown name, an empty expression, or saved selectors that refer to each other in a loop is an error.

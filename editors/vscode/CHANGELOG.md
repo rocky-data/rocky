@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.46.0] — 2026-10-09
+
+Pairs with engine 1.79.0.
+
+### Changed
+
+- Generated types and the `rocky.toml` schema follow engine 1.79.0: `rocky lint` output, `rocky docs` outputs, plan `cost_preview` and `first_run_fills`, and `[selectors]`.
+
 ## [1.45.0] — 2026-10-08
 
 Pairs with engine 1.78.0.
