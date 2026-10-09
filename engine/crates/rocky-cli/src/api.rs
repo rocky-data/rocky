@@ -236,7 +236,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
 
     app
         // The `Host`/`Origin` guard is outermost so it precedes routing for
-        // every request, UI files included. It is a no-op without `--ui`.
+        // every request, UI files included. It runs on every loopback bind
+        // and every `--ui` bind; it is a no-op only on a non-loopback bind
+        // without `--ui`.
         .layer(middleware::from_fn_with_state(
             state,
             rocky_server::auth::require_known_host,
