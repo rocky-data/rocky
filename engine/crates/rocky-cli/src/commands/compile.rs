@@ -845,7 +845,7 @@ fn apply_adapter_gates(result: &mut compile::CompileResult, targets: &ModelTarge
 }
 
 /// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043),
-/// and calls to functions the target warehouse does not have (E057).
+/// and calls to functions the target warehouse does not have (E057, W057).
 /// These judge against the warehouse that will run the SQL, so they need a
 /// dialect the compiler core does not carry; see `operand_target_for` for
 /// the precedence.
@@ -863,19 +863,19 @@ fn apply_operand_gates(
         &result.type_check.typed_models,
         &target_for,
     );
-    // Calls to functions the target warehouse does not have (E057). Skipped
-    // when `[portability] target_dialect` says the SQL is written for another
-    // warehouse: its functions are not DuckDB's, and P001 covers portability.
-    let written_for_other = project_config
+    // Calls to functions the target warehouse does not have: E057 on DuckDB,
+    // W057 on the warehouses whose list is built from documentation. A model
+    // is not judged against a warehouse other than the one `[portability]
+    // target_dialect` says its SQL is written for: P001 covers portability.
+    let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
-        .is_some_and(|d| d != Dialect::DuckDB);
-    if !written_for_other {
-        operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
-            &result.project.models,
-            result.semantic_graph.functions(),
-            &target_for,
-        ));
-    }
+        .map(rocky_compiler::operand_check::OperandDialect::from);
+    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
+        &result.project.models,
+        result.semantic_graph.functions(),
+        &target_for,
+        written_for,
+    ));
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }
