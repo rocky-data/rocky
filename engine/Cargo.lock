@@ -4094,6 +4094,7 @@ version = "1.80.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "rocky-secret-registry",
  "serde",
  "serde_json",
  "thiserror",
@@ -4172,6 +4173,7 @@ name = "rocky-cache"
 version = "1.80.0"
 dependencies = [
  "redis",
+ "rocky-secret-registry",
  "serde",
  "serde_json",
  "thiserror",
@@ -4184,6 +4186,7 @@ name = "rocky-catalog-core"
 version = "1.80.0"
 dependencies = [
  "async-trait",
+ "rocky-secret-registry",
  "serde",
  "serde_json",
  "thiserror",
@@ -4345,6 +4348,7 @@ dependencies = [
  "rocky-core",
  "rocky-duckdb",
  "rocky-ir",
+ "rocky-secret-registry",
  "rocky-sql",
  "schemars 0.8.22",
  "serde",
@@ -4616,6 +4620,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-secret-registry"
+version = "1.80.0"
+
+[[package]]
 name = "rocky-server"
 version = "1.80.0"
 dependencies = [
@@ -4701,6 +4709,7 @@ version = "1.80.0"
 dependencies = [
  "miette",
  "regex",
+ "rocky-secret-registry",
  "schemars 0.8.22",
  "serde",
  "serde_json",

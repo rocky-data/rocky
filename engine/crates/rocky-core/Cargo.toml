@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rocky-ir = { path = "../rocky-ir" }
 rocky-sql = { path = "../rocky-sql" }
+rocky-secret-registry = { path = "../rocky-secret-registry" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
