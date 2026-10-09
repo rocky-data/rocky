@@ -268,7 +268,7 @@
           "type": "object"
         },
         {
-          "description": "A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, exposure), surfaced so a migration is never silently lossy.",
+          "description": "A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, an exposure, or an exposure dependency that is not a model), surfaced so a migration is never silently lossy.",
           "properties": {
             "construct": {
               "type": "string"
@@ -370,7 +370,14 @@
     },
     "constructs_dropped": {
       "default": 0,
-      "description": "Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).",
+      "description": "Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models), plus the exposures and exposure dependencies that could not be carried over to a consumer.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "consumers_imported": {
+      "default": 0,
+      "description": "Number of dbt exposures written as downstream consumers (`consumers/<name>.toml`).",
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"

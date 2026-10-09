@@ -175,7 +175,7 @@ class Kind39(StrEnum):
 
 class ImportDbtStructuredWarning8(BaseModel):
     """
-    A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, exposure), surfaced so a migration is never silently lossy.
+    A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, an exposure, or an exposure dependency that is not a model), surfaced so a migration is never silently lossy.
     """
 
     construct_: str = Field(..., alias="construct")
@@ -218,7 +218,11 @@ class ImportDbtOutput(BaseModel):
     command: str
     constructs_dropped: conint(ge=0) | None = 0
     """
-    Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
+    Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models), plus the exposures and exposure dependencies that could not be carried over to a consumer.
+    """
+    consumers_imported: conint(ge=0) | None = 0
+    """
+    Number of dbt exposures written as downstream consumers (`consumers/<name>.toml`).
     """
     contracts_dropped: conint(ge=0) | None = 0
     """

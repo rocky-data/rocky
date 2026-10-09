@@ -12,6 +12,10 @@ class DocsOutput(BaseModel):
     """
 
     command: str
+    consumers_count: conint(ge=0)
+    """
+    Downstream consumers (`consumers/`) the documentation lists.
+    """
     duration_ms: conint(ge=0)
     files: list[str]
     """

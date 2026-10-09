@@ -13,6 +13,10 @@
 export interface LineageOutput {
   columns: LineageColumnDef[];
   command: string;
+  /**
+   * Downstream consumers (dashboards, notebooks, ML jobs, applications declared in `consumers/`) that read the focal model, directly or through the models downstream of it. Sorted by name. These are not models, so they are not part of `downstream`. Omitted when none.
+   */
+  consumers?: LineageConsumerRecord[];
   downstream: string[];
   edges: LineageEdgeRecord[];
   model: string;
@@ -30,6 +34,36 @@ export interface LineageColumnDef {
    */
   data_type?: string | null;
   name: string;
+  [k: string]: unknown;
+}
+/**
+ * One downstream consumer in a `rocky lineage` view.
+ */
+export interface LineageConsumerRecord {
+  /**
+   * What it is for, when declared.
+   */
+  description?: string | null;
+  /**
+   * `true` when the consumer reads the focal model itself; `false` when it reads only models downstream of it.
+   */
+  direct: boolean;
+  /**
+   * `dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.
+   */
+  kind: string;
+  /**
+   * Consumer name.
+   */
+  name: string;
+  /**
+   * Owner, when declared.
+   */
+  owner?: string | null;
+  /**
+   * Where to find it, when declared.
+   */
+  url?: string | null;
   [k: string]: unknown;
 }
 export interface LineageEdgeRecord {
