@@ -747,7 +747,7 @@ class PlanCostPreview(BaseModel):
     """
     The cost preview on [`PlanOutput::cost_preview`].
 
-    `estimated_*` totals are sums over the models that have the figure. They are `None` when no model has it. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.
+    Each total is the sum over every model, and is `None` when any model lacks the figure, so a total never covers only part of the plan. A total with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.
     """
 
     cost_delta_usd: float | None = None
@@ -756,11 +756,11 @@ class PlanCostPreview(BaseModel):
     """
     estimated_bytes_scanned: conint(ge=0) | None = None
     """
-    Estimated bytes the rebuild reads, summed over the models.
+    Estimated bytes the rebuild reads, summed over every model.
     """
     estimated_cost_usd: float | None = None
     """
-    Estimated cost of the rebuild in USD, summed over the models.
+    Estimated cost of the rebuild in USD, summed over every model.
     """
     is_estimate: bool
     """
@@ -780,7 +780,7 @@ class PlanCostPreview(BaseModel):
     """
     previous_cost_usd: float | None = None
     """
-    Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when the state has no such run for every model.
+    Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when any model has no such run.
     """
     source: CostEstimateSource1 | CostEstimateSource2 | CostEstimateSource3
     """

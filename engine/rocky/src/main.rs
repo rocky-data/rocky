@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
+use rocky_cli::commands::CostEstimateMode;
 use tracing::warn;
 
 /// Extended help text for the shared `--filter` flag on `rocky plan`,
@@ -1018,7 +1019,7 @@ enum Command {
         /// preview is report-only and never changes the plan or the exit code.
         /// Applies to the default plan subcommand only.
         #[arg(long, value_enum, default_value = "heuristic", global = false)]
-        cost_estimate: rocky_cli::commands::CostEstimateMode,
+        cost_estimate: CostEstimateMode,
     },
 
     /// Execute the full pipeline in one step: discover → drift → create → copy → check.
@@ -4252,6 +4253,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // and only over the flags `plan` itself declares: inherited globals
             // (`--output`, `--principal`) are consumed by the promote path and
             // must keep working before the subcommand.
+            let non_default_cost = cost_estimate != CostEstimateMode::Heuristic;
             if subcommand.is_some()
                 && let Some(flag) = offending_default_plan_flag(&[
                     ("--filter", filter.is_some()),
@@ -4282,10 +4284,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--semantic", semantic),
                     ("--intent", intent.is_some()),
                     ("--base", base != "main"),
-                    (
-                        "--cost-estimate",
-                        cost_estimate != rocky_cli::commands::CostEstimateMode::Heuristic,
-                    ),
+                    ("--cost-estimate", non_default_cost),
                 ])
             {
                 anyhow::bail!(

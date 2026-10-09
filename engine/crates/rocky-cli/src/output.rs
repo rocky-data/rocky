@@ -1920,8 +1920,10 @@ pub enum CostEstimateSource {
 
 /// The cost preview on [`PlanOutput::cost_preview`].
 ///
-/// `estimated_*` totals are sums over the models that have the figure. They
-/// are `None` when no model has it. `cost_delta_usd` compares an adapter
+/// Each total is the sum over every model, and is `None` when any model
+/// lacks the figure, so a total never covers only part of the plan. A total
+/// with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd`
+/// compares an adapter
 /// estimate with the observed cost of the last successful production run
 /// of the same models. It is `None` unless every model has both.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1933,15 +1935,15 @@ pub struct PlanCostPreview {
     pub source: CostEstimateSource,
     /// Number of models the plan rebuilds (the rebuild scope).
     pub models_to_rebuild: usize,
-    /// Estimated bytes the rebuild reads, summed over the models.
+    /// Estimated bytes the rebuild reads, summed over every model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_bytes_scanned: Option<u64>,
-    /// Estimated cost of the rebuild in USD, summed over the models.
+    /// Estimated cost of the rebuild in USD, summed over every model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     /// Observed cost in USD of the same models in the last successful
-    /// production run, priced from the state store. `None` when the state
-    /// has no such run for every model.
+    /// production run, priced from the state store. `None` when any model
+    /// has no such run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_cost_usd: Option<f64>,
     /// `estimated_cost_usd - previous_cost_usd`. Present only when the

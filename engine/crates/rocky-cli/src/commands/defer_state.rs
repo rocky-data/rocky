@@ -208,13 +208,24 @@ enum Lookup {
 /// [`Lookup::Unrecorded`] even if an older execution recorded one: the older
 /// table may no longer be where production writes.
 fn newest_recorded(runs: &[RunRecord], model: &str) -> Lookup {
-    for run in runs {
+    for (index, run) in runs.iter().enumerate() {
         for exec in &run.models_executed {
             if exec.status != "success" {
                 continue;
             }
             match &exec.output_target {
                 Some(target) if target.model == model => {
+                    if index > 0 {
+                        // Production's newest run did not build this
+                        // upstream; the table may be stale. Say so.
+                        tracing::warn!(
+                            upstream = model,
+                            run_id = %run.run_id,
+                            newest_run_id = %runs[0].run_id,
+                            "--defer-to-state: upstream resolved from an older production run \
+                             than the newest one in the store; its table may be stale"
+                        );
+                    }
                     return Lookup::Found(ResolvedUpstream {
                         target: target.clone(),
                         run_id: run.run_id.clone(),
@@ -261,7 +272,7 @@ fn unreadable(path: &str, source: StateError) -> DeferStateError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use rocky_core::state::{ModelExecution, RunScope, RunStatus, RunTrigger, SessionSource};
@@ -350,6 +361,19 @@ mod tests {
 
     fn production(id: &str, at: i64, models: Vec<ModelExecution>) -> RunRecord {
         run(id, at, Some(RunScope::Production), models)
+    }
+
+    /// A store at `dir/state.redb` with one production run that built `model`
+    /// into `schema.table`. For tests outside this module.
+    pub(crate) fn store_recording(dir: &Path, model: &str, schema: &str, table: &str) -> PathBuf {
+        store_with(
+            dir,
+            &[production(
+                "prod-run",
+                10,
+                vec![exec(model, "success", Some((schema, table)))],
+            )],
+        )
     }
 
     #[test]

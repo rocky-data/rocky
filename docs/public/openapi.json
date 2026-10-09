@@ -14052,7 +14052,7 @@
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
       "PlanCostPreview": {
-        "description": "The cost preview on [`PlanOutput::cost_preview`].\n\n`estimated_*` totals are sums over the models that have the figure. They are `None` when no model has it. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.",
+        "description": "The cost preview on [`PlanOutput::cost_preview`].\n\nEach total is the sum over every model, and is `None` when any model lacks the figure, so a total never covers only part of the plan. A total with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.",
         "properties": {
           "cost_delta_usd": {
             "description": "`estimated_cost_usd - previous_cost_usd`. Present only when the estimate came from the adapter for every model and every model has a previous cost. A heuristic estimate is never compared with an observed cost.",
@@ -14063,7 +14063,7 @@
             ]
           },
           "estimated_bytes_scanned": {
-            "description": "Estimated bytes the rebuild reads, summed over the models.",
+            "description": "Estimated bytes the rebuild reads, summed over every model.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -14072,7 +14072,7 @@
             ]
           },
           "estimated_cost_usd": {
-            "description": "Estimated cost of the rebuild in USD, summed over the models.",
+            "description": "Estimated cost of the rebuild in USD, summed over every model.",
             "format": "double",
             "type": [
               "number",
@@ -14104,7 +14104,7 @@
             "type": "array"
           },
           "previous_cost_usd": {
-            "description": "Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when the state has no such run for every model.",
+            "description": "Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when any model has no such run.",
             "format": "double",
             "type": [
               "number",

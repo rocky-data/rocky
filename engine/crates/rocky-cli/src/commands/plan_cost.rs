@@ -217,14 +217,14 @@ pub(crate) fn build_cost_preview(inputs: CostPreviewInputs<'_>) -> PlanCostPrevi
     }
 }
 
-/// Sum the present values, or `None` when none is present.
+/// The sum when every value is present, else `None`. A partial sum would
+/// read as a total for the whole plan.
 fn sum_present<T: std::iter::Sum<T> + Copy>(values: impl Iterator<Item = Option<T>>) -> Option<T> {
-    let present: Vec<T> = values.flatten().collect();
-    if present.is_empty() {
-        None
-    } else {
-        Some(present.into_iter().sum())
+    let values: Vec<Option<T>> = values.collect();
+    if values.is_empty() {
+        return None;
     }
+    values.into_iter().sum()
 }
 
 /// Where [`compute_plan_cost_preview`] reads its inputs.
@@ -260,6 +260,13 @@ pub(crate) async fn compute_plan_cost_preview(ctx: PlanCostContext<'_>) -> PlanC
         }
     };
     let mut notes = Vec::new();
+    if dag_nodes.is_empty() && !ctx.models.is_empty() {
+        notes.push(
+            "the models did not compile for the cost preview, so no heuristic estimate is \
+             available"
+                .to_string(),
+        );
+    }
     let adapter = match ctx.mode {
         CostEstimateMode::Heuristic => None,
         CostEstimateMode::Adapter => {
@@ -517,6 +524,27 @@ mod tests {
         assert_eq!(full.source, CostEstimateSource::Adapter);
         assert_eq!(full.previous_cost_usd, Some(1.5));
         assert_eq!(full.cost_delta_usd, Some(0.5));
+    }
+
+    #[test]
+    fn a_total_is_none_when_any_model_lacks_the_figure() {
+        let dag = dag();
+        let models = names(&["orders", "joined"]);
+        let previous = BTreeMap::from([("orders".to_string(), 1.5)]);
+        let preview = build_cost_preview(CostPreviewInputs {
+            dag_nodes: &dag,
+            models: &models,
+            warehouse_type: Some(WarehouseType::Databricks),
+            adapter: None,
+            previous: &previous,
+            notes: Vec::new(),
+        });
+        assert_eq!(preview.models[0].previous_cost_usd, Some(1.5));
+        assert_eq!(
+            preview.previous_cost_usd, None,
+            "joined has no previous cost, so there is no total"
+        );
+        assert!(preview.estimated_cost_usd.is_some());
     }
 
     #[test]

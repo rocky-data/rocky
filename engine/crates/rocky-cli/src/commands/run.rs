@@ -10136,7 +10136,12 @@ fn apply_defer_rewrite(
                 defer_opts.defer_to.is_none(),
                 "--defer-to and --defer-to-state cannot be combined"
             );
-            let needed = deferred_upstreams_needed(compile_result, &selected_set);
+            let needed = deferred_upstreams_needed(
+                compile_result,
+                &selected_set,
+                dialect_case_rules(dialect)?,
+                dialect_recursive_cte_visibility(dialect),
+            );
             Some(super::defer_state::resolve_deferred_upstreams(
                 source, &needed,
             )?)
@@ -10280,34 +10285,74 @@ fn apply_defer_rewrite(
     Ok(())
 }
 
-/// For each selected model, the unselected project models it reads, from the
-/// compiled DAG. These are the upstreams `--defer-to-state` must resolve.
+/// For each selected model, the unselected project models it reads. These
+/// are the upstreams `--defer-to-state` must resolve.
+///
+/// Two sources, unioned: the compiled DAG's `depends_on`, and every bare
+/// reference the defer rewrite itself would qualify. The second matters
+/// because `depends_on` can lack a name the SQL reads (the compiler drops an
+/// auto-binding that would close a cycle). Leaving such a reference out would
+/// let it stay bare and read the working schema. A selected model whose SQL
+/// does not parse adds nothing here; the rewrite itself then refuses it.
 fn deferred_upstreams_needed(
     compile_result: &rocky_compiler::compile::CompileResult,
     selected: &std::collections::HashSet<&str>,
+    case_rules: rocky_sql::defer::IdentifierCaseRules,
+    recursive_visibility: rocky_sql::defer::RecursiveCteVisibility,
 ) -> BTreeMap<String, BTreeSet<String>> {
-    let models: std::collections::HashSet<&str> = compile_result
+    let unselected: std::collections::HashSet<&str> = compile_result
         .project
         .models
         .iter()
         .map(|model| model.config.name.as_str())
+        .filter(|name| !selected.contains(name))
         .collect();
-    compile_result
-        .project
-        .dag_nodes
+    // Every unselected model mapped to a placeholder: the probe only asks
+    // which names the rewrite would touch, and its SQL is discarded.
+    let probe: std::collections::HashMap<String, rocky_sql::defer::DeferTarget> = unselected
         .iter()
-        .filter(|node| selected.contains(node.name.as_str()))
-        .map(|node| {
-            let upstreams: BTreeSet<String> = node
-                .depends_on
-                .iter()
-                .filter(|dep| models.contains(dep.as_str()) && !selected.contains(dep.as_str()))
-                .cloned()
-                .collect();
-            (node.name.clone(), upstreams)
+        .map(|name| {
+            (
+                (*name).to_string(),
+                rocky_sql::defer::DeferTarget {
+                    catalog: String::new(),
+                    schema: "probe".to_string(),
+                    table: "probe".to_string(),
+                    quote_style: None,
+                },
+            )
         })
-        .filter(|(_, upstreams)| !upstreams.is_empty())
-        .collect()
+        .collect();
+    let mut needed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in &compile_result.project.dag_nodes {
+        if !selected.contains(node.name.as_str()) {
+            continue;
+        }
+        needed.entry(node.name.clone()).or_default().extend(
+            node.depends_on
+                .iter()
+                .filter(|dep| unselected.contains(dep.as_str()))
+                .cloned(),
+        );
+    }
+    for model in &compile_result.project.models {
+        if !selected.contains(model.config.name.as_str()) {
+            continue;
+        }
+        if let Ok(outcome) = rocky_sql::defer::qualify_deferred_refs(
+            &model.sql,
+            &probe,
+            case_rules,
+            recursive_visibility,
+        ) {
+            needed
+                .entry(model.config.name.clone())
+                .or_default()
+                .extend(outcome.qualified);
+        }
+    }
+    needed.retain(|_, upstreams| !upstreams.is_empty());
+    needed
 }
 
 /// Identifier quoting a rewritten upstream reference must use so that it names
@@ -34540,6 +34585,96 @@ backend = "local"
         assert!(!sql("mart").contains("prod."), "{}", sql("mart"));
         assert!(sql("wide").contains("prod.orders"), "{}", sql("wide"));
         assert!(!sql("wide").contains("prod.stg"), "{}", sql("wide"));
+    }
+
+    /// `--defer-to-state` resolves every upstream the SQL reads, even one the
+    /// compiled DAG's `depends_on` lacks, and refuses when the state has no
+    /// table for it. Without the SQL probe the reference would stay bare and
+    /// read the working schema.
+    #[test]
+    fn defer_to_state_resolves_sql_references_missing_from_depends_on() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "dev", "orders");
+        write_model_with_target(&models_dir, "stg", "SELECT id FROM orders", "dev", "stg");
+        let compile = || {
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir: models_dir.clone(),
+                    ..Default::default()
+                })
+                .expect("compile models");
+            // Simulate a dropped auto-binding: the DAG no longer lists the
+            // edge the SQL still reads.
+            for node in &mut compiled.project.dag_nodes {
+                node.depends_on.clear();
+            }
+            compiled
+        };
+        let selected: BTreeSet<String> = ["stg".to_string()].into();
+        let state_dir = tempfile::TempDir::new().expect("state dir");
+        let state = super::super::defer_state::tests::store_recording(
+            state_dir.path(),
+            "orders",
+            "prod",
+            "orders_t",
+        );
+
+        let mut compiled = compile();
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: state,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect("defer rewrite");
+        let stg = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "stg")
+            .expect("stg");
+        assert!(stg.sql.contains("prod.orders_t"), "{}", stg.sql);
+
+        // A state that never built `orders` refuses rather than leaving the
+        // reference bare.
+        let empty_dir = tempfile::TempDir::new().expect("empty state dir");
+        let empty = super::super::defer_state::tests::store_recording(
+            empty_dir.path(),
+            "other",
+            "prod",
+            "other",
+        );
+        let mut compiled = compile();
+        let err = super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: empty,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect_err("orders has no recorded table");
+        assert!(
+            matches!(
+                err.downcast_ref::<super::super::DeferStateError>(),
+                Some(super::super::DeferStateError::UpstreamMissing { upstream, .. }) if upstream == "orders"
+            ),
+            "{err:#}"
+        );
     }
 
     /// #1350: the model-only fallback answers identically to naming the

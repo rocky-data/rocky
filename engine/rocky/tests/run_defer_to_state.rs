@@ -129,6 +129,31 @@ fn defer_to_state_reads_the_table_the_production_run_recorded() {
         "{}",
         describe(&out)
     );
+    // A missing store refuses and is not created.
+    let absent = root.join("absent.redb");
+    let out = rocky(
+        &dev_dir,
+        &root.join("dev-e.redb"),
+        &[
+            "run",
+            "--pipeline",
+            "transform",
+            "--model",
+            "report",
+            "--defer",
+            "--defer-to-state",
+            absent.to_str().unwrap(),
+            "-o",
+            "json",
+        ],
+    );
+    assert!(!out.status.success(), "missing store: {}", describe(&out));
+    assert!(
+        describe(&out).contains("no state store at"),
+        "{}",
+        describe(&out)
+    );
+    assert!(!absent.exists());
     // Build `report` alone in dev without deferral: it fails (no
     // `main.orders`), so this state records no execution of `orders`.
     let _ = rocky(

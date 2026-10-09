@@ -163,6 +163,7 @@ report: FROM orders  ──rewrite──▶ FROM prod.orders
 ```
 
 - Each unbuilt upstream that a selected model reads resolves to the catalog, schema and table that the newest successful production run recorded for it. Shadow and branch runs never count.
+- When the newest production run did not build an upstream, Rocky uses an older run that did and logs a warning: that table may be stale. Pass `--defer-run-id` to pin one run.
 - `--defer-run-id <RUN_ID>` reads only that run. It must be a production run.
 - Rocky opens the store read-only. It never stamps, upgrades or changes it.
 - The run refuses before any write when the store is missing, when its state schema version is one this binary cannot read, or when it has no recorded table for an upstream a selected model reads. The error names the store, the run and the model.

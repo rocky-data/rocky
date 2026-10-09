@@ -357,8 +357,8 @@ When the plan covers transformation models, the JSON output has a `cost_preview`
 | `is_estimate` | Always `true`. Every figure is an estimate. |
 | `source` | `heuristic`, `adapter`, or `mixed` when the adapter could not estimate some models. Each row in `models` has its own `source`. |
 | `models_to_rebuild` | The rebuild scope: the number of models the plan rebuilds. |
-| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over the models that have the figure. |
-| `previous_cost_usd` | The observed cost of the same models in the last successful production run, priced from the state store. |
+| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over every model. A total is absent when any model lacks the figure. |
+| `previous_cost_usd` | The observed cost of the same models in the last successful production run, priced from the state store. Absent when any model has no such run. |
 | `cost_delta_usd` | `estimated_cost_usd - previous_cost_usd`. Set only when every model has an adapter estimate and a previous cost. |
 | `notes` | Why a figure is missing, for example a failed `EXPLAIN`. |
 
