@@ -3423,8 +3423,7 @@ async fn execute_job_subprocess(
         // Surface the actionable part of stderr as the error: the final
         // `Error:` / `Caused by:` block, never the child's tracing lines.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = concise_job_error(&stderr)
-            .unwrap_or_else(|| format!("`rocky {}` exited with {}", kind.verb(), output.status));
+        let msg = failed_job_error(kind.verb(), &output.status, &stderr);
         (JobState::Failed, result, Some(msg))
     }
 }
@@ -3433,12 +3432,22 @@ async fn execute_job_subprocess(
 /// bytes, before the trailing `…`.
 const JOB_ERROR_MAX_BYTES: usize = 1_500;
 
+/// What a failed job's `error` says when cleaning leaves nothing of stderr.
+const JOB_FAILED_SEE_LOG: &str = "the job failed; see the server log";
+
+/// The `error` of a failed job: the actionable part of its stderr, or, when
+/// nothing is left, [`JOB_FAILED_SEE_LOG`] with the exit status. Never empty.
+fn failed_job_error(verb: &str, status: &impl std::fmt::Display, stderr: &str) -> String {
+    concise_job_error(stderr)
+        .unwrap_or_else(|| format!("{JOB_FAILED_SEE_LOG} (`rocky {verb}` exited with {status})"))
+}
+
 /// The part of a failed child's stderr a reader acts on.
 ///
 /// A child run with `RUST_LOG` set writes tracing lines to stderr: JSON
 /// objects, or `fmt` lines that start with a timestamp or a level. Those can
 /// carry SQL and local file paths, and they bury the error. They are dropped,
-/// and so are indented backtrace lines (`  at …`, `  with …`). Of what is
+/// and so are indented backtrace frames (`  at <file>:<line>`). Of what is
 /// left, the error is the final `Error:` line and what follows it (anyhow's
 /// `Caused by:` chain); without one, the last ten lines that name no
 /// absolute path. The text then goes through [`sanitize_job_text`]. `None`
@@ -3486,7 +3495,8 @@ fn sanitize_job_text(text: &str) -> String {
 }
 
 /// Run every `errors[].error` string of a job result through
-/// [`sanitize_job_text`]. Other fields are left as they are.
+/// [`sanitize_job_text`]. Other fields are left as they are. An error that
+/// cleans to nothing becomes [`JOB_FAILED_SEE_LOG`], never an empty string.
 fn sanitize_result_errors(result: &mut serde_json::Value) {
     let Some(errors) = result
         .get_mut("errors")
@@ -3498,15 +3508,42 @@ fn sanitize_result_errors(result: &mut serde_json::Value) {
         if let Some(error) = entry.get_mut("error")
             && let Some(text) = error.as_str()
         {
-            *error = serde_json::Value::String(sanitize_job_text(text));
+            let text = sanitize_job_text(text);
+            let text = if text.is_empty() {
+                JOB_FAILED_SEE_LOG.to_string()
+            } else {
+                text
+            };
+            *error = serde_json::Value::String(text);
         }
     }
 }
 
-/// An indented backtrace or context line: `  at <path>` or `  with <value>`.
+/// An indented backtrace frame: `  at <location>:<line>` or
+/// `  at <location>:<line>:<column>`. Other indented lines, such as SQL that
+/// opens `    with cte as (`, are kept.
 fn is_backtrace_line(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.len() < line.len() && (trimmed.starts_with("at ") || trimmed.starts_with("with "))
+    if trimmed.len() == line.len() {
+        return false;
+    }
+    let Some(location) = trimmed.strip_prefix("at ") else {
+        return false;
+    };
+    let mut rest = location.trim_end();
+    let mut numbers = 0;
+    while numbers < 2 {
+        match rest.rsplit_once(':') {
+            Some((head, number))
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                rest = head;
+                numbers += 1;
+            }
+            _ => break,
+        }
+    }
+    numbers > 0 && !rest.trim().is_empty()
 }
 
 /// `thread 'main' panicked at src/x.rs:1:2:` keeps `thread 'main' panicked:`.
@@ -3529,17 +3566,46 @@ fn closes_path_token(c: char) -> bool {
     c.is_whitespace() || "'\"`)]}>,;".contains(c)
 }
 
-/// The byte length of an absolute path starting at `rest`, or `None`: a Unix
-/// path (`/x…`), a `file:///x…` URL, a home path (`~/x…`), a Windows path
-/// (`C:\x…` or `C:/x…`) or a UNC path (`\\host\x…`).
+/// The Unix directories a local filesystem path starts under. A path under
+/// another root, such as a REST path (`/api/2.0/…`, `/v1/statements`), is
+/// not redacted: it names no file on the server.
+const FILESYSTEM_ROOTS: &[&str] = &[
+    "/Users/",
+    "/home/",
+    "/tmp/",
+    "/var/",
+    "/private/",
+    "/etc/",
+    "/opt/",
+    "/root/",
+    "/mnt/",
+    "/usr/",
+    "/srv/",
+    "/Volumes/",
+];
+
+/// Whether `rest` opens a Unix path under a [`FILESYSTEM_ROOTS`] directory
+/// with at least one more segment (`/etc/passwd`, not `/etc/`).
+fn opens_filesystem_path(rest: &str) -> bool {
+    FILESYSTEM_ROOTS.iter().any(|root| {
+        rest.strip_prefix(root)
+            .and_then(|tail| tail.chars().next())
+            .is_some_and(|c| c != '/' && !closes_path_token(c))
+    })
+}
+
+/// The byte length of a local filesystem path starting at `rest`, or
+/// `None`: a Unix path under a [`FILESYSTEM_ROOTS`] directory, a `file:///x…`
+/// URL, a home path (`~/x…`), a Windows path (`C:\x…` or `C:/x…`) or a UNC
+/// path (`\\host\x…`).
 fn absolute_path_at(rest: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
     let starts = match bytes {
         [b'f', b'i', b'l', b'e', b':', b'/', b'/', b'/', ..] => true,
         [b'\\', b'\\', next, ..] => next.is_ascii_alphanumeric(),
         [letter, b':', b'/', next, ..] => letter.is_ascii_alphabetic() && *next != b'/',
-        // `https://host` reaches here at `//host`: not a path.
-        [b'/', next, ..] => !next.is_ascii_whitespace() && *next != b'/',
+        // `https://host` never reaches a root here: `//host` is no root.
+        [b'/', ..] => opens_filesystem_path(rest),
         [b'~', b'/', ..] => true,
         [letter, b':', b'\\', ..] => letter.is_ascii_alphabetic(),
         _ => false,
@@ -3551,8 +3617,9 @@ fn contains_absolute_path(line: &str) -> bool {
     redact_absolute_paths(line) != line
 }
 
-/// Replace every absolute filesystem path in `text` with `<path>`. A URL's
-/// `//host/x` is not a path: its slashes follow `:` or a host character.
+/// Replace every local filesystem path in `text` with `<path>`. A URL's
+/// `//host/x` is not a path: its slashes follow `:` or a host character. A
+/// REST path is not one either (see [`FILESYSTEM_ROOTS`]).
 fn redact_absolute_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev: Option<char> = None;
@@ -11770,6 +11837,56 @@ Caused by:
         let tail = "thread 'main' panicked at src/x.rs:1:2:\nboom\nreading /etc/passwd\n";
         let error = concise_job_error(tail).expect("an error");
         assert_eq!(error, "thread 'main' panicked:\nboom");
+    }
+
+    /// A REST path is not a file path, and an indented SQL line that opens
+    /// with `with` is not a backtrace frame. Both are kept, so a failure
+    /// without an `Error:` line still says what went wrong.
+    #[test]
+    fn keeps_rest_paths_and_indented_sql() {
+        let stderr = "\
+request to /api/2.0/sql/statements failed with 400
+POST /v1/statements returned an error
+    with cte as (
+      select 1
+    )
+";
+        let error = concise_job_error(stderr).expect("an error");
+        for kept in [
+            "/api/2.0/sql/statements",
+            "/v1/statements",
+            "    with cte as (",
+        ] {
+            assert!(error.contains(kept), "{kept} dropped: {error}");
+        }
+        assert!(!error.contains("<path>"), "{error}");
+        let error = concise_job_error("Error: GET /api/2.1/jobs/list returned 403").unwrap();
+        assert_eq!(error, "Error: GET /api/2.1/jobs/list returned 403");
+
+        // A root alone, or a non-filesystem root, is not redacted.
+        let error = concise_job_error("Error: /etc/ and /data/x and /tmp/x").unwrap();
+        assert_eq!(error, "Error: /etc/ and /data/x and <path>");
+    }
+
+    /// A failed job's `error` is never empty: when cleaning leaves nothing,
+    /// it says the job failed and to see the server log. So does an
+    /// `errors[].error` that cleans to nothing.
+    #[test]
+    fn a_failed_job_error_is_never_empty() {
+        let only_noise = "{\"level\":\"DEBUG\"}\n   at src/x.rs:1:2\n";
+        let error = super::failed_job_error("apply", &"exit status: 1", only_noise);
+        assert!(error.starts_with(super::JOB_FAILED_SEE_LOG), "{error}");
+        assert!(
+            error.contains("`rocky apply` exited with exit status: 1"),
+            "{error}"
+        );
+
+        let error = super::failed_job_error("apply", &"exit status: 1", "Error: boom\n");
+        assert_eq!(error, "Error: boom");
+
+        let mut result = serde_json::json!({ "errors": [{ "error": "   at src/x.rs:1\n" }] });
+        super::sanitize_result_errors(&mut result);
+        assert_eq!(result["errors"][0]["error"], super::JOB_FAILED_SEE_LOG);
     }
 
     /// Each `errors[].error` in a job result goes through the same cleaning,
