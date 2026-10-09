@@ -89,7 +89,7 @@ Each card says whether its data was available. A signal the ledger does not hold
 
 The printed address opens Estate, even though Needs you is first in the sidebar. It shows the project as the engine compiled it. The strip at the top names the config file, the pipelines and adapters, the compiled models with their diagnostics, and the newest run.
 
-![The estate screen for the playground project: a project strip with one transformation pipeline, one DuckDB adapter and three compiled models, the newest run, and a DAG of raw_orders, customer_orders and revenue_summary](/ui-estate.png)
+![The estate screen for the playground project: a project strip with one transformation pipeline, one DuckDB adapter and three compiled models, the newest run, Plan, Run and Refresh buttons, and a DAG of raw_orders, customer_orders and revenue_summary](/ui-estate.png)
 
 Below the project strip, the DAG draws every model and the edges between them. Click a model to open its detail: its columns (with their types, where the compiler inferred them) and its compiled SQL. The server caps the SQL at 256 KiB and says so when it cuts it. Further down, the estate lists recent runs and the pipelines that declare a `[schedule]`. The Schedule panel also shows the webhook demands waiting in the spool, which no tick has claimed yet. If the server cannot read the spool, the panel shows that error instead of a count.
 
@@ -99,7 +99,7 @@ The Review screen lists the plans that the policy plane sent to a human, by a ru
 
 Open a plan to see why it waits:
 
-![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, and the rocky review --approve command to copy](/ui-review.png)
+![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, an Approve button, and the rocky review --approve command to copy](/ui-review.png)
 
 The plan screen shows:
 
