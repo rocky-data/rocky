@@ -1294,6 +1294,18 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub recipe_identity: Option<RecipeIdentityInternal>,
+    /// State-internal record of the model and table this materialization
+    /// wrote, stamped onto the persisted
+    /// [`rocky_core::state::ModelExecution::output_target`] by
+    /// [`RunOutput::to_run_record`]. Set on the transformation-model paths;
+    /// `None` on replication copies. Read back by `rocky run --defer
+    /// --defer-state`.
+    ///
+    /// Never serialized and never part of the JSON schema — same pattern as
+    /// [`Self::recipe_identity`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub output_target: Option<rocky_core::state::RecordedTarget>,
     /// State-internal per-output-column content hashes, co-located with the
     /// model so [`RunOutput::to_run_record`] can stamp them onto the persisted
     /// `ModelExecution.output_column_hashes`. Populated only by the
@@ -6118,6 +6130,8 @@ impl RunOutput {
                 // The output's version identity, stamped at the execution
                 // site right after the write (RV1-P1b). State only.
                 output_version: mat.output_version.clone(),
+                // Where this model wrote, for `rocky run --defer-state`.
+                output_target: mat.output_target.clone(),
             });
         }
 
@@ -6160,6 +6174,7 @@ impl RunOutput {
                 // A failed execution recorded no output version ("not
                 // recorded"); it may have written nothing at all.
                 output_version: None,
+                output_target: None,
             });
         }
 
@@ -7426,6 +7441,7 @@ mod cost_finalize_tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 
@@ -7721,6 +7737,7 @@ mod run_record_tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 

@@ -2543,6 +2543,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         store
             .record_run(&RunRecord {

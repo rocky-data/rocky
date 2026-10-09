@@ -23,6 +23,7 @@ mod compliance;
 mod containment;
 mod cost;
 mod dag;
+pub mod defer_state;
 mod discover;
 mod docs;
 mod doctor;
@@ -215,6 +216,7 @@ pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_sched
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
+pub use defer_state::{DeferStateError, DeferStateSource};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,

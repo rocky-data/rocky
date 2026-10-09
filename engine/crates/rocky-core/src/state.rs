@@ -2895,6 +2895,39 @@ pub struct ModelExecution {
         deserialize_with = "deserialize_output_version_lenient"
     )]
     pub output_version: Option<OutputVersion>,
+
+    // --- Output target (no schema bump) -----------------------------------
+    /// The model and the table this execution wrote, as resolved for the
+    /// run. `rocky run --defer --defer-state` reads it to point a deferred
+    /// upstream at the table a production run built.
+    ///
+    /// `None` for a failed execution, for an output that is not a
+    /// transformation model (a replication copy), and for a record written by
+    /// a binary that predates this field. A deferral that needs the field
+    /// refuses on `None` rather than guessing a table.
+    ///
+    /// Added without a schema bump, like [`Self::output_version`]. Omitted
+    /// when `None`, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical. State-internal: not part of any `*Output` JSON schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_target: Option<RecordedTarget>,
+}
+
+/// Where one successful model execution wrote its output.
+///
+/// The model name is recorded next to the table because
+/// [`ModelExecution::model_name`] holds the last asset-key part, which is the
+/// table name for a transformation model, not always the model name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedTarget {
+    /// The Rocky model name.
+    pub model: String,
+    /// Warehouse catalog. Empty when the dialect has no catalog part.
+    pub catalog: String,
+    /// Schema the table was written to.
+    pub schema: String,
+    /// Table name.
+    pub table: String,
 }
 
 /// Lenient reader for [`ModelExecution::output_version`]: any value that does
@@ -9416,6 +9449,7 @@ pub fn run_with_output_versions(
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: version.clone(),
+                output_target: None,
             })
             .collect(),
         trigger: RunTrigger::Manual,
@@ -11566,6 +11600,7 @@ mod tests {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -11765,6 +11800,7 @@ mod tests {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             })
             .collect();
         for i in 0..1440u32 {
@@ -12063,6 +12099,7 @@ mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         }
     }
 
@@ -12155,6 +12192,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    output_target: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -12177,6 +12215,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    output_target: None,
                 },
             ],
         );
@@ -12214,6 +12253,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    output_target: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -12334,6 +12374,39 @@ mod tests {
         // The new attribution dimension defaults to None — a pre-tenant
         // record is treated as unattributed, never crashes the read.
         assert_eq!(exec.tenant, None);
+    }
+
+    /// A `ModelExecution` written before `output_target` existed reads with it
+    /// `None`, and a `None` is omitted on write so older ledger bytes stay
+    /// byte-identical. A `Some` round-trips.
+    #[test]
+    fn test_model_execution_output_target_forward_compat_and_round_trip() {
+        let blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": null,
+            "status": "success",
+            "sql_hash": "h",
+            "bytes_scanned": null,
+            "bytes_written": null
+        }"#;
+        let mut exec: ModelExecution =
+            serde_json::from_slice(blob).expect("pre-field record must read");
+        assert_eq!(exec.output_target, None);
+        let written = serde_json::to_string(&exec).unwrap();
+        assert!(!written.contains("output_target"), "{written}");
+
+        exec.output_target = Some(RecordedTarget {
+            model: "orders".to_string(),
+            catalog: String::new(),
+            schema: "prod".to_string(),
+            table: "orders_t".to_string(),
+        });
+        let back: ModelExecution =
+            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        assert_eq!(back.output_target, exec.output_target);
     }
 
     /// v10 → v11 forward-compat: a `ModelExecution` blob written before the
@@ -12544,6 +12617,7 @@ mod tests {
             }]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -12597,6 +12671,7 @@ mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 

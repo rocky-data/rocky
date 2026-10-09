@@ -1224,6 +1224,30 @@ enum Command {
         #[arg(long, value_name = "SCHEMA", requires = "defer")]
         defer_to: Option<String>,
 
+        /// Saved production state the deferred upstreams resolve from when
+        /// `--defer` is set: the path of a Rocky state store file, for
+        /// example a copy of production's `.rocky-state.redb`.
+        ///
+        /// Each unbuilt upstream a selected model reads resolves to the table
+        /// the newest successful production run in that store recorded for
+        /// it (catalog, schema and table). The store is opened read-only. The
+        /// run refuses before any write when the store is missing, has an
+        /// incompatible state schema version, or has no recorded table for a
+        /// needed upstream. Mutually exclusive with `--defer-to`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "defer",
+            conflicts_with = "defer_to"
+        )]
+        defer_to_state: Option<PathBuf>,
+
+        /// Read deferred upstreams only from this production run in the
+        /// `--defer-to-state` store, instead of the newest run that built each
+        /// upstream.
+        #[arg(long, value_name = "RUN_ID", requires = "defer_to_state")]
+        defer_run_id: Option<String>,
+
         /// Skip re-materializing transformation models whose logic and
         /// upstream data both appear unchanged since the last successful
         /// build.
@@ -4407,6 +4431,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             defer,
             defer_to,
+            defer_to_state,
+            defer_run_id,
             skip_unchanged,
             force_rebuild,
             no_reuse,
@@ -4528,6 +4554,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         && !watch
                         && !defer
                         && defer_to.is_none()
+                        && defer_to_state.is_none()
                         && !skip_unchanged
                         && !no_prune
                         && idempotency_key.is_none()
@@ -4639,6 +4666,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let defer_opts = rocky_cli::commands::DeferOptions {
                 enabled: defer,
                 defer_to,
+                defer_state: defer_to_state.map(|path| rocky_cli::commands::DeferStateSource {
+                    path,
+                    run_id: defer_run_id,
+                }),
                 selected_models,
                 ..Default::default()
             };

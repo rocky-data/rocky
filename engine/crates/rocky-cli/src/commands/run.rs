@@ -1053,6 +1053,12 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// `--defer-to-state <PATH>` (and optional `--defer-run-id`). When set,
+    /// each unbuilt upstream a selected model reads resolves to the table a
+    /// production run in that state store recorded for it, and the run
+    /// refuses with a [`super::DeferStateError`] when the state cannot
+    /// answer. Mutually exclusive with [`Self::defer_to`].
+    pub defer_state: Option<super::DeferStateSource>,
     /// Multi-model graph selection (`--select` / `--exclude`), already
     /// resolved to model names. `None` (every caller that does not pass a
     /// selector) keeps today's behavior. When `Some`, `rocky run` takes the
@@ -10121,16 +10127,58 @@ fn apply_defer_rewrite(
     // for a `--select` that resolved to more than one model.
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
+    // `--defer-to-state`: resolve each unselected upstream a selected model
+    // reads from the recorded production state, before any SQL is touched.
+    // Every needed upstream must resolve, or the run refuses.
+    let state_targets = match &defer_opts.defer_state {
+        Some(source) => {
+            anyhow::ensure!(
+                defer_opts.defer_to.is_none(),
+                "--defer-to and --defer-to-state cannot be combined"
+            );
+            let needed = deferred_upstreams_needed(compile_result, &selected_set);
+            Some(super::defer_state::resolve_deferred_upstreams(
+                source, &needed,
+            )?)
+        }
+        None => None,
+    };
+
     // The deferred set = every compiled model not in the selection, mapped to
     // its qualified defer target. `--defer-to` overrides the schema part;
     // catalog + table always come from the upstream's own configured target.
+    // Under `--defer-to-state` all three parts come from the recorded state,
+    // and an unselected model no selected model reads is left out.
     let mut deferred: HashMap<String, rocky_sql::defer::DeferTarget> = HashMap::new();
     for model in &compile_result.project.models {
         let name = model.config.name.as_str();
         if selected_set.contains(name) {
             continue;
         }
-        let target = &model.config.target;
+        let recorded;
+        let target = match &state_targets {
+            Some(targets) => {
+                let Some(resolved) = targets.get(name) else {
+                    continue;
+                };
+                recorded = rocky_core::models::TargetConfig {
+                    catalog: resolved.target.catalog.clone(),
+                    schema: resolved.target.schema.clone(),
+                    table: resolved.target.table.clone(),
+                };
+                tracing::info!(
+                    upstream = name,
+                    run_id = %resolved.run_id,
+                    target = %format!(
+                        "{}.{}.{}",
+                        recorded.catalog, recorded.schema, recorded.table
+                    ),
+                    "--defer-to-state: deferred upstream resolved from recorded state"
+                );
+                &recorded
+            }
+            None => &model.config.target,
+        };
         let schema = defer_opts
             .defer_to
             .clone()
@@ -10230,6 +10278,36 @@ fn apply_defer_rewrite(
     }
 
     Ok(())
+}
+
+/// For each selected model, the unselected project models it reads, from the
+/// compiled DAG. These are the upstreams `--defer-to-state` must resolve.
+fn deferred_upstreams_needed(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: &std::collections::HashSet<&str>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let models: std::collections::HashSet<&str> = compile_result
+        .project
+        .models
+        .iter()
+        .map(|model| model.config.name.as_str())
+        .collect();
+    compile_result
+        .project
+        .dag_nodes
+        .iter()
+        .filter(|node| selected.contains(node.name.as_str()))
+        .map(|node| {
+            let upstreams: BTreeSet<String> = node
+                .depends_on
+                .iter()
+                .filter(|dep| models.contains(dep.as_str()) && !selected.contains(dep.as_str()))
+                .cloned()
+                .collect();
+            (node.name.clone(), upstreams)
+        })
+        .filter(|(_, upstreams)| !upstreams.is_empty())
+        .collect()
 }
 
 /// Identifier quoting a rewritten upstream reference must use so that it names
@@ -13611,6 +13689,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                                     &model_ir, &summary,
                                 ),
                             ),
+                            output_target: Some(recorded_output_target(&model_ir)),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -15512,7 +15591,19 @@ async fn execute_one_plain_model(
         // Consumer baseline is content-addressed-path only.
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(&model_ir)),
     })
+}
+
+/// The model and table a transformation materialization wrote, for the
+/// persisted run record. `rocky run --defer-state` reads it back.
+fn recorded_output_target(model_ir: &rocky_ir::ModelIr) -> rocky_core::state::RecordedTarget {
+    rocky_core::state::RecordedTarget {
+        model: model_ir.name.to_string(),
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    }
 }
 
 /// The run note for an incremental load against an existing target. The
@@ -15773,6 +15864,7 @@ async fn execute_snapshot_model(
         output_column_hashes: None,
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(model_ir)),
     })
 }
 
@@ -16272,6 +16364,7 @@ async fn run_one_partition(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: Some(recorded_output_target(&tplan_ir)),
         }),
     }
 }
@@ -17747,6 +17840,7 @@ async fn process_table(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -24037,6 +24131,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 
@@ -38013,6 +38108,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -40413,6 +40509,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -40614,6 +40711,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -40747,6 +40845,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
             attempts: Vec::new(),
+            output_target: None,
         };
         let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
             "run_id": "run-prod",
@@ -40890,6 +40989,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -41873,6 +41973,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -42179,6 +42280,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {
