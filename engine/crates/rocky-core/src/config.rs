@@ -2951,6 +2951,11 @@ pub struct RockyConfig {
     #[serde(default)]
     pub portability: PortabilityConfig,
 
+    /// Style-lint configuration for `rocky lint`: rules to switch off and
+    /// per-rule severity overrides.
+    #[serde(default)]
+    pub lint: LintConfig,
+
     /// Project-level cache configuration. Today this is just
     /// `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results);
     /// future cache surfaces live as sibling fields under
@@ -4702,6 +4707,41 @@ pub struct PortabilityConfig {
     /// `-- rocky-allow: <construct>` pragma over expanding this list.
     #[serde(default)]
     pub allow: Vec<String>,
+}
+
+/// Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it
+/// reports at least one `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSeverity {
+    /// Fails the run (non-zero exit).
+    Error,
+    /// Reported; does not fail the run.
+    Warning,
+    /// Reported; does not fail the run.
+    Info,
+}
+
+/// `[lint]` — style-lint settings for `rocky lint`.
+///
+/// ```toml
+/// [lint]
+/// disable = ["S003"]
+///
+/// [lint.severity]
+/// S001 = "error"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LintConfig {
+    /// Rule codes that do not run, e.g. `["S003", "S004"]`.
+    #[serde(default)]
+    pub disable: Vec<String>,
+
+    /// Per-rule severity overrides, keyed by rule code. A rule without an
+    /// entry keeps its default severity.
+    #[serde(default)]
+    pub severity: std::collections::BTreeMap<String, LintSeverity>,
 }
 
 /// Top-level retry configuration applied across every adapter for this

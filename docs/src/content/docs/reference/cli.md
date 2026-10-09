@@ -8,7 +8,7 @@ sidebar:
 Rocky ships one binary. Every subcommand below is a step in the pipeline lifecycle, grouped here by the job it does:
 
 - **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (single-step alias: `run`)
-- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `catalog`, `publish-ir`, `imports`
+- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `lint`, `catalog`, `publish-ir`, `imports`
 - **Data**: `seed`, `snapshot`, `docs`, `load`, `profile`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`, `ai-contract`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `mcp`, `import-dbt`, `package`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`, `completions`, `bench`
@@ -43,6 +43,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `ci-diff` | Compare a branch against a base and report what changed. |
 | `preview` | Build only the changed subtree of a PR into a branch. |
 | [`emit-sql`](#rocky-emit-sql) | Print the warehouse SQL a model compiles to. |
+| [`lint`](/reference/commands/modeling/#rocky-lint) | Check model SQL for style problems. `--fix` rewrites the mechanical ones. |
 | [`catalog`](#rocky-catalog) | Write a project-wide column-level lineage snapshot to disk. |
 | `dag` | Show the whole DAG: every pipeline stage and its dependencies. |
 | `publish-ir` | Publish this project's compiled schema for other teams to check against. |

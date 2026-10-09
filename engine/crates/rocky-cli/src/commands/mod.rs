@@ -48,6 +48,7 @@ mod init_adapter;
 mod intent_check;
 mod lineage;
 mod lineage_diff;
+mod lint;
 mod list;
 mod load;
 mod lsp;
@@ -164,6 +165,7 @@ pub use init::init;
 pub use init_adapter::run_init_adapter;
 pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
+pub use lint::run_lint;
 pub use list::{
     list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
     list_models_output, list_models_selected, list_pipelines, list_pipelines_output, list_sources,

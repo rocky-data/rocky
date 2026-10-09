@@ -1214,6 +1214,27 @@ See [Linters](/concepts/linters/) for the full list of covered constructs and th
 
 ---
 
+## `[lint]`
+
+Tune the style rules that `rocky lint` runs. Rocky rejects an unknown field here, and an unknown rule code is an error.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `disable` | list of string | `[]` | Rule codes that do not run, such as `["S003"]`. |
+| `severity` | table | `{}` | Severity per rule code: `"error"`, `"warning"` or `"info"`. A rule keeps its default severity if it has no entry. |
+
+```toml
+[lint]
+disable = ["S004"]
+
+[lint.severity]
+S001 = "error"
+```
+
+`rocky lint` exits with code `1` when a finding has `error` severity. See [`rocky lint`](/reference/commands/modeling/#rocky-lint) for the rules.
+
+---
+
 ## `[retry]`
 
 Share one retry budget across every adapter in a run, instead of giving each its own. Rocky builds a single counter and passes it to all of them; once it runs out, no adapter retries again. This stops one failing endpoint from consuming retries the other adapters would have used. Omit the block and each `[adapter.NAME.retry]` keeps its own independent budget.

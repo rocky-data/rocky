@@ -812,6 +812,107 @@ emit-sql: 1 model(s) not emitted:
 
 ---
 
+## `rocky lint`
+
+Check model SQL for style problems. The rules find queries that are hard to read or easy to break, such as a bare `JOIN` or a column with no table name in a two-table query. They do not check that a query is correct. `rocky compile` does that.
+
+```bash
+rocky lint                          # Lint every .sql file under models/
+rocky lint models/marts/            # Lint one directory
+rocky lint models/fct_orders.sql    # Lint one file
+rocky lint --fix                    # Rewrite the fixable findings in place
+rocky lint --output json            # Machine-readable findings
+```
+
+`rocky lint` reads `.sql` files. It does not read `.rocky` files. Use [`rocky fmt`](/reference/cli/) for those.
+
+**Arguments and flags:**
+
+| Argument or flag | Default | Description |
+|------------------|---------|-------------|
+| `[PATHS]...` | `models` | `.sql` files or directories. Directories are searched recursively. Hidden directories and `target` are skipped. |
+| `--fix` | off | Rewrite the findings marked "fixable" in the table below. Rocky does not write a file if the fix would make a readable file stop parsing. |
+
+### Rules
+
+| Code | Name | Default severity | Flags | Fix |
+|------|------|------------------|-------|-----|
+| `S001` | `ambiguous-column` | warning | A column with no table qualifier in a query that reads two or more tables. `JOIN ... USING` columns, output aliases, subquery columns and lambda parameters are not flagged. | Report only |
+| `S002` | `implicit-inner-join` | warning | A bare `JOIN`. Write `INNER JOIN`. | `--fix` inserts `INNER` |
+| `S003` | `select-star` | info | `SELECT *` or `t.*` in the final result of a statement. A `SELECT *` in a CTE or a subquery is not flagged. | Report only |
+| `S004` | `target-order` | info | A plain column listed after a calculated column. Order the list as wildcards, plain columns, then calculations. | Report only |
+| `S005` | `keyword-case` | warning | A keyword whose capitalisation differs from the rest of the file. The majority style wins. | `--fix` recases |
+| `S006` | `trailing-whitespace` | warning | Spaces or tabs at the end of a line. Lines inside a multi-line string are not touched. | `--fix` trims |
+| `S007` | `tab-character` | warning | A tab outside a string or a comment. | `--fix` writes spaces |
+
+`S004` is report only because moving a column changes the model's output schema. `S003` complements the `P002` lint in [Linters](/concepts/linters/). `P002` fires only when a downstream model reads specific columns. `S003` fires on every final `SELECT *`.
+
+`S001`, `S003` and `S004` need a parse. If a file does not parse, Rocky skips these three rules for that file, prints a note, and still runs the text rules.
+
+### Configuration
+
+Switch rules off or change their severity in `rocky.toml`. An unknown rule code is an error.
+
+```toml
+[lint]
+disable = ["S003", "S004"]
+
+[lint.severity]
+S001 = "error"
+```
+
+Severity is `"error"`, `"warning"` or `"info"`. The command exits with code `1` when at least one finding has `error` severity. Warnings and info findings never fail the run.
+
+### Example
+
+```text
+$ rocky lint models/
+models/fct_orders.sql:6:12: warning[S001] column `amount` has no table qualifier in a query that reads 2 tables
+    hint: write `<alias>.amount`
+models/fct_orders.sql:8:1: warning[S002] bare JOIN does not say which kind of join it is
+    hint: write INNER JOIN
+3 file(s) checked: 0 error(s), 2 warning(s), 0 info
+1 finding(s) can be fixed with `rocky lint --fix`
+```
+
+### JSON output
+
+`rocky lint --output json` prints a `LintOutput` object:
+
+```json
+{
+  "version": "1.78.0",
+  "command": "lint",
+  "files_checked": 3,
+  "findings": [
+    {
+      "code": "S002",
+      "rule": "implicit-inner-join",
+      "severity": "warning",
+      "file": "models/fct_orders.sql",
+      "line": 8,
+      "col": 1,
+      "message": "bare JOIN does not say which kind of join it is",
+      "hint": "write INNER JOIN",
+      "fixable": true
+    }
+  ],
+  "counts": { "error": 0, "warning": 1, "info": 0 },
+  "fixed": 0,
+  "files_fixed": [],
+  "ast_rules_skipped": []
+}
+```
+
+With `--fix`, `findings` lists what is left after the rewrite. `fixed` counts the findings that were rewritten.
+
+### Related Commands
+
+- [`rocky compile`](#rocky-compile) -- correctness diagnostics, including the `P001` and `P002` lints
+- [Linters](/concepts/linters/) -- the semantic lints that run inside `rocky compile`
+
+---
+
 ## `rocky test`
 
 Run local model tests via DuckDB without needing warehouse credentials. Validates model SQL, contract compliance, and user-defined test assertions.

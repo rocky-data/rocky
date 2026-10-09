@@ -824,6 +824,30 @@ class ImportEntry(BaseModel):
     """
 
 
+class LintSeverity4(StrEnum):
+    """
+    Fails the run (non-zero exit).
+    """
+
+    error = "error"
+
+
+class LintSeverity5(StrEnum):
+    """
+    Reported; does not fail the run.
+    """
+
+    warning = "warning"
+
+
+class LintSeverity6(StrEnum):
+    """
+    Reported; does not fail the run.
+    """
+
+    info = "info"
+
+
 class LoadFileFormat(StrEnum):
     """
     File format for load pipelines, parsed from TOML.
@@ -2312,6 +2336,28 @@ class IsolationConfig(BaseModel):
     workspace_ids: list[WorkspaceBindingConfig] | None = Field(
         [], validate_default=True
     )
+
+
+class LintConfig(BaseModel):
+    """
+    `[lint]` — style-lint settings for `rocky lint`.
+
+    ```toml [lint] disable = ["S003"]
+
+    [lint.severity] S001 = "error" ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    disable: list[str] | None = []
+    """
+    Rule codes that do not run, e.g. `["S003", "S004"]`.
+    """
+    severity: dict[str, LintSeverity4 | LintSeverity5 | LintSeverity6] | None = {}
+    """
+    Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.
+    """
 
 
 class NullRateConfig(BaseModel):
@@ -3985,6 +4031,12 @@ class RockyConfig(BaseModel):
     Imported producer-project snapshots, keyed by import name.
 
     Each `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.
+    """
+    lint: LintConfig | None = Field(
+        {"disable": [], "severity": {}}, validate_default=True
+    )
+    """
+    Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides.
     """
     mask: (
         dict[

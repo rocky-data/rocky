@@ -5271,6 +5271,73 @@ pub struct TestAdapterTestResult {
     pub duration_ms: u64,
 }
 
+// ---------------------------------------------------------------------------
+// rocky lint
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky lint`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LintOutput {
+    pub version: String,
+    pub command: String,
+    /// Number of `.sql` files read.
+    pub files_checked: usize,
+    /// Findings left after any `--fix` pass, ordered by file, line and column.
+    pub findings: Vec<LintFinding>,
+    /// Finding counts by severity.
+    pub counts: LintCounts,
+    /// Findings `--fix` rewrote. `0` without `--fix`.
+    pub fixed: usize,
+    /// Files `--fix` changed.
+    pub files_fixed: Vec<String>,
+    /// Files whose SQL did not parse. The AST rules (`S001`, `S003`, `S004`)
+    /// did not run on them; the text rules did.
+    pub ast_rules_skipped: Vec<String>,
+}
+
+impl LintOutput {
+    pub fn new(files_checked: usize) -> Self {
+        LintOutput {
+            version: VERSION.to_string(),
+            command: "lint".to_string(),
+            files_checked,
+            findings: vec![],
+            counts: LintCounts::default(),
+            fixed: 0,
+            files_fixed: vec![],
+            ast_rules_skipped: vec![],
+        }
+    }
+}
+
+/// One `rocky lint` finding.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LintFinding {
+    /// Rule code, e.g. `S001`.
+    pub code: String,
+    /// Short rule name, e.g. `ambiguous-column`.
+    pub rule: String,
+    pub severity: rocky_core::config::LintSeverity,
+    pub file: String,
+    /// 1-based line.
+    pub line: u64,
+    /// 1-based column, counted in characters.
+    pub col: u64,
+    pub message: String,
+    /// Short suggestion for the fix.
+    pub hint: String,
+    /// `true` when `rocky lint --fix` can rewrite this finding.
+    pub fixable: bool,
+}
+
+/// Finding counts by severity for `rocky lint`.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct LintCounts {
+    pub error: usize,
+    pub warning: usize,
+    pub info: usize,
+}
+
 /// JSON output for `rocky hooks test <event>`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct HooksTestOutput {

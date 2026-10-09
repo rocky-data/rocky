@@ -92,6 +92,10 @@ export type FulfillDriverConfig =
 export type WebhookConfigOrList = WebhookConfig | WebhookConfig[];
 export type FailureAction = "abort" | "warn" | "ignore";
 /**
+ * Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.
+ */
+export type LintSeverity = "error" | "warning" | "info";
+/**
  * One entry in the top-level `[mask]` block. A scalar value (`pii = "hash"`) binds a classification tag to a default masking strategy; a nested table (`[mask.prod] pii = "none"`) overrides strategies for a specific environment.
  *
  * Serde deserializes the outer `[mask]` map as `BTreeMap<String, MaskEntry>`; scalars are tried first, then the nested table shape. Unknown strategy spellings (e.g., `"mask"`) hard-fail at config load time — Rocky never silently accepts something it can't emit SQL for.
@@ -487,6 +491,10 @@ export interface RockyConfig {
   imports?: {
     [k: string]: ImportEntry;
   };
+  /**
+   * Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides.
+   */
+  lint?: LintConfig;
   /**
    * Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:
    *
@@ -1171,6 +1179,25 @@ export interface ImportEntry {
    * Filename of the producer's current published snapshot, relative to `path`.
    */
   snapshot: string;
+}
+/**
+ * `[lint]` — style-lint settings for `rocky lint`.
+ *
+ * ```toml [lint] disable = ["S003"]
+ *
+ * [lint.severity] S001 = "error" ```
+ */
+export interface LintConfig {
+  /**
+   * Rule codes that do not run, e.g. `["S003", "S004"]`.
+   */
+  disable?: string[];
+  /**
+   * Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.
+   */
+  severity?: {
+    [k: string]: LintSeverity;
+  };
 }
 /**
  * Replication pipeline configuration.
