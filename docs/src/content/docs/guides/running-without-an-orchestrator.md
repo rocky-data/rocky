@@ -64,11 +64,11 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 
 A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. A quality pipeline's failed check gate returns `1`, not `2`. Codes `3` and `4` come from `rocky doctor` and `rocky fulfill`. Run `rocky doctor` as a pre-flight (below) or in CI.
 
-**`rocky ci` does not return `4`.** It prints `"exit_code": 4` in its JSON when compile and the tests pass with advisory warnings, and then exits `0`. A CI step that wants to act on warnings must read that field:
+**`rocky ci` returns `0` or `1`.** Its JSON `exit_code` is the same number. Advisory warnings do not change it. A CI step that wants to act on warnings reads the diagnostics:
 
 ```bash
-code=$(rocky ci --output json | jq '.exit_code')
-[ "$code" = "4" ] && echo "advisory warnings"
+n=$(rocky ci --output json | jq '[.diagnostics[] | select(.severity == "Warning")] | length')
+[ "$n" -gt 0 ] && echo "advisory warnings"
 ```
 
 **`rocky tick` and the webhook spool.** A tick that cannot read `.rocky/pending-demands` exits `1`, even when everything it did run succeeded. The scan fails only when something *is* at that path and cannot be read — a dangling symlink, a permission fault. A spool directory that does not exist yet reads as "no pending demand" and exits `0`, so this never fires on a project that has not used webhooks.

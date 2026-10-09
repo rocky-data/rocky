@@ -33,7 +33,7 @@ Read the [exit code](/reference/glossary/#exit-code) alongside the JSON, because
 
 A quality pipeline's failed check gate exits `1`, not `2`.
 
-**`rocky ci` and the number `4`.** A warnings-only CI run puts `"exit_code": 4` in its JSON, but the process exits `0`, because compile and the tests passed. Branch on the `exit_code` field if you want to act on advisory warnings. The process status alone will not tell you.
+**`rocky ci` and `exit_code`.** The JSON `exit_code` is the code the process exits with: `0` or `1`. Advisory warnings do not change it. To act on warnings, read the `"severity": "Warning"` entries in `diagnostics`.
 
 Exit `2` still writes valid JSON to stdout, so parse the payload rather than treating a non-zero code as no output.
 

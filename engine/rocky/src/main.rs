@@ -3811,12 +3811,13 @@ fn parse_governance_override(
 /// | `1`  | total / generic failure (e.g. `rocky run` with no tables copied, config error) |
 /// | `2`  | partial/failed work: `rocky run` some tables materialized + some failed, or `rocky tick` had at least one executed run fail or come back partial (Dagster `allow_partial=True` keys on this) |
 /// | `3`  | `rocky doctor` found a Critical health check |
-/// | `4`  | `rocky ci` passed compile + tests but emitted advisory warnings |
+/// | `4`  | `rocky fulfill` applied a plan whose output fails a declared check |
 /// | `130`| interrupted by SIGINT / SIGTERM |
 ///
 /// `2` is reserved for run/tick partial-or-failed work (both surface it via the
-/// shared `PartialFailure` sentinel); doctor-critical and ci-warnings were split
-/// off to `3` / `4` so they no longer collide with it.
+/// shared `PartialFailure` sentinel); doctor-critical was split off to `3` so
+/// it no longer collides with it. `rocky ci` exits `0` or `1`, and its JSON
+/// `exit_code` reports that same code; warnings do not change it.
 /// Resolve the state-file namespace for this invocation, if any.
 ///
 /// Precedence:

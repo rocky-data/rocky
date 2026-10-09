@@ -48,7 +48,7 @@ table = "fct_daily_orders"
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `time_column` | string | required | Column on the **model output** that holds the partition value. The compiler validates it exists, has a date/timestamp type (when known), is non-nullable, and passes SQL identifier validation. |
+| `time_column` | string | required | Column on the **model output** that holds the partition value. The compiler validates it exists, has a date/timestamp type (when known), is non-nullable, and passes SQL identifier validation. A nullable upstream column passes the non-null check when the model's `WHERE` compares that same column (for example `order_date >= @start_date`), because the comparison drops every row with a NULL key. |
 | `granularity` | enum | required | One of `hour`, `day`, `month`, `year`. Determines the canonical partition key format. |
 | `lookback` | u32 | `0` | Recompute the previous N partitions on each run, in addition to whichever partitions the CLI selected. The standard pattern for late-arriving data without re-running the whole table. |
 | `batch_size` | NonZeroU32 | `1` | Combine N consecutive partitions into a single SQL statement when backfilling. `1` is atomic per partition (recommended). `>1` trades atomicity for backfill throughput. |
