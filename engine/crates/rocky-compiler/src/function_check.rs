@@ -260,12 +260,14 @@ mod tests {
         }
     }
 
-    fn run(sql: &str, target: OperandTarget, registry: &FunctionRegistry) -> Vec<Diagnostic> {
+    fn run(sql: &str, target: &OperandTarget, registry: &FunctionRegistry) -> Vec<Diagnostic> {
         check_unknown_functions(&[model("m", sql)], registry, &|_| target.clone())
     }
 
     fn registry_with(name: &str) -> FunctionRegistry {
-        use rocky_core::functions::{FunctionArgument, FunctionConfig, FunctionDef, FunctionTarget};
+        use rocky_core::functions::{
+            FunctionArgument, FunctionConfig, FunctionDef, FunctionTarget,
+        };
         let def = FunctionDef {
             name: name.to_string(),
             config: FunctionConfig {
@@ -283,10 +285,11 @@ mod tests {
             body: Some("CAST(value AS VARCHAR)".to_string()),
             file_path: PathBuf::from(format!("functions/{name}.toml")),
         };
-        let (registry, diags) = crate::udf::build_registry(rocky_core::functions::LoadedFunctions {
-            functions: vec![def],
-            errors: Vec::new(),
-        });
+        let (registry, diags) =
+            crate::udf::build_registry(rocky_core::functions::LoadedFunctions {
+                functions: vec![def],
+                errors: Vec::new(),
+            });
         assert!(diags.is_empty(), "{diags:?}");
         registry
     }
@@ -299,7 +302,7 @@ mod tests {
     fn a_misspelled_aggregate_is_refused_on_duckdb() {
         let diags = run(
             "SELECT customer_id,\n    SUMM(amount) AS lifetime_value\nFROM fct_orders GROUP BY customer_id",
-            duckdb(),
+            &duckdb(),
             &FunctionRegistry::default(),
         );
         assert_eq!(diags.len(), 1, "{diags:?}");
@@ -323,7 +326,7 @@ mod tests {
             "SELECT (SELECT no_such_fn(1)) AS x",
             "SELECT upper(no_such_fn(a)) AS x FROM t",
         ] {
-            let diags = run(sql, duckdb(), &FunctionRegistry::default());
+            let diags = run(sql, &duckdb(), &FunctionRegistry::default());
             assert_eq!(diags.len(), 1, "`{sql}`: {diags:?}");
         }
     }
@@ -332,21 +335,21 @@ mod tests {
     fn only_duckdb_targets_are_checked() {
         let sql = "SELECT SUMM(amount) AS s FROM t";
         let registry = FunctionRegistry::default();
-        assert!(run(sql, OperandTarget::Unconfigured, &registry).is_empty());
+        assert!(run(sql, &OperandTarget::Unconfigured, &registry).is_empty());
         for d in [
             OperandDialect::Snowflake,
             OperandDialect::Databricks,
             OperandDialect::BigQuery,
             OperandDialect::Postgres,
         ] {
-            assert!(run(sql, Some(d).into(), &registry).is_empty(), "{d:?}");
+            assert!(run(sql, &Some(d).into(), &registry).is_empty(), "{d:?}");
         }
         // A model that also runs on DuckDB fails there.
         let both = OperandTarget::Targets {
             dialects: vec![OperandDialect::Snowflake, OperandDialect::DuckDb],
             unruled: Vec::new(),
         };
-        assert_eq!(run(sql, both, &registry).len(), 1);
+        assert_eq!(run(sql, &both, &registry).len(), 1);
     }
 
     #[test]
@@ -368,14 +371,14 @@ mod tests {
         GROUP BY customer_id";
         let registry = registry_with("ltv_band");
         for target in [duckdb(), OperandTarget::Unconfigured] {
-            let diags = run(sql, target, &registry);
+            let diags = run(sql, &target, &registry);
             assert!(diags.is_empty(), "{diags:?}");
         }
     }
 
     #[test]
     fn unparseable_sql_is_skipped() {
-        let diags = run("SELECT SUMM( FROM", duckdb(), &FunctionRegistry::default());
+        let diags = run("SELECT SUMM( FROM", &duckdb(), &FunctionRegistry::default());
         assert!(diags.is_empty());
     }
 

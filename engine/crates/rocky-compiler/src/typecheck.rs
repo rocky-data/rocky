@@ -569,22 +569,19 @@ fn compute_model_typecheck(
                 col,
                 inferred.exact_type_outputs.contains(&index),
                 inferred.count_outputs.contains(&index),
-                inferred.cast_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast)) =
-                inferred_by_name.get(col.name.as_str())
+            let Some(&(inferred_col, exact_type, count)) = inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
             let Some(edge) = graph.producing_edge(model_name, &col.name) else {
-                // No traceable source column. Only `COUNT(...)` and a cast are
-                // typed here: `COUNT` is a non-null BIGINT whatever its
-                // argument (#2295), and a cast is its target type
-                // (`CAST(NULL AS DATE)`). Other source-less projections
-                // (literals, multi-column arithmetic) stay Unknown.
-                if count || cast {
+                // No traceable source column. Only `COUNT(...)` is typed here:
+                // it is a non-null BIGINT whatever its argument (#2295). Other
+                // source-less projections (literals, multi-column arithmetic)
+                // stay Unknown.
+                if count {
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
                 }
@@ -610,11 +607,15 @@ fn compute_model_typecheck(
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
                 // inference's answer only when the type comes straight from
-                // the SQL: a cast target, `COUNT`, `SUM`/`MIN`/`MAX`/`AVG` over
-                // one, or a `CASE`/`COALESCE` whose branches agree. A cast is
-                // its target type even over an input Rocky cannot type.
+                // the SQL (a cast target, `COUNT`, `SUM`/`MIN`/`MAX`/`AVG` over
+                // one, or a `CASE`/`COALESCE` whose branches agree) and the
+                // traced input column is known — the same "Unknown input stays
+                // Unknown" rule as cast refinement.
                 rocky_sql::lineage::TransformKind::Expression => {
-                    if exact_type && inferred_col.data_type != RockyType::Unknown {
+                    if exact_type
+                        && inferred_col.data_type != RockyType::Unknown
+                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                    {
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
@@ -650,6 +651,9 @@ fn compute_model_typecheck(
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
+        typed_models,
+        col_index,
+        &relation_key,
         inferred_cols
             .as_ref()
             .map(|inferred| inferred.columns.as_slice()),
@@ -801,8 +805,8 @@ fn compute_model_typecheck(
 /// it, its lineage schema is complete ([`ModelSchema::schema_is_complete`]),
 /// its output names are fixed by its own SQL ([`has_provably_fixed_output_names`]),
 /// and no two of them collide case-insensitively. A bare read binds to the
-/// model only when the model writes a table of that name (or is ephemeral); a
-/// qualified read binds through its `[target]`. Scope resolution, aliases,
+/// model only when the model writes a table of that name (or is ephemeral). A
+/// qualified read of the model's target is not checked. Scope resolution, aliases,
 /// CTEs, subqueries and struct-field reads follow
 /// [`crate::source_refs::check_upstream_model_column_refs`]: anything it
 /// cannot bind stays `Unknown`.
@@ -871,32 +875,14 @@ fn check_known_missing_upstream_refs(
                 upstream_model.config.strategy,
                 rocky_core::models::StrategyConfig::Ephemeral
             );
-            let target = &upstream_model.config.target;
             let name = upstream_model.config.name.as_str();
             // A bare `FROM x` reaches the table `x`: this model only when it
             // writes that table, or is ephemeral (inlined by name).
-            let bare_binding = ephemeral || fold_identifier(&target.table) == fold_identifier(name);
-            let qualified_bindings = if ephemeral {
-                Vec::new()
-            } else {
-                let schema_table = format!(
-                    "{}.{}",
-                    fold_identifier(&target.schema),
-                    fold_identifier(&target.table)
-                );
-                let mut keys = vec![schema_table.clone()];
-                if !fold_identifier(&target.catalog).is_empty() {
-                    keys.push(format!(
-                        "{}.{schema_table}",
-                        fold_identifier(&target.catalog)
-                    ));
-                }
-                keys
-            };
+            let bare_binding = ephemeral
+                || fold_identifier(&upstream_model.config.target.table) == fold_identifier(name);
             crate::source_refs::UpstreamModelColumns {
                 name,
                 bare_binding,
-                qualified_bindings,
                 columns: upstream_schema
                     .columns
                     .iter()
@@ -938,8 +924,7 @@ pub(crate) fn qualified_upstream_model<'m>(
         let target = &model.config.target;
         let table_matches = fold_identifier(&target.schema) == parts[parts.len() - 2]
             && fold_identifier(&target.table) == parts[parts.len() - 1];
-        let catalog_matches =
-            parts.len() == 2 || fold_identifier(&target.catalog) == parts[0];
+        let catalog_matches = parts.len() == 2 || fold_identifier(&target.catalog) == parts[0];
         (table_matches && catalog_matches).then_some(model.config.name.as_str())
     });
     let first = matches.next()?;
@@ -992,8 +977,12 @@ fn calls_expanding_function(expr: &Expr) -> bool {
     use std::ops::ControlFlow;
     ast::visit_expressions(expr, |e| match e {
         Expr::Function(function)
-            if function.name.0.last().and_then(ast::ObjectNamePart::as_ident).is_some_and(
-                |ident| {
+            if function
+                .name
+                .0
+                .last()
+                .and_then(ast::ObjectNamePart::as_ident)
+                .is_some_and(|ident| {
                     matches!(
                         ident.value.to_ascii_lowercase().as_str(),
                         "unnest"
@@ -1009,8 +998,7 @@ fn calls_expanding_function(expr: &Expr) -> bool {
                             | "unpack"
                             | "flatten"
                     )
-                },
-            ) =>
+                }) =>
         {
             ControlFlow::Break(())
         }
@@ -2547,31 +2535,59 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
     }
 }
 
+/// Whether the source column a lineage edge reads has a known type.
+fn edge_input_is_known(
+    edge: &crate::semantic::LineageEdge,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    col_index: &HashMap<String, HashMap<String, usize>>,
+    relation_key: &dyn Fn(&str) -> String,
+) -> bool {
+    let source = relation_key(&edge.source.model);
+    typed_models
+        .get(&source)
+        .and_then(|columns| {
+            col_index
+                .get(&source)
+                .and_then(|index| index.get(&*edge.source.column))
+                .map(|&index| &columns[index])
+        })
+        .is_some_and(|input| input.data_type != RockyType::Unknown)
+}
+
 /// Refine explicit casts by parsing their target types from the model SQL.
 ///
 /// Only columns that lineage left `Unknown` **and** that are produced by a cast
-/// edge — infallible [`Cast`] or fallible [`TryCast`] — are refined,
-/// substituting the parsed cast target (so `CAST(id AS STRING) AS id` resolves
-/// to `String`, not the source's pre-cast type — see #1145). This refines only the *type*; the nullable bit was already set in
+/// edge — infallible [`Cast`] or fallible [`TryCast`] — whose input type is
+/// known are refined, substituting the parsed cast target (so `CAST(id AS
+/// STRING) AS id` resolves to `String`, not the source's pre-cast type — see
+/// #1145). This refines only the *type*; the nullable bit was already set in
 /// Step 1 (a `TryCast` output is nullable regardless of input — #1148) and is
 /// left untouched here.
 ///
 /// [`Cast`]: rocky_sql::lineage::TransformKind::Cast
 /// [`TryCast`]: rocky_sql::lineage::TransformKind::TryCast
 ///
-/// The cast target is applied whatever the input's type: a statement that runs
-/// returns the target type, and a missing input column is a compile error of
-/// its own (E039 / E041) rather than a reason to leave the type unknown. A
-/// bare `DECIMAL` with no precision names no type and stays `Unknown`.
+/// Two deliberate restrictions, both erring toward `Unknown` — the safe
+/// "cannot type-check" state, where a contract on the column is skipped rather
+/// than validated against a fabricated type:
 ///
-/// There is no alias-based fallback: a remaining `Unknown` column is not
-/// resolved by matching its output name against an upstream column. That
-/// lookup was unsound: an expression aliased back to a source name (e.g.
-/// `amount_cents / 100 AS amount`) would inherit the source type even though
-/// the expression can change it. Such columns are left `Unknown`.
+/// - **No alias-based fallback.** A remaining `Unknown` column is not resolved
+///   by matching its output name against an upstream column. That lookup was
+///   unsound: an expression aliased back to a source name (e.g.
+///   `amount_cents / 100 AS amount`) would inherit the source type even though
+///   the expression can change it. Such columns are left `Unknown`.
+/// - **Unknown input stays Unknown.** The cast target is knowable from the SQL
+///   alone, but the target is only applied when the cast's *input* column
+///   resolves to a known type. Rocky cannot say whether such a cast is
+///   nullable: a nullable guess would refuse a valid model under a
+///   `nullable = false` contract (E012) or a `time_interval` column (E022),
+///   and a non-null guess would pass a NULL.
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    col_index: &HashMap<String, HashMap<String, usize>>,
+    relation_key: &dyn Fn(&str) -> String,
     inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
@@ -2586,6 +2602,10 @@ fn enhanced_inference(
             continue;
         };
         if !edge.transform.is_cast() {
+            continue;
+        }
+
+        if !edge_input_is_known(edge, typed_models, col_index, relation_key) {
             continue;
         }
 
@@ -3373,9 +3393,6 @@ pub(crate) struct SelectInference {
     exact_type_outputs: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
-    /// Outputs that are a `CAST` / `TRY_CAST` to a concrete type: the type is
-    /// the cast target whatever the input is.
-    cast_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -3396,9 +3413,7 @@ impl SelectInference {
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
-        if is_cast(expr) && data_type != RockyType::Unknown {
-            self.cast_outputs.insert(self.columns.len());
-        }
+
         self.columns.push(TypedColumn {
             name,
             data_type,
@@ -3414,16 +3429,6 @@ fn function_name(expr: &Expr) -> Option<String> {
         Expr::Nested(inner) => function_name(inner),
         Expr::Function(func) => Some(func.name.to_string().to_uppercase()),
         _ => None,
-    }
-}
-
-/// Whether `expr` is a `CAST` / `TRY_CAST` / `::`, looking through
-/// parentheses.
-fn is_cast(expr: &Expr) -> bool {
-    match expr {
-        Expr::Nested(inner) => is_cast(inner),
-        Expr::Cast { .. } => true,
-        _ => false,
     }
 }
 
@@ -3601,7 +3606,6 @@ fn combine_set_operation(
     }
     let mut exact_type_outputs = HashSet::new();
     let mut count_outputs = HashSet::new();
-    let mut cast_outputs = HashSet::new();
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
             left.exact_type_outputs.contains(&index) && right.exact_type_outputs.contains(&index);
@@ -3617,13 +3621,6 @@ fn combine_set_operation(
         if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
             count_outputs.insert(index);
         }
-        if left.cast_outputs.contains(&index)
-            && right.cast_outputs.contains(&index)
-            && same_type
-            && data_type != RockyType::Unknown
-        {
-            cast_outputs.insert(index);
-        }
         l.data_type = data_type;
         l.nullable |= r.nullable;
     }
@@ -3631,7 +3628,6 @@ fn combine_set_operation(
         columns: left.columns,
         exact_type_outputs,
         count_outputs,
-        cast_outputs,
         set_operation: true,
     })
 }
@@ -4105,8 +4101,8 @@ fn emit_join_key_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::E039;
     use crate::contracts::{CompilerContract, ContractColumn, ContractRules, validate_contract};
+    use crate::diagnostic::E039;
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
@@ -6081,11 +6077,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_over_unknown_input_takes_the_cast_target() {
-        // The cast target (`STRING`) is knowable from the SQL alone. When the
-        // cast's input column resolves to `Unknown` (a source type Rocky can't
-        // map), the output still has the target type: a statement that runs
-        // returns it. The cast may fail on such an input, so it is nullable.
+    fn test_cast_over_unknown_input_stays_unknown() {
+        // The cast target (`STRING`) is knowable from the SQL alone, but when the
+        // cast's input column resolves to `Unknown` — e.g. a source type Rocky
+        // can't map, or a missing/unresolved reference — the output is left
+        // `Unknown` rather than asserting the parsed target. This is the
+        // conservative branch of the cast-alias fix (#1145): a contract on the
+        // column is skipped instead of validated against a fabricated type.
         let models = vec![make_model(
             "cast_unknown",
             "SELECT CAST(id AS STRING) AS id FROM source.raw.users",
@@ -6103,7 +6101,8 @@ mod tests {
         );
         let graph = build_semantic_graph(&project, &external).unwrap();
 
-        // The typed source column resolves to Unknown.
+        // The typed source column resolves to Unknown, so `input_is_known` is
+        // false and the cast output must remain Unknown.
         let mut sources = HashMap::new();
         sources.insert(
             "source.raw.users".to_string(),
@@ -6112,8 +6111,7 @@ mod tests {
 
         let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
         let cast_id = &result.typed_models["cast_unknown"][0];
-        assert_eq!(cast_id.data_type, RockyType::String);
-        assert!(cast_id.nullable);
+        assert_eq!(cast_id.data_type, RockyType::Unknown);
     }
 
     #[test]
@@ -8415,7 +8413,11 @@ mod tests {
         crate::compile::compile_preloaded_models(models, &config).expect("compile")
     }
 
-    fn column<'a>(result: &'a crate::compile::CompileResult, model: &str, name: &str) -> &'a TypedColumn {
+    fn column<'a>(
+        result: &'a crate::compile::CompileResult,
+        model: &str,
+        name: &str,
+    ) -> &'a TypedColumn {
         result.type_check.typed_models[model]
             .iter()
             .find(|c| c.name == name)
@@ -8502,46 +8504,53 @@ mod tests {
     }
 
     #[test]
-    fn a_cast_is_its_target_type_whatever_the_input() {
-        // No schema for `raw.unknown`: every input column is Unknown.
-        let result = compile_typed(
-            &[(
-                "m",
-                "SELECT o.id, \
-                 CAST(o.quantity * o.price AS DECIMAL(12, 2)) AS amount, \
-                 CAST(o.id AS BIGINT) AS id_big, \
-                 TRY_CAST(o.code AS INT) AS code_int, \
-                 CAST(NULL AS DATE) AS no_date, \
-                 CAST(1 AS BIGINT) AS one, \
-                 CAST(o.id AS DECIMAL) AS bare_decimal \
-                 FROM raw.unknown AS o",
-            )],
-            HashMap::new(),
-        );
-        let amount = column(&result, "m", "amount");
+    fn a_cast_over_a_known_input_takes_its_target_and_an_unknown_one_does_not() {
+        let sql = "SELECT o.id, \
+                   CAST(o.qty * o.price AS DECIMAL(12, 2)) AS amount, \
+                   CAST(o.id AS BIGINT) AS id_big, \
+                   CAST(o.id AS DECIMAL) AS bare_decimal \
+                   FROM raw.orders AS o";
+        let known = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("id", RockyType::Int32, false),
+                ("qty", RockyType::Int32, false),
+                (
+                    "price",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+            ]),
+        )]);
+        let result = compile_typed(&[("m", sql)], known);
         assert_eq!(
-            amount.data_type,
+            column(&result, "m", "amount").data_type,
             RockyType::Decimal {
                 precision: 12,
                 scale: 2
             }
         );
-        assert!(amount.nullable, "a cast over an unknown input can fail");
         assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
-        let code = column(&result, "m", "code_int");
-        assert_eq!(code.data_type, RockyType::Int32);
-        assert!(code.nullable);
-        let no_date = column(&result, "m", "no_date");
-        assert_eq!(no_date.data_type, RockyType::Date);
-        assert!(no_date.nullable);
-        let one = column(&result, "m", "one");
-        assert_eq!(one.data_type, RockyType::Int64);
-        assert!(!one.nullable, "a fitting integer literal cannot fail");
         // A bare DECIMAL names no precision: still Unknown.
         assert_eq!(
             column(&result, "m", "bare_decimal").data_type,
             RockyType::Unknown
         );
+
+        // No schema: Rocky cannot say whether the casts are nullable, so it
+        // claims no type (a nullable guess would refuse a valid model under a
+        // NOT NULL contract or a time_interval column).
+        let result = compile_typed(&[("m", sql)], HashMap::new());
+        for name in ["amount", "id_big"] {
+            assert_eq!(
+                column(&result, "m", name).data_type,
+                RockyType::Unknown,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -8620,10 +8629,7 @@ mod tests {
             assert_eq!(ty("customer_id"), RockyType::Int64, "{model}");
             assert_eq!(ty("order_count"), RockyType::Int64, "{model}");
         }
-        assert_eq!(
-            column(&result, "top", "ltv").data_type,
-            RockyType::Float64
-        );
+        assert_eq!(column(&result, "top", "ltv").data_type, RockyType::Float64);
         assert_eq!(
             column(&result, "stray", "customer_id").data_type,
             RockyType::Unknown
@@ -8648,21 +8654,13 @@ mod tests {
             "SELECT order_id FROM order_lines WHERE stats IN ('a', 'b')",
             "SELECT order_id FROM order_lines WHERE order_id IN (SELECT order_id FROM order_lines WHERE stats = 'x')",
             "WITH c AS (SELECT order_id, stats FROM order_lines) SELECT order_id FROM c",
-            // A qualified read of the target binds when the reader declares
-            // the dependency.
-            "SELECT order_id FROM warehouse.silver.order_lines WHERE stats = 'x'",
-            "SELECT order_id FROM silver.order_lines WHERE stats = 'x'",
         ] {
             let mut consumer = make_model("consumer", sql);
             consumer.config.depends_on = vec!["order_lines".to_string()];
             let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), consumer]);
             let found = e039_diagnostics(&result);
             assert_eq!(found.len(), 1, "`{sql}`: {:?}", result.diagnostics);
-            assert!(
-                found[0].message.contains("'order_lines'"),
-                "{:?}",
-                found[0]
-            );
+            assert!(found[0].message.contains("'order_lines'"), "{:?}", found[0]);
             assert!(found[0].is_error());
         }
     }
@@ -8712,13 +8710,16 @@ mod tests {
             "WITH order_lines AS (SELECT 1 AS stats) SELECT stats FROM order_lines",
             // A derived table with its own columns.
             "SELECT d.stats FROM (SELECT status AS stats FROM order_lines) AS d",
-            // A string alias, a lambda, struct access.
+            // A lambda parameter is not a column.
             "SELECT list_transform([1], x -> x + 1) AS l FROM order_lines",
+            // A qualified read of the target is not checked (`rocky run
+            // --defer` keeps such a read local).
+            "SELECT order_id FROM warehouse.silver.order_lines WHERE stats = 'x'",
+            "SELECT order_id FROM silver.order_lines WHERE stats = 'x'",
         ] {
-            let result = compile_typechecks(vec![
-                make_model("order_lines", ORDER_LINES),
-                make_model("consumer", sql),
-            ]);
+            let mut consumer = make_model("consumer", sql);
+            consumer.config.depends_on = vec!["order_lines".to_string()];
+            let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), consumer]);
             assert!(
                 e039_diagnostics(&result).is_empty(),
                 "`{sql}`: {:?}",
@@ -8735,19 +8736,16 @@ mod tests {
         renamed.config.target.table = "order_lines_v2".to_string();
         let mut reader = make_model("consumer", "SELECT stats FROM order_lines");
         reader.config.depends_on = vec!["order_lines".to_string()];
-        let result = compile_typechecks(vec![renamed.clone(), reader]);
+        let result = compile_typechecks(vec![renamed, reader]);
         assert!(
             e039_diagnostics(&result).is_empty(),
             "{:?}",
             result.diagnostics
         );
-        // Its target name binds instead.
-        let mut reader = make_model(
-            "consumer",
-            "SELECT stats FROM warehouse.silver.order_lines_v2",
-        );
+        // The same reader with the default target is refused.
+        let mut reader = make_model("consumer", "SELECT stats FROM order_lines");
         reader.config.depends_on = vec!["order_lines".to_string()];
-        let result = compile_typechecks(vec![renamed, reader]);
+        let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), reader]);
         assert_eq!(
             e039_diagnostics(&result).len(),
             1,

@@ -717,7 +717,8 @@ fn apply_operand_gates(
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
 ) {
-    let target_for = |model: &str| operand_target_for(target_dialect, project_config, targets, model);
+    let target_for =
+        |model: &str| operand_target_for(target_dialect, project_config, targets, model);
     let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
         &result.project.models,
         &result.semantic_graph,

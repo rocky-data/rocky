@@ -248,9 +248,6 @@ pub(crate) struct UpstreamModelColumns<'a> {
     pub(crate) name: &'a str,
     /// Whether a bare read of [`Self::name`] reaches this model.
     pub(crate) bare_binding: bool,
-    /// Lower-cased dotted names a qualified read of the model's target uses
-    /// (`catalog.schema.table`, `schema.table`).
-    pub(crate) qualified_bindings: Vec<String>,
     /// Every output column name, including columns the model's strategy adds
     /// (snapshot metadata).
     pub(crate) columns: Vec<&'a str>,
@@ -258,8 +255,10 @@ pub(crate) struct UpstreamModelColumns<'a> {
 
 /// E039 for every direct reference in `model` to a column that a complete
 /// upstream model does not output. Same binder and rules as the source check;
-/// only `upstreams` are known relations, so a read of anything else keeps
-/// the name unprovable.
+/// only `upstreams` read by their bare name are known relations, so a read of
+/// anything else (a qualified target name included) keeps the name
+/// unprovable. `rocky run --defer` relies on this: it rewrites exactly the
+/// bare reads to external tables and then drops E039.
 pub(crate) fn check_upstream_model_column_refs(
     model: &rocky_core::models::Model,
     upstreams: &[UpstreamModelColumns<'_>],
@@ -275,25 +274,15 @@ pub(crate) fn check_upstream_model_column_refs(
             origin: Provenance::Model,
         }
     }
-    let mut bare = HashMap::new();
-    let mut qualified = HashMap::new();
-    let mut collided = HashSet::new();
-    for up in upstreams {
-        if up.bare_binding {
-            bare.insert(up.name.to_lowercase(), known(up));
-        }
-        for key in &up.qualified_bindings {
-            if qualified.insert(key.clone(), known(up)).is_some() {
-                collided.insert(key.clone());
-            }
-        }
+    let bare: HashMap<String, KnownSource<'_>> = upstreams
+        .iter()
+        .filter(|up| up.bare_binding)
+        .map(|up| (up.name.to_lowercase(), known(up)))
+        .collect();
+    if bare.is_empty() {
+        return Vec::new();
     }
-    // Two upstreams answer to one dotted name: Rocky cannot tell which one
-    // the read reaches.
-    for key in collided {
-        qualified.remove(&key);
-    }
-    check_model(model, &qualified, &bare, false)
+    check_model(model, &HashMap::new(), &bare, false)
 }
 
 /// Index source schemas by lower-cased key. Keys that collide
@@ -828,20 +817,18 @@ impl<'s, 'a> Binder<'s, 'a> {
                     && sample.is_none()
                     && index_hints.is_empty()
                     && alias.as_ref().is_none_or(|alias| alias.columns.is_empty());
-                let source = parts
-                    .filter(|_| plain)
-                    .and_then(|parts| {
-                        let dotted = parts.join(".").to_lowercase();
-                        // A CTE shadows a single-part name, and a quoted
-                        // dotted CTE name must still win over a source.
-                        if ctes.contains(&dotted) {
-                            None
-                        } else if parts.len() == 1 {
-                            self.bare.get(&dotted)
-                        } else {
-                            self.sources.get(&dotted)
-                        }
-                    });
+                let source = parts.filter(|_| plain).and_then(|parts| {
+                    let dotted = parts.join(".").to_lowercase();
+                    // A CTE shadows a single-part name, and a quoted
+                    // dotted CTE name must still win over a source.
+                    if ctes.contains(&dotted) {
+                        None
+                    } else if parts.len() == 1 {
+                        self.bare.get(&dotted)
+                    } else {
+                        self.sources.get(&dotted)
+                    }
+                });
                 scope.rels.push(Rel {
                     binding,
                     kind: source.map_or(RelKind::Opaque, RelKind::Source),

@@ -1243,10 +1243,7 @@ mod tests {
             }
         }
         let diags = run(
-            &[(
-                "m",
-                "SELECT order_id FROM raw.orders WHERE order_date > 5",
-            )],
+            &[("m", "SELECT order_id FROM raw.orders WHERE order_date > 5")],
             Some(OperandDialect::DuckDb),
         );
         assert!(diags[0].message.contains("order_date"), "{diags:?}");
@@ -1255,6 +1252,40 @@ mod tests {
             !diags[0].suggestion.as_deref().unwrap().contains("TRY_CAST"),
             "a number does not cast to a date: {diags:?}"
         );
+    }
+
+    #[test]
+    fn text_vs_number_join_through_upstream_models_warns_on_duckdb() {
+        // Types flow through two upstream models; the join compares text with
+        // a number.
+        let project = [
+            (
+                "stg_customers",
+                "SELECT customer_id, email FROM raw.customers",
+            ),
+            (
+                "customer_ltv",
+                "SELECT customer_id, COUNT(*) AS order_count FROM raw.orders GROUP BY customer_id",
+            ),
+            (
+                "dim_customers",
+                "SELECT c.customer_id, COALESCE(l.order_count, 0) AS order_count \
+                 FROM stg_customers AS c LEFT JOIN customer_ltv AS l ON c.email = l.customer_id",
+            ),
+        ];
+        let diags = run(&project, Some(OperandDialect::DuckDb));
+        assert_eq!(codes(&diags), vec!["W043"], "{diags:?}");
+        assert_eq!(diags[0].model, "dim_customers");
+        let fixed = [
+            project[0],
+            project[1],
+            (
+                "dim_customers",
+                "SELECT c.customer_id FROM stg_customers AS c \
+                 LEFT JOIN customer_ltv AS l ON c.customer_id = l.customer_id",
+            ),
+        ];
+        assert!(run(&fixed, Some(OperandDialect::DuckDb)).is_empty());
     }
 
     #[test]

@@ -169,10 +169,12 @@ pub const E037: &str = "E037";
 ///   by the CLI, not by `rocky compile`).
 pub const E038: &str = "E038";
 
-/// A direct projection reads a column absent from a complete in-project model.
+/// A model reads a column absent from a complete in-project upstream model,
+/// in any clause (`SELECT`, `WHERE`, join `ON`, `GROUP BY`, `HAVING`, ...).
 ///
 /// Emitted only when Rocky can prove the upstream model's output names are
-/// complete. External sources are covered separately, by [`E041`] / [`W041`],
+/// complete and the read binds to it by its bare name; see
+/// `check_known_missing_upstream_refs` in `typecheck.rs`. External sources are covered separately, by [`E041`] / [`W041`],
 /// which weigh where the source schema came from.
 pub const E039: &str = "E039";
 
