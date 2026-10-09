@@ -3572,12 +3572,13 @@ fn closes_path_token(c: char) -> bool {
     c.is_whitespace() || "'\"`)]}>,;".contains(c)
 }
 
-/// The URL-path prefixes of API routes. A token that opens with one names a
-/// REST endpoint (`/api/2.0/sql/statements`, `/v1/statements`), not a file
-/// on the server, and is kept. Every other absolute path is redacted.
-const API_ROUTE_PREFIXES: &[&str] = &[
-    "/api/", "/v1/", "/v2/", "/v3/", "/v4/", "/v5/", "/v6/", "/v7/", "/v8/", "/v9/", "/2.0/",
-    "/1.2/", "/rest/", "/oauth", "/sql/",
+/// The leading URL-path segments of API routes. A token whose first segment
+/// is exactly one of these names a REST endpoint (`/api/2.0/sql/statements`,
+/// `/v1/statements`), not a file on the server, and is kept. Every other
+/// absolute path is redacted (`/apis/x` and `/oauthx/y` are).
+const API_ROUTE_SEGMENTS: &[&str] = &[
+    "api", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "2.0", "1.2", "rest", "sql",
+    "oauth", "oauth2",
 ];
 
 /// Whether `rest` opens a Unix path with at least two segments (`/etc/passwd`,
@@ -3593,21 +3594,21 @@ fn opens_filesystem_path(rest: &str) -> bool {
     !first.is_empty()
         && !second.is_empty()
         && !second.starts_with('/')
-        && !API_ROUTE_PREFIXES
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
+        && !API_ROUTE_SEGMENTS.contains(&first)
 }
 
 /// The byte length of a local filesystem path starting at `rest`, or
 /// `None`. Fails closed: any Unix path of two or more segments that is not
-/// an API route (see [`API_ROUTE_PREFIXES`]), a `file://` URL, a home path
-/// (`~/x…`), a Windows path (`C:\x…` or `C:/x…`) or a UNC path (`\\host\x…`).
+/// an API route (see [`API_ROUTE_SEGMENTS`]), a `file://` URL, a home path
+/// (`~/x…`), a Windows path (`C:\x…` or `C:/x…`), a UNC path (`\\host\x…`)
+/// or an extended-length path (`\\?\C:\x…`).
 /// A path inside another URL (`https://host/a/b`) is not reached here: its
 /// slashes follow a host character, which opens no token.
 fn absolute_path_at(rest: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
     let starts = match bytes {
         _ if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"file://") => true,
+        [b'\\', b'\\', b'?', b'\\', ..] => true,
         [b'\\', b'\\', next, ..] => next.is_ascii_alphanumeric(),
         [letter, b':', b'/', next, ..] => letter.is_ascii_alphabetic() && *next != b'/',
         [b'/', ..] => opens_filesystem_path(rest),
@@ -3622,15 +3623,39 @@ fn contains_absolute_path(line: &str) -> bool {
     redact_absolute_paths(line) != line
 }
 
+/// The length of a `sqlite://` or `duckdb://` prefix at `rest` when the URL
+/// names an absolute file (`sqlite:///abs/x`), or `None`.
+fn database_url_prefix(rest: &str) -> Option<usize> {
+    ["sqlite://", "duckdb://"].iter().find_map(|scheme| {
+        let head = rest.as_bytes().get(..scheme.len() + 2)?;
+        (head[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+            && head[scheme.len()] == b'/'
+            && !closes_path_token(char::from(head[scheme.len() + 1])))
+        .then_some(scheme.len())
+    })
+}
+
 /// Replace every local filesystem path in `text` with `<path>`. A URL's
 /// `//host/x` is not a path: its slashes follow `:` or a host character. An
-/// API route is not one either (see [`API_ROUTE_PREFIXES`]).
+/// API route is not one either (see [`API_ROUTE_SEGMENTS`]). The absolute
+/// file of a `sqlite:///abs` or `duckdb:///abs` URL is a path: the scheme is
+/// kept and the rest is redacted. A relative path is not redacted.
 fn redact_absolute_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev: Option<char> = None;
     let mut i = 0;
     while i < text.len() {
         let rest = &text[i..];
+        if opens_path_token(prev)
+            && let Some(scheme) = database_url_prefix(rest)
+        {
+            out.push_str(&rest[..scheme]);
+            out.push_str("<path>");
+            let path = &rest[scheme..];
+            i += scheme + path.find(closes_path_token).unwrap_or(path.len());
+            prev = Some('>');
+            continue;
+        }
         if opens_path_token(prev)
             && let Some(len) = absolute_path_at(rest)
         {
@@ -4012,14 +4037,17 @@ mod tests {
         let rendered = serde_json::to_string(&result.expect("a result")).expect("serializes");
         assert!(
             !rendered.contains(secret),
-            "the stored result still holds it: {rendered}"
+            "the stored result still holds the secret"
         );
-        assert!(rendered.contains("${ROCKY_JOBSCRUB}"), "{rendered}");
+        assert!(
+            rendered.contains("${ROCKY_JOBSCRUB}"),
+            "the stored result lacks the placeholder"
+        );
 
         let error = error.expect("an error");
         assert!(
             !error.contains(secret),
-            "the stored error still holds it: {error}"
+            "the stored error still holds the secret"
         );
         assert_eq!(version, rocky_core::state::CURRENT_REDACTION_VERSION);
     }
@@ -11758,11 +11786,23 @@ Caused by:
 {\"level\":\"TRACE\",\"message\":\"shutdown\"}
 ";
         let error = concise_job_error(stderr).expect("an error");
-        assert!(error.starts_with("Error: plan_models_changed"), "{error}");
-        assert!(error.contains("Caused by:"), "{error}");
-        assert!(error.contains("a model it runs was changed"), "{error}");
+        assert!(
+            error.starts_with("Error: plan_models_changed"),
+            "the error does not open with the final Error: line"
+        );
+        assert!(
+            error.contains("Caused by:"),
+            "the Caused by: chain was dropped"
+        );
+        assert!(
+            error.contains("a model it runs was changed"),
+            "the cause was dropped"
+        );
         // A warehouse error body is JSON too, but not a tracing event: kept.
-        assert!(error.contains("TABLE_NOT_FOUND"), "{error}");
+        assert!(
+            error.contains("TABLE_NOT_FOUND"),
+            "the warehouse error body was dropped"
+        );
         for (i, leaked) in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"]
             .iter()
             .enumerate()
@@ -11906,6 +11946,12 @@ POST /v1/statements returned an error
             ("Error: open 'C:\\Users\\u\\x' failed", "Users"),
             ("Error: see file:///Users/u/x", "/Users/u"),
             ("Error: see FILE://host/share/x", "host/share"),
+            ("Error: open \\\\?\\C:\\Users\\u\\x failed", "Users"),
+            ("Error: open sqlite:///srv/u/x.db failed", "/srv/u"),
+            ("Error: open DUCKDB:///srv/u/x.duckdb failed", "/srv/u"),
+            ("Error: open /apis/u/x failed", "/apis/u"),
+            ("Error: open /oauthx/u/x failed", "/oauthx/u"),
+            ("Error: open /api2/u/x failed", "/api2/u"),
         ] {
             let error = concise_job_error(text).expect("an error");
             assert!(!error.contains(leaked), "{leaked:?} leaked: {error}");
@@ -11921,10 +11967,17 @@ POST /v1/statements returned an error
             "Error: GET /rest/api/latest returned 500",
             "Error: POST /oauth2/token returned 401",
             "Error: POST /sql/statements/x returned 400",
+            "Error: POST /oauth/token returned 401",
             "Error: /etc/ alone is not a path",
+            "Error: open sqlite://rel/x.db failed",
         ] {
             assert_eq!(concise_job_error(kept).as_deref(), Some(kept));
         }
+        assert_eq!(
+            concise_job_error("Error: open sqlite:///srv/u/x.db failed").as_deref(),
+            Some("Error: open sqlite://<path> failed"),
+            "the scheme is kept, the absolute file is redacted"
+        );
         let stderr = "\
 Error: boom
   at crates/x/src/y.rs
