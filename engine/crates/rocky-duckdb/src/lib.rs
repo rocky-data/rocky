@@ -15,6 +15,7 @@ pub mod test_harness;
 pub mod types;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::{Connection, params, types::Value};
 use thiserror::Error;
@@ -59,10 +60,10 @@ pub struct QueryResult {
 /// `icu` feature needs a DuckDB source checkout and CMake). Without it,
 /// `current_date`, `today()` and the time-zone-aware date arithmetic come
 /// from an autoload that fires in the middle of binding the statement that
-/// first uses them. In DuckDB 1.5.6 that autoload invalidates the operator
-/// the binder is resolving, so `current_date + 1` failed with
-/// `No function matches ... '(DATE, INTEGER_LITERAL)'` and an empty or
-/// unrelated candidate list (#2325). Loading `icu` here, between
+/// first uses them. With DuckDB 1.5.6 on macOS arm64 that mid-bind load was
+/// observed to break the operator the binder was resolving:
+/// `current_date + 1` failed with `No function matches ... '(DATE, INTEGER_LITERAL)'` and
+/// an empty or unrelated candidate list (#2325). Loading `icu` here, between
 /// statements, removes the mid-bind load.
 ///
 /// `LOAD` reads the local extension cache. When the cache has no `icu`,
@@ -70,12 +71,19 @@ pub struct QueryResult {
 /// what the autoload did before. A failure is logged, not returned: a
 /// project that never uses these functions must still open offline, and
 /// one that does use them gets DuckDB's own "exists in the icu extension"
-/// error at the statement.
+/// error at the statement. After one failed `INSTALL`, later connections in
+/// the same process skip it, so an offline machine pays the network attempt
+/// once, not on every open.
 fn load_icu(conn: &Connection) {
+    static INSTALL_FAILED: AtomicBool = AtomicBool::new(false);
     if conn.execute_batch("LOAD icu").is_ok() {
         return;
     }
+    if INSTALL_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
     if let Err(err) = conn.execute_batch("INSTALL icu; LOAD icu") {
+        INSTALL_FAILED.store(true, Ordering::Relaxed);
         warn!(
             error = %err,
             "could not load the DuckDB icu extension; `current_date` and time-zone \
@@ -330,6 +338,18 @@ mod tests {
             .execute_sql("SELECT (current_date + 1) - current_date AS days")
             .unwrap();
         assert_eq!(result.rows[0][0], "1");
+    }
+
+    /// The bind failure above reproduces only on some platforms (macOS
+    /// arm64, not Linux CI). This pins the fix itself on every platform:
+    /// `icu` is loaded before the first statement runs.
+    #[test]
+    fn icu_is_loaded_before_the_first_statement() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'icu'")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "true");
     }
 
     /// The same failure with an interval: the recorded dbt Stripe package
