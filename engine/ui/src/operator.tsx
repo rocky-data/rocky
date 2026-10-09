@@ -72,7 +72,7 @@ export function OperatorBanner({ access }: { access: WriteAccess }) {
         <div
           role="status"
           aria-label="Operator mode"
-          className="inline-flex items-center gap-1.5 rounded-full border border-amber-400 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/60 dark:text-amber-200"
+          className="inline-flex items-center gap-1.5 rounded-lg border sm:rounded-full border-amber-400 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/60 dark:text-amber-200"
         >
           <ShieldExclamationIcon aria-hidden="true" className="size-3.5 shrink-0" />
           {OPERATOR_MODE_LABEL}
@@ -85,7 +85,7 @@ export function OperatorBanner({ access }: { access: WriteAccess }) {
       <div
         role="status"
         aria-label="Read-only"
-        className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 px-2.5 py-0.5 text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
+        className="inline-flex items-center gap-1.5 rounded-lg border sm:rounded-full border-zinc-300 px-2.5 py-0.5 text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
       >
         <EyeIcon aria-hidden="true" className="size-3.5 shrink-0" />
         Read-only. {access.reason}

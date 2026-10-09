@@ -27,6 +27,24 @@ const TONE_BORDER: Record<Tone, string> = {
   pending: "border-zinc-200 dark:border-zinc-800",
 };
 
+/**
+ * A run's status as a tone. One function for every place a run is drawn,
+ * so the strip and the table never colour the same run differently.
+ */
+export function runStatusTone(status: string): Tone {
+  switch (status.toLowerCase()) {
+    case "success":
+      return "ok";
+    case "partialfailure":
+    case "partial_failure":
+      return "warn";
+    case "failure":
+      return "risk";
+    default:
+      return "muted";
+  }
+}
+
 /** The dot alone, for a line of status outside a card. */
 export function ToneDot({ tone }: { tone: Tone }) {
   const dot = TONE_DOT[tone];

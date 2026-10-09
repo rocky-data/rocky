@@ -1,10 +1,10 @@
 import { useCallback, useState } from "react";
-import type { BriefOutput, BriefSinceMode } from "@rocky-types/brief";
+import type { BriefOutput, BriefSinceMode, SectionAvailability } from "@rocky-types/brief";
 import { apiGet } from "../api";
 import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
 import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, type Tone } from "../components";
 import { useResource } from "../estate/useResource";
-import { formatDuration, formatInstant, orNotRecorded } from "../format";
+import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded } from "../format";
 import { reviewPath } from "../review/paths";
 import { navigateTo } from "../router";
 import { CustodyLink } from "./links";
@@ -154,7 +154,9 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
                   event.preventDefault();
                   navigateTo(reviewPath(entry.plan_id));
                 }}
-                className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-md bg-orange-500 px-3 text-sm font-semibold text-zinc-950 hover:bg-orange-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500"
+                // A navigation, so the read look: solid orange is kept for
+                // the writes that change something.
+                className={`${READ_BUTTON} shrink-0`}
               >
                 Review plan
                 <ArrowRightIcon aria-hidden="true" className="size-4" />
@@ -370,17 +372,27 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
 function Headline({ brief }: { brief: BriefOutput }) {
   const { escalations, runs, autonomy } = brief;
   const chips: { key: string; tone: Tone; text: string }[] = [];
+  // `no_data` is a real answer ("nothing in the window") and says so in the
+  // section's own words; `unavailable` is no answer and says only that.
+  const quiet = (key: string, availability: SectionAvailability, empty: string, name: string) => {
+    if (availability === "no_data") chips.push({ key, tone: "ok", text: empty });
+    if (availability === "unavailable") chips.push({ key, tone: "muted", text: `${name}: ${NOT_RECORDED}` });
+  };
   if (escalations.availability === "available") {
     chips.push({
       key: "escalations",
       tone: escalations.total > 0 ? "warn" : "ok",
       text:
         escalations.total === 0
-          ? "nothing waits on you"
+          ? "no escalation is pending"
           : `${escalations.total} ${escalations.total === 1 ? "decision waits" : "decisions wait"} on you`,
     });
+  } else {
+    quiet("escalations", escalations.availability, "no escalation is pending", "escalations");
   }
-  if (runs.availability === "available") {
+  if (runs.availability !== "available") {
+    quiet("runs", runs.availability, "no runs in the window", "runs");
+  } else {
     const bad = runs.failed + runs.partial_failure;
     chips.push({
       key: "runs",
@@ -396,7 +408,9 @@ function Headline({ brief }: { brief: BriefOutput }) {
               .join(", ")} of ${runs.total} runs`,
     });
   }
-  if (autonomy.availability === "available") {
+  if (autonomy.availability !== "available") {
+    quiet("autonomy", autonomy.availability, "no rule is degraded and no freeze is in force", "autonomy");
+  } else {
     const curtailed = autonomy.degraded_rules.length + autonomy.active_freezes.length;
     chips.push({
       key: "autonomy",
@@ -446,7 +460,8 @@ function EffectBar({ allow, review, deny }: { allow: number; review: number; den
         {parts
           .filter((part) => part.count > 0)
           .map((part) => (
-            <span key={part.label} className={part.color} style={{ flexGrow: part.count }} />
+            // `min-w-1`: a share of 1 in 1000 stays visible; the label has the exact counts.
+            <span key={part.label} className={`min-w-1 ${part.color}`} style={{ flexGrow: part.count }} />
           ))}
       </div>
       <ul aria-hidden="true" className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-600 dark:text-zinc-300">

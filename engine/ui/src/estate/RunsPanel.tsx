@@ -1,20 +1,8 @@
 import type { HistoryOutput } from "@rocky-types/history";
-import { Clip, EmptyState, TABLE, ToneDot, type Tone } from "../components";
+import { Clip, EmptyState, TABLE, ToneDot, runStatusTone, type Tone } from "../components";
 import { formatDuration, formatInstant, orNotRecorded } from "../format";
 
-function statusTone(status: string): Tone {
-  switch (status.toLowerCase()) {
-    case "success":
-      return "ok";
-    case "partialfailure":
-    case "partial_failure":
-      return "warn";
-    case "failure":
-      return "risk";
-    default:
-      return "muted";
-  }
-}
+const statusTone = runStatusTone;
 
 const TONE_TEXT: Record<Tone, string> = {
   ok: "text-emerald-700 dark:text-emerald-400",

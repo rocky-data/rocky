@@ -218,7 +218,27 @@ describe("BriefScreen", () => {
       />,
     );
     const summary = await screen.findByRole("list", { name: "Summary" });
-    expect(summary.textContent).not.toMatch(/waits on you/);
+    expect(summary.textContent).not.toMatch(/waits on you|no escalation/);
+    expect(within(summary).getAllByRole("listitem")[0].textContent).toBe("escalations: not recorded");
+  });
+
+  it("says a quiet window in the section's own words", async () => {
+    render(
+      <BriefScreen
+        load={async () => ({
+          ...BRIEF,
+          escalations: { ...BRIEF.escalations, availability: "no_data", total: 0, pending: [] },
+          runs: { ...BRIEF.runs, availability: "no_data" },
+        })}
+        now={NOW}
+      />,
+    );
+    const summary = await screen.findByRole("list", { name: "Summary" });
+    expect(within(summary).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "no escalation is pending",
+      "no runs in the window",
+      "1 freeze(s), 1 degraded rule(s)",
+    ]);
   });
 
   it("renders a hostile reason as text, never as markup", async () => {

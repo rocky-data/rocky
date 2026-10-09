@@ -391,7 +391,9 @@ function Approval({
   return (
     <section
       aria-label="Approval"
-      className="space-y-4 rounded-lg border border-zinc-300 bg-white p-5 lg:sticky lg:top-16 dark:border-zinc-700 dark:bg-zinc-900"
+      // Sticky only as tall as the window, and scrolls inside past that, so
+      // the Apply note and the command never sit stuck below the fold.
+      className="space-y-4 rounded-lg border border-zinc-300 bg-white p-5 lg:sticky lg:top-16 lg:max-h-[calc(100vh-5rem)] lg:overflow-y-auto dark:border-zinc-700 dark:bg-zinc-900"
     >
       <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Approval</h3>
       <Steps
@@ -405,7 +407,12 @@ function Approval({
             // After approval it is unknown, not "next": a plan applied in a
             // terminal, or before a reload, looks exactly the same here.
             state: applied ? "done" : status.reviewed ? "unknown" : "later",
-            note: applied || !status.reviewed ? undefined : "The plan status does not record apply.",
+            // A product-bound plan is applied in a terminal, never here.
+            note: productBound
+              ? "Apply this plan in a terminal."
+              : applied || !status.reviewed
+                ? undefined
+                : "The plan status does not record apply.",
           },
         ]}
       />

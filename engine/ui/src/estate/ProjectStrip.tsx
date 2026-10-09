@@ -1,6 +1,6 @@
 import type { ProjectOutput } from "@rocky-types/project";
 import type { ReactNode } from "react";
-import { Clip, ToneDot, type Tone } from "../components";
+import { Clip, ToneDot, runStatusTone, type Tone } from "../components";
 import { formatInstant, orNotRecorded } from "../format";
 
 /**
@@ -33,7 +33,9 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
     // One strip, not five cards: the project is one thing, and five boxes of
     // equal weight read as five things to check. A cell keeps the card's
     // label, value, sub-line and tone dot, so no fact is lost.
-    <dl className="grid overflow-hidden rounded-lg border border-zinc-200 bg-white sm:grid-cols-2 lg:grid-cols-5 dark:border-zinc-800 dark:bg-zinc-900">
+    // The 1px gap over a border-coloured ground draws the lines between
+    // cells, so no cell sets its own border and none doubles the frame's.
+    <dl className="grid gap-px overflow-hidden rounded-lg border border-zinc-200 bg-zinc-200 sm:grid-cols-2 lg:grid-cols-5 dark:border-zinc-800 dark:bg-zinc-800">
       <Cell
         label="project"
         value={project.name}
@@ -59,7 +61,7 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
       <Cell
         label="newest run"
         value={project.last_run ? <Clip value={project.last_run.run_id} keepEnds /> : orNotRecorded(null)}
-        tone={project.last_run ? runTone(project.last_run.status) : "pending"}
+        tone={project.last_run ? runStatusTone(project.last_run.status) : "pending"}
         sub={
           project.last_run
             ? `${project.last_run.status} · ${project.last_run.trigger} · ${project.last_run.models_executed} model(s) · ${formatInstant(project.last_run.started_at, now)}`
@@ -68,14 +70,6 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
       />
     </dl>
   );
-}
-
-/** A run's status as a tone: green only for a success the engine named. */
-function runTone(status: string): Tone {
-  const lower = status.toLowerCase();
-  if (lower === "success") return "ok";
-  if (lower.includes("fail")) return "risk";
-  return "warn";
 }
 
 /** One fact of the strip. Every value is text. */
@@ -93,14 +87,18 @@ function Cell({
   return (
     <div
       data-tone={tone}
-      className="min-w-0 border-zinc-200 p-4 not-last:border-b sm:not-last:border-r lg:not-last:border-b-0 dark:border-zinc-800"
+      className="min-w-0 bg-white p-4 dark:bg-zinc-900"
     >
       <dt className="flex items-center gap-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">
         <ToneDot tone={tone} />
         <span className="inline-block first-letter:uppercase">{label}</span>
       </dt>
-      <dd className="mt-1 truncate text-sm font-semibold text-zinc-900 dark:text-zinc-100">{value}</dd>
-      <dd className="mt-1 text-xs break-words text-zinc-600 dark:text-zinc-400">{sub}</dd>
+      {/* One definition per term: the sub-line belongs to the value, and a
+          second <dd> is announced as an unlabelled definition of its own. */}
+      <dd className="mt-1">
+        <span className="block text-sm font-semibold break-words text-zinc-900 dark:text-zinc-100">{value}</span>
+        <span className="mt-1 block text-xs break-words text-zinc-600 dark:text-zinc-400">{sub}</span>
+      </dd>
     </div>
   );
 }

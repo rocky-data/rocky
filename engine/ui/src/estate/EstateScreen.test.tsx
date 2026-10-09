@@ -665,6 +665,24 @@ describe("ProjectStrip", () => {
     expect(screen.queryByText("0 diagnostics, 0 warnings")).toBeNull();
   });
 
+  it("tones the newest run the way the runs table does", async () => {
+    render(
+      <EstateScreen
+        loaders={loaders({
+          project: async () => ({
+            ...project,
+            last_run: { ...project.last_run!, status: "PartialFailure" },
+          }),
+        })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    const label = await screen.findByText("newest run");
+    // Amber, as in the table: a partial failure is not a failed run.
+    expect(label.closest("[data-tone]")).toHaveAttribute("data-tone", "warn");
+  });
+
   it("says when no run was recorded", async () => {
     render(
       <EstateScreen

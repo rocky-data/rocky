@@ -85,7 +85,7 @@ The first card, which gives the area its name, is what needs you. Each pending p
 
 ![The brief: one pending plan under Needs you, ten agent decisions with their capability, effect and rule, two successful runs, no degraded autonomy, and a cost card](/ui-governor-brief.png)
 
-A card says so when its data was not available. A signal the ledger does not hold shows as **not recorded**, never as a zero. The summary line leaves out a part it could not read; it never counts it as zero.
+A card says so when its data was not available. A signal the ledger does not hold shows as **not recorded**, never as a zero. In the summary line, a part with nothing in the window says so in its own words, such as "no runs in the window". A part the engine could not read says **not recorded**, never zero.
 
 ## Estate
 
@@ -155,7 +155,7 @@ The audit tab is the whole policy decision ledger, oldest first. Filter it to on
 
 ## Areas without a screen
 
-Six of the eleven areas open nothing today. The sidebar folds them under **Coming later**, so the five areas that work come first. Open it to see each name with the reason under it, as plain text. A reason says where the same information is now, when it is somewhere:
+Six of the eleven areas open nothing today. The sidebar folds them under **Coming later**, so the five areas that work come first. Open it to see each name with the reason under it, as plain text. A reason says where the same information is now, when it is somewhere. The reasons stay hidden until you open the fold:
 
 | Area | What the sidebar says |
 |---|---|
