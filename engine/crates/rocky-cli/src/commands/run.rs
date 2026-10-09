@@ -15829,8 +15829,9 @@ async fn execute_time_interval_model(
     // Default selection: --latest. Matches the plan: "Default behavior when
     // running a time_interval model with no flags: --latest, with lookback
     // from the TOML applied."
-    let selection = partition_opts
-        .to_selection()
+    let explicit_selection = partition_opts.to_selection();
+    let selection = explicit_selection
+        .clone()
         .unwrap_or(PartitionSelection::Latest);
 
     // plan_partitions needs a state-store reference for --missing discovery.
@@ -15850,8 +15851,38 @@ async fn execute_time_interval_model(
         &local_state
     };
 
-    let plans = plan_partitions(model, &selection, partition_opts.lookback, state_ref)
-        .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
+    // With no partition flag, the first run of a model that sets
+    // `first_partition` fills from there up to now, as a dbt microbatch model
+    // fills from `begin`. A later run builds the latest partition.
+    let first_fill = if explicit_selection.is_none() && partition_opts.lookback.is_none() {
+        rocky_core::plan_partition::plan_first_run_fill(model, state_ref)
+            .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?
+    } else {
+        rocky_core::plan_partition::FirstRunFill::NotApplicable
+    };
+    let plans = match first_fill {
+        rocky_core::plan_partition::FirstRunFill::Fill(plans) => {
+            info!(
+                model = model_name,
+                partitions = plans.len(),
+                "first run: filling from first_partition"
+            );
+            plans
+        }
+        other => {
+            if let rocky_core::plan_partition::FirstRunFill::TooMany { partitions } = other {
+                warn!(
+                    model = model_name,
+                    partitions,
+                    limit = rocky_core::plan_partition::FIRST_RUN_FILL_LIMIT,
+                    "first_partition is more than the first-run limit back; building only the \
+                     latest partition. Pass --missing, or --from and --to, to fill the history"
+                );
+            }
+            plan_partitions(model, &selection, partition_opts.lookback, state_ref)
+                .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?
+        }
+    };
 
     info!(
         model = model_name,
@@ -28651,6 +28682,106 @@ table = "fct_daily"
         assert!(!replanned.contains(&&first));
         assert!(!replanned.contains(&&middle));
         assert!(!replanned.contains(&&last));
+    }
+
+    /// With no partition flag, the first run of a model that sets
+    /// `first_partition` fills from there; the next run builds only the latest.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn first_time_interval_run_fills_from_first_partition() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let today = Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().pred_opt().unwrap().to_string();
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let no_flags = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+
+        let mut first_run = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "first-run",
+            &mut first_run,
+            &exec_ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_run.partition_summaries[0].partitions_planned, 3);
+        assert_eq!(state.list_partitions("fct_daily_orders").unwrap().len(), 3);
+
+        let mut second_run = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &no_flags,
+            "second-run",
+            &mut second_run,
+            &exec_ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second_run.partition_summaries[0].partitions_planned, 1,
+            "a later run builds only the latest partition"
+        );
     }
 
     /// Inverse-design property: a *transient* target-probe failure must not be

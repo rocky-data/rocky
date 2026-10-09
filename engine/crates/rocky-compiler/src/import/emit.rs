@@ -259,6 +259,7 @@ fn clone_model(m: &ImportedModel) -> ImportedModel {
         sql: m.sql.clone(),
         config: m.config.clone(),
         unit_tests: m.unit_tests.clone(),
+        contract_toml: m.contract_toml.clone(),
     }
 }
 
@@ -328,6 +329,11 @@ fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), Str
     }
     std::fs::write(&toml_path, toml_body)
         .map_err(|e| format!("failed to write {}: {e}", toml_path.display()))?;
+    if let Some(contract) = &model.contract_toml {
+        let contract_path = models_dir.join(format!("{}.contract.toml", model.name));
+        std::fs::write(&contract_path, contract)
+            .map_err(|e| format!("failed to write {}: {e}", contract_path.display()))?;
+    }
     Ok(())
 }
 
@@ -1086,7 +1092,7 @@ fn write_structured_warnings(
                     ..
                 } => {
                     out.push_str(&format!(
-                        "- **Dropped enforced contract** ({typed_columns} typed column(s), {constraints} constraint(s)) — Rocky enforces contracts via `{contract_path}`, which the importer does not auto-generate. Author it to re-establish the contract.\n"
+                        "- **Partly imported enforced contract** — `{contract_path}` was generated, but {typed_columns} column type(s) have no Rocky type name and {constraints} constraint(s) (`unique`, `check`, ...) are not checked. Review the file.\n"
                     ));
                 }
             }
@@ -1295,6 +1301,7 @@ mod tests {
             name: name.to_string(),
             sql: sql.to_string(),
             unit_tests: vec![],
+            contract_toml: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],

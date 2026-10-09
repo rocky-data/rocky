@@ -175,6 +175,54 @@ pub fn plan_partitions(
     Ok(plans)
 }
 
+/// The most partitions a first run fills on its own (see
+/// [`plan_first_run_fill`]).
+pub const FIRST_RUN_FILL_LIMIT: usize = 1000;
+
+/// What a `time_interval` model does on a run that names no partition flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstRunFill {
+    /// Not a first run, or no `first_partition`: build the latest partition.
+    NotApplicable,
+    /// First run: build every partition from `first_partition` up to now.
+    Fill(Vec<PartitionPlan>),
+    /// First run, but `first_partition` is more than
+    /// [`FIRST_RUN_FILL_LIMIT`] partitions back. Nothing is filled; the
+    /// caller builds the latest partition and tells the user to pass
+    /// `--missing` or `--from`/`--to`.
+    TooMany { partitions: usize },
+}
+
+/// Plan the first run of a `time_interval` model.
+///
+/// A model with a `first_partition` and no partition recorded in the state
+/// store has never run. Like a dbt microbatch model, its first run fills from
+/// the start (`first_partition`) rather than building only the latest
+/// partition. The fill adds no `lookback` partitions before `first_partition`.
+/// It is bounded by [`FIRST_RUN_FILL_LIMIT`] so a distant `first_partition`
+/// on an hourly model cannot start a huge backfill by accident.
+///
+/// Every later run finds recorded partitions and returns
+/// [`FirstRunFill::NotApplicable`].
+pub fn plan_first_run_fill(model: &Model, state: &StateStore) -> Result<FirstRunFill, PlanError> {
+    let StrategyConfig::TimeInterval {
+        first_partition: Some(_),
+        ..
+    } = &model.config.strategy
+    else {
+        return Ok(FirstRunFill::NotApplicable);
+    };
+    if !state.list_partitions(&model.config.name)?.is_empty() {
+        return Ok(FirstRunFill::NotApplicable);
+    }
+    let plans = plan_partitions(model, &PartitionSelection::Missing, Some(0), state)?;
+    let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+    if partitions > FIRST_RUN_FILL_LIMIT {
+        return Ok(FirstRunFill::TooMany { partitions });
+    }
+    Ok(FirstRunFill::Fill(plans))
+}
+
 /// Resolve a `PartitionSelection` to a Vec of canonical partition keys,
 /// validated against the grain.
 fn resolve_selection(
@@ -509,6 +557,73 @@ mod tests {
         assert_eq!(plans.len(), 1);
         // Key format must match the grain.
         assert_eq!(plans[0].partition_key.len(), "YYYY-MM-DD".len());
+    }
+
+    fn recorded(
+        model: &str,
+        key: &str,
+        status: PartitionStatus,
+    ) -> crate::incremental::PartitionRecord {
+        crate::incremental::PartitionRecord {
+            model_name: model.into(),
+            partition_key: key.into(),
+            status,
+            computed_at: chrono::Utc::now(),
+            row_count: 0,
+            duration_ms: 0,
+            run_id: "test".into(),
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn first_run_fills_from_first_partition_without_lookback() {
+        let model = make_model("m", TimeGrain::Day, 3, 1, Some("2026-04-01"));
+        let (state, _dir) = temp_state();
+        let FirstRunFill::Fill(plans) = plan_first_run_fill(&model, &state).unwrap() else {
+            panic!("a never-run model with a first_partition must fill");
+        };
+        assert_eq!(
+            plans[0].partition_key, "2026-04-01",
+            "no lookback before the start"
+        );
+        let today = TimeGrain::Day.format_key(TimeGrain::Day.truncate(chrono::Utc::now()));
+        assert_eq!(plans.last().unwrap().partition_key, today);
+    }
+
+    #[test]
+    fn first_run_fill_applies_only_when_nothing_is_recorded() {
+        let model = make_model("m", TimeGrain::Day, 0, 1, Some("2026-04-01"));
+        let (state, _dir) = temp_state();
+        state
+            .record_partition(&recorded("m", "2026-04-02", PartitionStatus::Failed))
+            .unwrap();
+        assert_eq!(
+            plan_first_run_fill(&model, &state).unwrap(),
+            FirstRunFill::NotApplicable,
+            "a recorded partition, even a failed one, means the model has run"
+        );
+    }
+
+    #[test]
+    fn first_run_fill_needs_a_first_partition() {
+        let model = make_model("m", TimeGrain::Day, 0, 1, None);
+        let (state, _dir) = temp_state();
+        assert_eq!(
+            plan_first_run_fill(&model, &state).unwrap(),
+            FirstRunFill::NotApplicable
+        );
+    }
+
+    #[test]
+    fn first_run_fill_is_bounded() {
+        let model = make_model("m", TimeGrain::Hour, 0, 1, Some("2020-01-01T00"));
+        let (state, _dir) = temp_state();
+        let FirstRunFill::TooMany { partitions } = plan_first_run_fill(&model, &state).unwrap()
+        else {
+            panic!("an hourly model six years back is over the limit");
+        };
+        assert!(partitions > FIRST_RUN_FILL_LIMIT);
     }
 
     #[test]

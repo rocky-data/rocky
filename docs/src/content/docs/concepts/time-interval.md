@@ -52,7 +52,7 @@ table = "fct_daily_orders"
 | `granularity` | enum | required | One of `hour`, `day`, `month`, `year`. Determines the canonical partition key format. |
 | `lookback` | u32 | `0` | Recompute the previous N partitions on each run, in addition to whichever partitions the CLI selected. The standard pattern for late-arriving data without re-running the whole table. |
 | `batch_size` | NonZeroU32 | `1` | Combine N consecutive partitions into a single SQL statement when backfilling. `1` is atomic per partition (recommended). `>1` trades atomicity for backfill throughput. |
-| `first_partition` | string | none | Lower bound for `--missing` discovery, in canonical key format (e.g. `"2024-01-01"` for daily). Required when using `--missing`; otherwise optional. |
+| `first_partition` | string | none | Lower bound for `--missing` discovery and for the first-run fill, in canonical key format (e.g. `"2024-01-01"` for daily). Required when using `--missing`; otherwise optional. |
 
 ## SQL placeholders
 
@@ -169,10 +169,16 @@ enforces it):
 |---|---|
 | `--partition KEY` | Run exactly one partition by canonical key. Errors if the format doesn't match the model's grain. |
 | `--from FROM --to TO` | Run a closed inclusive range. Both bounds must align to the grain. |
-| `--latest` | Run the partition containing `now()` (UTC). Default for `time_interval` models when no other selection flag is given. |
+| `--latest` | Run the partition containing `now()` (UTC). Default for `time_interval` models when no other selection flag is given, except on the first run (see below). |
 | `--missing` | Compute the diff between expected partitions (`first_partition` → `now()`) and what's recorded as `Computed` in the `PARTITIONS` state-store table; run only the gaps. Errors if `first_partition` is unset. |
 | `--lookback N` | Recompute the previous N partitions in addition to the selected ones. CLI override beats the model's TOML `lookback`. |
 | `--parallel N` | Run N partitions concurrently (default 4; pass `--parallel 1` for serial). Driven by `futures::stream::buffer_unordered` so the per-partition futures are polled in the same task — no spawn, no `Send` constraint. Warehouse-query parallelism only: state writes serialize through redb's single-writer lock. **Caveat:** DuckDB's adapter holds a connection mutex and runs `execute_statement` synchronously, so partitions always run serially against DuckDB regardless of `--parallel`. Snowflake and Databricks (REST-based async I/O) parallelize up to N as expected. |
+
+### The first run
+
+A model that sets `first_partition` and has no recorded partition has never run. With no selection flag, its first run fills every partition from `first_partition` up to now, as if you had passed `--missing`. A dbt microbatch model fills from `begin` the same way. The fill adds no `lookback` partitions before `first_partition`.
+
+The fill has a limit of 1000 partitions. If `first_partition` is further back than that (an hourly model that starts years ago), the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. Every later run, with at least one partition recorded, builds the latest partition as before. A model with no `first_partition` always builds the latest partition.
 
 ```bash
 # Run today's partition

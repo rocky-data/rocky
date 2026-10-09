@@ -173,7 +173,7 @@ Listed in every emitted `MIGRATION-NOTES.md`:
 
 - Singular dbt tests (custom SQL files in `tests/`): not translated.
 - Macros and `dbt_packages/`: skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
-- dbt model contracts (`contract: {enforced}`, column `data_type`, `constraints`): not carried over to Rocky's contract model. Each is reported with a warning and counted in `contracts_dropped` (JSON output and `MIGRATION-NOTES.md`) so you know which models had a contract to re-author by hand.
+- dbt model contracts (`contract: {enforced}`): written to `<model>.contract.toml` next to the model. Column types and `not_null` / `primary_key` constraints carry over. A column type Rocky has no name for, and the `unique`, `check`, `foreign_key` and `custom` constraints, do not. A model with such a part is reported with a warning and counted in `contracts_dropped` (JSON output and `MIGRATION-NOTES.md`).
 
 The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[tests]]` on the matching per-model sidecar, as do several common `dbt_utils` / `dbt_expectations` tests. Tests with no native equivalent, or that reference columns Rocky didn't translate, are surfaced as `UnsupportedTest` warnings and listed in `MIGRATION-NOTES.md` rather than silently dropped. See the full [generic test mapping](/guides/migrate-from-dbt/#generic-test-mapping).
 

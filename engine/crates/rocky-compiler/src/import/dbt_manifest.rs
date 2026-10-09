@@ -55,7 +55,68 @@ pub struct DbtDroppedCounts {
     pub snapshots: usize,
     pub metrics: usize,
     pub semantic_models: usize,
-    pub exposures: usize,
+    /// dbt exposures (downstream consumers). Rocky has no equivalent, so
+    /// each is listed in the migration notes.
+    pub exposures: Vec<DbtExposure>,
+}
+
+/// A dbt exposure: a downstream consumer of models (a dashboard, an
+/// application, an ML job).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbtExposure {
+    pub name: String,
+    /// Owner name and/or email, as dbt wrote them.
+    pub owner: Option<String>,
+    /// Names of the models and sources the exposure reads.
+    pub depends_on: Vec<String>,
+}
+
+/// Read the exposures from the manifest's raw JSON, sorted by name.
+fn collect_exposures(raw: &HashMap<String, serde_json::Value>) -> Vec<DbtExposure> {
+    let text = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut exposures: Vec<DbtExposure> = raw
+        .iter()
+        .map(|(id, value)| {
+            let owner = value.get("owner").and_then(|o| {
+                let parts: Vec<String> = ["name", "email"]
+                    .iter()
+                    .filter_map(|key| text(o, key))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
+            });
+            let mut depends_on: Vec<String> = value
+                .pointer("/depends_on/nodes")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                // `model.<project>.<name>` -> `<name>`; sources keep their
+                // `source.<project>.<source>.<table>` tail.
+                .map(|node| match node.split_once('.') {
+                    Some(("model" | "snapshot" | "seed", rest)) => {
+                        rest.split_once('.').map_or(rest, |(_, name)| name)
+                    }
+                    Some(("source", rest)) => rest.split_once('.').map_or(rest, |(_, name)| name),
+                    _ => node,
+                })
+                .map(str::to_string)
+                .collect();
+            depends_on.sort();
+            DbtExposure {
+                name: text(value, "name").unwrap_or_else(|| id.clone()),
+                owner,
+                depends_on,
+            }
+        })
+        .collect();
+    exposures.sort_by(|a, b| a.name.cmp(&b.name));
+    exposures
 }
 
 /// Manifest-level metadata.
@@ -343,7 +404,7 @@ struct RawRunArgs {
 fn full_refresh_compile_evidence(
     manifest_path: &Path,
     invocation_id: Option<&str>,
-) -> Option<HashSet<String>> {
+) -> Option<FullRefreshEvidence> {
     let invocation_id = invocation_id.filter(|id| !id.is_empty())?;
     let Ok(file) = std::fs::File::open(manifest_path.with_file_name("run_results.json")) else {
         return None;
@@ -356,14 +417,25 @@ fn full_refresh_compile_evidence(
     {
         return None;
     }
-    Some(
-        results
+    Some(FullRefreshEvidence {
+        no_per_model_results: results.results.is_empty(),
+        succeeded: results
             .results
             .into_iter()
             .filter(|result| result.status == "success")
             .map(|result| result.unique_id)
             .collect(),
-    )
+    })
+}
+
+/// What a matching full-refresh `run_results.json` proves.
+struct FullRefreshEvidence {
+    /// Model IDs with a `success` result.
+    succeeded: HashSet<String>,
+    /// The file lists no results at all. dbt 2 writes `results: []` for
+    /// `dbt compile`; the manifest's `compiled_code` is then the only
+    /// per-model evidence, and a model dbt could not compile has none.
+    no_per_model_results: bool,
 }
 
 #[derive(Deserialize)]
@@ -543,7 +615,20 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
 
     let evidence = full_refresh_compile_evidence(path, raw.metadata.invocation_id.as_deref());
     let full_refresh_compiled = evidence.is_some();
-    let successfully_compiled_nodes = evidence.unwrap_or_default();
+    let successfully_compiled_nodes = match evidence {
+        Some(e) if e.no_per_model_results => raw
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                n.compiled_code
+                    .as_deref()
+                    .is_some_and(|code| !code.trim().is_empty())
+            })
+            .map(|(id, _)| id.clone())
+            .collect(),
+        Some(e) => e.succeeded,
+        None => HashSet::new(),
+    };
 
     let metadata = DbtManifestMetadata {
         dbt_schema_version: raw.metadata.dbt_schema_version.unwrap_or_default(),
@@ -558,7 +643,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         snapshots: 0,
         metrics: raw.metrics.len(),
         semantic_models: raw.semantic_models.len(),
-        exposures: raw.exposures.len(),
+        exposures: collect_exposures(&raw.exposures),
     };
 
     let nodes = raw
