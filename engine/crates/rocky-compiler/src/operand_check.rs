@@ -43,7 +43,9 @@
 //!   (`10::BIGINT = '10'::VARCHAR`), and any string literal compared with a
 //!   date or timestamp (`order_date >= '2024-01-01'`).
 //! - `DATE` vs `TIMESTAMP`, numeric vs numeric, and every pair this table
-//!   does not name (for example numeric vs temporal, boolean vs anything).
+//!   does not name (for example boolean vs anything).
+//! - Date arithmetic: `order_date >= CURRENT_DATE - 5` and `last - first > 5`
+//!   type their arithmetic side `Unknown`, never a date or a number.
 //! - `MIN` / `MAX` / `COUNT` / `ARRAY_AGG` over any type, `COUNT(*)`,
 //!   `COUNT(DISTINCT x)`, and an aggregate whose argument is a literal.
 //!
@@ -57,6 +59,11 @@
 //!   side per row (verified against DuckDB 1.5: `Conversion Error: Could not
 //!   convert string 'bob' to INT64`). `sum(VARCHAR)`, `stddev(VARCHAR)`,
 //!   `bool_and(VARCHAR)` fail with `Binder Error: No function matches`.
+//!   A `DATE` or `TIMESTAMP` against a number has no comparison (verified
+//!   against DuckDB 1.5: `order_date > 5` fails with `Binder Error: Cannot
+//!   compare values of type DATE and type INTEGER_LITERAL`; `order_date = 5`
+//!   binds but fails on the first row with `Conversion Error: Unimplemented
+//!   type for cast (INTEGER -> DATE)`).
 //! - Snowflake — <https://docs.snowflake.com/en/sql-reference/data-type-conversion>
 //!   (`VARCHAR` is implicitly coerced to `NUMBER`, `DATE`, `TIMESTAMP` and
 //!   `BOOLEAN`; failure is a run-time conversion error).
@@ -68,9 +75,10 @@
 //!   <https://cloud.google.com/bigquery/docs/reference/standard-sql/conversion_rules>
 //!   (no implicit `STRING` → `INT64` / `FLOAT64` / `NUMERIC` coercion outside
 //!   literals and parameters; `SUM(STRING)` and `INT64 = STRING` are
-//!   signature errors).
+//!   signature errors; `DATE` vs `INT64` has no comparison signature).
 //! - Trino — <https://trino.io/docs/current/functions/conversion.html>
-//!   ("Trino will not convert between character and numeric types").
+//!   ("Trino will not convert between character and numeric types"; there
+//!   is no implicit cast between a number and `DATE` / `TIMESTAMP` either).
 //! - SQL Server —
 //!   <https://learn.microsoft.com/sql/t-sql/data-types/data-type-conversion-database-engine>
 //!   (character types convert implicitly to the numeric and date/time types;
@@ -89,8 +97,8 @@
 //!   `bool_and` / `bool_or` take `boolean`, `string_agg` takes `text` or
 //!   `bytea`). Verified against PostgreSQL 16: `sum(text)`, `bool_and(text)`
 //!   and `string_agg(integer, unknown)` fail with "function … does not
-//!   exist"; `integer = text` and `date = text` fail with "operator does not
-//!   exist".
+//!   exist"; `integer = text`, `date = text` and `date > integer` fail with
+//!   "operator does not exist".
 //! - Amazon Redshift —
 //!   <https://docs.aws.amazon.com/redshift/latest/dg/r_SUM.html>,
 //!   <https://docs.aws.amazon.com/redshift/latest/dg/r_AVG.html>,
@@ -315,6 +323,15 @@ fn comparison_verdict(dialect: OperandDialect, a: &Operand<'_>, b: &Operand<'_>)
                 }
                 BigQuery | Postgres => Verdict::Refused,
             },
+        },
+        // `order_date > 5`: a date or timestamp against a number, column or
+        // literal. DuckDB, PostgreSQL, BigQuery and Trino have no such
+        // comparison. The other dialects are not verified here, so the pair
+        // is only a warning there; it is never clean, because no dialect is
+        // known to accept it.
+        (Some(Family::Temporal), Some(Family::Numeric)) => match dialect {
+            DuckDb | Postgres | BigQuery | Trino => Verdict::Refused,
+            Snowflake | Databricks | SqlServer | Redshift => Verdict::ValueDependent,
         },
         _ => Verdict::Clean,
     }
@@ -855,6 +872,36 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
         return;
     }
 
+    let pair = format!("`{left}` ({left_ty}) vs `{right}` ({right_ty})");
+    let refused = verdict == Verdict::Refused;
+    if l.family != Some(Family::Text) && r.family != Some(Family::Text) {
+        // A date or timestamp against a number (the only other ruled pair).
+        let message = match (dialect, refused) {
+            (Some(d), true) => format!(
+                "comparison of incompatible types: {pair}. {} cannot compare a date or \
+                 timestamp with a number and does not cast either side, so the query never runs",
+                d.name()
+            ),
+            (Some(d), false) => format!(
+                "comparison of a date or timestamp with a number: {pair}. Rocky has no rule \
+                 for this pair on {}; DuckDB, PostgreSQL, BigQuery and Trino refuse it",
+                d.name()
+            ),
+            (None, _) => format!(
+                "comparison of a date or timestamp with a number: {pair}. {}: {} refuse this \
+                 outright",
+                no_dialect_clause(&ctx.target),
+                dialects_with(judge, Verdict::Refused),
+            ),
+        };
+        let suggestion = "compare with a date or timestamp value (e.g. `DATE '2024-01-01'` or \
+                          `CURRENT_DATE - INTERVAL 5 DAY`), or check that the intended column \
+                          is used"
+            .to_string();
+        ctx.emit(refused, W043, E043, at, message, suggestion);
+        return;
+    }
+
     let (text_side, other_ty) = if l.family == Some(Family::Text) {
         (left, &right_ty)
     } else {
@@ -865,8 +912,6 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
     } else {
         "a number"
     };
-    let pair = format!("`{left}` ({left_ty}) vs `{right}` ({right_ty})");
-    let refused = verdict == Verdict::Refused;
     let message = match (dialect, refused) {
         (Some(d), true) => format!(
             "comparison of incompatible types: {pair}. {} has no comparison between these types \
@@ -1168,6 +1213,67 @@ mod tests {
             codes(&run(&[("m", sql)], Some(OperandDialect::BigQuery))),
             vec!["E043"]
         );
+    }
+
+    #[test]
+    fn date_vs_number_is_refused_where_no_comparison_exists() {
+        for sql in [
+            "SELECT order_id FROM raw.orders WHERE order_date > 5",
+            "SELECT order_id FROM raw.orders WHERE 5 <= order_date",
+            "SELECT order_id FROM raw.orders WHERE order_date = customer_id",
+            "SELECT order_id FROM raw.orders WHERE order_date BETWEEN 1 AND 5",
+            "SELECT c.customer_id FROM raw.customers c WHERE c.signed_up_at >= 20240101",
+        ] {
+            for (dialect, code) in [
+                (Some(OperandDialect::DuckDb), "E043"),
+                (Some(OperandDialect::Postgres), "E043"),
+                (Some(OperandDialect::BigQuery), "E043"),
+                (Some(OperandDialect::Trino), "E043"),
+                (Some(OperandDialect::Snowflake), "W043"),
+                (Some(OperandDialect::Databricks), "W043"),
+                (Some(OperandDialect::SqlServer), "W043"),
+                (Some(OperandDialect::Redshift), "W043"),
+                (None, "W043"),
+            ] {
+                let diags = run(&[("m", sql)], dialect);
+                assert!(
+                    !diags.is_empty() && codes(&diags).iter().all(|c| *c == code),
+                    "{dialect:?} `{sql}`: {diags:?}"
+                );
+            }
+        }
+        let diags = run(
+            &[(
+                "m",
+                "SELECT order_id FROM raw.orders WHERE order_date > 5",
+            )],
+            Some(OperandDialect::DuckDb),
+        );
+        assert!(diags[0].message.contains("order_date"), "{diags:?}");
+        assert!(diags[0].message.contains("DuckDB"), "{diags:?}");
+        assert!(
+            !diags[0].suggestion.as_deref().unwrap().contains("TRY_CAST"),
+            "a number does not cast to a date: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn date_arithmetic_and_date_literals_stay_clean() {
+        for sql in [
+            "SELECT order_id FROM raw.orders WHERE order_date >= CURRENT_DATE - 5",
+            "SELECT order_id FROM raw.orders WHERE order_date - order_date > 5",
+            "SELECT order_id FROM raw.orders WHERE order_date + 1 > order_date",
+            "SELECT order_id FROM raw.orders WHERE order_date >= DATE '2024-01-01'",
+            "SELECT order_id FROM raw.orders WHERE order_date >= '2024-01-01'",
+            "SELECT order_id FROM raw.orders WHERE YEAR(order_date) = 2024",
+            "SELECT order_id FROM raw.orders WHERE missing_col + 1 > order_date",
+            "SELECT order_id FROM raw.orders WHERE order_date IS NOT NULL AND order_id >= '1'",
+        ] {
+            for dialect in OperandDialect::ALL.map(Some).into_iter().chain([None]) {
+                let diags = run(&[("m", sql)], dialect);
+                assert!(diags.is_empty(), "{dialect:?} `{sql}`: {diags:?}");
+            }
+        }
     }
 
     #[test]

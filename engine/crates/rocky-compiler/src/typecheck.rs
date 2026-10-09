@@ -2836,6 +2836,19 @@ fn infer_binary_op_type(
         // Boolean logic
         ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
 
+        // Date arithmetic is dialect-dependent: `DATE - DATE` is a BIGINT in
+        // DuckDB, an INTERVAL in Databricks, and `DATE - 5` is a DATE in
+        // DuckDB. `common_supertype` would call `DATE - DATE` a DATE.
+        // An `Unknown` operand may be a date too, so the result is unknown
+        // (`common_supertype` would take the other side's type).
+        ast::BinaryOperator::Plus | ast::BinaryOperator::Minus
+            if left_type.is_temporal()
+                || right_type.is_temporal()
+                || left_type == RockyType::Unknown
+                || right_type == RockyType::Unknown =>
+        {
+            (RockyType::Unknown, nullable)
+        }
         // Arithmetic → numeric promotion
         ast::BinaryOperator::Plus | ast::BinaryOperator::Minus | ast::BinaryOperator::Multiply => {
             let result_type = crate::types::common_supertype(&left_type, &right_type)
