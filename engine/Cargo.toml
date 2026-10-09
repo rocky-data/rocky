@@ -297,6 +297,16 @@ prost = "0.14"
 # prost majors exactly.
 googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34"
 
+# Debug builds keep line tables for Rocky's own crates, so panic backtraces
+# still name the file and line, and drop debug info for dependencies. Full
+# debug info made each test binary several hundred MB, one per integration
+# test file. CI already builds with `line-tables-only` (engine-ci.yml).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 # LTO disabled: rustc 1.95 emits LLVM-22 bitcode (e.g. via the
