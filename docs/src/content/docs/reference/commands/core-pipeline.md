@@ -611,8 +611,8 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, `--contracts`, or `--resume`. |
-| `--contracts <PATH>` | `PathBuf` | | Check the selected model against its contract in this directory during the run's own compile. Requires `--model` and `--pipeline`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, or `--resume`. |
+| `--contracts <PATH>` | `PathBuf` | | Contracts directory for this run. Default: the project `contracts/` directory. With `--model` and `--pipeline`, the selected model must have a contract there. Not with `--watch`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
@@ -667,9 +667,23 @@ that run if the old flush is uncertain. See
 [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
 for recovery routes, supported adapters and remote durability limits.
 
+### Contracts on every run
+
+Every `rocky run` reads the project `contracts/` directory, with no flag. That is the `contracts/` directory beside the models directory, usually next to `rocky.toml`. `rocky compile`, `rocky ci` and `rocky test` read the same directory.
+
+The run checks each contract in the compile that supplies the model SQL. This applies to `--dag`, `--pipeline`, `--all`, `--select` and `--model`. When a model has a contract error (`E010` to `E013`):
+
+- Rocky does not write that model. Its existing table stays.
+- Rocky does not run the models downstream of it.
+- The run exits non-zero. Under `--dag`, the failed node's `error` names the code, for example `first error: fct_orders: [E012] ...`.
+
+A contract can declare a column type that Rocky cannot infer from the SQL alone, because the source table has no known schema. The compile reports that as `I003`. The run then reads that source's columns from the warehouse and compiles again, so it checks the type before it writes. If the warehouse cannot describe the source, the type stays unchecked.
+
+`--contracts <DIR>` replaces the project directory for one run. A contract in the project directory for a model that the compile does not include is skipped, because one directory serves every pipeline. A contract in an explicit `--contracts` directory for an unknown model is still the `W011` warning.
+
 ### Guard one model with a contract
 
-Use `--contracts` when you build one `full_refresh` transformation model:
+Use `--contracts` with `--model` and `--pipeline` when you build one `full_refresh` transformation model and want the run to require its contract:
 
 ```bash
 rocky run --pipeline transform --model int_order_lines --contracts contracts -o json
@@ -677,7 +691,7 @@ rocky run --pipeline transform --model int_order_lines --contracts contracts -o 
 
 The directory must exist and contain `int_order_lines.contract.toml`. Rocky checks that contract in the compile that supplies the model SQL for this run. An error such as `E010` fails the run before Rocky replaces the selected table. The failure JSON includes the compile error and has no materialization for that model.
 
-This first route does not cover a whole pipeline, `--dag`, `--all`, `rocky apply`, a branch, or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
+This guard does not cover a branch or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
 
 ### Pipeline Stages
 

@@ -481,6 +481,41 @@ impl std::fmt::Display for PartialFailure {
 
 impl std::error::Error for PartialFailure {}
 
+/// How an explicit `rocky run --contracts <DIR>` applies to a run.
+///
+/// Without the flag every compile reads the project `contracts/` directory
+/// (see `rocky_compiler::contracts::project_contracts_dir_for`), and a model
+/// with a contract error is not written on any run path.
+#[derive(Debug, Clone, Copy)]
+pub enum RunContracts<'a> {
+    /// `--contracts` with `--model` and `--pipeline` outside `--dag`: the
+    /// selected model must have a contract in the directory, and the run is
+    /// limited to a fresh `full_refresh` rebuild of that one model.
+    SelectedModelGuard(&'a Path),
+    /// `--contracts` on any other run shape: the directory replaces the
+    /// project `contracts/` directory for every compile of this run.
+    Directory(&'a Path),
+}
+
+impl<'a> RunContracts<'a> {
+    /// The contracts directory.
+    #[must_use]
+    pub fn dir(self) -> &'a Path {
+        match self {
+            Self::SelectedModelGuard(dir) | Self::Directory(dir) => dir,
+        }
+    }
+
+    /// Whether this is the selected-model guard.
+    #[must_use]
+    pub fn is_guard(self) -> bool {
+        match self {
+            Self::SelectedModelGuard(_) => true,
+            Self::Directory(_) => false,
+        }
+    }
+}
+
 /// Sentinel error signalling that `rocky run` completed its terminal state
 /// writes with no successful materialization (`RunStatus::Failure`). The
 /// message keeps the generic exit-1 contract (no `main.rs` mapping); the
@@ -490,10 +525,17 @@ impl std::error::Error for PartialFailure {}
 /// ride the terminal upload via `finalize` — from a pre-terminal hard error,
 /// which must abandon the session without uploading.
 #[derive(Debug, thiserror::Error)]
-#[error("{count} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)")]
+#[error(
+    "{count} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output){}",
+    first_error.as_deref().map(|e| format!("; first error: {e}")).unwrap_or_default()
+)]
 pub struct RunFailed {
     pub count: usize,
     pub run_id: String,
+    /// The first recorded error, as `<model>: <error>`. A `rocky run --dag`
+    /// node prints only this message, not the sub-run's JSON, so this is
+    /// where its diagnostic code (for example `E012`) reaches the operator.
+    pub first_error: Option<String>,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; the exit code is 1 either way.
     pub custody: RecordCustody,
@@ -682,6 +724,10 @@ pub(crate) fn run_status_exit_result(
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            first_error: output
+                .errors
+                .first()
+                .map(|e| format!("{}: {}", e.asset_key.join("."), e.error)),
             custody,
         }
         .into()),
@@ -3232,7 +3278,7 @@ pub async fn run_with_explicit_contracts(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
-    contracts_dir: Option<&Path>,
+    contracts: Option<RunContracts<'_>>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows
     // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
     // custody rows are still evaluated as the `agent` class.
@@ -3261,7 +3307,8 @@ pub async fn run_with_explicit_contracts(
     // it before the idempotency claim, state session, adapter, or warehouse
     // work. In particular, an old idempotency key must never skip reading a
     // changed model or contract while reporting a guarded success.
-    if contracts_dir.is_some() {
+    let contracts_guard = contracts.is_some_and(RunContracts::is_guard);
+    if contracts_guard {
         anyhow::ensure!(
             model_name_filter.is_some() && pipeline_name_arg.is_some(),
             "--contracts requires both --model and --pipeline"
@@ -3486,7 +3533,7 @@ pub async fn run_with_explicit_contracts(
     // forces the gate inert regardless of the flag / config.
     let mut skip_gate =
         SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
-    if contracts_dir.is_some() {
+    if contracts_guard {
         skip_gate.force_rebuild = true;
     }
 
@@ -3713,13 +3760,13 @@ pub async fn run_with_explicit_contracts(
             // not passed (clause 1 of the fail-closed decision). `--no-reuse`
             // suppresses the whole reuse path for this invocation — both the
             // point-to decision and the spine population it would feed.
-            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && contracts_dir.is_none(),
+            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && !contracts_guard,
             // Content-addressed column-level skip — its own `[reuse]` sub-key,
             // orthogonal to the point-to switch above but also disabled by
             // `--no-reuse`: the flag is the documented "force every
             // content-addressed model to BUILD" escape hatch, and a column
             // skip is a content-addressed non-build.
-            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && contracts_dir.is_none(),
+            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && !contracts_guard,
             run_vars,
             rocky_cfg.resilience.clone(),
             rocky_cfg.run.strict_scheduling,
@@ -3728,7 +3775,7 @@ pub async fn run_with_explicit_contracts(
             Some(&freeze_fence),
             // Finding #4: the `--model` path reconciles no masks.
             false,
-            contracts_dir,
+            contracts,
         )
         .await;
 
@@ -4235,6 +4282,7 @@ pub async fn run_with_explicit_contracts(
                 // its models directory is gone. `false` for a bare run.
                 governed_ctx.is_some_and(|c| c.expects_models),
                 Some(&hook_registry),
+                contracts.map(RunContracts::dir),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -7327,7 +7375,7 @@ pub async fn run_with_explicit_contracts(
             // fresh disk compile.
             let exec_result: Result<GovernanceSnapshot> = async {
                 let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
-                execute_models(
+                execute_models_with_explicit_contracts(
                     mdir,
                     None,
                     warehouse.as_ref(),
@@ -7363,6 +7411,7 @@ pub async fn run_with_explicit_contracts(
                     Some(&freeze_fence),
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
+                    contracts,
                 )
                 .await
             }
@@ -11868,6 +11917,133 @@ pub(crate) async fn reconcile_model_governance(
     }
 }
 
+/// Move each `E011` the source-typed compile found into the compile that
+/// executes, replacing the `I003` it resolves for the same model and column.
+///
+/// Nothing else crosses over: the executing compile keeps its own SQL,
+/// graph and every other diagnostic.
+fn adopt_contract_type_errors(
+    executing: &mut rocky_compiler::compile::CompileResult,
+    typed: rocky_compiler::compile::CompileResult,
+) {
+    let new_errors: Vec<rocky_compiler::diagnostic::Diagnostic> = typed
+        .contract_diagnostics
+        .into_iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::E011)
+        .collect();
+    if new_errors.is_empty() {
+        return;
+    }
+    // `I003` and `E011` name the column in the same quoted form.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    let resolved: BTreeSet<(String, Option<String>)> = new_errors
+        .iter()
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
+    let keep = |d: &rocky_compiler::diagnostic::Diagnostic| {
+        d.code.as_ref() != rocky_compiler::diagnostic::I003
+            || !resolved.contains(&(d.model.clone(), column_of(&d.message)))
+    };
+    executing.diagnostics.retain(keep);
+    executing.contract_diagnostics.retain(keep);
+    executing.diagnostics.extend(new_errors.iter().cloned());
+    executing.contract_diagnostics.extend(new_errors);
+    executing.has_errors = true;
+}
+
+/// Describe the external sources behind each contract type the compile could
+/// not check.
+///
+/// Starts from every model with an `I003` diagnostic and walks its upstream
+/// models. Each upstream that is not a project model, has no known schema and
+/// is not satisfied outside the compile is described on `warehouse`. The
+/// result is keyed by the exact upstream name, which is how the type checker
+/// looks a source up. A source that cannot be described is left out: the
+/// contract type then stays unchecked, as it was.
+///
+/// The entries carry no provenance, so the missing-source-column check
+/// (`E041` / `W041`) stays off for them.
+async fn describe_sources_for_unchecked_contract_types(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    known: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    external_dependencies: &BTreeSet<String>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+) -> std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+    let mut described = std::collections::HashMap::new();
+    let mut pending: Vec<&str> = compile_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::I003)
+        .map(|d| d.model.as_str())
+        .collect();
+    if pending.is_empty() {
+        return described;
+    }
+    let graph = &compile_result.semantic_graph;
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut sources: BTreeSet<String> = BTreeSet::new();
+    while let Some(model) = pending.pop() {
+        if !visited.insert(model) {
+            continue;
+        }
+        if let Some(schema) = graph.model_schema(model) {
+            pending.extend(schema.upstream.iter().map(String::as_str));
+        }
+        let Some(project_model) = compile_result.project.model(model) else {
+            continue;
+        };
+        // A model whose SQL does not parse here contributes no sources; its
+        // contract types stay unchecked, as before.
+        let Ok(tables) = rocky_sql::lineage::referenced_tables(&project_model.sql) else {
+            continue;
+        };
+        for table in tables {
+            if table.contains('.')
+                && compile_result.project.model(&table).is_none()
+                && !known.contains_key(&table)
+                && !external_dependencies.contains(&table)
+            {
+                sources.insert(table);
+            }
+        }
+    }
+    for source in &sources {
+        let source = source.as_str();
+        let parts: Vec<&str> = source.split('.').collect();
+        let table = match parts.as_slice() {
+            [schema, table] => rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            },
+            [catalog, schema, table] => rocky_ir::TableRef {
+                catalog: (*catalog).to_string(),
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            },
+            _ => continue,
+        };
+        match warehouse.describe_table(&table).await {
+            Ok(columns) if !columns.is_empty() => {
+                let typed = columns
+                    .into_iter()
+                    .map(|c| rocky_compiler::types::TypedColumn {
+                        data_type: rocky_compiler::compile::default_type_mapper(&c.data_type),
+                        name: c.name,
+                        nullable: c.nullable,
+                    })
+                    .collect();
+                described.insert(source.to_string(), typed);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!(source, error = %e, "could not describe source for a contract type check");
+            }
+        }
+    }
+    described
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
     models_dir: &Path,
@@ -12032,7 +12208,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // that path never masks would falsely refuse. The plan side computes the same
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
-    contracts_dir: Option<&Path>,
+    contracts: Option<RunContracts<'_>>,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -12118,8 +12294,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: contracts_dir.map(Path::to_path_buf),
-        required_explicit_contract_model: contracts_dir
+        contracts_dir: contracts.map(|c| c.dir().to_path_buf()),
+        required_explicit_contract_model: contracts
+            .filter(|c| c.is_guard())
             .and_then(|_| model_name_filter.map(str::to_string)),
         source_schemas,
         // W004 wiring happens on the governance compile path later in
@@ -12132,10 +12309,40 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         ..Default::default()
     };
 
-    let compile = match models_glob {
-        Some(glob) => rocky_compiler::compile::compile_matching(&compile_config, glob),
-        None => rocky_compiler::compile::compile(&compile_config),
+    let run_compile = |config: &rocky_compiler::compile::CompilerConfig| match models_glob {
+        Some(glob) => rocky_compiler::compile::compile_matching(config, glob),
+        None => rocky_compiler::compile::compile(config),
     };
+    let mut compile = run_compile(&compile_config);
+    // A contract that declares a column type the compile could not infer
+    // (`I003`) was not checked. The usual cause is an external source with no
+    // known schema: no seed, no schema cache entry. The warehouse is right
+    // here, so describe those sources and compile a second time to check the
+    // contract types before any write. A governed apply replays its reviewed
+    // source snapshot and never takes this path.
+    //
+    // Only the second compile's `E011` (contract type mismatch) is kept. The
+    // first compile stays the one that executes, so the new source types
+    // cannot raise any other error and refuse a run that was valid before.
+    // Nullability is not taken from the describe either: some adapters
+    // report every column as nullable, which would be a false `E012`.
+    if exec_fp_gate.is_none()
+        && let Ok(first) = &mut compile
+        && let described = describe_sources_for_unchecked_contract_types(
+            first,
+            &compile_config.source_schemas,
+            &compile_config.external_dependencies,
+            warehouse,
+        )
+        .await
+        && !described.is_empty()
+    {
+        let mut typed_config = compile_config.clone();
+        typed_config.source_schemas.extend(described);
+        if let Ok(typed) = run_compile(&typed_config) {
+            adopt_contract_type_errors(first, typed);
+        }
+    }
     let mut compile_result = match compile {
         Ok(r) => r,
         Err(e) => {
@@ -12222,7 +12429,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             "[E038] model '{name}' is ephemeral: it is inlined as a CTE into each model that \
              reads it and has nothing to build on its own. Run a model that reads it instead"
         );
-        if contracts_dir.is_some() {
+        if contracts.is_some_and(RunContracts::is_guard) {
             anyhow::ensure!(
                 matches!(
                     selected.config.strategy,
@@ -12258,7 +12465,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         })
         .context("invalid surrogate_key configuration")?;
     if let Some(name) = model_name_filter
-        && contracts_dir.is_some()
+        && contracts.is_some_and(RunContracts::is_guard)
     {
         anyhow::ensure!(
             !surrogate_keys.contains_key(name),
@@ -30917,6 +31124,7 @@ backend = "local"
             anyhow::Error::from(RunFailed {
                 count: 1,
                 run_id: "r".to_string(),
+                first_error: None,
                 custody,
             })
         };
@@ -32224,7 +32432,7 @@ backend = "local"
             None,
             None,
             false,
-            Some(&contracts),
+            Some(super::RunContracts::SelectedModelGuard(&contracts)),
         )
         .await;
         result.expect("compile rejection is carried in RunOutput");
@@ -32250,6 +32458,166 @@ backend = "local"
             .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
             .expect("original table must still have amount");
         assert_eq!(rows.rows.len(), 1, "the original row must survive");
+    }
+
+    /// A project `contracts/` directory beside the models directory is read
+    /// with no flag. On a full run, the model that breaks its contract is not
+    /// written, its existing table stays, its downstream model is withheld,
+    /// and an unrelated model still builds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn project_contracts_dir_guards_a_full_run_without_a_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "protected", "SELECT 8 AS id");
+        write_plain_model(&models, "child", "SELECT id FROM protected");
+        write_plain_model(&models, "other", "SELECT 1 AS id");
+        std::fs::write(
+            contracts.join("protected.contract.toml"),
+            "[rules]\nrequired = [\"id\", \"amount\"]\n",
+        )
+        .expect("contract");
+        // A contract for a model this compile does not own (another
+        // pipeline's) is skipped without W011.
+        std::fs::write(
+            contracts.join("elsewhere.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("foreign contract");
+
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE TABLE main.protected AS SELECT 7 AS id, 99 AS amount")
+                .expect("existing table");
+        }
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["protected".to_string()]
+                    && e.failure_kind == crate::output::FailureKind::CompileError
+                    && e.error.contains("E010")),
+            "E010 must reach the run's errors: {:?}",
+            output.errors
+        );
+        assert!(
+            !output.errors.iter().any(|e| e.error.contains("W011")),
+            "a contract for a model outside this compile is not a warning: {:?}",
+            output.errors
+        );
+        assert!(
+            output.contained.iter().any(|c| c.model == "child"),
+            "the downstream model is withheld: {:?}",
+            output.contained
+        );
+        let built: Vec<String> = output
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(built, vec!["other".to_string()]);
+
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
+            .expect("the existing table must still be there");
+        assert_eq!(rows.rows.len(), 1, "the existing row must survive");
+        assert!(
+            conn.execute_sql("SELECT id FROM main.child").is_err(),
+            "the withheld downstream model must not be written"
+        );
+    }
+
+    /// Writes a model that reads the external source `src.orders`, a
+    /// contract that declares `order_id` as `contract_type`, and the source
+    /// table itself, with no seed and no schema cache entry.
+    #[cfg(feature = "duckdb")]
+    fn described_source_fixture(contract_type: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "fct", "SELECT order_id FROM src.orders");
+        std::fs::write(
+            contracts.join("fct.contract.toml"),
+            format!("[[columns]]\nname = \"order_id\"\ntype = \"{contract_type}\"\n"),
+        )
+        .expect("contract");
+        let conn =
+            rocky_duckdb::DuckDbConnector::open(&dir.path().join("t.duckdb")).expect("open db");
+        conn.execute_sql("CREATE SCHEMA src").expect("schema");
+        conn.execute_sql("CREATE TABLE src.orders AS SELECT CAST(1 AS BIGINT) AS order_id")
+            .expect("source");
+        conn.execute_sql("CREATE TABLE main.fct AS SELECT 'kept' AS order_id")
+            .expect("existing table");
+        (dir, models)
+    }
+
+    /// With no known source schema the compile cannot infer `order_id`, so
+    /// the contract type is `I003`, unchecked. The run describes the source
+    /// on its warehouse and checks the type before writing: a mismatch is
+    /// `E011` and the existing table stays.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_describes_sources_to_check_a_contract_type() {
+        let (dir, models) = described_source_fixture("String");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        assert!(
+            output.errors.iter().any(|e| e.error.contains("E011")),
+            "the described source type must be checked: {:?}",
+            output.errors
+        );
+        assert!(output.materializations.is_empty());
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.fct WHERE order_id = 'kept'")
+            .expect("the existing table must still be there");
+        assert_eq!(rows.rows.len(), 1, "the existing row must survive");
+    }
+
+    /// Control for the test above: the same described source with a contract
+    /// type that matches builds cleanly.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_described_source_with_matching_contract_type_builds() {
+        let (dir, models) = described_source_fixture("Int64");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("a clean run");
+        assert!(output.errors.is_empty(), "no errors: {:?}", output.errors);
+        assert_eq!(output.materializations.len(), 1);
+    }
+
+    /// A `rocky run --dag` node prints only the error message, so a failed
+    /// run's message carries its first error and code.
+    #[test]
+    fn run_failed_message_names_the_first_error() {
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.tables_failed = 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["fct_orders".to_string()],
+            error: "[E012] column 'customer_id' must be non-nullable".to_string(),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+        let err = super::run_status_exit_result(&output, "r", super::RecordCustody::Persisted)
+            .expect_err("a failed run");
+        let message = format!("{err:#}");
+        assert!(message.contains("1 model(s) failed"), "{message}");
+        assert!(
+            message.contains("first error: fct_orders: [E012]"),
+            "{message}"
+        );
     }
 
     /// When every model fails to compile, the run is a total `Failure`:
