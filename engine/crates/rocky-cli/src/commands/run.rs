@@ -12733,6 +12733,26 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         return Ok(GovernanceSnapshot::default());
     }
 
+    // An agent's apply refuses a first-run fill its plan did not record
+    // before any model writes, over the same set the layer loop executes.
+    if let Some(gate) = exec_fp_gate {
+        refuse_unreviewed_first_run_fills(
+            compile_result
+                .project
+                .models
+                .iter()
+                .filter(|model| model_name_filter.is_none_or(|target| target == model.config.name))
+                .filter(|model| model_set.is_none_or(|set| set.contains(&model.config.name)))
+                .filter(|model| !compile_excluded_models.contains(&model.config.name)),
+            partition_opts,
+            state_store,
+            ReviewedFirstRunFills {
+                plan_id: &gate.plan_id,
+                models: &gate.reviewed_first_run_fills,
+            },
+        )?;
+    }
+
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
     // `time_interval` model whose `time_column` is absent from its SELECT
@@ -16170,6 +16190,70 @@ async fn execute_snapshot_model(
 /// 4. Build a `PartitionInfo` per materialization and a single
 ///    `PartitionSummary` per model and push them to the run output.
 ///
+/// The refusal for a first-run fill an agent's plan did not record.
+fn unreviewed_first_run_fill_error(
+    plan_id: &str,
+    model_name: &str,
+    partitions: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to execute plan '{plan_id}': model '{model_name}' has no recorded \
+         partition, so this run would fill {partitions} partitions from its \
+         first_partition, and the plan did not show that fill. Plan again with \
+         `rocky plan` (and review the new plan) to apply the fill, or run the model \
+         with a partition flag."
+    )
+}
+
+/// Under an agent's apply, refuse before the first warehouse write when a
+/// model about to run would fill from `first_partition` and the plan did not
+/// record that fill. Without this, the refusal in
+/// [`execute_time_interval_model`] fires only when that model's turn comes,
+/// after earlier models already wrote.
+///
+/// Uses the same rule as the run: no partition flag and no `--lookback`, and
+/// no partition recorded for the model. With no state store every model has
+/// never run, as in [`execute_time_interval_model`].
+fn refuse_unreviewed_first_run_fills<'m>(
+    models: impl IntoIterator<Item = &'m rocky_core::models::Model>,
+    partition_opts: &PartitionRunOptions,
+    state_store: Option<&StateStore>,
+    review: ReviewedFirstRunFills<'_>,
+) -> Result<()> {
+    if partition_opts.to_selection().is_some() || partition_opts.lookback.is_some() {
+        return Ok(());
+    }
+    let temp_state_dir;
+    let local_state;
+    let state: &StateStore = match state_store {
+        Some(s) => s,
+        None => {
+            temp_state_dir = tempfile::TempDir::new()
+                .context("failed to allocate temp state store for partition planning")?;
+            local_state = StateStore::open(&temp_state_dir.path().join("partitions.redb"))
+                .context("failed to open temp state store")?;
+            &local_state
+        }
+    };
+    for model in models {
+        let model_name = model.config.name.as_str();
+        if review.models.contains(model_name) {
+            continue;
+        }
+        let fill = rocky_core::plan_partition::plan_first_run_fill(model, state)
+            .with_context(|| format!("failed to plan partitions for model '{model_name}'"))?;
+        if let rocky_core::plan_partition::FirstRunFill::Fill(plans) = fill {
+            let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
+            return Err(unreviewed_first_run_fill_error(
+                review.plan_id,
+                model_name,
+                partitions,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Errors propagate to the caller; the state-store row records the
 /// `Failed` status before bubbling so a subsequent `--missing` run can
 /// pick up where this one left off.
@@ -16236,18 +16320,17 @@ async fn execute_time_interval_model(
     };
     let plans = match first_fill {
         rocky_core::plan_partition::FirstRunFill::Fill(plans) => {
+            // `refuse_unreviewed_first_run_fills` already refused this before
+            // the first write; kept here as defense in depth.
             if let Some(review) = exec_ctx.reviewed_first_run_fills
                 && !review.models.contains(model_name)
             {
                 let partitions: usize = plans.iter().map(|p| 1 + p.batch_with.len()).sum();
-                anyhow::bail!(
-                    "refusing to execute plan '{}': model '{model_name}' has no recorded \
-                     partition, so this run would fill {partitions} partitions from its \
-                     first_partition, and the plan did not show that fill. Plan again with \
-                     `rocky plan` (and review the new plan) to apply the fill, or run the model \
-                     with a partition flag.",
-                    review.plan_id
-                );
+                return Err(unreviewed_first_run_fill_error(
+                    review.plan_id,
+                    model_name,
+                    partitions,
+                ));
             }
             info!(
                 model = model_name,
@@ -29294,6 +29377,128 @@ table = "fct_daily"
         .await
         .unwrap();
         assert_eq!(filled.partition_summaries[0].partitions_planned, 2);
+    }
+
+    /// An agent's apply refuses an unrecorded first-run fill before the first
+    /// write, not when that model's turn comes. `a_orders` (no fill) would run
+    /// first; `fct_daily_orders` fills from `first_partition` and its plan did
+    /// not record that, so the run refuses and `a_orders` is not built.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_unrecorded_fill_refuses_before_any_model_writes() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let first = Utc::now().date_naive().pred_opt().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wh.duckdb");
+        let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("a_orders.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("a_orders.toml"),
+            "name = \"a_orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"a_orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nlookback = 0\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        // A legacy-shaped gate (no fingerprint, not required) so only the
+        // first-run-fill check can refuse.
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
+            expected: None,
+            config_identity: String::new(),
+            governance_identity: String::new(),
+            exec_control_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
+            plan_id: "plan-x".to_string(),
+            require: false,
+        };
+        let opts = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let error = super::execute_models(
+            &models,
+            None,
+            &warehouse as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &opts,
+            "unrecorded-fill",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true, // auto_create_schemas
+            None, // shadow_config (test)
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling
+            true,
+            Some(&gate),
+            None, // freeze_fence (test)
+            false,
+        )
+        .await
+        .expect_err("an unrecorded first-run fill must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("plan-x"), "{message}");
+        assert!(message.contains("fct_daily_orders"), "{message}");
+        assert!(output.materializations.is_empty(), "no model was built");
+        let result = warehouse
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name IN ('a_orders', 'fct_daily_orders')",
+            )
+            .await
+            .unwrap();
+        let count = result.rows[0][0]
+            .as_u64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+        assert_eq!(count, Some(0), "nothing is written before the refusal");
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Inverse-design property: a *transient* target-probe failure must not be
