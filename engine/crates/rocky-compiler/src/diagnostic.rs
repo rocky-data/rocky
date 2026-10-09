@@ -204,11 +204,12 @@ pub const E044: &str = "E044";
 /// A call names a function the target warehouse does not have, and the
 /// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
 ///
-/// Emitted by `rocky compile` from [`crate::function_check`] only for models
-/// that run on DuckDB, the one dialect with a complete function list here.
-/// Schema-qualified calls (`main.my_macro(x)`) and quoted names are not
-/// checked, nor is a project whose `[portability] target_dialect` names
-/// another warehouse.
+/// Emitted by `rocky compile` from [`crate::function_check`] for models that
+/// run on DuckDB, PostgreSQL, Spark or Trino, the dialects whose list was
+/// verified against a live engine. Every other warehouse with a list gets the
+/// warning [`W057`] instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
+/// not checked, nor is a model whose SQL `[portability] target_dialect` says
+/// was written for another warehouse.
 pub const E057: &str = "E057";
 /// The models form a dependency cycle: a model reads, directly or through
 /// other models, a model that depends on it (for example `fct_orders` reads
@@ -642,13 +643,23 @@ pub const W055: &str = "W055";
 /// window, or accept the gap. A warning, not
 /// an error: a source that never back-fills equal timestamps is safe.
 pub const W056: &str = "W056";
+/// A call names a function that is not in the function list Rocky holds for
+/// the target warehouse, and the project does not declare it in `functions/`.
+///
+/// The warning form of [`E057`], for warehouses whose list Rocky built from
+/// the vendor's reference but has not verified against a live engine
+/// (Snowflake, Databricks, BigQuery, Redshift).
+/// A warehouse can have functions the list lacks (a newer release, an
+/// extension, a UDF created outside Rocky), so this never fails a compile on
+/// its own. Escalate with `rocky compile --deny-warnings W057`.
+pub const W057: &str = "W057";
 
 /// Every warning code the compile pipeline can emit: the `W###` codes above
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so
