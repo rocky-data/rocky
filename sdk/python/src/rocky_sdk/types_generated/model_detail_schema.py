@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, conint
+from pydantic import BaseModel, ConfigDict, Field, RootModel, conint
 
 
 class ModelColumnOutput(BaseModel):
@@ -153,28 +153,7 @@ class RockyType5(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    Array: (
-        RockyType1
-        | RockyType2
-        | RockyType3
-        | RockyType4
-        | RockyType5
-        | RockyType6
-        | RockyType7
-    )
-    """
-    Rocky's unified column type.
-
-    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
-
-    # Wire contract
-
-    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
-
-    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
-
-    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
-    """
+    Array: RockyType
 
 
 class RockyType6(BaseModel):
@@ -195,15 +174,7 @@ class RockyType6(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    Map: list[
-        RockyType1
-        | RockyType2
-        | RockyType3
-        | RockyType4
-        | RockyType5
-        | RockyType6
-        | RockyType7
-    ]
+    Map: list[RockyType] = Field(..., max_length=2, min_length=2)
 
 
 class RockyType7(BaseModel):
@@ -232,7 +203,46 @@ class StructField(BaseModel):
     A field in a struct type.
     """
 
-    data_type: (
+    data_type: RockyType
+    name: str
+    nullable: bool
+
+
+class TypedColumnOutput(BaseModel):
+    """
+    One type-checked column of a model.
+    """
+
+    data_type: RockyType
+    """
+    The inferred type, structured and lossless — a struct field keeps its own nullability, which the display string drops.
+    """
+    data_type_display: str
+    """
+    Rocky's human rendering of `data_type`, e.g. `INT64`, `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.
+    """
+    name: str
+    """
+    Column name.
+    """
+    nullable: bool
+    """
+    Whether the column may be `NULL`.
+    """
+
+
+class RockyType(
+    RootModel[
+        RockyType1
+        | RockyType2
+        | RockyType3
+        | RockyType4
+        | RockyType5
+        | RockyType6
+        | RockyType7
+    ]
+):
+    root: (
         RockyType1
         | RockyType2
         | RockyType3
@@ -254,42 +264,11 @@ class StructField(BaseModel):
 
     The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
-    name: str
-    nullable: bool
-
-
-class TypedColumnOutput(BaseModel):
-    """
-    One type-checked column of a model.
-    """
-
-    data_type: (
-        RockyType1
-        | RockyType2
-        | RockyType3
-        | RockyType4
-        | RockyType5
-        | RockyType6
-        | RockyType7
-    )
-    """
-    The inferred type, structured and lossless — a struct field keeps its own nullability, which the display string drops.
-    """
-    data_type_display: str
-    """
-    Rocky's human rendering of `data_type`, e.g. `INT64`, `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.
-    """
-    name: str
-    """
-    Column name.
-    """
-    nullable: bool
-    """
-    Whether the column may be `NULL`.
-    """
 
 
 ModelDetailOutput.model_rebuild()
 RockyType5.model_rebuild()
 RockyType6.model_rebuild()
 RockyType7.model_rebuild()
+StructField.model_rebuild()
+TypedColumnOutput.model_rebuild()
