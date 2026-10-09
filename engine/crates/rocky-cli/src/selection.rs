@@ -424,14 +424,14 @@ pub fn resolve(
         );
     }
     let selection = selector::select(&graph, &select, &exclude, state.as_ref())?;
-    // A term that names one model, tag, path, file or source that does not
+    // A term that names one model, tag, path, file, source or consumer that does not
     // exist is a typo, not an empty selection: refuse it rather than run
     // nothing and report success. Globs and computed sets (`state:`,
     // `config.`) that match nothing stay a warning.
     if !selection.unmatched_named.is_empty() {
         anyhow::bail!(
             "--select: selector term(s) that match nothing in this project: {}. Each names a \
-             model, tag, path, file or source that does not exist. Check the spelling; \
+             model, tag, path, file, source or consumer that does not exist. Check the spelling; \
              `rocky list models` shows the model names",
             selection
                 .unmatched_named

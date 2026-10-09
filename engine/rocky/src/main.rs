@@ -1424,7 +1424,7 @@ enum Command {
     /// makes no network requests. `--output-path` ending in `.html` writes a
     /// single-page catalog instead. `--format parquet` writes the compiled
     /// project graph as Parquet tables (models, columns, edges,
-    /// column_lineage, tests, contracts, sources) that DuckDB can query.
+    /// column_lineage, tests, contracts, sources, consumers) that DuckDB can query.
     Docs {
         /// Models directory
         #[arg(long, default_value = "models")]
