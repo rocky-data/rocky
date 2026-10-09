@@ -1,5 +1,26 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "MetaTokenScope": {
+      "description": "The scope of the token a `rocky serve` was started with, as `GET /api/v1/meta` reports it.",
+      "oneOf": [
+        {
+          "description": "Every route, mutating ones included.",
+          "enum": [
+            "full"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`GET`, `HEAD` and `OPTIONS` only.",
+          "enum": [
+            "read_only"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
   "description": "Feature-detection payload for `GET /api/v1/meta`.\n\nFingerprints the running engine + bound config so an embedder can pin against a build without version-sniffing. Every field is computed at request time — none are baked literals — so `state_schema_version`, `schemas_hash`, and `config_hash` track the live engine and the on-disk config even across a long-running sidecar.",
   "properties": {
     "capabilities": {
@@ -36,6 +57,17 @@
       "format": "uint32",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "token_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MetaTokenScope"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the server's bearer token may do: `full` reaches every route, `read_only` only safe methods. `null` when no token is configured (a loopback server without `--ui`, which asks no request for one). The UI reads it to enable or disable its write controls. Never the secret."
     }
   },
   "required": [

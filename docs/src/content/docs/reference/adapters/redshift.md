@@ -88,17 +88,29 @@ Redshift needs every table in a late-binding view to name its schema: `marts.fct
 
 | Concern | Redshift |
 |---------|----------|
-| `MERGE` | `MERGE INTO <target> USING (<model SQL>) AS rocky_src ON <table>.<key> = rocky_src.<key>` — no target alias, and both `WHEN` arms are always present. A model whose only columns are its keys inserts the missing keys with `INSERT … WHERE NOT EXISTS` instead. |
+| `MERGE` | Three statements in one transaction: `CREATE TEMP TABLE rocky_merge_src AS <model SQL>`, then `MERGE INTO <target> USING rocky_merge_src ON <table>.<key> = rocky_merge_src.<key>`, then `DROP TABLE rocky_merge_src`. Redshift refuses a `WITH` clause in a MERGE and a source subquery that reads the target, and model SQL can do both. There is no target alias, and both `WHEN` arms are always present. A model whose only columns are its keys inserts the missing keys with `INSERT … WHERE NOT EXISTS` instead. |
+| Upserts | `MERGE` only. Redshift has no `ON CONFLICT`, so `merge_mode = "on_conflict"` is refused. |
 | Snapshots (SCD2) | Refused. The generic snapshot SQL uses `CREATE TABLE IF NOT EXISTS … AS`, a MERGE target alias and a conditional `WHEN MATCHED`. |
 | Names | Up to 127 bytes. Names fold to lower case. |
 | String literals | A backslash is an escape: Rocky writes `\'` and `\\` (from the Redshift lexer's PostgreSQL 8.0 roots — not verified live) |
 | Current time | `GETDATE()` |
-| Date arithmetic | `DATEADD(day, -n, CURRENT_DATE)` |
+| Date arithmetic | `DATEADD(day, -n, CURRENT_DATE)`. An incremental `lookback` is `DATEADD(<unit>, -n, <watermark>)`, and an interval literal is `INTERVAL 'n <unit>'`. |
 | Text casts | `VARCHAR(65535)`. A bare `VARCHAR` is `VARCHAR(256)` on Redshift and cuts longer values. |
 | `TABLESAMPLE` | None. Null-rate checks scan the whole table. |
 | Introspection | `svv_columns`, which also covers late-binding views and Spectrum tables |
 | Type changes in place | A longer `VARCHAR(n)` only. Any other change rebuilds the table. |
 | Materialized views | Drop and recreate on each run. Rocky does not set `AUTO REFRESH`. |
+
+## Not verified on a live cluster
+
+Every Redshift rendering on this page comes from the Redshift documentation and is pinned by generated-SQL tests. None has run against a Redshift cluster. These need a live cluster to confirm:
+
+- The `MERGE` temp-table form, including a model with CTEs and an `@incremental_filter`.
+- Backslash escapes in string literals.
+- `delete_insert`: `DELETE … WHERE (a, b) IN (SELECT …)` with more than one partition column.
+- `svv_columns` types for `SUPER`, `IDENTITY` columns and late-binding views.
+- In-place `VARCHAR` growth (`ALTER COLUMN … TYPE`).
+- `sslmode` defaults against a Redshift endpoint.
 
 ## Not supported yet
 

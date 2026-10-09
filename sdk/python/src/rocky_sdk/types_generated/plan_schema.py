@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, RootModel, conint
+from pydantic import AwareDatetime, BaseModel, Field, RootModel, conint
 
 
 class Kind(StrEnum):
@@ -298,6 +298,30 @@ class ClassificationAction(BaseModel):
     """
 
 
+class CostEstimateSource1(StrEnum):
+    """
+    Rocky's offline cost model over the compiled DAG. It uses fixed placeholder statistics for source tables and never contacts the warehouse. Good for comparing plans, not for budgeting.
+    """
+
+    heuristic = "heuristic"
+
+
+class CostEstimateSource2(StrEnum):
+    """
+    The warehouse's own estimate (`EXPLAIN` or a dry run) for the generated SQL. Requested with `rocky plan --cost-estimate adapter`.
+    """
+
+    adapter = "adapter"
+
+
+class CostEstimateSource3(StrEnum):
+    """
+    Totals that combine both sources, because the adapter could not estimate some models.
+    """
+
+    mixed = "mixed"
+
+
 class IntentCheckReason1(StrEnum):
     """
     Mismatch: the column names, types or order differ.
@@ -498,6 +522,33 @@ class ModelIntentVerdict(BaseModel):
     """
 
 
+class PlanFirstRunFill(BaseModel):
+    """
+    One row of [`PlanOutput::first_run_fills`].
+    """
+
+    fills: bool
+    """
+    `true` when the first run builds every partition in the range. `false` when the range is over the first-run limit (1000 partitions): the run then builds only the latest partition.
+    """
+    from_: str = Field(..., alias="from")
+    """
+    The first partition key: the model's `first_partition`.
+    """
+    model: str
+    """
+    The model.
+    """
+    partitions: conint(ge=0)
+    """
+    Partitions from `from` to `to`, both included.
+    """
+    to: str
+    """
+    The last partition key: the partition current when the plan was made. An apply on a later day or hour fills up to its own current partition.
+    """
+
+
 class PlanIntent1(StrEnum):
     """
     Same schema. The base and head outputs are equal multisets of rows.
@@ -512,6 +563,41 @@ class PlanIntent(RootModel[PlanIntent1]):
     The closed list of intents `rocky plan --intent` accepts.
 
     Version 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.
+    """
+
+
+class PlanModelCost(BaseModel):
+    """
+    One model's row in [`PlanCostPreview::models`].
+    """
+
+    confidence: str | None = None
+    """
+    `"low"` for a heuristic estimate, whose source statistics are placeholders. `None` for an adapter estimate.
+    """
+    estimated_bytes_scanned: conint(ge=0) | None = None
+    """
+    Estimated bytes the model reads.
+    """
+    estimated_cost_usd: float | None = None
+    """
+    Estimated cost in USD.
+    """
+    estimated_rows: conint(ge=0) | None = None
+    """
+    Estimated rows the model produces (heuristic) or reads (adapter).
+    """
+    model: str
+    """
+    Model name.
+    """
+    previous_cost_usd: float | None = None
+    """
+    Observed cost in USD of this model in the last successful production run that built it.
+    """
+    source: CostEstimateSource1 | CostEstimateSource2 | CostEstimateSource3
+    """
+    Where this model's estimate came from (`heuristic` or `adapter`).
     """
 
 
@@ -684,6 +770,51 @@ class IntentCheckOutput(BaseModel):
     summary: IntentCheckSummary
 
 
+class PlanCostPreview(BaseModel):
+    """
+    The cost preview on [`PlanOutput::cost_preview`].
+
+    Each total is the sum over every model, and is `None` when any model lacks the figure, so a total never covers only part of the plan. A total with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.
+    """
+
+    cost_delta_usd: float | None = None
+    """
+    `estimated_cost_usd - previous_cost_usd`. Present only when the estimate came from the adapter for every model and every model has a previous cost. A heuristic estimate is never compared with an observed cost.
+    """
+    estimated_bytes_scanned: conint(ge=0) | None = None
+    """
+    Estimated bytes the rebuild reads, summed over every model.
+    """
+    estimated_cost_usd: float | None = None
+    """
+    Estimated cost of the rebuild in USD, summed over every model.
+    """
+    is_estimate: bool
+    """
+    Always `true`. Every figure in this object is an estimate made before execution, not a measurement.
+    """
+    models: list[PlanModelCost]
+    """
+    One row per rebuilt model, in plan order.
+    """
+    models_to_rebuild: conint(ge=0)
+    """
+    Number of models the plan rebuilds (the rebuild scope).
+    """
+    notes: list[str] | None = None
+    """
+    Why a figure is missing, for example an adapter estimate that failed for one model. Empty when nothing is missing.
+    """
+    previous_cost_usd: float | None = None
+    """
+    Observed cost in USD of the same models in the last successful production run, priced from the state store. `None` when any model has no such run.
+    """
+    source: CostEstimateSource1 | CostEstimateSource2 | CostEstimateSource3
+    """
+    Where the totals came from.
+    """
+
+
 class SemanticPlanVerdict(BaseModel):
     """
     Decision-support verdict from the typed-IR breaking-change classifier, attached to `PlanOutput` when `rocky plan --semantic` runs against a usable baseline.
@@ -725,6 +856,10 @@ class PlanOutput(BaseModel):
     Column-tag applications the governance reconciler would issue via `apply_column_tags`. One row per `(model, column, tag)` triple declared in a model sidecar's `[classification]` block.
     """
     command: str
+    cost_preview: PlanCostPreview | None = None
+    """
+    What applying this plan would rebuild and roughly cost, computed before any model runs. Present when the plan covers transformation models. Every figure is an estimate: see [`PlanCostPreview::source`]. REPORT-ONLY: it never changes `models`, `skipped`, the budget fields, or the exit code, and it is not part of the persisted plan, so it does not enter `plan_id`.
+    """
     created_at: AwareDatetime | None = None
     """
     UTC timestamp when the plan was persisted. Present when `plan_id` is present.
@@ -738,6 +873,10 @@ class PlanOutput(BaseModel):
     Execution layers (topological order) as a list-of-lists of model names. Models within a layer can execute concurrently. Informational — re-derived at apply time. Empty for replication-only plans.
     """
     filter: str
+    first_run_fills: list[PlanFirstRunFill] | None = None
+    """
+    The `time_interval` models whose first run fills from `first_partition` when this plan is applied: no partition is recorded for them in the state store, and the plan names no partition flag. One row per model, the over-the-limit case included. The persisted plan records which models fill, and an agent's apply refuses a fill its plan did not record.
+    """
     has_budget_errors: bool | None = None
     """
     `true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = "error"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.

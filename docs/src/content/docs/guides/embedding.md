@@ -110,6 +110,7 @@ A mutating route does not block. You submit the work, get an id back, and poll f
   POST /api/v1/jobs/run ─────► 202 Accepted  { "job_id": ... }
        /api/v1/jobs/plan                │
        /api/v1/jobs/apply               │
+       /api/v1/jobs/approve             │
         ┌───────────────────────────────┘
         ▼
   GET /api/v1/jobs/{id} ──► running ───► poll again
@@ -119,6 +120,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
 ```
 
 The polled result is the same payload the CLI would have produced.
+
+`POST /api/v1/jobs/approve` takes `{"plan_id": "<64 lowercase hex>"}`. It runs `rocky review <plan_id> --approve` as a subprocess and takes the same single-mutation lock as `run` and `apply`. While one of them runs, it answers `409 mutation_in_progress`. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`. The approval records the approver source `http_api` and the server's git identity. If `git config user.email` cannot be resolved, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`, so run records show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
 
 A submitted job becomes `running` right away. The schema also declares a `queued` state, but this server never uses it, because submissions never sit in a queue. Poll until the state is `succeeded` or `failed` rather than matching on the full set.
 
@@ -134,7 +137,7 @@ The full route reference, request and response schemas, and status codes are pub
 
 ### The browser UI
 
-`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. It needs a read-only token. On a loopback bind with no token configured, the server generates one for the process; elsewhere pass `rocky serve --ui --token <secret> --token-scope read-only`. The server prints one address, `http://127.0.0.1:8080/ui/#token=<secret>`; the page reads the token from the fragment once, clears it, and sends it on every API call. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. The UI token cannot start a run: run a second sidecar without `--ui` for job submissions.
+`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. On a loopback bind with no token configured, the server generates a full-scope token for the process (operator mode). Pass `--read-only` for a view-only UI. Elsewhere pass `rocky serve --ui --token <secret> --read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it stays read-only. The server prints one address, `http://127.0.0.1:8080/login?t=<secret>`. `GET /login` checks the token and sets a session cookie for the browser, then redirects to `/ui/`. The page holds no token; its API calls carry the cookie. Embedders keep using `Authorization: Bearer <token>`. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. A read-only UI token cannot start a run. See [operator mode](/guides/browser-ui/#operator-mode).
 
 For the command flags, see [`rocky serve`](/reference/commands/development/). For where the server sits in the engine, see the [architecture overview](/concepts/architecture/).
 
@@ -144,7 +147,7 @@ CI holds the shape of every `/api/v1` payload stable. The `codegen-drift` check 
 
 CI guarantees **shape**, not values. The drift check compares the structure of each payload. It does not compare the specific values inside a primitive field. A string field stays a string across a minor release, but the exact string it carries is best-effort. Pin against shape, and expect value semantics to change within a minor version. A frozen-value corpus that would trip on any value change is planned, and is not in force yet.
 
-Read `GET /api/v1/meta` to identify the engine you are talking to at runtime. It reports the engine version, the state-schema version, and a hash of the full schema set. It also reports a per-request hash of the resolved config, and the routes and capabilities this build serves. Feature-detect against `capabilities` and `routes` rather than parsing the version string. Compare `schemas_hash` between deployments to see whether any payload shape moved.
+Read `GET /api/v1/meta` to identify the engine you are talking to at runtime. It reports the engine version, the state-schema version, and a hash of the full schema set. It also reports `token_scope` (`"full"`, `"read_only"`, or `null` when no token is configured). It also reports a per-request hash of the resolved config, and the routes and capabilities this build serves. Feature-detect against `capabilities` and `routes` rather than parsing the version string. Compare `schemas_hash` between deployments to see whether any payload shape moved.
 
 Recommended practice:
 
@@ -161,7 +164,7 @@ Run `rocky serve` next to your application as a single-tenant sidecar. It is not
 
 **Authentication.** Auth is one optional shared-secret bearer token, passed with `--token` or the `ROCKY_SERVE_TOKEN` environment variable. When you set a token, the check runs on every request whose path is not exempt. Two paths are exempt, whatever the method: `/api/v1/health`, and the webhook `/api/v1/hooks/trigger/{pipeline}` — bearer-exempt because it authenticates with its own HMAC over the raw body (and, on a loopback bind with `--scheduler` and no secret, accepts an unsigned `POST`). A CORS preflight is answered before the check, and the browser UI's own files under `/ui/` are public. When you set no token, a loopback server asks no request for one. This is a single secret, not a user system.
 
-**Token scope.** A token reaches every route by default. `--token-scope read-only` (or `ROCKY_SERVE_TOKEN_SCOPE`) narrows it to `GET`, `HEAD`, and `OPTIONS`; every other method gets `403 forbidden_read_only_token`. Hand that token to anything you do not fully trust with a warehouse write — a browser UI above all, where a leaked token would otherwise reach `POST /api/v1/jobs/run`. The rule is the HTTP method, not a list of paths, so routes added in future are covered as well.
+**Token scope.** A token reaches every route by default. `--token-scope read-only` (or `--read-only`, or `ROCKY_SERVE_TOKEN_SCOPE`) narrows it to `GET`, `HEAD`, and `OPTIONS`; every other method gets `403 forbidden_read_only_token`. Hand that token to anything you do not fully trust with a warehouse write — a browser UI above all, where a leaked token would otherwise reach `POST /api/v1/jobs/run`. The rule is the HTTP method, not a list of paths, so routes added in future are covered as well.
 
 The scope restricts the token. It is not a whole-server perimeter, and one gap is worth knowing before a browser reaches this sidecar: the webhook route authenticates itself and ignores the token. Run `--scheduler` on loopback without `ROCKY_WEBHOOK_SECRET` and it accepts an unsigned `POST`, then queues work for the scheduler. Script running in the page can do that with no token at all. Set `ROCKY_WEBHOOK_SECRET`. Put the sidecar behind your own gateway if you need per-user identity, TLS, rate limiting, or a public perimeter. The server does not terminate TLS. The `X-Rocky-Principal` header is recorded for audit only, and never authorizes anything.
 

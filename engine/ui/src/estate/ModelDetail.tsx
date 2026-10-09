@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import { StatusCard } from "../components";
 import { orNotRecorded } from "../format";
@@ -11,10 +12,13 @@ export function ModelDetail({
   name,
   load,
   onClose,
+  actions,
 }: {
   name: string;
   load: (name: string) => Promise<ModelDetailOutput>;
   onClose: () => void;
+  /** Run and Plan for this one model, drawn under its name. */
+  actions?: ReactNode;
 }) {
   const detail = useResource(() => load(name), [name]);
   return (
@@ -32,6 +36,7 @@ export function ModelDetail({
           Close
         </button>
       </div>
+      {actions !== undefined && <div className="mb-3">{actions}</div>}
       <DetailBody name={name} detail={detail} />
     </aside>
   );

@@ -11,19 +11,7 @@
     {
       "severity": "Info",
       "code": "I002",
-      "message": "3 column(s) have unknown types \u2014 provide source schemas for full type checking",
-      "span": {
-        "file": "models/customer_orders.rocky",
-        "line": 1,
-        "col": 1
-      },
-      "model": "customer_orders",
-      "suggestion": null
-    },
-    {
-      "severity": "Info",
-      "code": "I002",
-      "message": "4 column(s) have unknown types \u2014 provide source schemas for full type checking",
+      "message": "1 column(s) have unknown types \u2014 provide source schemas for full type checking",
       "span": {
         "file": "models/revenue_summary.sql",
         "line": 1,
@@ -33,20 +21,28 @@
       "suggestion": null
     },
     {
-      "severity": "Info",
-      "code": "I003",
-      "message": "column 'customer_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "severity": "Warning",
+      "code": "W005",
+      "message": "model 'raw_orders' has temporal column(s) (order_date) but no `freshness` block declared",
       "span": null,
-      "model": "revenue_summary",
-      "suggestion": "give `rocky compile` source schemas so `customer_id`'s type resolves \u2014 `rocky compile --with-seed` reads them from `data/seed.sql`; for a replication pipeline, `rocky discover --with-schemas` fills the schema cache (it refuses transformation-only pipelines); `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Int64 whatever the column actually holds"
+      "model": "raw_orders",
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"order_date\"`"
     },
     {
-      "severity": "Info",
-      "code": "I003",
-      "message": "column 'total_revenue' declares type Decimal in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "severity": "Warning",
+      "code": "W005",
+      "message": "model 'revenue_summary' has temporal column(s) (first_order) but no `freshness` block declared",
       "span": null,
       "model": "revenue_summary",
-      "suggestion": "give `rocky compile` source schemas so `total_revenue`'s type resolves \u2014 `rocky compile --with-seed` reads them from `data/seed.sql`; for a replication pipeline, `rocky discover --with-schemas` fills the schema cache (it refuses transformation-only pipelines); `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Decimal whatever the column actually holds"
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"first_order\"`"
+    },
+    {
+      "severity": "Warning",
+      "code": "W005",
+      "message": "model 'customer_orders' has temporal column(s) (first_order) but no `freshness` block declared",
+      "span": null,
+      "model": "customer_orders",
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"first_order\"`"
     }
   ],
   "failures": []

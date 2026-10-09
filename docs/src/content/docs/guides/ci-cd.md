@@ -10,13 +10,13 @@ sidebar:
 ## 1. The rocky ci Command
 
 ```bash
-rocky ci --models models --contracts contracts
+rocky ci --contracts contracts
 ```
 
-The command runs two phases in order:
+With no `--models`, the command covers the models of every transformation pipeline. It runs two phases in order:
 
-1. **Compile**: type-check every model, resolve the DAG, validate contracts
-2. **Test**: execute each model's SQL against DuckDB in dependency order
+1. **Compile**: type-check every model, resolve the DAG, validate contracts. When the project has `data/seed.sql`, the types come from the tables it makes.
+2. **Test**: execute each model's SQL against DuckDB in dependency order, on the seed's tables
 
 ```
 Rocky CI Pipeline

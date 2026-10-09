@@ -68,6 +68,7 @@ export type ImportDbtStructuredWarning =
       contract_path: string;
       kind: "dropped_contract";
       model: string;
+      not_null_constraints: number;
       typed_columns: number;
       [k: string]: unknown;
     };
@@ -88,7 +89,7 @@ export interface ImportDbtOutput {
    */
   constructs_dropped?: number;
   /**
-   * Number of dbt models whose enforced `contract` (column `data_type`s / `constraints`) was dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate.
+   * Number of dbt models whose enforced `contract` was written to a `{model}.contract.toml` but not fully: a column type Rocky has no name for, or a constraint Rocky does not check (`unique`, `check`, ...).
    */
   contracts_dropped?: number;
   dbt_version?: string | null;

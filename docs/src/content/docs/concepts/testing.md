@@ -274,12 +274,14 @@ Run them with `--declarative`. A declarative test executes against the configure
 # Run declarative assertions against the warehouse
 rocky test --declarative
 
-# Pick a pipeline when the config defines more than one
+# Run one pipeline's models only, against that pipeline's warehouse
 rocky test --declarative --pipeline silver
 
 # Scope to one model
 rocky test --declarative --model orders_summary
 ```
+
+With no `--pipeline` and no `--models`, every transformation pipeline runs the tests of its own models, against the warehouse that pipeline targets.
 
 Each assertion compiles to a SQL query in the adapter's dialect. Rocky runs it against the model's target table and reports `pass`, `fail`, or `error`. A failed assertion with `severity = "error"` (the default) exits non-zero. One with `severity = "warning"` reports without failing the run. The `--output json` payload carries a `declarative` summary with the per-assertion results and the SQL that ran.
 
@@ -303,13 +305,16 @@ The singular and plural keys are two different test mechanisms:
 `rocky ci` runs the full CI pipeline: compile, then test. It is built for a CI system, so it returns a non-zero exit code on failure.
 
 ```bash
-rocky ci --models models/ --contracts contracts/
+rocky ci --contracts contracts/
 ```
+
+With no `--models`, `rocky ci` covers every transformation pipeline in `rocky.toml`. `--models <PATH>` limits it to one directory.
 
 ### Pipeline
 
-1. **Compile** -- run the full compiler: type checking and contract validation
-2. **Test** -- execute every model locally on DuckDB
+1. **Seed** -- run `data/seed.sql`, when the project has one, in an in-memory DuckDB
+2. **Compile** -- run the full compiler, typed from the seed's tables: type checking and contract validation
+3. **Test** -- execute every model in that database, upstream pipelines first
 
 Both phases must pass for the CI pipeline to succeed.
 
@@ -330,7 +335,8 @@ Rocky CI Pipeline
 |------|---------|
 | 0 | All checks passed |
 | 1 | Compilation or tests failed (type errors, contract violations, or models that failed to execute locally) |
-| 4 | Compiled and tested clean, but advisory warnings were emitted |
+
+Warnings do not change the exit code. The JSON `exit_code` is the same number the process exits with.
 
 ### JSON output
 

@@ -81,7 +81,7 @@ pub fn classify_command(name: &str) -> Option<CommandGroup> {
             Some(CommandGroup::Pipeline)
         }
         // Model
-        "compile" | "test" | "lineage" | "catalog" | "metrics" | "optimize" | "ci" => {
+        "compile" | "test" | "lint" | "lineage" | "catalog" | "metrics" | "optimize" | "ci" => {
             Some(CommandGroup::Model)
         }
         // Infra
@@ -120,6 +120,7 @@ fn commands_for_group(group: CommandGroup) -> &'static [(&'static str, &'static 
                 "Resolve dependencies, type check, validate contracts",
             ),
             ("test", "Run local model tests via DuckDB"),
+            ("lint", "Lint model SQL for style"),
             ("lineage", "Show column-level lineage for a model"),
             ("catalog", "Emit a project-wide column-lineage snapshot"),
             ("metrics", "Show quality metrics for a model"),

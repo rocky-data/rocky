@@ -266,17 +266,33 @@ fn test_contract_project_loads_contracts() {
 }
 
 #[test]
-fn test_contract_project_with_no_contracts_dir() {
-    let config = CompilerConfig {
+fn test_contract_project_reads_its_contracts_dir_without_a_flag() {
+    let discovered = CompilerConfig {
         models_dir: fixture_path("contract_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
         ..Default::default()
     };
+    let explicit = CompilerConfig {
+        contracts_dir: Some(fixture_path("contract_project/contracts")),
+        ..discovered.clone()
+    };
 
-    let result = compile(&config).unwrap();
-    // Without contracts dir, no contract diagnostics
-    assert!(result.contract_diagnostics.is_empty());
+    let codes = |config: &CompilerConfig| {
+        let mut codes: Vec<(String, String)> = compile(config)
+            .unwrap()
+            .contract_diagnostics
+            .iter()
+            .map(|d| (d.model.clone(), d.code.to_string()))
+            .collect();
+        codes.sort();
+        codes
+    };
+    // The project `contracts/` beside `models/` is read with no flag, and
+    // gives the same contract diagnostics as passing it explicitly.
+    let found = codes(&discovered);
+    assert!(!found.is_empty(), "the project contracts dir must be read");
+    assert_eq!(found, codes(&explicit));
 }
 
 // ---- Incremental compile (§P3.1) ----
@@ -1661,4 +1677,213 @@ fn dsl_in_list_compiles_to_boolean_with_3vl_nullability() {
         col("cold").nullable,
         "a NULL in the list makes NOT IN nullable"
     );
+}
+
+/// Dependency and name-resolution checks across the whole compile: a cycle
+/// through a `WHERE` sub-query, a missing source table (E045 / W045), and an
+/// ambiguous bare column (E029).
+mod dependency_and_name_checks {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use rocky_compiler::compile::{CompilerConfig, compile};
+    use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
+    use rocky_compiler::types::{RockyType, TypedColumn};
+
+    fn write_model(dir: &Path, name: &str, sql: &str, depends_on: &[&str]) {
+        std::fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        let deps = depends_on
+            .iter()
+            .map(|d| format!("\"{d}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\ndepends_on = [{deps}]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"main\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn cols(names: &[&str]) -> Vec<TypedColumn> {
+        names
+            .iter()
+            .map(|name| TypedColumn {
+                name: (*name).to_string(),
+                data_type: RockyType::Unknown,
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([
+            (
+                "shop.orders".to_string(),
+                cols(&["order_id", "customer_id", "amount", "status"]),
+            ),
+            (
+                "shop.customers".to_string(),
+                cols(&["customer_id", "name", "email"]),
+            ),
+        ])
+    }
+
+    fn compile_models(
+        models: &[(&str, &str, &[&str])],
+        origin: SourceSchemaOrigin,
+        strict: bool,
+    ) -> Result<rocky_compiler::compile::CompileResult, String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, sql, deps) in models {
+            write_model(dir.path(), name, sql, deps);
+        }
+        let source_schemas = sources();
+        let source_provenance =
+            SourceProvenance::uniform(source_schemas.keys(), &origin).with_strict(strict);
+        compile(&CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas,
+            source_provenance,
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn codes(result: &rocky_compiler::compile::CompileResult) -> Vec<&str> {
+        let mut codes: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity != rocky_compiler::diagnostic::Severity::Info)
+            .map(|d| d.code.as_ref())
+            .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    const STG_ORDERS: &str = "SELECT order_id, customer_id, amount, status FROM shop.orders";
+    const STG_CUSTOMERS: &str = "SELECT customer_id, name, email FROM shop.customers";
+    const LTV: &str = "SELECT customer_id, SUM(amount) AS lifetime_value FROM fct_orders \
+                       GROUP BY customer_id";
+    const FCT: &str = "SELECT order_id, customer_id, amount FROM stg_orders \
+                       WHERE status = 'completed'";
+
+    #[test]
+    fn a_cycle_through_a_where_subquery_is_refused_naming_both_models() {
+        let fct_reads_ltv = "SELECT order_id, customer_id, amount FROM stg_orders \
+                             WHERE status = 'completed' \
+                             AND customer_id IN (SELECT customer_id FROM customer_ltv)";
+        let err = compile_models(
+            &[
+                ("stg_orders", STG_ORDERS, &[]),
+                ("fct_orders", fct_reads_ltv, &["stg_orders"]),
+                ("customer_ltv", LTV, &["fct_orders"]),
+                ("top_customers", "SELECT customer_id FROM customer_ltv", &[]),
+            ],
+            SourceSchemaOrigin::Seed,
+            false,
+        )
+        .err()
+        .expect("fct_orders and customer_ltv read each other");
+        assert!(err.starts_with("circular dependency"), "{err}");
+        assert!(
+            err.contains("\"fct_orders\"") && err.contains("\"customer_ltv\""),
+            "{err}"
+        );
+        assert!(
+            !err.contains("top_customers"),
+            "a model that only reads the cycle is not named: {err}"
+        );
+
+        let ok = compile_models(
+            &[
+                ("stg_orders", STG_ORDERS, &[]),
+                ("fct_orders", FCT, &["stg_orders"]),
+                ("customer_ltv", LTV, &["fct_orders"]),
+            ],
+            SourceSchemaOrigin::Seed,
+            false,
+        )
+        .expect("without the sub-query read there is no cycle");
+        assert!(!ok.has_errors, "{:?}", ok.diagnostics);
+    }
+
+    #[test]
+    fn a_missing_source_table_warns_and_strict_refuses() {
+        let models: &[(&str, &str, &[&str])] = &[(
+            "stg_orders",
+            "SELECT order_id, customer_id FROM shop.orderz",
+            &[],
+        )];
+        let seed = compile_models(models, SourceSchemaOrigin::Seed, false).unwrap();
+        assert_eq!(codes(&seed), ["W045"], "{:?}", seed.diagnostics);
+        assert!(!seed.has_errors);
+
+        let strict = compile_models(models, SourceSchemaOrigin::Seed, true).unwrap();
+        assert_eq!(codes(&strict), ["E045"], "{:?}", strict.diagnostics);
+        assert!(strict.has_errors);
+
+        let live = compile_models(models, SourceSchemaOrigin::Live, false).unwrap();
+        assert_eq!(codes(&live), ["E045"], "{:?}", live.diagnostics);
+    }
+
+    const DIM: &str = "SELECT c.customer_id, c.name, COALESCE(l.lifetime_value, 0) AS ltv \
+                       FROM stg_customers AS c LEFT JOIN customer_ltv AS l \
+                       ON c.customer_id = l.customer_id";
+
+    fn project_with_dim(dim: &str) -> rocky_compiler::compile::CompileResult {
+        compile_models(
+            &[
+                ("stg_orders", STG_ORDERS, &[]),
+                ("stg_customers", STG_CUSTOMERS, &[]),
+                ("fct_orders", FCT, &[]),
+                ("customer_ltv", LTV, &[]),
+                ("dim_customers", dim, &[]),
+            ],
+            SourceSchemaOrigin::Seed,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ambiguous_bare_column_over_two_upstream_models_is_refused() {
+        let dim = DIM.replacen("c.customer_id, c.name", "customer_id, c.name", 1);
+        let result = project_with_dim(&dim);
+        assert_eq!(codes(&result), ["E029"], "{:?}", result.diagnostics);
+        let e029 = &result
+            .diagnostics
+            .iter()
+            .find(|d| &*d.code == "E029")
+            .unwrap();
+        assert_eq!(e029.model, "dim_customers");
+        assert!(e029.message.contains("customer_id"));
+    }
+
+    #[test]
+    fn valid_joins_over_upstream_models_stay_clean() {
+        for dim in [
+            DIM.to_string(),
+            // USING merges the key.
+            "SELECT customer_id, c.name FROM stg_customers AS c \
+             LEFT JOIN customer_ltv AS l USING (customer_id)"
+                .to_string(),
+            // A correlated sub-query reading a third model.
+            DIM.replacen(
+                "COALESCE(l.lifetime_value, 0) AS ltv",
+                "COALESCE(l.lifetime_value, 0) AS ltv, (SELECT COUNT(*) FROM stg_orders AS so \
+                 WHERE so.customer_id = c.customer_id) AS all_orders",
+                1,
+            ),
+            // One side unknown: an external table Rocky has no schema for.
+            "SELECT customer_id, c.name FROM stg_customers AS c \
+             LEFT JOIN ext.unknown_table AS u ON c.customer_id = u.customer_id"
+                .to_string(),
+        ] {
+            let result = project_with_dim(&dim);
+            assert!(codes(&result).is_empty(), "{dim}: {:?}", result.diagnostics);
+        }
+    }
 }

@@ -135,6 +135,7 @@ pub fn qualify_deferred_refs(
         return Ok(DeferQualifyOutcome {
             sql: sql.to_string(),
             setting_dependent_refs: Vec::new(),
+            qualified: std::collections::BTreeSet::new(),
         });
     }
 
@@ -150,12 +151,14 @@ pub fn qualify_deferred_refs(
         deferred,
         scopes: CteScopeStack::new(case_rules, recursive_visibility),
         setting_dependent_refs: Vec::new(),
+        qualified: std::collections::BTreeSet::new(),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
     Ok(DeferQualifyOutcome {
         sql: statement.to_string(),
         setting_dependent_refs: rewriter.setting_dependent_refs,
+        qualified: rewriter.qualified,
     })
 }
 
@@ -170,6 +173,10 @@ pub struct DeferQualifyOutcome {
     /// refuse on any: qualifying may read a table where the warehouse reads the
     /// CTE, and not qualifying may read whatever the working schema holds.
     pub setting_dependent_refs: Vec<String>,
+    /// The deferred model names whose bare references were qualified. A
+    /// caller that resolves targets lazily uses it to learn exactly which
+    /// deferred models the statement reads.
+    pub qualified: std::collections::BTreeSet<String>,
 }
 
 /// Whether each component of a qualified name carries case as part of object
@@ -948,6 +955,7 @@ struct DeferRewriter<'a> {
     deferred: &'a HashMap<String, DeferTarget>,
     scopes: CteScopeStack,
     setting_dependent_refs: Vec<String>,
+    qualified: std::collections::BTreeSet<String>,
 }
 
 impl VisitorMut for DeferRewriter<'_> {
@@ -988,7 +996,10 @@ impl VisitorMut for DeferRewriter<'_> {
         // Exhaustive on purpose: a future variant must be decided here.
         match binding {
             CteBinding::Bound => {}
-            CteBinding::Free => *relation = target.to_object_name(),
+            CteBinding::Free => {
+                self.qualified.insert(ident.value.clone());
+                *relation = target.to_object_name();
+            }
             // Bound under one reading of `QUOTED_IDENTIFIERS_IGNORE_CASE`, a
             // deferred-model read under the other. Report, don't guess.
             CteBinding::SettingDependent => self.setting_dependent_refs.push(relation.to_string()),

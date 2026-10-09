@@ -492,7 +492,7 @@ description = "Unique order identifier"
 description = "Order total in USD"
 ```
 
-`rocky catalog --output json` reports each description as the asset's `CatalogColumn.description`. Rocky attaches a description only when `<name>` matches a column the model actually projects. It drops a description for a column the SELECT does not produce, silently, so keep these keys in step with your output columns. The `rocky docs` HTML catalog carries no per-column detail, because it has no warehouse connection with which to read the column list. Descriptions reach consumers through `rocky catalog`, not the generated HTML.
+`rocky catalog --output json` reports each description as the asset's `CatalogColumn.description`. Rocky attaches a description only when `<name>` matches a column the model actually projects. It drops a description for a column the SELECT does not produce, silently, so keep these keys in step with your output columns. `rocky docs` shows each description next to its column on the model page. It takes the column list from the offline compile, so it needs no warehouse connection.
 
 The singular `[columns.<name>]` table documents columns, and is distinct from the plural `[[columns]]` array used to declare a contract's column schema. The two look similar but do different jobs.
 

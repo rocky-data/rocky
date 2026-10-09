@@ -21,15 +21,15 @@ rocky compile [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--models <PATH>` | `PathBuf` | every pipeline | Compile only the `.sql`, `.rocky` and `.toml` model files in this directory. Without it, Rocky compiles the models of every transformation pipeline together. See [The whole project by default](#the-whole-project-by-default). |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
 | `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). The flag also selects the warehouse for the `E042`/`E043` operand checks, ahead of the adapter type. See [Aggregate and comparison operands](/concepts/compiler/#aggregate-and-comparison-operands). |
 | `--deny-warnings <CODES>` | `string` (comma-separated, repeatable) | | Report the listed warning codes as errors and exit non-zero, such as `--deny-warnings W042,W043`. Other warnings stay warnings. A code that is not a warning code (`W999`, `W42`, `E042`) is refused before the compile, with the list of valid codes. |
-| `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
-| `--strict-sources` | `bool` | `false` | Treat every known source schema as current. A reference to a column the source lacks is the `E041` error, even when the schema came from a seed or an old cache entry. Without the flag, those schemas give the `W041` warning. Same as `[cache.schemas] strict_sources = true`. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041). |
+| `--with-seed` | `bool` | `false` | Require `data/seed.sql`, and use only its tables as the source schemas. Without the flag, Rocky still uses the seed when the project has one. The flag makes a missing or broken seed an error. Requires the `duckdb` feature (enabled by default in the shipped binary). |
+| `--strict-sources` | `bool` | `false` | Treat every known source schema as current. A reference to a column the source lacks is the `E041` error, even when the schema came from a seed or an old cache entry. Without the flag, those schemas give the `W041` warning. A read of a table missing from a known schema is likewise the `E045` error instead of the `W045` warning. Same as `[cache.schemas] strict_sources = true`. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041). |
 | `--dbt-project <DIR>` | `PathBuf` | | **Experimental.** Compile a dbt project in place (attach mode). See [Attach to a dbt project](#attach-to-a-dbt-project-experimental). Conflicts with `--models` and `--with-seed`. |
 
 ### Examples
@@ -39,6 +39,32 @@ Compile all models:
 ```bash
 rocky compile
 ```
+
+#### The whole project by default
+
+With no `--models`, `rocky compile` reads the models of every transformation pipeline in `rocky.toml` and compiles them as one project graph. A model in one pipeline that reads the output of another pipeline gets that output's column types. So a type error across pipelines is found in one command.
+
+```
+[pipeline.transform]  models = "models/**"     ─┐
+                                                 ├─► one compile, one graph
+[pipeline.reporting]  models = "reporting/**"  ─┘
+```
+
+Each model is still checked against the warehouse of the pipeline that runs it. Two model files with the same name in different pipelines are an error.
+
+A project with no transformation pipeline compiles the `models` directory. `--models <PATH>` compiles that one directory only, as before.
+
+#### Source schemas
+
+Rocky types the models that read source tables from these schemas, in this order:
+
+1. With `--with-seed`: the tables of `data/seed.sql` only.
+2. Otherwise: the schema cache, when `[cache.schemas]` is enabled.
+3. Plus, when the project has `data/seed.sql`: every seed table the cache does not hold.
+
+The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed that fails to run is skipped, and the compile goes on without it. Only `--with-seed` makes that an error. The seed is SQL from your repository, so it runs only for the `rocky compile` command itself. The compile behind `rocky serve` and the MCP compile tool does not run it.
+
+`data/seed.sql` is beside `rocky.toml` for a whole-project compile. With `--models <PATH>`, it is one level up from that directory.
 
 ```json
 {
@@ -190,9 +216,9 @@ Compile with seeded source schemas so leaf `.sql` models pick up real types:
 rocky compile --with-seed
 ```
 
-`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+`--with-seed` opens an in-memory DuckDB, runs `data/seed.sql`, and gives the compiler the column types of the tables it made. So type inference gets concrete types instead of `RockyType::Unknown`. It stops with an error if `data/seed.sql` is missing or fails to run.
 
-A seed can be out of date. So a reference to a column the seed lacks is the `W041` warning, and the compile still exits `0`. Add `--strict-sources` to refuse it with the `E041` error instead:
+A seed can be out of date. So a reference to a column the seed lacks is the `W041` warning, and a read of a table the seed lacks in a schema it does create (`FROM staging.orderz` when the seed creates `staging.orders`) is the `W045` warning. The compile still exits `0`. Add `--strict-sources` to refuse them with the `E041` and `E045` errors instead:
 
 ```bash
 rocky compile --with-seed --strict-sources
@@ -812,6 +838,107 @@ emit-sql: 1 model(s) not emitted:
 
 ---
 
+## `rocky lint`
+
+Check model SQL for style problems. The rules find queries that are hard to read or easy to break, such as a bare `JOIN` or a column with no table name in a two-table query. They do not check that a query is correct. `rocky compile` does that.
+
+```bash
+rocky lint                          # Lint every .sql file under models/
+rocky lint models/marts/            # Lint one directory
+rocky lint models/fct_orders.sql    # Lint one file
+rocky lint --fix                    # Rewrite the fixable findings in place
+rocky lint --output json            # Machine-readable findings
+```
+
+`rocky lint` reads `.sql` files. It does not read `.rocky` files. Use [`rocky fmt`](/reference/cli/) for those.
+
+**Arguments and flags:**
+
+| Argument or flag | Default | Description |
+|------------------|---------|-------------|
+| `[PATHS]...` | `models` | `.sql` files or directories. Directories are searched recursively. Hidden directories and `target` are skipped. |
+| `--fix` | off | Rewrite the findings marked "fixable" in the table below. Rocky does not write a file if the fix would make a readable file stop parsing. |
+
+### Rules
+
+| Code | Name | Default severity | Flags | Fix |
+|------|------|------------------|-------|-----|
+| `S001` | `ambiguous-column` | warning | A column with no table qualifier in a query that reads two or more tables. `JOIN ... USING` columns, output aliases, subquery columns and lambda parameters are not flagged. | Report only |
+| `S002` | `implicit-inner-join` | warning | A bare `JOIN`. Write `INNER JOIN`. | `--fix` inserts `INNER` |
+| `S003` | `select-star` | info | `SELECT *` or `t.*` in the final result of a statement. A `SELECT *` in a CTE or a subquery is not flagged. | Report only |
+| `S004` | `target-order` | info | A plain column listed after a calculated column. Order the list as wildcards, plain columns, then calculations. | Report only |
+| `S005` | `keyword-case` | warning | A keyword whose capitalisation differs from the rest of the file. The majority style wins. | `--fix` recases |
+| `S006` | `trailing-whitespace` | warning | Spaces or tabs at the end of a line. Lines inside a multi-line string are not touched. | `--fix` trims |
+| `S007` | `tab-character` | warning | A tab outside a string or a comment. | `--fix` writes spaces |
+
+`S004` is report only because moving a column changes the model's output schema. `S003` complements the `P002` lint in [Linters](/concepts/linters/). `P002` fires only when a downstream model reads specific columns. `S003` fires on every final `SELECT *`.
+
+`S001`, `S003` and `S004` need a parse. If a file does not parse, Rocky skips these three rules for that file, prints a note, and still runs the text rules.
+
+### Configuration
+
+Switch rules off or change their severity in `rocky.toml`. An unknown rule code is an error.
+
+```toml
+[lint]
+disable = ["S003", "S004"]
+
+[lint.severity]
+S001 = "error"
+```
+
+Severity is `"error"`, `"warning"` or `"info"`. The command exits with code `1` when at least one finding has `error` severity. Warnings and info findings never fail the run.
+
+### Example
+
+```text
+$ rocky lint models/
+models/fct_orders.sql:6:12: warning[S001] column `amount` has no table qualifier in a query that reads 2 tables
+    hint: write `<alias>.amount`
+models/fct_orders.sql:8:1: warning[S002] bare JOIN does not say which kind of join it is
+    hint: write INNER JOIN
+3 file(s) checked: 0 error(s), 2 warning(s), 0 info
+1 finding(s) can be fixed with `rocky lint --fix`
+```
+
+### JSON output
+
+`rocky lint --output json` prints a `LintOutput` object:
+
+```json
+{
+  "version": "1.78.0",
+  "command": "lint",
+  "files_checked": 3,
+  "findings": [
+    {
+      "code": "S002",
+      "rule": "implicit-inner-join",
+      "severity": "warning",
+      "file": "models/fct_orders.sql",
+      "line": 8,
+      "col": 1,
+      "message": "bare JOIN does not say which kind of join it is",
+      "hint": "write INNER JOIN",
+      "fixable": true
+    }
+  ],
+  "counts": { "error": 0, "warning": 1, "info": 0 },
+  "fixed": 0,
+  "files_fixed": [],
+  "ast_rules_skipped": []
+}
+```
+
+With `--fix`, `findings` lists what is left after the rewrite. `fixed` counts the findings that were rewritten.
+
+### Related Commands
+
+- [`rocky compile`](#rocky-compile) -- correctness diagnostics, including the `P001` and `P002` lints
+- [Linters](/concepts/linters/) -- the semantic lints that run inside `rocky compile`
+
+---
+
 ## `rocky test`
 
 Run local model tests via DuckDB without needing warehouse credentials. Validates model SQL, contract compliance, and user-defined test assertions.
@@ -824,10 +951,16 @@ rocky test [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--models <PATH>` | `PathBuf` | `models/` beside the config file | Directory containing model files. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 | `--model <NAME>` | `string` | | Run tests for a single model only. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
+| `--declarative` | `bool` | `false` | Run the `[[tests]]` of model sidecars against the warehouse instead of DuckDB. |
+| `--pipeline <NAME>` | `string` | | With `--declarative`: run the tests of the models in `--models` against this pipeline's warehouse. Without it and without `--models`, every transformation pipeline runs its own models' tests against its own warehouse. |
+
+`rocky test` runs `data/seed.sql` first, when the project has one, and types its compile from the tables the seed made. The models then run on those tables. So a contract type mismatch (`E011`) or a column the seed lacks (`W041`) is reported before any model runs.
+
+With a `rocky.toml`, the compile also runs the per-model-target checks of [`rocky ci`](#rocky-ci) (`E042`/`E043`, `E057`, `E044`, `E049`, `E051`, `E053` and `E054`). An error from them fails `rocky test` before any model runs.
 
 ### Examples
 
@@ -939,8 +1072,24 @@ rocky ci [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--models <PATH>` | `PathBuf` | every pipeline | Run only the models in this directory. Without it, `rocky ci` runs the models of every transformation pipeline. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
+
+With no `--models`, `rocky ci` compiles every transformation pipeline's models as one project graph, as [`rocky compile`](#the-whole-project-by-default) does. Then it runs them all in one in-memory DuckDB, in dependency order. So a model in a downstream pipeline reads the tables its upstream pipelines made.
+
+```
+data/seed.sql ─► in-memory DuckDB ─► compile (typed from the seed) ─► run every model, upstream first
+```
+
+The seed is `data/seed.sql` beside `rocky.toml`. The compile is typed from the tables it made, so `rocky ci` finds a contract type mismatch (`E011`) from the seed alone.
+
+The compile runs the same per-model-target checks as [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`. `E054` is judged on the SQL each model runs, with its ephemeral upstreams inlined, as `rocky run` sends it.
+
+The project files are found beside the config file, not the working directory. So `rocky --config sub/rocky.toml ci` run from the directory above reads `sub/contracts/` and `sub/functions/`. `rocky compile` and `rocky test` do the same when you pass no `--models`.
+
+A dependency cycle is the `E058` error, one for each model on the cycle. `rocky ci` prints its JSON with these diagnostics, runs no model, and exits `1`. See [Dependency cycles](/concepts/compiler/#dependency-cycles-e058).
+
+`exit_code` in the JSON is the code the process exits with: `0` when compile and tests pass, `1` when either fails. Warnings do not change it. To act on warnings, read the `"severity": "Warning"` entries in `diagnostics`.
 
 ### Examples
 

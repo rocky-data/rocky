@@ -468,7 +468,7 @@ impl ContainmentLedger {
             },
             // The stuck set (cycle + downstream) can't be ordered — fail closed:
             // contain it, and layer only the acyclic remainder.
-            Err(DagError::CyclicDependency { nodes: stuck }) => {
+            Err(DagError::CyclicDependency { nodes: stuck, .. }) => {
                 let stuck_set: HashSet<&str> = stuck.iter().map(String::as_str).collect();
                 let acyclic: Vec<DagNode> = nodes
                     .iter()

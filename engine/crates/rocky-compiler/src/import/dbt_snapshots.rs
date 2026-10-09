@@ -236,6 +236,7 @@ fn imported_snapshot(
             target_table_declared: String::new(),
         },
         unit_tests: Vec::new(),
+        contract_toml: None,
     }
 }
 

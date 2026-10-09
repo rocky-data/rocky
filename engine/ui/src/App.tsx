@@ -9,7 +9,7 @@ import {
 import { Dialog, DialogBackdrop, DialogPanel, useClose } from "@headlessui/react";
 import { Bars3Icon, XMarkIcon } from "@heroicons/react/24/outline";
 import type { MetaOutput } from "@rocky-types/meta";
-import { ApiError, apiGet } from "./api";
+import { ApiError, SESSION_EXPIRED_EVENT, apiGet } from "./api";
 import {
   AREAS,
   NOT_YET_HEADING,
@@ -24,7 +24,12 @@ import { EstateScreen } from "./estate/EstateScreen";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { ReviewScreen } from "./review/ReviewScreen";
 import { laneFromPath, navigateTo, usePathname, type Lane } from "./router";
-import { currentToken } from "./token";
+import {
+  OperatorBanner,
+  WriteAccessProvider,
+  accessFromScope,
+  type WriteAccess,
+} from "./operator";
 
 interface ErrorBoundaryState {
   error: Error | undefined;
@@ -56,7 +61,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
 
 type EngineState =
   | { kind: "loading" }
-  | { kind: "no_token" }
+  | { kind: "expired" }
   | { kind: "ready"; meta: MetaOutput }
   | { kind: "refused"; error: ApiError }
   | { kind: "unreachable"; message: string };
@@ -80,15 +85,19 @@ const fetchMetaFromEngine = (): Promise<MetaOutput> => apiGet<MetaOutput>("meta"
  * shell calls this once and hands the state to each copy.
  */
 export function useEngineMeta(
-  token: string | null,
   fetchMeta: () => Promise<MetaOutput> = fetchMetaFromEngine,
 ): EngineState {
-  const [state, setState] = useState<EngineState>(
-    token === null ? { kind: "no_token" } : { kind: "loading" },
-  );
+  const [state, setState] = useState<EngineState>({ kind: "loading" });
+
+  // Any `401`, from any panel, means the session is gone: a restarted
+  // server made a new key, or the login link was never opened.
+  useEffect(() => {
+    const onExpired = () => setState({ kind: "expired" });
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, []);
 
   useEffect(() => {
-    if (token === null) return;
     let cancelled = false;
     fetchMeta()
       .then((meta) => {
@@ -96,30 +105,29 @@ export function useEngineMeta(
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        if (error instanceof ApiError) setState({ kind: "refused", error });
+        if (error instanceof ApiError && error.status === 401) setState({ kind: "expired" });
+        else if (error instanceof ApiError) setState({ kind: "refused", error });
         else setState({ kind: "unreachable", message: String(error) });
       });
     return () => {
       cancelled = true;
     };
-  }, [fetchMeta, token]);
+  }, [fetchMeta]);
 
   return state;
 }
 
 /**
- * The engine panel: `GET /api/v1/meta` with the tab's token. It proves the
- * whole path on every load: embedded assets, token bootstrap, bearer
- * header, typed payload, envelope on refusal.
+ * The engine panel: `GET /api/v1/meta` with the session cookie. It proves the
+ * whole path on every load: embedded assets, the login cookie, typed
+ * payload, envelope on refusal.
  */
 export function EnginePanel({
   fetchMeta = fetchMetaFromEngine,
-  token = currentToken(sessionStorage),
 }: {
   fetchMeta?: () => Promise<MetaOutput>;
-  token?: string | null;
 }) {
-  return <EngineLine state={useEngineMeta(token, fetchMeta)} />;
+  return <EngineLine state={useEngineMeta(fetchMeta)} />;
 }
 
 /** One engine state, drawn. Owns no read, so it can be drawn twice. */
@@ -129,18 +137,8 @@ export function EngineLine({ state }: { state: EngineState }) {
   const capabilitiesId = useId();
 
   switch (state.kind) {
-    case "no_token":
-      return (
-        <EmptyState
-          title="No token for this tab"
-          detail={
-            <>
-              Open the address <code>rocky serve --ui</code> printed; it carries the token in its
-              fragment.
-            </>
-          }
-        />
-      );
+    case "expired":
+      return <SessionExpired />;
     case "loading":
       return <p className="text-sm text-zinc-500">Reaching the engine…</p>;
     case "refused":
@@ -159,7 +157,7 @@ export function EngineLine({ state }: { state: EngineState }) {
       const count = meta.capabilities.length;
       const capabilities = meta.capabilities.join(", ");
       // One line, not three cards. It still proves the whole path works —
-      // embedded assets, token bootstrap, bearer header, typed payload — but
+      // embedded assets, the session cookie, typed payload — but
       // it stops spending the top of every screen saying so. The full
       // capability list moves into a tooltip, the idiom the governor tabs
       // already use for their producer routes.
@@ -195,22 +193,25 @@ function Dot() {
   return <span className="px-1.5 text-zinc-400 dark:text-zinc-600">·</span>;
 }
 
+/** The words of the sign-in note. Exported so tests pin one string. */
+export const SESSION_EXPIRED_TITLE = "Session expired";
+
 /**
- * What the page is when this tab holds no token.
+ * What the page is when the session is gone: any `401`.
  *
  * It is the whole page, not a banner above one: every lane's panels read the
- * API, and without a token each read is a refusal the viewer can do nothing
- * about. Four `REFUSED (401)` cards under a "no token" notice describe the
+ * API, and without a session each read is a refusal the viewer can do
+ * nothing about. Four `REFUSED (401)` cards under one notice describe the
  * same single fact four times and read as a broken install.
  */
-function NoToken() {
+function SessionExpired() {
   return (
     <EmptyState
-      title="No token for this tab"
+      title={SESSION_EXPIRED_TITLE}
       detail={
         <>
-          Open the address <code>rocky serve --ui</code> printed. It carries the token in its
-          fragment, which this page reads once and then clears from the address bar.
+          Open the newest <code>Rocky UI:</code> link from the console. Each start of{" "}
+          <code>rocky serve --ui</code> makes a new one, and a restart ends the old session.
         </>
       }
     />
@@ -387,8 +388,10 @@ function SidebarContents({ current, engine }: { current: AreaId; engine: ReactNo
  * The shell: the sidebar of areas, the engine line in its footer, and the
  * selected lane.
  *
- * The token check is **one boundary here**, above `LaneScreen` and the engine
- * line, rather than a gate inside each lane. A lane cannot gate itself:
+ * The session check is **one boundary here**, above `LaneScreen` and the
+ * engine line, rather than a gate inside each lane: any `401` (the meta read,
+ * or a panel's, through `SESSION_EXPIRED_EVENT`) swaps the whole page for the
+ * sign-in note. A lane cannot gate itself:
  * returning after its `useResource` calls is too late, the loads have already
  * started, and returning before them makes the hooks conditional. One boundary
  * is also the only shape that stays true when a lane is added — a per-lane
@@ -404,28 +407,35 @@ function SidebarContents({ current, engine }: { current: AreaId; engine: ReactNo
  * the fixed sidebar. Escape and focus return are the dialog's own.
  *
  * The engine read is the shell's, not the sidebar's, so the drawer and the
- * rail draw the same one read.
+ * rail draw the same one read. It also says what the page may change
+ * (`token_scope`): the shell hands that to every control through
+ * `WriteAccessProvider`, and draws the operator-mode bar, sticky at the top,
+ * whenever the page can change things.
  */
 export function App({
   engine,
   estate,
   review,
   governor,
-  token = currentToken(sessionStorage),
+  fetchMeta = fetchMetaFromEngine,
 }: {
   engine?: ReactNode;
   estate?: ReactNode;
   review?: ReactNode;
   governor?: ReactNode;
-  token?: string | null;
+  fetchMeta?: () => Promise<MetaOutput>;
 }) {
   const pathname = usePathname();
   const lane: Lane = laneFromPath(pathname);
   const area = areaFromPath(pathname);
   const [menuOpen, setMenuOpen] = useState(false);
-  // One read for both copies of the sidebar, and none without a token.
-  const engineState = useEngineMeta(token);
-  const engineLine = token === null ? null : (engine ?? <EngineLine state={engineState} />);
+  // One read for both copies of the sidebar.
+  const engineState = useEngineMeta(fetchMeta);
+  const expired = engineState.kind === "expired";
+  const engineLine = expired ? null : (engine ?? <EngineLine state={engineState} />);
+  // What the page may change. Until the engine has said, nothing.
+  const access: WriteAccess | null =
+    engineState.kind === "ready" ? accessFromScope(engineState.meta.token_scope) : null;
   const areaLabel = AREAS.find((entry) => entry.id === area)?.label ?? "Rocky";
 
   // Fold on any route change, Back and Forward included, not only on a click.
@@ -445,6 +455,14 @@ export function App({
 
   return (
     <ErrorBoundary>
+      <WriteAccessProvider
+        value={
+          access ?? {
+            kind: "read_only",
+            reason: "The engine has not said yet what this UI may change.",
+          }
+        }
+      >
       <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
         {/* The drawer, below `lg`. Mounted only while open. */}
         <Dialog
@@ -478,7 +496,8 @@ export function App({
           <SidebarContents current={area} engine={engineLine} />
         </div>
 
-        <div className="sticky top-0 z-40 flex items-center gap-x-6 border-b border-zinc-200 bg-white px-4 py-4 sm:px-6 lg:hidden dark:border-white/10 dark:bg-zinc-900">
+        <div className="sticky top-0 z-40 lg:pl-72">
+        <div className="flex items-center gap-x-6 border-b border-zinc-200 bg-white px-4 py-4 sm:px-6 lg:hidden dark:border-white/10 dark:bg-zinc-900">
           <button
             type="button"
             aria-expanded={menuOpen}
@@ -494,11 +513,13 @@ export function App({
           </div>
           <Wordmark className="flex" />
         </div>
+        {access !== null && !expired && <OperatorBanner access={access} />}
+        </div>
 
         <main className="py-10 lg:pl-72">
           <div className="mx-auto max-w-6xl space-y-4 px-4 sm:px-6 lg:px-8">
-            {token === null ? (
-              <NoToken />
+            {expired ? (
+              <SessionExpired />
             ) : (
               <LaneScreen
                 lane={lane}
@@ -510,6 +531,7 @@ export function App({
           </div>
         </main>
       </div>
+      </WriteAccessProvider>
     </ErrorBoundary>
   );
 }

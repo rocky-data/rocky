@@ -374,7 +374,7 @@ jobs:
           ./target/release/rocky --config "$tmp/play/rocky.toml" serve --ui --models "$tmp/play/models" --token t --token-scope read-only --port 18080 > "$tmp/serve.log" 2>&1 &
           server=$!
           for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:18080/api/v1/health && break; sleep 0.2; done
-          grep -q "http://127.0.0.1:18080/ui/#token=t" "$tmp/serve.log"
+          grep -q "http://127.0.0.1:18080/login?t=t" "$tmp/serve.log"
           curl -fsS -D - -o /dev/null http://127.0.0.1:18080/ui/ | grep -qi "content-security-policy"
           test "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/api/v1/meta)" = "401"
           test "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: evil.example" http://127.0.0.1:18080/ui/)" = "421"

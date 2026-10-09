@@ -12,12 +12,13 @@ class ApproverSource(StrEnum):
     """
     Where the approval signature was produced.
 
-    Reserved for future CI / OIDC paths. Today only the `Local` variant is emitted by the CLI.
+    `Local` is a CLI or MCP sign-off on this machine. `HttpApi` is a sign-off made through `POST /api/v1/jobs/approve`: the child `rocky review --approve` runs with `ROCKY_SESSION_SOURCE=http_api`. It names the channel, not the person. The identity beside it is the server's git identity, and nothing proves a browser made the call. `CiOidc` and `Pat` are reserved for future CI / OIDC paths.
     """
 
     local = "local"
     ci_oidc = "ci_oidc"
     pat = "pat"
+    http_api = "http_api"
 
 
 class SignatureAlgorithm1(StrEnum):

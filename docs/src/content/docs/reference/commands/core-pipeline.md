@@ -305,7 +305,7 @@ Four plan kinds are always gated, whatever the policy: `ai_authored`, `backfill`
 
 ### Flags
 
-Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic`, `--intent` and `--base`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
+Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic`, `--intent`, `--base` and `--cost-estimate`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
 
 Rocky records the execution flags in the plan file, so `rocky apply` replays the same intent. The recorded set is:
 
@@ -346,6 +346,25 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
 | `--intent <INTENT>` | `string` | | **Experimental.** State what the change is meant to do, and check it on the data. The only value is `refactor`. See [Check a refactor with `--intent`](#check-a-refactor-with---intent). |
 | `--base <ref>` | `string` | `main` | Git ref the working tree is compared against. `--semantic` and `--intent` use it. The change classification that every run plan carries uses it too. |
+| `--cost-estimate <MODE>` | `string` | `heuristic` | How `cost_preview` is estimated. `heuristic` is offline and never contacts the warehouse. `adapter` asks the warehouse with `EXPLAIN`. See [Cost preview](#cost-preview). Not recorded in the plan. |
+
+### Cost preview
+
+When the plan covers transformation models, the JSON output has a `cost_preview` object. It shows what applying the plan would rebuild, and roughly what it would cost, before any model runs.
+
+| Field | Meaning |
+|---|---|
+| `is_estimate` | Always `true`. Every figure is an estimate. |
+| `source` | `heuristic`, `adapter`, or `mixed` when the adapter could not estimate some models. Each row in `models` has its own `source`. |
+| `models_to_rebuild` | The rebuild scope: the number of models the plan rebuilds. |
+| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over every model. A total is absent when any model lacks the figure. |
+| `previous_cost_usd` | The observed cost of the same models in the last successful production run, priced from the state store. Absent when any model has no such run. |
+| `cost_delta_usd` | `estimated_cost_usd - previous_cost_usd`. Set only when every model has an adapter estimate and a previous cost. |
+| `notes` | Why a figure is missing, for example a failed `EXPLAIN`. |
+
+The default `heuristic` uses the same cost model as `cost_hint` in `rocky compile`. It assumes placeholder statistics for source tables, so its confidence is always `low`. Use it to compare plans, not to set a budget. A DuckDB target costs `0`. `--cost-estimate adapter` runs `EXPLAIN` for each planned model, as [`rocky estimate`](/reference/cli/#rocky-estimate) does. A model the adapter cannot estimate falls back to the heuristic, with a note.
+
+The preview is report-only. It never changes the planned models, the budget check or the exit code, and it is not part of `plan_id`.
 
 > The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal: the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
 
@@ -546,9 +565,14 @@ Staleness checking is per plan kind. The three kinds below differ in what they c
 
 **`replication`.** Apply re-runs discovery and compares the result against the snapshot taken at plan time. A difference aborts an unfiltered apply and tells you to re-plan. When the plan carries a `--filter`, a difference outside the filter scope logs a warning and the apply continues. A difference inside the filter scope still aborts.
 
-**`run`.** Apply reloads `rocky.toml` and recompiles the current models, then executes those. For a human applier there is no comparison against plan time. So a `run` plan applied after you edit a model executes the edited model, not the one you reviewed. Under an agent principal (`--principal agent`, or `ROCKY_PRINCIPAL=agent`) Rocky does compare: it checks the plan's recorded model fingerprint and routing identity against the current project, and refuses on a mismatch.
+**`run`.** Apply reloads `rocky.toml` and recompiles the current models, then executes those. It does not replay SQL stored in the plan. So it first checks the plan's models. A plan records a fingerprint of the models it runs, and a second one of those models plus the config they run under. If a model was added, removed or edited after the plan was made, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". The same check covers `ai_authored` and `backfill` plans. It runs after the policy and review gates and before any warehouse statement.
 
-A review-gated `--dag` plan (agent-authored, or AI-authored) is the exception for a human applier. Its fingerprint and its `rocky review` approval cover every model the DAG runs: each transformation pipeline's models, from that pipeline's own directory and file glob. The fingerprint also covers the project's seeds (data, sidecar and seed hooks). Before the DAG runs, apply recomputes that fingerprint and refuses if any model or seed was added, removed or changed. An agent applying a `--dag` plan is still refused, because the DAG's sub-runs are not yet policy-gated.
+- A person's apply compares the models only. A plan made in one shell and applied from another environment (for example a `rocky serve` job), or after an edit to another pipeline, still applies. It does not re-check that config (`[run]`, `[hook]`, governance), so a config edit made after approval applies too. The one exception is `[mask]`: where the run applies masks (a replication plan made with `--all` or `--models`), a change to the strategy of a tag those models classify with, as resolved for the plan's `--env`, refuses with `plan_models_changed`. A `${VAR}` inside a model's SQL or sidecar is part of the models: a different value refuses with `plan_models_changed`. The models can still change between this check and the run's own compile.
+- An agent's apply (`--principal agent`, or `ROCKY_PRINCIPAL=agent`) compares the models and the config. If only the config changed, it refuses with `plan_config_changed`. It also checks the routing identity, and repeats the fingerprint check when the models execute. `ai_authored` and `backfill` plans always apply as an agent.
+- A plan whose models did not compile at plan time has no fingerprint and is not checked. Nor is a snapshot, load, quality or replication-only plan.
+- A plan made before this release refuses with `plan_snapshot_missing`. Plan it again, and review it again if it needs approval.
+
+A review-gated `--dag` plan (agent-authored, or AI-authored) is checked across the whole DAG, against the models and the config they run under. Its fingerprint and its `rocky review` approval cover every model the DAG runs: each transformation pipeline's models, from that pipeline's own directory and file glob. The fingerprint also covers the project's seeds (data, sidecar and seed hooks). Before the DAG runs, apply recomputes that fingerprint and refuses if any model or seed was added, removed or changed. An agent applying a `--dag` plan is still refused, because the DAG's sub-runs are not yet policy-gated.
 
 **`promote`.** The plan stores the branch-state hash that `rocky plan promote` computed. Apply does not recompute it, and it does not re-run the approval or breaking-change gates. Those ran at plan time, which is what makes "plan in the pull request, apply on merge" work. The `[policy]` gate described below still runs at apply time.
 
@@ -611,8 +635,8 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, `--contracts`, or `--resume`. |
-| `--contracts <PATH>` | `PathBuf` | | Check the selected model against its contract in this directory during the run's own compile. Requires `--model` and `--pipeline`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, or `--resume`. |
+| `--contracts <PATH>` | `PathBuf` | | Contracts directory for this run. Default: the project `contracts/` directory. With `--model` and `--pipeline`, the selected model must have a contract there. Not with `--watch`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
@@ -627,6 +651,8 @@ rocky run [flags]
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
+| `--defer-to-state <PATH>` | `PathBuf` | | Saved production state store file the deferred upstreams resolve from. Requires `--defer`; conflicts with `--defer-to`. Each unbuilt upstream a selected model reads resolves to the table the newest successful production run recorded for it. Opened read-only. Refuses before any write when the store is missing, has an incompatible state schema version, or has no recorded table for a needed upstream. See [Defer to a saved production state](/guides/skip-and-defer/#defer-to-a-saved-production-state). |
+| `--defer-run-id <RUN_ID>` | `string` | | Read deferred upstreams only from this production run in the `--defer-to-state` store. Requires `--defer-to-state`. |
 | `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
 | `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
 | `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`, so the table holds the model's full result. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and rebuilding from it would drop history. The flag also turns off the `--skip-unchanged` gate. |
@@ -667,9 +693,23 @@ that run if the old flush is uncertain. See
 [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
 for recovery routes, supported adapters and remote durability limits.
 
+### Contracts on every run
+
+Every `rocky run` reads the project `contracts/` directory, with no flag. That is the `contracts/` directory beside the models directory, usually next to `rocky.toml`. `rocky compile`, `rocky ci` and `rocky test` read the same directory.
+
+The run checks each contract in the compile that supplies the model SQL. This applies to `--dag`, `--pipeline`, `--all`, `--select` and `--model`. When a model has a contract error (`E010` to `E013`):
+
+- Rocky does not write that model. Its existing table stays.
+- Rocky does not run the models downstream of it.
+- The run exits non-zero. Under `--dag`, the failed node's `error` names the code, for example `first error: fct_orders: [E012] ...`.
+
+A contract can declare a column type that Rocky cannot infer from the SQL alone, because the source table has no known schema. The compile reports that as `I003`. The run then reads that source's columns from the warehouse and compiles again, so it checks the type before it writes. If the warehouse cannot describe the source, the type stays unchecked.
+
+`--contracts <DIR>` replaces the project directory for one run. A contract in the project directory for a model that the compile does not include is skipped, because one directory serves every pipeline. A contract in an explicit `--contracts` directory for an unknown model is still the `W011` warning.
+
 ### Guard one model with a contract
 
-Use `--contracts` when you build one `full_refresh` transformation model:
+Use `--contracts` with `--model` and `--pipeline` when you build one `full_refresh` transformation model and want the run to require its contract:
 
 ```bash
 rocky run --pipeline transform --model int_order_lines --contracts contracts -o json
@@ -677,7 +717,7 @@ rocky run --pipeline transform --model int_order_lines --contracts contracts -o 
 
 The directory must exist and contain `int_order_lines.contract.toml`. Rocky checks that contract in the compile that supplies the model SQL for this run. An error such as `E010` fails the run before Rocky replaces the selected table. The failure JSON includes the compile error and has no materialization for that model.
 
-This first route does not cover a whole pipeline, `--dag`, `--all`, `rocky apply`, a branch, or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
+This guard does not cover a branch or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
 
 ### Pipeline Stages
 

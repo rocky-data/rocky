@@ -131,9 +131,9 @@ pub enum WarningCategory {
     /// default), so the importer emitted a stub DuckDB adapter. Surfaced
     /// loudly so the migration never silently defaults to duckdb.
     ProfileFallback,
-    /// A dbt model `contract` (`enforced: true`), column `data_type`s, or
-    /// column `constraints` were dropped on import. Rocky enforces contracts
-    /// via a `{model}.contract.toml` sidecar the importer doesn't generate.
+    /// An enforced dbt model `contract` was written to a
+    /// `{model}.contract.toml`, but a column type or constraint has no Rocky
+    /// check.
     DroppedContract,
     /// A dbt construct was mapped to a native Rocky equivalent rather than
     /// dropped — informational, not a degradation. Today this covers
@@ -223,18 +223,20 @@ pub enum ImportDbtStructuredWarning {
         name: String,
         detail: String,
     },
-    /// A dbt model `contract` (`contract: { enforced: true }`), column
-    /// `data_type`s, and/or column `constraints` were dropped on import.
-    /// Rocky enforces contracts via a `{model}.contract.toml` sidecar, but
-    /// the importer doesn't auto-generate one — the user must hand-author it.
-    /// Stub generation is out of scope; this is visibility only.
+    /// A dbt model `contract` (`contract: { enforced: true }`) was written to
+    /// a `{model}.contract.toml`, but part of it has no Rocky check.
     DroppedContract {
         model: String,
-        /// Number of columns that declared a `data_type`.
+        /// Number of columns whose `data_type` has no Rocky type name.
         typed_columns: usize,
-        /// Number of declared column constraints across all columns.
+        /// Number of constraints Rocky does not check, other than
+        /// `not_null` and `primary_key`.
         constraints: usize,
-        /// Path (relative to the emitted repo) the user should author.
+        /// Number of `not_null` and `primary_key` constraints. The contract
+        /// does not check them: Rocky cannot prove a column NOT NULL from the
+        /// sources, so `nullable = false` would refuse a valid model.
+        not_null_constraints: usize,
+        /// Path (relative to the emitted repo) of the generated contract.
         contract_path: String,
     },
 }
@@ -298,9 +300,9 @@ pub struct ImportResult {
     /// detected and skipped (snapshots, metrics, semantic models, exposures).
     /// Surfaced so a migration is never silently lossy.
     pub constructs_dropped: usize,
-    /// Number of dbt models whose enforced `contract` (column `data_type`s /
-    /// `constraints`) was dropped on import. Rocky enforces contracts via a
-    /// `{model}.contract.toml` sidecar the importer doesn't auto-generate.
+    /// Number of dbt models whose enforced `contract` was written to a
+    /// `{model}.contract.toml` but not fully: a column type Rocky has no name
+    /// for, or a constraint Rocky does not check (`unique`, `check`, ...).
     pub contracts_dropped: usize,
 }
 
@@ -313,6 +315,9 @@ pub struct ImportedModel {
     /// Emitted as `[[test]]` blocks alongside the sidecar TOML; not yet
     /// wired into the runtime test runner.
     pub unit_tests: Vec<UnitTestDef>,
+    /// Body of `<name>.contract.toml`, generated from an enforced dbt
+    /// contract. Written next to the model SQL.
+    pub contract_toml: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +410,7 @@ pub fn import_from_manifest(
             &manifest.successfully_compiled_nodes,
             &model_relations,
             &manifest.groups,
+            manifest.metadata.adapter_type.as_deref(),
             &mut result,
         );
     }
@@ -453,11 +459,6 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
             dropped.semantic_models,
             "MetricFlow semantic models are not imported",
         ),
-        (
-            "exposure",
-            dropped.exposures,
-            "dbt exposures (downstream-usage docs) are not imported",
-        ),
     ] {
         if count == 0 {
             continue;
@@ -476,6 +477,37 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
                 name: format!("{count} total"),
                 detail: detail.to_string(),
             });
+    }
+
+    // Rocky has no record of downstream consumers, so each exposure is listed
+    // by name in the migration notes with its owner and the models it reads.
+    if !dropped.exposures.is_empty() {
+        let count = dropped.exposures.len();
+        result.constructs_dropped += count;
+        result.warnings.push(ImportWarning {
+            model: "<project>".to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!(
+                "{count} exposure(s) skipped — Rocky has no downstream-consumer record; \
+                 they are listed in MIGRATION-NOTES.md"
+            ),
+            suggestion: None,
+        });
+        for exposure in &dropped.exposures {
+            let owner = exposure.owner.as_deref().unwrap_or("none declared");
+            let depends_on = if exposure.depends_on.is_empty() {
+                "nothing".to_string()
+            } else {
+                exposure.depends_on.join(", ")
+            };
+            result
+                .structured_warnings
+                .push(ImportDbtStructuredWarning::DroppedConstruct {
+                    construct: "exposure".to_string(),
+                    name: exposure.name.clone(),
+                    detail: format!("owner: {owner}; depends on: {depends_on}"),
+                });
+        }
     }
 }
 
@@ -1044,6 +1076,7 @@ fn import_manifest_node(
     successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
     groups: &std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
+    adapter: Option<&str>,
     result: &mut ImportResult,
 ) {
     // A snapshot node converts to a `type = "snapshot"` model, or fails with
@@ -1256,7 +1289,7 @@ fn import_manifest_node(
     // Surface a dropped model contract (`contract: { enforced: true }` +
     // column data_type/constraints). Rocky enforces contracts via a sidecar
     // the importer doesn't generate — point the user at where to author it.
-    collect_dropped_contract_warnings(node, &table, result);
+    let contract_toml = collect_contract(node, &rocky_name, adapter, result);
 
     // Detect unresolvable Jinja macros that survived `dbt compile`. dbt's
     // compile step inlines in-tree macros, so anything still present
@@ -1337,6 +1370,7 @@ fn import_manifest_node(
         sql: sql.trim().to_string(),
         config,
         unit_tests: Vec::new(),
+        contract_toml,
     });
 }
 
@@ -1610,7 +1644,10 @@ const INCREMENTAL_COMPILE_EVIDENCE_REFUSED: &str = "is a dbt incremental model w
      per-model evidence in a matching full-refresh `run_results.json` and `compiled_code` in \
      `manifest.json`. Its SQL may keep a delta filter and omit older rows on Rocky's first run. \
      Run `dbt compile --full-refresh` without `--select` (or include this model), then import \
-     the resulting manifest.json and run_results.json together";
+     the resulting manifest.json and run_results.json together. dbt 2 writes no per-model \
+     results for `compile`; Rocky then accepts the model's `compiled_code` from the same \
+     invocation. If the model is still refused, `dbt run --full-refresh` writes per-model \
+     results on dbt 1 and dbt 2 (it rebuilds the tables)";
 
 const INCREMENTAL_FULL_REFRESH_DISABLED: &str = "is a dbt incremental model with effective \
      `full_refresh=false` config. That config overrides `dbt compile --full-refresh`, so \
@@ -1888,54 +1925,52 @@ fn collect_dropped_config_warnings(
     }
 }
 
-/// Detect a dropped dbt model contract and surface it. dbt's
-/// `contract: { enforced: true }` (plus per-column `data_type` / `constraints`)
-/// has no auto-translation in Rocky — contracts are enforced via a
-/// `{model}.contract.toml` sidecar the importer does not generate. We emit a
-/// structured + string warning naming the file the user should author, and
-/// bump `contracts_dropped`, so the loss is never silent. Stub generation is
-/// out of scope (visibility only).
+/// Generate the `<model>.contract.toml` for an enforced dbt contract.
 ///
-/// Only fires when the contract is `enforced`; an un-enforced `contract` block
-/// (dbt's default) carries no semantics to lose.
-fn collect_dropped_contract_warnings(
+/// Returns the file body. When part of the contract has no Rocky check (a
+/// column type Rocky has no name for, or a constraint other than `not_null`
+/// and `primary_key`), it also bumps `contracts_dropped` and warns, so that
+/// loss is never silent. An un-enforced `contract` block (dbt's default)
+/// carries no semantics and yields nothing.
+fn collect_contract(
     node: &DbtManifestNode,
-    table: &str,
+    rocky_name: &str,
+    adapter: Option<&str>,
     result: &mut ImportResult,
-) {
-    let enforced = node.config.contract.as_ref().is_some_and(|c| c.enforced);
-    if !enforced {
-        return;
-    }
-
-    let typed_columns = node
-        .columns
-        .values()
-        .filter(|c| c.data_type.is_some())
-        .count();
-    let constraints: usize = node.columns.values().map(|c| c.constraints.len()).sum();
-    let contract_path = format!("models/{table}.contract.toml");
-
-    result.contracts_dropped += 1;
-    result
-        .structured_warnings
-        .push(ImportDbtStructuredWarning::DroppedContract {
+) -> Option<String> {
+    let contract = super::dbt_contract::contract_from_node(node, adapter)?;
+    let contract_path = format!("models/{rocky_name}.contract.toml");
+    if contract.untyped_columns > 0
+        || contract.unmapped_constraints > 0
+        || contract.not_null_constraints > 0
+    {
+        result.contracts_dropped += 1;
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedContract {
+                model: node.name.clone(),
+                typed_columns: contract.untyped_columns,
+                constraints: contract.unmapped_constraints,
+                not_null_constraints: contract.not_null_constraints,
+                contract_path: contract_path.clone(),
+            });
+        result.warnings.push(ImportWarning {
             model: node.name.clone(),
-            typed_columns,
-            constraints,
-            contract_path: contract_path.clone(),
+            category: WarningCategory::DroppedContract,
+            message: format!(
+                "{contract_path} was generated from the enforced dbt contract, but {} column type(s) \
+                 are not checked (no Rocky type for them on this warehouse), {} `not_null` or \
+                 `primary_key` constraint(s) are not checked (Rocky cannot prove NOT NULL from the \
+                 sources), and {} other constraint(s) (`unique`, `check`, ...) are not checked",
+                contract.untyped_columns, contract.not_null_constraints, contract.unmapped_constraints
+            ),
+            suggestion: Some(format!(
+                "review {contract_path}; check the unchecked rules with a data test (a `not_null` \
+                 test for a not_null constraint) or a `[[checks]]` block"
+            )),
         });
-    result.warnings.push(ImportWarning {
-        model: node.name.clone(),
-        category: WarningCategory::DroppedContract,
-        message: format!(
-            "enforced dbt contract dropped ({typed_columns} typed column(s), {constraints} constraint(s)) — \
-             Rocky enforces contracts via {contract_path}, which the importer does not auto-generate"
-        ),
-        suggestion: Some(format!(
-            "author {contract_path} declaring the required/protected columns to re-establish the contract"
-        )),
-    });
+    }
+    Some(contract.toml)
 }
 
 /// Translate dbt's `on_schema_change` values to a human-readable Rocky
@@ -2619,6 +2654,7 @@ fn import_single_model(
             sql,
             config,
             unit_tests: Vec::new(),
+            contract_toml: None,
         },
         warnings,
     ))
@@ -4809,7 +4845,7 @@ WHERE e.id > 0
     }
 
     #[test]
-    fn test_manifest_enforced_contract_warns_and_counts() {
+    fn test_manifest_enforced_contract_is_generated_and_partial_loss_warns() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": { "model.p.dim_customer": {
@@ -4820,16 +4856,27 @@ WHERE e.id > 0
                 "config": { "materialized": "table", "contract": { "enforced": true } },
                 "columns": {
                     "id": { "name": "id", "data_type": "bigint", "constraints": [{ "type": "not_null" }, { "type": "primary_key" }] },
-                    "email": { "name": "email", "data_type": "varchar" }
+                    "email": { "name": "email", "data_type": "varchar", "constraints": [{ "type": "unique" }] },
+                    "loc": { "name": "loc", "data_type": "geography" }
                 },
                 "tags": [], "schema": "s", "database": "d"
             }},
             "sources": {}
         });
         let result = import_from_manifest_json(&manifest);
+        let toml = result.imported[0]
+            .contract_toml
+            .as_deref()
+            .expect("an enforced contract generates a contract file");
+        assert!(toml.contains("name = \"id\"\ntype = \"Int64\"\n"));
+        assert!(
+            !toml.contains("nullable = false"),
+            "a not_null constraint must not become an E012 check: {toml}"
+        );
+        assert!(toml.contains("required = [\"email\", \"id\", \"loc\"]"));
         assert_eq!(
             result.contracts_dropped, 1,
-            "enforced contract must be counted"
+            "a contract with unchecked parts must be counted"
         );
         assert!(
             result
@@ -4845,18 +4892,69 @@ WHERE e.id > 0
                 ImportDbtStructuredWarning::DroppedContract {
                     typed_columns,
                     constraints,
+                    not_null_constraints,
                     contract_path,
                     ..
-                } => Some((*typed_columns, *constraints, contract_path.clone())),
+                } => Some((
+                    *typed_columns,
+                    *constraints,
+                    contract_path.clone(),
+                    *not_null_constraints,
+                )),
                 _ => None,
             })
             .expect("must emit a DroppedContract structured warning");
-        assert_eq!(structured.0, 2, "two columns declared a data_type");
-        assert_eq!(structured.1, 2, "two constraints declared");
+        assert_eq!(structured.0, 1, "one column type has no Rocky name");
+        assert_eq!(structured.1, 1, "one constraint is not checked");
+        assert_eq!(structured.3, 2, "not_null and primary_key are not checked");
         assert!(
             structured.2.contains("dim_customer.contract.toml"),
             "warning must point at the contract sidecar path: {}",
             structured.2
+        );
+    }
+
+    #[test]
+    fn test_manifest_exposures_are_listed_with_owner_and_dependencies() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {},
+            "sources": {},
+            "exposures": {
+                "exposure.p.weekly_board": {
+                    "name": "weekly_board",
+                    "owner": { "name": "Ana", "email": "ana@example.com" },
+                    "depends_on": { "nodes": ["model.p.revenue", "source.p.shop.orders"] }
+                },
+                "exposure.p.ad_hoc": { "name": "ad_hoc" }
+            }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.constructs_dropped, 2);
+        let details: Vec<(String, String)> = result
+            .structured_warnings
+            .iter()
+            .filter_map(|w| match w {
+                ImportDbtStructuredWarning::DroppedConstruct {
+                    construct,
+                    name,
+                    detail,
+                } if construct == "exposure" => Some((name.clone(), detail.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            details,
+            [
+                (
+                    "ad_hoc".to_string(),
+                    "owner: none declared; depends on: nothing".to_string()
+                ),
+                (
+                    "weekly_board".to_string(),
+                    "owner: Ana, ana@example.com; depends on: revenue, shop.orders".to_string()
+                ),
+            ]
         );
     }
 
@@ -5967,6 +6065,58 @@ WHERE e.id > 0
                 .unwrap();
             assert!(failure.reason.contains("dbt compile --full-refresh"));
         }
+    }
+
+    #[test]
+    fn incremental_accepts_compiled_code_when_compile_writes_no_results() {
+        // dbt 2 writes `results: []` for `dbt compile --full-refresh`. The
+        // matching invocation and the model's `compiled_code` are the evidence.
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/select_orders_inc");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let results_path = dir.path().join("run_results.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("run_results.json")).unwrap())
+                .unwrap();
+        results["results"] = serde_json::json!([]);
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        std::fs::write(&results_path, results.to_string()).unwrap();
+        let parsed = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+        let imported = import_from_manifest(&parsed, &target, false, MicrobatchMode::Merge);
+        assert!(
+            imported.imported.iter().any(|m| m.name == "orders_inc"),
+            "{:?}",
+            imported.failed
+        );
+
+        // A model dbt did not compile has no `compiled_code`: still refused.
+        let mut uncompiled = manifest.clone();
+        uncompiled["nodes"]["model.inc_probe.orders_inc"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compiled_code");
+        std::fs::write(&manifest_path, uncompiled.to_string()).unwrap();
+        let parsed = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+        let imported = import_from_manifest(&parsed, &target, false, MicrobatchMode::Merge);
+        assert!(imported.imported.is_empty());
+        assert!(imported.failed.iter().any(|f| f.name == "orders_inc"));
+
+        // Without `full_refresh` in the args, empty results prove nothing.
+        results["args"]["full_refresh"] = serde_json::json!(false);
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        std::fs::write(&results_path, results.to_string()).unwrap();
+        let parsed = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+        let imported = import_from_manifest(&parsed, &target, false, MicrobatchMode::Merge);
+        assert!(imported.imported.is_empty());
     }
 
     #[test]

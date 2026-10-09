@@ -15,7 +15,7 @@
 
 const pause = (page, ms) => page.waitForTimeout(ms);
 
-/** The base of the printed URL, without the `/ui/...` path or the fragment. */
+/** The base of the printed URL, without the path or the query. */
 function origin(page) {
   const u = new URL(page.url());
   return `${u.protocol}//${u.host}`;
@@ -37,11 +37,11 @@ export const SCENES = {
   review: {
     description: "the review queue, then one plan's detail",
     async run(page) {
-      // The address the server printed carries `#token=…`; the SPA moves it to
-      // sessionStorage and scrubs the bar. Wait for that to have happened
-      // before filming anything — a frame with the token in it is a frame that
+      // The address the server printed is `/login?t=…`. The server sets the
+      // session cookie and redirects to `/ui/`. Wait for the redirect before
+      // filming anything — a frame with the token in it is a frame that
       // teaches the pattern of a real one.
-      await page.waitForFunction(() => !window.location.hash.includes("token="));
+      await page.waitForURL(/\/ui\//);
 
       await goto(page, "/ui/review");
       await page.waitForSelector('section[aria-label="The review queue"]');
@@ -73,7 +73,7 @@ export const SCENES = {
     // plan id is passed in and the page is opened by address.
     needsPlan: true,
     async run(page, { plan }) {
-      await page.waitForFunction(() => !window.location.hash.includes("token="));
+      await page.waitForURL(/\/ui\//);
 
       await goto(page, `/ui/review/${plan}`);
 
@@ -98,7 +98,7 @@ export const SCENES = {
   journal: {
     description: "one product's whole life, in append order",
     async run(page) {
-      await page.waitForFunction(() => !window.location.hash.includes("token="));
+      await page.waitForURL(/\/ui\//);
 
       await goto(page, "/ui/governor/products");
       await page.waitForSelector("text=/\\d+ products?/");

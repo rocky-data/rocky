@@ -138,6 +138,24 @@ pub enum ProjectError {
     #[error(transparent)]
     Dag(#[from] dag::DagError),
 
+    /// The models form a dependency cycle. Renders exactly as
+    /// [`dag::DagError::CyclicDependency`] does, so every command that
+    /// refuses the project prints the same message; `diagnostics` holds one
+    /// E058 per model on the cycle ([`crate::cycle::cycle_diagnostics`]) for
+    /// the commands that report it instead.
+    #[error("circular dependency detected involving: {cycle:?}")]
+    Cycle {
+        /// Every model that could not be ordered (see
+        /// [`dag::DagError::CyclicDependency`]).
+        nodes: Vec<String>,
+        /// The models on or between cycles.
+        cycle: Vec<String>,
+        /// One E058 error per model in `cycle`.
+        diagnostics: Vec<crate::diagnostic::Diagnostic>,
+        /// Every model of the project, in load order.
+        models: Vec<String>,
+    },
+
     #[error("no models found in {path}")]
     NoModels { path: String },
 
@@ -382,7 +400,19 @@ impl Project {
 
         let (dag_nodes, lineage_cache, resolve_diagnostics) =
             resolve::resolve_dependencies_with_externals(&models, externals)?;
-        let execution_order = dag::topological_sort(&dag_nodes)?;
+        let execution_order = match dag::topological_sort(&dag_nodes) {
+            Ok(order) => order,
+            Err(dag::DagError::CyclicDependency { nodes, cycle }) => {
+                let diagnostics = crate::cycle::cycle_diagnostics(&models, &dag_nodes, &cycle);
+                return Err(ProjectError::Cycle {
+                    nodes,
+                    cycle,
+                    diagnostics,
+                    models: models.iter().map(|m| m.config.name.clone()).collect(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
         let layers = dag::execution_layers(&dag_nodes)?;
 
         Ok(Project {

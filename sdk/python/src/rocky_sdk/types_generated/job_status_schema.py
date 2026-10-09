@@ -33,6 +33,14 @@ class JobKind3(StrEnum):
     apply = "apply"
 
 
+class JobKind4(StrEnum):
+    """
+    `rocky review <plan_id> --approve` — writes the sign-off marker that unblocks `apply`. Takes the mutation permit, so an approval cannot land while a run or an apply is in flight.
+    """
+
+    approve = "approve"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -84,7 +92,7 @@ class JobStatus(BaseModel):
     """
     Opaque job identifier (as returned by `POST /api/v1/jobs/{kind}`).
     """
-    kind: JobKind1 | JobKind2 | JobKind3
+    kind: JobKind1 | JobKind2 | JobKind3 | JobKind4
     """
     Which operation the job wraps.
     """

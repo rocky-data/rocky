@@ -1,0 +1,173 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "LintCounts": {
+      "description": "Finding counts by severity for `rocky lint`.",
+      "properties": {
+        "error": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "info": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warning": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "error",
+        "info",
+        "warning"
+      ],
+      "type": "object"
+    },
+    "LintFinding": {
+      "description": "One `rocky lint` finding.",
+      "properties": {
+        "code": {
+          "description": "Rule code, e.g. `S001`.",
+          "type": "string"
+        },
+        "col": {
+          "description": "1-based column, counted in characters.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "fixable": {
+          "description": "`true` when `rocky lint --fix` can rewrite this finding.",
+          "type": "boolean"
+        },
+        "hint": {
+          "description": "Short suggestion for the fix.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based line.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "rule": {
+          "description": "Short rule name, e.g. `ambiguous-column`.",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/definitions/LintSeverity"
+        }
+      },
+      "required": [
+        "code",
+        "col",
+        "file",
+        "fixable",
+        "hint",
+        "line",
+        "message",
+        "rule",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "LintSeverity": {
+      "description": "Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.",
+      "oneOf": [
+        {
+          "description": "Fails the run (non-zero exit).",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reported; does not fail the run.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reported; does not fail the run.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky lint`.",
+  "properties": {
+    "ast_rules_skipped": {
+      "description": "Files whose SQL did not parse. The AST rules (`S001`, `S003`, `S004`) did not run on them; the text rules did.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "counts": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LintCounts"
+        }
+      ],
+      "description": "Finding counts by severity."
+    },
+    "files_checked": {
+      "description": "Number of `.sql` files read.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "files_fixed": {
+      "description": "Files `--fix` changed.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "findings": {
+      "description": "Findings left after any `--fix` pass, ordered by file, line and column.",
+      "items": {
+        "$ref": "#/definitions/LintFinding"
+      },
+      "type": "array"
+    },
+    "fixed": {
+      "description": "Findings `--fix` rewrote. `0` without `--fix`.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "ast_rules_skipped",
+    "command",
+    "counts",
+    "files_checked",
+    "files_fixed",
+    "findings",
+    "fixed",
+    "version"
+  ],
+  "title": "LintOutput",
+  "type": "object"
+}

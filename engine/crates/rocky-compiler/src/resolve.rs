@@ -1451,6 +1451,51 @@ mod tests {
         );
     }
 
+    /// A read inside a `WHERE … IN (SELECT …)` derives an edge, so two
+    /// models that read each other that way are refused as a cycle, also when
+    /// one of them declares `depends_on`.
+    #[test]
+    fn a_where_subquery_read_closes_the_cycle_it_really_is() {
+        let models = vec![
+            make_model_with_deps(
+                "fct_orders",
+                "SELECT order_id, customer_id FROM lines \
+                 WHERE customer_id IN (SELECT customer_id FROM customer_ltv)",
+                vec!["lines"],
+            ),
+            make_model("lines", "SELECT order_id, customer_id FROM raw.lines"),
+            make_model_with_deps(
+                "customer_ltv",
+                "SELECT customer_id, COUNT(*) AS n FROM fct_orders GROUP BY customer_id",
+                vec!["fct_orders"],
+            ),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let fct = dag_nodes.iter().find(|n| n.name == "fct_orders").unwrap();
+        assert!(
+            fct.depends_on.contains(&"customer_ltv".to_string()),
+            "{:?}",
+            fct.depends_on
+        );
+        let err = rocky_ir::dag::topological_sort(&dag_nodes)
+            .expect_err("fct_orders and customer_ltv read each other");
+        let message = format!("{err}");
+        assert!(message.contains("circular"), "{message}");
+        assert!(
+            message.contains("fct_orders") && message.contains("customer_ltv"),
+            "{message}"
+        );
+        assert_eq!(
+            derived_model_edges(&models)
+                .into_iter()
+                .filter(|(c, p)| c == "fct_orders" && p == "customer_ltv")
+                .count(),
+            1,
+            "`rocky run --dag` derives the same edge"
+        );
+    }
+
     /// A model reading its own name from inside a subquery is still a
     /// self-reference and still gets no edge — the nested path applies the
     /// same exclusion the top-level one does, or the model would depend on
