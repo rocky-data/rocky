@@ -3621,13 +3621,35 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
         Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
-            // `NULLIF(x, y)` returns `x` or NULL, so it has the type of `x`.
-            "SUM" | "MIN" | "MAX" | "AVG" | "NULLIF" => match &func.args {
+            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
                         if has_exact_type(arg, scope)
                 ),
+                _ => false,
+            },
+            // `NULLIF(x, y)` returns `x` or NULL. PostgreSQL, Redshift and
+            // BigQuery may promote it to the common type of `x` and `y`
+            // (`NULLIF(int_col, 0.5)` is numeric), so it has the type of `x`
+            // only when `y` cannot widen it: the same rule as a `COALESCE`
+            // branch (an integer literal, `NULL`, or a value of `x`'s type).
+            "NULLIF" if func.over.is_none() && func.filter.is_none() => match &func.args {
+                ast::FunctionArguments::List(list)
+                    if list.args.len() == 2
+                        && list.duplicate_treatment.is_none()
+                        && list.clauses.is_empty() =>
+                {
+                    let mut args = Vec::with_capacity(2);
+                    for arg in &list.args {
+                        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
+                            return false;
+                        };
+                        args.push(arg);
+                    }
+                    has_exact_type(args[0], scope)
+                        && branches_agree(&args, &infer_expr_type(expr, scope).0, scope)
+                }
                 _ => false,
             },
             "COALESCE" if func.over.is_none() && func.filter.is_none() => match &func.args {
@@ -5195,14 +5217,20 @@ mod tests {
         }
     }
 
-    /// `NULLIF(x, y)` is `x` or NULL: it has the type of `x`, and is nullable.
-    /// Over an expression whose type is a guess (`LENGTH`), it stays Unknown.
+    /// `NULLIF(x, y)` is `x` or NULL: it has the type of `x`, and is nullable,
+    /// when `y` cannot widen it. Over an expression whose type is a guess
+    /// (`LENGTH`), or against a value that can promote it (`0.5`, a column of
+    /// another type), it stays Unknown.
     #[test]
     fn nullif_takes_the_type_of_its_first_argument() {
-        let sql = "SELECT NULLIF(x, 0) AS a, NULLIF(LENGTH(n), 0) AS b FROM t";
+        let sql = "SELECT NULLIF(x, 0) AS a, NULLIF(LENGTH(n), 0) AS b, \
+                   NULLIF(x, 0.5) AS c, NULLIF(x, n) AS d, NULLIF(x, x) AS e FROM t";
         let expected = vec![
             ("a".to_string(), RockyType::Int32, true),
             ("b".to_string(), RockyType::Unknown, true),
+            ("c".to_string(), RockyType::Unknown, true),
+            ("d".to_string(), RockyType::Unknown, true),
+            ("e".to_string(), RockyType::Int32, true),
         ];
         assert_eq!(typecheck_over_t("t", sql), expected);
     }

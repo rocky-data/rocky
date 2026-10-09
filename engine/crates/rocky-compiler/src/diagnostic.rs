@@ -205,9 +205,9 @@ pub const E044: &str = "E044";
 /// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
 ///
 /// Emitted by `rocky compile` from [`crate::function_check`] for models that
-/// run on DuckDB or Spark, the dialects whose list was verified against a
-/// live engine and that nothing outside Rocky extends with plain-named
-/// functions. Every other warehouse with a list gets the
+/// run on DuckDB, whose list was verified against a live engine and
+/// includes the functions its extensions load on first use. Every other
+/// warehouse with a list gets the
 /// warning [`W057`] instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
 /// not checked, nor is a model whose SQL `[portability] target_dialect` says
 /// was written for another warehouse.

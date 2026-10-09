@@ -16,17 +16,20 @@
 //! | PostgreSQL | PostgreSQL 17 `pg_proc` | against a live PostgreSQL 17.11 (`pg_proc`); extensions add functions | `W057` |
 //! | Snowflake | vendor reference | built from docs, not run | `W057` |
 //! | Databricks | vendor reference + Spark | built from docs, not run (a superset of the live Spark list) | `W057` |
-//! | Spark | Spark 4.0.1 `SHOW FUNCTIONS` | against a live Spark 4.0.1 with Delta | `E057` |
+//! | Spark | Spark 4.0.1 `SHOW FUNCTIONS` | against a live Spark 4.0.1 with Delta; UDFs and session extensions add functions | `W057` |
 //! | BigQuery | vendor reference | built from docs, not run | `W057` |
 //! | Trino | Trino 483 `SHOW FUNCTIONS` | against a live Trino 483; connectors add functions | `W057` |
 //! | Redshift | vendor reference + PostgreSQL | built from docs, not run | `W057` |
 //! | SQL Server, ClickHouse | none | | silent |
 //!
-//! `E057` needs a list that was checked against a running engine and that
-//! nothing outside Rocky can extend. A list built from documentation can lag
-//! a warehouse release. PostgreSQL extensions (PostGIS, pgcrypto) and Trino
-//! connectors add unqualified functions that no catalog list holds, so a
-//! live-checked list there is still not closed. Those dialects warn (`W057`); `rocky compile --deny-warnings
+//! Only DuckDB reports `E057`: its list was checked against a running engine
+//! and includes the functions its extensions load on first use, and a macro
+//! created outside Rocky is called schema-qualified. A list built from
+//! documentation can lag a warehouse release. A live-checked list is still
+//! not closed where the warehouse lets a user add plain-named functions:
+//! PostgreSQL extensions (PostGIS, pgcrypto), Trino connectors, and Spark
+//! UDFs, `CREATE FUNCTION` and session extensions (Sedona). A list is also
+//! pinned to one engine version. Those dialects warn (`W057`); `rocky compile --deny-warnings
 //! W057` turns the warning into an error. SQL Server and ClickHouse have no
 //! list yet and stay silent. The files under `data/functions/` name their
 //! source and build date in a header comment. Moving a dialect to `E057` is
@@ -60,8 +63,9 @@ use crate::udf::FunctionRegistry;
 /// How sure Rocky is that a dialect's function list is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Checked against a live engine, and nothing outside Rocky adds unqualified
-    /// functions to it: an unknown call is an error (`E057`).
+    /// Checked against a live engine, with the functions its extensions load on
+    /// first use; a macro made outside Rocky is called schema-qualified. An
+    /// unknown call is an error (`E057`). Only DuckDB.
     Verified,
     /// Built from the vendor's reference, or open to extensions and connectors
     /// that add functions: an unknown call is a warning (`W057`).
@@ -162,11 +166,13 @@ impl FunctionDialect {
     /// Whether this dialect's list was checked against a live engine.
     pub fn tier(self) -> Tier {
         match self {
-            Self::DuckDb | Self::Spark => Tier::Verified,
-            // PostgreSQL and Trino were checked live, but extensions and
-            // connectors add unqualified functions the list cannot hold.
+            Self::DuckDb => Tier::Verified,
+            // PostgreSQL, Trino and Spark were checked live, but extensions,
+            // connectors and UDFs add plain-named functions the list cannot
+            // hold, and each list is pinned to one engine version.
             Self::Postgres
             | Self::Trino
+            | Self::Spark
             | Self::Snowflake
             | Self::Databricks
             | Self::BigQuery
@@ -559,7 +565,7 @@ mod tests {
                 "W057",
                 "try_divide(a, b)",
             ),
-            ("Spark", spark(), "E057", "array_distinct(a)"),
+            ("Spark", spark(), "W057", "array_distinct(a)"),
             (
                 "BigQuery",
                 Some(OperandDialect::BigQuery).into(),
@@ -690,6 +696,7 @@ mod tests {
         for dialect in [
             FunctionDialect::Postgres,
             FunctionDialect::Trino,
+            FunctionDialect::Spark,
             FunctionDialect::Snowflake,
             FunctionDialect::Databricks,
             FunctionDialect::BigQuery,
@@ -697,7 +704,7 @@ mod tests {
         ] {
             assert_eq!(dialect.tier(), Tier::Documented, "{dialect:?}");
         }
-        for dialect in [FunctionDialect::DuckDb, FunctionDialect::Spark] {
+        for dialect in [FunctionDialect::DuckDb] {
             assert_eq!(dialect.tier(), Tier::Verified, "{dialect:?}");
         }
     }
