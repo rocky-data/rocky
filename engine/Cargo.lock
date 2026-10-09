@@ -4238,6 +4238,7 @@ dependencies = [
  "rocky-postgres",
  "rocky-server",
  "rocky-snowflake",
+ "rocky-spark",
  "rocky-sql",
  "rocky-sqlserver",
  "rocky-trino",

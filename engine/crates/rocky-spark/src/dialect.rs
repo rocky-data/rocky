@@ -13,6 +13,7 @@
 //! | `is_safe_type_widening` | always `false`: a column type change rebuilds the table (full refresh) |
 //! | `pre_alter_column_type_sql` | `None`: follows from the line above |
 //! | `insert_overwrite_partition` | Delta: one `INSERT INTO … REPLACE WHERE`; Iceberg: `DELETE` then `INSERT` |
+//! | `snapshot_column_identifier` | backticks, as Databricks (the trait default picks `"x"` for any other dialect name) |
 //! | `delete_partitions_sql` | `MERGE … WHEN MATCHED THEN DELETE`: open-source Delta refuses a subquery in `DELETE` |
 //! | `supports_lakehouse_format_ddl`, `supports_delta_maintenance` | `false`: not verified on open-source Spark |
 //!
@@ -222,6 +223,13 @@ impl SqlDialect for SparkDialect {
              ON {on}\n\
              WHEN MATCHED THEN DELETE"
         )
+    }
+
+    /// Backticks, as Databricks. The trait default picks its quote by
+    /// dialect name and would give `"x"`, which Spark parses as a string
+    /// literal.
+    fn snapshot_column_identifier(&self, name: &str) -> String {
+        INNER.snapshot_column_identifier(name)
     }
 
     fn tablesample_clause(&self, percent: u32) -> Option<String> {
@@ -473,6 +481,21 @@ mod tests {
                 .unwrap(),
             "SELECT a"
         );
+    }
+
+    #[test]
+    fn snapshot_identifiers_use_backticks_not_double_quotes() {
+        assert_eq!(d().snapshot_column_identifier("valid_from"), "`valid_from`");
+        assert_eq!(d().snapshot_column_identifier("a`b"), "`a``b`");
+        assert_eq!(
+            d().snapshot_metadata_identifier("is_current"),
+            "`is_current`"
+        );
+        let (names, values) = d()
+            .snapshot_insert_columns(&["id".into()], &[("valid_to", "NULL")])
+            .unwrap();
+        assert_eq!(names, ["`id`", "`valid_to`"]);
+        assert_eq!(values, ["source.`id`", "NULL"]);
     }
 
     #[test]

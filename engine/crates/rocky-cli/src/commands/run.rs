@@ -10262,7 +10262,7 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" | "spark" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
@@ -10476,6 +10476,14 @@ pub(crate) fn dialect_case_rules(
         // `orders` and `Orders` are two tables —
         // clickhouse.com/docs/sql-reference/syntax#identifiers
         "clickhouse" => Ok(uniform(true)),
+        // Spark: identifier case follows the session's `spark.sql.caseSensitive`
+        // (off by default, so `orders` and `Orders` resolve to one table) —
+        // spark.apache.org/docs/latest/sql-ref-identifier.html
+        // The setting is server state this function does not read, so this
+        // assumes case-sensitive, the fail-closed answer for the redirect
+        // question (same narrow reading as the BigQuery / Snowflake note
+        // above).
+        "spark" => Ok(uniform(true)),
         // SQL Server: identifier case follows the database COLLATION, quoted or
         // not — the default `SQL_Latin1_General_CP1_CI_AS` folds case, a `_CS_`
         // or `_BIN2` collation does not —

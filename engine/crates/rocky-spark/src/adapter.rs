@@ -53,7 +53,7 @@ impl SparkWarehouseAdapter {
                 self.client.execute(&sql).await.map(|_| ()).map_err(wrap)
             })
             .await
-            .map(|()| ())
+            .copied()
     }
 
     async fn run(&self, sql: &str) -> AdapterResult<Vec<arrow::record_batch::RecordBatch>> {

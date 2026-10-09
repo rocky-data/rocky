@@ -194,7 +194,7 @@ impl SparkClient {
         let mut stream = grpc
             .server_streaming(request, path, codec)
             .await
-            .map_err(status_error)?
+            .map_err(|s| status_error(&s))?
             .into_inner();
 
         // The stream ends with the call's gRPC status: `None` here means the
@@ -204,7 +204,7 @@ impl SparkClient {
         // marker is only sent to reattachable executions, which Rocky does
         // not request, so its absence is not a signal.
         let mut batches = Vec::new();
-        while let Some(message) = stream.message().await.map_err(status_error)? {
+        while let Some(message) = stream.message().await.map_err(|s| status_error(&s))? {
             match message.response_type {
                 Some(execute_plan_response::ResponseType::ArrowBatch(batch)) => {
                     decode_arrow_batch(&batch.data, &mut batches)?;
@@ -237,7 +237,7 @@ impl SparkClient {
     }
 }
 
-fn status_error(status: tonic::Status) -> SparkError {
+fn status_error(status: &tonic::Status) -> SparkError {
     SparkError::Status {
         code: status.code(),
         message: status.message().to_string(),
