@@ -189,6 +189,14 @@ pub const E040: &str = "E040";
 /// projection aliases, and arguments of unknown functions stay silent. See
 /// `rocky_compiler::group_by` for the full rule set.
 pub const E044: &str = "E044";
+/// A call names a function the target warehouse does not have, and the
+/// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
+///
+/// Emitted by `rocky compile` from [`crate::function_check`] only for models
+/// that run on DuckDB, the one dialect with a complete function list here.
+/// Schema-qualified calls (`main.my_macro(x)`) and quoted names are not
+/// checked.
+pub const E045: &str = "E045";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

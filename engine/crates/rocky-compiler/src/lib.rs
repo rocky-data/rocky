@@ -24,6 +24,7 @@ pub mod cost_check;
 pub mod diagnostic;
 pub mod ephemeral;
 pub mod freshness;
+pub mod function_check;
 pub mod governance;
 pub mod group_by;
 pub mod import;

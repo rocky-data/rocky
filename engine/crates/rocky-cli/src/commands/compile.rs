@@ -706,7 +706,8 @@ fn apply_adapter_gates(result: &mut compile::CompileResult, targets: &ModelTarge
     result.diagnostics.extend(merge_diags);
 }
 
-/// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043).
+/// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043),
+/// and calls to functions the target warehouse does not have (E045).
 /// These judge against the warehouse that will run the SQL, so they need a
 /// dialect the compiler core does not carry; see `operand_target_for` for
 /// the precedence.
@@ -716,12 +717,19 @@ fn apply_operand_gates(
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
 ) {
-    let operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
+    let target_for = |model: &str| operand_target_for(target_dialect, project_config, targets, model);
+    let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
         &result.project.models,
         &result.semantic_graph,
         &result.type_check.typed_models,
-        &|model| operand_target_for(target_dialect, project_config, targets, model),
+        &target_for,
     );
+    // Calls to functions the target warehouse does not have (E045).
+    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
+        &result.project.models,
+        result.semantic_graph.functions(),
+        &target_for,
+    ));
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }
