@@ -5,7 +5,7 @@ use rocky_sql::validation::{self, ValidationError};
 use thiserror::Error;
 
 /// Errors from catalog/schema SQL generation, including validation and tag safety checks.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CatalogError {
     #[error("validation error: {0}")]
     Validation(#[from] ValidationError),
@@ -17,6 +17,14 @@ pub enum CatalogError {
 
     #[error("empty tag {kind}")]
     EmptyTag { kind: &'static str },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for CatalogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "CatalogError", self)
+    }
 }
 
 /// Generates `CREATE CATALOG IF NOT EXISTS <catalog>`.
@@ -334,6 +342,20 @@ fn validate_tag_value(value: &str, kind: &'static str) -> Result<(), CatalogErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn catalog_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "catalog-tag-1919-e1f2";
+        crate::secret_registry::register_substitution("RV_CATALOG_DBG", SECRET);
+        let err = CatalogError::UnsafeTag {
+            kind: "value",
+            value: format!("{SECRET}'"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CATALOG_DBG}"), "{debug}");
+    }
 
     #[test]
     fn test_create_catalog() {
