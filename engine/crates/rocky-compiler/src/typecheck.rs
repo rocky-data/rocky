@@ -1878,7 +1878,8 @@ fn filter_window_bound(filter: &Expr, scope: &mut CteScope) -> WindowBound {
 /// Under SQL three-valued logic such a comparison is NULL, never TRUE, when
 /// `column` is NULL, so the row is filtered out. Anything else — a parse
 /// failure, a set operation, an aliased or computed projection, a comparison
-/// under `OR` — answers `false`.
+/// under `OR`, a `GROUP BY` with `ROLLUP`, `CUBE` or `GROUPING SETS` (their
+/// subtotal rows carry a NULL key) — answers `false`.
 fn where_rejects_null_column(sql: &str, column: &str) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
@@ -1889,6 +1890,23 @@ fn where_rejects_null_column(sql: &str, column: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
+    // ROLLUP, CUBE and GROUPING SETS add subtotal rows whose grouping
+    // columns are NULL, after the WHERE has run.
+    let adds_subtotal_rows = match &select.group_by {
+        ast::GroupByExpr::All(modifiers) => !modifiers.is_empty(),
+        ast::GroupByExpr::Expressions(exprs, modifiers) => {
+            !modifiers.is_empty()
+                || exprs.iter().any(|expr| {
+                    matches!(
+                        expr,
+                        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
+                    )
+                })
+        }
+    };
+    if adds_subtotal_rows {
+        return false;
+    }
     // A column reference as its lowercased name parts, when its last part is
     // `column`. The WHERE side must spell the same reference as the
     // projection, so `SELECT p.d ... WHERE o.d > x` does not count.
@@ -7306,6 +7324,22 @@ mod tests {
             // A set operation: the other branch is not filtered on the key.
             "SELECT order_date FROM a WHERE order_date >= @start_date AND order_date < @end_date \
              UNION ALL SELECT order_date FROM b WHERE ts >= @start_date AND ts < @end_date",
+            // ROLLUP adds a grand-total row with a NULL key after the WHERE.
+            "SELECT order_date, SUM(x) AS s FROM t \
+             WHERE order_date >= @start_date AND order_date < @end_date GROUP BY ROLLUP(order_date)",
+            "SELECT order_date, SUM(x) AS s FROM t \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             GROUP BY GROUPING SETS ((order_date), ())",
+            // The comparison is on another column, not the key.
+            "SELECT order_date FROM t WHERE ts >= @start_date AND ts < @end_date AND amount > 0",
+            // The comparison is on an expression over the key.
+            "SELECT order_date FROM t WHERE COALESCE(order_date, ts) >= @start_date \
+             AND ts < @end_date",
+            // A computed projection named like the key.
+            "SELECT CAST(order_date AS DATE) AS order_date FROM t \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // A wildcard projection.
+            "SELECT * FROM t WHERE order_date >= @start_date AND order_date < @end_date",
         ] {
             let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
             model.sql = sql.to_string();

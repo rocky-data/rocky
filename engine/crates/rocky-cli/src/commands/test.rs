@@ -952,15 +952,26 @@ async fn whole_project_declarative_run(
         declared: 0,
         results: Vec::new(),
     };
+    // One file can be claimed by two pipelines whose roots nest; its tests
+    // run once, under the first pipeline that claims it.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, pipeline) in transformation_pipelines {
         let Some(models) = loaded.by_pipeline.get(name) else {
             continue;
         };
-        if models.iter().all(|m| m.config.tests.is_empty()) {
+        let models: Vec<rocky_core::models::Model> = models
+            .iter()
+            .filter(|m| seen.insert(m.config.name.clone()))
+            .cloned()
+            .collect();
+        let has_selected_tests = models
+            .iter()
+            .any(|m| !m.config.tests.is_empty() && model_filter.is_none_or(|f| m.config.name == f));
+        if !has_selected_tests {
             continue;
         }
         let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
-        let pipeline_run = execute_checks(models, &warehouse, model_filter).await;
+        let pipeline_run = execute_checks(&models, &warehouse, model_filter).await;
         run.declared += pipeline_run.declared;
         run.results.extend(pipeline_run.results);
     }
@@ -1364,6 +1375,28 @@ mod tests {
             run.results
         );
         assert_eq!(run.declared, 2);
+    }
+
+    /// Two pipelines whose roots nest claim the same file. Its tests run
+    /// once, not once per pipeline.
+    #[tokio::test]
+    async fn a_model_claimed_by_two_nested_pipelines_runs_its_tests_once() {
+        let tmp = three_pipeline_project();
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        let text = std::fs::read_to_string(&config).expect("read config");
+        std::fs::write(
+            &config,
+            text.replace("models = \"reporting/**\"", "models = \"models/**\""),
+        )
+        .expect("write config");
+        let run = whole_project_declarative_run(&config, None)
+            .await
+            .expect("run")
+            .expect("transformation pipelines");
+        let models: Vec<&str> = run.results.iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(models, ["stg"], "{:?}", run.results);
+        assert_eq!(run.declared, 1);
     }
 
     /// `--model` still scopes the run, and a name no pipeline declares is

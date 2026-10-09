@@ -118,7 +118,11 @@ pub fn run_compile_with_options(
         model_filter,
         do_expand_macros,
         target_dialect,
-        with_seed,
+        if with_seed {
+            SeedUse::Required
+        } else {
+            SeedUse::IfPresent
+        },
         cache_ttl_override,
         run_vars,
         strict_sources,
@@ -230,6 +234,21 @@ pub fn run_compile_dbt_attach(
     )
 }
 
+/// Whether a compile runs the project's seed file for source schemas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedUse {
+    /// `--with-seed`: the seed's tables only, and a missing or broken seed
+    /// is an error.
+    Required,
+    /// The `rocky compile` default: the seed's tables fill what the schema
+    /// cache lacks, when the project has a seed that runs.
+    IfPresent,
+    /// Never run the seed. For in-process callers ([`compile_output`]: the
+    /// `rocky serve` API and the MCP compile tool), which compile on request
+    /// and must not execute the project's seed SQL each time.
+    Never,
+}
+
 /// Compile body shared by the JSON core ([`compile_output`]) and the text
 /// renderer in [`run_compile`]. Returns the typed [`CompileOutput`] plus the
 /// extra raw data the text path needs ([`CompileTextData`]).
@@ -248,7 +267,7 @@ fn compile_inner(
     model_filter: Option<&str>,
     do_expand_macros: bool,
     target_dialect: Option<Dialect>,
-    with_seed: bool,
+    seed_use: SeedUse,
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
@@ -312,7 +331,7 @@ fn compile_inner(
     let config_strict_sources = project_config
         .as_ref()
         .is_some_and(|config| config.cache.schemas.strict_sources);
-    let (source_schemas, source_provenance) = if with_seed {
+    let (source_schemas, source_provenance) = if seed_use == SeedUse::Required {
         // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
@@ -337,7 +356,12 @@ fn compile_inner(
         } else {
             (HashMap::new(), SourceProvenance::default())
         };
-        merge_default_seed_schemas(project_root, &mut schemas, &mut provenance);
+        match seed_use {
+            SeedUse::IfPresent => {
+                merge_default_seed_schemas(project_root, &mut schemas, &mut provenance);
+            }
+            SeedUse::Never | SeedUse::Required => {}
+        }
         (schemas, provenance)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
@@ -1358,7 +1382,13 @@ pub fn compile_output(
         model_filter,
         do_expand_macros,
         target_dialect,
-        with_seed,
+        // These callers compile on request; only an explicit `with_seed`
+        // runs the project's seed SQL.
+        if with_seed {
+            SeedUse::Required
+        } else {
+            SeedUse::Never
+        },
         cache_ttl_override,
         // `compile_output` backs commands that don't expose `--var`
         // (ci / dag); an `@var()` model would surface an E028 diagnostic.
@@ -1502,7 +1532,8 @@ fn merge_default_seed_schemas(
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
     provenance: &mut SourceProvenance,
 ) {
-    if !seed_file(project_root).is_file() {
+    // A build without DuckDB cannot run a seed; the default tier is silent.
+    if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
         return;
     }
     match load_source_schemas_from_seed_at(project_root) {
@@ -3091,7 +3122,7 @@ schema_template = "s"
             None,
             false,
             None,
-            true,
+            SeedUse::Required,
             None,
             &rocky_core::run_vars::RunVars::new(),
             strict_sources,
@@ -3290,7 +3321,7 @@ schema_template = "s"
                 None,
                 false,
                 None,
-                false,
+                SeedUse::IfPresent,
                 None,
                 &rocky_core::run_vars::RunVars::new(),
                 false,
@@ -3362,7 +3393,7 @@ schema_template = "s"
         dir: &Path,
         models_dir: &Path,
         scope: ModelScope,
-        with_seed: bool,
+        seed_use: SeedUse,
     ) -> CompileOutput {
         compile_inner(
             Some(&dir.join("rocky.toml")),
@@ -3373,7 +3404,7 @@ schema_template = "s"
             None,
             false,
             None,
-            with_seed,
+            seed_use,
             None,
             &rocky_core::run_vars::RunVars::new(),
             false,
@@ -3393,7 +3424,12 @@ schema_template = "s"
         let dir = scaffold_two_pipeline_project();
         let root = dir.path();
 
-        let whole = compile_scoped(root, &root.join("models"), ModelScope::WholeProject, false);
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
         assert_eq!(whole.models, 2, "{:?}", whole.models_detail);
         assert!(
             whole
@@ -3404,7 +3440,12 @@ schema_template = "s"
             whole.diagnostics
         );
 
-        let one_dir = compile_scoped(root, &root.join("reporting"), ModelScope::Dir, false);
+        let one_dir = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
         assert_eq!(one_dir.models, 1);
         assert!(
             !one_dir.diagnostics.iter().any(|d| &*d.code == "E011"),
@@ -3426,7 +3467,12 @@ schema_template = "s"
         )
         .unwrap();
 
-        let whole = compile_scoped(root, &root.join("models"), ModelScope::WholeProject, false);
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
         assert_eq!(whole.models, 2);
         assert!(!whole.has_errors, "{:?}", whole.diagnostics);
         assert!(
@@ -3452,7 +3498,12 @@ schema_template = "s"
             "SELECT id, status, segment FROM src.orders",
         );
 
-        let whole = compile_scoped(root, &root.join("models"), ModelScope::WholeProject, false);
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
         assert!(
             whole
                 .diagnostics
@@ -3460,6 +3511,38 @@ schema_template = "s"
                 .any(|d| &*d.code == "W041" && d.message.contains("segment")),
             "{:?}",
             whole.diagnostics
+        );
+    }
+
+    /// `compile_output` (the `rocky serve` API, the MCP compile tool) never
+    /// runs the seed unasked: the same project gives no W041 there.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn compile_output_does_not_run_the_seed_unasked() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        write_model(
+            &root.join("models"),
+            "stg",
+            "SELECT id, status, segment FROM src.orders",
+        );
+
+        let out = compile_output(
+            Some(&root.join("rocky.toml")),
+            &root.join("state.redb"),
+            &root.join("models"),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !out.diagnostics.iter().any(|d| &*d.code == "W041"),
+            "{:?}",
+            out.diagnostics
         );
     }
 
@@ -3473,7 +3556,12 @@ schema_template = "s"
         let root = dir.path();
         write_seed(root, "DEFINITELY NOT VALID SQL;");
 
-        let whole = compile_scoped(root, &root.join("models"), ModelScope::WholeProject, false);
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
         assert_eq!(whole.models, 2);
         assert!(
             !whole.diagnostics.iter().any(|d| &*d.code == "E011"),

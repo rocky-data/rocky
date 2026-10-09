@@ -3426,17 +3426,6 @@ fn reset_sigpipe() {
 /// global subscriber. Splitting it drops that to ~5 ms for the
 /// fast-exit flags, which matters for shell prompt integrations and
 /// editor-extension startup checks.
-/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
-/// read: the named `--models` directory, or the whole project when none was
-/// named. Decided by presence, so `--models models` keeps reading that one
-/// directory.
-fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
-    match models {
-        Some(_) => rocky_cli::commands::ModelScope::Dir,
-        None => rocky_cli::commands::ModelScope::WholeProject,
-    }
-}
-
 /// The first supplied default-plan flag, if any.
 ///
 /// `rocky plan`'s own flags are declared `global = false` and documented
@@ -3459,6 +3448,17 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .iter()
         .find(|(_, supplied)| *supplied)
         .map(|(name, _)| *name)
+}
+
+/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
+/// read: the named `--models` directory, or the whole project when none was
+/// named. Decided by presence, so `--models models` keeps reading that one
+/// directory.
+fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
+    match models {
+        Some(_) => rocky_cli::commands::ModelScope::Dir,
+        None => rocky_cli::commands::ModelScope::WholeProject,
+    }
 }
 
 /// How long process exit waits for blocking-pool work that is still running.

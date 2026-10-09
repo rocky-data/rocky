@@ -62,7 +62,7 @@ Rocky types the models that read source tables from these schemas, in this order
 2. Otherwise: the schema cache, when `[cache.schemas]` is enabled.
 3. Plus, when the project has `data/seed.sql`: every seed table the cache does not hold.
 
-The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed that fails to run is skipped, and the compile goes on without it. Only `--with-seed` makes that an error.
+The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed that fails to run is skipped, and the compile goes on without it. Only `--with-seed` makes that an error. The seed is SQL from your repository, so it runs only for the `rocky compile` command itself. The compile behind `rocky serve` and the MCP compile tool does not run it.
 
 `data/seed.sql` is beside `rocky.toml` for a whole-project compile. With `--models <PATH>`, it is one level up from that directory.
 

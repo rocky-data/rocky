@@ -206,10 +206,17 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
     } else {
         None
     };
-    let source_schemas = if seeded && seed_error.is_none() {
-        source_schemas_from_db(&db)?
-    } else {
-        HashMap::new()
+    // A failure to read the seeded schemas is reported like a seed that
+    // failed, not as an error of the whole run.
+    let (source_schemas, seed_error) = match (seeded, seed_error) {
+        (true, None) => match source_schemas_from_db(&db) {
+            Ok(schemas) => (schemas, None),
+            Err(e) => (
+                HashMap::new(),
+                Some(format!("failed to read the seeded tables: {e:#}")),
+            ),
+        },
+        (_, error) => (HashMap::new(), error),
     };
     let source_provenance =
         SourceProvenance::uniform(source_schemas.keys(), &SourceSchemaOrigin::Seed);
@@ -1166,6 +1173,47 @@ mod tests {
         );
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.passed, 1);
+    }
+
+    /// A stale seed table with a model's name does not shadow the model: a
+    /// reader of `stg` gets the model's columns, not the seed table's.
+    #[test]
+    fn a_seed_table_named_like_a_model_does_not_shadow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(
+            seed_path(dir.path()),
+            "CREATE TABLE main.stg AS SELECT 'stale' AS other;\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        write_full_refresh(&models_dir, "stg", "SELECT 1::BIGINT AS id");
+        write_full_refresh(&models_dir, "rep", "SELECT id FROM stg");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::write(
+            contracts.join("rep.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n\n\
+             [rules]\nrequired = [\"id\"]\n",
+        )
+        .unwrap();
+
+        let result = run_tests(
+            &models_dir,
+            Some(&contracts),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::diagnostic::Diagnostic::is_error),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
     }
 
     /// A model reading a column the seed's table lacks gets W041 from the
