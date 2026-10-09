@@ -89,6 +89,28 @@ them into three kinds:
 Rocky merges any explicit `depends_on` entries from the model config with the
 dependencies it resolved. It then drops self-references and duplicates.
 
+#### Dependency cycles (`E058`)
+
+A cycle is a set of models that depend on each other, so no model can run
+first. For example, `fct_orders` reads `customer_ltv` in a `WHERE` sub-query,
+and `customer_ltv` reads `fct_orders`:
+
+```sql
+-- fct_orders.sql. E058: fct_orders depends on customer_ltv, which depends on fct_orders
+SELECT order_id, customer_id, amount
+FROM raw.orders
+WHERE customer_id IN (SELECT customer_id FROM customer_ltv)
+```
+
+`rocky compile`, `rocky test` and `rocky ci` report `E058` once for each model
+on the cycle. Each diagnostic names the models on the cycle and points at the
+line of the read that closes it. A dependency that only `depends_on` declares
+has no line to point at. The JSON output is printed as for any other error,
+and the command exits `1`. No later compile step runs, so a cycle hides other
+diagnostics until you remove it.
+
+`rocky run` refuses a project with a cycle before it writes anything.
+
 ### 3. Build semantic graph
 
 Rocky walks the models in topological order. For each one it pulls column-level
@@ -530,6 +552,7 @@ span, and sometimes a suggested fix.
 | `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
 | `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
 | `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB only). See [Unknown functions](#unknown-functions) |
+| `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |

@@ -61,6 +61,7 @@ pub fn run_ci(
         contracts_dir,
         model_filter: None,
         run_vars,
+        gates: None,
     })
 }
 

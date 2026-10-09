@@ -76,7 +76,6 @@ pub enum TestModels {
 }
 
 /// Everything one local test run reads.
-#[derive(Debug)]
 pub struct TestRunInputs<'a> {
     /// The models directory. Anchors `functions/` beside it.
     pub models_dir: &'a Path,
@@ -90,6 +89,33 @@ pub struct TestRunInputs<'a> {
     pub model_filter: Option<&'a str>,
     /// Per-run `@var(name)` substitutions.
     pub run_vars: &'a rocky_core::run_vars::RunVars,
+    /// The project's compile checks, run on the compile result before any
+    /// model executes. An error they add fails the run without executing a
+    /// model, as a compiler error does.
+    ///
+    /// The result still holds each model's authored SQL: ephemeral upstreams
+    /// are inlined after the checks run, as `rocky compile` orders them.
+    /// `rocky ci` passes the per-model-target checks of `rocky compile`
+    /// here; `None` runs none.
+    pub gates: Option<&'a CompileGates<'a>>,
+}
+
+/// Checks a caller runs over a test run's compile result. See
+/// [`TestRunInputs::gates`].
+pub type CompileGates<'a> = dyn Fn(&mut rocky_compiler::compile::CompileResult) + 'a;
+
+impl std::fmt::Debug for TestRunInputs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestRunInputs")
+            .field("models_dir", &self.models_dir)
+            .field("project_root", &self.project_root)
+            .field("models", &self.models)
+            .field("contracts_dir", &self.contracts_dir)
+            .field("model_filter", &self.model_filter)
+            .field("run_vars", &self.run_vars)
+            .field("gates", &self.gates.is_some())
+            .finish()
+    }
 }
 
 /// The seed file of a project: `<project_root>/data/seed.sql`.
@@ -161,6 +187,7 @@ pub fn run_tests(
         contracts_dir,
         model_filter,
         run_vars,
+        gates: None,
     })
 }
 
@@ -186,6 +213,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         contracts_dir,
         model_filter,
         run_vars,
+        gates,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
@@ -227,15 +255,41 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         source_schemas,
         source_provenance,
         run_vars: run_vars.clone(),
+        // The checks in `gates` judge the authored SQL; ephemeral upstreams
+        // are inlined after them, below.
+        preserve_authored_sql: true,
         ..Default::default()
     };
 
-    let compile_result = match models {
-        TestModels::Dir => rocky_compiler::compile::compile(&config)?,
+    let compiled = match models {
+        TestModels::Dir => rocky_compiler::compile::compile(&config),
         TestModels::Preloaded(models) => {
-            rocky_compiler::compile::compile_preloaded_models(models, &config)?
+            rocky_compiler::compile::compile_preloaded_models(models, &config)
         }
     };
+    let mut compile_result = match compiled {
+        Ok(result) => result,
+        // A dependency cycle leaves no execution order: report its E058
+        // diagnostics as compile errors, and execute nothing.
+        Err(error) => match error.cycle_diagnostics() {
+            Some(diagnostics) => {
+                let all_models = error.cycle_models().unwrap_or_default().to_vec();
+                return Ok(cycle_result(diagnostics, all_models, model_filter));
+            }
+            None => return Err(error.into()),
+        },
+    };
+    if let Some(gates) = gates {
+        gates(&mut compile_result);
+        compile_result.has_errors |= compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
+    // The statement each model executes inlines its ephemeral upstreams. The
+    // E038 diagnostics this returns were already reported by the compile.
+    let _already_reported =
+        rocky_compiler::ephemeral::apply_ephemerals(&mut compile_result.project, true);
 
     let mut result = TestResult {
         total: 0,
@@ -326,6 +380,37 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
     Ok(result)
 }
 
+/// The result of a run refused by a dependency cycle: every E058 diagnostic,
+/// and a failure for each model on the cycle (filtered to `model_filter`).
+fn cycle_result(
+    diagnostics: &[rocky_compiler::diagnostic::Diagnostic],
+    all_models: Vec<String>,
+    model_filter: Option<&str>,
+) -> TestResult {
+    let mut result = TestResult {
+        total: 0,
+        passed: 0,
+        failures: Vec::new(),
+        model_results: Vec::new(),
+        diagnostics: diagnostics.to_vec(),
+        all_models,
+    };
+    for d in diagnostics {
+        if include_model(model_filter, &d.model) {
+            result
+                .failures
+                .push((d.model.clone(), d.message.to_string()));
+            result.model_results.push(ModelTestResult {
+                model: d.model.clone(),
+                status: ModelTestStatus::Fail,
+                error: Some(d.message.to_string()),
+            });
+        }
+    }
+    result.total = result.model_results.len();
+    result
+}
+
 /// Filter helper: include a model when there's no filter, or when the filter
 /// matches the model name exactly. Centralized so callers can't accidentally
 /// substring-match.
@@ -379,11 +464,37 @@ pub fn run_unit_tests(
         models_dir: models_dir.to_path_buf(),
         ..Default::default()
     };
-    let compile_result = rocky_compiler::compile::compile(&config)?;
+    let compiled = rocky_compiler::compile::compile(&config);
 
     // Stable, name-sorted iteration so output order is deterministic.
     let mut names: Vec<&String> = unit_tests.keys().collect();
     names.sort();
+
+    // A dependency cycle fails every unit test. [`run_tests_with`] reports
+    // the cycle itself, as E058 diagnostics.
+    let compile_result = match compiled {
+        Ok(result) => result,
+        Err(error) if error.cycle_diagnostics().is_some() => {
+            let results = names
+                .into_iter()
+                .filter(|name| include_model(model_filter, name))
+                .flat_map(|name| {
+                    unit_tests[name].iter().map(move |test| UnitTestResult {
+                        model: name.clone(),
+                        test: test.name.clone(),
+                        passed: false,
+                        error: Some(format!(
+                            "model '{name}' is not run: the project has a dependency cycle \
+                             (E058)"
+                        )),
+                        mismatches: Vec::new(),
+                    })
+                })
+                .collect();
+            return Ok(UnitTestRun { results });
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let mut results = Vec::new();
     for name in names {
@@ -1093,6 +1204,7 @@ mod tests {
             contracts_dir: None,
             model_filter: None,
             run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1238,6 +1350,128 @@ mod tests {
                 .any(|d| &*d.code == "W041" && d.message.contains("segment")),
             "{:?}",
             result.diagnostics
+        );
+    }
+
+    /// A dependency cycle is reported as E058 compile errors, one per model
+    /// on it, and no model executes.
+    #[test]
+    fn a_dependency_cycle_is_e058_and_executes_nothing() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        write_full_refresh(
+            &models_dir,
+            "fct",
+            "SELECT id FROM stg WHERE id IN (SELECT id FROM ltv)",
+        );
+        write_full_refresh(&models_dir, "ltv", "SELECT id FROM fct");
+
+        let result = run_tests(
+            &models_dir,
+            None,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        let mut cycle: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == rocky_compiler::diagnostic::E058 && d.is_error())
+            .map(|d| d.model.as_str())
+            .collect();
+        cycle.sort_unstable();
+        assert_eq!(cycle, ["fct", "ltv"], "{:?}", result.diagnostics);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failures.len(), 2, "{:?}", result.failures);
+        assert!(
+            result.all_models.iter().any(|m| m == "stg"),
+            "every loaded model is listed: {:?}",
+            result.all_models
+        );
+    }
+
+    /// An error the caller's gates add fails the run before any model
+    /// executes; a gate that adds nothing leaves the run as it was.
+    #[test]
+    fn a_gate_error_fails_the_run_before_execution() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        let refuse = |result: &mut rocky_compiler::compile::CompileResult| {
+            result
+                .diagnostics
+                .push(rocky_compiler::diagnostic::Diagnostic::error(
+                    "E042", "stg", "refused",
+                ));
+        };
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&refuse),
+        })
+        .unwrap();
+        assert_eq!(result.passed, 0, "{:?}", result.model_results);
+        assert_eq!(
+            result.failures,
+            [("stg".to_string(), "refused".to_string())]
+        );
+        assert!(result.diagnostics.iter().any(|d| &*d.code == "E042"));
+
+        let silent = |_: &mut rocky_compiler::compile::CompileResult| {};
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&silent),
+        })
+        .unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.passed, 1);
+    }
+
+    /// The gates see each model's authored SQL; the model then executes with
+    /// its ephemeral upstream inlined.
+    #[test]
+    fn gates_see_authored_sql_and_ephemerals_still_inline() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            models_dir.join("eph.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+        write_full_refresh(&models_dir, "mart", "SELECT id FROM eph");
+        let seen = std::cell::RefCell::new(String::new());
+        let record = |result: &mut rocky_compiler::compile::CompileResult| {
+            let mart = result.project.model("mart").unwrap();
+            *seen.borrow_mut() = mart.sql.clone();
+        };
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: Some(&record),
+        })
+        .unwrap();
+        assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(
+            result
+                .model_results
+                .iter()
+                .any(|m| m.model == "mart" && m.status == ModelTestStatus::Pass),
+            "{:?}",
+            result.model_results
         );
     }
 }

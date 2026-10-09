@@ -1085,6 +1085,10 @@ data/seed.sql ─► in-memory DuckDB ─► compile (typed from the seed) ─�
 
 The seed is `data/seed.sql` beside `rocky.toml`. The compile is typed from the tables it made, so `rocky ci` finds a contract type mismatch (`E011`) from the seed alone.
 
+The compile runs the same per-model-target checks as [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`.
+
+A dependency cycle is the `E058` error, one for each model on the cycle. `rocky ci` prints its JSON with these diagnostics, runs no model, and exits `1`. See [Dependency cycles](/concepts/compiler/#dependency-cycles-e058).
+
 `exit_code` in the JSON is the code the process exits with: `0` when compile and tests pass, `1` when either fails. Warnings do not change it. To act on warnings, read the `"severity": "Warning"` entries in `diagnostics`.
 
 ### Examples

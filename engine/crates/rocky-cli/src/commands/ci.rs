@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rocky_engine::test_runner::{TestModels, TestRunInputs};
+use rocky_engine::test_runner::{CompileGates, TestModels, TestRunInputs};
 
 use super::ModelScope;
 use crate::output::{CiOutput, TestFailure, print_json};
@@ -24,7 +24,24 @@ pub fn run_ci(
     output_json: bool,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
-    let (models, project_root) = ci_models(config_path, models_dir, scope)?;
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let (models, project_root) =
+        ci_models(config_path, project_config.as_ref(), models_dir, scope)?;
+    // The per-model-target checks of `rocky compile` (E042/E043, E057, E044,
+    // E049, E051, E053, E054), judged against the warehouses of the
+    // pipelines that load each model. A project without `rocky.toml` has no
+    // targets, so there is nothing to judge against.
+    let gates = project_config.as_ref().map(|config| {
+        move |result: &mut rocky_compiler::compile::CompileResult| {
+            super::compile::apply_model_target_gates(
+                result,
+                config,
+                config_path,
+                rocky_server::project_gates::ModelSqlForm::Authored,
+            );
+        }
+    });
     let result = rocky_engine::ci::run_ci_with(TestRunInputs {
         models_dir,
         project_root: &project_root,
@@ -32,6 +49,7 @@ pub fn run_ci(
         contracts_dir,
         model_filter: None,
         run_vars,
+        gates: gates.as_ref().map(|g| g as &CompileGates<'_>),
     })?;
 
     if output_json {
@@ -90,6 +108,7 @@ pub fn run_ci(
 /// from.
 fn ci_models(
     config_path: &Path,
+    project_config: Option<&rocky_core::config::RockyConfig>,
     models_dir: &Path,
     scope: ModelScope,
 ) -> Result<(TestModels, std::path::PathBuf)> {
@@ -102,10 +121,6 @@ fn ci_models(
     match scope {
         ModelScope::Dir => Ok((TestModels::Dir, dir_root())),
         ModelScope::WholeProject => {
-            let project_config = rocky_core::config::load_optional_project_config(Some(
-                config_path,
-            ))
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?;
             let Some(project) = project_config else {
                 return Ok((TestModels::Dir, dir_root()));
             };
@@ -113,7 +128,7 @@ fn ci_models(
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf();
-            match crate::models_loader::whole_project_models(config_path, &project)? {
+            match crate::models_loader::whole_project_models(config_path, project)? {
                 Some(models) => Ok((TestModels::Preloaded(models), config_root)),
                 None => Ok((TestModels::Dir, config_root)),
             }

@@ -418,9 +418,16 @@ fn compile_inner(
         }
         (ModelScope::WholeProject, None) | (ModelScope::Dir, _) => None,
     };
-    let mut result = match whole_project {
-        Some(models) => compile::compile_preloaded_models(models, &config)?,
-        None => compile::compile(&config)?,
+    let compiled = match whole_project {
+        Some(models) => compile::compile_preloaded_models(models, &config),
+        None => compile::compile(&config),
+    };
+    let mut result = match compiled {
+        Ok(result) => result,
+        Err(error) => match error.cycle_diagnostics() {
+            Some(diagnostics) => return Ok(cycle_output(diagnostics)),
+            None => return Err(error.into()),
+        },
     };
 
     // `--model` may also name a user-defined function (`functions/`), valid
@@ -720,9 +727,44 @@ fn compile_inner(
     Ok((output, text_data))
 }
 
+/// The output of a compile refused by a dependency cycle: the E058
+/// diagnostics, and no models (a cyclic project has no execution order, so
+/// nothing past dependency resolution ran).
+///
+/// Every cycle diagnostic is reported, whatever `--model` or `--select`
+/// names: a cycle anywhere stops the whole project from running.
+fn cycle_output(diagnostics: &[Diagnostic]) -> (CompileOutput, CompileTextData) {
+    let mut execution_order: Vec<String> = Vec::new();
+    let mut source_map = HashMap::new();
+    for d in diagnostics {
+        if !execution_order.contains(&d.model) {
+            execution_order.push(d.model.clone());
+        }
+        if let Some(span) = &d.span
+            && let Ok(text) = std::fs::read_to_string(&span.file)
+        {
+            source_map.insert(span.file.clone(), text);
+        }
+    }
+    let output = CompileOutput::new(
+        0,
+        0,
+        diagnostics.to_vec(),
+        true,
+        compile::PhaseTimings::default(),
+    );
+    let text_data = CompileTextData {
+        execution_order,
+        typed_column_counts: HashMap::new(),
+        source_map,
+    };
+    (output, text_data)
+}
+
 /// The project-level, per-model-target checks of `rocky compile`, for the
 /// surfaces that compile through `rocky_compiler::compile` directly:
-/// `rocky serve` and `rocky lsp`.
+/// `rocky serve`, `rocky lsp` and `rocky ci` (through
+/// `rocky_engine::test_runner::TestRunInputs::gates`).
 ///
 /// This is the ONE funnel for those surfaces. `rocky compile` runs the same
 /// three steps ([`apply_adapter_gates`], [`apply_operand_gates`],
