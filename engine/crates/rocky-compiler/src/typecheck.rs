@@ -453,6 +453,13 @@ fn compute_model_typecheck(
         ReferenceMap::default()
     };
 
+    // A qualified read of an upstream model's own target table
+    // (`FROM tour.main.customer_ltv`) types from that model.
+    let relation_key = |name: &str| -> String {
+        qualified_upstream_model(name, &model_schema.upstream, model_by_name)
+            .map_or_else(|| name.to_string(), str::to_string)
+    };
+
     // Step 1: Lineage-based type propagation
     let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(model_schema.columns.len());
 
@@ -460,11 +467,12 @@ fn compute_model_typecheck(
         let producing_edge = graph.producing_edge(model_name, &col_def.name);
 
         let (data_type, nullable) = if let Some(edge) = producing_edge {
+            let source_model = relation_key(&edge.source.model);
             let upstream_type = typed_models
-                .get(&*edge.source.model)
+                .get(&source_model)
                 .and_then(|cols| {
                     col_index
-                        .get(&*edge.source.model)
+                        .get(&source_model)
                         .and_then(|idx| idx.get(&*edge.source.column))
                         .map(|&i| &cols[i])
                 })
@@ -530,7 +538,7 @@ fn compute_model_typecheck(
         .filter(|_| needs_inference)
         .map(|model| {
             infer_select_types_with_lookup(&model.sql, &|name| {
-                typed_models.get(name).map(Vec::as_slice)
+                typed_models.get(&relation_key(name)).map(Vec::as_slice)
             })
             .ok()
         });
@@ -667,7 +675,7 @@ fn compute_model_typecheck(
     if let Some(model) = model_by_name.get(model_name) {
         let relation_columns = |name: &str| -> Option<Vec<String>> {
             let columns = if name.contains('.') {
-                typed_models.get(name).or_else(|| {
+                typed_models.get(&relation_key(name)).or_else(|| {
                     typed_models
                         .iter()
                         .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
@@ -999,6 +1007,43 @@ fn check_known_missing_projection_refs(
         }
     }
     diagnostics
+}
+
+/// The upstream model whose `[target]` table a qualified read names, for a
+/// reader that depends on it: `catalog.schema.table`, or `schema.table` when
+/// exactly one upstream writes that schema and table.
+///
+/// Only models in `upstream` (the reader's DAG edges) are candidates, so a
+/// physical name never binds to a model the reader does not read (#1631). An
+/// ephemeral model writes no table and never matches. A bare name returns
+/// `None`: it is already a model key.
+pub(crate) fn qualified_upstream_model<'m>(
+    name: &str,
+    upstream: &[String],
+    model_by_name: &HashMap<&str, &'m rocky_core::models::Model>,
+) -> Option<&'m str> {
+    use rocky_core::physical_edges::fold_identifier;
+    let parts: Vec<String> = name.split('.').map(fold_identifier).collect();
+    if parts.len() < 2 || parts.len() > 3 || parts.iter().any(String::is_empty) {
+        return None;
+    }
+    let mut matches = upstream.iter().filter_map(|up| {
+        let model = model_by_name.get(up.as_str())?;
+        if matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            return None;
+        }
+        let target = &model.config.target;
+        let table_matches = fold_identifier(&target.schema) == parts[parts.len() - 2]
+            && fold_identifier(&target.table) == parts[parts.len() - 1];
+        let catalog_matches =
+            parts.len() == 2 || fold_identifier(&target.catalog) == parts[0];
+        (table_matches && catalog_matches).then_some(model.config.name.as_str())
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
@@ -8590,5 +8635,60 @@ mod tests {
             assert_eq!(ty(name), RockyType::Unknown, "{name}");
         }
         assert_eq!(ty("next_n"), RockyType::Int64);
+    }
+
+    #[test]
+    fn a_qualified_read_of_an_upstream_target_types_from_that_model() {
+        let sources = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("customer_id", RockyType::Int64, false),
+                ("amount", RockyType::Float64, true),
+            ]),
+        )]);
+        let ltv = make_model(
+            "customer_ltv",
+            "SELECT customer_id, SUM(amount) AS lifetime_value, COUNT(*) AS order_count \
+             FROM raw.orders GROUP BY customer_id",
+        );
+        // Ephemeral, reads its upstream by the physical name it writes, and
+        // declares the dependency.
+        let mut active = make_model(
+            "int_active",
+            "SELECT customer_id, lifetime_value, order_count \
+             FROM warehouse.silver.customer_ltv WHERE order_count > 0",
+        );
+        active.config.depends_on = vec!["customer_ltv".to_string()];
+        active.config.strategy = StrategyConfig::Ephemeral;
+        let top = make_model(
+            "top",
+            "WITH ranked AS (SELECT customer_id, lifetime_value AS ltv, order_count \
+             FROM int_active) SELECT customer_id, ltv, order_count FROM ranked",
+        );
+        // Same read, but no dependency on the model: the name may be any
+        // physical table, so nothing binds.
+        let stray = make_model(
+            "stray",
+            "SELECT customer_id FROM warehouse.silver.customer_ltv",
+        );
+        let models = vec![ltv, active, top, stray];
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources,
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
+        for model in ["int_active", "top"] {
+            let ty = |name: &str| column(&result, model, name).data_type.clone();
+            assert_eq!(ty("customer_id"), RockyType::Int64, "{model}");
+            assert_eq!(ty("order_count"), RockyType::Int64, "{model}");
+        }
+        assert_eq!(
+            column(&result, "top", "ltv").data_type,
+            RockyType::Float64
+        );
+        assert_eq!(
+            column(&result, "stray", "customer_id").data_type,
+            RockyType::Unknown
+        );
     }
 }
