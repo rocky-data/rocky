@@ -544,6 +544,14 @@ export interface RockyConfig {
    */
   schedule?: ScheduleDefaultsConfig;
   /**
+   * Saved selectors: a name mapped to a `--select` expression. Use one with `--select selector:<name>` on any command that takes `--select` (or `--exclude selector:<name>`). A saved selector may use graph operators, `state:` and other `selector:` terms; a loop is an error.
+   *
+   * ```toml [selectors] nightly = "tag:nightly+ config.materialized:incremental" finance = "path:marts/finance,tag:certified" ```
+   */
+  selectors?: {
+    [k: string]: string;
+  };
+  /**
    * Global state persistence configuration.
    */
   state?: StateConfig;

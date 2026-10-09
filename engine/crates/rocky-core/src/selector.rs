@@ -1093,12 +1093,19 @@ mod tests {
 
     #[test]
     fn saved_selector_expands_with_its_own_union_and_intersection() {
-        let defs = saved(&[("tail", "d e"), ("lower", "b,c"), ("wide", "selector:tail x")]);
+        let defs = saved(&[
+            ("tail", "d e"),
+            ("lower", "b,c"),
+            ("wide", "selector:tail x"),
+        ]);
         let g = diamond();
         assert_eq!(sel_saved(&g, &defs, "selector:tail"), names(&["d", "e"]));
         // The saved union binds as a unit: `d e` intersected with `e`.
         assert_eq!(sel_saved(&g, &defs, "selector:tail,e"), names(&["e"]));
-        assert_eq!(sel_saved(&g, &defs, "selector:wide"), names(&["d", "e", "x"]));
+        assert_eq!(
+            sel_saved(&g, &defs, "selector:wide"),
+            names(&["d", "e", "x"])
+        );
     }
 
     #[test]
@@ -1120,7 +1127,10 @@ mod tests {
         assert!(none.to_string().contains("[selectors]"));
         let defs = saved(&[("a", "selector:b"), ("b", "selector:a"), ("e", "")]);
         let cycle = parse_with(&["selector:a".to_string()], &defs).unwrap_err();
-        assert!(matches!(cycle, SelectorError::SavedSelectorCycle { .. }), "{cycle}");
+        assert!(
+            matches!(cycle, SelectorError::SavedSelectorCycle { .. }),
+            "{cycle}"
+        );
         assert!(cycle.to_string().contains("a -> b -> a"));
         assert!(parse_with(&["selector:e".to_string()], &defs).is_err());
         let _ = g;

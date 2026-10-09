@@ -1325,6 +1325,16 @@ The v1 Databricks implementation validates each `rocky_role_<name>` principal ag
 
 ---
 
+## `[selectors]`
+
+Saved selectors. Each entry maps a name to a `--select` expression. Use one with `--select selector:<name>` (or `--exclude selector:<name>`) on any command that takes `--select`. See [Saved selectors](/reference/node-selection/#saved-selectors).
+
+```toml
+[selectors]
+nightly = "tag:nightly+ config.materialized:incremental"
+finance = "path:marts/finance,tag:certified"
+```
+
 ## `[freshness]`
 
 Set a project-wide staleness budget, so you do not repeat the same threshold in every model sidecar. Freshness is how far behind the newest row in a table is.

@@ -651,14 +651,16 @@ mod tests {
                 select: vec![select.into()],
                 ..Default::default()
             };
-            resolve_in_dir(&args, dir.path(), None, &ctx)
-                .map(|s| s.into_iter().collect::<Vec<_>>())
+            resolve_in_dir(&args, dir.path(), None, &ctx).map(|s| s.into_iter().collect::<Vec<_>>())
         };
         assert_eq!(run("selector:downstream").unwrap(), vec!["base", "m"]);
         assert_eq!(run("selector:only_m").unwrap(), vec!["m"]);
         assert_eq!(run("+selector:only_m").unwrap(), vec!["base", "m"]);
         let err = run("selector:missing").unwrap_err();
-        assert!(format!("{err:#}").contains("unknown saved selector"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("unknown saved selector"),
+            "{err:#}"
+        );
     }
 
     #[test]
