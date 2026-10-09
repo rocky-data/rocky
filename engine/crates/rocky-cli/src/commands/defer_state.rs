@@ -63,7 +63,7 @@ pub enum DeferStateError {
     Unreadable {
         path: String,
         #[source]
-        source: StateError,
+        source: Box<StateError>,
     },
     /// `--defer-run-id` names a run the store does not hold.
     #[error("--defer-run-id: the state store at {path} holds no run '{run_id}'")]
@@ -256,7 +256,7 @@ fn open_store(path: &Path) -> Result<StateStore, DeferStateError> {
 fn unreadable(path: &str, source: StateError) -> DeferStateError {
     DeferStateError::Unreadable {
         path: path.to_string(),
-        source,
+        source: Box::new(source),
     }
 }
 
