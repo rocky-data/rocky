@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.0] — 2026-10-09
+
+Pairs with engine 1.80.0. Works with `rocky-sdk` 0.18.0 or later.
+
+### Fixed
+
+- **Strict contracts fail the contract check.** With `--strict-contracts` or `[contracts] strict = true`, engine 1.80.0 reports a contract type it cannot check as the error `E059`. The contract checks map it to `contract_column_constraints`. Without the mapping, the check passed although the compile reported the error.
+
 ## [1.69.0] — 2026-10-07
 
 Pairs with engine 1.77.0 and `rocky-sdk` 0.18.0.
