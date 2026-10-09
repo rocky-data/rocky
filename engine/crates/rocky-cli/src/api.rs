@@ -3520,19 +3520,25 @@ fn strip_panic_location(line: &str) -> String {
 
 /// Characters a path token may follow and still count as absolute.
 fn opens_path_token(prev: Option<char>) -> bool {
-    prev.is_none_or(|c| c.is_whitespace() || "'\"`([{<=,;".contains(c))
+    prev.is_none_or(|c| c.is_whitespace() || "'\"`([{<=,;:".contains(c))
 }
 
-/// Characters that end a path token.
+/// Characters that end a path token. A path with a space in it is cut at
+/// the space, so its tail can survive.
 fn closes_path_token(c: char) -> bool {
     c.is_whitespace() || "'\"`)]}>,;".contains(c)
 }
 
 /// The byte length of an absolute path starting at `rest`, or `None`: a Unix
-/// path (`/x…`), a home path (`~/x…`) or a Windows path (`C:\x…`).
+/// path (`/x…`), a `file:///x…` URL, a home path (`~/x…`), a Windows path
+/// (`C:\x…` or `C:/x…`) or a UNC path (`\\host\x…`).
 fn absolute_path_at(rest: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
     let starts = match bytes {
+        [b'f', b'i', b'l', b'e', b':', b'/', b'/', b'/', ..] => true,
+        [b'\\', b'\\', next, ..] => next.is_ascii_alphanumeric(),
+        [letter, b':', b'/', next, ..] => letter.is_ascii_alphabetic() && *next != b'/',
+        // `https://host` reaches here at `//host`: not a path.
         [b'/', next, ..] => !next.is_ascii_whitespace() && *next != b'/',
         [b'~', b'/', ..] => true,
         [letter, b':', b'\\', ..] => letter.is_ascii_alphabetic(),
@@ -11742,6 +11748,22 @@ Caused by:
             error.contains("https://docs.example.com/a/b"),
             "a URL is not a path: {error}"
         );
+
+        // Other spellings of an absolute path.
+        for (text, leaked) in [
+            ("see file:///Users/me/x.sql", "/Users/me"),
+            ("cwd:/home/me/project", "/home/me"),
+            ("at C:/Users/me/x", "C:/Users"),
+            ("share \\\\srv\\share\\x", "srv"),
+        ] {
+            let error = concise_job_error(&format!("Error: {text}")).expect("an error");
+            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+            assert!(error.contains("<path>"), "{error}");
+        }
+        for url in ["https://docs.example.com/a/b", "s3://bucket/key"] {
+            let error = concise_job_error(&format!("Error: see {url}")).expect("an error");
+            assert!(error.contains(url), "a URL is not a path: {error}");
+        }
 
         // Without an `Error:` line, a line naming an absolute path is
         // dropped, and a panic keeps its message but not its location.

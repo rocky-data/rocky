@@ -422,9 +422,16 @@ pub async fn propose_governed_run_plan(
     // directory and file glob, not `models_dir` without a glob. Otherwise
     // plan and apply hash different model sets and the apply refuses an
     // unchanged plan. An unresolvable scope refuses the propose.
-    let scope = rocky_core::config::load_optional_project_config(Some(config_path))
+    //
+    // Resolved against the config path joined to `root`, as review does, so
+    // the directory and the glob are both anchored at the project root. A
+    // relative glob over a root-anchored directory matches nothing.
+    let scope_config_path = root.join(config_path);
+    let scope = rocky_core::config::load_optional_project_config(Some(&scope_config_path))
         .map_err(anyhow::Error::from)
-        .and_then(|cfg| super::approval_scope::approval_scope(cfg.as_ref(), config_path, &run_plan))
+        .and_then(|cfg| {
+            super::approval_scope::approval_scope(cfg.as_ref(), &scope_config_path, &run_plan)
+        })
         .map(|scope| scope.anchored_at(root))
         .map_err(|e| ProposeError::Compile(format!("{e:#}")))?;
     let capabilities = super::plan::compute_embedded_capabilities_for_scope(
