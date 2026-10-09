@@ -1409,9 +1409,11 @@ enum Command {
 
     /// Compile models: resolve dependencies, type check, validate contracts
     Compile {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Without it, every transformation pipeline's
+        /// models compile together, in one project graph (a project with no
+        /// transformation pipeline reads `models`).
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -1941,9 +1943,11 @@ enum Command {
     /// the configured warehouse adapter instead of DuckDB.
     #[cfg(feature = "duckdb")]
     Test {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory (default `models`). With `--declarative` and
+        /// neither `--models` nor `--pipeline`, every transformation
+        /// pipeline's own models run, each against its pipeline's warehouse.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -1956,7 +1960,8 @@ enum Command {
         /// Run declarative [[tests]] from model sidecars against the warehouse
         #[arg(long)]
         declarative: bool,
-        /// Pipeline name (only used with --declarative; required if multiple pipelines defined)
+        /// Pipeline name (only used with --declarative). Runs that one
+        /// pipeline's declarative tests.
         #[arg(long)]
         pipeline: Option<String>,
         /// Per-run variable substituted into model SQL (repeatable). Resolves
@@ -1971,9 +1976,11 @@ enum Command {
     /// Run CI pipeline: compile + test without warehouse credentials
     #[cfg(feature = "duckdb")]
     Ci {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Without it, every transformation pipeline's
+        /// models compile together and run in one in-memory DuckDB, so a
+        /// model reads the outputs of the pipelines it depends on.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -3419,6 +3426,17 @@ fn reset_sigpipe() {
 /// global subscriber. Splitting it drops that to ~5 ms for the
 /// fast-exit flags, which matters for shell prompt integrations and
 /// editor-extension startup checks.
+/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
+/// read: the named `--models` directory, or the whole project when none was
+/// named. Decided by presence, so `--models models` keeps reading that one
+/// directory.
+fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
+    match models {
+        Some(_) => rocky_cli::commands::ModelScope::Dir,
+        None => rocky_cli::commands::ModelScope::WholeProject,
+    }
+}
+
 /// The first supplied default-plan flag, if any.
 ///
 /// `rocky plan`'s own flags are declared `global = false` and documented
@@ -4940,10 +4958,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     selection.as_ref(),
                 )
             } else {
+                let scope = model_scope(models.as_deref());
                 rocky_cli::commands::run_compile_with_options(
                     Some(cli.config.as_path()),
                     &state_path,
-                    &models,
+                    models
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("models")),
+                    scope,
                     contracts.as_deref(),
                     model.as_deref(),
                     json,
@@ -5313,10 +5335,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "--select / --exclude are not yet supported with --declarative; use --model"
                 );
             }
+            let models_dir = models
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("models"));
             if declarative {
                 rocky_cli::commands::run_declarative_tests(
                     &cli.config,
-                    &models,
+                    models_dir,
+                    model_scope(models.as_deref()),
                     pipeline.as_deref(),
                     model.as_deref(),
                     json,
@@ -5329,7 +5355,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cache_ttl_override: cli.cache_ttl,
                 };
                 rocky_cli::commands::run_test_with_selection(
-                    &models,
+                    models_dir,
                     contracts.as_deref(),
                     model.as_deref(),
                     json,
@@ -5346,7 +5372,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rocky_cli::commands::run_ci(&models, contracts.as_deref(), json, &run_vars)
+            rocky_cli::commands::run_ci(
+                &cli.config,
+                models
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("models")),
+                model_scope(models.as_deref()),
+                contracts.as_deref(),
+                json,
+                &run_vars,
+            )
         }
         Command::CiDiff {
             base_ref,

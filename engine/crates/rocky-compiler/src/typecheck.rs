@@ -1137,8 +1137,10 @@ fn check_time_interval_strategy(
     // E022: time_column must not be nullable. Partition keys can't be NULL.
     // Skip when the type is Unknown — the nullable bit defaults to true in
     // that case, which would falsely fire on every model with an inferred
-    // upstream.
-    if type_known && column.nullable {
+    // upstream. Skip also when the model's own WHERE compares the column:
+    // a comparison is never TRUE on NULL, so no emitted row has a NULL key,
+    // whatever the upstream column allows.
+    if type_known && column.nullable && !where_rejects_null_column(&model.sql, time_column) {
         diagnostics.push(
             Diagnostic::error(
                 E022,
@@ -1863,6 +1865,84 @@ fn filter_window_bound(filter: &Expr, scope: &mut CteScope) -> WindowBound {
         .fold(WindowBound::default(), |bound, conjunct| {
             bound.or(conjunct_window_bound(conjunct, scope))
         })
+}
+
+/// Whether the model emits no row whose `column` is NULL, because its WHERE
+/// requires a comparison on that column to be TRUE.
+///
+/// Holds only for the narrow shape where that is certain: one SELECT (no set
+/// operation), whose projection carries `column` as a bare column reference
+/// of the same name (so the WHERE reads the same value the output carries),
+/// and whose WHERE has a top-level `AND` conjunct `column <op> <expr>` or
+/// `<expr> <op> column` with `<op>` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.
+/// Under SQL three-valued logic such a comparison is NULL, never TRUE, when
+/// `column` is NULL, so the row is filtered out. Anything else — a parse
+/// failure, a set operation, an aliased or computed projection, a comparison
+/// under `OR` — answers `false`.
+fn where_rejects_null_column(sql: &str, column: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    // A column reference as its lowercased name parts, when its last part is
+    // `column`. The WHERE side must spell the same reference as the
+    // projection, so `SELECT p.d ... WHERE o.d > x` does not count.
+    let column_ref = |expr: &Expr| -> Option<Vec<String>> {
+        let parts: Vec<String> = match expr {
+            Expr::Identifier(ident) => vec![ident.value.to_lowercase()],
+            Expr::CompoundIdentifier(idents) => {
+                idents.iter().map(|i| i.value.to_lowercase()).collect()
+            }
+            _ => return None,
+        };
+        parts
+            .last()
+            .is_some_and(|last| last.eq_ignore_ascii_case(column))
+            .then_some(parts)
+    };
+    let projected: Vec<Vec<String>> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => column_ref(expr),
+            SelectItem::ExprWithAlias { expr, alias } => alias
+                .value
+                .eq_ignore_ascii_case(column)
+                .then(|| column_ref(expr))
+                .flatten(),
+            SelectItem::ExprWithAliases { .. }
+            | SelectItem::QualifiedWildcard(..)
+            | SelectItem::Wildcard(..) => None,
+        })
+        .collect();
+    if projected.is_empty() {
+        return false;
+    }
+    let Some(selection) = &select.selection else {
+        return false;
+    };
+    let is_projected = |expr: &Expr| column_ref(expr).is_some_and(|r| projected.contains(&r));
+    let mut conjuncts = Vec::new();
+    top_level_conjuncts(selection, &mut conjuncts);
+    conjuncts.into_iter().any(|conjunct| match conjunct {
+        Expr::BinaryOp { left, op, right } => {
+            matches!(
+                op,
+                ast::BinaryOperator::Eq
+                    | ast::BinaryOperator::NotEq
+                    | ast::BinaryOperator::Lt
+                    | ast::BinaryOperator::LtEq
+                    | ast::BinaryOperator::Gt
+                    | ast::BinaryOperator::GtEq
+            ) && (is_projected(left) || is_projected(right))
+        }
+        _ => false,
+    })
 }
 
 /// Split `expr` on top-level `AND`, looking through parentheses.
@@ -7173,10 +7253,68 @@ mod tests {
 
     #[test]
     fn test_e022_nullable_column() {
-        let model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+        // The WHERE filters `ts`, not the emitted `order_date`, so nothing
+        // proves the key non-NULL.
+        let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+        model.sql = "SELECT CAST(ts AS DATE) AS order_date FROM upstream \
+                     WHERE ts >= @start_date AND ts < @end_date"
+            .to_string();
         let cols = vec![typed_col("order_date", RockyType::Date, true)];
         let diags = check_time_interval_strategy(&model, &cols);
         assert!(diags.iter().any(|d| &*d.code == "E022"));
+    }
+
+    /// A nullable upstream column is no refusal when the model's own WHERE
+    /// compares it: the comparison is never TRUE on NULL, so no emitted row
+    /// has a NULL key. The standard `time_column >= @start_date` shape, on a
+    /// column typed from a seed (every seed column reads as nullable).
+    #[test]
+    fn test_e022_skipped_when_where_compares_the_time_column() {
+        let model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+        let cols = vec![typed_col("order_date", RockyType::Date, true)];
+        let diags = check_time_interval_strategy(&model, &cols);
+        assert!(
+            !diags.iter().any(|d| &*d.code == "E022"),
+            "unexpected E022: {diags:?}"
+        );
+
+        // Qualified, aliased to its own name, the comparison on the right.
+        let mut qualified = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+        qualified.sql = "SELECT f.order_date AS order_date, f.category FROM fct AS f \
+                         WHERE @start_date <= f.order_date AND f.order_date < @end_date"
+            .to_string();
+        let diags = check_time_interval_strategy(&qualified, &cols);
+        assert!(
+            !diags.iter().any(|d| &*d.code == "E022"),
+            "unexpected E022: {diags:?}"
+        );
+    }
+
+    /// The null-rejection must be on the emitted column and certain: a
+    /// comparison under OR, on another table's same-named column, or in a
+    /// UNION keeps E022.
+    #[test]
+    fn test_e022_kept_when_the_where_does_not_reject_null_keys() {
+        let cols = vec![typed_col("order_date", RockyType::Date, true)];
+        for sql in [
+            // OR: a row with a NULL key passes through the other branch.
+            "SELECT order_date FROM upstream WHERE (order_date >= @start_date OR flag) \
+             AND ts < @end_date AND ts >= @start_date",
+            // The filter reads `o.order_date`; the output carries `p.order_date`.
+            "SELECT p.order_date FROM o JOIN p ON o.id = p.id \
+             WHERE o.order_date >= @start_date AND o.order_date < @end_date",
+            // A set operation: the other branch is not filtered on the key.
+            "SELECT order_date FROM a WHERE order_date >= @start_date AND order_date < @end_date \
+             UNION ALL SELECT order_date FROM b WHERE ts >= @start_date AND ts < @end_date",
+        ] {
+            let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+            model.sql = sql.to_string();
+            let diags = check_time_interval_strategy(&model, &cols);
+            assert!(
+                diags.iter().any(|d| &*d.code == "E022"),
+                "expected E022 for {sql}: {diags:?}"
+            );
+        }
     }
 
     #[test]
