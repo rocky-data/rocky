@@ -18,7 +18,7 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E046, I001, I002,
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
@@ -659,10 +659,10 @@ fn compute_model_typecheck(
 
     // A missing type is normally conservative Unknown: unsupported functions,
     // incomplete source schemas, and expressions outside our inference subset
-    // are all valid reasons not to know. Refuse only the narrow case where the
-    // SQL directly projects a name from one complete in-project upstream model
-    // and that name is absent from the model's proven output schema.
-    diagnostics.extend(check_known_missing_projection_refs(
+    // are all valid reasons not to know. Refuse only a reference that binds
+    // unambiguously to a complete in-project upstream model and is absent from
+    // that model's proven output schema.
+    diagnostics.extend(check_known_missing_upstream_refs(
         model_name,
         model_schema,
         graph,
@@ -794,219 +794,119 @@ fn compute_model_typecheck(
     }
 }
 
-/// Refuse a direct projection only when absence is proven from a complete
-/// in-project relation.
+/// E039: a reference, in any clause, to a column that a complete upstream
+/// model does not output.
 ///
-/// This deliberately skips expression traversal, external source schemas,
-/// CTEs, derived relations, joins, stars, set operations, and relation aliases
-/// with column lists. Those forms need more scope or provenance than the
-/// compiler currently carries, so they retain the existing `Unknown` fallback.
-fn check_known_missing_projection_refs(
+/// An upstream counts only when absence is provable: the reader depends on
+/// it, its lineage schema is complete ([`ModelSchema::schema_is_complete`]),
+/// its output names are fixed by its own SQL ([`has_provably_fixed_output_names`]),
+/// and no two of them collide case-insensitively. A bare read binds to the
+/// model only when the model writes a table of that name (or is ephemeral); a
+/// qualified read binds through its `[target]`. Scope resolution, aliases,
+/// CTEs, subqueries and struct-field reads follow
+/// [`crate::source_refs::check_upstream_model_column_refs`]: anything it
+/// cannot bind stays `Unknown`.
+fn check_known_missing_upstream_refs(
     model_name: &str,
     model_schema: &ModelSchema,
     graph: &SemanticGraph,
     model_by_name: &HashMap<&str, &rocky_core::models::Model>,
 ) -> Vec<Diagnostic> {
+    use rocky_core::physical_edges::fold_identifier;
     let Some(model) = model_by_name.get(model_name) else {
         return Vec::new();
     };
-    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
-    else {
-        return Vec::new();
-    };
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Vec::new();
-    };
-    if query.with.is_some() {
-        return Vec::new();
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Vec::new();
-    };
-    if !select.lateral_views.is_empty()
-        || select.exclude.is_some()
-        || select.value_table_mode.is_some()
-        || select.flavor != ast::SelectFlavor::Standard
-    {
-        return Vec::new();
-    }
-    let [from] = select.from.as_slice() else {
-        return Vec::new();
-    };
-    if !from.joins.is_empty() {
-        return Vec::new();
-    }
-    let TableFactor::Table {
-        name,
-        alias,
-        args,
-        with_hints,
-        version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
-    } = &from.relation
-    else {
-        return Vec::new();
-    };
-    if args.is_some()
-        || !with_hints.is_empty()
-        || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
-    {
-        return Vec::new();
-    }
-    if alias
-        .as_ref()
-        .is_some_and(|alias| !alias.columns.is_empty())
-    {
-        return Vec::new();
-    }
-    let [part] = name.0.as_slice() else {
-        return Vec::new();
-    };
-    let Some(relation_name) = part.as_ident().map(|ident| ident.value.as_str()) else {
-        return Vec::new();
-    };
-
-    // Bind only through the dependency graph's exact logical model name. A
-    // physical `catalog.schema.name` must never be shortened into a project
-    // model merely because the last component happens to match.
-    if !model_schema
-        .upstream
-        .iter()
-        .any(|upstream| upstream == relation_name)
-    {
-        return Vec::new();
-    }
-    let Some(upstream_model) = model_by_name.get(relation_name) else {
-        return Vec::new();
-    };
-    if !has_provably_fixed_output_names(&upstream_model.sql) {
-        return Vec::new();
-    }
-    let Some(upstream_schema) = graph
-        .model_schema(relation_name)
-        .filter(|schema| schema.schema_is_complete())
-    else {
-        return Vec::new();
-    };
-    let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
-    if upstream_schema
-        .columns
-        .iter()
-        .any(|column| !output_names.insert(CiKey::owned(column.name.clone())))
-    {
-        // Warehouses can rename duplicate projected names while materializing
-        // the model (DuckDB turns the second `id` into `id_1`). The semantic
-        // graph preserves both source spellings, so it cannot prove absence
-        // from the physical relation in this shape.
-        return Vec::new();
-    }
-
-    let qualifier = alias
-        .as_ref()
-        .map_or(relation_name, |alias| alias.name.value.as_str());
-    // A snapshot model's table holds its SELECT's columns plus the SCD2
-    // metadata columns (`valid_from`, `is_current`, ...), which the semantic
-    // graph does not list. Readers of the snapshot may project them.
-    let snapshot_meta: Vec<String> = upstream_model
-        .config
-        .strategy
-        .snapshot_lowered()
-        .map(|lowered| {
-            lowered
-                .spec
-                .meta_columns
-                .reserved()
-                .into_iter()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let column_exists = |name: &str| {
-        upstream_schema
+    let mut snapshot_meta: Vec<Vec<String>> = Vec::new();
+    let mut candidates: Vec<(&rocky_core::models::Model, &ModelSchema)> = Vec::new();
+    for upstream in &model_schema.upstream {
+        let Some(upstream_model) = model_by_name.get(upstream.as_str()) else {
+            continue;
+        };
+        let Some(upstream_schema) = graph
+            .model_schema(upstream)
+            .filter(|schema| schema.schema_is_complete())
+        else {
+            continue;
+        };
+        if !has_provably_fixed_output_names(&upstream_model.sql) {
+            continue;
+        }
+        let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
+        if upstream_schema
             .columns
             .iter()
-            .any(|column| column.name.eq_ignore_ascii_case(name))
-            || snapshot_meta
-                .iter()
-                .any(|meta| meta.eq_ignore_ascii_case(name))
-    };
-
-    let mut diagnostics = Vec::new();
-    let mut prior_projection_aliases: Vec<&str> = Vec::new();
-    for item in &select.projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-            _ => None,
-        };
-        let missing = expr.and_then(|expr| match expr {
-            Expr::Identifier(identifier) => {
-                let name = identifier.value.as_str();
-                // DuckDB/Postgres accept a relation binding as a whole-row
-                // value. A prior SELECT alias may also be visible in dialects
-                // Rocky supports. Neither is a source-column absence proof.
-                if name.eq_ignore_ascii_case(qualifier)
-                    || name.eq_ignore_ascii_case(relation_name)
-                    || is_warehouse_pseudo_column(name)
-                    || prior_projection_aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(name))
-                    || column_exists(name)
-                {
-                    None
-                } else {
-                    Some(name)
-                }
-            }
-            Expr::CompoundIdentifier(parts) => {
-                let [qualifier_part, column_part] = parts.as_slice() else {
-                    return None;
-                };
-                // `s.foo` is not necessarily relation-alias qualification:
-                // when the upstream outputs a STRUCT column named `s`,
-                // DuckDB resolves this as field dereference. Prefer the valid
-                // expression over an absence diagnostic when both readings
-                // are possible.
-                if !qualifier_part.value.eq_ignore_ascii_case(qualifier)
-                    || column_exists(&qualifier_part.value)
-                    || is_warehouse_pseudo_column(&qualifier_part.value)
-                    || is_warehouse_pseudo_column(&column_part.value)
-                    || column_exists(&column_part.value)
-                {
-                    None
-                } else {
-                    Some(column_part.value.as_str())
-                }
-            }
-            _ => None,
-        });
-        if let Some(column) = missing {
-            diagnostics.push(
-                Diagnostic::error(
-                    E039,
-                    model_name,
-                    format!(
-                        "column '{column}' does not exist in complete upstream model '{relation_name}'"
-                    ),
-                )
-                .with_suggestion(format!(
-                    "use a column produced by '{relation_name}', or add the intended derivation upstream"
-                )),
-            );
+            .any(|column| !output_names.insert(CiKey::owned(column.name.clone())))
+        {
+            // Warehouses can rename duplicate projected names while
+            // materializing the model (DuckDB turns the second `id` into
+            // `id_1`), so the graph cannot prove absence from that relation.
+            continue;
         }
-        if let SelectItem::ExprWithAlias { alias, .. } = item {
-            prior_projection_aliases.push(alias.value.as_str());
-        }
+        // A snapshot model's table holds its SELECT's columns plus the SCD2
+        // metadata columns (`valid_from`, `is_current`, ...), which the
+        // semantic graph does not list. Readers may read them.
+        snapshot_meta.push(
+            upstream_model
+                .config
+                .strategy
+                .snapshot_lowered()
+                .map(|lowered| {
+                    lowered
+                        .spec
+                        .meta_columns
+                        .reserved()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        candidates.push((upstream_model, upstream_schema));
     }
-    diagnostics
+    let upstreams: Vec<crate::source_refs::UpstreamModelColumns<'_>> = candidates
+        .iter()
+        .zip(&snapshot_meta)
+        .map(|((upstream_model, upstream_schema), meta)| {
+            let ephemeral = matches!(
+                upstream_model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            );
+            let target = &upstream_model.config.target;
+            let name = upstream_model.config.name.as_str();
+            // A bare `FROM x` reaches the table `x`: this model only when it
+            // writes that table, or is ephemeral (inlined by name).
+            let bare_binding = ephemeral || fold_identifier(&target.table) == fold_identifier(name);
+            let qualified_bindings = if ephemeral {
+                Vec::new()
+            } else {
+                let schema_table = format!(
+                    "{}.{}",
+                    fold_identifier(&target.schema),
+                    fold_identifier(&target.table)
+                );
+                let mut keys = vec![schema_table.clone()];
+                if !fold_identifier(&target.catalog).is_empty() {
+                    keys.push(format!(
+                        "{}.{schema_table}",
+                        fold_identifier(&target.catalog)
+                    ));
+                }
+                keys
+            };
+            crate::source_refs::UpstreamModelColumns {
+                name,
+                bare_binding,
+                qualified_bindings,
+                columns: upstream_schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .chain(meta.iter().map(String::as_str))
+                    .collect(),
+            }
+        })
+        .collect();
+    crate::source_refs::check_upstream_model_column_refs(model, &upstreams)
 }
 
 /// The upstream model whose `[target]` table a qualified read names, for a
@@ -1056,6 +956,14 @@ pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("metadata$"))
 }
 
+/// Whether a model's output column names are fixed by its own SQL: one
+/// `SELECT` (CTEs allowed) whose every projection item is a column reference
+/// or carries an alias.
+///
+/// An alias over a function that can expand into several output columns
+/// (`unnest` of a struct in DuckDB, `explode` of a map in Spark, `COLUMNS`,
+/// `UNPACK`, `json_tuple`, `stack`, `inline`) does not fix the names, and
+/// neither does a set operation, a star, or a string-quoted alias.
 fn has_provably_fixed_output_names(sql: &str) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
@@ -1066,20 +974,49 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    query.with.is_none()
-        && select.exclude.is_none()
+    select.exclude.is_none()
         && select.value_table_mode.is_none()
+        && select.lateral_views.is_empty()
         && select.flavor == ast::SelectFlavor::Standard
-        && select.projection.iter().all(|item| {
-            matches!(
-                item,
-                SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                    | SelectItem::ExprWithAlias {
-                        expr: Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_),
-                        ..
-                    }
-            )
+        && select.projection.iter().all(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => true,
+            SelectItem::ExprWithAlias { expr, alias } => {
+                alias.quote_style != Some('\'') && !calls_expanding_function(expr)
+            }
+            _ => false,
         })
+}
+
+/// Whether `expr` calls a function that can return several columns.
+fn calls_expanding_function(expr: &Expr) -> bool {
+    use std::ops::ControlFlow;
+    ast::visit_expressions(expr, |e| match e {
+        Expr::Function(function)
+            if function.name.0.last().and_then(ast::ObjectNamePart::as_ident).is_some_and(
+                |ident| {
+                    matches!(
+                        ident.value.to_ascii_lowercase().as_str(),
+                        "unnest"
+                            | "explode"
+                            | "explode_outer"
+                            | "posexplode"
+                            | "posexplode_outer"
+                            | "inline"
+                            | "inline_outer"
+                            | "json_tuple"
+                            | "stack"
+                            | "columns"
+                            | "unpack"
+                            | "flatten"
+                    )
+                },
+            ) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// Validate a model's `time_interval` strategy against its typed output schema.
@@ -4168,6 +4105,7 @@ fn emit_join_key_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::E039;
     use crate::contracts::{CompilerContract, ContractColumn, ContractRules, validate_contract};
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
@@ -8690,5 +8628,151 @@ mod tests {
             column(&result, "stray", "customer_id").data_type,
             RockyType::Unknown
         );
+    }
+
+    /// An upstream whose output names are fixed by aliases over expressions.
+    const ORDER_LINES: &str = "SELECT o.order_id, o.customer_id, o.status, o.order_date, \
+                               CAST(o.quantity * o.price AS DECIMAL(12, 2)) AS amount \
+                               FROM raw.orders AS o";
+
+    #[test]
+    fn known_missing_upstream_column_is_refused_in_every_clause() {
+        for sql in [
+            "SELECT order_id FROM order_lines WHERE stats = 'completed'",
+            "SELECT l.order_id FROM order_lines AS l WHERE l.stats = 'completed'",
+            "SELECT a.order_id FROM order_lines AS a JOIN order_lines AS b ON a.order_id = b.ordr_id",
+            "SELECT customer_id, COUNT(*) AS n FROM order_lines GROUP BY customer_id, stats",
+            "SELECT customer_id FROM order_lines GROUP BY customer_id HAVING MAX(amout) > 0",
+            "SELECT CASE WHEN stats = 'x' THEN 1 END AS flag FROM order_lines",
+            "SELECT UPPER(stats) AS s FROM order_lines",
+            "SELECT order_id FROM order_lines WHERE stats IN ('a', 'b')",
+            "SELECT order_id FROM order_lines WHERE order_id IN (SELECT order_id FROM order_lines WHERE stats = 'x')",
+            "WITH c AS (SELECT order_id, stats FROM order_lines) SELECT order_id FROM c",
+            // A qualified read of the target binds when the reader declares
+            // the dependency.
+            "SELECT order_id FROM warehouse.silver.order_lines WHERE stats = 'x'",
+            "SELECT order_id FROM silver.order_lines WHERE stats = 'x'",
+        ] {
+            let mut consumer = make_model("consumer", sql);
+            consumer.config.depends_on = vec!["order_lines".to_string()];
+            let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), consumer]);
+            let found = e039_diagnostics(&result);
+            assert_eq!(found.len(), 1, "`{sql}`: {:?}", result.diagnostics);
+            assert!(
+                found[0].message.contains("'order_lines'"),
+                "{:?}",
+                found[0]
+            );
+            assert!(found[0].is_error());
+        }
+    }
+
+    #[test]
+    fn known_missing_column_of_a_case_aliased_upstream_is_refused() {
+        // The upstream projects an aliased CASE (what a `.rocky` derive
+        // lowers to) and drops `category`; the reader still reads it.
+        let result = compile_typechecks(vec![
+            make_model(
+                "products",
+                "SELECT product_id, name, price, \
+                 CASE WHEN price < 20 THEN 'budget' ELSE 'premium' END AS price_band \
+                 FROM raw.products",
+            ),
+            make_model("order_lines", ORDER_LINES),
+            make_model(
+                "lines",
+                "SELECT o.order_id, p.category FROM order_lines AS o \
+                 JOIN products AS p ON o.order_id = p.product_id",
+            ),
+        ]);
+        let found = e039_diagnostics(&result);
+        assert_eq!(found.len(), 1, "{:?}", result.diagnostics);
+        assert!(found[0].message.contains("'category'"));
+        assert!(found[0].message.contains("'products'"));
+    }
+
+    #[test]
+    fn known_missing_upstream_controls_stay_clean() {
+        for sql in [
+            // Every column exists.
+            "SELECT order_id, status, amount FROM order_lines WHERE status = 'completed' \
+             AND order_id >= '1'",
+            // A SELECT alias reused later in the projection (DuckDB lateral alias).
+            "SELECT customer_id, MIN(order_date) AS first_order, MAX(order_date) AS last_order, \
+             last_order - first_order AS span_days FROM order_lines GROUP BY customer_id",
+            // ORDER BY an output alias.
+            "SELECT order_id AS id FROM order_lines ORDER BY id",
+            // A correlated subquery reading the outer relation.
+            "SELECT c.customer_id, (SELECT COUNT(*) FROM order_lines AS so \
+             WHERE so.customer_id = c.customer_id) AS n FROM raw.customers AS c",
+            // A join with a relation Rocky cannot enumerate: unqualified names
+            // may come from it.
+            "SELECT tier FROM order_lines JOIN raw.customers USING (customer_id)",
+            // A CTE that shadows the model's name.
+            "WITH order_lines AS (SELECT 1 AS stats) SELECT stats FROM order_lines",
+            // A derived table with its own columns.
+            "SELECT d.stats FROM (SELECT status AS stats FROM order_lines) AS d",
+            // A string alias, a lambda, struct access.
+            "SELECT list_transform([1], x -> x + 1) AS l FROM order_lines",
+        ] {
+            let result = compile_typechecks(vec![
+                make_model("order_lines", ORDER_LINES),
+                make_model("consumer", sql),
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "`{sql}`: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_read_binds_only_to_the_model_that_writes_that_table() {
+        // `order_lines` writes `silver.order_lines_v2`: a bare `order_lines`
+        // reaches some other table, so nothing is provable about it.
+        let mut renamed = make_model("order_lines", ORDER_LINES);
+        renamed.config.target.table = "order_lines_v2".to_string();
+        let mut reader = make_model("consumer", "SELECT stats FROM order_lines");
+        reader.config.depends_on = vec!["order_lines".to_string()];
+        let result = compile_typechecks(vec![renamed.clone(), reader]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+        // Its target name binds instead.
+        let mut reader = make_model(
+            "consumer",
+            "SELECT stats FROM warehouse.silver.order_lines_v2",
+        );
+        reader.config.depends_on = vec!["order_lines".to_string()];
+        let result = compile_typechecks(vec![renamed, reader]);
+        assert_eq!(
+            e039_diagnostics(&result).len(),
+            1,
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn an_upstream_with_an_expanding_or_unaliased_expression_proves_nothing() {
+        for upstream in [
+            "SELECT order_id, unnest(items) AS item FROM raw.orders",
+            "SELECT order_id, amount * 2 FROM raw.orders",
+            "SELECT order_id FROM raw.a UNION ALL SELECT order_id FROM raw.b",
+            "SELECT order_id, 'x' AS 'quoted' FROM raw.orders",
+        ] {
+            let result = compile_typechecks(vec![
+                make_model("up", upstream),
+                make_model("consumer", "SELECT order_id FROM up WHERE missing = 1"),
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "`{upstream}`: {:?}",
+                result.diagnostics
+            );
+        }
     }
 }
