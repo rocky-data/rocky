@@ -406,30 +406,7 @@ pub fn compile_project(
     // 4. Load and validate contracts (explicit dir + auto-discovered from model sidecars)
     let contracts_start = Instant::now();
     let contract_diagnostics = {
-        // Start with auto-discovered contracts from model.contract_path
-        let mut contract_map = contracts::discover_contracts_from_models(&project.models)
-            .map_err(CompileError::ContractLoad)?;
-
-        // Merge explicit contracts dir (explicit wins on collision)
-        if config.required_explicit_contract_model.is_some() && config.contracts_dir.is_none() {
-            return Err(CompileError::ContractLoad(
-                "selected-model contract enforcement requires an explicit contracts directory"
-                    .to_string(),
-            ));
-        }
-        if let Some(ref contracts_dir) = config.contracts_dir {
-            let explicit =
-                contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
-            if let Some(name) = &config.required_explicit_contract_model
-                && !explicit.contains_key(name)
-            {
-                return Err(CompileError::ContractLoad(format!(
-                    "explicit contracts directory {} has no contract for selected model '{name}'",
-                    contracts_dir.display()
-                )));
-            }
-            contract_map.extend(explicit);
-        }
+        let contract_map = load_contract_map(config, &project.models)?;
 
         if contract_map.is_empty() {
             Vec::new()
@@ -711,28 +688,7 @@ pub fn compile_incremental(
     //    differ from previous so re-running is the safe default.
     let contracts_start = Instant::now();
     let contract_diagnostics = {
-        let mut contract_map = contracts::discover_contracts_from_models(&project.models)
-            .map_err(CompileError::ContractLoad)?;
-
-        if config.required_explicit_contract_model.is_some() && config.contracts_dir.is_none() {
-            return Err(CompileError::ContractLoad(
-                "selected-model contract enforcement requires an explicit contracts directory"
-                    .to_string(),
-            ));
-        }
-        if let Some(ref contracts_dir) = config.contracts_dir {
-            let explicit =
-                contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
-            if let Some(name) = &config.required_explicit_contract_model
-                && !explicit.contains_key(name)
-            {
-                return Err(CompileError::ContractLoad(format!(
-                    "explicit contracts directory {} has no contract for selected model '{name}'",
-                    contracts_dir.display()
-                )));
-            }
-            contract_map.extend(explicit);
-        }
+        let contract_map = load_contract_map(config, &project.models)?;
 
         if contract_map.is_empty() {
             Vec::new()
@@ -916,6 +872,54 @@ fn target_collision_diagnostics(project: &crate::project::Project) -> Vec<Diagno
             })
         })
         .collect()
+}
+
+/// Build the contract map one compile validates.
+///
+/// Sources, lowest precedence first:
+///
+/// 1. `<model>.contract.toml` next to a model file.
+/// 2. A contracts directory: the explicit [`CompilerConfig::contracts_dir`]
+///    when set, otherwise the project's `contracts/` directory beside the
+///    models directory ([`contracts::project_contracts_dir_for`]). A file in
+///    the directory wins over a sidecar for the same model.
+///
+/// One project `contracts/` directory serves every pipeline, so a compile
+/// over one pipeline's models sees contracts for models it does not own.
+/// Those are skipped silently. An explicit `--contracts` directory keeps the
+/// `W011` warning for a contract whose model is not in the compile.
+fn load_contract_map(
+    config: &CompilerConfig,
+    models: &[rocky_core::models::Model],
+) -> Result<HashMap<String, CompilerContract>, CompileError> {
+    let mut contract_map =
+        contracts::discover_contracts_from_models(models).map_err(CompileError::ContractLoad)?;
+
+    if config.required_explicit_contract_model.is_some() && config.contracts_dir.is_none() {
+        return Err(CompileError::ContractLoad(
+            "selected-model contract enforcement requires an explicit contracts directory"
+                .to_string(),
+        ));
+    }
+    if let Some(ref contracts_dir) = config.contracts_dir {
+        let explicit =
+            contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
+        if let Some(name) = &config.required_explicit_contract_model
+            && !explicit.contains_key(name)
+        {
+            return Err(CompileError::ContractLoad(format!(
+                "explicit contracts directory {} has no contract for selected model '{name}'",
+                contracts_dir.display()
+            )));
+        }
+        contract_map.extend(explicit);
+    } else if let Some(project_dir) = contracts::project_contracts_dir_for(&config.models_dir) {
+        let mut project =
+            contracts::load_contracts(&project_dir).map_err(CompileError::ContractLoad)?;
+        project.retain(|name, _| models.iter().any(|m| m.config.name == *name));
+        contract_map.extend(project);
+    }
+    Ok(contract_map)
 }
 
 fn validate_all_contracts(
@@ -1133,6 +1137,85 @@ mod tests {
                 d.model == "m00" && d.code.as_ref() == "E010" && d.message.contains("amount")
             }),
             "the selected contract must produce E010 on the owned compile result"
+        );
+    }
+
+    #[test]
+    fn project_contracts_dir_is_read_without_a_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let project_dir = tmp.path().join("contracts");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&project_dir).expect("contracts dir");
+        write_flat_models(&models_dir, 2);
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+        let clean = compile(&config).expect("compile with an empty project contracts dir");
+        assert!(!clean.has_errors);
+
+        std::fs::write(
+            project_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"amount\"]\n",
+        )
+        .expect("breaking contract");
+        // Another pipeline's model: not in this compile, so not a warning.
+        std::fs::write(
+            project_dir.join("elsewhere.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("foreign contract");
+        let broken = compile(&config).expect("diagnostic-bearing compile");
+        assert!(
+            broken
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "m00" && d.code.as_ref() == "E010"),
+            "the project contract must be checked with no flag"
+        );
+        assert!(
+            !broken.diagnostics.iter().any(|d| d.code.as_ref() == W011),
+            "a project contract for a model outside this compile is skipped silently"
+        );
+    }
+
+    #[test]
+    fn explicit_contracts_dir_replaces_the_project_dir_and_keeps_w011() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let project_dir = tmp.path().join("contracts");
+        let explicit_dir = tmp.path().join("explicit");
+        for dir in [&models_dir, &project_dir, &explicit_dir] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        write_flat_models(&models_dir, 2);
+        std::fs::write(
+            project_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"amount\"]\n",
+        )
+        .expect("project contract");
+        std::fs::write(
+            explicit_dir.join("ghost.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("explicit contract");
+        let config = CompilerConfig {
+            models_dir,
+            contracts_dir: Some(explicit_dir),
+            ..Default::default()
+        };
+        let result = compile(&config).expect("compile");
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code.as_ref() == "E010"),
+            "the explicit directory replaces the project one"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "ghost" && d.code.as_ref() == W011),
+            "an explicit contract for an unknown model still warns"
         );
     }
 

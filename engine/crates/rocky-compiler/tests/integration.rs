@@ -266,17 +266,33 @@ fn test_contract_project_loads_contracts() {
 }
 
 #[test]
-fn test_contract_project_with_no_contracts_dir() {
-    let config = CompilerConfig {
+fn test_contract_project_reads_its_contracts_dir_without_a_flag() {
+    let discovered = CompilerConfig {
         models_dir: fixture_path("contract_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
         ..Default::default()
     };
+    let explicit = CompilerConfig {
+        contracts_dir: Some(fixture_path("contract_project/contracts")),
+        ..discovered.clone()
+    };
 
-    let result = compile(&config).unwrap();
-    // Without contracts dir, no contract diagnostics
-    assert!(result.contract_diagnostics.is_empty());
+    let codes = |config: &CompilerConfig| {
+        let mut codes: Vec<(String, String)> = compile(config)
+            .unwrap()
+            .contract_diagnostics
+            .iter()
+            .map(|d| (d.model.clone(), d.code.to_string()))
+            .collect();
+        codes.sort();
+        codes
+    };
+    // The project `contracts/` beside `models/` is read with no flag, and
+    // gives the same contract diagnostics as passing it explicitly.
+    let found = codes(&discovered);
+    assert!(!found.is_empty(), "the project contracts dir must be read");
+    assert_eq!(found, codes(&explicit));
 }
 
 // ---- Incremental compile (§P3.1) ----
