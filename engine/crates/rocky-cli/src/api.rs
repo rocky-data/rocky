@@ -3579,9 +3579,26 @@ const FILESYSTEM_ROOTS: &[&str] = &[
     "/opt/",
     "/root/",
     "/mnt/",
+    "/media/",
     "/usr/",
     "/srv/",
+    "/run/",
+    "/proc/",
+    "/nix/",
     "/Volumes/",
+    "/Library/",
+    "/Applications/",
+    // Common container and CI working directories.
+    "/app/",
+    "/workspace/",
+    "/workspaces/",
+    "/data/",
+    "/build/",
+    "/builds/",
+    "/code/",
+    "/src/",
+    "/github/",
+    "/__w/",
 ];
 
 /// Whether `rest` opens a Unix path under a [`FILESYSTEM_ROOTS`] directory
@@ -11863,9 +11880,11 @@ POST /v1/statements returned an error
         let error = concise_job_error("Error: GET /api/2.1/jobs/list returned 403").unwrap();
         assert_eq!(error, "Error: GET /api/2.1/jobs/list returned 403");
 
-        // A root alone, or a non-filesystem root, is not redacted.
-        let error = concise_job_error("Error: /etc/ and /data/x and /tmp/x").unwrap();
-        assert_eq!(error, "Error: /etc/ and /data/x and <path>");
+        // A root alone, or a non-filesystem root, is not redacted. A container
+        // working directory is.
+        let error =
+            concise_job_error("Error: /etc/ and /v2/x and /tmp/x and /app/rocky.toml").unwrap();
+        assert_eq!(error, "Error: /etc/ and /v2/x and <path> and <path>");
     }
 
     /// A failed job's `error` is never empty: when cleaning leaves nothing,

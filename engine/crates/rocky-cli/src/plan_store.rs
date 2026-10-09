@@ -340,8 +340,10 @@ pub struct EmbeddedCapabilities {
     /// the check is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_fingerprint: Option<String>,
-    /// The same fingerprint over the models alone: no config, governance or
-    /// execution-control identity and no mask. A person's apply compares this
+    /// The same fingerprint over the models and the masks they use: no
+    /// config, governance or execution-control identity. The mask is the one
+    /// `models_fingerprint` binds (resolved for the plan's `--env`, only where
+    /// the run applies masks). A person's apply compares this
     /// one, so a plan made in one shell and applied from another environment
     /// (or after an edit to an unrelated pipeline) is not refused as changed.
     /// An agent's apply still compares [`Self::models_fingerprint`]. `None`
