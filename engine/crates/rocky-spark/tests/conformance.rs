@@ -15,7 +15,7 @@
 //!   --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
 //!   --conf spark.connect.grpc.binding.address=0.0.0.0
 //! # wait for "Spark Connect server started" in `docker logs`
-//! cargo test -p rocky-spark --features spark-conformance
+//! cargo test -p rocky-spark --features spark-conformance -- --ignored
 //! ```
 //!
 //! Every statement below is rendered by [`SparkDialect`], so the test proves
@@ -95,6 +95,7 @@ async fn rows(a: &SparkWarehouseAdapter, sql: &str) -> Vec<Vec<String>> {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn literal_escape_round_trips() {
     let a = adapter();
     let value = "it's a \\ back\\slash 'quoted' \\' end";
@@ -104,6 +105,7 @@ async fn literal_escape_round_trips() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn full_refresh_view_describe_kind_and_list() {
     let a = adapter();
     let s = schema(&a, "fr").await;
@@ -173,6 +175,7 @@ async fn full_refresh_view_describe_kind_and_list() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn missing_objects_are_typed() {
     let a = adapter();
     let s = schema(&a, "miss").await;
@@ -191,6 +194,7 @@ async fn missing_objects_are_typed() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn incremental_append_with_watermark_and_merge() {
     let a = adapter();
     let s = schema(&a, "inc").await;
@@ -256,6 +260,7 @@ async fn incremental_append_with_watermark_and_merge() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn time_interval_replace_where_and_delete_insert() {
     let a = adapter();
     let s = schema(&a, "ti").await;
@@ -302,6 +307,7 @@ async fn time_interval_replace_where_and_delete_insert() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
 async fn arrow_fetch_case_branch_clone_and_checksums() {
     let a = adapter();
     let s = schema(&a, "misc").await;

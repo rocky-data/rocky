@@ -90,7 +90,7 @@ Schema drift never alters a column type in place on Spark. A type change rebuild
 
 ## Testing
 
-`cargo test -p rocky-spark --features spark-conformance` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above. It proves the string-literal round trip, every strategy's SQL, `DESCRIBE TABLE`, the view/table probe, Arrow fetch and the checksum query.
+`cargo test -p rocky-spark --features spark-conformance -- --ignored` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above. It proves the string-literal round trip, every strategy's SQL, `DESCRIBE TABLE`, the view/table probe, Arrow fetch and the checksum query.
 
 ## See also
 
