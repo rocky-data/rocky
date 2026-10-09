@@ -430,6 +430,7 @@ mod tests {
             timings: rocky_compiler::compile::PhaseTimings::default(),
             model_timings: std::collections::HashMap::new(),
             contract_files: std::collections::BTreeMap::new(),
+            consumers: vec![],
         }
     }
 }

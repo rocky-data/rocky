@@ -26,7 +26,7 @@ pub fn load_and_check(
     model_names: &BTreeSet<&str>,
 ) -> (Vec<Consumer>, Vec<Diagnostic>) {
     check(
-        rocky_core::consumers::load_consumers_for_models_dir(models_dir),
+        &rocky_core::consumers::load_consumers_for_models_dir(models_dir),
         model_names,
     )
 }
@@ -34,7 +34,7 @@ pub fn load_and_check(
 /// Check loaded consumers against the model names. See [`load_and_check`].
 #[must_use]
 pub fn check(
-    loaded: LoadedConsumers,
+    loaded: &LoadedConsumers,
     model_names: &BTreeSet<&str>,
 ) -> (Vec<Consumer>, Vec<Diagnostic>) {
     let mut diagnostics: Vec<Diagnostic> = loaded.errors.iter().map(load_error).collect();
@@ -160,7 +160,7 @@ mod tests {
             consumers: vec![consumer("board", &["fct_orders", "dim_customers"])],
             errors: vec![],
         };
-        let (consumers, diagnostics) = check(loaded, &models());
+        let (consumers, diagnostics) = check(&loaded, &models());
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(consumers[0].depends_on.len(), 2);
     }
@@ -171,7 +171,7 @@ mod tests {
             consumers: vec![consumer("board", &["fct_order", "fct_orders"])],
             errors: vec![],
         };
-        let (consumers, diagnostics) = check(loaded, &models());
+        let (consumers, diagnostics) = check(&loaded, &models());
         assert_eq!(diagnostics.len(), 1);
         let d = &diagnostics[0];
         assert!(d.is_error());
@@ -193,7 +193,7 @@ mod tests {
             ],
             errors: vec![],
         };
-        let (consumers, diagnostics) = check(loaded, &models());
+        let (consumers, diagnostics) = check(&loaded, &models());
         assert!(consumers.is_empty());
         assert_eq!(diagnostics.len(), 2);
         assert!(diagnostics.iter().all(Diagnostic::is_error));
@@ -209,7 +209,7 @@ mod tests {
                 message: "invalid consumer file".into(),
             }],
         };
-        let (_, diagnostics) = check(loaded, &models());
+        let (_, diagnostics) = check(&loaded, &models());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(&*diagnostics[0].code, "E059");
     }
