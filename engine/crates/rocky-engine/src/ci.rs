@@ -63,6 +63,7 @@ pub fn run_ci(
         run_vars,
         gates: None,
         inlined_gates: None,
+        strict_contracts: false,
     })
 }
 

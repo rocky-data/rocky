@@ -103,6 +103,10 @@ pub struct TestRunInputs<'a> {
     /// error they add fails the run without executing a model. `None` runs
     /// none.
     pub inlined_gates: Option<&'a CompileGates<'a>>,
+    /// Refuse a contract column whose declared type Rocky cannot check
+    /// (`E059` in place of the `I003` note). `rocky ci` sets it from
+    /// `--strict-contracts` or `[contracts] strict`.
+    pub strict_contracts: bool,
 }
 
 /// Checks a caller runs over a test run's compile result. See
@@ -195,6 +199,7 @@ pub fn run_tests(
         run_vars,
         gates: None,
         inlined_gates: None,
+        strict_contracts: false,
     })
 }
 
@@ -222,6 +227,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         run_vars,
         gates,
         inlined_gates,
+        strict_contracts,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
@@ -266,6 +272,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         // The checks in `gates` judge the authored SQL; ephemeral upstreams
         // are inlined after them, below.
         preserve_authored_sql: true,
+        strict_contracts,
         ..Default::default()
     };
 
@@ -1221,6 +1228,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: None,
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1446,6 +1454,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&refuse),
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1465,6 +1474,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&silent),
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1480,6 +1490,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: None,
             inlined_gates: Some(&refuse),
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1521,6 +1532,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&record),
             inlined_gates: Some(&record_inlined),
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");

@@ -1251,6 +1251,19 @@ max_retries_per_run = 50
 
 ---
 
+## `[contracts]`
+
+Project-level contract settings.
+
+```toml
+[contracts]
+strict = true
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `strict` | bool | `false` | Refuse a contract column whose declared type Rocky cannot check. Every `I003` note becomes the `E059` error, which names the model and the column, says why the type is unknown, and says how to fix it. `rocky compile --strict-contracts` and `rocky ci --strict-contracts` do the same for one invocation. `rocky run` and `rocky test` read this key. |
+
 ## `[mask]`
 
 Hide sensitive column values without editing a model. Tag a column with a `[classification]` in its sidecar, then map that tag to a strategy here. Every column carrying the tag gets the same treatment, across every model. See [Governance](/guides/governance/) for the narrative.

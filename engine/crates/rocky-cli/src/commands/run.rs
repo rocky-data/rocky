@@ -3799,6 +3799,7 @@ pub async fn run_with_explicit_contracts(
             // Finding #4: the `--model` path reconciles no masks.
             false,
             contracts,
+            rocky_cfg.contracts.strict,
         )
         .await;
 
@@ -7435,6 +7436,7 @@ pub async fn run_with_explicit_contracts(
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
                     contracts,
+                    rocky_cfg.contracts.strict,
                 )
                 .await
             }
@@ -11739,6 +11741,7 @@ pub(crate) async fn execute_backfill_set(
             freeze_fence,
             // Finding #4: a backfill reconciles only tags, not masks.
             false,
+            rocky_cfg.contracts.strict,
         )
         .await;
 
@@ -12099,6 +12102,37 @@ fn adopt_contract_type_errors(
     executing.has_errors = true;
 }
 
+/// Move each `E059` the strict compile found into the compile that executes,
+/// replacing the `I003` it escalates for the same model and column.
+fn adopt_unchecked_contract_type_errors(
+    executing: &mut rocky_compiler::compile::CompileResult,
+    strict: rocky_compiler::compile::CompileResult,
+) {
+    let new_errors: Vec<rocky_compiler::diagnostic::Diagnostic> = strict
+        .contract_diagnostics
+        .into_iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::E059)
+        .collect();
+    if new_errors.is_empty() {
+        return;
+    }
+    // `I003` and `E059` both name the column first, in single quotes.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    let escalated: BTreeSet<(String, Option<String>)> = new_errors
+        .iter()
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
+    let keep = |d: &rocky_compiler::diagnostic::Diagnostic| {
+        d.code.as_ref() != rocky_compiler::diagnostic::I003
+            || !escalated.contains(&(d.model.clone(), column_of(&d.message)))
+    };
+    executing.diagnostics.retain(keep);
+    executing.contract_diagnostics.retain(keep);
+    executing.diagnostics.extend(new_errors.iter().cloned());
+    executing.contract_diagnostics.extend(new_errors);
+    executing.has_errors = true;
+}
+
 /// Describe the external sources behind each contract type the compile could
 /// not check.
 ///
@@ -12219,6 +12253,7 @@ pub(crate) async fn execute_models(
     exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
     freeze_fence: Option<&super::freeze_fence::FreezeFence>,
     reconciles_masks: bool,
+    strict_contracts: bool,
 ) -> Result<GovernanceSnapshot> {
     execute_models_with_explicit_contracts(
         models_dir,
@@ -12247,6 +12282,7 @@ pub(crate) async fn execute_models(
         freeze_fence,
         reconciles_masks,
         None,
+        strict_contracts,
     )
     .await
 }
@@ -12357,6 +12393,10 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
     contracts: Option<RunContracts<'_>>,
+    // `[contracts] strict`: refuse a contract column whose declared type Rocky
+    // cannot check (`E059` in place of the `I003` note), after the source
+    // describe below has had its chance to resolve the type.
+    strict_contracts: bool,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -12474,6 +12514,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // cannot raise any other error and refuse a run that was valid before.
     // Nullability is not taken from the describe either: some adapters
     // report every column as nullable, which would be a false `E012`.
+    let mut described_sources = std::collections::HashMap::new();
     if exec_fp_gate.is_none()
         && let Ok(first) = &mut compile
         && let described = describe_sources_for_unchecked_contract_types(
@@ -12486,9 +12527,22 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         && !described.is_empty()
     {
         let mut typed_config = compile_config.clone();
-        typed_config.source_schemas.extend(described);
+        typed_config.source_schemas.extend(described.clone());
+        described_sources = described;
         if let Ok(typed) = run_compile(&typed_config) {
             adopt_contract_type_errors(first, typed);
+        }
+    }
+    // Strict contracts: a declared type still unchecked after the describe is
+    // refused. The compile that executes stays non-strict so a type the
+    // describe resolves is never refused; this one reads the same sources plus
+    // the described ones, and only its `E059` errors cross over.
+    if strict_contracts && let Ok(first) = &mut compile {
+        let mut strict_config = compile_config.clone();
+        strict_config.strict_contracts = true;
+        strict_config.source_schemas.extend(described_sources);
+        if let Ok(strict) = run_compile(&strict_config) {
+            adopt_unchecked_contract_type_errors(first, strict);
         }
     }
     let mut compile_result = match compile {
@@ -29479,6 +29533,7 @@ table = "fct_daily"
             Some(&gate),
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await
         .expect_err("an unrecorded first-run fill must refuse");
@@ -33081,6 +33136,7 @@ backend = "local"
             None,
             false,
             Some(super::RunContracts::SelectedModelGuard(&contracts)),
+            false,
         )
         .await;
         result.expect("compile rejection is carried in RunOutput");
@@ -33875,6 +33931,7 @@ backend = "local"
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await;
         (output, result)
@@ -33956,6 +34013,7 @@ backend = "local"
             Some(&gate),
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await;
         ok.expect("KILL-CHECK: an unchanged governed apply must NOT refuse");
@@ -33995,6 +34053,7 @@ backend = "local"
             true,
             Some(&gate),
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await
@@ -34275,6 +34334,7 @@ backend = "local"
             Some(&gate),
             None, // freeze_fence (test)
             reconciles_masks,
+            false,
         )
         .await
     }
@@ -34519,6 +34579,7 @@ backend = "local"
             Some(&gate),
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await
         .expect("the non-empty-snapshot seed branch must run, not panic");
@@ -34610,6 +34671,7 @@ backend = "local"
             Some(&gate),
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await
         .expect(
@@ -34669,6 +34731,7 @@ backend = "local"
             true,
             Some(&gate),
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await
@@ -34864,6 +34927,7 @@ backend = "local"
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await;
         (output, result)
@@ -34910,6 +34974,7 @@ backend = "local"
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await;
@@ -34963,6 +35028,7 @@ backend = "local"
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await;
@@ -35956,6 +36022,7 @@ auto_create_schemas = true
                 true,
                 None,
                 None, // freeze_fence (test)
+                false,
                 false,
             )
             .await
@@ -37944,6 +38011,7 @@ auto_create_schemas = true
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
             false,
+            false,
         )
         .await
         .expect("run with --var should succeed");
@@ -38056,6 +38124,7 @@ auto_create_schemas = true
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await
@@ -38182,6 +38251,7 @@ auto_create_schemas = true
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await;
@@ -38470,6 +38540,7 @@ auto_create_schemas = true
                 None, // exec_fp_gate (test)
                 None, // freeze_fence (test)
                 false,
+                false,
             )
             .await
             .expect("backfill run must succeed on serial DuckDB under --parallel");
@@ -38600,6 +38671,7 @@ auto_create_schemas = true
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
+            false,
             false,
         )
         .await
@@ -39528,6 +39600,7 @@ auto_create_schemas = true
                 None,
                 None,
                 false,
+                false,
             )
             .await;
             assert!(result.is_ok(), "healthy branches continue: {result:?}");
@@ -39604,6 +39677,7 @@ auto_create_schemas = true
                 None,
                 None,
                 false,
+                false,
             )
             .await;
             assert!(blocked.is_ok(), "the scoped refusal is carried in output");
@@ -39659,6 +39733,7 @@ auto_create_schemas = true
                 true,
                 None,
                 None,
+                false,
                 false,
             )
             .await;
@@ -39788,6 +39863,7 @@ auto_create_schemas = true
                 None,
                 None,
                 false,
+                false,
             )
             .await;
             assert!(
@@ -39860,6 +39936,7 @@ auto_create_schemas = true
                     None,
                     None,
                     false,
+                    false,
                 )
                 .await;
                 assert!(blocked.is_ok(), "the scoped refusal is carried in output");
@@ -39927,6 +40004,7 @@ auto_create_schemas = true
                 true,
                 None,
                 None,
+                false,
                 false,
             )
             .await;
@@ -40032,6 +40110,7 @@ auto_create_schemas = true
                 true,
                 None,
                 None,
+                false,
                 false,
             )
             .await;
@@ -40180,6 +40259,7 @@ auto_create_schemas = true
             None,
             None,
             false,
+            false,
         )
         .await;
         drop(adapter);
@@ -40311,6 +40391,7 @@ auto_create_schemas = true
                 true,
                 None,
                 None,
+                false,
                 false,
             )
             .await;
@@ -40479,6 +40560,7 @@ auto_create_schemas = true
             None,
             None,
             false,
+            false,
         )
         .await;
         drop(adapter);
@@ -40602,6 +40684,7 @@ auto_create_schemas = true
                 true,
                 None, // exec_fp_gate (test)
                 None, // freeze_fence (test)
+                false,
                 false,
             )
             .await

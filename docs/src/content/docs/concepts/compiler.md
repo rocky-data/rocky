@@ -630,6 +630,7 @@ span, and sometimes a suggested fix.
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
+| `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |

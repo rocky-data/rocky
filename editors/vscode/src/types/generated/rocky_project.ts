@@ -460,6 +460,10 @@ export interface RockyConfig {
    */
   classifications?: ClassificationsConfig;
   /**
+   * Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`].
+   */
+  contracts?: ContractsConfig;
+  /**
    * Cost estimation configuration.
    */
   cost?: CostSection;
@@ -1019,6 +1023,19 @@ export interface ClassificationsConfig {
    * Classification tags that are allowed to appear in a model's `[classification]` block without a corresponding `[mask]` strategy.
    */
   allow_unmasked?: string[];
+}
+/**
+ * `[contracts]` — project-level contract settings.
+ *
+ * ```toml [contracts] strict = true ```
+ */
+export interface ContractsConfig {
+  /**
+   * Refuse a contract column whose declared type Rocky cannot check. Defaults to `false`.
+   *
+   * A contract that declares a column `type` is checked against the type the compiler infers. When the compiler cannot infer the column's type (a source with no known schema, an expression whose result type depends on the warehouse), the declared type goes unchecked and the compile reports the `I003` info note. With `strict = true` that is the `E059` error instead. `rocky compile --strict-contracts` sets it for one invocation, as does `rocky ci --strict-contracts`; `rocky run` and `rocky test` read this key.
+   */
+  strict?: boolean;
 }
 /**
  * Cost estimation configuration.

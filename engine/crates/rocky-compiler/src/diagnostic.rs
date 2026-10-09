@@ -720,14 +720,25 @@ pub const I002: &str = "I002";
 /// initializers only; a caller that builds the map elsewhere and passes it in
 /// empty will not show up.
 ///
-/// A `CAST` is *not* a general fix. `refine_casts` in `typecheck.rs` refines a
-/// cast column only when the cast's input type is already known, so
-/// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` with no schema for
-/// `source.raw.users` still infers `Unknown`. And a warehouse-dependent
-/// expression — `AVG` over a `DECIMAL` input (#1238) — stays `Unknown` even
-/// with source schemas, because the result type is not knowable at this
+/// A cast gives its column the cast's target type, whatever the input is:
+/// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` is `Int64` with no
+/// schema for `source.raw.users`. The contract is then compared with the
+/// target, which the warehouse enforces. A bare `DECIMAL` or `NUMERIC` names
+/// no digits, so such a cast stays `Unknown`. A warehouse-dependent
+/// expression — `AVG` over a `DECIMAL` input (#1238) — also stays `Unknown`
+/// even with source schemas, because the result type is not knowable at this
 /// layer.
+///
+/// `--strict-contracts` (or `[contracts] strict = true`) turns this code into
+/// the [`E059`] error.
 pub const I003: &str = "I003";
+
+/// A contract declares a column type that Rocky cannot check, because the
+/// column's type is unknown, and strict contracts are on
+/// (`--strict-contracts` or `[contracts] strict = true`). Error severity.
+/// This is [`I003`] escalated: the message names the model and column and
+/// says why the type is unknown; the suggestion says how to make it known.
+pub const E059: &str = "E059";
 
 // Lints — portability + blast-radius
 /// Construct is not portable to the configured target dialect.

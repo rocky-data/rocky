@@ -508,6 +508,7 @@ impl RockyLsp {
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
             source_provenance: Default::default(),
+            strict_contracts: false,
             // Diagnostics and symbols map onto the authored text, so keep it
             // rather than the ephemeral-inlined form.
             preserve_authored_sql: true,
@@ -1488,6 +1489,7 @@ impl LanguageServer for RockyLsp {
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
                     source_provenance: Default::default(),
+                    strict_contracts: false,
                     // Diagnostics and symbols map onto the authored text, so keep it
                     // rather than the ephemeral-inlined form.
                     preserve_authored_sql: true,
@@ -5077,6 +5079,7 @@ mod tests {
         )
         .unwrap();
         let config = CompilerConfig {
+            strict_contracts: false,
             models_dir: models,
             contracts_dir: None,
             required_explicit_contract_model: None,
@@ -7302,6 +7305,7 @@ mod tests {
         let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
         let project_freshness = cfg.freshness.clone();
         let compile_config = rocky_compiler::compile::CompilerConfig {
+            strict_contracts: false,
             models_dir: models_dir.clone(),
             contracts_dir: None,
             required_explicit_contract_model: None,

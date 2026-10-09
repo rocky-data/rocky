@@ -16,6 +16,9 @@ use crate::output::{CiOutput, TestFailure, print_json};
 /// pipelines it depends on. The seed file is `data/seed.sql` beside
 /// `rocky.toml`. [`ModelScope::Dir`] runs the models under `models_dir`,
 /// with the seed file beside that directory.
+///
+/// `strict_contracts` (`rocky ci --strict-contracts`) turns `I003` into the
+/// `E059` error. It ORs with `[contracts] strict`.
 pub fn run_ci(
     config_path: &Path,
     models_dir: &Path,
@@ -23,6 +26,7 @@ pub fn run_ci(
     contracts_dir: Option<&Path>,
     output_json: bool,
     run_vars: &rocky_core::run_vars::RunVars,
+    strict_contracts: bool,
 ) -> Result<()> {
     let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
@@ -41,6 +45,10 @@ pub fn run_ci(
                 run_vars,
                 gates,
                 inlined_gates,
+                strict_contracts: strict_contracts
+                    || project_config
+                        .as_ref()
+                        .is_some_and(|config| config.contracts.strict),
             })
         },
     )?;
