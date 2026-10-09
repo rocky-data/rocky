@@ -11556,6 +11556,51 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// #2328: the directory an apply hands `run`. A plan-named directory is
+    /// joined to the root. With none, `run` reads a bare `models` for
+    /// `--model` and `--all` when no pipeline glob applies, so that is
+    /// replaced by the gate's `<root>/models`. Everywhere else `run` keeps
+    /// `None`: it keys checks on whether a directory was passed, and a
+    /// directory would override a pipeline glob.
+    #[test]
+    fn run_models_dir_anchors_only_where_run_reads_a_directory() {
+        let root = Path::new("rel/proj");
+        let gate_dir = root.join("models");
+        let named = RunPlan {
+            models_dir: Some("gold".to_string()),
+            ..minimal_run_plan()
+        };
+        assert_eq!(
+            super::run_models_dir(root, &named, &root.join("gold"), None),
+            Some(root.join("gold"))
+        );
+        for plan in [
+            RunPlan {
+                model: Some("m".to_string()),
+                ..minimal_run_plan()
+            },
+            RunPlan {
+                run_all: true,
+                ..minimal_run_plan()
+            },
+        ] {
+            assert_eq!(
+                super::run_models_dir(root, &plan, &gate_dir, None),
+                Some(gate_dir.clone())
+            );
+            assert_eq!(
+                super::run_models_dir(root, &plan, &gate_dir, Some("rel/proj/models/**")),
+                None,
+                "a pipeline glob is never overridden"
+            );
+        }
+        assert_eq!(
+            super::run_models_dir(root, &minimal_run_plan(), &gate_dir, None),
+            None,
+            "a replication-only plan passes no directory"
+        );
+    }
+
     /// The hazard behind #2328: `<cwd>/<dir>` exists and holds a DIFFERENT
     /// model of the same name. The gate and the models check read
     /// `<root>/<dir>`, so the run must execute that model too, not the cwd's.
