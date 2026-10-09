@@ -3,15 +3,18 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB, ephemeral)
 > **Runtime:** < 2s
-> **Rocky features:** `rocky compile --with-seed`, contract type checks (`I003`), `SELECT *` lints (`I001` info / `P002` blast-radius)
+> **Rocky features:** seed-typed `rocky compile` (`data/seed.sql`, `--with-seed`), contract type checks (`I003`), `SELECT *` lints (`I001` info / `P002` blast-radius)
 
 ## What it shows
 
 Raw `.sql` models become first-class in Rocky's semantic graph.
 
-1. **`rocky compile --with-seed`** — load `data/seed.sql` into an
+1. **Seed-typed `rocky compile`** — load `data/seed.sql` into an
    in-memory DuckDB, introspect `information_schema`, and use the
-   result as the source of truth for raw source schemas. Leaf `.sql`
+   result as the source of truth for raw source schemas. Since engine
+   1.79.0 (#2329) a plain `rocky compile` does this whenever the project
+   has `data/seed.sql`; `--with-seed` makes the seed required, so a
+   missing or broken seed fails the compile. Leaf `.sql`
    models that read from `raw__*` tables go from `Unknown` columns to
    concrete types, which lets a data contract's type check run and
    cascades into downstream type inference.
@@ -41,7 +44,7 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
 .
 ├── README.md                this file
 ├── rocky.toml               DuckDB pipeline
-├── run.sh                   compile with + without --with-seed; diff the result
+├── run.sh                   compile with + without a seed file; diff the result
 ├── data/seed.sql            raw__orders.orders with typed columns
 ├── contracts/
 │   └── orders_typed.contract.toml   typed contract checked once types are known
@@ -59,10 +62,13 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
 
 ## What happened
 
-1. **Compile without `--with-seed`** — every column of `raw__orders.orders`
-   is `Unknown`, so the contract's type check cannot run: `orders_typed`
-   reports `I003` for `order_id` and `amount`.
-2. **Compile with `--with-seed`** — Rocky spun up an in-memory DuckDB,
+1. **Compile with no seed file** — `run.sh` copies `models/` and
+   `contracts/` into a scratch directory with no `data/seed.sql` and
+   compiles that copy. Every column of `raw__orders.orders` is `Unknown`,
+   so the contract's type check cannot run: `orders_typed` reports `I003`
+   for `order_id` and `amount`.
+2. **Compile the project** (plain, then with `--with-seed`; both give the
+   same result) — Rocky spun up an in-memory DuckDB,
    ran `data/seed.sql`, introspected `information_schema`, and fed
    those columns into the semantic graph. The columns resolve to
    `Int32` and `Decimal`, the contract type check runs and passes, and

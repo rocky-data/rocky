@@ -7,11 +7,23 @@ cd "$HERE"
 
 mkdir -p expected
 
-echo "==> 1. Compile WITHOUT --with-seed"
-rocky compile --models models --contracts contracts > expected/compile_no_seed.json 2>/dev/null
+# Since engine 1.79.0 (#2329) a plain `rocky compile` reads `data/seed.sql`
+# when the project has one, so this project is always typed. To show what
+# the compiler sees with no source schemas, step 1 compiles a copy of the
+# models and contract in a scratch project that has no `data/seed.sql`.
+NO_SEED="$(mktemp -d)"
+trap 'rm -rf "$NO_SEED"' EXIT
+cp -R models contracts "$NO_SEED/"
 
-echo "==> 2. Compile WITH --with-seed (data/seed.sql → in-memory DuckDB → information_schema)"
-rocky compile --models models --contracts contracts --with-seed > expected/compile_with_seed.json 2>/dev/null
+echo "==> 1. Compile a copy of the project that has no data/seed.sql"
+rocky compile --models "$NO_SEED/models" --contracts "$NO_SEED/contracts" \
+    > expected/compile_no_seed.json 2>/dev/null
+
+echo "==> 2. Compile the project (data/seed.sql → in-memory DuckDB → information_schema, no flag needed)"
+rocky compile --models models --contracts contracts > expected/compile_with_seed.json 2>/dev/null
+
+echo "==> 2b. Same compile with --with-seed (requires the seed; fails if it is missing or broken)"
+rocky compile --models models --contracts contracts --with-seed > expected/compile_with_seed_flag.json 2>/dev/null
 
 echo
 echo "==> 3. Diff: what did grounding the source schema actually change?"
@@ -30,13 +42,15 @@ def unchecked(path):
 
 no_seed = unchecked("expected/compile_no_seed.json")
 with_seed = unchecked("expected/compile_with_seed.json")
+with_flag = unchecked("expected/compile_with_seed_flag.json")
 print(f"  contract columns whose type could not be checked (I003):")
-print(f"    without --with-seed : {len(no_seed)} {no_seed}")
-print(f"    with    --with-seed : {len(with_seed)} {with_seed}")
-if no_seed != ["amount", "order_id"] or with_seed:
+print(f"    no seed file          : {len(no_seed)} {no_seed}")
+print(f"    seed file, no flag    : {len(with_seed)} {with_seed}")
+print(f"    seed file, --with-seed: {len(with_flag)} {with_flag}")
+if no_seed != ["amount", "order_id"] or with_seed or with_flag:
     raise SystemExit(
         f"expected I003 for exactly amount and order_id without seed data and none with it; "
-        f"got {no_seed} and {with_seed}"
+        f"got {no_seed}, {with_seed} and {with_flag}"
     )
 PY2
 
@@ -60,5 +74,5 @@ if any(x["code"] == "P002" for x in (d.get("diagnostics") or [])):
 PY
 
 echo
-echo "POC complete: --with-seed resolves source column types, so the contract's"
+echo "POC complete: data/seed.sql resolves source column types, so the contract's"
 echo "type check runs instead of reporting I003; SELECT * is flagged with its span."
