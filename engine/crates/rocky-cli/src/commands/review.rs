@@ -429,7 +429,12 @@ async fn compute_review_with_disclosure_and_seam(
         }
     } else {
         let cfg = rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
-        approval_scope(cfg.as_ref(), &resolved_config_path, &run_plan)?.anchored_at(root)
+        super::approval_scope::approval_scope_at(
+            cfg.as_ref(),
+            root,
+            &resolved_config_path,
+            &run_plan,
+        )?
     };
     let findings = if scope.dag {
         dag_review_findings(

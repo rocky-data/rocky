@@ -100,6 +100,36 @@ pub(crate) fn approval_scope(
     })
 }
 
+/// [`approval_scope`] for a project at `root`, anchoring every directory at
+/// `root` exactly once.
+///
+/// `config_path` is already resolved against `root` (`root.join(path)`; an
+/// absolute path is kept), so the directories and globs a config declares
+/// come out anchored by it. Only a directory taken from the plan itself
+/// (`--models`, or the `models` default when no transformation pipeline
+/// applies) is relative to the project root, and only those are joined to
+/// `root`. Joining a config-derived directory again would double a relative
+/// root (`proj/proj/models`).
+pub(crate) fn approval_scope_at(
+    config: Option<&RockyConfig>,
+    root: &Path,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<ApprovalScope> {
+    let mut scope = approval_scope(config, config_path, run_plan)?;
+    if !scope.dag {
+        for unit in &mut scope.units {
+            // `run_model_selection` returns a glob exactly when it resolved a
+            // pipeline from the config; a unit without one is the plan's own
+            // directory.
+            if unit.models_glob.is_none() {
+                unit.models_dir = root.join(&unit.models_dir);
+            }
+        }
+    }
+    Ok(scope)
+}
+
 /// One unit per transformation pipeline, name-sorted, resolved exactly as
 /// `run_dag_exec::load_transformation_models` and the DAG's model-only
 /// sub-runs resolve them. A pipeline whose directory is absent is kept: it
@@ -531,7 +561,8 @@ pub(crate) const PLAN_SNAPSHOT_MISSING: &str = "plan_snapshot_missing";
 /// snapshot, or (for a person) no models-only fingerprint, predates this
 /// check and refuses with [`PLAN_SNAPSHOT_MISSING`].
 ///
-/// `root` anchors a backfill's relative models directory, as review does.
+/// `config_path` is already resolved against `root`; `root` anchors only a
+/// directory the plan names itself (a backfill's, or `--models`).
 pub(crate) fn verify_plan_models_for_apply(
     plan: &crate::plan_store::PersistedPlan,
     plan_id: &str,
@@ -585,10 +616,10 @@ pub(crate) fn verify_plan_models_for_apply(
         }
         .anchored_at(root)
     } else {
-        // Resolved against the config path joined to `root`, as propose and
-        // review do, so the directory and the glob are both anchored at the
-        // project root and not at the process cwd.
-        approval_scope(cfg, &root.join(config_path), run_plan)?.anchored_at(root)
+        // `config_path` is resolved against `root` by the apply entry point,
+        // as propose and review resolve it, so the directory and the glob
+        // are both anchored at the project root and not at the process cwd.
+        approval_scope_at(cfg, root, config_path, run_plan)?
     };
     let compiled = scope
         .compile(&source_schemas, NoModels::Empty)

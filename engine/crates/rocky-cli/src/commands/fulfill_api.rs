@@ -430,9 +430,13 @@ pub async fn propose_governed_run_plan(
     let scope = rocky_core::config::load_optional_project_config(Some(&scope_config_path))
         .map_err(anyhow::Error::from)
         .and_then(|cfg| {
-            super::approval_scope::approval_scope(cfg.as_ref(), &scope_config_path, &run_plan)
+            super::approval_scope::approval_scope_at(
+                cfg.as_ref(),
+                root,
+                &scope_config_path,
+                &run_plan,
+            )
         })
-        .map(|scope| scope.anchored_at(root))
         .map_err(|e| ProposeError::Compile(format!("{e:#}")))?;
     let capabilities = super::plan::compute_embedded_capabilities_for_scope(
         config_path,

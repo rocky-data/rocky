@@ -141,6 +141,11 @@ pub(crate) async fn run_apply_core_in(
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
+    // One resolution of the config path for every gate and check below: the
+    // policy gate and the models check read the same file. `Path::join`
+    // keeps an absolute path, and the CLI passes the absolute cwd as `root`,
+    // so a CLI apply resolves exactly as before.
+    let config_path = &root.join(config_path);
     // A run plan can sync or write policy state before it delegates to run().
     // The binary checks this too; keep the direct apply API fail-fast.
     crate::pipes::PipesEmitter::validate_requested()?;
@@ -11320,36 +11325,62 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// A relative config path resolves against the project root, not the
-    /// process cwd, as propose and review resolve it. The test process runs
-    /// in the crate directory, which has no `gold/`: resolved against the
-    /// cwd, the check finds no models and refuses an unchanged plan.
+    /// A relative project root other than `.` is joined to the scope once.
+    /// The config-derived directory (`<root>/gold`) is already anchored by
+    /// the config path; anchoring it again (`<root>/<root>/gold`) finds no
+    /// models and refuses an unchanged plan.
     #[test]
-    fn a_relative_config_path_resolves_against_the_project_root() -> anyhow::Result<()> {
+    fn a_relative_root_anchors_the_scope_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        // The same directory, spelled relative to the process cwd without
+        // changing it: climb to `/`, then descend into the temp dir.
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        assert!(root.is_relative() && root != Path::new("."));
+        let config = two_pipeline_dag_project(&root)?;
+        assert!(config.is_relative());
+        let plan_id = write_pipeline_plan(&root, &config, PolicyPrincipal::Human)?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            check_plan_models(&root, &config, &plan_id, principal)
+                .map_err(|e| anyhow::anyhow!("{principal:?}: {e:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// `rocky apply` called with a project root that is not the process cwd
+    /// (as `rocky fulfill`'s typed apply can be) and a relative config path
+    /// resolves the config once, against the root, for the policy gate, the
+    /// models check and the run. The test process runs in the crate
+    /// directory, which has no `rocky.toml` and no `gold/`: resolved against
+    /// the cwd, the config does not load.
+    #[tokio::test]
+    async fn a_relative_config_path_resolves_against_the_project_root() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let config = two_pipeline_dag_project(root)?;
         let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
         let cwd = std::env::current_dir()?;
         assert!(
-            !cwd.join("gold").exists(),
-            "the cwd must not hold the models"
+            !cwd.join("rocky.toml").exists() && !cwd.join("gold").exists(),
+            "the cwd must hold neither the config nor the models"
         );
-
-        let plan = crate::plan_store::read_plan(root, &plan_id)?;
-        let cfg = rocky_core::config::load_rocky_config(&config)?;
-        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
-            super::super::approval_scope::verify_plan_models_for_apply(
-                &plan,
-                &plan_id,
-                Some(&cfg),
-                Path::new("rocky.toml"),
-                root,
-                &gold_run_plan(),
-                principal,
-            )
-            .map_err(|e| anyhow::anyhow!("{principal:?}: {e:#}"))?;
-        }
+        super::run_apply_core_in(
+            root,
+            Path::new("rocky.toml"),
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
         Ok(())
     }
 
