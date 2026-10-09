@@ -2527,7 +2527,8 @@ pub struct ContractsConfig {
     /// depends on the warehouse), the declared type goes unchecked and the
     /// compile reports the `I003` info note. With `strict = true` that is the
     /// `E059` error instead. `rocky compile --strict-contracts` sets it for
-    /// one invocation; `rocky ci` and `rocky run` read this key.
+    /// one invocation, as does `rocky ci --strict-contracts`; `rocky run` and
+    /// `rocky test` read this key.
     pub strict: bool,
 }
 

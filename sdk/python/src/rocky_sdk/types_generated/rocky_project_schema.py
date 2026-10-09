@@ -293,6 +293,24 @@ class ConcurrencyMode1(StrEnum):
     adaptive = "adaptive"
 
 
+class ContractsConfig(BaseModel):
+    """
+    `[contracts]` — project-level contract settings.
+
+    ```toml [contracts] strict = true ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    strict: bool | None = False
+    """
+    Refuse a contract column whose declared type Rocky cannot check. Defaults to `false`.
+
+    A contract that declares a column `type` is checked against the type the compiler infers. When the compiler cannot infer the column's type (a source with no known schema, an expression whose result type depends on the warehouse), the declared type goes unchecked and the compile reports the `I003` info note. With `strict = true` that is the `E059` error instead. `rocky compile --strict-contracts` sets it for one invocation, as does `rocky ci --strict-contracts`; `rocky run` and `rocky test` read this key.
+    """
+
+
 class CostSection(BaseModel):
     """
     Cost estimation configuration.
@@ -3993,6 +4011,10 @@ class RockyConfig(BaseModel):
     )
     """
     Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings.
+    """
+    contracts: ContractsConfig | None = Field({"strict": False}, validate_default=True)
+    """
+    Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`].
     """
     cost: CostSection | None = Field(
         {

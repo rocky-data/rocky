@@ -5942,6 +5942,18 @@
         ],
         "type": "object"
       },
+      "ContractsConfig": {
+        "additionalProperties": false,
+        "description": "`[contracts]` — project-level contract settings.\n\n```toml [contracts] strict = true ```",
+        "properties": {
+          "strict": {
+            "default": false,
+            "description": "Refuse a contract column whose declared type Rocky cannot check. Defaults to `false`.\n\nA contract that declares a column `type` is checked against the type the compiler infers. When the compiler cannot infer the column's type (a source with no known schema, an expression whose result type depends on the warehouse), the declared type goes unchecked and the compile reports the `I003` info note. With `strict = true` that is the `E059` error instead. `rocky compile --strict-contracts` sets it for one invocation, as does `rocky ci --strict-contracts`; `rocky run` and `rocky test` read this key.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "CostEstimateSource": {
         "description": "Where a `rocky plan` cost estimate came from.",
         "oneOf": [
@@ -20069,6 +20081,17 @@
               "allow_unmasked": []
             },
             "description": "Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings."
+          },
+          "contracts": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContractsConfig"
+              }
+            ],
+            "default": {
+              "strict": false
+            },
+            "description": "Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`]."
           },
           "cost": {
             "allOf": [
