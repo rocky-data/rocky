@@ -374,12 +374,15 @@ async fn compute_review_with_disclosure_and_seam(
 
     // Run plans use apply's execution selection, including the pipeline glob.
     // Backfills below use their persisted directory and rebuild set instead.
-    // A relative directory belongs to this project root.
-    let (selected_dir, models_glob) = if plan.kind == PlanKind::Backfill {
+    // Every arm anchors at this project root exactly once: a directory the
+    // plan names is joined to `root`, and one from the config is already
+    // anchored by `resolved_config_path`. Joining that one again would double
+    // a relative root (#2328).
+    let (models_dir, models_glob) = if plan.kind == PlanKind::Backfill {
         // Backfill executes its persisted directory and model set, without the
         // transformation pipeline's glob.
         (
-            PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+            root.join(run_plan.models_dir.as_deref().unwrap_or("models")),
             None,
         )
     } else {
@@ -390,14 +393,16 @@ async fn compute_review_with_disclosure_and_seam(
                     resolved_config_path.display()
                 )
             })? {
-            Some(cfg) => super::apply::run_model_selection(&cfg, &resolved_config_path, &run_plan)?,
+            Some(cfg) => {
+                super::apply::run_model_selection_at(&cfg, root, &resolved_config_path, &run_plan)?
+            }
             None => (
-                PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                root.join(run_plan.models_dir.as_deref().unwrap_or("models")),
                 None,
             ),
         }
     };
-    let (models_dir, default_state_path) = review_gate_paths(root, &selected_dir);
+    let default_state_path = review_state_path(&models_dir);
     let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
@@ -827,12 +832,10 @@ fn build_message(
     }
 }
 
-/// Anchor apply's selected model directory at the review project root, then
-/// resolve the schema-cache state path from that directory.
-fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
-    let models_dir = root.join(selected_dir);
-    let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
-    (models_dir, state_path)
+/// The schema-cache state path for a models directory already anchored at
+/// the review project root: the CLI/MCP default under that directory.
+fn review_state_path(models_dir: &Path) -> PathBuf {
+    rocky_core::state::resolve_state_path(None, models_dir).path
 }
 
 /// Compute the breaking-change findings between `base_ref` and the working
@@ -2417,6 +2420,43 @@ mod tests {
         Ok(())
     }
 
+    /// #2328: a project root that is not the cwd, given relative to it (as
+    /// `rocky fulfill`'s typed apply can pass one). The pipeline glob's
+    /// directory is anchored by the config path, which is already under the
+    /// root. Joining the root to it again doubled a relative root
+    /// (`proj/proj/models`): the directory was missing, so the
+    /// breaking-change gate was skipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_root_reads_the_pipeline_directory_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cwd = std::env::current_dir()?;
+        let mut root = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            root.push("..");
+        }
+        let root = root.join(dir.path().strip_prefix("/")?);
+        assert!(root.is_relative());
+        let a_toml = sidecar("a");
+        git_project(
+            &root,
+            GLOB_CONFIG_2236,
+            &[
+                ("models/a.sql", "SELECT 1 AS id, 'x' AS name\n"),
+                ("models/a.toml", &a_toml),
+            ],
+            &[("models/a.sql", "SELECT 1 AS id\n")],
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(&root, PlanKind::AiAuthored, &payload)?;
+        let review = dry_review(&root, &plan_id).await?;
+        assert_eq!(
+            finding_models(&review),
+            BTreeSet::from([".main.a".to_string()])
+        );
+        Ok(())
+    }
+
     /// #2236: a backfill's findings come from its persisted directory and
     /// keep only its rebuild closure; a `--model` run plan keeps only that
     /// model. Pre-fix, both reported the breaking change in `b`, which the
@@ -3538,9 +3578,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("models")).unwrap();
+        let cfg: rocky_core::config::RockyConfig =
+            toml::from_str("[adapter.default]\ntype = \"duckdb\"\n").unwrap();
+        let select = |models_dir: &Path| {
+            let plan: RunPlan = serde_json::from_value(serde_json::json!({
+                "parallel": 1, "model": "m", "models_dir": models_dir,
+            }))
+            .unwrap();
+            super::super::apply::run_model_selection_at(&cfg, root, &root.join("rocky.toml"), &plan)
+                .unwrap()
+        };
 
-        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
+        let (models_dir, glob) = select(Path::new("models"));
         assert_eq!(models_dir, root.join("models"));
+        assert!(glob.is_none());
         assert!(
             models_dir.is_dir(),
             "root-joined models dir must be found regardless of cwd"
@@ -3548,11 +3599,15 @@ mod tests {
         // The schema-cache state path follows the CLI/MCP default
         // (`<models_dir>/.rocky-state.redb`), not the old hardcoded
         // cwd-relative `.rocky/state.redb`.
-        assert_eq!(state_path, root.join("models").join(".rocky-state.redb"));
+        assert_eq!(
+            review_state_path(&models_dir),
+            root.join("models").join(".rocky-state.redb")
+        );
 
         // An absolute selected directory is used verbatim.
-        let (abs_dir, _) = review_gate_paths(Path::new("/somewhere/else"), &root.join("models"));
-        assert_eq!(abs_dir, root.join("models"));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (abs_dir, _) = select(elsewhere.path());
+        assert_eq!(abs_dir, elsewhere.path());
     }
 
     /// FIX: an approved plan's later apply-time re-evaluation rows (same
@@ -3715,7 +3770,8 @@ mod tests {
         // REFUSE on a broken one. Without this the assertion below would pass
         // for the wrong reason — the marker is written here anyway, because
         // the base compile has no git repo to read.
-        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
+        let models_dir = root.join("models");
+        let state_path = review_state_path(&models_dir);
         assert!(
             compute_review_findings(
                 &config_path,

@@ -630,11 +630,13 @@ async fn run_apply_run_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    let run_models_dir = run_models_dir(root, &run_plan, &models_dir, models_glob.as_deref());
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
         run_plan,
+        run_models_dir,
         state_path,
         output_json,
         &apply_run_id,
@@ -1078,6 +1080,9 @@ async fn execute_run_plan(
     loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
     plan_id: &str,
     run_plan: RunPlan,
+    // The models directory `run` reads, from [`run_models_dir`]: anchored at
+    // the project root, so the run executes the models the gate checked.
+    run_models_dir: Option<PathBuf>,
     state_path: &Path,
     output_json: bool,
     // The unique run_id this apply forces `run` to record under, so the
@@ -1151,7 +1156,7 @@ async fn execute_run_plan(
         None
     };
 
-    let models_dir_path = run_plan.models_dir.as_ref().map(std::path::PathBuf::from);
+    let models_dir_path = run_models_dir;
 
     // `--dag` runs every pipeline as a unified DAG. The DAG runner is still
     // flag-light — it reads config + tooling defaults rather than walking the
@@ -3214,7 +3219,7 @@ pub(crate) fn run_model_selection(
 /// pre-execution check. A directory resolved from the config is already
 /// anchored by `config_path`; an absolute directory is kept as is. The CLI
 /// passes the absolute cwd as `root`, so its behaviour does not change.
-fn run_model_selection_at(
+pub(crate) fn run_model_selection_at(
     config: &rocky_core::config::RockyConfig,
     root: &Path,
     config_path: &Path,
@@ -3229,6 +3234,33 @@ fn run_model_selection_at(
         models_dir
     };
     Ok((models_dir, models_glob))
+}
+
+/// The models directory an apply hands `run`, anchored at `root` the way
+/// [`run_model_selection_at`] anchors the gate's (#2328).
+///
+/// `run` reads a plan-named directory (`--models`) as given, and falls back to
+/// a bare `models` for `--model` and `--all` when no transformation pipeline
+/// supplies a glob. Both are relative to the cwd, so a root that is not the
+/// cwd would gate one directory and execute another. A plan-named directory
+/// is joined to `root`; the bare fallback is replaced by the gate's own
+/// `<root>/models`. `run` keys several checks on whether a directory was
+/// passed at all, so the fallback is only filled in where `run` would read
+/// `models` anyway, and a pipeline glob is never overridden. The CLI passes
+/// the absolute cwd as `root`, so its behaviour does not change.
+fn run_models_dir(
+    root: &Path,
+    run_plan: &RunPlan,
+    selected_dir: &Path,
+    selected_glob: Option<&str>,
+) -> Option<PathBuf> {
+    match run_plan.models_dir.as_deref() {
+        Some(dir) => Some(root.join(dir)),
+        None if selected_glob.is_none() && (run_plan.model.is_some() || run_plan.run_all) => {
+            Some(selected_dir.to_path_buf())
+        }
+        None => None,
+    }
 }
 
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
@@ -4984,11 +5016,13 @@ async fn run_apply_ai_authored_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    let run_models_dir = run_models_dir(root, &run_plan, &models_dir, models_glob.as_deref());
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
         run_plan,
+        run_models_dir,
         state_path,
         output_json,
         &apply_run_id,
@@ -7107,6 +7141,7 @@ mod tests {
             loaded,
             "plan-dag-shadow",
             run_plan,
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -7234,6 +7269,7 @@ mod tests {
             loaded,
             "plan-dag-partition",
             run_plan,
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -7342,6 +7378,7 @@ mod tests {
                 execution_layers: vec![],
                 ..minimal_run_plan()
             },
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -11447,10 +11484,12 @@ autonomy_budget = { failures = 3, window = "7d" }
 
     /// A plan that names its own relative `--models` directory, applied with
     /// a relative project root that is not the process cwd (as `rocky
-    /// fulfill`'s typed apply can be): the policy gate and the models check
-    /// both read `<root>/gold`. Read against the cwd, the gate compiles a
-    /// directory that does not exist and the `[policy]` block refuses the
-    /// apply.
+    /// fulfill`'s typed apply can be): the policy gate, the models check and
+    /// the run all read `<root>/gold`. Read against the cwd, the gate
+    /// compiles a directory that does not exist and the `[policy]` block
+    /// refuses the apply; the run fails with `models directory 'gold' not
+    /// found` (#2328).
+    #[cfg(all(unix, feature = "duckdb"))]
     #[tokio::test]
     async fn a_plan_named_models_dir_is_read_under_the_project_root() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -11497,10 +11536,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             capabilities,
         )?;
 
-        // The gate and the check pass. The run itself still reads the plan's
-        // `--models` directory against the cwd, so it stops there: that is
-        // the first step after both, and the only one left unanchored.
-        let error = super::run_apply_core_in(
+        super::run_apply_core_in(
             &root,
             &config,
             &plan_id,
@@ -11510,12 +11546,94 @@ autonomy_budget = { failures = 3, window = "7d" }
             None,
             true,
         )
-        .await
-        .expect_err("the run reads `gold` against the cwd");
-        let msg = format!("{error:#}");
-        assert!(
-            msg.contains("models directory 'gold' not found (required for --model)"),
-            "the gate and the models check must pass before the run: {msg}"
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT v FROM marts.totals")?.rows,
+            vec![vec![serde_json::json!("2")]],
+            "the run must execute `<root>/gold/totals`"
+        );
+        Ok(())
+    }
+
+    /// The hazard behind #2328: `<cwd>/<dir>` exists and holds a DIFFERENT
+    /// model of the same name. The gate and the models check read
+    /// `<root>/<dir>`, so the run must execute that model too, not the cwd's.
+    /// Read against the cwd, the apply passes the gate on one model and
+    /// materializes the other.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn the_run_executes_the_models_the_gate_checked() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        let config = two_pipeline_dag_project(&root)?;
+
+        // A uniquely named directory in the cwd (removed on drop), so no
+        // other test sees it. The plan names it relative, and it exists
+        // under both the cwd and the root, with different `totals` models.
+        let decoy = tempfile::Builder::new()
+            .prefix("apply-root-decoy-")
+            .tempdir_in(&cwd)?;
+        let models_dir = PathBuf::from(decoy.path().file_name().context("decoy name")?);
+        let totals = |base: &Path, column: &str| -> anyhow::Result<()> {
+            std::fs::create_dir_all(base)?;
+            std::fs::write(base.join("totals.sql"), format!("SELECT 2 AS {column}\n"))?;
+            std::fs::write(
+                base.join("totals.toml"),
+                "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"totals\"\n",
+            )?;
+            Ok(())
+        };
+        totals(&root.join(&models_dir), "checked")?;
+        totals(&cwd.join(&models_dir), "unchecked")?;
+
+        let rp = RunPlan {
+            model: Some("totals".to_string()),
+            models_dir: Some(models_dir.to_string_lossy().into_owned()),
+            ..gold_run_plan()
+        };
+        let cfg = rocky_core::config::load_rocky_config(&config)?;
+        let scope =
+            super::super::approval_scope::approval_scope_at(Some(&cfg), &root, &config, &rp)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let plan_id = crate::plan_store::write_plan_governed(
+            &root,
+            PlanKind::Run,
+            &rp,
+            PolicyPrincipal::Human,
+            capabilities,
+        )?;
+        super::run_apply_core_in(
+            &root,
+            &config,
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT * FROM marts.totals")?.columns,
+            vec!["checked".to_string()],
+            "the run must execute the root's `totals`, the model the gate checked"
         );
         Ok(())
     }
