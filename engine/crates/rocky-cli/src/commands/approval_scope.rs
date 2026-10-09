@@ -299,7 +299,12 @@ pub(crate) fn scope_fingerprint(
         } else {
             super::apply::resolved_surrogate_keys(&unit.unit.models_dir, models)?
         };
-        let extras = super::apply::ExecutionExtras::build(&keys, models, mask);
+        let empty_contracts = BTreeMap::new();
+        let contract_files = unit
+            .head
+            .as_ref()
+            .map_or(&empty_contracts, |head| &head.contract_files);
+        let extras = super::apply::ExecutionExtras::build(&keys, models, contract_files, mask);
         Ok(super::apply::execution_ir_fingerprint(
             models,
             ids.config,

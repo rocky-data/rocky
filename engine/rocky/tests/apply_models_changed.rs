@@ -44,6 +44,15 @@ fn ok(out: &Output) {
 
 /// A playground project with one approved backfill plan.
 fn project_with_an_approved_backfill(dir: &Path) -> (PathBuf, String) {
+    project_with_an_approved_backfill_with(dir, |_| {})
+}
+
+/// [`project_with_an_approved_backfill`], with `before_plan` run on the
+/// project root after the first run and before the plan is made.
+fn project_with_an_approved_backfill_with(
+    dir: &Path,
+    before_plan: impl FnOnce(&Path),
+) -> (PathBuf, String) {
     std::fs::write(
         dir.join("gitconfig"),
         "[user]\n\temail = operator@example.com\n\tname = Operator\n",
@@ -61,6 +70,7 @@ fn project_with_an_approved_backfill(dir: &Path) -> (PathBuf, String) {
         .args(["--state-path", state.to_str().unwrap(), "run"])
         .output()
         .unwrap());
+    before_plan(&root);
     let out = rocky(dir)
         .current_dir(&root)
         .args(["-o", "json", "--state-path", state.to_str().unwrap()])
@@ -119,6 +129,36 @@ fn cli_apply_refuses_a_plan_whose_models_changed_and_applies_an_unchanged_one() 
     );
 
     std::fs::write(&path, original).unwrap();
+    ok(&cli_apply(dir.path(), &root, &plan_id));
+}
+
+/// A contract in the project `contracts/` directory is part of what a plan
+/// fingerprints, like a `<model>.contract.toml` beside the model. Editing it
+/// or deleting it after the plan refuses the apply; restoring it applies.
+#[test]
+fn cli_apply_refuses_a_plan_whose_project_dir_contract_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    const CONTRACT: &str = "[rules]\nrequired = []\n";
+    let (root, plan_id) = project_with_an_approved_backfill_with(dir.path(), |root| {
+        let contracts = root.join("contracts");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::write(contracts.join("revenue_summary.contract.toml"), CONTRACT).unwrap();
+    });
+    let path = root.join("contracts").join("revenue_summary.contract.toml");
+
+    std::fs::write(&path, format!("{CONTRACT}# edited after the plan\n")).unwrap();
+    let out = cli_apply(dir.path(), &root, &plan_id);
+    assert!(!out.status.success(), "an edited contract must not apply");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CODE), "{stderr}");
+
+    std::fs::remove_file(&path).unwrap();
+    let out = cli_apply(dir.path(), &root, &plan_id);
+    assert!(!out.status.success(), "a deleted contract must not apply");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CODE), "{stderr}");
+
+    std::fs::write(&path, CONTRACT).unwrap();
     ok(&cli_apply(dir.path(), &root, &plan_id));
 }
 

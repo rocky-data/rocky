@@ -113,6 +113,58 @@ pub fn load_contracts(dir: &Path) -> Result<HashMap<String, CompilerContract>, S
     Ok(contracts)
 }
 
+/// The path of `model_name`'s contract in a contracts directory.
+#[must_use]
+pub fn contract_file_in(dir: &Path, model_name: &str) -> PathBuf {
+    dir.join(format!("{model_name}.contract.toml"))
+}
+
+/// Load the project `contracts/` directory for one compile.
+///
+/// Returns each in-scope model's contract with the file it was read from.
+/// `in_scope` names the models the compile includes. One directory serves
+/// every pipeline, so a file for a model outside the compile is skipped. If
+/// that file does not parse, Rocky logs a warning and goes on: the compile
+/// that includes the model reports it. A file for an in-scope model that
+/// cannot be read or parsed is an error.
+pub fn load_project_contracts(
+    dir: &Path,
+    in_scope: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, (PathBuf, CompilerContract)>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read contracts directory {}: {e}", dir.display()))?;
+    let mut contracts = HashMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(model_name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".contract.toml"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))
+            .and_then(|content| {
+                toml::from_str::<CompilerContract>(&content)
+                    .map_err(|e| format!("failed to parse {}: {e}", path.display()))
+            });
+        if !in_scope(&model_name) {
+            if let Err(error) = parsed {
+                tracing::warn!(
+                    model = %model_name,
+                    "skipping a contract for a model outside this compile: {error}"
+                );
+            }
+            continue;
+        }
+        contracts.insert(model_name, (path, parsed?));
+    }
+    Ok(contracts)
+}
+
 /// Discover contracts from models that have a `contract_path` set
 /// (auto-discovered `<stem>.contract.toml` next to the `.sql` file).
 ///

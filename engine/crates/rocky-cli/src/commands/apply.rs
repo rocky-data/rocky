@@ -1496,7 +1496,8 @@ thread_local! {
 /// Build the apply-time [`ModelAttributes`] for every compiled model under
 /// `models_dir`, mirroring `rocky policy check`: `classifications` is the
 /// distinct column-classification set, `layer` is the `layer` tag, and
-/// `contracted` is the presence of a sibling `.contract.toml`.
+/// `contracted` is whether the compile read a contract for the model (a
+/// sibling `.contract.toml` or a file in the project `contracts/` directory).
 fn model_attributes(
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1545,7 +1546,9 @@ fn model_attributes(
         let name = model.config.name.clone();
         let classifications = model.config.classification.values().cloned().collect();
         let layer = model.config.tags.get("layer").cloned();
-        let contracted = model.contract_path.is_some();
+        // The merged contract set the compile checked: a sidecar or a file
+        // in the project `contracts/` directory.
+        let contracted = result.contract_files.contains_key(&name);
         let downstreams = result
             .project
             .models
@@ -3410,8 +3413,10 @@ pub(crate) fn execution_ir_fingerprint(
 ///   NOT by the compiler, so they are absent from `ModelConfig` and invisible to
 ///   the config+SQL projection. A model that gains/changes a surrogate key wraps
 ///   its SELECT at materialization time — a different physical write.
-/// - **Contracts (#3).** `contract_path` lives on `Model`, outside
-///   `ModelConfig`, so contract presence and contents are unfingerprinted — yet
+/// - **Contracts (#3).** A contract lives outside `ModelConfig` (a sidecar
+///   `.contract.toml`, or a file in the project `contracts/` directory, as the
+///   compile's `contract_files` records), so contract presence and contents
+///   are unfingerprinted by the projection — yet
 ///   contract PRESENCE is authorization-relevant (the `contracted` policy
 ///   attribute) and its contents constrain the model's output. Keyed by model
 ///   name; the value is a content hash. An absent key means "no contract", so
@@ -3475,15 +3480,19 @@ pub(crate) fn resolved_surrogate_keys(
 
 impl ExecutionExtras {
     /// Assemble the extras from the already-loaded surrogate-key map, the
-    /// compiled models (for `contract_path`s + classification tags), and the
-    /// env-resolved mask map. Called identically at plan time and at the apply
-    /// choke-point over the same `models_dir` / resolved mask.
+    /// compiled models (for classification tags), the contract file the
+    /// compile read for each contracted model
+    /// ([`CompileResult::contract_files`](rocky_compiler::compile::CompileResult::contract_files):
+    /// a sidecar or a `contracts/` directory file), and the env-resolved mask
+    /// map. Called identically at plan time and at the apply choke-point over
+    /// the same `models_dir` / resolved mask.
     pub(crate) fn build(
         surrogate_keys: &std::collections::HashMap<
             String,
             Vec<rocky_core::models::SurrogateKeySpec>,
         >,
         models: &[rocky_core::models::Model],
+        contract_files: &BTreeMap<String, std::path::PathBuf>,
         resolved_mask: &BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> Self {
         let surrogate_keys: BTreeMap<String, Vec<rocky_core::models::SurrogateKeySpec>> =
@@ -3494,7 +3503,7 @@ impl ExecutionExtras {
         let mut contracts = BTreeMap::new();
         let mut effective_masks = BTreeMap::new();
         for m in models {
-            if let Some(path) = &m.contract_path {
+            if let Some(path) = contract_files.get(&m.config.name) {
                 // Hash the CONTENTS. A read failure at apply that succeeded at
                 // plan yields a distinct stable sentinel → the fingerprint moves
                 // → refuse (fail-closed); it only silently matches when the

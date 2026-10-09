@@ -84,10 +84,11 @@ pub fn compute_policy_check(
     // Build the matcher's view of the model. `classifications` collapses the
     // per-column classification map to the distinct set of values; `layer`
     // is read from the model's `layer` tag (v0 convention); `contracted` is
-    // the presence of a sibling `.contract.toml` (best-effort v0).
+    // whether the compile read a contract for it (a sibling `.contract.toml`
+    // or a file in the project `contracts/` directory), as `rocky apply` reads it.
     let classifications: BTreeSet<String> = model.config.classification.values().cloned().collect();
     let layer = model.config.tags.get("layer").cloned();
-    let contracted = model.contract_path.is_some();
+    let contracted = result.contract_files.contains_key(model_name);
     let downstreams = result
         .project
         .models
@@ -2140,6 +2141,25 @@ max_retries = 0
             "an uncontracted agent apply matches no rule and falls to the default posture"
         );
         assert_eq!(out.matched_rule, None);
+
+        // A contract in the project `contracts/` directory makes the model
+        // contracted, as a sidecar `.contract.toml` does.
+        let contracts = dir.path().join("contracts");
+        fs::create_dir_all(&contracts).unwrap();
+        fs::write(
+            contracts.join("orders.contract.toml"),
+            "[rules]\nrequired = []\n",
+        )
+        .unwrap();
+        let out = compute_policy_check(
+            &config,
+            &models,
+            rocky_core::config::PolicyPrincipal::Agent,
+            rocky_core::config::PolicyCapability::Apply,
+            "orders",
+        )
+        .unwrap();
+        assert!(out.model_attributes.contracted);
     }
 
     /// `run_policy_test --output json` is `compute_policy_test` plus one

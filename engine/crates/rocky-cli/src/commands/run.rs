@@ -12635,6 +12635,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
             &compile_result.project.models,
+            &compile_result.contract_files,
             mask_for_extras,
         );
         gate.verify(&compile_result.project.models, &extras)?;
@@ -33698,6 +33699,7 @@ backend = "local"
         let extras = crate::commands::apply::ExecutionExtras::build(
             &sk,
             &result.project.models,
+            &result.contract_files,
             resolved_mask,
         );
         crate::commands::apply::execution_ir_fingerprint(

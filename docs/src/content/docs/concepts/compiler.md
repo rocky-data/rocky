@@ -230,7 +230,17 @@ These calls are never reported:
 Rocky loads the `.contract.toml` files and checks resolvable facts against
 the inferred schemas. It reads a `<model>.contract.toml` next to a model file,
 then the project `contracts/` directory beside the models directory. A
-`--contracts <DIR>` flag replaces the project directory. The
+`--contracts <DIR>` flag replaces the project directory. A file in the
+directory wins over a file next to the model.
+
+One `contracts/` directory serves every pipeline. A compile skips a file
+for a model it does not include. If that file does not parse, the compile
+logs a warning and goes on. A file that does not parse for a model in the
+compile is an error.
+
+A `rocky plan` fingerprints the contract file of each model it covers, from
+either place. If that file changes or is deleted before `rocky apply`, the
+apply refuses with `plan_models_changed`. The
 [Testing and Contracts](/concepts/testing) page has the contract format.
 
 ### 6. Lint passes and merge

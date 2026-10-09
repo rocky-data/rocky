@@ -311,6 +311,7 @@ pub(crate) fn run_backfill_in(
     let extras = crate::commands::apply::ExecutionExtras::build(
         &crate::commands::apply::resolved_surrogate_keys(models_dir, &compiled.project.models)?,
         &compiled.project.models,
+        &compiled.contract_files,
         &resolved_mask,
     );
     let capabilities = EmbeddedCapabilities {
