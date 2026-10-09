@@ -12734,7 +12734,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     }
 
     // An agent's apply refuses a first-run fill its plan did not record
-    // before any model writes, over the same set the layer loop executes.
+    // before any model writes. The set is the run's selection minus the
+    // models that failed to compile. Models withheld later (descendants of a
+    // runtime or function-creation failure, or by failure containment) are
+    // still counted, so this can refuse a run that would never have reached
+    // the fill. That errs on the side of refusing.
     if let Some(gate) = exec_fp_gate {
         refuse_unreviewed_first_run_fills(
             compile_result
