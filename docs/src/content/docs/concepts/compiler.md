@@ -173,8 +173,10 @@ To fail the compile on the warnings, run
 
 ### 5. Validate contracts
 
-If a contracts directory exists, Rocky loads the `.contract.toml` files and
-checks resolvable facts against the inferred schemas. The
+Rocky loads the `.contract.toml` files and checks resolvable facts against
+the inferred schemas. It reads a `<model>.contract.toml` next to a model file,
+then the project `contracts/` directory beside the models directory. A
+`--contracts <DIR>` flag replaces the project directory. The
 [Testing and Contracts](/concepts/testing) page has the contract format.
 
 ### 6. Lint passes and merge

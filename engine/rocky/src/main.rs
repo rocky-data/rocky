@@ -1035,9 +1035,11 @@ enum Command {
         /// `--model`.
         #[command(flatten)]
         selection: SelectArgs,
-        /// Check an explicitly selected model contract in the same compile
-        /// that supplies the model executed by this run.
-        #[arg(long, requires_all = ["model", "pipeline"])]
+        /// Contracts directory for this run's compiles. Defaults to the
+        /// project `contracts/` directory beside the models directory. With
+        /// `--model` and `--pipeline` it also requires the selected model to
+        /// have a contract there.
+        #[arg(long)]
         contracts: Option<PathBuf>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
@@ -4467,12 +4469,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     !dag && !watch
                         && !run_all
                         && filter.is_none()
-                        && contracts.is_none()
                         && resume.is_none()
                         && !resume_latest,
                     "--select / --exclude choose transformation models and cannot be combined \
-                     with --dag, --watch, --all, --filter, --contracts, --resume, or \
-                     --resume-latest"
+                     with --dag, --watch, --all, --filter, --resume, or --resume-latest"
                 );
                 let selection = selection.with_model(model.as_deref())?;
                 let mut set = rocky_cli::commands::resolve_run_selection(
@@ -4544,35 +4544,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if contracts.is_some() {
-                anyhow::ensure!(
-                    model.is_some()
-                        && pipeline.is_some()
-                        && filter.is_none()
-                        && models_dir.is_none()
-                        && !run_all
-                        && resume.is_none()
-                        && !resume_latest
-                        && !shadow
-                        && shadow_schema.is_none()
-                        && branch.is_none()
-                        && partition.is_none()
-                        && from.is_none()
-                        && to.is_none()
-                        && !latest
-                        && !missing
-                        && lookback.is_none()
-                        && !dag
-                        && !watch
-                        && !defer
-                        && defer_to.is_none()
-                        && !skip_unchanged
-                        && !no_prune
-                        && idempotency_key.is_none()
-                        && !assume_fresh_state,
-                    "--contracts supports only a fresh --model/--pipeline run; remove mixed, skip, defer, partition, shadow, resume, idempotency, and other unsupported flags"
+            // Every compile reads the project `contracts/` directory without a
+            // flag, on every run shape, and a model with a contract error is
+            // not written. `--contracts` swaps the directory. With `--model`
+            // outside `--dag` it is also the selected-model guard: the model
+            // must have a contract there, and `run` refuses the options that
+            // guard cannot cover.
+            if contracts.is_some() && watch {
+                anyhow::bail!(
+                    "--contracts is not supported with --watch; put the contracts in the \
+                     project `contracts/` directory, which every run reads"
                 );
             }
+            let run_contracts = contracts.as_deref().map(|dir| {
+                if model.is_some() && !dag {
+                    rocky_cli::commands::RunContracts::SelectedModelGuard(dir)
+                } else {
+                    rocky_cli::commands::RunContracts::Directory(dir)
+                }
+            });
             // `--var` is only threaded through the standard run path. The `--dag`
             // and `--watch` dispatch paths compile their sub-runs with an empty
             // `RunVars`, so a supplied `--var` would be silently dropped —
@@ -4731,7 +4721,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 if refuse_hooks {
                     rocky_cli::commands::refuse_configured_side_effects(&loaded.config.hooks)?;
                 }
-                let run_future = rocky_cli::commands::run_with_dag(
+                let run_future = rocky_cli::commands::run_with_dag_and_contracts(
                     &cli.config,
                     loaded,
                     &state_path,
@@ -4744,6 +4734,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // the caller asked for a bound (#1288).
                     parallel,
                     &actor,
+                    contracts.as_deref(),
                 );
                 tokio::select! {
                     result = run_future => result,
@@ -4787,7 +4778,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &skip_opts,
                     &run_vars,
                     assume_fresh_state,
-                    contracts.as_deref(),
+                    run_contracts,
                     &actor,
                     refuse_hooks,
                 )

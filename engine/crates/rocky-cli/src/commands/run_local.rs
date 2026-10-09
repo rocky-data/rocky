@@ -127,6 +127,9 @@ pub async fn run_transformation(
     // route fires `compile_complete` and the per-model events (#2317); `None`
     // for direct callers that run without hooks.
     hook_registry: Option<&rocky_core::hooks::HookRegistry>,
+    // `rocky run --contracts <DIR>`: replaces the project `contracts/`
+    // directory for this pipeline's compiles. `None` reads the project one.
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -166,7 +169,7 @@ pub async fn run_transformation(
 
             // Finding #1: baseline failures so a soft model failure skips governance.
             let failures_before = output.tables_failed;
-            let exec_result = super::run::execute_models(
+            let exec_result = super::run::execute_models_with_explicit_contracts(
                 models_dir,
                 Some(models_glob),
                 warehouse_adapter.as_ref(),
@@ -199,6 +202,7 @@ pub async fn run_transformation(
                 freeze_fence,
                 // Finding #4: the transformation route reconciles no masks.
                 false,
+                contracts_dir.map(super::run::RunContracts::Directory),
             )
             .await;
 
@@ -3852,6 +3856,7 @@ auto_create_schemas = true
             None,  // freeze_fence
             false, // expects_models
             None,  // hook_registry
+            None,  // contracts_dir
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

@@ -219,11 +219,11 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
-    CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
+    CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions, RunContracts,
     ShadowComparisonFailure, SkipRunOptions, refuse_configured_side_effects,
     require_shadow_support_for_config, resolve_run_selection, run,
 };
-pub use run_dag_exec::run_with_dag;
+pub use run_dag_exec::{run_with_dag, run_with_dag_and_contracts};
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};

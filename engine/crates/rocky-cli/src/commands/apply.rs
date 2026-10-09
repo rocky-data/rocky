@@ -6195,7 +6195,7 @@ pub async fn run_apply_inline_for_run(
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
-    contracts_dir: Option<&Path>,
+    contracts: Option<crate::commands::run::RunContracts<'_>>,
     // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
     actor: &PrincipalRef,
     // `--refuse-hooks` (#2162): refuse a config that would fire hooks.
@@ -6244,7 +6244,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
-        contracts_dir,
+        contracts,
         actor,
         None,
     )

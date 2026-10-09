@@ -23,6 +23,8 @@ rocky compile [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | every pipeline | Compile only the `.sql`, `.rocky` and `.toml` model files in this directory. Without it, Rocky compiles the models of every transformation pipeline together. See [The whole project by default](#the-whole-project-by-default). |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 | `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
@@ -952,7 +954,7 @@ rocky test [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 | `--model <NAME>` | `string` | | Run tests for a single model only. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
 | `--declarative` | `bool` | `false` | Run the `[[tests]]` of model sidecars against the warehouse instead of DuckDB. |
@@ -1072,6 +1074,8 @@ rocky ci [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | every pipeline | Run only the models in this directory. Without it, `rocky ci` runs the models of every transformation pipeline. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 
 With no `--models`, `rocky ci` compiles every transformation pipeline's models as one project graph, as [`rocky compile`](#the-whole-project-by-default) does. Then it runs them all in one in-memory DuckDB, in dependency order. So a model in a downstream pipeline reads the tables its upstream pipelines made.
 
