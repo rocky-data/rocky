@@ -193,6 +193,28 @@ pub enum CompileError {
     ContractLoad(String),
 }
 
+impl CompileError {
+    /// The E058 diagnostics of a dependency cycle, when this error is one.
+    ///
+    /// The commands that report rather than execute (`rocky compile`,
+    /// `rocky test`, `rocky ci`) print these in their normal output instead
+    /// of failing with the bare error.
+    pub fn cycle_diagnostics(&self) -> Option<&[Diagnostic]> {
+        match self {
+            Self::Project(ProjectError::Cycle { diagnostics, .. }) => Some(diagnostics),
+            Self::Project(_) | Self::SemanticGraph(_) | Self::ContractLoad(_) => None,
+        }
+    }
+
+    /// Every model of the project, when this error is a dependency cycle.
+    pub fn cycle_models(&self) -> Option<&[String]> {
+        match self {
+            Self::Project(ProjectError::Cycle { models, .. }) => Some(models),
+            Self::Project(_) | Self::SemanticGraph(_) | Self::ContractLoad(_) => None,
+        }
+    }
+}
+
 /// Compile a project from a models directory.
 ///
 /// This is the main entry point for `rocky compile`. Constructs a

@@ -210,6 +210,16 @@ pub const E044: &str = "E044";
 /// checked, nor is a project whose `[portability] target_dialect` names
 /// another warehouse.
 pub const E057: &str = "E057";
+/// The models form a dependency cycle: a model reads, directly or through
+/// other models, a model that depends on it (for example `fct_orders` reads
+/// `customer_ltv` in a `WHERE` sub-query, and `customer_ltv` reads
+/// `fct_orders`). No execution order exists.
+///
+/// Emitted by `rocky compile`, `rocky test` and `rocky ci` from
+/// [`crate::cycle`], one diagnostic per model on the cycle, each pointing at
+/// that model's read of the next model on it. Commands that execute models
+/// (`rocky run`) refuse the project with the same cycle before they write.
+pub const E058: &str = "E058";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

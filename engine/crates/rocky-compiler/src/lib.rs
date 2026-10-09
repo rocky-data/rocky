@@ -22,6 +22,7 @@ pub mod clickhouse_options;
 pub mod compile;
 pub mod contracts;
 pub mod cost_check;
+pub mod cycle;
 pub mod diagnostic;
 pub mod ephemeral;
 pub mod freshness;
