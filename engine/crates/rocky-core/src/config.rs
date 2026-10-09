@@ -148,7 +148,7 @@ fn navigate_to_table_mut<'a>(
 }
 
 /// Errors from loading and parsing pipeline configuration.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ConfigError {
     #[error("No rocky.toml found at '{}'", .path.display())]
     FileNotFound { path: PathBuf },
@@ -473,6 +473,14 @@ pub enum ConfigError {
         column: EnvString,
         reason: EnvString,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ConfigError", self)
+    }
 }
 
 /// Concurrency strategy for table processing.
@@ -8505,6 +8513,20 @@ impl ReplicationPipelineConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn config_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "cfg-prefix-1919-a7f3";
+        crate::secret_registry::register_substitution("RV_CFG_DBG", SECRET);
+        let err = ConfigError::InvalidPattern(crate::schema::SchemaError::MissingPrefix {
+            schema: "raw_orders".into(),
+            prefix: SECRET.into(),
+        });
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CFG_DBG}"), "{debug}");
+    }
 
     // ---- credential-tolerant loading (#1536) ----
 
