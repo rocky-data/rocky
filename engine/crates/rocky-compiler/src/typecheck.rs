@@ -21,7 +21,7 @@ use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
-use crate::semantic::{LineageEdge, ModelSchema, SemanticGraph};
+use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
@@ -561,19 +561,22 @@ fn compute_model_typecheck(
                 col,
                 inferred.exact_type_outputs.contains(&index),
                 inferred.count_outputs.contains(&index),
+                inferred.cast_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count)) = inferred_by_name.get(col.name.as_str())
+            let Some(&(inferred_col, exact_type, count, cast)) =
+                inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
             let Some(edge) = graph.producing_edge(model_name, &col.name) else {
-                // No traceable source column. Only `COUNT(...)` is typed here:
-                // it is a non-null BIGINT whatever its argument (#2295). Other
-                // source-less projections (literals, multi-column arithmetic)
-                // stay Unknown.
-                if count {
+                // No traceable source column. Only `COUNT(...)` and a cast are
+                // typed here: `COUNT` is a non-null BIGINT whatever its
+                // argument (#2295), and a cast is its target type
+                // (`CAST(NULL AS DATE)`). Other source-less projections
+                // (literals, multi-column arithmetic) stay Unknown.
+                if count || cast {
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
                 }
@@ -599,14 +602,11 @@ fn compute_model_typecheck(
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
                 // inference's answer only when the type comes straight from
-                // the SQL (a cast target, `COUNT`, or `SUM`/`MIN`/`MAX`/`AVG`
-                // over one) and the traced input column is known — the same
-                // "Unknown input stays Unknown" rule as cast refinement.
+                // the SQL: a cast target, `COUNT`, `SUM`/`MIN`/`MAX`/`AVG` over
+                // one, or a `CASE`/`COALESCE` whose branches agree. A cast is
+                // its target type even over an input Rocky cannot type.
                 rocky_sql::lineage::TransformKind::Expression => {
-                    if exact_type
-                        && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index)
-                    {
+                    if exact_type && inferred_col.data_type != RockyType::Unknown {
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
@@ -619,6 +619,15 @@ fn compute_model_typecheck(
                         col.nullable |= inferred_col.nullable;
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if col.data_type == RockyType::Unknown
+                        && exact_type
+                        && inferred_col.data_type != RockyType::Unknown
+                    {
+                        // A function over one column that Step 1 cannot type
+                        // from its name alone (`COALESCE(id, 0)`): take
+                        // inference's exact answer, as for `Expression`.
+                        col.data_type = inferred_col.data_type.clone();
+                        col.nullable = inferred_col.nullable;
                     }
                 }
             }
@@ -633,8 +642,6 @@ fn compute_model_typecheck(
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
-        typed_models,
-        col_index,
         inferred_cols
             .as_ref()
             .map(|inferred| inferred.columns.as_slice()),
@@ -2558,55 +2565,31 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
     }
 }
 
-/// Whether the source column a lineage edge reads has a known type.
-fn edge_input_is_known(
-    edge: &LineageEdge,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-) -> bool {
-    typed_models
-        .get(&*edge.source.model)
-        .and_then(|columns| {
-            col_index
-                .get(&*edge.source.model)
-                .and_then(|index| index.get(&*edge.source.column))
-                .map(|&index| &columns[index])
-        })
-        .is_some_and(|input| input.data_type != RockyType::Unknown)
-}
-
 /// Refine explicit casts by parsing their target types from the model SQL.
 ///
 /// Only columns that lineage left `Unknown` **and** that are produced by a cast
-/// edge — infallible [`Cast`] or fallible [`TryCast`] — whose input type is
-/// known are refined, substituting the parsed cast target (so `CAST(id AS
-/// STRING) AS id` resolves to `String`, not the source's pre-cast type — see
-/// #1145). This refines only the *type*; the nullable bit was already set in
+/// edge — infallible [`Cast`] or fallible [`TryCast`] — are refined,
+/// substituting the parsed cast target (so `CAST(id AS STRING) AS id` resolves
+/// to `String`, not the source's pre-cast type — see #1145). This refines only the *type*; the nullable bit was already set in
 /// Step 1 (a `TryCast` output is nullable regardless of input — #1148) and is
 /// left untouched here.
 ///
 /// [`Cast`]: rocky_sql::lineage::TransformKind::Cast
 /// [`TryCast`]: rocky_sql::lineage::TransformKind::TryCast
 ///
-/// Two deliberate restrictions, both erring toward `Unknown` — the safe
-/// "cannot type-check" state, where a contract on the column is skipped rather
-/// than validated against a fabricated type:
+/// The cast target is applied whatever the input's type: a statement that runs
+/// returns the target type, and a missing input column is a compile error of
+/// its own (E039 / E041) rather than a reason to leave the type unknown. A
+/// bare `DECIMAL` with no precision names no type and stays `Unknown`.
 ///
-/// - **No alias-based fallback.** A remaining `Unknown` column is not resolved
-///   by matching its output name against an upstream column. That lookup was
-///   unsound: an expression aliased back to a source name (e.g.
-///   `amount_cents / 100 AS amount`) would inherit the source type even though
-///   the expression can change it. Such columns are left `Unknown`.
-/// - **Unknown input stays Unknown.** The cast target is knowable from the SQL
-///   alone, but the target is only applied when the cast's *input* column
-///   resolves to a known type. This avoids fabricating a type for a cast over a
-///   missing or unresolved column, whose input reads as `Unknown` for the same
-///   reason a broken reference would.
+/// There is no alias-based fallback: a remaining `Unknown` column is not
+/// resolved by matching its output name against an upstream column. That
+/// lookup was unsound: an expression aliased back to a source name (e.g.
+/// `amount_cents / 100 AS amount`) would inherit the source type even though
+/// the expression can change it. Such columns are left `Unknown`.
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
     inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
@@ -2621,10 +2604,6 @@ fn enhanced_inference(
             continue;
         };
         if !edge.transform.is_cast() {
-            continue;
-        }
-
-        if !edge_input_is_known(edge, typed_models, col_index) {
             continue;
         }
 
@@ -3412,6 +3391,9 @@ pub(crate) struct SelectInference {
     exact_type_outputs: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
+    /// Outputs that are a `CAST` / `TRY_CAST` to a concrete type: the type is
+    /// the cast target whatever the input is.
+    cast_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -3426,11 +3408,14 @@ impl SelectInference {
         // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
         let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
             && matches!(data_type, RockyType::Decimal { .. });
-        if has_exact_type(expr) && !widened_decimal {
+        if has_exact_type(expr, scope) && !widened_decimal {
             self.exact_type_outputs.insert(self.columns.len());
         }
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
+        }
+        if is_cast(expr) && data_type != RockyType::Unknown {
+            self.cast_outputs.insert(self.columns.len());
         }
         self.columns.push(TypedColumn {
             name,
@@ -3450,30 +3435,116 @@ fn function_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Whether `expr` is a `CAST` / `TRY_CAST` / `::`, looking through
+/// parentheses.
+fn is_cast(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_cast(inner),
+        Expr::Cast { .. } => true,
+        _ => false,
+    }
+}
+
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
 /// itself rather than from a guess: a column, a cast (its target), `COUNT`,
-/// or `SUM` / `MIN` / `MAX` / `AVG` over one of these.
+/// `SUM` / `MIN` / `MAX` / `AVG` over one of these, or a `CASE` / `COALESCE`
+/// whose branches agree (see [`branches_agree`]).
 ///
 /// Anything else — a scalar function whose result width is dialect-dependent
-/// (`LENGTH`), a numeric literal, `COALESCE` over a literal — is not exact, so
-/// a nested expression built from it stays `Unknown` (#2295).
-fn has_exact_type(expr: &Expr) -> bool {
+/// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
+/// type — is not exact, so a nested expression built from it stays `Unknown`
+/// (#2295).
+fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
-        Expr::Nested(inner) => has_exact_type(inner),
+        Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
             "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
-                        if has_exact_type(arg)
+                        if has_exact_type(arg, scope)
                 ),
+                _ => false,
+            },
+            "COALESCE" if func.over.is_none() && func.filter.is_none() => match &func.args {
+                ast::FunctionArguments::List(list)
+                    if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
+                {
+                    let mut branches = Vec::with_capacity(list.args.len());
+                    for arg in &list.args {
+                        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
+                            return false;
+                        };
+                        branches.push(arg);
+                    }
+                    branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
+                }
                 _ => false,
             },
             _ => false,
         },
+        // Simple `CASE x WHEN ...` and searched `CASE WHEN ...`: the type
+        // comes from the results only.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            let branches: Vec<&Expr> = conditions
+                .iter()
+                .map(|when| &when.result)
+                .chain(else_result.as_deref())
+                .collect();
+            branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
+        }
         _ => false,
+    }
+}
+
+/// Whether the branches of a `CASE` or `COALESCE` fix its type `result`:
+/// every branch is exact (see [`has_exact_type`]), a text or boolean literal,
+/// an integer literal, or `NULL`; at least one branch is neither `NULL` nor a
+/// number; and every branch that is neither infers to `result` exactly.
+///
+/// An integer literal takes its type from the context in DuckDB
+/// (`COALESCE(int_col, 0)` is `INTEGER`), so Rocky's `BIGINT` for it is a
+/// guess. It is accepted only because the other branches must already infer
+/// to `result`: if the literal had widened the type, they would not.
+fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> bool {
+    if *result == RockyType::Unknown {
+        return false;
+    }
+    let mut typed_branch = false;
+    for branch in branches {
+        let branch = strip_nested(branch);
+        if let Expr::Value(value) = branch {
+            match &value.value {
+                ast::Value::Null => continue,
+                ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
+                    continue;
+                }
+                ast::Value::SingleQuotedString(_)
+                | ast::Value::DoubleQuotedString(_)
+                | ast::Value::Boolean(_) => {}
+                _ => return false,
+            }
+        } else if !has_exact_type(branch, scope) {
+            return false;
+        }
+        if infer_expr_type(branch, scope).0 != *result {
+            return false;
+        }
+        typed_branch = true;
+    }
+    typed_branch
+}
+
+fn strip_nested(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => strip_nested(inner),
+        other => other,
     }
 }
 
@@ -3548,6 +3619,7 @@ fn combine_set_operation(
     }
     let mut exact_type_outputs = HashSet::new();
     let mut count_outputs = HashSet::new();
+    let mut cast_outputs = HashSet::new();
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
             left.exact_type_outputs.contains(&index) && right.exact_type_outputs.contains(&index);
@@ -3563,6 +3635,13 @@ fn combine_set_operation(
         if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
             count_outputs.insert(index);
         }
+        if left.cast_outputs.contains(&index)
+            && right.cast_outputs.contains(&index)
+            && same_type
+            && data_type != RockyType::Unknown
+        {
+            cast_outputs.insert(index);
+        }
         l.data_type = data_type;
         l.nullable |= r.nullable;
     }
@@ -3570,6 +3649,7 @@ fn combine_set_operation(
         columns: left.columns,
         exact_type_outputs,
         count_outputs,
+        cast_outputs,
         set_operation: true,
     })
 }
@@ -4255,7 +4335,10 @@ mod tests {
             assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
             assert_eq!(col.nullable, nullable, "{}", col.name);
         }
-        assert_eq!(columns[3].data_type, RockyType::Unknown);
+        // `COALESCE(b.id, 0)`: the BIGINT branch fixes the type, and the
+        // non-null literal makes it non-null even over the null-extended side.
+        assert_eq!(columns[3].data_type, RockyType::Int64);
+        assert!(!columns[3].nullable);
         assert!(
             !columns[4].nullable,
             "COUNT stays non-null even over null-extended input"
@@ -6015,13 +6098,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_over_unknown_input_stays_unknown() {
-        // The cast target (`STRING`) is knowable from the SQL alone, but when the
-        // cast's input column resolves to `Unknown` — e.g. a source type Rocky
-        // can't map, or a missing/unresolved reference — the output is left
-        // `Unknown` rather than asserting the parsed target. This is the
-        // conservative branch of the cast-alias fix (#1145): a contract on the
-        // column is skipped instead of validated against a fabricated type.
+    fn test_cast_over_unknown_input_takes_the_cast_target() {
+        // The cast target (`STRING`) is knowable from the SQL alone. When the
+        // cast's input column resolves to `Unknown` (a source type Rocky can't
+        // map), the output still has the target type: a statement that runs
+        // returns it. The cast may fail on such an input, so it is nullable.
         let models = vec![make_model(
             "cast_unknown",
             "SELECT CAST(id AS STRING) AS id FROM source.raw.users",
@@ -6039,8 +6120,7 @@ mod tests {
         );
         let graph = build_semantic_graph(&project, &external).unwrap();
 
-        // The typed source column resolves to Unknown, so `input_is_known` is
-        // false and the cast output must remain Unknown.
+        // The typed source column resolves to Unknown.
         let mut sources = HashMap::new();
         sources.insert(
             "source.raw.users".to_string(),
@@ -6049,7 +6129,8 @@ mod tests {
 
         let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
         let cast_id = &result.typed_models["cast_unknown"][0];
-        assert_eq!(cast_id.data_type, RockyType::Unknown);
+        assert_eq!(cast_id.data_type, RockyType::String);
+        assert!(cast_id.nullable);
     }
 
     #[test]
@@ -8335,5 +8416,179 @@ mod tests {
         let plain = make_model("plain_m", "SELECT 1 AS id");
         let diags = check_lakehouse_format_options(&[delta, plain]);
         assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    /// Compile `models` with `sources` and return the typed columns and the
+    /// diagnostics.
+    fn compile_typed(
+        models: &[(&str, &str)],
+        sources: HashMap<String, Vec<TypedColumn>>,
+    ) -> crate::compile::CompileResult {
+        let models: Vec<Model> = models.iter().map(|(n, s)| make_model(n, s)).collect();
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources,
+            ..Default::default()
+        };
+        crate::compile::compile_preloaded_models(models, &config).expect("compile")
+    }
+
+    fn column<'a>(result: &'a crate::compile::CompileResult, model: &str, name: &str) -> &'a TypedColumn {
+        result.type_check.typed_models[model]
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{model}.{name} missing"))
+    }
+
+    fn product_sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([(
+            "raw.products".to_string(),
+            source_schema(&[
+                ("product_id", RockyType::Int64, false),
+                ("name", RockyType::String, true),
+                ("qty", RockyType::Int32, true),
+                (
+                    "price",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ]),
+        )])
+    }
+
+    #[test]
+    fn case_over_text_literals_is_text() {
+        let result = compile_typed(
+            &[(
+                "stg_products",
+                "SELECT product_id, name, price, \
+                 CASE WHEN price < 20 THEN 'budget' WHEN price < 60 THEN 'standard' \
+                 ELSE 'premium' END AS price_band FROM raw.products",
+            )],
+            product_sources(),
+        );
+        let band = column(&result, "stg_products", "price_band");
+        assert_eq!(band.data_type, RockyType::String);
+        assert!(!band.nullable, "every branch is a non-null literal");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "I002"),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn case_and_coalesce_type_only_when_branches_agree() {
+        let result = compile_typed(
+            &[(
+                "m",
+                "SELECT product_id, \
+                 CASE WHEN qty > 1 THEN 'x' END AS no_else, \
+                 COALESCE(product_id, 0) AS id_or_zero, \
+                 COALESCE(name, 'unknown') AS name_or_default, \
+                 COALESCE(qty, 0) AS qty_or_zero, \
+                 COALESCE(price, 0) AS price_or_zero, \
+                 COALESCE(product_id, 1.5) AS id_or_fraction, \
+                 CASE WHEN qty > 1 THEN 1 ELSE 2 END AS literals_only, \
+                 CASE WHEN qty > 1 THEN qty ELSE product_id END AS widened, \
+                 CASE WHEN qty > 1 THEN name ELSE NULL END AS name_or_null \
+                 FROM raw.products",
+            )],
+            product_sources(),
+        );
+        let ty = |name: &str| column(&result, "m", name).data_type.clone();
+        let no_else = column(&result, "m", "no_else");
+        assert_eq!(no_else.data_type, RockyType::String);
+        assert!(no_else.nullable, "no ELSE yields NULL");
+        assert_eq!(ty("id_or_zero"), RockyType::Int64);
+        assert!(!column(&result, "m", "id_or_zero").nullable);
+        assert_eq!(ty("name_or_default"), RockyType::String);
+        assert_eq!(ty("name_or_null"), RockyType::String);
+        // DuckDB types `COALESCE(INTEGER, 0)` INTEGER and
+        // `COALESCE(DECIMAL(10,2), 0)` DECIMAL(10,2); Rocky would widen
+        // both, so it claims no type.
+        assert_eq!(ty("qty_or_zero"), RockyType::Unknown);
+        assert_eq!(ty("price_or_zero"), RockyType::Unknown);
+        // `1.5` is not an integer literal; numeric-literal-only and widening
+        // branches have no exact type.
+        assert_eq!(ty("id_or_fraction"), RockyType::Unknown);
+        assert_eq!(ty("literals_only"), RockyType::Unknown);
+        assert_eq!(ty("widened"), RockyType::Unknown);
+    }
+
+    #[test]
+    fn a_cast_is_its_target_type_whatever_the_input() {
+        // No schema for `raw.unknown`: every input column is Unknown.
+        let result = compile_typed(
+            &[(
+                "m",
+                "SELECT o.id, \
+                 CAST(o.quantity * o.price AS DECIMAL(12, 2)) AS amount, \
+                 CAST(o.id AS BIGINT) AS id_big, \
+                 TRY_CAST(o.code AS INT) AS code_int, \
+                 CAST(NULL AS DATE) AS no_date, \
+                 CAST(1 AS BIGINT) AS one, \
+                 CAST(o.id AS DECIMAL) AS bare_decimal \
+                 FROM raw.unknown AS o",
+            )],
+            HashMap::new(),
+        );
+        let amount = column(&result, "m", "amount");
+        assert_eq!(
+            amount.data_type,
+            RockyType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert!(amount.nullable, "a cast over an unknown input can fail");
+        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
+        let code = column(&result, "m", "code_int");
+        assert_eq!(code.data_type, RockyType::Int32);
+        assert!(code.nullable);
+        let no_date = column(&result, "m", "no_date");
+        assert_eq!(no_date.data_type, RockyType::Date);
+        assert!(no_date.nullable);
+        let one = column(&result, "m", "one");
+        assert_eq!(one.data_type, RockyType::Int64);
+        assert!(!one.nullable, "a fitting integer literal cannot fail");
+        // A bare DECIMAL names no precision: still Unknown.
+        assert_eq!(
+            column(&result, "m", "bare_decimal").data_type,
+            RockyType::Unknown
+        );
+    }
+
+    #[test]
+    fn date_arithmetic_is_unknown() {
+        let sources = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("first_order", RockyType::Date, false),
+                ("last_order", RockyType::Date, false),
+                ("n", RockyType::Int64, false),
+            ]),
+        )]);
+        let columns = infer_select_types(
+            "SELECT last_order - first_order AS span, last_order - 5 AS earlier, \
+             first_order + n AS later, missing + 1 AS unknown_plus, n + 1 AS next_n \
+             FROM raw.orders",
+            &sources,
+            "m",
+        )
+        .unwrap();
+        let ty = |name: &str| {
+            columns
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.data_type.clone())
+                .unwrap()
+        };
+        for name in ["span", "earlier", "later", "unknown_plus"] {
+            assert_eq!(ty(name), RockyType::Unknown, "{name}");
+        }
+        assert_eq!(ty("next_n"), RockyType::Int64);
     }
 }
