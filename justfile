@@ -85,12 +85,16 @@ lint-vscode:
 lint-ui:
     cd engine/ui && npm run lint
 
-# The server below is a debug build of this checkout, started in `dir` with a
-# read-only token, without `--ui` (the page comes from Vite). Vite starts only
+# The server below is a debug build of this checkout, started in `dir` on
+# loopback with NO token and without `--ui` (the page comes from Vite). A
+# loopback server with no token asks no request for one, so the page needs no
+# sign-in; the session cookie and `/login` exist only under `--ui`, which a
+# debug build without the embedded page refuses. `/api/v1/meta` then reports
+# `token_scope: null` and the page offers its write controls. Vite starts only
 # once `/api/v1/health` answers. Ctrl-C stops both; if either process dies the
 # other is stopped and the recipe fails. The API port is the ONE source for
 # Vite's proxy target: `engine/ui/vite.config.ts` reads it from `ROCKY_API`,
-# which this recipe sets. Override with ROCKY_UI_DEV_PORT and ROCKY_UI_DEV_TOKEN.
+# which this recipe sets. Override with ROCKY_UI_DEV_PORT.
 
 # The UI development loop in one command: `rocky serve` + `npm run dev`.
 ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
@@ -103,7 +107,6 @@ ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
     set -m
     root="$(pwd)"
     port="${ROCKY_UI_DEV_PORT:-8080}"
-    token="${ROCKY_UI_DEV_TOKEN:-dev}"
     target="${CARGO_TARGET_DIR:-$root/engine/target}"
     (cd engine && cargo build --quiet --bin rocky)
     # `</dev/null` on BOTH jobs. Under job control a background job keeps the
@@ -111,7 +114,7 @@ ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
     # background read of the terminal stops the process (SIGTTIN) on the first
     # Enter — a frozen dev server with no message. With no terminal on stdin
     # the shortcuts stay off and nothing reads.
-    (cd "{{dir}}" && exec "$target/debug/rocky" serve --port "$port" --token "$token" --token-scope read-only) </dev/null &
+    (cd "{{dir}}" && exec "$target/debug/rocky" serve --port "$port") </dev/null &
     server=$!
     vite=""
     stop() {
@@ -147,7 +150,7 @@ ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
         echo "ui-dev: rocky serve did not answer on :$port within 30s" >&2
         exit 1
     }
-    echo "ui-dev: API on http://127.0.0.1:$port — open http://localhost:5173/ui/#token=$token"
+    echo "ui-dev: API on http://127.0.0.1:$port — open http://localhost:5173/ui/"
     (cd engine/ui && ROCKY_API="http://127.0.0.1:$port" exec npm run dev -- --strictPort --port 5173) </dev/null &
     vite=$!
     # Watch both. Whichever dies first ends the loop; the trap stops the other.

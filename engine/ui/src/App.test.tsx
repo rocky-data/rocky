@@ -2,11 +2,11 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
-import { ApiError } from "./api";
-import { App, EnginePanel, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
+import { ApiError, SESSION_EXPIRED_EVENT } from "./api";
+import { App, EnginePanel, SESSION_EXPIRED_TITLE, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
 import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
-import { TOKEN_STORAGE_KEY } from "./token";
+import { OPERATOR_MODE_LABEL, READ_ONLY_REASON } from "./operator";
 
 const META: MetaOutput = {
   version: "1.74.0",
@@ -18,9 +18,12 @@ const META: MetaOutput = {
   capabilities: ["estate", "products"],
 };
 
+/** A session the engine has accepted. */
+const readyMeta = async (): Promise<MetaOutput> => META;
+
 describe("EnginePanel", () => {
   it("renders the engine version and the capabilities", async () => {
-    render(<EnginePanel token="t" fetchMeta={async () => META} />);
+    render(<EnginePanel fetchMeta={async () => META} />);
     await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
     expect(screen.getByText(/state schema v23/)).toBeInTheDocument();
     expect(screen.getByText("2 capabilities")).toHaveAttribute("title", "estate, products");
@@ -28,7 +31,7 @@ describe("EnginePanel", () => {
 
   it("renders a hostile engine version as text, never as markup", async () => {
     const hostile = { ...META, engine_version: '<img src=x onerror="alert(1)">' };
-    const { container } = render(<EnginePanel token="t" fetchMeta={async () => hostile} />);
+    const { container } = render(<EnginePanel fetchMeta={async () => hostile} />);
     await waitFor(() =>
       expect(screen.getByText(`rocky ${hostile.engine_version}`)).toBeInTheDocument(),
     );
@@ -36,20 +39,19 @@ describe("EnginePanel", () => {
   });
 
   it("shows the envelope when the engine refuses", async () => {
-    const refused = new ApiError(401, {
-      code: "unauthorized",
-      message: "missing bearer",
+    const refused = new ApiError(403, {
+      code: "origin_not_allowed",
+      message: "foreign origin",
       remediation_hint: "open the printed address",
     });
     render(
       <EnginePanel
-        token="t"
         fetchMeta={async () => {
           throw refused;
         }}
       />,
     );
-    await waitFor(() => expect(screen.getByText("unauthorized")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("origin_not_allowed")).toBeInTheDocument());
     expect(screen.getByText("open the printed address")).toBeInTheDocument();
   });
 
@@ -58,7 +60,7 @@ describe("EnginePanel", () => {
     // Chrome extension is not connected and no headless browser is
     // installed), so the claim is pinned mechanically instead: the whole
     // engine block is a single element whose text is one line.
-    const { container } = render(<EnginePanel token="t" fetchMeta={async () => META} />);
+    const { container } = render(<EnginePanel fetchMeta={async () => META} />);
     await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
 
     const line = container.firstElementChild as HTMLElement;
@@ -81,9 +83,15 @@ describe("EnginePanel", () => {
     expect(container.querySelector(".grid")).toBeNull();
   });
 
-  it("explains the missing token instead of calling the engine", () => {
-    render(<EnginePanel token={null} />);
-    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
+  it("asks for the newest link when the session is gone", async () => {
+    render(
+      <EnginePanel
+        fetchMeta={async () => {
+          throw new ApiError(401, { code: "unauthorized", message: "missing" });
+        }}
+      />,
+    );
+    await screen.findByText(SESSION_EXPIRED_TITLE);
   });
 
   describe("how often it asks", () => {
@@ -93,7 +101,6 @@ describe("EnginePanel", () => {
     // 15 times a second, for as long as it was open (#2075).
     afterEach(() => {
       vi.unstubAllGlobals();
-      window.sessionStorage.clear();
     });
 
     function countingFetch() {
@@ -112,7 +119,6 @@ describe("EnginePanel", () => {
     }
 
     it("asks once, and does not ask again while the tab sits there", async () => {
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
       const calls = countingFetch();
       render(<EnginePanel />);
 
@@ -122,7 +128,6 @@ describe("EnginePanel", () => {
     });
 
     it("does not ask again when the page around it renders", async () => {
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
       const calls = countingFetch();
       function Around() {
         const [tick, setTick] = useState(0);
@@ -169,7 +174,7 @@ describe("App", () => {
 
   it("shows the Rocky mark beside the name, and says nothing twice", () => {
     window.history.pushState(null, "", "/ui/estate");
-    const { container } = render(<App token="t" {...slots} />);
+    const { container } = render(<App fetchMeta={readyMeta} {...slots} />);
     // Two wordmarks with the drawer closed: the sidebar's and the narrow
     // bar's. CSS shows one at a time; both carry the mark.
     const marks = container.querySelectorAll("img");
@@ -194,7 +199,7 @@ describe("App", () => {
 
   it("renders the eleven areas: five links, six disabled with their reasons", () => {
     window.history.pushState(null, "", "/ui/estate");
-    render(<App token="t" {...slots} />);
+    render(<App fetchMeta={readyMeta} {...slots} />);
     const nav = liveAreasNav();
     // Five that open a screen, then the six that do not, under their heading.
     // Queried as its own element, not as page text: three of the six reasons
@@ -217,7 +222,7 @@ describe("App", () => {
 
   it("switches areas on a click without a reload, and marks exactly one current", async () => {
     window.history.pushState(null, "", "/ui/governor");
-    render(<App token="t" {...slots} />);
+    render(<App fetchMeta={readyMeta} {...slots} />);
     expect(screen.getByText("governor slot")).toBeInTheDocument();
     // A bare governor path opens the brief, so Needs you is current.
     expect(areas().getByRole("link", { name: "Needs you" })).toHaveAttribute("aria-current", "page");
@@ -245,7 +250,7 @@ describe("App", () => {
     ["/ui/nope", "Estate", "page", "estate slot"],
   ])("deep-links %s under %s", (path, area, mark, slot) => {
     window.history.pushState(null, "", path);
-    render(<App token="t" {...slots} />);
+    render(<App fetchMeta={readyMeta} {...slots} />);
     expect(screen.getByText(slot)).toBeInTheDocument();
     expect(areas().getByRole("link", { name: area })).toHaveAttribute("aria-current", mark);
   });
@@ -270,14 +275,14 @@ describe("App", () => {
         products={() => <span>products slot</span>}
       />
     );
-    render(<App token="t" {...slots} governor={governor} />);
+    render(<App fetchMeta={readyMeta} {...slots} governor={governor} />);
     const pages = document.querySelectorAll('[aria-current="page"]');
     expect([...pages].map((node) => node.textContent)).toEqual([page]);
   });
 
   it("follows Back and Forward", async () => {
     window.history.pushState(null, "", "/ui/estate");
-    render(<App token="t" {...slots} />);
+    render(<App fetchMeta={readyMeta} {...slots} />);
     areas().getByRole("link", { name: "Review" }).click();
     await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
 
@@ -297,7 +302,7 @@ describe("App", () => {
 
     it("names the current area in the bar, and opens the areas in a dialog", async () => {
       window.history.pushState(null, "", "/ui/review");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       // The bar names where you are, since the sidebar is folded away.
       expect(screen.getByText("Review", { selector: "div" })).toBeInTheDocument();
       const button = openButton();
@@ -312,7 +317,7 @@ describe("App", () => {
 
     it("leaves one set of areas in the reading order while it is open", async () => {
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       const button = openButton();
       fireEvent.click(button);
       await screen.findByRole("dialog");
@@ -332,7 +337,7 @@ describe("App", () => {
 
     it("closes on a navigation from inside it", async () => {
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       const button = openButton();
       fireEvent.click(button);
       const dialog = await screen.findByRole("dialog");
@@ -344,7 +349,7 @@ describe("App", () => {
     it("closes on Back", async () => {
       window.history.pushState(null, "", "/ui/estate");
       window.history.pushState(null, "", "/ui/review");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       const button = openButton();
       fireEvent.click(button);
       await screen.findByRole("dialog");
@@ -357,7 +362,7 @@ describe("App", () => {
 
     it("closes on Escape and gives focus back to the button", async () => {
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       const button = openButton();
       fireEvent.click(button);
       await screen.findByRole("dialog");
@@ -384,7 +389,7 @@ describe("App", () => {
         })),
       );
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       expect(window.matchMedia).toHaveBeenCalledWith(WIDE_ENOUGH_FOR_THE_SIDEBAR);
       const button = openButton();
       fireEvent.click(button);
@@ -414,7 +419,7 @@ describe("App", () => {
         })),
       );
       window.history.pushState(null, "", "/ui/estate");
-      const view = render(<App token="t" {...slots} />);
+      const view = render(<App fetchMeta={readyMeta} {...slots} />);
       expect(added.length).toBeGreaterThan(0);
 
       view.unmount();
@@ -429,7 +434,7 @@ describe("App", () => {
       // Left to that effect, the drawer stayed open with its focus trap and
       // scroll lock over an inert page.
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" {...slots} />);
+      render(<App fetchMeta={readyMeta} {...slots} />);
       const button = openButton();
       fireEvent.click(button);
       const dialog = await screen.findByRole("dialog");
@@ -454,7 +459,7 @@ describe("App", () => {
         ),
       );
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" estate={<span>estate slot</span>} />);
+      render(<App estate={<span>estate slot</span>} />);
       await waitFor(() => expect(screen.getAllByText("2 capabilities").length).toBe(1));
       const button = openButton();
       fireEvent.click(button);
@@ -485,7 +490,7 @@ describe("App", () => {
         }),
       );
       window.history.pushState(null, "", "/ui/estate");
-      render(<App token="t" estate={<span>estate slot</span>} />);
+      render(<App estate={<span>estate slot</span>} />);
       await waitFor(() => expect(calls.some((url) => url.includes("/api/v1/meta"))).toBe(true));
 
       const button = openButton();
@@ -500,79 +505,18 @@ describe("App", () => {
   });
 });
 
-describe("the no-token page", () => {
+describe("the session boundary", () => {
   // The whole point of one boundary is that this is true for every lane at
   // once. So these render the REAL lanes — passing a slot would prove nothing
   // about the screen that actually reads the API.
-  function countingFetch() {
-    const calls: string[] = [];
-    const stub = vi.fn(async (input: RequestInfo | URL) => {
-      calls.push(String(input));
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    });
-    vi.stubGlobal("fetch", stub);
-    return calls;
-  }
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    window.sessionStorage.clear();
-  });
-
-  it("keeps the engine line inside the token boundary, though it sits in the sidebar", () => {
-    // The sidebar renders at every width and for every path, including with no
-    // token. The engine line reads the API, so it must not render there.
-    render(<App token={null} engine={<span>engine slot</span>} />);
-    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
-    expect(screen.queryByText("engine slot")).toBeNull();
-    expect(screen.queryByRole("region", { name: "Engine" })).toBeNull();
-    // The areas still show: they read nothing.
-    expect(screen.getByRole("navigation", { name: "Areas" })).toBeInTheDocument();
-  });
-
-  it.each(["estate", "review", "governor"])(
-    "issues no request at all on the %s lane",
-    async (lane) => {
-      const calls = countingFetch();
-      window.history.pushState(null, "", `/ui/${lane}`);
-      render(<App token={null} />);
-
-      expect(screen.getByText("No token for this tab")).toBeInTheDocument();
-      // Give any effect that was going to fire the chance to fire.
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(calls).toEqual([]);
-    },
-  );
-
-  it.each(["estate", "review", "governor"])(
-    "does issue requests on the %s lane once a token is present",
-    async (lane) => {
-      // Without this the assertion above is vacuous: it would also pass if
-      // the lanes never called `fetch` for some unrelated reason.
-      const calls = countingFetch();
-      window.history.pushState(null, "", `/ui/${lane}`);
-      render(<App token="t" />);
-
-      await waitFor(() => expect(calls.length).toBeGreaterThan(0));
-      expect(screen.queryByText("No token for this tab")).not.toBeInTheDocument();
-    },
-  );
-});
-
-describe("the production token seam", () => {
-  // The tests above pass `token` explicitly, which proves the boundary but
-  // not the thing production uses. `main.tsx` renders a bare `<App />`, so
-  // the default parameter IS the production path: swap it for any non-null
-  // value and every test above stays green while the real page mounts lanes
-  // with no credentials. These render `<App />` with nothing passed.
-  function countingFetch() {
+  function fetchAnswering(status: number, body: unknown) {
     const calls: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         calls.push(String(input));
-        return new Response("{}", {
-          status: 200,
+        return new Response(JSON.stringify(body), {
+          status,
           headers: { "content-type": "application/json" },
         });
       }),
@@ -582,41 +526,75 @@ describe("the production token seam", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    window.sessionStorage.clear();
   });
 
-  it("reads the token storage actually holds, not one handed in", async () => {
-    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "from-storage");
-    const calls = countingFetch();
+  it.each(["estate", "review", "governor"])(
+    "swaps the %s lane for the sign-in note on a 401, and hides the engine line",
+    async (lane) => {
+      fetchAnswering(401, { code: "unauthorized", message: "missing or invalid bearer token" });
+      window.history.pushState(null, "", `/ui/${lane}`);
+      render(<App />);
+
+      await screen.findByText(SESSION_EXPIRED_TITLE);
+      expect(screen.getByText(/newest/)).toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Engine" })).toBeNull();
+      // The areas still show: they read nothing.
+      expect(screen.getByRole("navigation", { name: "Areas" })).toBeInTheDocument();
+      // No write controls and no operator bar on an expired session.
+      expect(screen.queryByText(OPERATOR_MODE_LABEL)).toBeNull();
+    },
+  );
+
+  it("swaps the page when a panel, not the meta read, gets the 401", async () => {
+    // The meta read succeeded; a later panel read finds the session gone
+    // (the server restarted). The whole page must follow.
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} estate={<span>estate slot</span>} />);
+    expect(screen.getByText("estate slot")).toBeInTheDocument();
+    act(() => {
+      window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+    });
+    expect(screen.getByText(SESSION_EXPIRED_TITLE)).toBeInTheDocument();
+    expect(screen.queryByText("estate slot")).toBeNull();
+  });
+
+  it("reads the lanes once the session answers", async () => {
+    const calls = fetchAnswering(200, META);
     window.history.pushState(null, "", "/ui/estate");
     render(<App />);
+    await waitFor(() => expect(calls.length).toBeGreaterThan(1));
+    expect(screen.queryByText(SESSION_EXPIRED_TITLE)).not.toBeInTheDocument();
+  });
+});
 
-    await waitFor(() => expect(calls.length).toBeGreaterThan(0));
-    expect(screen.queryByText("No token for this tab")).not.toBeInTheDocument();
+describe("operator mode in the shell", () => {
+  it("draws the operator bar the whole time a full-scope session is open", async () => {
+    render(
+      <App
+        fetchMeta={async () => ({ ...META, token_scope: "full" })}
+        estate={<span>estate slot</span>}
+      />,
+    );
+    const bar = await screen.findByRole("status", { name: "Operator mode" });
+    expect(bar).toHaveTextContent(OPERATOR_MODE_LABEL);
+    expect(screen.queryByRole("status", { name: "Read-only" })).toBeNull();
   });
 
-  it("gates when storage is empty", async () => {
-    window.sessionStorage.clear();
-    const calls = countingFetch();
-    window.history.pushState(null, "", "/ui/estate");
-    render(<App />);
-
-    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(calls).toEqual([]);
+  it("says read-only, and never operator mode, on a read-only session", async () => {
+    render(
+      <App
+        fetchMeta={async () => ({ ...META, token_scope: "read_only" })}
+        estate={<span>estate slot</span>}
+      />,
+    );
+    const bar = await screen.findByRole("status", { name: "Read-only" });
+    expect(bar).toHaveTextContent(READ_ONLY_REASON);
+    expect(screen.queryByText(OPERATOR_MODE_LABEL)).toBeNull();
   });
 
-  it("treats a stored empty string as no token, not as one", async () => {
-    // The two readers must agree. `apiGet` sends no Authorization header for
-    // "" because it is falsy, so a shell that accepted "" would mount every
-    // lane and fetch without credentials — the wall of 401s, back again.
-    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "");
-    const calls = countingFetch();
-    window.history.pushState(null, "", "/ui/review");
-    render(<App />);
-
-    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(calls).toEqual([]);
+  it("draws no bar until the engine has said", () => {
+    render(<App fetchMeta={() => new Promise(() => {})} estate={<span>estate slot</span>} />);
+    expect(screen.queryByRole("status", { name: "Operator mode" })).toBeNull();
+    expect(screen.queryByRole("status", { name: "Read-only" })).toBeNull();
   });
 });

@@ -25,6 +25,7 @@
 //! POST /api/v1/jobs/run                         → submit a run job    → 202 {job_id}
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
 //! POST /api/v1/jobs/apply                       → submit an apply job → 202 {job_id}
+//! POST /api/v1/jobs/approve                     → approve a plan (= rocky review --approve) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -186,6 +187,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/run", post(submit_run))
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
+        .route("/api/v1/jobs/approve", post(submit_approve))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/schedule/spool", get(schedule_spool))
@@ -557,11 +559,27 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run/apply job is already in progress on this project",
+            "another run, apply or approve job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
         err
+    }
+
+    /// `400` — an `apply` or `approve` job named no plan, or a `plan_id` that
+    /// is not the 64 lowercase hex characters of a plan digest. Refused
+    /// before the permit is taken and before any argv is built, so a value
+    /// that looks like a flag never reaches the child's command line.
+    fn invalid_plan_id(kind: JobKind) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_plan_id",
+            format!(
+                "a {} job needs `plan_id`: exactly 64 lowercase hex characters",
+                kind.verb()
+            ),
+            Some("use a plan_id from GET /api/v1/review/queue or from a plan job's result"),
+        )
     }
 
     /// `400` — the request body could not be parsed.
@@ -880,6 +898,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/run",
         "POST /api/v1/jobs/plan",
         "POST /api/v1/jobs/apply",
+        "POST /api/v1/jobs/approve",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
         "GET /api/v1/schedule/spool",
@@ -1127,6 +1146,18 @@ async fn meta(State(state): State<Arc<ServerState>>) -> PrettyJson<MetaOutput> {
         config_hash,
         capabilities: capabilities(),
         routes: api_v1_routes(),
+        token_scope: meta_token_scope(state.auth.as_ref()),
+    })
+}
+
+/// The scope `GET /api/v1/meta` reports: the installed token's, or `None`
+/// when no token is configured. Reads the scope field only, never the secret.
+fn meta_token_scope(
+    token: Option<&rocky_server::auth::ServeToken>,
+) -> Option<crate::output::MetaTokenScope> {
+    token.map(|token| match token.scope {
+        rocky_server::auth::TokenScope::Full => crate::output::MetaTokenScope::Full,
+        rocky_server::auth::TokenScope::ReadOnly => crate::output::MetaTokenScope::ReadOnly,
     })
 }
 
@@ -2685,7 +2716,8 @@ pub(crate) struct JobRequest {
     pipeline: Option<String>,
     /// `--model <name>` for `run`/`plan` (single-model execution).
     model: Option<String>,
-    /// The positional `<plan_id>` for `apply`.
+    /// The positional `<plan_id>` for `apply` and `approve`: required there,
+    /// and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.
     plan_id: Option<String>,
     /// `--expect-spec-digest <hex>` for `apply` — the approved-spec digest
     /// the caller expects the plan to be bound to. The engine's gate is
@@ -3114,6 +3146,20 @@ async fn submit_apply(
     submit_job(JobKind::Apply, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/approve` — approve a plan: `rocky review <plan_id>
+/// --approve` as a job (takes the permit). Body `{"plan_id": "<64 hex>"}`.
+///
+/// The child runs with `ROCKY_SESSION_SOURCE=http_api`, so the marker records
+/// `ApproverSource::HttpApi` and the server's git identity, and the child
+/// refuses (`approver_identity_unresolved`) when that identity cannot be read.
+async fn submit_approve(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Approve, state, &headers, &body).await
+}
+
 /// Shared submission path for all three job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
@@ -3134,6 +3180,7 @@ async fn submit_job(
         serde_json::from_slice(body)
             .map_err(|e| ApiError::bad_request(format!("invalid job request body: {e}")))?
     };
+    validate_job_plan_id(kind, &request)?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3195,11 +3242,19 @@ async fn submit_job(
     cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
-        let _permit = permit;
         let (final_state, result, error) =
             execute_job_subprocess(kind, config_path, state_path.clone(), request).await;
 
-        finish_job(task_state, state_path, record, final_state, result, error).await;
+        finish_job(
+            task_state,
+            state_path,
+            record,
+            final_state,
+            result,
+            error,
+            permit,
+        )
+        .await;
     });
 
     Ok((
@@ -3209,13 +3264,29 @@ async fn submit_job(
         .into_response())
 }
 
-async fn finish_job(
+/// `apply` and `approve` name a plan; refuse any `plan_id` that is not a plan
+/// digest before the permit is taken or an argv is built. `run` and `plan`
+/// ignore the field, as before.
+fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    match kind {
+        JobKind::Run | JobKind::Plan => Ok(()),
+        JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
+            Some(plan_id) if is_plan_id(plan_id) => Ok(()),
+            Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
+        },
+    }
+}
+
+async fn finish_job<P>(
     state: Arc<ServerState>,
     state_path: std::path::PathBuf,
     mut done: PersistedJob,
     final_state: JobState,
     result: Option<serde_json::Value>,
     error: Option<String>,
+    // The mutation permit the job holds (`None` for `plan`), released once
+    // the terminal record is durable and before it is visible.
+    permit: P,
 ) {
     done.state = job_state_str(final_state).to_string();
     done.finished_at = Some(chrono::Utc::now().to_rfc3339());
@@ -3225,11 +3296,17 @@ async fn finish_job(
     done.redaction_version = Some(version);
     // The outcome scrub checks its two fields. Check the whole record before
     // either sink so a cache hit and a restart serve the same held payload.
-    cache_job(&state, done.clone()).await;
+    //
+    // Order: persist, release the mutation permit, THEN cache the terminal
+    // record. `GET /jobs/{id}` reads the cache first, so a client that sees
+    // the job settle can submit the next run, apply or approve at once
+    // without a `409 mutation_in_progress` from a permit still held.
     if let Err(e) = persist_job(&state, state_path, done.clone()).await {
         tracing::warn!(error = %e, job_id = %done.job_id,
             "could not persist terminal job record; /runs is the reconcile surface");
     }
+    drop(permit);
+    cache_job(&state, done).await;
 }
 
 /// Build the full `rocky` argv (minus the binary path) for a job subprocess.
@@ -3254,7 +3331,7 @@ fn job_subprocess_args(
     }
     args.push("--state-path".into());
     args.push(state_path.into());
-    args.push(kind.verb().into());
+    args.push(kind.subcommand().into());
     match kind {
         JobKind::Run | JobKind::Plan => {
             if let Some(filter) = &request.filter {
@@ -3283,6 +3360,12 @@ fn job_subprocess_args(
                 args.push("--expect-spec-digest".into());
                 args.push(digest.into());
             }
+        }
+        JobKind::Approve => {
+            if let Some(plan_id) = &request.plan_id {
+                args.push(plan_id.into());
+            }
+            args.push("--approve".into());
         }
     }
     args
@@ -3326,23 +3409,300 @@ async fn execute_job_subprocess(
 
     // The canonical output is emitted on stdout; embed it verbatim when parseable.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    let mut result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    // The UI shows each `errors[].error` as a failure line. Clean them here,
+    // like `error`, so the response never carries a secret, an absolute path
+    // or a backtrace the browser would display.
+    if let Some(result) = result.as_mut() {
+        sanitize_result_errors(result);
+    }
 
     if output.status.success() {
         (JobState::Succeeded, result, None)
     } else {
-        // Surface the last few stderr lines (the actionable tail) as the error.
+        // Surface the actionable part of stderr as the error: the final
+        // `Error:` / `Caused by:` block, never the child's tracing lines.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let lines: Vec<&str> = stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(10)..].join("\n");
-        let msg = if tail.trim().is_empty() {
-            format!("`rocky {}` exited with {}", kind.verb(), output.status)
-        } else {
-            tail
-        };
+        let msg = failed_job_error(kind.verb(), &output.status, &stderr);
         (JobState::Failed, result, Some(msg))
     }
 }
+
+/// The most a failed job's `error` (and each `errors[].error`) carries, in
+/// bytes, before the trailing `…`.
+const JOB_ERROR_MAX_BYTES: usize = 1_500;
+
+/// What a failed job's `error` says when cleaning leaves nothing of stderr.
+const JOB_FAILED_SEE_LOG: &str = "the job failed; see the server log";
+
+/// The `error` of a failed job: the actionable part of its stderr, or, when
+/// nothing is left, [`JOB_FAILED_SEE_LOG`] with the exit status. Never empty.
+fn failed_job_error(verb: &str, status: &impl std::fmt::Display, stderr: &str) -> String {
+    concise_job_error(stderr)
+        .unwrap_or_else(|| format!("{JOB_FAILED_SEE_LOG} (`rocky {verb}` exited with {status})"))
+}
+
+/// The part of a failed child's stderr a reader acts on.
+///
+/// A child run with `RUST_LOG` set writes tracing lines to stderr: JSON
+/// objects, or `fmt` lines that start with a timestamp or a level. Those can
+/// carry SQL and local file paths, and they bury the error. They are dropped,
+/// and so are indented backtrace frames (`  at <file>:<line>`). Of what is
+/// left, the error is the final `Error:` line and what follows it (anyhow's
+/// `Caused by:` chain); without one, the last ten lines that name no
+/// absolute path. The text then goes through [`sanitize_job_text`]. `None`
+/// when nothing is left.
+fn concise_job_error(stderr: &str) -> Option<String> {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !is_tracing_line(line) && !is_backtrace_line(line))
+        .collect();
+    let text = match lines.iter().rposition(|line| line.starts_with("Error:")) {
+        Some(start) => lines[start..].join("\n"),
+        None => {
+            let kept: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| !contains_absolute_path(line))
+                .collect();
+            kept[kept.len().saturating_sub(10)..].join("\n")
+        }
+    };
+    let text = sanitize_job_text(&text);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Clean one job message for the browser: drop backtrace lines, drop the
+/// source location from a panic line, redact registered secrets and absolute
+/// filesystem paths, and cap the length at [`JOB_ERROR_MAX_BYTES`].
+fn sanitize_job_text(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|line| !is_backtrace_line(line))
+        .map(strip_panic_location)
+        .collect();
+    let text = lines.join("\n");
+    let text = redact_absolute_paths(&crate::secret_filter::redact(text.trim()));
+    let text = text.trim();
+    if text.len() <= JOB_ERROR_MAX_BYTES {
+        return text.to_string();
+    }
+    let mut cut = JOB_ERROR_MAX_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    crate::secret_filter::redact_truncated_tail(&format!("{}…", &text[..cut]))
+}
+
+/// Run every `errors[].error` string of a job result through
+/// [`sanitize_job_text`]. Other fields are left as they are. An error that
+/// cleans to nothing becomes [`JOB_FAILED_SEE_LOG`], never an empty string.
+fn sanitize_result_errors(result: &mut serde_json::Value) {
+    let Some(errors) = result
+        .get_mut("errors")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in errors {
+        if let Some(error) = entry.get_mut("error")
+            && let Some(text) = error.as_str()
+        {
+            let text = sanitize_job_text(text);
+            let text = if text.is_empty() {
+                JOB_FAILED_SEE_LOG.to_string()
+            } else {
+                text
+            };
+            *error = serde_json::Value::String(text);
+        }
+    }
+}
+
+/// An indented backtrace frame: `  at <location>`, where the location ends
+/// in `:<line>` (or `:<line>:<column>`), or is a single token that names a
+/// path (`crates/x/src/y.rs`). Other indented lines, such as SQL that opens
+/// `    with cte as (` or `    at time zone 'UTC'`, are kept.
+fn is_backtrace_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.len() == line.len() {
+        return false;
+    }
+    let Some(location) = trimmed.strip_prefix("at ") else {
+        return false;
+    };
+    let location = location.trim();
+    let mut rest = location;
+    let mut numbers = 0;
+    while numbers < 2 {
+        match rest.rsplit_once(':') {
+            Some((head, number))
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                rest = head;
+                numbers += 1;
+            }
+            _ => break,
+        }
+    }
+    if numbers > 0 {
+        return !rest.trim().is_empty();
+    }
+    // Without a line number, only a single path-like token is a frame.
+    !rest.is_empty() && !rest.contains(char::is_whitespace) && rest.contains(['/', '\\'])
+}
+
+/// `thread 'main' panicked at src/x.rs:1:2:` keeps `thread 'main' panicked:`.
+/// The location names a source file, which tells the reader nothing.
+fn strip_panic_location(line: &str) -> String {
+    match line.find(" panicked at ") {
+        Some(at) => format!("{} panicked:", &line[..at]),
+        None => line.to_string(),
+    }
+}
+
+/// Characters a path token may follow and still count as absolute.
+fn opens_path_token(prev: Option<char>) -> bool {
+    prev.is_none_or(|c| c.is_whitespace() || "'\"`([{<=,;:".contains(c))
+}
+
+/// Characters that end a path token. A path with a space in it is cut at
+/// the space, so its tail can survive.
+fn closes_path_token(c: char) -> bool {
+    c.is_whitespace() || "'\"`)]}>,;".contains(c)
+}
+
+/// The leading URL-path segments of API routes. A token whose first segment
+/// is exactly one of these names a REST endpoint (`/api/2.0/sql/statements`,
+/// `/v1/statements`), not a file on the server, and is kept. Every other
+/// absolute path is redacted (`/apis/x` and `/oauthx/y` are).
+const API_ROUTE_SEGMENTS: &[&str] = &[
+    "api", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "2.0", "1.2", "rest", "sql",
+    "oauth", "oauth2",
+];
+
+/// Whether `rest` opens a Unix path with at least two segments (`/etc/passwd`,
+/// not `/etc/` or `//host`) that is not an API route.
+fn opens_filesystem_path(rest: &str) -> bool {
+    let token = &rest[..rest.find(closes_path_token).unwrap_or(rest.len())];
+    let Some(tail) = token.strip_prefix('/') else {
+        return false;
+    };
+    let Some((first, second)) = tail.split_once('/') else {
+        return false;
+    };
+    !first.is_empty()
+        && !second.is_empty()
+        && !second.starts_with('/')
+        && !API_ROUTE_SEGMENTS.contains(&first)
+}
+
+/// The byte length of a local filesystem path starting at `rest`, or
+/// `None`. Fails closed: any Unix path of two or more segments that is not
+/// an API route (see [`API_ROUTE_SEGMENTS`]), a `file://` URL, a home path
+/// (`~/x…`), a Windows path (`C:\x…` or `C:/x…`), a UNC path (`\\host\x…`)
+/// or an extended-length path (`\\?\C:\x…`).
+/// A path inside another URL (`https://host/a/b`) is not reached here: its
+/// slashes follow a host character, which opens no token.
+fn absolute_path_at(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let starts = match bytes {
+        _ if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"file://") => true,
+        [b'\\', b'\\', b'?', b'\\', ..] => true,
+        [b'\\', b'\\', next, ..] => next.is_ascii_alphanumeric(),
+        [letter, b':', b'/', next, ..] => letter.is_ascii_alphabetic() && *next != b'/',
+        [b'/', ..] => opens_filesystem_path(rest),
+        [b'~', b'/', ..] => true,
+        [letter, b':', b'\\', ..] => letter.is_ascii_alphabetic(),
+        _ => false,
+    };
+    starts.then(|| rest.find(closes_path_token).unwrap_or(rest.len()))
+}
+
+fn contains_absolute_path(line: &str) -> bool {
+    redact_absolute_paths(line) != line
+}
+
+/// The length of a `sqlite://` or `duckdb://` prefix at `rest` when the URL
+/// names an absolute file (`sqlite:///abs/x`), or `None`.
+fn database_url_prefix(rest: &str) -> Option<usize> {
+    ["sqlite://", "duckdb://"].iter().find_map(|scheme| {
+        let head = rest.as_bytes().get(..scheme.len() + 2)?;
+        (head[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+            && head[scheme.len()] == b'/'
+            && !closes_path_token(char::from(head[scheme.len() + 1])))
+        .then_some(scheme.len())
+    })
+}
+
+/// Replace every local filesystem path in `text` with `<path>`. A URL's
+/// `//host/x` is not a path: its slashes follow `:` or a host character. An
+/// API route is not one either (see [`API_ROUTE_SEGMENTS`]). The absolute
+/// file of a `sqlite:///abs` or `duckdb:///abs` URL is a path: the scheme is
+/// kept and the rest is redacted. A relative path is not redacted.
+fn redact_absolute_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if opens_path_token(prev)
+            && let Some(scheme) = database_url_prefix(rest)
+        {
+            out.push_str(&rest[..scheme]);
+            out.push_str("<path>");
+            let path = &rest[scheme..];
+            i += scheme + path.find(closes_path_token).unwrap_or(path.len());
+            prev = Some('>');
+            continue;
+        }
+        if opens_path_token(prev)
+            && let Some(len) = absolute_path_at(rest)
+        {
+            out.push_str("<path>");
+            i += len;
+            prev = Some('>');
+            continue;
+        }
+        let c = rest.chars().next().expect("i is on a char boundary");
+        out.push(c);
+        prev = Some(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// A line a `tracing` subscriber wrote: a JSON event (an object with a
+/// `level`), an ANSI-coloured line, or a `fmt` line that opens with an RFC
+/// 3339 timestamp or a level. Any other JSON, such as a warehouse error body
+/// in a `Caused by:` chain, is kept.
+fn is_tracing_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<serde_json::Value>(trimmed)
+            .is_ok_and(|v| v.get("level").is_some());
+    }
+    if trimmed.starts_with('\u{1b}') {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    let timestamp = bytes.len() >= 11
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T';
+    timestamp
+        || ["TRACE ", "DEBUG ", "INFO ", "WARN ", "ERROR "]
+            .iter()
+            .any(|level| trimmed.starts_with(level))
+}
+
+/// The variable a job child reads to learn it was started by the HTTP API.
+const HTTP_API_SESSION_SOURCE_ENV: &str = "ROCKY_SESSION_SOURCE";
+/// The value `run_audit::detect_session_source` maps to `SessionSource::HttpApi`.
+const HTTP_API_SESSION_SOURCE: &str = "http_api";
 
 fn job_subprocess_command(
     exe: std::path::PathBuf,
@@ -3353,10 +3713,33 @@ fn job_subprocess_command(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(exe);
     rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
-    for arg in job_subprocess_args(kind, config_path, state_path, request) {
+    // Every child the HTTP API starts says so. The run record then shows
+    // `session_source: http_api` instead of `cli`, and `rocky review
+    // --approve` stamps `ApproverSource::HttpApi` and refuses to fall back
+    // to an `unknown` approver. It labels the channel, not the person.
+    cmd.env(HTTP_API_SESSION_SOURCE_ENV, HTTP_API_SESSION_SOURCE);
+    // The child runs in the project root: the directory of the bound
+    // `rocky.toml`, the same root the review and product GET routes read
+    // (`project_root_for`). `plan`, `review --approve` and `apply` keep their
+    // plans and markers under `<cwd>/.rocky/plans`, so a server started from
+    // another directory would otherwise write a marker where its own routes
+    // never look. The paths are made absolute first, so moving the child's
+    // cwd cannot change what a relative `--config` or `--state-path` names.
+    let config_path = config_path.map(absolute_path);
+    let state_path = absolute_path(state_path);
+    if let Some(root) = config_path.as_deref().and_then(std::path::Path::parent) {
+        cmd.current_dir(root);
+    }
+    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, request) {
         cmd.arg(arg);
     }
     cmd
+}
+
+/// `path` made absolute against this process's cwd, or `path` as given when
+/// that cannot be read (the child then resolves it as before).
+fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `GET /api/v1/jobs/{id}` — job status, with the embedded canonical result once
@@ -3654,14 +4037,17 @@ mod tests {
         let rendered = serde_json::to_string(&result.expect("a result")).expect("serializes");
         assert!(
             !rendered.contains(secret),
-            "the stored result still holds it: {rendered}"
+            "the stored result still holds the secret"
         );
-        assert!(rendered.contains("${ROCKY_JOBSCRUB}"), "{rendered}");
+        assert!(
+            rendered.contains("${ROCKY_JOBSCRUB}"),
+            "the stored result lacks the placeholder"
+        );
 
         let error = error.expect("an error");
         assert!(
             !error.contains(secret),
-            "the stored error still holds it: {error}"
+            "the stored error still holds the secret"
         );
         assert_eq!(version, rocky_core::state::CURRENT_REDACTION_VERSION);
     }
@@ -8974,15 +9360,21 @@ mod tests {
         let base = spawn_router(state).await;
 
         let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{base}/api/v1/jobs/apply"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 409);
-        let body: ErrorEnvelope = resp.json().await.unwrap();
-        assert_eq!(body.code, "mutation_in_progress");
-        assert_eq!(body.running_job_id.as_deref(), Some("job_incumbent"));
+        let plan_id = "a".repeat(64);
+        // `approve` takes the same permit: an approval cannot land while a
+        // run or an apply is in flight.
+        for route in ["apply", "approve"] {
+            let resp = client
+                .post(format!("{base}/api/v1/jobs/{route}"))
+                .json(&serde_json::json!({ "plan_id": plan_id }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 409, "{route}");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "mutation_in_progress", "{route}");
+            assert_eq!(body.running_job_id.as_deref(), Some("job_incumbent"));
+        }
 
         drop(held);
     }
@@ -8995,10 +9387,21 @@ mod tests {
     fn job_kind_mutation_and_verb_semantics() {
         assert!(JobKind::Run.mutates());
         assert!(JobKind::Apply.mutates());
+        assert!(JobKind::Approve.mutates());
         assert!(!JobKind::Plan.mutates());
         assert_eq!(JobKind::Run.verb(), "run");
         assert_eq!(JobKind::Plan.verb(), "plan");
         assert_eq!(JobKind::Apply.verb(), "apply");
+        assert_eq!(JobKind::Approve.verb(), "approve");
+        assert_eq!(JobKind::Approve.subcommand(), "review");
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            assert_eq!(JobKind::parse(kind.verb()), Some(kind));
+        }
     }
 
     /// FF-WP1 (finding 5) — the apply job's argv threading, pinned at the
@@ -9095,7 +9498,7 @@ mod tests {
         let resp = client
             .post(format!("{base}/api/v1/jobs/apply"))
             .json(&serde_json::json!({
-                "plan_id": "abc",
+                "plan_id": "a".repeat(64),
                 "expect_spec_digest": "sha256:feed"
             }))
             .send()
@@ -9211,6 +9614,7 @@ mod tests {
             JobState::Failed,
             None,
             Some("ordinary failure".to_string()),
+            (),
         )
         .await;
         let cached = state.jobs.get("finished-scrub").await.unwrap();
@@ -10048,6 +10452,16 @@ mod tests {
                 "ui_router() uses `{form}`, which this guard cannot classify"
             );
         }
+        // The one exception, named exactly: `POST /login`, the token field on
+        // the failed-login page. It changes no project state; it checks the
+        // token (constant time) and sets the session cookie, and it refuses
+        // a request without an allowed Origin. Anything else is refused.
+        let login = r#".route("/login", get(login_link).post(login_form))"#;
+        assert!(
+            ui_body.contains(login),
+            "ui_router() must register the login exchange by exactly `{login}`"
+        );
+        let ui_body = ui_body.replace(login, "");
         let ui_mutating: usize = ["post(", "put(", "patch(", "delete("]
             .iter()
             .map(|verb| ui_body.matches(verb).count())
@@ -10055,7 +10469,7 @@ mod tests {
         assert_eq!(
             ui_mutating, 0,
             "ui_router() is merged outside the bearer layer, so it may register \
-             safe methods only"
+             safe methods only (and the named `POST /login`)"
         );
 
         let registered: usize = ["post(", "put(", "patch(", "delete("]
@@ -10699,5 +11113,929 @@ adapter = "db"
             1,
             "an over-limit request writes no spool file"
         );
+    }
+
+    // --- Operator mode and the UI session (`rocky serve --ui`) ---
+
+    /// A `--ui` server whose token carries `scope`, with optional allowed
+    /// origins, and optionally a webhook ingress with `webhook_secret`.
+    fn ui_state_scoped(
+        scope: rocky_server::auth::TokenScope,
+        allowed_origins: &[&str],
+        webhook: Option<(&str, &tempfile::TempDir)>,
+    ) -> Arc<ServerState> {
+        use rocky_server::ui::{InMemoryAssets, UiConfig};
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "index.html".to_string(),
+            b"<!doctype html><div id=root></div>".to_vec(),
+        );
+        let (config_path, ingress) = match webhook {
+            Some((secret, dir)) => {
+                let config_path = dir.path().join("rocky.toml");
+                std::fs::write(&config_path, WEBHOOK_TEST_CONFIG).unwrap();
+                (
+                    Some(config_path),
+                    Some(rocky_server::webhook_ingress::WebhookIngress {
+                        secret: Some(secret.to_string()),
+                        bind_is_loopback: true,
+                        rocky_dir: dir.path().join(".rocky"),
+                        rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(100.0),
+                    }),
+                )
+            }
+            None => (None, None),
+        };
+        ServerState::with_auth_and_webhook(
+            simple_project_models(),
+            false,
+            None,
+            config_path,
+            Some(ServeToken {
+                secret: "s3cret-operator-token".to_string(),
+                scope,
+            }),
+            allowed_origins.iter().map(ToString::to_string).collect(),
+            None,
+            ingress,
+            Some(UiConfig {
+                bind_host: "127.0.0.1".to_string(),
+                allowed_hosts: Vec::new(),
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
+        )
+    }
+
+    const OPERATOR_TOKEN: &str = "s3cret-operator-token";
+
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// Log in with the printed link and return the `name=value` cookie pair.
+    async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303);
+        let set_cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    /// `GET /login?t=<token>`: `303 /ui/` with an `HttpOnly`,
+    /// `SameSite=Strict`, session cookie whose value is not the token. Both
+    /// answers carry `no-store` and `no-referrer`.
+    #[tokio::test]
+    async fn login_link_sets_the_session_cookie_and_redirects_to_the_page() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303);
+        assert_eq!(resp.headers()["location"], "/ui/");
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+        let cookie = resp.headers()["set-cookie"].to_str().unwrap();
+        assert!(cookie.starts_with("rocky_ui_"), "{cookie}");
+        for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+            assert!(cookie.contains(attr), "{cookie}");
+        }
+        assert!(
+            !cookie.contains("Max-Age") && !cookie.contains("Secure"),
+            "{cookie}"
+        );
+        assert!(
+            !cookie.contains(OPERATOR_TOKEN),
+            "the cookie is not the token"
+        );
+
+        // Behind a TLS proxy the cookie is `Secure`.
+        let resp = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .ends_with("; Secure")
+        );
+    }
+
+    /// A wrong, stale or missing token: `401`, a small page with a token
+    /// field, no cookie, and nothing from the request echoed back.
+    #[tokio::test]
+    async fn a_wrong_login_link_gets_the_page_without_a_cookie_or_an_echo() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        for query in ["?t=stale-token-from-yesterday", "", "?other=1"] {
+            let resp = client
+                .get(format!("{base}/login{query}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{query}");
+            assert!(resp.headers().get("set-cookie").is_none(), "{query}");
+            assert_eq!(resp.headers()["cache-control"], "no-store");
+            assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains(r#"action="/login""#), "{body}");
+            assert!(body.contains("newest"), "{body}");
+            assert!(!body.contains("stale-token-from-yesterday"), "{body}");
+        }
+    }
+
+    /// `POST /login` (the page's token field) needs an Origin that is
+    /// present AND allowed, and then answers like the link.
+    #[tokio::test]
+    async fn post_login_needs_an_allowed_origin() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let form = format!("t={OPERATOR_TOKEN}");
+        let post = |origin: Option<&str>, body: String| {
+            let mut req = client
+                .post(format!("{base}/login"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body);
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            req.send()
+        };
+        let resp = post(None, form.clone()).await.unwrap();
+        assert_eq!(resp.status(), 403, "a missing Origin is refused");
+        assert!(resp.headers().get("set-cookie").is_none());
+        let resp = post(Some("https://evil.example"), form.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "a foreign Origin is refused");
+        assert!(resp.headers().get("set-cookie").is_none());
+
+        let resp = post(Some(&base), form).await.unwrap();
+        assert_eq!(resp.status(), 303);
+        assert!(
+            resp.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .starts_with("rocky_ui_")
+        );
+        let resp = post(Some(&base), "t=wrong".to_string()).await.unwrap();
+        assert_eq!(resp.status(), 401);
+        assert!(resp.headers().get("set-cookie").is_none());
+    }
+
+    /// The cookie authenticates reads. A write with it needs BOTH an allowed
+    /// Origin and `X-Rocky-UI: 1`; then the token's scope decides, exactly as
+    /// for a Bearer request. A Bearer write keeps today's rules.
+    #[tokio::test]
+    async fn cookie_session_reads_and_its_writes_need_origin_and_the_ui_header() {
+        for (scope, write_status) in [(TokenScope::Full, 200), (TokenScope::ReadOnly, 403)] {
+            let base = spawn_router(ui_state_scoped(scope, &[], None)).await;
+            let client = no_redirect_client();
+            let cookie = login_cookie(&client, &base).await;
+
+            let resp = client
+                .get(format!("{base}/api/v1/meta"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{scope:?}: a cookie GET works");
+
+            let write = |origin: Option<&str>, marker: bool| {
+                let mut req = client
+                    .post(format!("{base}/api/v1/compile"))
+                    .header("cookie", &cookie);
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                if marker {
+                    req = req.header("x-rocky-ui", "1");
+                }
+                req.send()
+            };
+            let resp = write(Some(&base), false).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: no X-Rocky-UI");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
+            let resp = write(None, true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: no Origin");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
+            let resp = write(Some("https://evil.example"), true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: a foreign Origin");
+            // Another local page: it passes the `--ui` Origin guard (any port
+            // on a loopback host) and its browser sends the cookie (cookies do
+            // not separate ports), but it is not this server's origin.
+            let resp = write(Some("http://127.0.0.1:1"), true).await.unwrap();
+            assert_eq!(resp.status(), 403, "{scope:?}: another local port");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui");
+
+            let resp = write(Some(&base), true).await.unwrap();
+            assert_eq!(resp.status(), write_status, "{scope:?}: both present");
+            if scope == TokenScope::ReadOnly {
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(body.code, "forbidden_read_only_token");
+            }
+
+            // Bearer: unchanged. No Origin and no marker needed.
+            let resp = client
+                .post(format!("{base}/api/v1/compile"))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), write_status, "{scope:?}: Bearer write");
+        }
+    }
+
+    /// A cookie that is not this process's: the raw token, garbage, or one
+    /// minted by another server (another key) is `401`. So is a wrong Bearer
+    /// beside a good cookie: one request never mixes credentials.
+    #[tokio::test]
+    async fn a_foreign_cookie_or_a_wrong_bearer_beside_one_is_unauthorized() {
+        let other = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let foreign = login_cookie(&client, &other).await;
+        let good = login_cookie(&client, &base).await;
+        let (name, _) = good.split_once('=').unwrap();
+        let (foreign_name, foreign_value) = foreign.split_once('=').unwrap();
+        assert_ne!(
+            name, foreign_name,
+            "two servers on one host use two cookie names"
+        );
+        // Both sessions can live in one browser: each server reads its own.
+        let both = format!("{foreign}; {good}");
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .header("cookie", &both)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "the other server's cookie does not get in the way"
+        );
+        for cookie in [
+            foreign.as_str(),
+            &format!("{name}={foreign_value}"),
+            &format!("{name}={OPERATOR_TOKEN}"),
+            &format!("{name}="),
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/meta"))
+                .header("cookie", cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{cookie}");
+        }
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .header("cookie", &good)
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    /// Another page on this machine (a different localhost port) passes the
+    /// Origin guard, but holds no credential: `401`. A foreign site WITH the
+    /// token is still refused by the Origin guard: `403`.
+    #[tokio::test]
+    async fn a_local_page_without_the_token_is_401_and_a_foreign_origin_with_it_is_403() {
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let resp = client
+            .post(format!("{base}/api/v1/compile"))
+            .header("origin", "http://localhost:9999")
+            .header("x-rocky-ui", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .post(format!("{base}/api/v1/compile"))
+            .header("origin", "https://evil.example")
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "origin_not_allowed");
+    }
+
+    /// The webhook route is the one write route outside the token. Under a
+    /// writable `--ui` it still answers only to its HMAC: neither the
+    /// full-scope Bearer token nor the UI cookie gets an unsigned POST in.
+    #[tokio::test]
+    async fn the_webhook_still_needs_its_hmac_under_a_writable_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        // A per-run secret: the temp dir's random name.
+        let hook_secret = dir
+            .path()
+            .file_name()
+            .expect("a temp dir has a name")
+            .to_string_lossy()
+            .into_owned();
+        let state = ui_state_scoped(TokenScope::Full, &[], Some((&hook_secret, &dir)));
+        let base = spawn_router(state).await;
+        let client = no_redirect_client();
+        let cookie = login_cookie(&client, &base).await;
+        let url = format!("{base}/api/v1/hooks/trigger/raw");
+        for req in [
+            client.post(&url).bearer_auth(OPERATOR_TOKEN),
+            client
+                .post(&url)
+                .header("cookie", &cookie)
+                .header("origin", &base)
+                .header("x-rocky-ui", "1"),
+            client.post(&url),
+        ] {
+            let resp = req.body("{}").send().await.unwrap();
+            assert_eq!(resp.status(), 401, "an unsigned webhook POST is refused");
+        }
+        let spooled = rocky_core::schedule::spool::list_pending_files(&dir.path().join(".rocky"))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(spooled, 0, "nothing unsigned reached the spool");
+        let body = b"{}";
+        let resp = client
+            .post(&url)
+            .header(WEBHOOK_SIGNATURE_HEADER, sign(&hook_secret, body))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "a signed POST still works: {}",
+            resp.status()
+        );
+    }
+
+    /// The token reaches no log line: not the login link's query, not the
+    /// form body, not a refusal. Every event this process emits at TRACE
+    /// while serving the login paths is captured and searched.
+    #[tokio::test]
+    async fn the_token_never_reaches_a_log_line() {
+        use std::io::Write as _;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        // Current-thread runtime: every task the server spawns runs on this
+        // thread, under this subscriber.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!("capture is live");
+
+        let base = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let client = no_redirect_client();
+        let _ = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .get(format!("{base}/login?t={OPERATOR_TOKEN}-stale"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .post(format!("{base}/login"))
+            .header("origin", &base)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("t={OPERATOR_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .get(format!("{base}/api/v1/meta"))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let mut sink = captured.clone();
+        sink.flush().unwrap();
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("capture is live"),
+            "the capture works: {logs}"
+        );
+        assert!(
+            !logs.contains(OPERATOR_TOKEN),
+            "the token was logged:\n{logs}"
+        );
+    }
+
+    /// `GET /api/v1/meta` says what the token may do, and never the token.
+    #[tokio::test]
+    async fn meta_reports_the_token_scope_and_never_the_secret() {
+        for (state, expected) in [
+            (
+                test_state_with_scoped_token(ServeToken::full("s3cret")),
+                serde_json::json!("full"),
+            ),
+            (
+                test_state_with_scoped_token(ServeToken::read_only("s3cret")),
+                serde_json::json!("read_only"),
+            ),
+            (test_state(), serde_json::Value::Null),
+        ] {
+            let base = spawn_router(state).await;
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/api/v1/meta"))
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let text = resp.text().await.unwrap();
+            assert!(!text.contains("s3cret"), "{text}");
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["token_scope"], expected, "{text}");
+        }
+    }
+
+    /// `apply` and `approve` refuse a `plan_id` that is not 64 lowercase hex
+    /// characters, with `400 invalid_plan_id`, BEFORE the permit: a held
+    /// permit would otherwise answer 409.
+    #[tokio::test]
+    async fn apply_and_approve_refuse_a_malformed_plan_id_before_the_permit() {
+        let state = test_state();
+        let _held = state.mutation_permit.try_acquire("job_incumbent").unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let upper = "A".repeat(64);
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        for route in ["apply", "approve"] {
+            for body in [
+                serde_json::json!({}),
+                serde_json::json!({ "plan_id": "abc" }),
+                serde_json::json!({ "plan_id": upper }),
+                serde_json::json!({ "plan_id": short }),
+                serde_json::json!({ "plan_id": long }),
+                serde_json::json!({ "plan_id": "--approve" }),
+            ] {
+                let resp = client
+                    .post(format!("{base}/api/v1/jobs/{route}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 400, "{route} {body}");
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(envelope.code, "invalid_plan_id", "{route} {body}");
+            }
+        }
+    }
+
+    /// The approve job's argv: `review <plan_id> --approve`, with the same
+    /// global `--config` / `--state-path` every job gets.
+    #[test]
+    fn approve_job_runs_review_approve_with_the_job_argv() {
+        let plan_id = "b".repeat(64);
+        let request = JobRequest {
+            plan_id: Some(plan_id.clone()),
+            ..JobRequest::default()
+        };
+        let args: Vec<String> = job_subprocess_args(
+            JobKind::Approve,
+            Some(std::path::Path::new("rocky.toml")),
+            std::path::Path::new("state.redb"),
+            &request,
+        )
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--output",
+                "json",
+                "--config",
+                "rocky.toml",
+                "--state-path",
+                "state.redb",
+                "review",
+                plan_id.as_str(),
+                "--approve",
+            ]
+        );
+    }
+
+    /// Every job child the HTTP API starts carries
+    /// `ROCKY_SESSION_SOURCE=http_api`, over whatever the server inherited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_children_carry_the_http_api_session_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s' \"$ROCKY_SESSION_SOURCE\"\n")
+            .expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod probe");
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            let built = job_subprocess_command(
+                probe.clone(),
+                kind,
+                None,
+                &dir.path().join("state.redb"),
+                &JobRequest::default(),
+            );
+            let envs: Vec<_> = built
+                .as_std()
+                .get_envs()
+                .filter(|(k, _)| *k == "ROCKY_SESSION_SOURCE")
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+                .collect();
+            assert_eq!(
+                envs,
+                vec![Some(std::ffi::OsString::from("http_api"))],
+                "{kind:?}"
+            );
+            let output = job_subprocess_command(
+                probe.clone(),
+                kind,
+                None,
+                &dir.path().join("state.redb"),
+                &JobRequest::default(),
+            )
+            .output()
+            .await
+            .expect("run probe");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "http_api",
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A job child runs in the project root (the bound config's directory),
+    /// where the review GET routes read plans and markers, with absolute
+    /// `--config` and `--state-path`, whatever the server's own cwd is.
+    #[test]
+    fn job_children_run_in_the_project_root_with_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("proj").join("rocky.toml");
+        let request = JobRequest {
+            plan_id: Some("e".repeat(64)),
+            ..JobRequest::default()
+        };
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Approve,
+            Some(&config),
+            std::path::Path::new("relative-state.redb"),
+            &request,
+        );
+        let std = command.as_std();
+        assert_eq!(
+            std.get_current_dir(),
+            Some(dir.path().join("proj").as_path())
+        );
+        let args: Vec<PathBuf> = std.get_args().map(PathBuf::from).collect();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(args.contains(&config), "{args:?}");
+        assert!(args.contains(&cwd.join("relative-state.redb")), "{args:?}");
+
+        // A relative config is resolved against the server's cwd first.
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Run,
+            Some(std::path::Path::new("sub/rocky.toml")),
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(cwd.join("sub").as_path())
+        );
+
+        // No config bound: the child keeps the server's cwd.
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Run,
+            None,
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        assert_eq!(command.as_std().get_current_dir(), None);
+    }
+}
+
+#[cfg(test)]
+mod concise_job_error_tests {
+    use super::{JOB_ERROR_MAX_BYTES, concise_job_error};
+
+    /// A child run with `RUST_LOG` writes tracing lines, JSON or `fmt`, with
+    /// SQL and local paths in them. The job's `error` keeps only the final
+    /// `Error:` block and its `Caused by:` chain.
+    #[test]
+    fn keeps_the_final_error_block_and_drops_tracing_lines() {
+        let stderr = "\
+{\"timestamp\":\"2026-10-08T10:00:00Z\",\"level\":\"DEBUG\",\"fields\":{\"sql\":\"SELECT 1\"}}
+2026-10-08T10:00:00.000000Z DEBUG rocky_core: reading /home/me/.cargo/registry/src/x.rs
+DEBUG rocky_core: SELECT * FROM secret_table
+\u{1b}[2m2026-10-08T10:00:01Z\u{1b}[0m \u{1b}[34mINFO\u{1b}[0m compiled
+Error: plan_models_changed: refusing to apply plan 'abc': models changed since this plan was made
+
+Caused by:
+    0: a model it runs was changed
+{\"error_code\":\"TABLE_NOT_FOUND\",\"message\":\"no such table\"}
+{\"level\":\"TRACE\",\"message\":\"shutdown\"}
+";
+        let error = concise_job_error(stderr).expect("an error");
+        assert!(
+            error.starts_with("Error: plan_models_changed"),
+            "the error does not open with the final Error: line"
+        );
+        assert!(
+            error.contains("Caused by:"),
+            "the Caused by: chain was dropped"
+        );
+        assert!(
+            error.contains("a model it runs was changed"),
+            "the cause was dropped"
+        );
+        // A warehouse error body is JSON too, but not a tracing event: kept.
+        assert!(
+            error.contains("TABLE_NOT_FOUND"),
+            "the warehouse error body was dropped"
+        );
+        for (i, leaked) in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"]
+            .iter()
+            .enumerate()
+        {
+            assert!(!error.contains(leaked), "probe {i} leaked into the error");
+        }
+    }
+
+    /// Without an `Error:` line, the last ten non-tracing lines; with
+    /// nothing at all, `None`; and the result is capped.
+    #[test]
+    fn falls_back_to_the_tail_and_caps_the_length() {
+        let stderr: String = (0..15).map(|i| format!("line {i}\n")).collect();
+        let error = concise_job_error(&stderr).unwrap();
+        assert!(error.starts_with("line 5"), "{error}");
+        assert!(error.ends_with("line 14"), "{error}");
+
+        assert_eq!(concise_job_error("{\"level\":\"DEBUG\"}\n\n"), None);
+
+        let long = format!("Error: {}", "é".repeat(JOB_ERROR_MAX_BYTES));
+        let error = concise_job_error(&long).unwrap();
+        assert!(
+            error.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8(),
+            "{}",
+            error.len()
+        );
+        assert!(error.ends_with('…'));
+    }
+
+    /// Backtrace lines, a panic's source location, absolute paths and
+    /// registered secrets never reach the job's `error`.
+    #[test]
+    fn drops_backtraces_panic_locations_paths_and_secrets() {
+        let secret = "CONCISE-PROBE-5d1c-SECRET-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_CONCISE_PROBE", secret);
+        let stderr = format!(
+            "\
+thread 'main' panicked at crates/rocky-cli/src/run.rs:12:5:
+Error: failed to open '/Users/me/project/models/a.sql' with token {secret}
+
+Caused by:
+    0: C:\\Users\\me\\state.redb is locked
+       at /rustc/abc/library/core/src/x.rs:1
+       with ~/secret/thing
+    1: see https://docs.example.com/a/b for help
+"
+        );
+        let error = concise_job_error(&stderr).expect("an error");
+        for (i, leaked) in [
+            "/Users/me",
+            "C:\\Users",
+            "/rustc",
+            "~/secret",
+            "crates/rocky-cli",
+            secret,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(!error.contains(leaked), "probe {i} leaked into the error");
+        }
+        assert!(
+            error.starts_with("Error: failed to open '<path>'"),
+            "a quoted path is redacted"
+        );
+        assert!(
+            error.contains("<path> is locked"),
+            "a Windows path is redacted"
+        );
+        assert!(
+            error.contains("https://docs.example.com/a/b"),
+            "a URL is not a path"
+        );
+
+        // Other spellings of an absolute path.
+        for (text, leaked) in [
+            ("see file:///Users/me/x.sql", "/Users/me"),
+            ("cwd:/home/me/project", "/home/me"),
+            ("at C:/Users/me/x", "C:/Users"),
+            ("share \\\\srv\\share\\x", "srv"),
+        ] {
+            let error = concise_job_error(&format!("Error: {text}")).expect("an error");
+            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+            assert!(error.contains("<path>"), "{error}");
+        }
+        for url in ["https://docs.example.com/a/b", "s3://bucket/key"] {
+            let error = concise_job_error(&format!("Error: see {url}")).expect("an error");
+            assert!(error.contains(url), "a URL is not a path: {error}");
+        }
+
+        // Without an `Error:` line, a line naming an absolute path is
+        // dropped, and a panic keeps its message but not its location.
+        let tail = "thread 'main' panicked at src/x.rs:1:2:\nboom\nreading /etc/passwd\n";
+        let error = concise_job_error(tail).expect("an error");
+        assert_eq!(error, "thread 'main' panicked:\nboom");
+    }
+
+    /// A REST path is not a file path, and an indented SQL line that opens
+    /// with `with` is not a backtrace frame. Both are kept, so a failure
+    /// without an `Error:` line still says what went wrong.
+    #[test]
+    fn keeps_rest_paths_and_indented_sql() {
+        let stderr = "\
+request to /api/2.0/sql/statements failed with 400
+POST /v1/statements returned an error
+    with cte as (
+      select 1
+    )
+";
+        let error = concise_job_error(stderr).expect("an error");
+        for kept in [
+            "/api/2.0/sql/statements",
+            "/v1/statements",
+            "    with cte as (",
+        ] {
+            assert!(error.contains(kept), "{kept} dropped: {error}");
+        }
+        assert!(!error.contains("<path>"), "{error}");
+        let error = concise_job_error("Error: GET /api/2.1/jobs/list returned 403").unwrap();
+        assert_eq!(error, "Error: GET /api/2.1/jobs/list returned 403");
+
+        // A root alone, or a non-filesystem root, is not redacted. A container
+        // working directory is.
+        let error =
+            concise_job_error("Error: /etc/ and /v2/x and /tmp/x and /app/rocky.toml").unwrap();
+        assert_eq!(error, "Error: /etc/ and /v2/x and <path> and <path>");
+    }
+
+    /// Redaction fails closed: every absolute path of two or more segments
+    /// is redacted, whatever directory it starts under, unless it is an API
+    /// route or sits inside a non-`file` URL. Quoted paths are redacted. An
+    /// indented `at <path>` frame is dropped with or without a line number;
+    /// indented SQL is kept.
+    #[test]
+    fn redacts_every_absolute_path_but_api_routes_and_urls() {
+        for (text, leaked) in [
+            ("Error: open /work/x/y failed", "/work/x"),
+            ("Error: open /scratch/a/b failed", "/scratch/a"),
+            ("Error: open \"/home/u/x\" failed", "/home/u"),
+            ("Error: open '/home/u/x' failed", "/home/u"),
+            ("Error: open 'C:\\Users\\u\\x' failed", "Users"),
+            ("Error: see file:///Users/u/x", "/Users/u"),
+            ("Error: see FILE://host/share/x", "host/share"),
+            ("Error: open \\\\?\\C:\\Users\\u\\x failed", "Users"),
+            ("Error: open sqlite:///srv/u/x.db failed", "/srv/u"),
+            ("Error: open DUCKDB:///srv/u/x.duckdb failed", "/srv/u"),
+            ("Error: open /apis/u/x failed", "/apis/u"),
+            ("Error: open /oauthx/u/x failed", "/oauthx/u"),
+            ("Error: open /api2/u/x failed", "/api2/u"),
+        ] {
+            let error = concise_job_error(text).expect("an error");
+            assert!(!error.contains(leaked), "{leaked:?} leaked: {error}");
+            assert!(error.contains("<path>"), "{error}");
+        }
+        for kept in [
+            "Error: POST /api/2.0/sql/statements returned 400",
+            "Error: GET https://host/v1/x returned 500",
+            "Error: GET https://host/home/u/x returned 500",
+            "Error: GET /v3/jobs/run returned 500",
+            "Error: GET /2.0/clusters/list returned 500",
+            "Error: GET /1.2/contexts/create returned 500",
+            "Error: GET /rest/api/latest returned 500",
+            "Error: POST /oauth2/token returned 401",
+            "Error: POST /sql/statements/x returned 400",
+            "Error: POST /oauth/token returned 401",
+            "Error: /etc/ alone is not a path",
+            "Error: open sqlite://rel/x.db failed",
+        ] {
+            assert_eq!(concise_job_error(kept).as_deref(), Some(kept));
+        }
+        assert_eq!(
+            concise_job_error("Error: open sqlite:///srv/u/x.db failed").as_deref(),
+            Some("Error: open sqlite://<path> failed"),
+            "the scheme is kept, the absolute file is redacted"
+        );
+        let stderr = "\
+Error: boom
+  at crates/x/src/y.rs
+  at crates/x/src/y.rs:12
+    with cte as (
+    at time zone 'UTC'
+";
+        let error = concise_job_error(stderr).expect("an error");
+        assert!(!error.contains("crates/x"), "{error}");
+        assert!(error.contains("    with cte as ("), "{error}");
+        assert!(error.contains("    at time zone 'UTC'"), "{error}");
+    }
+
+    /// A failed job's `error` is never empty: when cleaning leaves nothing,
+    /// it says the job failed and to see the server log. So does an
+    /// `errors[].error` that cleans to nothing.
+    #[test]
+    fn a_failed_job_error_is_never_empty() {
+        let only_noise = "{\"level\":\"DEBUG\"}\n   at src/x.rs:1:2\n";
+        let error = super::failed_job_error("apply", &"exit status: 1", only_noise);
+        assert!(error.starts_with(super::JOB_FAILED_SEE_LOG), "{error}");
+        assert!(
+            error.contains("`rocky apply` exited with exit status: 1"),
+            "{error}"
+        );
+
+        let error = super::failed_job_error("apply", &"exit status: 1", "Error: boom\n");
+        assert_eq!(error, "Error: boom");
+
+        let mut result = serde_json::json!({ "errors": [{ "error": "   at src/x.rs:1\n" }] });
+        super::sanitize_result_errors(&mut result);
+        assert_eq!(result["errors"][0]["error"], super::JOB_FAILED_SEE_LOG);
+    }
+
+    /// Each `errors[].error` in a job result goes through the same cleaning,
+    /// so the UI's failure line carries no path or secret either.
+    #[test]
+    fn result_errors_are_sanitized_and_capped() {
+        let secret = "RESULT-ERRORS-PROBE-77ab-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_RESULT_ERRORS_PROBE", secret);
+        let mut result = serde_json::json!({
+            "errors": [
+                { "asset_key": ["a"], "error": format!("bad {secret} at /home/me/x.sql\n   at src/y.rs:1") },
+                { "asset_key": ["b"], "error": "x".repeat(5_000) },
+                { "asset_key": ["c"] },
+            ],
+            "other": "/home/me/untouched",
+        });
+        super::sanitize_result_errors(&mut result);
+        let first = result["errors"][0]["error"].as_str().unwrap();
+        assert!(first.starts_with("bad "), "the message is kept");
+        assert!(first.ends_with(" at <path>"), "the path is redacted");
+        for (i, leaked) in [secret, "/home/me", "src/y.rs"].iter().enumerate() {
+            assert!(!first.contains(leaked), "probe {i} leaked into the error");
+        }
+        let long = result["errors"][1]["error"].as_str().unwrap();
+        assert!(long.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8());
+        assert_eq!(result["other"], "/home/me/untouched");
     }
 }

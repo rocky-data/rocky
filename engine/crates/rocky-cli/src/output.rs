@@ -8682,14 +8682,19 @@ pub struct ApproverIdentity {
 
 /// Where the approval signature was produced.
 ///
-/// Reserved for future CI / OIDC paths. Today only the `Local` variant is
-/// emitted by the CLI.
+/// `Local` is a CLI or MCP sign-off on this machine. `HttpApi` is a sign-off
+/// made through `POST /api/v1/jobs/approve`: the child `rocky review
+/// --approve` runs with `ROCKY_SESSION_SOURCE=http_api`. It names the channel,
+/// not the person. The identity beside it is the server's git identity, and
+/// nothing proves a browser made the call. `CiOidc` and `Pat` are reserved
+/// for future CI / OIDC paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApproverSource {
     Local,
     CiOidc,
     Pat,
+    HttpApi,
 }
 
 /// Algorithm tag for an [`ApprovalSignature`].
@@ -12165,6 +12170,22 @@ pub struct MetaOutput {
     pub capabilities: Vec<String>,
     /// The `/api/v1` routes this build serves.
     pub routes: Vec<String>,
+    /// What the server's bearer token may do: `full` reaches every route,
+    /// `read_only` only safe methods. `null` when no token is configured (a
+    /// loopback server without `--ui`, which asks no request for one). The UI
+    /// reads it to enable or disable its write controls. Never the secret.
+    pub token_scope: Option<MetaTokenScope>,
+}
+
+/// The scope of the token a `rocky serve` was started with, as
+/// `GET /api/v1/meta` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaTokenScope {
+    /// Every route, mutating ones included.
+    Full,
+    /// `GET`, `HEAD` and `OPTIONS` only.
+    ReadOnly,
 }
 
 // --- The five estate routes (server-only, no CLI counterpart) ---
@@ -12489,22 +12510,44 @@ pub enum JobKind {
     Plan,
     /// `rocky apply` — executes a persisted plan. Takes the mutation permit.
     Apply,
+    /// `rocky review <plan_id> --approve` — writes the sign-off marker that
+    /// unblocks `apply`. Takes the mutation permit, so an approval cannot
+    /// land while a run or an apply is in flight.
+    Approve,
 }
 
 impl JobKind {
-    /// The `rocky` subcommand this kind spawns.
+    /// The persisted name of this kind: the string [`JobKind::parse`] reads
+    /// back, and the `kind` a job record carries. For every kind but
+    /// `Approve` it is also the subcommand; see [`JobKind::subcommand`].
     pub fn verb(self) -> &'static str {
         match self {
             JobKind::Run => "run",
             JobKind::Plan => "plan",
             JobKind::Apply => "apply",
+            JobKind::Approve => "approve",
         }
     }
 
-    /// Whether this kind mutates warehouse state (and so takes the permit).
-    /// `plan` previews only.
+    /// The `rocky` subcommand this kind spawns. `Approve` runs `review` with
+    /// `--approve`; there is no `rocky approve` verb.
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            JobKind::Run => "run",
+            JobKind::Plan => "plan",
+            JobKind::Apply => "apply",
+            JobKind::Approve => "review",
+        }
+    }
+
+    /// Whether this kind takes the single mutation permit. `run` and `apply`
+    /// change warehouse state; `approve` changes what `apply` may do. `plan`
+    /// previews only.
     pub fn mutates(self) -> bool {
-        matches!(self, JobKind::Run | JobKind::Apply)
+        match self {
+            JobKind::Run | JobKind::Apply | JobKind::Approve => true,
+            JobKind::Plan => false,
+        }
     }
 
     /// Parse the persisted string form; unknown values map to `None`.
@@ -12513,6 +12556,7 @@ impl JobKind {
             "run" => Some(JobKind::Run),
             "plan" => Some(JobKind::Plan),
             "apply" => Some(JobKind::Apply),
+            "approve" => Some(JobKind::Approve),
             _ => None,
         }
     }

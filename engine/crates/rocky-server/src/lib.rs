@@ -28,5 +28,6 @@ pub mod project_gates;
 pub(crate) mod schema_cache_throttle;
 pub mod state;
 pub mod ui;
+pub mod ui_session;
 pub mod watch;
 pub mod webhook_ingress;

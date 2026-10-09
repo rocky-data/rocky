@@ -982,11 +982,12 @@
         "type": "object"
       },
       "ApproverSource": {
-        "description": "Where the approval signature was produced.\n\nReserved for future CI / OIDC paths. Today only the `Local` variant is emitted by the CLI.",
+        "description": "Where the approval signature was produced.\n\n`Local` is a CLI or MCP sign-off on this machine. `HttpApi` is a sign-off made through `POST /api/v1/jobs/approve`: the child `rocky review --approve` runs with `ROCKY_SESSION_SOURCE=http_api`. It names the channel, not the person. The identity beside it is the server's git identity, and nothing proves a browser made the call. `CiOidc` and `Pat` are reserved for future CI / OIDC paths.",
         "enum": [
           "local",
           "ci_oidc",
-          "pat"
+          "pat",
+          "http_api"
         ],
         "type": "string"
       },
@@ -10493,6 +10494,13 @@
               "apply"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky review <plan_id> --approve` — writes the sign-off marker that unblocks `apply`. Takes the mutation permit, so an approval cannot land while a run or an apply is in flight.",
+            "enum": [
+              "approve"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10533,7 +10541,7 @@
           },
           "plan_id": {
             "default": null,
-            "description": "The positional `<plan_id>` for `apply`.",
+            "description": "The positional `<plan_id>` for `apply` and `approve`: required there, and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.",
             "type": [
               "string",
               "null"
@@ -11959,6 +11967,17 @@
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "token_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MetaTokenScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the server's bearer token may do: `full` reaches every route, `read_only` only safe methods. `null` when no token is configured (a loopback server without `--ui`, which asks no request for one). The UI reads it to enable or disable its write controls. Never the secret."
           }
         },
         "required": [
@@ -11969,6 +11988,25 @@
           "state_schema_version"
         ],
         "type": "object"
+      },
+      "MetaTokenScope": {
+        "description": "The scope of the token a `rocky serve` was started with, as `GET /api/v1/meta` reports it.",
+        "oneOf": [
+          {
+            "description": "Every route, mutating ones included.",
+            "enum": [
+              "full"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`GET`, `HEAD` and `OPTIONS` only.",
+            "enum": [
+              "read_only"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "MetadataColumnConfig": {
         "additionalProperties": false,
@@ -25733,7 +25771,7 @@
     },
     "/api/v1/jobs/apply": {
       "post": {
-        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409.",
+        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409. `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`).",
         "operationId": "submitApplyJob",
         "parameters": [
           {
@@ -25798,6 +25836,78 @@
           }
         },
         "summary": "Submit an apply job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/approve": {
+      "post": {
+        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply or approve holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
+        "operationId": "submitApproveJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit an approve job",
         "tags": [
           "jobs"
         ]

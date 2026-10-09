@@ -5,8 +5,8 @@
 # pending plan is REFUSED, with its reason, until a marker exists. The same
 # command then succeeds once a person has signed off.
 #
-# Approving stays in the terminal. The browser holds a read-only token and
-# physically cannot do it — `rocky serve --ui` refuses to start otherwise.
+# This recording approves in the terminal. A `rocky serve --ui --read-only`
+# page cannot approve; in operator mode the plan page can, over the HTTP API.
 #
 # $PLAN is set by record-screencast.sh from the queue the previous tape just
 # printed, so the id on screen is the id the browser was showing.

@@ -340,6 +340,17 @@ pub struct EmbeddedCapabilities {
     /// the check is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_fingerprint: Option<String>,
+    /// The same fingerprint over the models and the masks they use: no
+    /// config, governance or execution-control identity. The mask is the one
+    /// `models_fingerprint` binds (resolved for the plan's `--env`, only where
+    /// the run applies masks). A person's apply compares this
+    /// one, so a plan made in one shell and applied from another environment
+    /// (or after an edit to an unrelated pipeline) is not refused as changed.
+    /// An agent's apply still compares [`Self::models_fingerprint`]. `None`
+    /// wherever `models_fingerprint` is `None`, and on a plan written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_only_fingerprint: Option<String>,
     /// The routing config identity (`apply::config_policy_identity`) the gate
     /// authorized — the physical destination / adapter-target shape, credentials
     /// excluded. Verified BEFORE any replication/governance mutation (finding
@@ -992,6 +1003,7 @@ mod tests {
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: Some("fp".to_string()),
+            models_only_fingerprint: None,
             config_identity: Some("cfg".to_string()),
             fingerprint_version: CURRENT_FINGERPRINT_VERSION,
             reviewed_source_schemas: Some(BTreeMap::from([(
@@ -1540,6 +1552,7 @@ mod tests {
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -1562,6 +1575,7 @@ mod tests {
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -1586,6 +1600,7 @@ mod tests {
             diff_available: true,
             changed,
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
@@ -1615,6 +1630,7 @@ mod tests {
             diff_available: true,
             changed,
             models_fingerprint: None,
+            models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
