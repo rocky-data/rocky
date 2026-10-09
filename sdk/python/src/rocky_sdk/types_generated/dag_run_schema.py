@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, conint
 
 
@@ -41,6 +43,61 @@ class DagRunNodeOutput(BaseModel):
     """
 
 
+class Severity(StrEnum):
+    """
+    Severity level of a diagnostic.
+
+    Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+    """
+
+    Error = "Error"
+    Warning = "Warning"
+    Info = "Info"
+
+
+class SourceSpan(BaseModel):
+    """
+    Location in a source file.
+    """
+
+    col: conint(ge=0)
+    file: str
+    line: conint(ge=0)
+
+
+class Diagnostic(BaseModel):
+    """
+    A compiler diagnostic (error, warning, or informational message).
+
+    `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+    """
+
+    code: str
+    """
+    Diagnostic code (e.g., "E001", "W001").
+    """
+    message: str
+    """
+    Human-readable message.
+    """
+    model: str
+    """
+    Which model this diagnostic relates to.
+    """
+    severity: Severity
+    """
+    Severity level.
+    """
+    span: SourceSpan | None = None
+    """
+    Source location (if available).
+    """
+    suggestion: str | None = None
+    """
+    Suggested fix (if any).
+    """
+
+
 class DagRunOutput(BaseModel):
     """
     Output of `rocky run --dag`: per-node execution results plus aggregate counts.
@@ -50,6 +107,10 @@ class DagRunOutput(BaseModel):
     completed: conint(ge=0)
     """
     Nodes that completed successfully.
+    """
+    consumer_diagnostics: list[Diagnostic] | None = None
+    """
+    Problems in the project's `consumers/` records (`E060`). Reported once for the whole graph; they never fail a node. Empty (and omitted) when the records are sound.
     """
     duration_ms: conint(ge=0)
     """

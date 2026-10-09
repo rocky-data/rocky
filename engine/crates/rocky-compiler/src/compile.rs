@@ -80,6 +80,20 @@ fn source_column_info(
         .collect()
 }
 
+/// What the compile knows about the project beyond the models it was handed.
+///
+/// A compile can cover part of a project: one `--models` directory, one
+/// pipeline's `models` glob, one model of a multi-pipeline run. Things that
+/// belong to the whole project must not be judged against that part.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectContext {
+    /// The directory that holds `rocky.toml`. `consumers/` is read from here.
+    pub root: PathBuf,
+    /// Every model name in the whole project, across all pipelines. A
+    /// consumer may read any of them.
+    pub model_names: std::collections::BTreeSet<String>,
+}
+
 /// Configuration for the compiler.
 #[derive(Clone, Default)]
 pub struct CompilerConfig {
@@ -141,6 +155,11 @@ pub struct CompilerConfig {
     /// [`crate::source_refs`]. The default records no origin, so the check
     /// stays off for callers that don't know their schemas' provenance.
     pub source_provenance: crate::source_refs::SourceProvenance,
+    /// Refuse a contract column whose declared type Rocky cannot check
+    /// (its inferred type is `Unknown`): the `I003` info note becomes the
+    /// `E059` error. `rocky compile --strict-contracts` and
+    /// `[contracts] strict = true` set it. Off by default.
+    pub strict_contracts: bool,
     /// Keep each consumer's authored SQL instead of replacing it with the
     /// form that inlines its ephemeral upstreams as CTEs
     /// ([`crate::ephemeral::apply_ephemerals`]). The language server sets
@@ -153,6 +172,12 @@ pub struct CompilerConfig {
     /// of the model DAG instead of being refused as an unknown model. Empty by
     /// default: every other caller still refuses an unknown name.
     pub external_dependencies: std::collections::BTreeSet<String>,
+    /// The whole project, when this compile covers only part of it. With
+    /// `Some`, `consumers/` is read from [`ProjectContext::root`] and a
+    /// consumer's `depends_on` may name any model in
+    /// [`ProjectContext::model_names`]. With `None`, `consumers/` is the
+    /// sibling of `models_dir` and only the compiled models count.
+    pub project: Option<ProjectContext>,
 }
 
 /// Result of compilation.
@@ -183,6 +208,11 @@ pub struct CompileResult {
     /// bytes reads it here, not from [`rocky_core::models::Model::contract_path`],
     /// which only knows the sidecar.
     pub contract_files: std::collections::BTreeMap<String, PathBuf>,
+    /// Downstream consumers (`consumers/` beside the models directory):
+    /// dashboards, notebooks, ML jobs and applications that read models. Each
+    /// holds only the `depends_on` entries that name a model; an entry that
+    /// does not is an `E060` in [`Self::diagnostics`].
+    pub consumers: Vec<rocky_core::consumers::Consumer>,
 }
 
 /// Compile error.
@@ -441,7 +471,11 @@ pub fn compile_project(
         let diagnostics = if contracts.is_empty() {
             Vec::new()
         } else {
-            validate_all_contracts(&contracts, &type_check.typed_models)
+            validate_all_contracts(
+                &contracts,
+                &type_check.typed_models,
+                config.strict_contracts.then_some(&semantic_graph),
+            )
         };
         (diagnostics, files)
     };
@@ -548,6 +582,10 @@ pub fn compile_project(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Downstream consumers: every `depends_on` entry must name a model (E060).
+    let (consumers, consumer_diagnostics) =
+        crate::consumers::load_and_check_project(config, &project.models);
+    diagnostics.extend(consumer_diagnostics);
     // User-defined functions: invalid definitions, then invalid calls (E051).
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
@@ -587,6 +625,7 @@ pub fn compile_project(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 
@@ -736,7 +775,11 @@ pub fn compile_incremental(
         let diagnostics = if contracts.is_empty() {
             Vec::new()
         } else {
-            validate_all_contracts(&contracts, &type_check.typed_models)
+            validate_all_contracts(
+                &contracts,
+                &type_check.typed_models,
+                config.strict_contracts.then_some(&semantic_graph),
+            )
         };
         (diagnostics, files)
     };
@@ -832,6 +875,11 @@ pub fn compile_incremental(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Same check as the full path; it reads only the consumer files and the
+    // model names, so recomputing it keeps incremental equal to from-scratch.
+    let (consumers, consumer_diagnostics) =
+        crate::consumers::load_and_check_project(config, &project.models);
+    diagnostics.extend(consumer_diagnostics);
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
         &project.models,
@@ -888,6 +936,7 @@ pub fn compile_incremental(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 
@@ -1003,9 +1052,58 @@ fn load_contract_map(
     })
 }
 
+/// Why `column` of `model` has no known type, for the `E059` message.
+fn unknown_type_reason(
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    model: &str,
+    column: &str,
+) -> String {
+    use rocky_sql::lineage::TransformKind;
+    let Some(edge) = graph.producing_edge(model, column) else {
+        return "the column is a literal or an expression with no source column to trace, \
+                and Rocky does not infer a type for it"
+            .to_string();
+    };
+    let source = &*edge.source.model;
+    let source_column = &*edge.source.column;
+    let input_type = typed_models
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(source))
+        .and_then(|(_, columns)| columns.iter().find(|c| &*c.name == source_column))
+        .map(|c| &c.data_type);
+    match (input_type, &edge.transform) {
+        (None, _) => {
+            format!("it reads `{source}.{source_column}` and Rocky has no schema for `{source}`")
+        }
+        (Some(RockyType::Unknown), TransformKind::Cast | TransformKind::TryCast) => format!(
+            "its CAST target is not one Rocky types over an unknown input (INT, INTEGER, BIGINT, FLOAT, \
+             REAL, TIMESTAMP and a bare DECIMAL differ by warehouse; DECIMAL digits must satisfy \
+             1 <= p <= 38 and 0 <= s <= p), and `{source}.{source_column}` is also \
+             of unknown type"
+        ),
+        (Some(RockyType::Unknown), _) => {
+            format!("it reads `{source}.{source_column}`, whose type is unknown")
+        }
+        (Some(_), TransformKind::Cast | TransformKind::TryCast) => {
+            "its CAST target has no fixed type: INT, INTEGER, BIGINT, FLOAT, REAL, TIMESTAMP and a bare \
+             DECIMAL differ by warehouse, DECIMAL digits must satisfy 1 <= p <= 38 and 0 <= s <= p, \
+             and the type name may not be one Rocky maps"
+                .to_string()
+        }
+        (Some(_), _) => format!(
+            "the result type of the expression over `{source}.{source_column}` depends on the \
+             warehouse (for example AVG over a DECIMAL), so Rocky does not state one"
+        ),
+    }
+}
+
+/// `strict_graph` is `Some` under strict contracts: a declared type Rocky
+/// cannot check is then the `E059` error, with the reason read from the graph.
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    strict_graph: Option<&SemanticGraph>,
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
@@ -1020,7 +1118,14 @@ fn validate_all_contracts(
     for model_name in model_names {
         let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
-            let diags = contracts::validate_contract(model_name, schema, contract);
+            let diags = match strict_graph {
+                Some(graph) => {
+                    let reason =
+                        |column: &str| unknown_type_reason(graph, typed_models, model_name, column);
+                    contracts::validate_contract_with(model_name, schema, contract, Some(&reason))
+                }
+                None => contracts::validate_contract(model_name, schema, contract),
+            };
             all_diags.extend(diags);
         } else {
             all_diags.push(Diagnostic::warning(
@@ -1682,7 +1787,7 @@ mod tests {
 
         let mut expected = names.clone();
         expected.sort();
-        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models)
+        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models, None)
             .iter()
             .map(|d| d.model.clone())
             .collect();

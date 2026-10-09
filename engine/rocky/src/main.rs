@@ -1424,7 +1424,7 @@ enum Command {
     /// makes no network requests. `--output-path` ending in `.html` writes a
     /// single-page catalog instead. `--format parquet` writes the compiled
     /// project graph as Parquet tables (models, columns, edges,
-    /// column_lineage, tests, contracts, sources) that DuckDB can query.
+    /// column_lineage, tests, contracts, sources, consumers) that DuckDB can query.
     Docs {
         /// Models directory
         #[arg(long, default_value = "models")]
@@ -1498,6 +1498,13 @@ enum Command {
         /// Same as `[cache.schemas] strict_sources = true`.
         #[arg(long)]
         strict_sources: bool,
+
+        /// Refuse a contract column whose declared type Rocky cannot check:
+        /// the `I003` info note becomes the `E059` error, which names the
+        /// model, the column and why its type is unknown. Same as
+        /// `[contracts] strict = true`.
+        #[arg(long)]
+        strict_contracts: bool,
 
         /// Per-run variable substituted into model SQL (repeatable). Resolves
         /// `@var(name)` markers to the supplied value so `rocky compile` type-
@@ -2056,6 +2063,11 @@ enum Command {
         /// default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+        /// Refuse a contract column whose declared type Rocky cannot check:
+        /// the `I003` info note becomes the `E059` error. Same as
+        /// `[contracts] strict = true`.
+        #[arg(long)]
+        strict_contracts: bool,
     },
 
     /// Detect changed models between git refs and generate a structural diff report
@@ -3418,6 +3430,7 @@ struct SelectArgs {
     /// Select models with dbt-style node selection: names and globs
     /// (`stg_*`), graph operators (`+m`, `m+`, `2+m`, `m+3`, `@m`), and
     /// methods (`tag:`, `path:`, `file:`, `config.materialized:`, `source:`,
+    /// `consumer:<name>` for the models a downstream consumer reads,
     /// `selector:<name>` for an entry of the `[selectors]` table in rocky.toml,
     /// `state:modified`, `state:new`). Space-separated terms union;
     /// comma-joined terms intersect. Repeatable.
@@ -5043,6 +5056,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_dialect,
             with_seed,
             strict_sources,
+            strict_contracts,
             var,
             deny_warnings,
             dbt_project,
@@ -5061,6 +5075,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     &run_vars,
                     strict_sources,
+                    strict_contracts,
                     &deny_warnings,
                     selection.as_ref(),
                 )
@@ -5080,6 +5095,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     &run_vars,
                     strict_sources,
+                    strict_contracts,
                     &deny_warnings,
                     selection.as_ref(),
                 )
@@ -5475,6 +5491,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             contracts,
             var,
+            strict_contracts,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -5485,6 +5502,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 contracts.as_deref(),
                 json,
                 &run_vars,
+                strict_contracts,
             )
         }
         Command::CiDiff {

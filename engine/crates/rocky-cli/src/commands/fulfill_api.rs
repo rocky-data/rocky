@@ -289,7 +289,9 @@ pub(crate) fn build_ai_run_plan(
     let errors: Vec<String> = result
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.is_error())
+        .filter(|diagnostic| {
+            diagnostic.is_error() && !rocky_compiler::consumers::is_consumer_diagnostic(diagnostic)
+        })
         .map(|diagnostic| {
             format!(
                 "{} [{}] {}",
@@ -1165,6 +1167,73 @@ pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_consumer_record_does_not_refuse_an_ai_run_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models_dir = root.join("models");
+        write_file(&models_dir.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models_dir.join("orders.toml"),
+            b"name = \"orders\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"orders\"\n",
+        );
+        write_file(
+            &root.join("consumers").join("board.toml"),
+            b"depends_on = [\"nowhere\"]\n",
+        );
+        let result = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        })
+        .expect("compile");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::consumers::is_consumer_diagnostic),
+            "{:?}",
+            result.diagnostics
+        );
+        let plan = build_ai_run_plan(None, &result, None, None, None);
+        assert!(plan.is_ok(), "{plan:?}");
+    }
+
+    /// The fulfill loop's compile step reads the model errors and the consumer
+    /// problems apart: a bad dashboard file has `has_errors` set, but no model
+    /// error, so it must not turn the verify gate red.
+    #[test]
+    fn compile_output_separates_a_consumer_problem_from_model_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models_dir = root.join("models");
+        write_file(&models_dir.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models_dir.join("orders.toml"),
+            b"name = \"orders\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"orders\"\n",
+        );
+        write_file(
+            &root.join("consumers").join("board.toml"),
+            b"depends_on = [\"nowhere\"]\n",
+        );
+        let output = compile_output(
+            None,
+            &root.join("state.redb"),
+            &models_dir,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("compile");
+        assert!(output.has_errors, "{:?}", output.diagnostics);
+        assert!(output.model_error_lines().is_empty());
+        let consumer = output.consumer_problem_lines();
+        assert_eq!(consumer.len(), 1, "{consumer:?}");
+        assert!(consumer[0].starts_with("E060"));
+    }
 
     #[tokio::test]
     async fn propose_refuses_compile_diagnostics_before_plan_write() {

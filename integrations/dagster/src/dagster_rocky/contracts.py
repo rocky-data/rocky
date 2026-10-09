@@ -28,6 +28,7 @@ Mapping from compiler diagnostic codes to dagster check names:
   E013 (protected column removed)        → contract_protected_columns
   E011 (column type mismatch)            → contract_column_constraints
   E012 (column nullability violated)     → contract_column_constraints
+  E059 (declared type not checkable, strict contracts) → contract_column_constraints
   W010 (contract column not in model)    → contract_column_constraints (warn)
 
 These are pure-function builders, decoupled from :class:`RockyComponent` so
@@ -73,6 +74,10 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
     # dropped silently at the dispatch — so without this entry the check
     # would report PASSING while the contract was being violated.
     "E014": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    # `--strict-contracts` / `[contracts] strict`: a declared type Rocky cannot
+    # check is an error, not the `I003` note. Unmapped, the dispatch would drop
+    # it and the check would pass on a run Rocky refused.
+    "E059": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     "W010": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
 

@@ -204,11 +204,13 @@ pub const E044: &str = "E044";
 /// A call names a function the target warehouse does not have, and the
 /// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
 ///
-/// Emitted by `rocky compile` from [`crate::function_check`] only for models
-/// that run on DuckDB, the one dialect with a complete function list here.
-/// Schema-qualified calls (`main.my_macro(x)`) and quoted names are not
-/// checked, nor is a project whose `[portability] target_dialect` names
-/// another warehouse.
+/// Emitted by `rocky compile` from [`crate::function_check`] for models that
+/// run on DuckDB, whose list was verified against a live engine and
+/// includes the functions its extensions load on first use. Every other
+/// warehouse with a list gets the
+/// warning [`W057`] instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
+/// not checked, nor is a model whose SQL `[portability] target_dialect` says
+/// was written for another warehouse.
 pub const E057: &str = "E057";
 /// The models form a dependency cycle: a model reads, directly or through
 /// other models, a model that depends on it (for example `fct_orders` reads
@@ -220,6 +222,19 @@ pub const E057: &str = "E057";
 /// that model's read of the next model on it. Commands that execute models
 /// (`rocky run`) refuse the project with the same cycle before they write.
 pub const E058: &str = "E058";
+/// A downstream-consumer record in `consumers/` is invalid: the file does not
+/// parse, two consumers share a name, or `depends_on` names something that is
+/// not a model in this project (a typo, a source table, a seed, a removed
+/// model). The message names the consumer and the entry; a near-miss model
+/// name is offered when there is one.
+///
+/// Emitted by `rocky compile` (and so by `rocky ci` and strict compiles) from
+/// [`crate::consumers`]. `rocky run` does not stop for it and does not count
+/// it as a failed table: a consumer is not a model, so the run reports it in
+/// `consumer_diagnostics` and writes the models. A consumer that points at a
+/// model that no longer exists is the failure this exists to catch: the dashboard would
+/// otherwise keep reading a table nobody maintains.
+pub const E060: &str = "E060";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -642,13 +657,23 @@ pub const W055: &str = "W055";
 /// window, or accept the gap. A warning, not
 /// an error: a source that never back-fills equal timestamps is safe.
 pub const W056: &str = "W056";
+/// A call names a function that is not in the function list Rocky holds for
+/// the target warehouse, and the project does not declare it in `functions/`.
+///
+/// The warning form of [`E057`], for warehouses whose list Rocky built from
+/// the vendor's reference but has not verified against a live engine
+/// (Snowflake, Databricks, BigQuery, Redshift).
+/// A warehouse can have functions the list lacks (a newer release, an
+/// extension, a UDF created outside Rocky), so this never fails a compile on
+/// its own. Escalate with `rocky compile --deny-warnings W057`.
+pub const W057: &str = "W057";
 
 /// Every warning code the compile pipeline can emit: the `W###` codes above
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so
@@ -709,14 +734,25 @@ pub const I002: &str = "I002";
 /// initializers only; a caller that builds the map elsewhere and passes it in
 /// empty will not show up.
 ///
-/// A `CAST` is *not* a general fix. `refine_casts` in `typecheck.rs` refines a
-/// cast column only when the cast's input type is already known, so
-/// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` with no schema for
-/// `source.raw.users` still infers `Unknown`. And a warehouse-dependent
-/// expression — `AVG` over a `DECIMAL` input (#1238) — stays `Unknown` even
-/// with source schemas, because the result type is not knowable at this
+/// A cast gives its column the cast's target type, whatever the input is:
+/// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` is `Int64` with no
+/// schema for `source.raw.users`. The contract is then compared with the
+/// target, which the warehouse enforces. A bare `DECIMAL` or `NUMERIC` names
+/// no digits, so such a cast stays `Unknown`. A warehouse-dependent
+/// expression — `AVG` over a `DECIMAL` input (#1238) — also stays `Unknown`
+/// even with source schemas, because the result type is not knowable at this
 /// layer.
+///
+/// `--strict-contracts` (or `[contracts] strict = true`) turns this code into
+/// the [`E059`] error.
 pub const I003: &str = "I003";
+
+/// A contract declares a column type that Rocky cannot check, because the
+/// column's type is unknown, and strict contracts are on
+/// (`--strict-contracts` or `[contracts] strict = true`). Error severity.
+/// This is [`I003`] escalated: the message names the model and column and
+/// says why the type is unknown; the suggestion says how to make it known.
+pub const E059: &str = "E059";
 
 // Lints — portability + blast-radius
 /// Construct is not portable to the configured target dialect.

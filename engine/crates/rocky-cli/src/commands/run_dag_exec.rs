@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use rocky_core::dag_executor::{DagExecutor, NodeDispatcher, NodeFuture, NodeStatus};
 use rocky_core::unified_dag::{self, NodeId, NodeKind};
@@ -134,7 +134,21 @@ fn default_sub_runner(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
 ) -> SubRunner {
-    sub_runner_with_contracts(actor, external_dependencies, None)
+    sub_runner_with_contracts(actor, external_dependencies, None, None)
+}
+
+/// The options every `--dag` sub-run carries. The graph judged `consumers/`
+/// and logged each problem once, so a sub-run does not log them again.
+fn sub_run_defer_options(
+    external_dependencies: &std::collections::BTreeSet<String>,
+    project: Option<rocky_compiler::compile::ProjectContext>,
+) -> super::run::DeferOptions {
+    super::run::DeferOptions {
+        external_dependencies: external_dependencies.clone(),
+        project,
+        consumers_logged_by_caller: true,
+        ..super::run::DeferOptions::default()
+    }
 }
 
 /// [`default_sub_runner`] with `rocky run --dag --contracts <DIR>`: every
@@ -145,6 +159,7 @@ fn sub_runner_with_contracts(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
     contracts_dir: Option<PathBuf>,
+    project: Option<rocky_compiler::compile::ProjectContext>,
 ) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
@@ -157,10 +172,7 @@ fn sub_runner_with_contracts(
               shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
             let contracts_dir = contracts_dir.clone();
-            let defer_opts = super::run::DeferOptions {
-                external_dependencies: (*external_dependencies).clone(),
-                ..super::run::DeferOptions::default()
-            };
+            let defer_opts = sub_run_defer_options(&external_dependencies, project.clone());
             Box::pin(async move {
                 super::run::run_with_explicit_contracts(
                     &config_path,
@@ -421,6 +433,20 @@ pub async fn run_with_dag_and_contracts(
         Err(reason) => (None, Some(reason)),
     };
 
+    // `consumers/` is judged once for the whole graph: every sub-run shares
+    // this context, and the problems are reported on the graph's output, not
+    // counted against any node.
+    let project = rocky_compiler::consumers::project_context(config_path, &loaded.config);
+    let consumer_diagnostics = rocky_compiler::consumers::diagnose_project(&project);
+    for diagnostic in &consumer_diagnostics {
+        warn!(
+            consumer = diagnostic.model.as_str(),
+            code = &*diagnostic.code,
+            message = &*diagnostic.message,
+            "consumer record problem - reported, the run is not stopped"
+        );
+    }
+
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
         loaded: std::sync::Arc::clone(&loaded),
@@ -437,6 +463,7 @@ pub async fn run_with_dag_and_contracts(
             actor.clone(),
             Arc::new(dag_external_dependencies(&dag)),
             contracts_dir.map(Path::to_path_buf),
+            Some(project.clone()),
         ),
         state_turns: StateTurnstile::new(),
     };
@@ -450,6 +477,7 @@ pub async fn run_with_dag_and_contracts(
         let output = DagRunOutput {
             version: VERSION.into(),
             command: "run --dag".into(),
+            consumer_diagnostics: consumer_diagnostics.clone(),
             warnings: physical_edge_warnings.clone(),
             total_nodes: result.total_nodes,
             total_layers: result.total_layers,
@@ -1109,6 +1137,12 @@ impl NodeDispatcher for CliDispatcher {
 
 #[cfg(test)]
 mod run_opts_threading_tests {
+    #[test]
+    fn a_dag_sub_run_does_not_log_consumer_problems_again() {
+        let options = super::sub_run_defer_options(&std::collections::BTreeSet::new(), None);
+        assert!(options.consumers_logged_by_caller);
+    }
+
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 

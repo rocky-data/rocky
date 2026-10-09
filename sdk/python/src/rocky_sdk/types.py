@@ -539,6 +539,10 @@ class RunResult(BaseModel):
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
     override_warnings: list[OverrideWarningOutput] = Field(default_factory=list)
+    #: Problems in the project's ``consumers/`` records (``E060``). They never
+    #: stop a model from being written and are never counted as a failed
+    #: table. Empty when the records are sound.
+    consumer_diagnostics: list[Diagnostic] = Field(default_factory=list)
     #: The ``--idempotency-key`` value this run was invoked with, echoed back.
     #: ``None`` for runs that didn't pass the flag.
     idempotency_key: str | None = None
@@ -892,6 +896,11 @@ class ModelLineageResult(BaseModel):
     #: model). Loose ``dict`` entries — the nested shape lives on the generated
     #: ``LineageOutput.nodes``. Empty when the engine doesn't emit node metadata.
     nodes: list[dict] = Field(default_factory=list)
+    #: Downstream consumers (dashboards, notebooks, ML jobs, applications)
+    #: that read the model, directly or through downstream models. Loose
+    #: ``dict`` entries; the nested shape lives on the generated
+    #: ``LineageOutput.consumers``. Empty when none are declared.
+    consumers: list[dict] = Field(default_factory=list)
 
 
 class RowSelectionEdge(BaseModel):

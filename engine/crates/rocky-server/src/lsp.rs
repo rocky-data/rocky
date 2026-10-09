@@ -508,10 +508,12 @@ impl RockyLsp {
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
             source_provenance: Default::default(),
+            strict_contracts: false,
             // Diagnostics and symbols map onto the authored text, so keep it
             // rather than the ephemeral-inlined form.
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
+            project: None,
         };
 
         let generation = self.published_files.begin_compile();
@@ -1488,10 +1490,12 @@ impl LanguageServer for RockyLsp {
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
                     source_provenance: Default::default(),
+                    strict_contracts: false,
                     // Diagnostics and symbols map onto the authored text, so keep it
                     // rather than the ephemeral-inlined form.
                     preserve_authored_sql: true,
                     external_dependencies: Default::default(),
+                    project: None,
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -4665,7 +4669,8 @@ fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
 /// name a user-defined function instead: they go on the function's `.toml`
 /// under `functions/` (the registry knows the path; an invalid definition
 /// that is not in the registry carries it in its span). Anything else that
-/// names no model has no file and is skipped.
+/// names no model has no file and is skipped. A consumer diagnostic (E060)
+/// goes on the `consumers/` file its span names.
 fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
     let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
 
@@ -4689,6 +4694,13 @@ fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
                 // The loader reaches `functions/` as `<models>/../functions`;
                 // an editor matches open documents by the plain path.
                 Some(path) => lexically_normalized(&path),
+                None => continue,
+            }
+        } else if rocky_compiler::consumers::is_consumer_diagnostic(d) {
+            // A consumer record is not a model: the diagnostic names the
+            // `consumers/<name>.toml` file in its span.
+            match d.span.as_ref().filter(|s| !s.file.is_empty()) {
+                Some(span) => lexically_normalized(std::path::Path::new(&span.file)),
                 None => continue,
             }
         } else {
@@ -5077,6 +5089,7 @@ mod tests {
         )
         .unwrap();
         let config = CompilerConfig {
+            strict_contracts: false,
             models_dir: models,
             contracts_dir: None,
             required_explicit_contract_model: None,
@@ -5088,6 +5101,7 @@ mod tests {
             source_provenance: Default::default(),
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
+            project: None,
         };
         rocky_compiler::compile::compile(&config).expect("the project compiles")
     }
@@ -5131,6 +5145,35 @@ mod tests {
         assert!(
             !by_uri.keys().any(|u| u.path().ends_with("nobody")),
             "a diagnostic with no file stays unpublished"
+        );
+    }
+
+    /// E060 names a consumer, not a model. It lands on the consumer's file.
+    #[test]
+    fn e060_is_published_on_the_consumer_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("consumers")).unwrap();
+        std::fs::write(
+            tmp.path().join("consumers/board.toml"),
+            "depends_on = [\"missing\"]\n",
+        )
+        .unwrap();
+        let result = compile_function_project(tmp.path());
+        let by_uri = diagnostics_by_uri(&result);
+        let consumer_uri = Url::from_file_path(lexically_normalized(
+            &tmp.path().join("models/../consumers/board.toml"),
+        ))
+        .unwrap();
+        let on_consumer = by_uri.get(&consumer_uri).unwrap_or_else(|| {
+            panic!(
+                "E060 must land on the consumer's file; got {:?}",
+                by_uri.keys().collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(on_consumer.len(), 1);
+        assert_eq!(
+            on_consumer[0].code,
+            Some(NumberOrString::String("E060".to_string()))
         );
     }
 
@@ -7302,6 +7345,7 @@ mod tests {
         let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
         let project_freshness = cfg.freshness.clone();
         let compile_config = rocky_compiler::compile::CompilerConfig {
+            strict_contracts: false,
             models_dir: models_dir.clone(),
             contracts_dir: None,
             required_explicit_contract_model: None,
@@ -7315,6 +7359,7 @@ mod tests {
             // rather than the ephemeral-inlined form.
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
+            project: None,
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

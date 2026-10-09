@@ -108,7 +108,16 @@ pub struct StateContext<'a> {
 /// Dependencies come from the compiler's resolved DAG (sidecar `depends_on`
 /// plus SQL-inferred references). Sources are the external relations each
 /// model's SQL reads, plus any sidecar `[[sources]]`.
-pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
+///
+/// `project_root` is the directory of `rocky.toml`; `consumers/` is read from
+/// it, so a `--models` subdirectory or a pipeline glob sees the same consumers
+/// as a whole-project run. `None` (no config file) reads the sibling of
+/// `models_dir`.
+pub fn build_graph(
+    project: &Project,
+    models_dir: &Path,
+    project_root: Option<&Path>,
+) -> SelectorGraph {
     let model_names: BTreeSet<String> = project
         .models
         .iter()
@@ -176,7 +185,26 @@ pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
             sources,
         }
     });
-    SelectorGraph::new(nodes)
+    // Consumers feed the `consumer:` method. Files that do not load are the
+    // compiler's `E060`, not this graph's concern.
+    // A name used twice is ambiguous (the compiler refuses both with E060), so
+    // neither holder is selectable.
+    let loaded = match project_root {
+        Some(root) => rocky_core::consumers::load_consumers_for_root(root),
+        None => rocky_core::consumers::load_consumers_for_models_dir(models_dir),
+    }
+    .consumers;
+    let mut holders: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for c in &loaded {
+        *holders.entry(c.name.as_str()).or_default() += 1;
+    }
+    let unique: Vec<_> = loaded
+        .iter()
+        .filter(|c| holders[c.name.as_str()] == 1)
+        .map(|c| (c.name.clone(), c.depends_on.clone()))
+        .collect();
+    let consumers = unique.into_iter();
+    SelectorGraph::new(nodes).with_consumers(consumers)
 }
 
 /// Compute `state:` sets by diffing `state_ref...HEAD` exactly as
@@ -410,7 +438,12 @@ pub fn resolve(
     } else {
         None
     };
-    let graph = build_graph(project, models_dir);
+    let project_root = ctx
+        .config_path
+        .is_file()
+        .then(|| ctx.config_path.parent())
+        .flatten();
+    let graph = build_graph(project, models_dir, project_root);
     if let Some(name) = &args.required_model {
         anyhow::ensure!(
             graph.contains(name),
@@ -418,14 +451,27 @@ pub fn resolve(
         );
     }
     let selection = selector::select(&graph, &select, &exclude, state.as_ref())?;
-    // A term that names one model, tag, path, file or source that does not
+    if !selection.empty_consumers.is_empty() {
+        anyhow::bail!(
+            "--select: consumer(s) {} exist but read no known model. Their `depends_on` names \
+             nothing that is a model in this project, so there is nothing to select. \
+             `rocky compile` reports each bad entry as E060",
+            selection
+                .empty_consumers
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // A term that names one model, tag, path, file, source or consumer that does not
     // exist is a typo, not an empty selection: refuse it rather than run
     // nothing and report success. Globs and computed sets (`state:`,
     // `config.`) that match nothing stay a warning.
     if !selection.unmatched_named.is_empty() {
         anyhow::bail!(
             "--select: selector term(s) that match nothing in this project: {}. Each names a \
-             model, tag, path, file or source that does not exist. Check the spelling; \
+             model, tag, path, file, source or consumer that does not exist. Check the spelling; \
              `rocky list models` shows the model names",
             selection
                 .unmatched_named
@@ -661,6 +707,78 @@ mod tests {
             format!("{err:#}").contains("unknown saved selector"),
             "{err:#}"
         );
+    }
+
+    /// `consumer:<name>` selects the models a `consumers/` file reads, and
+    /// `+consumer:<name>` adds their upstream.
+    #[test]
+    fn consumer_selector_reads_the_consumers_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_var_project(&models);
+        let consumers = root.path().join("consumers");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::write(consumers.join("board.toml"), "depends_on = [\"m\"]\n").unwrap();
+        let run = |select: &str| {
+            let args = SelectionArgs {
+                select: vec![select.into()],
+                ..Default::default()
+            };
+            resolve_in_dir(&args, &models, None, &ctx(&models))
+                .map(|s| s.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(run("consumer:board").unwrap(), vec!["m"]);
+        assert_eq!(run("+consumer:board").unwrap(), vec!["base", "m"]);
+        let err = run("consumer:borad").unwrap_err();
+        assert!(format!("{err:#}").contains("consumer:borad"), "{err:#}");
+    }
+
+    /// A consumer whose `depends_on` names no model exists. Selecting it says
+    /// so, instead of calling the name a typo.
+    #[test]
+    fn a_consumer_reading_no_known_model_is_not_reported_as_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_var_project(&models);
+        let consumers = root.path().join("consumers");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::write(consumers.join("orphan.toml"), "depends_on = [\"gone\"]\n").unwrap();
+        let args = SelectionArgs {
+            select: vec!["consumer:orphan".into()],
+            ..Default::default()
+        };
+        let err = resolve_in_dir(&args, &models, None, &ctx(&models)).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("exist but read no known model"), "{text}");
+        assert!(!text.contains("does not exist"), "{text}");
+    }
+
+    /// With a `rocky.toml`, `consumers/` is the project's, wherever the
+    /// models directory is: `--models models/marts` sees the same consumers.
+    #[test]
+    fn consumers_are_read_from_the_config_directory_for_a_nested_models_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let marts = root.path().join("models").join("marts");
+        std::fs::create_dir_all(&marts).unwrap();
+        write_var_project(&marts);
+        std::fs::write(root.path().join("rocky.toml"), "").unwrap();
+        let consumers = root.path().join("consumers");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::write(consumers.join("board.toml"), "depends_on = [\"m\"]\n").unwrap();
+        let config_path = root.path().join("rocky.toml");
+        let ctx = StateContext {
+            config_path: &config_path,
+            state_path: root.path(),
+            cache_ttl_override: None,
+        };
+        let args = SelectionArgs {
+            select: vec!["consumer:board".into()],
+            ..Default::default()
+        };
+        let got = resolve_in_dir(&args, &marts, None, &ctx).expect("the consumer is found");
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["m".to_string()]);
     }
 
     #[test]

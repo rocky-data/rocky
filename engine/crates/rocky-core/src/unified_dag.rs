@@ -2260,6 +2260,7 @@ mod tests {
             map.insert(name.to_string(), cfg);
         }
         RockyConfig {
+            contracts: Default::default(),
             state: StateConfig::default(),
             adapters: IndexMap::new(),
             pipelines: map,

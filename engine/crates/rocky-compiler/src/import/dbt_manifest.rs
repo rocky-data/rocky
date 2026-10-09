@@ -29,6 +29,9 @@ pub struct DbtManifest {
     /// Counts of resource classes the importer does not translate, captured at
     /// parse time so the sweep can report them.
     pub dropped: DbtDroppedCounts,
+    /// dbt exposures (downstream consumers), sorted by name. The importer
+    /// writes each as a `consumers/<name>.toml` file.
+    pub exposures: Vec<DbtExposure>,
     /// dbt `groups`, keyed by group name, with their owners.
     pub groups: std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
 }
@@ -55,9 +58,6 @@ pub struct DbtDroppedCounts {
     pub snapshots: usize,
     pub metrics: usize,
     pub semantic_models: usize,
-    /// dbt exposures (downstream consumers). Rocky has no equivalent, so
-    /// each is listed in the migration notes.
-    pub exposures: Vec<DbtExposure>,
 }
 
 /// A dbt exposure: a downstream consumer of models (a dashboard, an
@@ -65,10 +65,21 @@ pub struct DbtDroppedCounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbtExposure {
     pub name: String,
+    /// dbt's `type`: `dashboard`, `notebook`, `analysis`, `ml`,
+    /// `application`.
+    pub kind: Option<String>,
     /// Owner name and/or email, as dbt wrote them.
     pub owner: Option<String>,
-    /// Names of the models and sources the exposure reads.
-    pub depends_on: Vec<String>,
+    pub url: Option<String>,
+    /// dbt's `description`, else its `label`.
+    pub description: Option<String>,
+    /// `unique_id`s of the models the exposure reads, sorted (for example
+    /// `model.shop.orders`). The importer maps each to its Rocky name.
+    pub models: Vec<String>,
+    /// Everything else it reads, spelled `<kind> <name>` (for example
+    /// `source shop.orders`, `seed countries`). Rocky consumers read models
+    /// only, so these are reported and not written.
+    pub other_dependencies: Vec<String>,
 }
 
 /// Read the exposures from the manifest's raw JSON, sorted by name.
@@ -77,7 +88,7 @@ fn collect_exposures(raw: &HashMap<String, serde_json::Value>) -> Vec<DbtExposur
         value
             .get(key)
             .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
     };
     let mut exposures: Vec<DbtExposure> = raw
@@ -90,28 +101,40 @@ fn collect_exposures(raw: &HashMap<String, serde_json::Value>) -> Vec<DbtExposur
                     .collect();
                 (!parts.is_empty()).then(|| parts.join(", "))
             });
-            let mut depends_on: Vec<String> = value
+            let mut models = Vec::new();
+            let mut other_dependencies = Vec::new();
+            for node in value
                 .pointer("/depends_on/nodes")
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(serde_json::Value::as_str)
-                // `model.<project>.<name>` -> `<name>`; sources keep their
-                // `source.<project>.<source>.<table>` tail.
-                .map(|node| match node.split_once('.') {
-                    Some(("model" | "snapshot" | "seed", rest)) => {
-                        rest.split_once('.').map_or(rest, |(_, name)| name)
+            {
+                // `model.<project>.<name>` -> `<name>`; a source keeps its
+                // `<source>.<table>` tail.
+                match node.split_once('.') {
+                    Some(("model", _)) => models.push(node.to_string()),
+                    Some((kind, rest)) => {
+                        other_dependencies.push(format!(
+                            "{kind} {}",
+                            rest.split_once('.').map_or(rest, |(_, n)| n)
+                        ));
                     }
-                    Some(("source", rest)) => rest.split_once('.').map_or(rest, |(_, name)| name),
-                    _ => node,
-                })
-                .map(str::to_string)
-                .collect();
-            depends_on.sort();
+                    None => other_dependencies.push(node.to_string()),
+                }
+            }
+            models.sort();
+            models.dedup();
+            other_dependencies.sort();
+            other_dependencies.dedup();
             DbtExposure {
                 name: text(value, "name").unwrap_or_else(|| id.clone()),
+                kind: text(value, "type"),
                 owner,
-                depends_on,
+                url: text(value, "url"),
+                description: text(value, "description").or_else(|| text(value, "label")),
+                models,
+                other_dependencies,
             }
         })
         .collect();
@@ -649,8 +672,8 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         snapshots: 0,
         metrics: raw.metrics.len(),
         semantic_models: raw.semantic_models.len(),
-        exposures: collect_exposures(&raw.exposures),
     };
+    let exposures = collect_exposures(&raw.exposures);
 
     let nodes = raw
         .nodes
@@ -708,6 +731,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         sources,
         unit_tests,
         dropped,
+        exposures,
     })
 }
 

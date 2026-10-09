@@ -134,7 +134,12 @@ fn retain_selected(
 ) {
     result.failures.retain(|(name, _)| selected.contains(name));
     result.model_results.retain(|r| selected.contains(&r.model));
-    result.diagnostics.retain(|d| selected.contains(&d.model));
+    // A consumer record problem (E060) is about the project, not one model.
+    // A scoped run keeps it in the report; `consumer_diagnostics_fail_the_run`
+    // decides whether it fails the run.
+    result.diagnostics.retain(|d| {
+        selected.contains(&d.model) || rocky_compiler::consumers::is_consumer_diagnostic(d)
+    });
     result.total = result.model_results.len();
     result.passed = result
         .model_results
@@ -142,6 +147,21 @@ fn retain_selected(
         .filter(|r| r.status == rocky_engine::test_runner::ModelTestStatus::Pass)
         .count();
     unit_run.results.retain(|r| selected.contains(&r.model));
+}
+
+/// Whether a consumer record error (E060) fails `rocky test`.
+///
+/// It fails only a run that covers the whole project. A run scoped by
+/// `--model`, `--select` or `--exclude` reports it in `diagnostics` and does
+/// not fail on it, so a scoped run is not blocked by a file it never selected.
+fn consumer_diagnostics_fail_the_run(
+    diagnostics: &[rocky_compiler::diagnostic::Diagnostic],
+    scoped: bool,
+) -> bool {
+    !scoped
+        && diagnostics
+            .iter()
+            .any(rocky_compiler::consumers::is_consumer_diagnostic)
 }
 
 /// [`run_test`] scoped by `--select` / `--exclude`.
@@ -186,6 +206,9 @@ pub fn run_test_with_selection(
                 run_vars,
                 gates,
                 inlined_gates,
+                strict_contracts: project_config
+                    .as_ref()
+                    .is_some_and(|config| config.contracts.strict),
             })
         },
     )?;
@@ -271,6 +294,14 @@ pub fn run_test_with_selection(
 
     if !result.failures.is_empty() || unit_failed > 0 {
         anyhow::bail!("test failures detected");
+    }
+    // A consumer record error (E060) is reported as a diagnostic, after the
+    // model tests have run. It fails a whole-project run only.
+    if consumer_diagnostics_fail_the_run(
+        &result.diagnostics,
+        model_filter.is_some() || selected.is_some(),
+    ) {
+        anyhow::bail!("consumer record errors detected (E060)");
     }
 
     Ok(())
@@ -1335,6 +1366,104 @@ mod tests {
         CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme_is_current, declarative_check_digest,
         declarative_test_count, load_all_models, whole_project_declarative_run,
     };
+
+    /// A two-model project with a consumer record that names a model that
+    /// does not exist (E060). Returns the project dir and its models dir.
+    fn project_with_a_bad_consumer() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("models dir");
+        for name in ["raw_orders", "good_mart"] {
+            let sql = if name == "raw_orders" {
+                "SELECT 1 AS id"
+            } else {
+                "SELECT id FROM raw_orders"
+            };
+            std::fs::write(models.join(format!("{name}.sql")), sql).expect("sql");
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"wh\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .expect("sidecar");
+        }
+        let consumers = tmp.path().join("consumers");
+        std::fs::create_dir(&consumers).expect("consumers dir");
+        std::fs::write(consumers.join("board.toml"), "depends_on = [\"nowhere\"]\n")
+            .expect("consumer");
+        (tmp, models)
+    }
+
+    fn run_scoped(
+        models: &std::path::Path,
+        model: Option<&str>,
+        select: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let args = crate::selection::SelectionArgs {
+            select: select.map(|s| vec![s.to_string()]).unwrap_or_default(),
+            ..Default::default()
+        };
+        let state = models.parent().unwrap().join("state.redb");
+        let ctx = crate::selection::StateContext {
+            config_path: &models.parent().unwrap().join("rocky.toml"),
+            state_path: &state,
+            cache_ttl_override: None,
+        };
+        super::run_test_with_selection(
+            None,
+            models,
+            None,
+            model,
+            true,
+            &rocky_core::run_vars::RunVars::new(),
+            select.map(|_| (&args, &ctx)),
+        )
+    }
+
+    /// A consumer record error fails a whole-project `rocky test`, and only
+    /// that: `--model` and `--select` report it but do not fail on it.
+    #[test]
+    fn a_consumer_error_fails_only_a_whole_project_test() {
+        let (_tmp, models) = project_with_a_bad_consumer();
+        let err = run_scoped(&models, None, None).expect_err("whole project fails");
+        assert!(err.to_string().contains("E060"), "{err:#}");
+        run_scoped(&models, Some("good_mart"), None).expect("--model does not fail on E060");
+        run_scoped(&models, None, Some("name:good_mart")).expect("--select does not fail on E060");
+    }
+
+    #[test]
+    fn a_scoped_test_still_reports_the_consumer_error() {
+        let (_tmp, models) = project_with_a_bad_consumer();
+        let mut result = rocky_engine::test_runner::run_tests(
+            &models,
+            None,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("run");
+        let mut unit_run =
+            rocky_engine::test_runner::run_unit_tests(&models, None).expect("unit run");
+        let selected = std::collections::BTreeSet::from(["good_mart".to_string()]);
+        super::retain_selected(&mut result, &mut unit_run, &selected);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::consumers::is_consumer_diagnostic),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(super::consumer_diagnostics_fail_the_run(
+            &result.diagnostics,
+            false
+        ));
+        assert!(!super::consumer_diagnostics_fail_the_run(
+            &result.diagnostics,
+            true
+        ));
+    }
 
     /// A project with three pipelines — `transform` (models/**), `reporting`
     /// (reporting/**) and a quality pipeline — and one model with a

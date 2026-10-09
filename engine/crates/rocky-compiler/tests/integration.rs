@@ -1887,3 +1887,117 @@ mod dependency_and_name_checks {
         }
     }
 }
+
+// ---- downstream consumers (`consumers/`, E060) ----
+
+fn write_consumer(dir: &std::path::Path, file: &str, body: &str) {
+    let consumers = dir.join("consumers");
+    std::fs::create_dir_all(&consumers).unwrap();
+    std::fs::write(consumers.join(file), body).unwrap();
+}
+
+fn e060_messages(result: &rocky_compiler::compile::CompileResult) -> Vec<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E060")
+        .map(|d| d.message.to_string())
+        .collect()
+}
+
+/// A consumer over real models compiles clean and appears on the result; one
+/// over a missing model is an E060 error that sets `has_errors`, and the full
+/// and incremental paths agree.
+#[test]
+fn consumer_depends_on_must_name_a_model() {
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project(dir.path(), "type = \"full_refresh\"");
+    write_consumer(
+        dir.path(),
+        "board.toml",
+        "kind = \"dashboard\"\nowner = \"finance\"\ndepends_on = [\"leaf\", \"src\"]\n",
+    );
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    let clean = compile(&config).unwrap();
+    assert!(e060_messages(&clean).is_empty(), "{:?}", clean.diagnostics);
+    assert!(!clean.has_errors, "{:?}", clean.diagnostics);
+    assert_eq!(clean.consumers.len(), 1);
+    assert_eq!(clean.consumers[0].name, "board");
+    assert_eq!(clean.consumers[0].depends_on, vec!["leaf", "src"]);
+
+    // Point it at a model that does not exist.
+    write_consumer(
+        dir.path(),
+        "board.toml",
+        "kind = \"dashboard\"\ndepends_on = [\"lef\", \"src\"]\n",
+    );
+    let broken = compile(&config).unwrap();
+    let messages = e060_messages(&broken);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("`lef`"), "{}", messages[0]);
+    assert!(broken.has_errors);
+    // The valid edge stays visible.
+    assert_eq!(broken.consumers[0].depends_on, vec!["src"]);
+
+    // The incremental path reports the same thing.
+    let incremental = rocky_compiler::compile::compile_incremental(&config, &[], &broken).unwrap();
+    assert_eq!(e060_messages(&incremental), messages);
+    assert!(incremental.has_errors);
+    assert_eq!(incremental.consumers, broken.consumers);
+}
+
+/// A compile that covers part of a project must judge `consumers/` against the
+/// whole project: the directory is the project root's, and a `depends_on`
+/// entry is valid when it names a model anywhere in the project. Only a name
+/// that is a model nowhere is an E060.
+#[test]
+fn a_scoped_compile_judges_consumers_against_the_whole_project() {
+    use rocky_compiler::compile::{ProjectContext, compile_preloaded_models};
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project(dir.path(), "type = \"full_refresh\"");
+    // The compile covers `src` only, and its models directory is a
+    // subdirectory, so the sibling `../consumers` is not the project's.
+    let scoped_dir = dir.path().join("models").join("marts");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    let only_src = || {
+        let all = rocky_compiler::project::Project::load_models(&dir.path().join("models"), None)
+            .unwrap();
+        all.into_iter()
+            .filter(|m| m.config.name == "src")
+            .collect::<Vec<_>>()
+    };
+    let project = ProjectContext {
+        root: dir.path().to_path_buf(),
+        model_names: ["src", "leaf"].into_iter().map(String::from).collect(),
+    };
+    let config = CompilerConfig {
+        models_dir: scoped_dir,
+        project: Some(project),
+        ..Default::default()
+    };
+
+    // `leaf` is outside this compile and inside the project: clean.
+    write_consumer(
+        dir.path(),
+        "board.toml",
+        "depends_on = [\"leaf\", \"src\"]\n",
+    );
+    let clean = compile_preloaded_models(only_src(), &config).unwrap();
+    assert!(e060_messages(&clean).is_empty(), "{:?}", clean.diagnostics);
+    assert!(!clean.has_errors, "{:?}", clean.diagnostics);
+    // Read from the project root, not from `models/marts/../consumers`.
+    assert_eq!(clean.consumers.len(), 1);
+    assert_eq!(clean.consumers[0].depends_on, vec!["leaf", "src"]);
+
+    // A name that is a model nowhere is still refused.
+    write_consumer(dir.path(), "board.toml", "depends_on = [\"nowhere\"]\n");
+    let broken = compile_preloaded_models(only_src(), &config).unwrap();
+    let messages = e060_messages(&broken);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("`nowhere`"), "{}", messages[0]);
+}

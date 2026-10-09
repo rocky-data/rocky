@@ -200,6 +200,7 @@ fn emit_models_selected(
     let models_dir = models_dir.as_path();
 
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -214,6 +215,7 @@ fn emit_models_selected(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let compiled = match models_glob.as_deref() {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -259,11 +261,13 @@ fn emit_models_selected(
     // MISSING_SENTINEL ("NULL") into the SQL. `rocky compile`/`run` refuse to
     // proceed in that case; emit-sql must too, rather than emitting (and, with
     // `--out-dir`, persisting) provably-wrong SQL. Mirrors the compile command.
-    if result.has_errors {
+    // A wrong consumer record (`E060`) does not change the SQL of any model,
+    // so it does not stop this command; `rocky compile` reports it.
+    if rocky_compiler::consumers::has_model_errors(&result) {
         let errors: Vec<String> = result
             .diagnostics
             .iter()
-            .filter(|d| d.is_error())
+            .filter(|d| d.is_error() && !rocky_compiler::consumers::is_consumer_diagnostic(d))
             .map(|d| format!("{}: {} ({})", d.code, d.message, d.model))
             .collect();
         anyhow::bail!(

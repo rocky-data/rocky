@@ -19,6 +19,50 @@
       ],
       "type": "object"
     },
+    "LineageConsumerRecord": {
+      "description": "One downstream consumer in a `rocky lineage` view.",
+      "properties": {
+        "description": {
+          "description": "What it is for, when declared.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "direct": {
+          "description": "`true` when the consumer reads the focal model itself; `false` when it reads only models downstream of it.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "`dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Consumer name.",
+          "type": "string"
+        },
+        "owner": {
+          "description": "Owner, when declared.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Where to find it, when declared.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "direct",
+        "kind",
+        "name"
+      ],
+      "type": "object"
+    },
     "LineageEdgeRecord": {
       "properties": {
         "source": {
@@ -92,6 +136,13 @@
     },
     "command": {
       "type": "string"
+    },
+    "consumers": {
+      "description": "Downstream consumers (dashboards, notebooks, ML jobs, applications declared in `consumers/`) that read the focal model, directly or through the models downstream of it. Sorted by name. These are not models, so they are not part of `downstream`. Omitted when none.",
+      "items": {
+        "$ref": "#/definitions/LineageConsumerRecord"
+      },
+      "type": "array"
     },
     "downstream": {
       "items": {

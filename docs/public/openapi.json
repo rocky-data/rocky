@@ -5942,6 +5942,18 @@
         ],
         "type": "object"
       },
+      "ContractsConfig": {
+        "additionalProperties": false,
+        "description": "`[contracts]` — project-level contract settings.\n\n```toml [contracts] strict = true ```",
+        "properties": {
+          "strict": {
+            "default": false,
+            "description": "Refuse a contract column whose declared type Rocky cannot check. Defaults to `false`.\n\nA contract that declares a column `type` is checked against the type the compiler infers. When the compiler cannot infer the column's type (a source with no known schema, an expression whose result type depends on the warehouse), the declared type goes unchecked and the compile reports the `I003` info note. With `strict = true` that is the `E059` error instead. `rocky compile --strict-contracts` sets it for one invocation, as does `rocky ci --strict-contracts`; `rocky run` and `rocky test` read this key.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "CostEstimateSource": {
         "description": "Where a `rocky plan` cost estimate came from.",
         "oneOf": [
@@ -6695,6 +6707,13 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "consumer_diagnostics": {
+            "description": "Problems in the project's `consumers/` records (`E060`). Reported once for the whole graph; they never fail a node. Empty (and omitted) when the records are sound.",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
           "duration_ms": {
             "description": "Wall-clock duration of the entire DAG execution.",
             "format": "uint64",
@@ -7261,6 +7280,12 @@
           "command": {
             "type": "string"
           },
+          "consumers_count": {
+            "description": "Downstream consumers (`consumers/`) the documentation lists.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "duration_ms": {
             "format": "uint64",
             "minimum": 0.0,
@@ -7302,6 +7327,7 @@
         },
         "required": [
           "command",
+          "consumers_count",
           "duration_ms",
           "files",
           "format",
@@ -9795,7 +9821,14 @@
           },
           "constructs_dropped": {
             "default": 0,
-            "description": "Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).",
+            "description": "Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models), plus the exposures and exposure dependencies that could not be carried over to a consumer.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "consumers_imported": {
+            "default": 0,
+            "description": "Number of dbt exposures written as downstream consumers (`consumers/<name>.toml`).",
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
@@ -10140,7 +10173,7 @@
             "type": "object"
           },
           {
-            "description": "A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, exposure), surfaced so a migration is never silently lossy.",
+            "description": "A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, an exposure, or an exposure dependency that is not a model), surfaced so a migration is never silently lossy.",
             "properties": {
               "construct": {
                 "type": "string"
@@ -10752,6 +10785,50 @@
         ],
         "type": "object"
       },
+      "LineageConsumerRecord": {
+        "description": "One downstream consumer in a `rocky lineage` view.",
+        "properties": {
+          "description": {
+            "description": "What it is for, when declared.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "direct": {
+            "description": "`true` when the consumer reads the focal model itself; `false` when it reads only models downstream of it.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "`dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Consumer name.",
+            "type": "string"
+          },
+          "owner": {
+            "description": "Owner, when declared.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Where to find it, when declared.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "direct",
+          "kind",
+          "name"
+        ],
+        "type": "object"
+      },
       "LineageDiffOutput": {
         "description": "JSON output for `rocky lineage-diff <base_ref>`.\n\nCombines the structural per-column diff produced by `rocky ci-diff` (added/removed/type-changed columns between two git refs) with the downstream blast-radius from `rocky lineage --downstream` (consumers of each changed column, traced through HEAD's semantic graph).\n\nThe markdown payload is rendered server-side and ready to drop into a PR comment — answers \"what does this PR change downstream?\" in one command.\n\n`downstream_consumers` is traced **downstream from HEAD**, so a removed column reports an empty set there. Removed columns instead carry `consumer_impact`: each direct consumer on the base side (or HEAD side), classified by comparing the base and HEAD lineage graphs.",
         "properties": {
@@ -10892,6 +10969,13 @@
           },
           "command": {
             "type": "string"
+          },
+          "consumers": {
+            "description": "Downstream consumers (dashboards, notebooks, ML jobs, applications declared in `consumers/`) that read the focal model, directly or through the models downstream of it. Sorted by name. These are not models, so they are not part of `downstream`. Omitted when none.",
+            "items": {
+              "$ref": "#/components/schemas/LineageConsumerRecord"
+            },
+            "type": "array"
           },
           "downstream": {
             "items": {
@@ -20070,6 +20154,17 @@
             },
             "description": "Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings."
           },
+          "contracts": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContractsConfig"
+              }
+            ],
+            "default": {
+              "strict": false
+            },
+            "description": "Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`]."
+          },
           "cost": {
             "allOf": [
               {
@@ -20874,6 +20969,13 @@
           },
           "command": {
             "type": "string"
+          },
+          "consumer_diagnostics": {
+            "description": "Problems in the project's `consumers/` records (`E060`): a file that does not load, a duplicate name, a `depends_on` entry that names no model, or an unreadable directory. A consumer is metadata about readers of the models, so these never stop a model from being written and are never counted as a failed table. `rocky compile` and `rocky ci` do refuse on them. Empty (and omitted) when the records are sound.",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
           },
           "contained": {
             "description": "Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.",

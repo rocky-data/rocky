@@ -3960,6 +3960,7 @@ effect = "require_review"
                     .collect::<Vec<_>>(),
             );
             compile::compile(&CompilerConfig {
+                strict_contracts: false,
                 models_dir: root.join("models"),
                 contracts_dir: None,
                 required_explicit_contract_model: None,
@@ -3971,6 +3972,7 @@ effect = "require_review"
                 source_provenance: Default::default(),
                 preserve_authored_sql: false,
                 external_dependencies: Default::default(),
+                project: None,
             })
         };
         let diagnostics = |result: &compile::CompileResult, code: &str| -> Vec<String> {

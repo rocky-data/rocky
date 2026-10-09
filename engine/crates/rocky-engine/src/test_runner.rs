@@ -103,6 +103,10 @@ pub struct TestRunInputs<'a> {
     /// error they add fails the run without executing a model. `None` runs
     /// none.
     pub inlined_gates: Option<&'a CompileGates<'a>>,
+    /// Refuse a contract column whose declared type Rocky cannot check
+    /// (`E059` in place of the `I003` note). `rocky ci` sets it from
+    /// `--strict-contracts` or `[contracts] strict`.
+    pub strict_contracts: bool,
 }
 
 /// Checks a caller runs over a test run's compile result. See
@@ -195,6 +199,7 @@ pub fn run_tests(
         run_vars,
         gates: None,
         inlined_gates: None,
+        strict_contracts: false,
     })
 }
 
@@ -222,6 +227,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         run_vars,
         gates,
         inlined_gates,
+        strict_contracts,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
@@ -266,6 +272,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         // The checks in `gates` judge the authored SQL; ephemeral upstreams
         // are inlined after them, below.
         preserve_authored_sql: true,
+        strict_contracts,
         ..Default::default()
     };
 
@@ -323,10 +330,16 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
             .collect(),
     };
 
-    // Check for compilation errors
-    if compile_result.has_errors {
+    // Check for compilation errors. A consumer record problem (`E060`) is not
+    // a model failure: it stays in `diagnostics` (so `rocky test` and
+    // `rocky ci` still fail on it) but never becomes a `model_results` entry
+    // and never stops the model tests from running.
+    if rocky_compiler::consumers::has_model_errors(&compile_result) {
         for d in &compile_result.diagnostics {
-            if d.is_error() && include_model(model_filter, &d.model) {
+            if d.is_error()
+                && !rocky_compiler::consumers::is_consumer_diagnostic(d)
+                && include_model(model_filter, &d.model)
+            {
                 result
                     .failures
                     .push((d.model.clone(), d.message.to_string()));
@@ -954,6 +967,37 @@ mod tests {
         assert!(why.contains("upstream 'source'"), "{why}");
     }
 
+    /// A consumer record with a bad `depends_on` (E060) is a diagnostic, not a
+    /// failed model: it never appears in `model_results` or `failures`, and
+    /// the model tests still run.
+    #[test]
+    fn a_bad_consumer_record_is_a_diagnostic_and_the_model_tests_still_run() {
+        let (tmp, models) = scaffold_two_model_project();
+        let consumers = tmp.path().join("consumers");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::write(consumers.join("board.toml"), "depends_on = [\"nowhere\"]\n").unwrap();
+        let result = run_tests(&models, None, None, &rocky_core::run_vars::RunVars::new()).unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(rocky_compiler::consumers::is_consumer_diagnostic),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.total, 2, "{:?}", result.model_results);
+        assert_eq!(result.passed, 2, "{:?}", result.model_results);
+        assert!(
+            result
+                .model_results
+                .iter()
+                .all(|m| !m.model.starts_with("consumer:")),
+            "{:?}",
+            result.model_results
+        );
+    }
+
     /// `--model good_mart` filters the reported results to one model. The
     /// upstream `raw_orders` still executes (so good_mart's SQL resolves)
     /// but doesn't appear in `model_results`. Closes the TODO that had
@@ -1221,6 +1265,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: None,
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1446,6 +1491,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&refuse),
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1465,6 +1511,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&silent),
             inlined_gates: None,
+            strict_contracts: false,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1480,6 +1527,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: None,
             inlined_gates: Some(&refuse),
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1521,6 +1569,7 @@ mod tests {
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&record),
             inlined_gates: Some(&record_inlined),
+            strict_contracts: false,
         })
         .unwrap();
         assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");

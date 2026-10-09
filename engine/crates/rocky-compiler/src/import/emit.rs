@@ -11,6 +11,8 @@
 //! │   ├── _defaults.toml
 //! │   ├── <name>.sql
 //! │   └── <name>.toml
+//! ├── consumers/              # one file per dbt exposure
+//! │   └── <name>.toml
 //! ├── seeds/
 //! └── MIGRATION-NOTES.md
 //! ```
@@ -42,6 +44,8 @@ pub struct EmissionResult {
     pub models_skipped: usize,
     /// Number of files copied from `<dbt_project>/seeds/` into `<out>/seeds/`.
     pub seeds_copied: usize,
+    /// Number of `consumers/<name>.toml` files written, one per dbt exposure.
+    pub consumers_written: usize,
     /// Path to the generated `MIGRATION-NOTES.md`.
     pub migration_notes_path: PathBuf,
     /// Path to the generated `rocky.toml`.
@@ -109,6 +113,9 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
 
     write_governance_files(&inputs.import.imported, &models_dir)?;
 
+    let consumers_written =
+        write_consumer_files(&inputs.import.consumers, &inputs.out_dir.join("consumers"))?;
+
     write_models_defaults(&models_dir, inputs.default_catalog, inputs.default_schema)?;
 
     let rocky_toml_path = inputs.out_dir.join("rocky.toml");
@@ -135,6 +142,7 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
             translated,
             models_skipped: inputs.import.failed.len(),
             seeds_copied,
+            consumers_written,
             tests_skipped: inputs.import.tests_found,
             macros_detected: inputs.import.macros_detected,
             unit_tests_found: inputs.import.unit_tests_found,
@@ -154,6 +162,7 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         models_translated: translated,
         models_skipped: inputs.import.failed.len(),
         seeds_copied,
+        consumers_written,
         migration_notes_path,
         rocky_toml_path,
         unknown_materializations,
@@ -251,6 +260,28 @@ fn write_governance_files(models: &[ImportedModel], models_dir: &Path) -> Result
             .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+/// Write one `consumers/<name>.toml` per consumer. Names were checked as
+/// identifiers when the exposure was imported, so none can leave the directory.
+fn write_consumer_files(
+    consumers: &[rocky_core::consumers::Consumer],
+    consumers_dir: &Path,
+) -> Result<usize, String> {
+    if consumers.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(consumers_dir)
+        .map_err(|e| format!("failed to create {}: {e}", consumers_dir.display()))?;
+    for consumer in consumers {
+        if !is_safe_model_file_stem(&consumer.name) {
+            return Err(format!("unsafe consumer name `{}`", consumer.name));
+        }
+        let path = consumers_dir.join(format!("{}.toml", consumer.name));
+        std::fs::write(&path, consumer.to_toml())
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    }
+    Ok(consumers.len())
 }
 
 fn clone_model(m: &ImportedModel) -> ImportedModel {
@@ -966,6 +997,7 @@ struct MigrationContext<'a> {
     translated: usize,
     models_skipped: usize,
     seeds_copied: usize,
+    consumers_written: usize,
     tests_skipped: usize,
     macros_detected: usize,
     unit_tests_found: usize,
@@ -1131,6 +1163,10 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
     out.push_str(&format!("- Models translated: {}\n", ctx.translated));
     out.push_str(&format!("- Models skipped: {}\n", ctx.models_skipped));
     out.push_str(&format!("- Seeds copied: {}\n", ctx.seeds_copied));
+    out.push_str(&format!(
+        "- Consumers written from dbt exposures (`consumers/`): {}\n",
+        ctx.consumers_written
+    ));
     out.push_str(&format!(
         "- dbt tests detected (canonical four mapped to `[[tests]]`; non-canonical surfaced as warnings): {}\n",
         ctx.tests_skipped
@@ -1354,6 +1390,7 @@ mod tests {
             unit_tests_skipped: 0,
             constructs_dropped: 0,
             contracts_dropped: 0,
+            consumers: Vec::new(),
         }
     }
 
@@ -1394,6 +1431,64 @@ mod tests {
         assert!(toml_body.contains("[strategy]"));
         assert!(toml_body.contains("type = \"full_refresh\""));
         assert!(toml_body.contains("[target]"));
+    }
+
+    #[test]
+    fn emits_consumer_files_that_compile_clean() {
+        let dbt_dir = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let mut result = empty_result(vec![make_model(
+            "stg_orders",
+            StrategyConfig::FullRefresh,
+            "SELECT 1 AS id",
+        )]);
+        result.consumers = vec![rocky_core::consumers::Consumer {
+            name: "weekly_board".to_string(),
+            kind: rocky_core::consumers::ConsumerKind::Dashboard,
+            owner: Some("Ana \"the\" owner".to_string()),
+            url: Some("https://bi.example.com/board".to_string()),
+            description: Some("two\nlines".to_string()),
+            depends_on: vec!["stg_orders".to_string()],
+            file_path: PathBuf::new(),
+        }];
+        let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
+
+        let emission = emit_repo(&EmitInputs {
+            dbt_project_dir: dbt_dir.path(),
+            out_dir: out_dir.path(),
+            overwrite: OverwritePolicy::ReplaceContents,
+            profile: &profile,
+            default_catalog: "warehouse",
+            default_schema: "main",
+            import: &result,
+            adapter_override_label: None,
+        })
+        .unwrap();
+        assert_eq!(emission.consumers_written, 1);
+
+        let loaded =
+            rocky_core::consumers::load_consumers_from_dir(&out_dir.path().join("consumers"));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(loaded.consumers[0].owner, result.consumers[0].owner);
+        assert_eq!(
+            loaded.consumers[0].description,
+            result.consumers[0].description
+        );
+
+        // The emitted repo compiles with no E060.
+        let compiled = crate::compile::compile(&crate::compile::CompilerConfig {
+            models_dir: out_dir.path().join("models"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !compiled.diagnostics.iter().any(|d| &*d.code == "E060"),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert_eq!(compiled.consumers.len(), 1);
+        let notes = std::fs::read_to_string(out_dir.path().join("MIGRATION-NOTES.md")).unwrap();
+        assert!(notes.contains("Consumers written from dbt exposures"));
     }
 
     #[test]

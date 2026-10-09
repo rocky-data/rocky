@@ -12,6 +12,7 @@ pub mod circuit_breaker;
 pub mod column_map;
 pub mod compare;
 pub mod config;
+pub mod consumers;
 pub mod contracts;
 pub mod cost;
 pub mod cross_engine;

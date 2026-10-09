@@ -85,9 +85,13 @@ export type ImportDbtHookKind = "pre" | "post";
 export interface ImportDbtOutput {
   command: string;
   /**
-   * Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
+   * Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models), plus the exposures and exposure dependencies that could not be carried over to a consumer.
    */
   constructs_dropped?: number;
+  /**
+   * Number of dbt exposures written as downstream consumers (`consumers/<name>.toml`).
+   */
+  consumers_imported?: number;
   /**
    * Number of dbt models whose enforced `contract` was written to a `{model}.contract.toml` but not fully: a column type Rocky has no name for, or a constraint Rocky does not check (`unique`, `check`, ...).
    */

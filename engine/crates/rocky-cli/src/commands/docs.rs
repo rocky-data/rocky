@@ -147,7 +147,8 @@ pub fn run_docs(
         &contracts,
         lineage,
         compiled.is_some(),
-    );
+    )
+    .with_consumers(&load_doc_consumers(config_path));
     let index = &docs.index;
 
     // A `[columns]` description whose column the compile step cannot see
@@ -221,15 +222,17 @@ pub fn run_docs(
             duration_ms,
             format: shape.into(),
             sources_count,
+            consumers_count: docs.consumers.len(),
             files: written,
         };
         print_json(&output)?;
     } else {
         println!(
-            "Documentation generated: {} ({shape}, {} models, {} sources, {} files, {} ms)",
+            "Documentation generated: {} ({shape}, {} models, {} sources, {} consumers, {} files, {} ms)",
             output_path.display(),
             models_count,
             sources_count,
+            docs.consumers.len(),
             written.len(),
             duration_ms
         );
@@ -268,6 +271,21 @@ fn write_site(docs: &ProjectDocs, dir: &Path) -> Result<Vec<String>> {
             .context(format!("failed to write {}", path.display()))?;
     }
     Ok(files.into_iter().map(|f| f.path).collect())
+}
+
+/// Downstream consumers for the docs. A file that cannot be read is skipped
+/// with a warning, as for contracts; `rocky compile` reports it as `E060`.
+fn load_doc_consumers(config_path: &Path) -> Vec<rocky_core::consumers::Consumer> {
+    let root = config_path.parent().unwrap_or_else(|| Path::new(""));
+    let loaded = rocky_core::consumers::load_consumers_for_root(root);
+    for error in &loaded.errors {
+        warn!(
+            file = %error.file_path.display(),
+            error = %error.message,
+            "consumer file could not be read; docs omit it"
+        );
+    }
+    loaded.consumers
 }
 
 /// Contracts for the docs: the ones auto-discovered next to each model, then
@@ -373,6 +391,7 @@ fn compile_for_docs(
         .clone()
         .with_ttl_override(cache_ttl_override);
     let compiler_cfg = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -387,6 +406,7 @@ fn compile_for_docs(
         source_provenance: Default::default(),
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
+        project: None,
     };
     // The models are already loaded (and were loaded strictly), so compile
     // them directly instead of re-reading the directory — one load, and the
@@ -401,7 +421,7 @@ fn compile_for_docs(
             return None;
         }
     };
-    if result.has_errors {
+    if rocky_compiler::consumers::has_model_errors(&result) {
         let first = result
             .diagnostics
             .iter()

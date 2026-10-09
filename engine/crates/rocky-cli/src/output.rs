@@ -428,6 +428,14 @@ pub struct RunOutput {
     /// no overrides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_warnings: Vec<OverrideWarningOutput>,
+    /// Problems in the project's `consumers/` records (`E060`): a file that
+    /// does not load, a duplicate name, a `depends_on` entry that names no
+    /// model, or an unreadable directory. A consumer is metadata about readers
+    /// of the models, so these never stop a model from being written and are
+    /// never counted as a failed table. `rocky compile` and `rocky ci` do
+    /// refuse on them. Empty (and omitted) when the records are sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
 /// Soft warning surfaced on
@@ -2435,6 +2443,29 @@ impl CompileOutput {
         self
     }
 
+    /// The error diagnostics that block a caller which only builds models:
+    /// every error except a consumer record problem (`E060`), which is about
+    /// a dashboard's `depends_on`, not about any model.
+    #[must_use]
+    pub fn model_error_lines(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.is_error() && !rocky_compiler::consumers::is_consumer_diagnostic(d))
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
+    /// The consumer record problems (`E060`) this compile found, to report
+    /// without blocking on them.
+    #[must_use]
+    pub fn consumer_problem_lines(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|d| rocky_compiler::consumers::is_consumer_diagnostic(d))
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
     /// Attach expanded SQL (post-macro-expansion) for each model.
     #[must_use]
     pub fn with_expanded_sql(mut self, expanded: HashMap<String, String>) -> Self {
@@ -3812,6 +3843,33 @@ pub struct LineageOutput {
     /// JSON payloads cached locally may omit the field entirely.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<LineageNodeDef>,
+    /// Downstream consumers (dashboards, notebooks, ML jobs, applications
+    /// declared in `consumers/`) that read the focal model, directly or
+    /// through the models downstream of it. Sorted by name. These are not
+    /// models, so they are not part of `downstream`. Omitted when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumers: Vec<LineageConsumerRecord>,
+}
+
+/// One downstream consumer in a `rocky lineage` view.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LineageConsumerRecord {
+    /// Consumer name.
+    pub name: String,
+    /// `dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.
+    pub kind: String,
+    /// Owner, when declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Where to find it, when declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// What it is for, when declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `true` when the consumer reads the focal model itself; `false` when
+    /// it reads only models downstream of it.
+    pub direct: bool,
 }
 
 /// JSON output for `rocky lineage <model> --column <col>`.
@@ -5177,9 +5235,15 @@ pub struct ImportDbtOutput {
     #[serde(default)]
     pub unit_tests_skipped: usize,
     /// Number of dbt resources the importer does not translate that were
-    /// detected and skipped (snapshots, metrics, semantic models, exposures).
+    /// detected and skipped (snapshots, metrics, semantic models), plus the
+    /// exposures and exposure dependencies that could not be carried over to
+    /// a consumer.
     #[serde(default)]
     pub constructs_dropped: usize,
+    /// Number of dbt exposures written as downstream consumers
+    /// (`consumers/<name>.toml`).
+    #[serde(default)]
+    pub consumers_imported: usize,
     /// Number of dbt models whose enforced `contract` was written to a
     /// `{model}.contract.toml` but not fully: a column type Rocky has no name
     /// for, or a constraint Rocky does not check (`unique`, `check`, ...).
@@ -5304,7 +5368,8 @@ pub enum ImportDbtStructuredWarning {
     MicrobatchMapped { model: String, mapped_to: String },
     /// A dbt construct the importer does not translate was detected and
     /// skipped (snapshot, source freshness, grants, meta, metric, semantic
-    /// model, exposure), surfaced so a migration is never silently lossy.
+    /// model, an exposure, or an exposure dependency that is not a model),
+    /// surfaced so a migration is never silently lossy.
     DroppedConstruct {
         construct: String,
         name: String,
@@ -5687,6 +5752,8 @@ pub struct DocsOutput {
     pub format: String,
     /// External tables the models read.
     pub sources_count: usize,
+    /// Downstream consumers (`consumers/`) the documentation lists.
+    pub consumers_count: usize,
     /// Files written, relative to `output_path` (for `html`, the file name).
     pub files: Vec<String>,
 }
@@ -6057,6 +6124,7 @@ impl RunOutput {
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            consumer_diagnostics: vec![],
         }
     }
 
@@ -6807,6 +6875,11 @@ pub struct DagRunOutput {
     pub duration_ms: u64,
     /// Per-node execution records, sorted by (layer, id).
     pub nodes: Vec<DagRunNodeOutput>,
+    /// Problems in the project's `consumers/` records (`E060`). Reported once
+    /// for the whole graph; they never fail a node. Empty (and omitted) when
+    /// the records are sound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
 /// Per-node record in a [`DagRunOutput`].

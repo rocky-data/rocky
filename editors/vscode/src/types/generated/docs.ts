@@ -10,6 +10,10 @@
  */
 export interface DocsOutput {
   command: string;
+  /**
+   * Downstream consumers (`consumers/`) the documentation lists.
+   */
+  consumers_count: number;
   duration_ms: number;
   /**
    * Files written, relative to `output_path` (for `html`, the file name).

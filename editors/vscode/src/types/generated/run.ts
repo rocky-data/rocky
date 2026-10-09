@@ -88,6 +88,12 @@ export type CheckResult1 =
  */
 export type TestSeverity = "error" | "warning";
 /**
+ * Severity level of a diagnostic.
+ *
+ * Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+ */
+export type Severity = "Error" | "Warning" | "Info";
+/**
  * Coarse-grained failure classification for an entry on [`RunOutput::errors`]. Lets orchestrators branch on the kind of failure (retry, page someone, surface in the UI) without parsing the free-form `error` string.
  *
  * Variants partition the [`rocky_databricks::connector::ConnectorError`] and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown` is the fallback for non-connector failures (drift, governance, adapter-internal errors) where the error reached the output layer already type-erased.
@@ -145,6 +151,10 @@ export interface RunOutput {
   check_gate_failed?: boolean;
   check_results: TableCheckOutput[];
   command: string;
+  /**
+   * Problems in the project's `consumers/` records (`E060`): a file that does not load, a duplicate name, a `depends_on` entry that names no model, or an unreadable directory. A consumer is metadata about readers of the models, so these never stop a model from being written and are never counted as a failed table. `rocky compile` and `rocky ci` do refuse on them. Empty (and omitted) when the records are sound.
+   */
+  consumer_diagnostics?: Diagnostic[];
   /**
    * Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.
    */
@@ -301,6 +311,47 @@ export interface BudgetBreachOutput {
 export interface TableCheckOutput {
   asset_key: string[];
   checks: CheckResult[];
+  [k: string]: unknown;
+}
+/**
+ * A compiler diagnostic (error, warning, or informational message).
+ *
+ * `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+ */
+export interface Diagnostic {
+  /**
+   * Diagnostic code (e.g., "E001", "W001").
+   */
+  code: string;
+  /**
+   * Human-readable message.
+   */
+  message: string;
+  /**
+   * Which model this diagnostic relates to.
+   */
+  model: string;
+  /**
+   * Severity level.
+   */
+  severity: Severity;
+  /**
+   * Source location (if available).
+   */
+  span?: SourceSpan | null;
+  /**
+   * Suggested fix (if any).
+   */
+  suggestion?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Location in a source file.
+ */
+export interface SourceSpan {
+  col: number;
+  file: string;
+  line: number;
   [k: string]: unknown;
 }
 /**

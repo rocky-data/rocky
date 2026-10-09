@@ -677,17 +677,11 @@ impl Runner {
             false,
             None,
         ) {
-            Ok(output) => {
-                if output.has_errors {
-                    let rendered: Vec<String> = output
-                        .diagnostics
-                        .iter()
-                        .map(|d| format!("{}: {}", d.code, d.message))
-                        .collect();
-                    detail.push(format!("compile errors: {}", rendered.join("; ")));
-                }
-                !output.has_errors
-            }
+            Ok(output) => compile_gate(
+                &output.model_error_lines(),
+                &output.consumer_problem_lines(),
+                &mut detail,
+            ),
             Err(err) => {
                 detail.push(format!("compile failed: {err:#}"));
                 false
@@ -1951,6 +1945,28 @@ struct ApprovedSpec {
     parsed: rocky_core::product::spec::ParsedSpec,
 }
 
+/// The verify bundle's compile gate: green when the compile has no model
+/// error. A consumer record problem (`E060`) is about a dashboard file, not
+/// the product's model, so it is reported in the detail but never turns the
+/// gate red; otherwise a bad dashboard file would stall the loop.
+fn compile_gate(
+    model_errors: &[String],
+    consumer_problems: &[String],
+    detail: &mut Vec<String>,
+) -> bool {
+    if !consumer_problems.is_empty() {
+        detail.push(format!(
+            "consumer record problems (not blocking): {}",
+            consumer_problems.join("; ")
+        ));
+    }
+    if model_errors.is_empty() {
+        return true;
+    }
+    detail.push(format!("compile errors: {}", model_errors.join("; ")));
+    false
+}
+
 /// Turn a count attempt into the typed field plus its `detail` note.
 ///
 /// Pure, so the rule that a FAILED count never becomes `Some(0)` is
@@ -2360,5 +2376,35 @@ mod state_store_placement {
             with_state_path("rocky review plan-1 --approve", Path::new("/tmp/a b.redb")),
             "rocky --state-path '/tmp/a b.redb' review plan-1 --approve"
         );
+    }
+}
+
+#[cfg(test)]
+mod compile_gate_tests {
+    use super::compile_gate;
+
+    #[test]
+    fn a_consumer_problem_is_reported_and_does_not_block() {
+        let mut detail = Vec::new();
+        let green = compile_gate(
+            &[],
+            &["E060: consumer `board` depends on `nowhere`".to_string()],
+            &mut detail,
+        );
+        assert!(green, "{detail:?}");
+        assert_eq!(detail.len(), 1);
+        assert!(detail[0].contains("not blocking") && detail[0].contains("E060"));
+    }
+
+    #[test]
+    fn a_model_error_blocks_even_beside_a_consumer_problem() {
+        let mut detail = Vec::new();
+        let green = compile_gate(
+            &["E001: bad".to_string()],
+            &["E060: board".to_string()],
+            &mut detail,
+        );
+        assert!(!green);
+        assert!(detail.iter().any(|d| d.starts_with("compile errors: E001")));
     }
 }

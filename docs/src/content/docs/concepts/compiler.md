@@ -153,7 +153,7 @@ A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGIN
 An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
 A `UNION`, `INTERSECT` or `EXCEPT` is typed from all its branches, paired by position. The column name comes from the first branch. A column is non-null only if it is non-null in every branch, and its type is the common supertype of the branches (`Unknown` if there is none). If Rocky cannot type the query (for example branches with different column counts, or a `VALUES` branch), every column is nullable and computed columns are `Unknown`.
-A cast of a column Rocky can type is the cast's target type: `CAST(o.quantity * p.price AS DECIMAL(12, 2))` is `Decimal(12, 2)`. A cast of a column Rocky cannot type stays `Unknown`, because Rocky cannot say whether it is nullable. A bare `DECIMAL` with no precision stays `Unknown`.
+A cast of a column Rocky can type is the cast's target type: `CAST(o.quantity * p.price AS DECIMAL(12, 2))` is `Decimal(12, 2)`. A cast of a column Rocky cannot type takes its target type only for `BOOLEAN`, `DOUBLE` (`DOUBLE PRECISION`, `FLOAT64`), `DATE`, text types (`VARCHAR`, `CHAR`, `TEXT`, `STRING`), binary types (`BINARY`, `VARBINARY`, `BLOB`), and `DECIMAL` or `NUMERIC` with digits (`DECIMAL(p)` or `DECIMAL(p, s)`, `1 <= p <= 38`, `0 <= s <= p`); the column stays nullable. `INT`, `INTEGER`, `SMALLINT`, `TINYINT`, `BIGINT`, `FLOAT`, `REAL`, `TIMESTAMP`, a bare `DECIMAL` or `NUMERIC`, and `DECIMAL` digits out of that range stay `Unknown`, because their width differs by warehouse (Snowflake `BIGINT` and `INTEGER` are `NUMBER(38,0)`, `FLOAT` is 64-bit, `TIMESTAMP` is `TIMESTAMP_NTZ`).
 A `CASE` or `COALESCE` takes a type when its branches agree exactly. Each branch must be a column, a cast, `COUNT`, a text or boolean literal, or `NULL`, and every branch must have the same type. `CASE WHEN price < 20 THEN 'budget' ELSE 'premium' END` is `String`, and `COALESCE(order_count, 0)` over a `BIGINT` is `Int64`. An integer literal counts only when it does not change the type, so `COALESCE(qty, 0)` over an `INT` stays `Unknown`. A branch with a fraction (`1.5`) or two branches of different widths also leave the result `Unknown`.
 Date arithmetic is `Unknown`, because warehouses disagree on its type: `DATE - DATE` is a `BIGINT` in DuckDB and an interval in Databricks.
 An aggregate over a computed argument takes its type from that argument only when the argument's type comes from the SQL itself (a cast target): `SUM(CAST(y AS DOUBLE))` is `Float64`. Otherwise it stays `Unknown`: `MAX(LENGTH(n))` is `Unknown`, because the width of `LENGTH` differs between warehouses. `SUM` or `AVG` over a cast to `DECIMAL` is also `Unknown`, because each warehouse widens the precision differently.
@@ -204,19 +204,42 @@ To fail the compile on the warnings, run
 
 #### Unknown functions
 
-Rocky reports `E057` when a model calls a function that the target warehouse
-does not have and that the project does not declare in `functions/`:
+Rocky reports a call to a function that the target warehouse does not have
+and that the project does not declare in `functions/`:
 
 ```sql
 -- E057: function `SUMM` does not exist in DuckDB and is not a project function in `functions/`
 SELECT customer_id, SUMM(amount) AS lifetime_value FROM fct_orders GROUP BY customer_id
 ```
 
-The message suggests close names (`did you mean sum?`). The check runs only for
-models that run on DuckDB, because only DuckDB has a complete function list in
-Rocky. The list holds DuckDB's built-in functions and the functions its
-extensions load on first use. Other warehouses are not checked, and neither is
-a project whose `[portability] target_dialect` names another warehouse.
+The message suggests close names (`did you mean sum?`). Each warehouse has a
+list of its functions: aggregate, window and table functions, and common
+aliases. How Rocky treats a miss depends on how the list was made:
+
+| Warehouse | List | Checked against a live engine | Code |
+|---|---|---|---|
+| DuckDB | `duckdb_functions()` of DuckDB 1.5, plus functions its extensions load on first use | yes | `E057` (error) |
+| PostgreSQL | The PostgreSQL 17 built-in function catalog (`pg_proc`), plus the SQL-standard forms it lacks | yes, PostgreSQL 17.11 | `W057`: extensions add functions |
+| Snowflake | Vendor function reference | no, built from the docs | `W057` (warning) |
+| Databricks | Vendor function reference and the Spark list | no, built from the docs | `W057` |
+| Spark | `SHOW FUNCTIONS` of Spark 4.0.1 with Delta Lake 4.0.0 | yes | `W057`: UDFs and session extensions add functions |
+| BigQuery | Vendor function reference | no, built from the docs | `W057` |
+| Trino | `SHOW FUNCTIONS` of Trino 483, plus the names it hides (`version`, `format`, SQL special forms) | yes | `W057`: connectors add functions |
+| Redshift | Vendor function reference and the PostgreSQL list | no, built from the docs | `W057` |
+| SQL Server, ClickHouse | none yet | | not checked |
+
+A false refusal of a real function costs more than a missed typo, so only
+DuckDB gets the error `E057`. A list built from documentation can lag a
+release, so Snowflake, Databricks, BigQuery and Redshift get the warning
+`W057`. The PostgreSQL, Trino and Spark lists were checked live, but they hold
+the built-in catalog of one version only: a PostgreSQL extension (PostGIS,
+pgcrypto), a Trino connector, or a Spark UDF, `CREATE FUNCTION` or session
+extension adds functions with plain names, so those three get `W057` too. A warning never fails
+a compile alone. To fail on it, run `rocky compile --deny-warnings W057`. The
+lists were built and checked on 2026-10-09. Each file under `engine/crates/rocky-compiler/src/data/` names its source.
+A model that runs on several warehouses is checked against each. When
+`[portability] target_dialect` names a warehouse, a model is checked only
+against that warehouse.
 
 These calls are never reported:
 
@@ -224,6 +247,8 @@ These calls are never reported:
   macro or an extension function that you load outside Rocky.
 - A quoted function name.
 - A function declared in `functions/`.
+- A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
+  `IFNULL`.
 
 ### 5. Validate contracts
 
@@ -561,7 +586,8 @@ span, and sometimes a suggested fix.
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
 | `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
 | `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
-| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB only). See [Unknown functions](#unknown-functions) |
+| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB; the other warehouses with a list get `W057`). See [Unknown functions](#unknown-functions) |
+| `E060` | A downstream-consumer file in `consumers/` is invalid: it does not parse, two consumers share a name, or `depends_on` names something that is not a model. See [Downstream consumers](/concepts/downstream-consumers/) |
 | `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
@@ -599,6 +625,7 @@ span, and sometimes a suggested fix.
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
+| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
@@ -606,6 +633,7 @@ span, and sometimes a suggested fix.
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
+| `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |

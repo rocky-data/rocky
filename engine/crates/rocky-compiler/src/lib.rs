@@ -20,6 +20,7 @@ pub mod blast_radius;
 pub mod cache;
 pub mod clickhouse_options;
 pub mod compile;
+pub mod consumers;
 pub mod contracts;
 pub mod cost_check;
 pub mod cycle;

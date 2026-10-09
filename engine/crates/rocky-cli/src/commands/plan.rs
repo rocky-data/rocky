@@ -1223,6 +1223,7 @@ pub(crate) fn conditional_drops_for_run_plan(
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -1234,6 +1235,7 @@ pub(crate) fn conditional_drops_for_run_plan(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let compiled = match models_glob {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -1451,6 +1453,7 @@ fn plan_preview_output_for_pipeline(
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -1462,6 +1465,7 @@ fn plan_preview_output_for_pipeline(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -1714,6 +1718,30 @@ fn plan_preview_output_for_pipeline(
     Ok(output)
 }
 
+/// The compile errors that stop a run plan from being persisted.
+///
+/// A consumer record problem (`E060`) is about a dashboard's `depends_on`, not
+/// a model, so it never blocks a plan that writes models. `rocky compile` and
+/// `rocky ci` still refuse on it.
+fn run_plan_refusals(
+    diagnostics: &[rocky_compiler::diagnostic::Diagnostic],
+    model: Option<&str>,
+    needed: &BTreeSet<String>,
+) -> Vec<SkippedModel> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.is_error()
+                && !rocky_compiler::consumers::is_consumer_diagnostic(diagnostic)
+                && (model.is_none() || needed.contains(&diagnostic.model))
+        })
+        .map(|diagnostic| SkippedModel {
+            model: diagnostic.model.clone(),
+            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
+        })
+        .collect()
+}
+
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return
 /// `Some(RunPlanBuild)`.
@@ -1738,6 +1766,7 @@ fn build_and_persist_run_plan(
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -1749,6 +1778,7 @@ fn build_and_persist_run_plan(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -1778,18 +1808,7 @@ fn build_and_persist_run_plan(
             }
         }
     }
-    let refused: Vec<SkippedModel> = result
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.is_error()
-                && (run_options.model.is_none() || needed.contains(&diagnostic.model))
-        })
-        .map(|diagnostic| SkippedModel {
-            model: diagnostic.model.clone(),
-            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
-        })
-        .collect();
+    let refused = run_plan_refusals(&result.diagnostics, run_options.model.as_deref(), &needed);
     if !refused.is_empty() {
         return Ok(Some(RunPlanBuild::Refused(refused)));
     }
@@ -2749,6 +2768,7 @@ pub fn populate_governance_actions(
     let tag_to_strategy = cfg.resolve_mask_for_env(env);
 
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -2760,6 +2780,7 @@ pub fn populate_governance_actions(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     })
     .context("failed to compile project for governance preview")?;
 
@@ -2854,6 +2875,7 @@ async fn check_plan_budget(
 
     // Compile models offline — no catalog I/O here.
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -2865,6 +2887,7 @@ async fn check_plan_budget(
         source_provenance: Default::default(),
         preserve_authored_sql: false,
         external_dependencies: Default::default(),
+        project: None,
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,
@@ -3704,6 +3727,21 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_consumer_diagnostic_does_not_refuse_a_run_plan() {
+        use rocky_compiler::diagnostic::{Diagnostic, E060};
+        let diagnostics = vec![
+            Diagnostic::error(E060, "consumer:board", "depends_on names no model"),
+            Diagnostic::error("E001", "orders", "broken"),
+        ];
+        let needed = std::collections::BTreeSet::new();
+        let refused = super::run_plan_refusals(&diagnostics, None, &needed);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].model, "orders");
+        let only_consumer = &diagnostics[..1];
+        assert!(super::run_plan_refusals(only_consumer, None, &needed).is_empty());
+    }
 
     #[tokio::test]
     async fn plan_branch_refuses_hyphen_before_config_io() {

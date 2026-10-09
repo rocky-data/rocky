@@ -278,6 +278,37 @@ def test_results_e014_maps_to_column_constraints():
     assert r.passed is False, "an E014 violation must fail the check, not pass silently"
 
 
+def test_results_e059_maps_to_column_constraints():
+    """E059 (strict contracts: declared type not checkable) fails the check.
+
+    Unmapped, the dispatch would drop it and the check would report PASSING
+    for a run Rocky refused.
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag(
+                    "E059",
+                    "orders",
+                    "column 'id' of model 'orders': the contract declares type Int64, but "
+                    "Rocky cannot work out the column's type, so the declared type cannot "
+                    "be checked",
+                ),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].check_name == CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    assert results[0].passed is False
+
+
 def test_results_i003_passes_but_is_listed_as_unverified():
     """I003 is not a violation, so the check passes — but it must not be hidden.
 

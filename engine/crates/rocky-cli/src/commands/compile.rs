@@ -71,6 +71,7 @@ pub fn run_compile(
         cache_ttl_override,
         run_vars,
         false,
+        false,
         deny_warning_codes,
         None,
     )
@@ -84,6 +85,10 @@ pub fn run_compile(
 /// to E045
 /// for this invocation. It ORs with `[cache.schemas] strict_sources`; it can
 /// turn strictness on, never off.
+///
+/// `strict_contracts` (`rocky compile --strict-contracts`) turns `I003` (a
+/// contract declares a column type Rocky cannot check) into the `E059` error.
+/// It ORs with `[contracts] strict`; it can turn strictness on, never off.
 ///
 /// `selection` (`--select` / `--exclude`) scopes the report: the whole
 /// project still compiles (types flow across models); only the selected
@@ -107,6 +112,7 @@ pub fn run_compile_with_options(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     deny_warning_codes: &[String],
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
@@ -128,6 +134,7 @@ pub fn run_compile_with_options(
         cache_ttl_override,
         run_vars,
         strict_sources,
+        strict_contracts,
         selection,
     )?;
 
@@ -171,6 +178,7 @@ pub fn run_compile_dbt_attach(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     deny_warning_codes: &[String],
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
@@ -231,6 +239,7 @@ pub fn run_compile_dbt_attach(
         cache_ttl_override,
         run_vars,
         strict_sources,
+        strict_contracts,
         deny_warning_codes,
         selection,
     )
@@ -273,6 +282,7 @@ fn compile_inner(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
@@ -367,6 +377,12 @@ fn compile_inner(
         (schemas, provenance)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
+    // `--strict-contracts` ORs with `[contracts] strict`; it can turn
+    // strictness on, never off.
+    let strict_contracts = strict_contracts
+        || project_config
+            .as_ref()
+            .is_some_and(|config| config.contracts.strict);
 
     // Load `[mask]` + `[classifications.allow_unmasked]` for the W004
     // classification-tag completeness check. No rocky.toml (standalone
@@ -399,6 +415,7 @@ fn compile_inner(
         project_freshness,
         run_vars: run_vars.clone(),
         source_provenance,
+        strict_contracts,
         // The lints below (P001, E042/E043, imports E030/E033) judge each
         // model's SQL as authored. Against the inlined form, an ephemeral
         // model's defect would be reported again on every consumer, at
@@ -406,6 +423,7 @@ fn compile_inner(
         // is written back after them, for `--expand-macros`.
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
+        project: None,
     };
 
     // Without `--models`, one compile over every transformation pipeline's
@@ -418,6 +436,17 @@ fn compile_inner(
         }
         (ModelScope::WholeProject, None) | (ModelScope::Dir, _) => None,
     };
+    // `consumers/` belongs to the project, not to whichever models this
+    // compile covers: read it from the config's directory and judge it against
+    // every model in the project. A whole-project compile already holds them.
+    let mut config = config;
+    if let Some(project) = &project_config {
+        let mut context = rocky_compiler::consumers::project_context(config_file_path, project);
+        if let Some(models) = &whole_project {
+            context.model_names = rocky_compiler::consumers::model_name_set(models);
+        }
+        config.project = Some(context);
+    }
     let compiled = match whole_project {
         Some(models) => compile::compile_preloaded_models(models, &config),
         None => compile::compile(&config),
@@ -845,7 +874,7 @@ fn apply_adapter_gates(result: &mut compile::CompileResult, targets: &ModelTarge
 }
 
 /// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043),
-/// and calls to functions the target warehouse does not have (E057).
+/// and calls to functions the target warehouse does not have (E057, W057).
 /// These judge against the warehouse that will run the SQL, so they need a
 /// dialect the compiler core does not carry; see `operand_target_for` for
 /// the precedence.
@@ -863,19 +892,19 @@ fn apply_operand_gates(
         &result.type_check.typed_models,
         &target_for,
     );
-    // Calls to functions the target warehouse does not have (E057). Skipped
-    // when `[portability] target_dialect` says the SQL is written for another
-    // warehouse: its functions are not DuckDB's, and P001 covers portability.
-    let written_for_other = project_config
+    // Calls to functions the target warehouse does not have: E057 on the
+    // warehouses whose list was checked against a live engine, W057 on the
+    // others (their list is built from documentation). A model is not judged against a warehouse other than the one `[portability]
+    // target_dialect` says its SQL is written for: P001 covers portability.
+    let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
-        .is_some_and(|d| d != Dialect::DuckDB);
-    if !written_for_other {
-        operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
-            &result.project.models,
-            result.semantic_graph.functions(),
-            &target_for,
-        ));
-    }
+        .map(rocky_compiler::operand_check::OperandDialect::from);
+    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
+        &result.project.models,
+        result.semantic_graph.functions(),
+        &target_for,
+        written_for,
+    ));
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }
@@ -1474,6 +1503,8 @@ pub fn compile_output(
         &rocky_core::run_vars::RunVars::new(),
         // No `--strict-sources` flag on these surfaces; `[cache.schemas]
         // strict_sources` still applies.
+        false,
+        // Likewise `[contracts] strict` still applies.
         false,
         None,
     )?;
@@ -3205,6 +3236,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             strict_sources,
+            false,
             None,
         )
         .expect("compile should produce output")
@@ -3275,6 +3307,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             true,
+            false,
             &[],
             None,
         )
@@ -3404,6 +3437,7 @@ schema_template = "s"
                 None,
                 &rocky_core::run_vars::RunVars::new(),
                 false,
+                false,
                 None,
             )
             .unwrap()
@@ -3487,6 +3521,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             false,
+            false,
             None,
         )
         .unwrap()
@@ -3531,6 +3566,54 @@ schema_template = "s"
             "{:?}",
             one_dir.diagnostics
         );
+    }
+
+    /// A consumer that reads a model of another pipeline is not an E060 when
+    /// the compile covers one directory: `consumers/` is the project's and is
+    /// judged against every model in it. A name that is a model nowhere is
+    /// still an E060, scoped or not.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn consumers_are_judged_against_the_whole_project_in_a_scoped_compile() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        fs::create_dir_all(root.join("consumers")).unwrap();
+        fs::write(
+            root.join("consumers").join("board.toml"),
+            "depends_on = [\"stg\", \"rep\"]\n",
+        )
+        .unwrap();
+        let e060 = |o: &CompileOutput| {
+            o.diagnostics
+                .iter()
+                .filter(|d| &*d.code == "E060")
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let one_dir = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(one_dir.models, 1);
+        assert!(e060(&one_dir).is_empty(), "{:?}", one_dir.diagnostics);
+
+        fs::write(
+            root.join("consumers").join("board.toml"),
+            "depends_on = [\"stg\", \"nowhere\"]\n",
+        )
+        .unwrap();
+        let broken = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
+        let messages = e060(&broken);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("`nowhere`"), "{}", messages[0]);
     }
 
     /// The control: with a contract that matches, the whole-project compile
