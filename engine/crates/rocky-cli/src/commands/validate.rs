@@ -765,6 +765,33 @@ fn validate_adapter(
                 }
             }
         }
+        "spark" => {
+            // Same parse the registry runs before connecting: a missing or
+            // malformed host, an unknown `extra` key, a bad `table_format`,
+            // or `use_ssl = false` with a token is reported here rather than
+            // at `rocky run`.
+            let parsed = crate::registry::spark_table_format(name, adapter)
+                .and_then(|_| crate::registry::spark_config(name, adapter));
+            match parsed {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: spark (beta)"),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
         "sqlserver" => {
             // Same parse the registry runs before connecting: a missing
             // host / database, no or several auth methods, or an unknown

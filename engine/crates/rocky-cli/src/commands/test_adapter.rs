@@ -26,6 +26,7 @@ const BUILTIN_ADAPTERS: &[&str] = &[
     "redshift",
     "clickhouse",
     "sqlserver",
+    "spark",
 ];
 
 /// Run the conformance test suite against a process adapter.
@@ -185,6 +186,20 @@ pub async fn run_test_adapter_builtin(
         // database is the connection), page-level `TABLESAMPLE`. No
         // governance or batch checks yet.
         "sqlserver" => AdapterCapabilities {
+            warehouse: true,
+            discovery: false,
+            governance: false,
+            batch_checks: false,
+            create_catalog: false,
+            create_schema: true,
+            merge: true,
+            tablesample: true,
+            file_load: false,
+        },
+        // Spark (Spark Connect, Delta Lake by default): MERGE, schemas but no
+        // catalogs (a catalog is server configuration), `TABLESAMPLE`. No
+        // governance or batch checks yet.
+        "spark" => AdapterCapabilities {
             warehouse: true,
             discovery: false,
             governance: false,

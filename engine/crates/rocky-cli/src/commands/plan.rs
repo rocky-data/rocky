@@ -815,6 +815,7 @@ pub(crate) fn dialect_for_adapter_type(
         "redshift" => Box::new(rocky_postgres::RedshiftDialect::new()),
         "clickhouse" => Box::new(rocky_clickhouse::ClickHouseDialect::new()),
         "sqlserver" => Box::new(rocky_sqlserver::SqlServerDialect::new()),
+        "spark" => Box::new(rocky_spark::SparkDialect::new()),
         #[cfg(feature = "duckdb")]
         "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
         other => {
@@ -830,13 +831,14 @@ pub(crate) fn dialect_for_adapter_type(
 
 /// [`dialect_for_adapter_type`] for a whole `[adapter]` block, so options
 /// that change the rendered SQL (`postgres` `merge_mode`, `redshift`
-/// `late_binding_views`, `sqlserver` `flavor`) reach the preview exactly as
-/// `rocky run` will use them.
+/// `late_binding_views`, `sqlserver` `flavor`, `spark` `table_format`) reach
+/// the preview exactly as `rocky run` will use them.
 pub(crate) fn dialect_for_adapter(
     adapter: &rocky_core::config::AdapterConfig,
 ) -> Box<dyn rocky_core::traits::SqlDialect> {
     crate::registry::postgres_dialect_for_config(adapter)
         .or_else(|| crate::registry::sqlserver_dialect_for_config(adapter))
+        .or_else(|| crate::registry::spark_dialect_for_config(adapter))
         .unwrap_or_else(|| dialect_for_adapter_type(&adapter.adapter_type))
 }
 

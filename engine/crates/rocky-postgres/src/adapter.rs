@@ -95,6 +95,18 @@ impl PostgresWarehouseAdapter {
     }
 }
 
+/// The row count to report for `sql`. The connector returns the count of
+/// the LAST command. A Redshift `MERGE` ends with `DROP TABLE` of its
+/// temporary source table, whose count is always 0, so the count is unknown
+/// (`None`) rather than a wrong 0.
+fn rows_affected_of(sql: &str, rows: Option<u64>) -> Option<u64> {
+    let tail = sql.trim_end().rsplit(";\n").next().unwrap_or_default();
+    if tail.starts_with("DROP TABLE ") && sql.contains("MERGE INTO ") {
+        return None;
+    }
+    rows
+}
+
 fn wrap(err: PgError) -> AdapterError {
     AdapterError::new(err)
 }
@@ -146,7 +158,7 @@ impl WarehouseAdapter for PostgresWarehouseAdapter {
     async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
         let rows = self.client.execute(sql).await.map_err(wrap)?;
         Ok(ExecutionStats {
-            rows_affected: rows,
+            rows_affected: rows_affected_of(sql, rows),
             ..ExecutionStats::default()
         })
     }
@@ -378,5 +390,35 @@ impl WarehouseAdapter for PostgresWarehouseAdapter {
             "checksum-bisection diff is not supported on {} yet; use the sampled comparison",
             self.flavor().adapter_type()
         )))
+    }
+}
+
+#[cfg(test)]
+mod rows_affected_tests {
+    use super::*;
+    use rocky_core::traits::SqlDialect;
+
+    #[test]
+    fn a_redshift_merge_reports_no_count_instead_of_the_drop_s_zero() {
+        let merge = crate::RedshiftDialect::new()
+            .merge_into(
+                "m.t",
+                "SELECT 1 AS id, 2 AS v",
+                &[std::sync::Arc::from("id")],
+                &rocky_ir::ColumnSelection::Explicit(vec!["id".into(), "v".into()]),
+            )
+            .unwrap();
+        assert_eq!(rows_affected_of(&merge, Some(0)), None);
+        assert_eq!(
+            rows_affected_of("DELETE FROM t WHERE x;\nINSERT INTO t SELECT 1", Some(1)),
+            Some(1)
+        );
+        assert_eq!(
+            rows_affected_of(
+                "DROP TABLE IF EXISTS t;\nCREATE TABLE t AS SELECT 1",
+                Some(1)
+            ),
+            Some(1)
+        );
     }
 }

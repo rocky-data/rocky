@@ -157,8 +157,8 @@ Declare a connection once, then reference it by name from any number of pipeline
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"postgres"`, `"redshift"`, `"clickhouse"`, `"sqlserver"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
-| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks`, `snowflake`, `postgres`, `redshift`, `clickhouse` and `sqlserver`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
+| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"postgres"`, `"redshift"`, `"clickhouse"`, `"sqlserver"`, `"spark"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks`, `snowflake`, `postgres`, `redshift`, `clickhouse`, `sqlserver` and `spark`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -187,6 +187,7 @@ The connection fields, authentication, and examples for each adapter type live o
 - [Redshift](/reference/adapters/redshift/) (Beta) — the PostgreSQL adapter's fields plus dist/sort keys and late-binding views
 - [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
 - [SQL Server](/reference/adapters/sqlserver/) (Beta) — SQL Server, Azure SQL and Fabric Warehouse; SQL auth or Entra ID
+- [Spark](/reference/adapters/spark/) (Beta) — Spark Connect with an optional bearer token, on Delta Lake or Iceberg tables
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
 
 `type = "trino"`, `type = "airbyte"`, and `type = "iceberg"` are accepted by the config parser but have no dedicated page yet; configure adapter-specific keys through [`[adapter.NAME.extra]`](#adaptername).
