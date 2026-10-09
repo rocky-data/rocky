@@ -279,8 +279,10 @@ pub fn validate_contract_with(
                                 ),
                             )
                             .with_suggestion(format!(
-                                "cast `{0}` to a fully specified type in the SELECT (not a bare DECIMAL; the \
-                                 cast is then checked against the contract's {1}), or give the compiler source \
+                                "cast `{0}` in the SELECT to BOOLEAN, DOUBLE, DATE, a text or binary type, or \
+                                 DECIMAL(p, s) with 1 <= p <= 38 and 0 <= s <= p (INT, INTEGER, BIGINT, FLOAT, \
+                                 REAL, TIMESTAMP and a bare DECIMAL stay unknown, because their width \
+                                 differs by warehouse; the cast is then checked against the contract's {1}), or give the compiler source \
                                  schemas so the type resolves (`data/seed.sql`, or \
                                  `rocky discover --with-schemas`), or drop the type from the \
                                  contract. `--strict-contracts` refuses a declared type Rocky \
@@ -301,19 +303,21 @@ pub fn validate_contract_with(
                                     contract_col.name, expected_type
                                 ),
                             )
-                            // A CAST to a fully specified type does clear
-                            // this: the cast's target is the column's type
-                            // whatever the input is. A bare DECIMAL names no
-                            // digits and stays Unknown, so the advice below
-                            // says "fully specified" (#1721).
+                            // A CAST to one of the warehouse-independent
+                            // targets does clear this: the cast's target is
+                            // the column's type whatever the input is. INT,
+                            // BIGINT, FLOAT, TIMESTAMP and a bare DECIMAL stay
+                            // Unknown (#1721), so the advice names the list.
                             .with_suggestion(format!(
                                 "give the compiler source schemas so `{0}`'s type resolves — \
                                  `rocky compile`, `rocky test` and `rocky ci` read them from \
                                  `data/seed.sql` when the project has one; for a replication \
                                  pipeline, `rocky discover --with-schemas` fills the schema \
                                  cache (it refuses transformation-only pipelines). Or cast \
-                                 `{0}` to a fully specified type in the SELECT (not a bare \
-                                 DECIMAL): the cast's target is then checked against {1}",
+                                 `{0}` in the SELECT to BOOLEAN, DOUBLE, DATE, a text or binary type, or \
+                                 DECIMAL(p, s) with 1 <= p <= 38 and 0 <= s <= p (INT, INTEGER, BIGINT, \
+                                 FLOAT, REAL, TIMESTAMP and a bare DECIMAL stay unknown, because their \
+                                 width differs by warehouse): the cast's target is then checked against {1}",
                                 contract_col.name, expected_type
                             )),
                         );

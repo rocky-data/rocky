@@ -1718,16 +1718,6 @@ fn plan_preview_output_for_pipeline(
     Ok(output)
 }
 
-/// Compile the models directory, build a `RunPlan` payload, persist it to
-/// `.rocky/plans/<plan_id>.json`, and return
-/// `Some(RunPlanBuild)`.
-///
-/// Returns `Ok(None)` when the compile succeeds but produces zero models —
-/// the caller falls through to the replication-plan branch in that case.
-///
-/// Captures the full `rocky run` flag surface from `run_options` so apply-time
-/// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
-/// as booleans; the actual state-store lookup happens at apply time.
 /// The compile errors that stop a run plan from being persisted.
 ///
 /// A consumer record problem (`E060`) is about a dashboard's `depends_on`, not
@@ -1752,6 +1742,16 @@ fn run_plan_refusals(
         .collect()
 }
 
+/// Compile the models directory, build a `RunPlan` payload, persist it to
+/// `.rocky/plans/<plan_id>.json`, and return
+/// `Some(RunPlanBuild)`.
+///
+/// Returns `Ok(None)` when the compile succeeds but produces zero models —
+/// the caller falls through to the replication-plan branch in that case.
+///
+/// Captures the full `rocky run` flag surface from `run_options` so apply-time
+/// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
+/// as booleans; the actual state-store lookup happens at apply time.
 #[allow(clippy::too_many_arguments)]
 fn build_and_persist_run_plan(
     config_path: &Path,

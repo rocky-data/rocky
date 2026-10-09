@@ -77,18 +77,17 @@ Two limits, stated plainly:
   transformation-only pipeline, so for those use a seed. One limit on that:
   an expression whose result type depends on the warehouse — `AVG` over a
   `DECIMAL` column — stays `Unknown` either way. A `CAST` (also `::`,
-  `TRY_CAST` and `SAFE_CAST`) to a fully specified type clears an `I003`: the
-  column has the cast's target type whatever the input is, and the contract is
-  compared with that target. A cast to a bare `DECIMAL` or `NUMERIC` names no
-  digits, so it stays `Unknown`. A `TRY_CAST` or `SAFE_CAST` column is
+  `TRY_CAST` and `SAFE_CAST`) over an input Rocky cannot type takes its
+  target type, and so clears an `I003`, only for these targets: `BOOLEAN`, `DOUBLE` (`DOUBLE PRECISION`, `FLOAT64`), `DATE`, text types (`VARCHAR`, `CHAR`, `TEXT`, `STRING`), binary types (`BINARY`, `VARBINARY`, `BLOB`), and `DECIMAL` or `NUMERIC` with digits (`DECIMAL(p)` or `DECIMAL(p, s)`, `1 <= p <= 38`, `0 <= s <= p`). The contract is
+  compared with that target. `INT`, `INTEGER`, `SMALLINT`, `TINYINT`, `BIGINT`, `FLOAT`, `REAL`, `TIMESTAMP`, a bare `DECIMAL` or `NUMERIC`, and `DECIMAL` digits out of that range stay `Unknown`, because their width differs by warehouse (Snowflake `BIGINT` and `INTEGER` are `NUMBER(38,0)`, `FLOAT` is 64-bit, `TIMESTAMP` is `TIMESTAMP_NTZ`). A `TRY_CAST` or `SAFE_CAST` column is
   nullable.
 - To refuse a declared type Rocky cannot check, run `rocky compile
   --strict-contracts` or `rocky ci --strict-contracts`, or set
   `[contracts] strict = true` in `rocky.toml` (which `rocky run` and
   `rocky test` also read). Each `I003` is then the `E059` error. It names the
   model and the column, says why the type is unknown, and says how to fix it:
-  give the compiler source schemas, or cast the column to a fully specified
-  type in the SELECT. `rocky run` first describes the sources in the
+  give the compiler source schemas, or cast the column to one of the targets
+  above in the SELECT. `rocky run` first describes the sources in the
   warehouse, so it refuses only what stays unknown after that.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision

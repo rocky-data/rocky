@@ -2692,7 +2692,8 @@ fn edge_input_is_known(
 /// Whether the nullable bit of `(model, column)` rests on known types: every
 /// lineage edge on the way back to its sources reads a column whose type is
 /// known. A column with no edges (a literal, a cast of a literal) has nothing
-/// to prove its nullable bit, so it is not proven.
+/// to prove its nullable bit, so it is not proven. That holds for a column of
+/// an upstream model the trace reaches, not only the model's own column.
 ///
 /// A column typed by a cast over an unknown input has a type but only a
 /// guessed nullable bit (nullable, the safe answer for a contract or a
@@ -2707,7 +2708,21 @@ fn nullability_is_proven(
     column: &str,
 ) -> bool {
     let edges = graph.trace_column(model, column);
-    !edges.is_empty()
+    if edges.is_empty() {
+        return false;
+    }
+    // A column of any project model that the trace reaches but that has no
+    // edge of its own (`SELECT CAST('2024-01-01' AS DATE) AS d`) has typed
+    // output and a guessed nullable bit, in an upstream model just as in this
+    // one. An external source column has no model in the graph; its type is
+    // checked by `edge_input_is_known`.
+    let reaches_edgeless_column = edges.iter().any(|edge| {
+        graph.model_schema(&edge.source.model).is_some()
+            && graph
+                .producing_edge(&edge.source.model, &edge.source.column)
+                .is_none()
+    });
+    !reaches_edgeless_column
         && edges
             .into_iter()
             .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
@@ -3402,6 +3417,21 @@ fn integer_literal_fits(expr: &Expr, target_sql: &ast::DataType, target: &RockyT
     }
 }
 
+/// The `(precision, scale)` a `DECIMAL(p)` / `DECIMAL(p, s)` target states,
+/// or `None` for a bare `DECIMAL` or digits outside `1 <= p <= 38`,
+/// `0 <= s <= p`. `DECIMAL(p)` is `DECIMAL(p, 0)` by the SQL standard.
+fn decimal_digits(info: &ast::ExactNumberInfo) -> Option<(u8, u8)> {
+    let (precision, scale) = match info {
+        ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+        ast::ExactNumberInfo::Precision(p) => (*p, 0),
+        ast::ExactNumberInfo::None => return None,
+    };
+    if !(1..=38).contains(&precision) || !(0..=i128::from(precision)).contains(&i128::from(scale)) {
+        return None;
+    }
+    Some((u8::try_from(precision).ok()?, u8::try_from(scale).ok()?))
+}
+
 /// Convert an sqlparser DataType to RockyType.
 fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
     match dt {
@@ -3415,14 +3445,14 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
         ast::DataType::Float(_) | ast::DataType::Real => RockyType::Float32,
         ast::DataType::Double(_) | ast::DataType::DoublePrecision => RockyType::Float64,
         ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
-            ast::ExactNumberInfo::PrecisionAndScale(p, s) => RockyType::Decimal {
-                precision: *p as u8,
-                scale: *s as u8,
-            },
-            ast::ExactNumberInfo::Precision(p) => RockyType::Decimal {
-                precision: *p as u8,
-                scale: 0,
-            },
+            // Out-of-range digits (`NUMERIC(300, 0)`) are not a type Rocky
+            // can name; narrowing them with `as u8` wrapped to a wrong one.
+            ast::ExactNumberInfo::PrecisionAndScale(_, _) | ast::ExactNumberInfo::Precision(_) => {
+                match decimal_digits(info) {
+                    Some((precision, scale)) => RockyType::Decimal { precision, scale },
+                    None => RockyType::Unknown,
+                }
+            }
             // A bare `DECIMAL` / `NUMERIC` names no digits, so Rocky does
             // not know the type — the same answer `warehouse_type_to_rocky`
             // gives for the bare string since #1646. Guessing (38,0) here
@@ -3593,39 +3623,39 @@ impl SelectInference {
 /// every warehouse Rocky targets. Only then may a cast over an input Rocky
 /// cannot type take the target as its output type.
 ///
-/// `sql_type_to_rocky` reads `FLOAT` / `REAL` as 32-bit and `INT` / `INTEGER`
-/// as 32-bit, but Snowflake's `FLOAT` is 64-bit and its `INTEGER` is
+/// The list: BOOLEAN; DOUBLE / DOUBLE PRECISION / FLOAT64 (every warehouse
+/// that accepts one of these spellings means a 64-bit float; BigQuery has no
+/// `DOUBLE` and rejects it); DECIMAL / NUMERIC with `1 <= p <= 38` and
+/// `0 <= s <= p`; VARCHAR, CHAR, TEXT, STRING; BINARY, VARBINARY, BLOB; DATE.
+///
+/// `sql_type_to_rocky` reads `FLOAT` / `REAL` and `INT` / `INTEGER` as
+/// 32-bit, but Snowflake's `FLOAT` is 64-bit, its `INTEGER` and `BIGINT` are
 /// `NUMBER(38,0)`, PostgreSQL's `FLOAT` is `DOUBLE PRECISION`, and Snowflake's
 /// bare `TIMESTAMP` is `TIMESTAMP_NTZ`. Those names, and any name not listed
 /// here, stay `Unknown`, like a bare `DECIMAL`.
 fn cast_target_is_warehouse_independent(expr: &Expr) -> bool {
     match expr {
         Expr::Nested(inner) => cast_target_is_warehouse_independent(inner),
-        Expr::Cast { data_type, .. } => matches!(
-            data_type,
-            ast::DataType::Boolean
-                | ast::DataType::BigInt(_)
-                | ast::DataType::Int64
-                | ast::DataType::Double(_)
-                | ast::DataType::DoublePrecision
-                | ast::DataType::Float64
-                | ast::DataType::Decimal(
-                    ast::ExactNumberInfo::Precision(_)
-                        | ast::ExactNumberInfo::PrecisionAndScale(_, _)
-                )
-                | ast::DataType::Numeric(
-                    ast::ExactNumberInfo::Precision(_)
-                        | ast::ExactNumberInfo::PrecisionAndScale(_, _)
-                )
-                | ast::DataType::Varchar(_)
-                | ast::DataType::Char(_)
-                | ast::DataType::Text
-                | ast::DataType::String(_)
-                | ast::DataType::Binary(_)
-                | ast::DataType::Varbinary(_)
-                | ast::DataType::Blob(_)
-                | ast::DataType::Date
-        ),
+        Expr::Cast { data_type, .. } => match data_type {
+            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
+                decimal_digits(info).is_some()
+            }
+            _ => matches!(
+                data_type,
+                ast::DataType::Boolean
+                    | ast::DataType::Double(_)
+                    | ast::DataType::DoublePrecision
+                    | ast::DataType::Float64
+                    | ast::DataType::Varchar(_)
+                    | ast::DataType::Char(_)
+                    | ast::DataType::Text
+                    | ast::DataType::String(_)
+                    | ast::DataType::Binary(_)
+                    | ast::DataType::Varbinary(_)
+                    | ast::DataType::Blob(_)
+                    | ast::DataType::Date
+            ),
+        },
         _ => false,
     }
 }
@@ -6427,14 +6457,37 @@ mod tests {
             "CAST(id AS SMALLINT) AS id",
             "CAST(id AS TIMESTAMP) AS id",
             "TRY_CAST(id AS FLOAT) AS id",
+            // Snowflake's BIGINT is NUMBER(38,0), which Rocky reads as
+            // Decimal(38,0), not Int64.
+            "CAST(id AS BIGINT) AS id",
+            "TRY_CAST(id AS BIGINT) AS id",
+            "CAST(id AS INT64) AS id",
+            // Digits outside 1 <= p <= 38, 0 <= s <= p name no type.
+            "CAST(id AS NUMERIC(300, 0)) AS id",
+            "CAST(id AS DECIMAL(39, 0)) AS id",
+            "CAST(id AS DECIMAL(0)) AS id",
+            "CAST(id AS DECIMAL(10, 11)) AS id",
         ] {
             let col = first_column_over(projection, None);
             assert_eq!(col.data_type, RockyType::Unknown, "{projection}");
         }
         for (projection, expected) in [
             ("CAST(id AS DOUBLE) AS id", RockyType::Float64),
-            ("CAST(id AS BIGINT) AS id", RockyType::Int64),
             ("CAST(id AS DATE) AS id", RockyType::Date),
+            (
+                "CAST(id AS DECIMAL(38, 0)) AS id",
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            ),
+            (
+                "CAST(id AS NUMERIC(10)) AS id",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                },
+            ),
         ] {
             let col = first_column_over(projection, None);
             assert_eq!(col.data_type, expected, "{projection}");
@@ -6443,9 +6496,29 @@ mod tests {
 
     #[test]
     fn test_try_cast_over_unknown_input_is_typed_and_nullable() {
-        let col = first_column_over("TRY_CAST(id AS BIGINT) AS id", None);
-        assert_eq!(col.data_type, RockyType::Int64);
+        let col = first_column_over("TRY_CAST(id AS DECIMAL(18, 2)) AS id", None);
+        assert_eq!(
+            col.data_type,
+            RockyType::Decimal {
+                precision: 18,
+                scale: 2
+            }
+        );
         assert!(col.nullable);
+    }
+
+    #[test]
+    fn test_out_of_range_decimal_digits_never_wrap_into_a_type() {
+        // `NUMERIC(300, 0)` used to wrap through `as u8` to Decimal(44, 0).
+        for projection in [
+            "CAST(id AS NUMERIC(300, 0)) AS id",
+            "CAST(id AS DECIMAL(256, 2)) AS id",
+            "CAST(id AS DECIMAL(39)) AS id",
+            "CAST(id AS DECIMAL(10, 11)) AS id",
+        ] {
+            let col = first_column_over(projection, Some(RockyType::Int32));
+            assert_eq!(col.data_type, RockyType::Unknown, "{projection}");
+        }
     }
 
     #[test]
@@ -8966,14 +9039,13 @@ mod tests {
                 scale: 2
             }
         );
-        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
+        // BIGINT is Decimal(38,0) on Snowflake: no target without an input.
+        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Unknown);
         assert_eq!(
             column(&result, "m", "bare_decimal").data_type,
             RockyType::Unknown
         );
-        for name in ["amount", "id_big"] {
-            assert!(column(&result, "m", name).nullable, "{name}");
-        }
+        assert!(column(&result, "m", "amount").nullable);
     }
 
     /// Why `E022` is withheld for a cast over an unknown input: the cast gives
@@ -9025,6 +9097,32 @@ mod tests {
             column(&result, "m", "order_date").data_type,
             RockyType::Date
         );
+        assert!(!has_code(&result, "E022"), "{:?}", result.diagnostics);
+    }
+
+    /// The trace reaches an upstream project model's column that has no edge
+    /// of its own, so the nullable bit is a guess in `up` as well.
+    #[test]
+    fn a_time_column_cast_over_an_edgeless_upstream_column_does_not_raise_e022() {
+        let up = make_model(
+            "up",
+            "SELECT CAST('2024-01-01' AS DATE) AS d FROM raw.orders",
+        );
+        let mut down = make_model(
+            "down",
+            "SELECT CAST(d AS DATE) AS d FROM up WHERE d >= @start_date AND d < @end_date",
+        );
+        down.config.strategy = StrategyConfig::TimeInterval {
+            time_column: "d".to_string(),
+            granularity: TimeGrain::Day,
+            lookback: 0,
+            batch_size: NonZeroU32::new(1).unwrap(),
+            first_partition: None,
+        };
+        let config = crate::compile::CompilerConfig::default();
+        let result =
+            crate::compile::compile_preloaded_models(vec![up, down], &config).expect("compile");
+        assert_eq!(column(&result, "down", "d").data_type, RockyType::Date);
         assert!(!has_code(&result, "E022"), "{:?}", result.diagnostics);
     }
 

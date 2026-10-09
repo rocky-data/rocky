@@ -1077,16 +1077,18 @@ fn unknown_type_reason(
             format!("it reads `{source}.{source_column}` and Rocky has no schema for `{source}`")
         }
         (Some(RockyType::Unknown), TransformKind::Cast | TransformKind::TryCast) => format!(
-            "its CAST target has no fixed type (a bare DECIMAL or NUMERIC names no precision, \
-             or the type name is not one Rocky maps), and `{source}.{source_column}` is also \
+            "its CAST target is not one Rocky types over an unknown input (INT, INTEGER, BIGINT, FLOAT, \
+             REAL, TIMESTAMP and a bare DECIMAL differ by warehouse; DECIMAL digits must satisfy \
+             1 <= p <= 38 and 0 <= s <= p), and `{source}.{source_column}` is also \
              of unknown type"
         ),
         (Some(RockyType::Unknown), _) => {
             format!("it reads `{source}.{source_column}`, whose type is unknown")
         }
         (Some(_), TransformKind::Cast | TransformKind::TryCast) => {
-            "its CAST target has no fixed type (a bare DECIMAL or NUMERIC names no precision, \
-             or the type name is not one Rocky maps)"
+            "its CAST target has no fixed type: INT, INTEGER, BIGINT, FLOAT, REAL, TIMESTAMP and a bare \
+             DECIMAL differ by warehouse, DECIMAL digits must satisfy 1 <= p <= 38 and 0 <= s <= p, \
+             and the type name may not be one Rocky maps"
                 .to_string()
         }
         (Some(_), _) => format!(

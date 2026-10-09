@@ -72,8 +72,13 @@ report it as a diagnostic, not as a failed model: it never appears in
 `model_results`, and the model tests still run before the command exits with an
 error.
 
-`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan` and
-`rocky propose` do not stop for it. A
+`rocky test` fails on `E060` only when it covers the whole project. With
+`--model`, `--select` or `--exclude` it still lists the problem in
+`diagnostics`, but does not fail on it, so a scoped test is not blocked by a
+consumer file it never selected. `rocky ci` always covers the whole project.
+
+`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan`,
+`rocky propose` and the compile check of `rocky fulfill` do not stop for it. A
 consumer is metadata about the readers of your models, so a wrong record cannot
 make a model unsafe to write. The run writes the models, does not count the
 consumer as a failed table, and lists each problem in the

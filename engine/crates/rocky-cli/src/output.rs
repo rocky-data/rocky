@@ -2443,6 +2443,29 @@ impl CompileOutput {
         self
     }
 
+    /// The error diagnostics that block a caller which only builds models:
+    /// every error except a consumer record problem (`E060`), which is about
+    /// a dashboard's `depends_on`, not about any model.
+    #[must_use]
+    pub fn model_error_lines(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.is_error() && !rocky_compiler::consumers::is_consumer_diagnostic(d))
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
+    /// The consumer record problems (`E060`) this compile found, to report
+    /// without blocking on them.
+    #[must_use]
+    pub fn consumer_problem_lines(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|d| rocky_compiler::consumers::is_consumer_diagnostic(d))
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect()
+    }
+
     /// Attach expanded SQL (post-macro-expansion) for each model.
     #[must_use]
     pub fn with_expanded_sql(mut self, expanded: HashMap<String, String>) -> Self {
