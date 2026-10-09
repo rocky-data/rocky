@@ -7,6 +7,7 @@
 //!
 //! | Method | Spark |
 //! |---|---|
+//! | `create_table_as`, `create_table_as_new` | adds `USING delta` / `USING iceberg` |
 //! | `create_catalog_sql` | `None`: a Spark catalog is server configuration (`spark.sql.catalog.<name>`), not DDL |
 //! | `materialized_view_ddl` | refused: open-source Spark has no materialized views |
 //! | `view_governance_probe_sql` | `None`: Unity Catalog tags and policies do not exist |
@@ -127,8 +128,22 @@ impl SqlDialect for SparkDialect {
         INNER.format_table_ref(catalog, schema, table)
     }
 
+    /// `CREATE OR REPLACE TABLE … USING <format> AS`. The session default
+    /// already names the format; stating it here as well means a full
+    /// refresh never builds a Parquet table, even in a session that lost
+    /// that setting.
     fn create_table_as(&self, target: &str, select_sql: &str) -> String {
-        INNER.create_table_as(target, select_sql)
+        format!(
+            "CREATE OR REPLACE TABLE {target} USING {} AS\n{select_sql}",
+            self.format.source_name()
+        )
+    }
+
+    fn create_table_as_new(&self, target: &str, select_sql: &str) -> String {
+        format!(
+            "CREATE TABLE {target} USING {} AS\n{select_sql}",
+            self.format.source_name()
+        )
     }
 
     fn insert_into(&self, target: &str, select_sql: &str) -> String {
@@ -304,7 +319,16 @@ mod tests {
     fn full_refresh_view_and_append_render_like_databricks() {
         assert_eq!(
             d().create_table_as("c.s.t", "SELECT 1"),
-            "CREATE OR REPLACE TABLE c.s.t AS\nSELECT 1"
+            "CREATE OR REPLACE TABLE c.s.t USING delta AS\nSELECT 1"
+        );
+        assert_eq!(
+            d().create_table_as_new("c.s.t", "SELECT 1"),
+            "CREATE TABLE c.s.t USING delta AS\nSELECT 1"
+        );
+        assert_eq!(
+            SparkDialect::with_table_format(TableFormat::Iceberg)
+                .create_table_as("c.s.t", "SELECT 1"),
+            "CREATE OR REPLACE TABLE c.s.t USING iceberg AS\nSELECT 1"
         );
         assert_eq!(
             d().view_ddl("c.s.v", "SELECT 1").unwrap(),

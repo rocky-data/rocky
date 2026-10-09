@@ -30,6 +30,12 @@ pub struct ExecutePlanRequest {
     /// A client-chosen UUID naming this one execution.
     #[prost(string, optional, tag = "6")]
     pub operation_id: Option<String>,
+    /// The server-side session id this client saw on an earlier response.
+    /// When the server's session for `session_id` is no longer that one
+    /// (expired, or the server restarted), Spark 4.0 fails the call instead
+    /// of silently running it in a fresh session.
+    #[prost(string, optional, tag = "8")]
+    pub client_observed_server_side_session_id: Option<String>,
 }
 
 /// `spark.connect.UserContext`.
@@ -89,6 +95,10 @@ pub struct Sql {
 pub struct ExecutePlanResponse {
     #[prost(string, tag = "1")]
     pub session_id: String,
+    /// The server's own id for the session; it changes when the server
+    /// replaces the session.
+    #[prost(string, tag = "15")]
+    pub server_side_session_id: String,
     #[prost(oneof = "execute_plan_response::ResponseType", tags = "2, 14")]
     pub response_type: Option<execute_plan_response::ResponseType>,
 }
@@ -146,6 +156,7 @@ pub fn sql_request(
         }),
         client_type: Some(client_type.to_string()),
         operation_id: Some(operation_id.to_string()),
+        client_observed_server_side_session_id: None,
     }
 }
 
@@ -193,6 +204,17 @@ mod tests {
             }
             other => panic!("expected an Arrow batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn observed_server_session_uses_field_8_and_the_response_id_field_15() {
+        let mut req = sql_request("s", "u", "o", "c", "SELECT 1");
+        req.client_observed_server_side_session_id = Some("x".into());
+        let bytes = req.encode_to_vec();
+        assert!(bytes.ends_with(&[0x42, 0x01, b'x']), "{bytes:?}");
+        // server_side_session_id: tag (15 << 3) | 2 = 0x7a.
+        let resp = ExecutePlanResponse::decode(&[0x7a, 0x01, b'z'][..]).unwrap();
+        assert_eq!(resp.server_side_session_id, "z");
     }
 
     #[test]

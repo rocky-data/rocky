@@ -35,7 +35,7 @@ The adapter reads the shared `[adapter]` fields:
 | `host` | string | Yes | `host`, `host:port` or `sc://host[:port]`. The default port is `15002`. Connection-string parameters (`sc://host/;token=…`) are refused: use the fields below. |
 | `token` | string | No | Bearer token, sent as `authorization: Bearer <token>`. Setting it turns TLS on. |
 | `username` | string | No | The Spark Connect user id, shown in the Spark UI. Default `rocky`. |
-| `timeout_secs` | integer | No | Per-statement timeout. Default `300`. When it expires, the server may still be running the statement. |
+| `timeout_secs` | integer | No | Per-statement timeout. Default `300`. When it expires, Rocky stops waiting but does not cancel the statement: the server may still be running it. Rocky does not retry it. |
 
 Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses a key it does not know, so a typo fails loudly:
 
@@ -61,7 +61,9 @@ table_format = "delta"
 
 Spark names a table `catalog.schema.table`. The session catalog is `spark_catalog`; another catalog is whatever the server configures as `spark.sql.catalog.<name>`. Rocky cannot create a catalog, so leave `auto_create_catalogs` off. `auto_create_schemas = true` runs `CREATE SCHEMA IF NOT EXISTS catalog.schema`.
 
-Before its first statement, Rocky runs `SET spark.sql.sources.default = delta` (or `iceberg`) in its session. So every `CREATE TABLE` Rocky renders makes a table of that format. That includes models, snapshots, seeds and branch copies.
+Before its first statement, Rocky runs `SET spark.sql.sources.default = delta` (or `iceberg`) in its session. So every `CREATE TABLE` Rocky renders makes a table of that format. That includes models, snapshots, seeds and branch copies. A full refresh also says `USING delta` (or `USING iceberg`) itself.
+
+Rocky sends back the server's session id on every call. If the server replaced the session (it expired, or the server restarted), Spark 4.0 refuses the call. So a statement never runs in a fresh session that lacks the format setting.
 
 Identifiers are quoted with backticks. String literals use Spark's default backslash escapes: Rocky writes `\'` and `\\`.
 
@@ -69,7 +71,7 @@ Identifiers are quoted with backticks. String literals use Spark's default backs
 
 | Strategy | SQL | Notes |
 |----------|-----|-------|
-| `full_refresh` | `CREATE OR REPLACE TABLE … AS` | One atomic statement. |
+| `full_refresh` | `CREATE OR REPLACE TABLE … USING delta AS` | One atomic statement. |
 | `view` | `CREATE OR REPLACE VIEW … AS` | A switch between view and table needs `drop_existing_kind`. |
 | `incremental` | `INSERT INTO … SELECT` | Watermark filter `WHERE ts > TIMESTAMP '…'`. |
 | `merge` | `MERGE INTO … USING (…) ON … WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` | Explicit `update_columns` render `UPDATE SET t.c = s.c`. |

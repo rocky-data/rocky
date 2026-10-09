@@ -86,6 +86,9 @@ pub struct SparkClient {
     session_id: String,
     bearer: Option<MetadataValue<Ascii>>,
     channel: OnceCell<Channel>,
+    /// The server-side session id from the first response, sent back on
+    /// every later request so a replaced session fails loudly.
+    server_session: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for SparkClient {
@@ -110,6 +113,11 @@ impl SparkClient {
             .as_ref()
             .map(|t| {
                 MetadataValue::try_from(format!("Bearer {t}"))
+                    .map(|mut v| {
+                        // Keeps the token out of `Debug` output of the request.
+                        v.set_sensitive(true);
+                        v
+                    })
                     .map_err(|_| SparkError::Config("token is not a valid header value".into()))
             })
             .transpose()?;
@@ -118,6 +126,7 @@ impl SparkClient {
             session_id: uuid::Uuid::new_v4().to_string(),
             bearer,
             channel: OnceCell::new(),
+            server_session: std::sync::Mutex::new(None),
         })
     }
 
@@ -176,13 +185,15 @@ impl SparkClient {
             .map_err(|e| SparkError::Connect(error_chain(&e)))?;
 
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let mut request = tonic::Request::new(proto::sql_request(
+        let mut body = proto::sql_request(
             &self.session_id,
             &self.config.user_id,
             &operation_id,
             concat!("rocky/", env!("CARGO_PKG_VERSION")),
             sql,
-        ));
+        );
+        body.client_observed_server_side_session_id = self.observed_server_session();
+        let mut request = tonic::Request::new(body);
         if let Some(bearer) = &self.bearer {
             request
                 .metadata_mut()
@@ -205,6 +216,7 @@ impl SparkClient {
         // not request, so its absence is not a signal.
         let mut batches = Vec::new();
         while let Some(message) = stream.message().await.map_err(|s| status_error(&s))? {
+            self.observe_server_session(&message.server_side_session_id);
             match message.response_type {
                 Some(execute_plan_response::ResponseType::ArrowBatch(batch)) => {
                     decode_arrow_batch(&batch.data, &mut batches)?;
@@ -214,6 +226,28 @@ impl SparkClient {
             }
         }
         Ok(batches)
+    }
+
+    fn observed_server_session(&self) -> Option<String> {
+        self.server_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Remember the first server-side session id the server reports. Only
+    /// the first: a later, different id is the server's to refuse.
+    fn observe_server_session(&self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let mut seen = self
+            .server_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.is_none() {
+            *seen = Some(id.to_string());
+        }
     }
 
     /// Run one statement and return its rows as strings (`NULL` as JSON
