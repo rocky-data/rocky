@@ -1628,6 +1628,55 @@
       },
       "type": "object"
     },
+    "LintConfig": {
+      "additionalProperties": false,
+      "description": "`[lint]` — style-lint settings for `rocky lint`.\n\n```toml [lint] disable = [\"S003\"]\n\n[lint.severity] S001 = \"error\" ```",
+      "properties": {
+        "disable": {
+          "default": [],
+          "description": "Rule codes that do not run, e.g. `[\"S003\", \"S004\"]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LintSeverity"
+          },
+          "default": {},
+          "description": "Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "LintSeverity": {
+      "description": "Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.",
+      "oneOf": [
+        {
+          "description": "Fails the run (non-zero exit).",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reported; does not fail the run.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reported; does not fail the run.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "LoadFileFormat": {
       "description": "File format for load pipelines, parsed from TOML.\n\nMirrors `rocky_adapter_sdk::FileFormat` but lives in rocky-core to avoid a hard dependency from config parsing to the adapter SDK.",
       "enum": [
@@ -4767,6 +4816,18 @@
       "default": {},
       "description": "Imported producer-project snapshots, keyed by import name.\n\nEach `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.",
       "type": "object"
+    },
+    "lint": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LintConfig"
+        }
+      ],
+      "default": {
+        "disable": [],
+        "severity": {}
+      },
+      "description": "Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides."
     },
     "mask": {
       "additionalProperties": {

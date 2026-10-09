@@ -306,6 +306,7 @@ mod tests {
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),
+            lint: Default::default(),
             cache: Default::default(),
             mask: Default::default(),
             classifications: Default::default(),

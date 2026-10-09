@@ -2535,6 +2535,22 @@ enum Command {
         check: bool,
     },
 
+    /// Lint model SQL for style (`S001`-`S007`).
+    ///
+    /// Reads `.sql` files and reports ambiguous unqualified columns, bare
+    /// `JOIN`, `SELECT *` in a final result, column order, keyword
+    /// capitalisation, trailing whitespace and tabs. `--fix` rewrites the
+    /// mechanical rules in place. Rules are switched off or re-graded in the
+    /// `[lint]` section of `rocky.toml`. Exits non-zero when a finding has
+    /// `error` severity.
+    Lint {
+        /// `.sql` files or directories to lint (default: `models`)
+        paths: Vec<PathBuf>,
+        /// Rewrite the fixable findings in place (`S002`, `S005`, `S006`, `S007`)
+        #[arg(long)]
+        fix: bool,
+    },
+
     /// Export JSON Schema files for every CLI `--output json` payload type.
     ///
     /// Used by the dagster + vscode codegen pipelines to derive Pydantic
@@ -3537,6 +3553,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "branch",
             "list",
             "emit-sql",
+            "lint",
             "imports",
             "publish-ir",
         ],
@@ -5985,6 +6002,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             )
             .await
+        }
+        Command::Lint { paths, fix } => {
+            rocky_cli::commands::run_lint(&cli.config, &paths, fix, json)
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
