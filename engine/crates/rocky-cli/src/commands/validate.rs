@@ -1742,7 +1742,7 @@ fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
                     field: None,
                 });
             }
-            Err(rocky_ir::dag::DagError::CyclicDependency { nodes }) => {
+            Err(rocky_ir::dag::DagError::CyclicDependency { cycle: nodes, .. }) => {
                 out.push(ValidateMessage {
                     severity: "error".into(),
                     code: "V030".into(),

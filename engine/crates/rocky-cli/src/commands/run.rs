@@ -12403,14 +12403,14 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     //     `DagExecutor` then skipped the healthy descendants of nodes that had
     //     actually materialized successfully. The broken model's OWN node
     //     still reports it, which is where it belongs.
-    // W041 (a source column missing from a possibly-stale cached schema) does
-    // not block execution — the warehouse may have the column — but say so
-    // before the warehouse is touched, so a failure that follows is explained.
-    for d in compile_result
-        .diagnostics
-        .iter()
-        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::W041)
-    {
+    // W041 (a source column missing from a possibly-stale cached schema) and
+    // W045 (a source table missing from a possibly-incomplete table list) do
+    // not block execution — the warehouse may have it — but say so before the
+    // warehouse is touched, so a failure that follows is explained.
+    for d in compile_result.diagnostics.iter().filter(|d| {
+        d.code.as_ref() == rocky_compiler::diagnostic::W041
+            || d.code.as_ref() == rocky_compiler::diagnostic::W045
+    }) {
         warn!(
             model = d.model.as_str(),
             code = &*d.code,

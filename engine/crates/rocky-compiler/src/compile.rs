@@ -534,6 +534,12 @@ pub fn compile_project(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // E045 / W045: two-part reads of a table absent from a known schema.
+    diagnostics.extend(source_refs::check_source_table_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
     // User-defined functions: invalid definitions, then invalid calls (E051).
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
@@ -822,6 +828,12 @@ pub fn compile_incremental(
     // E041 / W041: direct references to columns absent from a source schema
     // with known provenance. Whole-project and recomputed on every call.
     diagnostics.extend(source_refs::check_source_column_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
+    // E045 / W045: two-part reads of a table absent from a known schema.
+    diagnostics.extend(source_refs::check_source_table_refs(
         &project.models,
         &config.source_schemas,
         &config.source_provenance,

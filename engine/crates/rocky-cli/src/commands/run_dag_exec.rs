@@ -490,7 +490,15 @@ fn plan_runtime_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let mut models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    // Each node's sub-run compiles its model with `@var()` replaced by its
+    // inline default (the DAG driver takes no `--var`). The graph reads the
+    // same SQL, so a model whose `@var()` would not parse still derives its
+    // edges, and a cycle through it is refused before any node runs.
+    let no_vars = rocky_core::run_vars::RunVars::new();
+    for model in models_by_pipeline.values_mut().flatten() {
+        model.sql = rocky_core::run_vars::substitute_run_vars(&model.sql, &no_vars).sql;
+    }
     let ephemeral_nodes: HashSet<NodeId> = models_by_pipeline
         .values()
         .flatten()

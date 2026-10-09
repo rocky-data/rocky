@@ -1,4 +1,6 @@
-//! Missing-column checks against external source schemas (E041 / W041).
+//! Missing-column checks against external source schemas (E041 / W041), and
+//! missing-table checks against the schemas they live in (E045 / W045, see
+//! [`check_source_table_refs`]).
 //!
 //! The type checker treats a reference it cannot resolve as
 //! [`crate::types::RockyType::Unknown`]. For an in-project upstream, E039
@@ -46,7 +48,7 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E041, SourceSpan, W041};
+use crate::diagnostic::{Diagnostic, E041, E045, SourceSpan, W041, W045};
 use crate::types::TypedColumn;
 
 /// Where a source schema handed to the compiler came from.
@@ -990,6 +992,219 @@ fn resolve_qualified<'s, 'a>(
     Resolution::Unprovable
 }
 
+// ---------------------------------------------------------------------------
+// Missing source tables (E045 / W045)
+// ---------------------------------------------------------------------------
+
+/// The tables Rocky knows in one external schema, from source schemas with a
+/// recorded origin.
+struct KnownSchema<'a> {
+    /// Lower-cased table names.
+    tables: HashSet<String>,
+    /// Table names as the source schemas spell them, sorted.
+    display_tables: Vec<&'a str>,
+    /// Every origin the schema's tables came from.
+    origins: Vec<&'a SourceSchemaOrigin>,
+}
+
+impl KnownSchema<'_> {
+    /// Whether the table list is the schema's whole content: every table was
+    /// introspected from the warehouse in this invocation. A seed file or the
+    /// schema cache lists the tables it was given or still holds, which may be
+    /// fewer than the warehouse has.
+    fn is_complete(&self) -> bool {
+        self.origins
+            .iter()
+            .all(|origin| matches!(origin, SourceSchemaOrigin::Live))
+    }
+}
+
+/// Check every model for two-part reads (`schema.table`) of a table that is
+/// absent from a schema Rocky knows.
+///
+/// A schema is known when at least one source schema with a recorded origin
+/// lives in it. The check never fires for a schema Rocky knows nothing about,
+/// for a schema that a model of this project writes to (the project adds
+/// tables Rocky has no source schema for), for a table a model writes, or for
+/// a one-part or three-part name. A `WITH`-bound name is never a read.
+///
+/// Severity follows completeness: `E045` when every table of the schema was
+/// introspected live, `W045` when the list came from a seed file or the schema
+/// cache, which can miss tables the warehouse has. Strict sources
+/// ([`SourceProvenance::strict`]) escalate `W045` to `E045`.
+pub fn check_source_table_refs(
+    models: &[rocky_core::models::Model],
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+    provenance: &SourceProvenance,
+) -> Vec<Diagnostic> {
+    if provenance.origins.is_empty() {
+        return Vec::new();
+    }
+    let mut schemas: HashMap<String, KnownSchema<'_>> = HashMap::new();
+    for key in source_schemas.keys() {
+        let Some(origin) = provenance.origins.get(key) else {
+            continue;
+        };
+        let Some((schema, table)) = key.split_once('.') else {
+            continue;
+        };
+        if schema.is_empty() || table.is_empty() || table.contains('.') {
+            continue;
+        }
+        let entry = schemas
+            .entry(schema.to_lowercase())
+            .or_insert_with(|| KnownSchema {
+                tables: HashSet::new(),
+                display_tables: Vec::new(),
+                origins: Vec::new(),
+            });
+        entry.tables.insert(table.to_lowercase());
+        entry.display_tables.push(table);
+        entry.origins.push(origin);
+    }
+    if schemas.is_empty() {
+        return Vec::new();
+    }
+    for schema in schemas.values_mut() {
+        schema.display_tables.sort_unstable();
+    }
+
+    let written_schemas: HashSet<String> = models
+        .iter()
+        .map(|m| m.config.target.schema.to_lowercase())
+        .collect();
+    let written_tables: HashSet<String> = models
+        .iter()
+        .map(|m| {
+            format!(
+                "{}.{}",
+                m.config.target.schema.to_lowercase(),
+                m.config.target.table.to_lowercase()
+            )
+        })
+        .collect();
+
+    let mut diagnostics = Vec::new();
+    for model in models {
+        let Ok(reads) = rocky_sql::lineage::referenced_tables(&model.sql) else {
+            continue;
+        };
+        for read in reads {
+            let parts: Vec<&str> = read.split('.').collect();
+            let [schema_name, table_name] = parts.as_slice() else {
+                continue;
+            };
+            if written_schemas.contains(*schema_name) || written_tables.contains(&read) {
+                continue;
+            }
+            let Some(schema) = schemas.get(*schema_name) else {
+                continue;
+            };
+            if schema.tables.contains(*table_name) {
+                continue;
+            }
+            let mut diagnostic =
+                missing_table_diagnostic(&model.config.name, &read, schema, provenance.strict);
+            if let Some(span) = read_span(model, &read) {
+                diagnostic = diagnostic.with_span(span);
+            }
+            diagnostics.push(diagnostic);
+        }
+    }
+    diagnostics
+}
+
+fn missing_table_diagnostic(
+    model_name: &str,
+    read: &str,
+    schema: &KnownSchema<'_>,
+    strict: bool,
+) -> Diagnostic {
+    let (schema_name, table_name) = read.split_once('.').unwrap_or((read, read));
+    let threshold = (table_name.chars().count() / 3).max(1);
+    let mut close: Vec<(usize, &str)> = schema
+        .display_tables
+        .iter()
+        .map(|t| (strsim::levenshtein(table_name, &t.to_lowercase()), *t))
+        .filter(|(distance, _)| *distance <= threshold)
+        .collect();
+    close.sort_unstable();
+    let mut suggestion = if let Some((_, best)) = close.first() {
+        format!("did you mean '{schema_name}.{best}'?")
+    } else {
+        const MAX_LISTED: usize = 12;
+        let mut listed: Vec<&str> = schema.display_tables.clone();
+        let total = listed.len();
+        listed.truncate(MAX_LISTED);
+        let mut text = format!("known tables in '{schema_name}': {}", listed.join(", "));
+        if total > MAX_LISTED {
+            text.push_str(&format!(", … ({} more)", total - MAX_LISTED));
+        }
+        text
+    };
+    if schema.is_complete() {
+        return Diagnostic::error(
+            E045,
+            model_name,
+            format!(
+                "table '{read}' does not exist: the warehouse schema '{schema_name}' has no \
+                 table '{table_name}'"
+            ),
+        )
+        .with_suggestion(suggestion);
+    }
+    suggestion.push_str(
+        ". If the warehouse has this table, refresh the schema: add it to the seed file, or \
+         re-warm the cache with `rocky discover --with-schemas`",
+    );
+    if strict {
+        Diagnostic::error(
+            E045,
+            model_name,
+            format!(
+                "table '{read}' is not among the known tables of schema '{schema_name}'; strict \
+                 sources are on, so a possibly incomplete table list is treated as authoritative"
+            ),
+        )
+        .with_suggestion(suggestion)
+    } else {
+        suggestion.push_str(
+            ". To make this an error, pass `--strict-sources` or set \
+             `[cache.schemas] strict_sources = true`",
+        );
+        Diagnostic::warning(
+            W045,
+            model_name,
+            format!(
+                "table '{read}' was not found among the known tables of schema '{schema_name}' \
+                 (from the seed file or the schema cache); the table list may be incomplete"
+            ),
+        )
+        .with_suggestion(suggestion)
+    }
+}
+
+/// Where `read` (lower-cased `schema.table`) first appears in the model's
+/// `.sql` file, when the parsed SQL is a verbatim slice of it.
+fn read_span(model: &rocky_core::models::Model, read: &str) -> Option<SourceSpan> {
+    let (line_offset, col_offset) = sql_position_in_file(model)?;
+    let at = model.sql.to_lowercase().find(read)?;
+    let before = model.sql.get(..at)?;
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let col = before[line_start..].chars().count() + 1;
+    let (line, col) = if line == 1 {
+        (line + line_offset, col + col_offset)
+    } else {
+        (line + line_offset, col)
+    };
+    Some(SourceSpan {
+        file: model.file_path.display().to_string(),
+        line,
+        col,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,5 +1572,111 @@ mod tests {
         let sql = "SELECT nope FROM raw.orders o JOIN raw.customers c ON true";
         let diagnostics = check_source_column_refs(&[model("m", sql)], &schemas, &provenance);
         assert_eq!(codes(&diagnostics), ["W041"]);
+    }
+
+    fn check_tables(origin: SourceSchemaOrigin, strict: bool, models: &[Model]) -> Vec<Diagnostic> {
+        let schemas = schemas();
+        let provenance = SourceProvenance::uniform(schemas.keys(), &origin).with_strict(strict);
+        check_source_table_refs(models, &schemas, &provenance)
+    }
+
+    #[test]
+    fn a_missing_table_in_a_seeded_schema_warns_and_strict_refuses() {
+        let m = [model("stg", "SELECT order_id FROM raw.orderz")];
+        let diagnostics = check_tables(SourceSchemaOrigin::Seed, false, &m);
+        assert_eq!(codes(&diagnostics), ["W045"], "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        assert!(diagnostics[0].message.contains("raw.orderz"));
+        let suggestion = diagnostics[0].suggestion.as_deref().unwrap();
+        assert!(
+            suggestion.contains("did you mean 'raw.orders'?"),
+            "{suggestion}"
+        );
+        assert!(suggestion.contains("--strict-sources"), "{suggestion}");
+
+        let strict = check_tables(SourceSchemaOrigin::Seed, true, &m);
+        assert_eq!(codes(&strict), ["E045"], "{strict:?}");
+        assert_eq!(strict[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_missing_table_in_a_live_schema_is_an_error() {
+        let m = [model("stg", "SELECT 1 AS x FROM raw.payments")];
+        let diagnostics = check_tables(SourceSchemaOrigin::Live, false, &m);
+        assert_eq!(codes(&diagnostics), ["E045"], "{diagnostics:?}");
+        let suggestion = diagnostics[0].suggestion.as_deref().unwrap();
+        assert!(suggestion.contains("customers, orders"), "{suggestion}");
+    }
+
+    #[test]
+    fn a_missing_table_in_a_cached_schema_warns_even_when_trusted() {
+        let m = [model("stg", "SELECT 1 AS x FROM raw.orderz")];
+        let trusted = SourceSchemaOrigin::Cache {
+            cached_at: Utc::now(),
+            trusted: true,
+        };
+        assert_eq!(codes(&check_tables(trusted, false, &m)), ["W045"]);
+        assert_eq!(codes(&check_tables(trusted, true, &m)), ["E045"]);
+    }
+
+    #[test]
+    fn a_missing_table_is_found_in_joins_ctes_and_subqueries() {
+        for sql in [
+            "SELECT o.order_id FROM raw.orders o JOIN raw.refunds r ON r.order_id = o.order_id",
+            "WITH x AS (SELECT * FROM raw.refunds) SELECT * FROM x",
+            "SELECT order_id FROM raw.orders WHERE order_id IN (SELECT order_id FROM raw.refunds)",
+            "SELECT * FROM (SELECT order_id FROM raw.refunds) AS s",
+        ] {
+            let diagnostics = check_tables(SourceSchemaOrigin::Live, false, &[model("m", sql)]);
+            assert_eq!(codes(&diagnostics), ["E045"], "{sql}: {diagnostics:?}");
+            assert!(diagnostics[0].message.contains("raw.refunds"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn table_reads_rocky_cannot_judge_stay_silent() {
+        let mut writer = model("writer", "SELECT 1 AS x");
+        writer.config.target.schema = "mart".to_string();
+        let mut raw_writer = model("raw_writer", "SELECT 1 AS x");
+        raw_writer.config.target.schema = "raw".to_string();
+        raw_writer.config.target.table = "staged".to_string();
+        let cases: Vec<Vec<Model>> = vec![
+            // A known table, in any case.
+            vec![model("m", "SELECT order_id FROM RAW.Orders")],
+            // A schema Rocky knows nothing about.
+            vec![model("m", "SELECT * FROM other.anything")],
+            // A one-part read: a model, a CTE or a search-path table.
+            vec![model("m", "SELECT * FROM orderz")],
+            // A three-part read: its catalog may hold another `raw`.
+            vec![model("m", "SELECT * FROM cat.raw.orderz")],
+            // A CTE named like a missing table is not a read.
+            vec![model(
+                "m",
+                "WITH refunds AS (SELECT 1 AS x) SELECT * FROM refunds",
+            )],
+            // A schema a project model writes to: the project adds tables.
+            vec![writer.clone(), model("m", "SELECT * FROM mart.new_table")],
+            vec![raw_writer, model("m", "SELECT * FROM raw.whatever")],
+            // SQL that does not parse is another check's to report.
+            vec![model("m", "SELEC broken FROM raw.orderz")],
+        ];
+        for models in &cases {
+            for origin in [SourceSchemaOrigin::Live, SourceSchemaOrigin::Seed] {
+                let diagnostics = check_tables(origin, true, models);
+                assert!(
+                    diagnostics.is_empty(),
+                    "{:?}: {diagnostics:?}",
+                    models.last().map(|m| &m.sql)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_provenance_never_reports_a_missing_table() {
+        let schemas = schemas();
+        let m = [model("m", "SELECT * FROM raw.orderz")];
+        let diagnostics = check_source_table_refs(&m, &schemas, &SourceProvenance::default());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }
