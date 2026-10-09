@@ -14,6 +14,37 @@ class LineageColumnDef(BaseModel):
     name: str
 
 
+class LineageConsumerRecord(BaseModel):
+    """
+    One downstream consumer in a `rocky lineage` view.
+    """
+
+    description: str | None = None
+    """
+    What it is for, when declared.
+    """
+    direct: bool
+    """
+    `true` when the consumer reads the focal model itself; `false` when it reads only models downstream of it.
+    """
+    kind: str
+    """
+    `dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.
+    """
+    name: str
+    """
+    Consumer name.
+    """
+    owner: str | None = None
+    """
+    Owner, when declared.
+    """
+    url: str | None = None
+    """
+    Where to find it, when declared.
+    """
+
+
 class LineageNodeDef(BaseModel):
     """
     Per-node metadata for the lineage graph.
@@ -58,6 +89,10 @@ class LineageOutput(BaseModel):
 
     columns: list[LineageColumnDef]
     command: str
+    consumers: list[LineageConsumerRecord] | None = None
+    """
+    Downstream consumers (dashboards, notebooks, ML jobs, applications declared in `consumers/`) that read the focal model, directly or through the models downstream of it. Sorted by name. These are not models, so they are not part of `downstream`. Omitted when none.
+    """
     downstream: list[str]
     edges: list[LineageEdgeRecord]
     model: str

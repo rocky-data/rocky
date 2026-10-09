@@ -1121,6 +1121,13 @@ pub struct DeferOptions {
     /// this is the one options value every sub-run already carries to the
     /// compile. Empty outside `--dag`.
     pub external_dependencies: std::collections::BTreeSet<String>,
+    /// The whole project this run belongs to: where `consumers/` lives and
+    /// every model name a consumer may read. Passed to the compile as
+    /// [`rocky_compiler::compile::CompilerConfig::project`] so a run that
+    /// covers one pipeline, one glob or one model does not judge the
+    /// consumers against that part alone. `None` outside a project run (the
+    /// compile then reads the sibling of the models directory).
+    pub project: Option<rocky_compiler::compile::ProjectContext>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -1180,6 +1187,35 @@ fn suppress_deferred_selected_e039(
         .diagnostics
         .iter()
         .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+}
+
+/// Move the consumer diagnostics (`E060`) out of a compile result and onto the
+/// run output, then recompute `has_errors` without them.
+///
+/// `rocky compile` and `rocky ci` refuse on these; a run does not, because a
+/// wrong dashboard record cannot make a model unsafe to write. Each one is
+/// also logged, so a text-mode run still shows it.
+pub(crate) fn take_consumer_diagnostics(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    output: &mut RunOutput,
+) {
+    let (consumer, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut compile_result.diagnostics)
+        .into_iter()
+        .partition(rocky_compiler::consumers::is_consumer_diagnostic);
+    compile_result.diagnostics = rest;
+    compile_result.has_errors = compile_result
+        .diagnostics
+        .iter()
+        .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    for diagnostic in consumer {
+        warn!(
+            consumer = diagnostic.model.as_str(),
+            code = &*diagnostic.code,
+            message = &*diagnostic.message,
+            "consumer record problem — reported, the run is not stopped"
+        );
+        output.consumer_diagnostics.push(diagnostic);
+    }
 }
 
 /// Identify declared edges that this single-model defer run will actually
@@ -3531,6 +3567,23 @@ pub async fn run_with_explicit_contracts(
     let rocky_cfg = &loaded.config;
     let config_hash = loaded.fingerprint.clone();
 
+    // Every compile in this run judges `consumers/` against the whole project,
+    // not against the models of one pipeline, glob or selection. A `--dag`
+    // sub-run arrives with the context already built, once for the graph.
+    let defer_with_project;
+    let defer_opts = if defer_opts.project.is_none() {
+        defer_with_project = DeferOptions {
+            project: Some(rocky_compiler::consumers::project_context(
+                config_path,
+                rocky_cfg,
+            )),
+            ..defer_opts.clone()
+        };
+        &defer_with_project
+    } else {
+        defer_opts
+    };
+
     // #1095(c): refuse a governed apply that configures `[hook]`/`[hook.webhooks]`
     // BEFORE any hook is built or fired — hooks run outside (and before) the
     // execution-fingerprint gate, so they cannot be enforced by fingerprint.
@@ -4307,6 +4360,7 @@ pub async fn run_with_explicit_contracts(
                 governed_ctx.is_some_and(|c| c.expects_models),
                 Some(&hook_registry),
                 contracts.map(RunContracts::dir),
+                defer_opts.project.as_ref(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -12494,6 +12548,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         run_vars: run_vars.clone(),
         source_provenance,
         external_dependencies: defer_opts.external_dependencies.clone(),
+        project: defer_opts.project.clone(),
         ..Default::default()
     };
 
@@ -12585,6 +12640,12 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             .iter()
             .any(rocky_compiler::diagnostic::Diagnostic::is_error);
     }
+
+    // A consumer record is metadata about the readers of the models, not a
+    // model: its problems (`E060`) are reported on the run output and never
+    // stop a model from being written or count as a failed table. Take them
+    // out before anything below sorts diagnostics into failures.
+    take_consumer_diagnostics(&mut compile_result, output);
 
     // `--model <function>` selects a user-defined function (`functions/`):
     // create it and the functions it calls, and build no model.
@@ -25198,6 +25259,7 @@ auto_create_schemas = true
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            consumer_diagnostics: vec![],
         };
 
         emit_pipes_events(&emitter, &output);
@@ -33895,6 +33957,26 @@ backend = "local"
         parallel: u32,
         model_name_filter: Option<&str>,
     ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
+        run_filtered_models_with_defer(
+            models_dir,
+            db_path,
+            concurrent_adapter,
+            parallel,
+            model_name_filter,
+            &DeferOptions::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn run_filtered_models_with_defer(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        concurrent_adapter: bool,
+        parallel: u32,
+        model_name_filter: Option<&str>,
+        defer_opts: &DeferOptions,
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path)
@@ -33920,7 +34002,7 @@ backend = "local"
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             None, // shadow_config (test)
-            &DeferOptions::default(),
+            defer_opts,
             super::SkipGateConfig::off(),
             false,
             false,
@@ -33935,6 +34017,70 @@ backend = "local"
         )
         .await;
         (output, result)
+    }
+
+    fn write_consumer_project(dir: &std::path::Path, depends_on: &str) -> std::path::PathBuf {
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+        std::fs::create_dir(dir.join("consumers")).unwrap();
+        std::fs::write(
+            dir.join("consumers").join("board.toml"),
+            format!("depends_on = [{depends_on}]\n"),
+        )
+        .unwrap();
+        models
+    }
+
+    /// A consumer record with a bad `depends_on` (E060) must not stop a model
+    /// from being written and must not be counted as a failed table. It is
+    /// reported on `consumer_diagnostics` instead.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_bad_consumer_record_is_reported_and_never_fails_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = write_consumer_project(dir.path(), "\"nowhere\"");
+        let (output, result) =
+            run_models_against_duckdb(&models, &dir.path().join("wh.duckdb"), false, 1).await;
+        result.expect("the run completes");
+        assert_eq!(output.tables_failed, 0, "{:?}", output.errors);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(output.materializations.len(), 1, "the model is written");
+        assert_eq!(output.consumer_diagnostics.len(), 1);
+        assert_eq!(&*output.consumer_diagnostics[0].code, "E060");
+        assert_eq!(output.consumer_diagnostics[0].model, "consumer:board");
+    }
+
+    /// A run that covers one pipeline or selection judges consumers against
+    /// the whole project: a model that is elsewhere in the project is not an
+    /// unknown name.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_consumer_reading_a_model_outside_this_run_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = write_consumer_project(dir.path(), "\"orders\", \"elsewhere\"");
+        let defer = DeferOptions {
+            project: Some(rocky_compiler::compile::ProjectContext {
+                root: dir.path().to_path_buf(),
+                model_names: ["orders", "elsewhere"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }),
+            ..DeferOptions::default()
+        };
+        let (output, result) = run_filtered_models_with_defer(
+            &models,
+            &dir.path().join("wh.duckdb"),
+            false,
+            1,
+            None,
+            &defer,
+        )
+        .await;
+        result.expect("the run completes");
+        assert_eq!(output.tables_failed, 0, "{:?}", output.errors);
+        assert!(output.consumer_diagnostics.is_empty());
     }
 
     /// 🔴 E KILL-CHECK (real DuckDB, the choke-point): the sound TOCTOU close.

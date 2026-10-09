@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use rocky_core::dag_executor::{DagExecutor, NodeDispatcher, NodeFuture, NodeStatus};
 use rocky_core::unified_dag::{self, NodeId, NodeKind};
@@ -134,7 +134,7 @@ fn default_sub_runner(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
 ) -> SubRunner {
-    sub_runner_with_contracts(actor, external_dependencies, None)
+    sub_runner_with_contracts(actor, external_dependencies, None, None)
 }
 
 /// [`default_sub_runner`] with `rocky run --dag --contracts <DIR>`: every
@@ -145,6 +145,7 @@ fn sub_runner_with_contracts(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
     contracts_dir: Option<PathBuf>,
+    project: Option<rocky_compiler::compile::ProjectContext>,
 ) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
@@ -159,6 +160,7 @@ fn sub_runner_with_contracts(
             let contracts_dir = contracts_dir.clone();
             let defer_opts = super::run::DeferOptions {
                 external_dependencies: (*external_dependencies).clone(),
+                project: project.clone(),
                 ..super::run::DeferOptions::default()
             };
             Box::pin(async move {
@@ -421,6 +423,20 @@ pub async fn run_with_dag_and_contracts(
         Err(reason) => (None, Some(reason)),
     };
 
+    // `consumers/` is judged once for the whole graph: every sub-run shares
+    // this context, and the problems are reported on the graph's output, not
+    // counted against any node.
+    let project = rocky_compiler::consumers::project_context(config_path, &loaded.config);
+    let consumer_diagnostics = rocky_compiler::consumers::diagnose_project(&project);
+    for diagnostic in &consumer_diagnostics {
+        warn!(
+            consumer = diagnostic.model.as_str(),
+            code = &*diagnostic.code,
+            message = &*diagnostic.message,
+            "consumer record problem - reported, the run is not stopped"
+        );
+    }
+
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
         loaded: std::sync::Arc::clone(&loaded),
@@ -437,6 +453,7 @@ pub async fn run_with_dag_and_contracts(
             actor.clone(),
             Arc::new(dag_external_dependencies(&dag)),
             contracts_dir.map(Path::to_path_buf),
+            Some(project.clone()),
         ),
         state_turns: StateTurnstile::new(),
     };
@@ -450,6 +467,7 @@ pub async fn run_with_dag_and_contracts(
         let output = DagRunOutput {
             version: VERSION.into(),
             command: "run --dag".into(),
+            consumer_diagnostics: consumer_diagnostics.clone(),
             warnings: physical_edge_warnings.clone(),
             total_nodes: result.total_nodes,
             total_layers: result.total_layers,

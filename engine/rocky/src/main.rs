@@ -1424,7 +1424,7 @@ enum Command {
     /// makes no network requests. `--output-path` ending in `.html` writes a
     /// single-page catalog instead. `--format parquet` writes the compiled
     /// project graph as Parquet tables (models, columns, edges,
-    /// column_lineage, tests, contracts, sources) that DuckDB can query.
+    /// column_lineage, tests, contracts, sources, consumers) that DuckDB can query.
     Docs {
         /// Models directory
         #[arg(long, default_value = "models")]
@@ -3430,6 +3430,7 @@ struct SelectArgs {
     /// Select models with dbt-style node selection: names and globs
     /// (`stg_*`), graph operators (`+m`, `m+`, `2+m`, `m+3`, `@m`), and
     /// methods (`tag:`, `path:`, `file:`, `config.materialized:`, `source:`,
+    /// `consumer:<name>` for the models a downstream consumer reads,
     /// `selector:<name>` for an entry of the `[selectors]` table in rocky.toml,
     /// `state:modified`, `state:new`). Space-separated terms union;
     /// comma-joined terms intersect. Repeatable.

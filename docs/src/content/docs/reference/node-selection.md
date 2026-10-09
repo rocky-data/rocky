@@ -93,6 +93,7 @@ A method has the form `method:value`. The value accepts globs. See dbt's [node s
 | `config.catalog:<catalog>` | write to this target catalog. `config.database` is an alias. |
 | `config.table:<table>` | write to this target table. `config.alias` is an alias. |
 | `source:<relation>` | read this external table. `source:raw` matches `raw.orders`. `source:raw.orders` matches `raw.orders` and `warehouse.raw.orders`. |
+| `consumer:<name>` | are read by the downstream consumer `<name>`, a file in `consumers/`. `+consumer:<name>` selects everything the consumer needs. See [Downstream consumers](/concepts/downstream-consumers/). |
 | `selector:<name>` | match the saved selector `<name>`. See [Saved selectors](#saved-selectors). |
 | `state:modified` | changed since `--state-ref`. New models are included, as in dbt. |
 | `state:new` | do not exist at `--state-ref`. |
@@ -143,7 +144,7 @@ These rules decide what happens at the edges of the syntax.
 - An unknown method, such as `owner:x`, is an error. The message lists the supported methods.
 - `test_type:` is not supported. Rocky tests are not separate nodes in the DAG.
 - `@` with `+` (such as `@+m`) is an error, as in dbt.
-- A `--select` term that names one model, tag, path, file or source with no glob, and matches nothing, is an error. Every selecting command exits non-zero and does nothing. The term is almost always a typo.
+- A `--select` term that names one model, tag, path, file, source or consumer with no glob, and matches nothing, is an error. Every selecting command exits non-zero and does nothing. The term is almost always a typo.
 - A glob (`stg_*`), a `config.` term, or a `state:` term that matches no model logs a warning: `The selection criterion 'x' does not match any enabled nodes`. An `--exclude` term that matches nothing also only warns.
 - A selection that matches no model logs `Nothing to do`. `list`, `compile`, `test`, `emit-sql`, and `run` then exit 0 with nothing done. With `--output json`, `rocky run` prints an empty, successful run result. `plan` and `docs` refuse, because they cannot write an empty plan or catalog.
 

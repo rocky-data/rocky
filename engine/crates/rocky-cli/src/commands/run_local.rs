@@ -130,6 +130,10 @@ pub async fn run_transformation(
     // `rocky run --contracts <DIR>`: replaces the project `contracts/`
     // directory for this pipeline's compiles. `None` reads the project one.
     contracts_dir: Option<&Path>,
+    // The whole project, so `consumers/` is judged against every model and
+    // not against this pipeline's alone. `None` reads the sibling of the
+    // models directory.
+    project: Option<&rocky_compiler::compile::ProjectContext>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -185,7 +189,11 @@ pub async fn run_transformation(
                 pipeline.target.governance.auto_create_schemas,
                 shadow_config,
                 // run_local has no `--model` selection; defer is a no-op here.
-                &super::run::DeferOptions::default(),
+                // Only the project rides along, for the consumer check.
+                &super::run::DeferOptions {
+                    project: project.cloned(),
+                    ..super::run::DeferOptions::default()
+                },
                 skip_gate,
                 // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
                 // not passed (clause 1 of the fail-closed decision) — same
@@ -3859,6 +3867,7 @@ auto_create_schemas = true
             false, // expects_models
             None,  // hook_registry
             None,  // contracts_dir
+            None,  // project
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

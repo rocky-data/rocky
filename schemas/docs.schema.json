@@ -5,6 +5,12 @@
     "command": {
       "type": "string"
     },
+    "consumers_count": {
+      "description": "Downstream consumers (`consumers/`) the documentation lists.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
     "duration_ms": {
       "format": "uint64",
       "minimum": 0.0,
@@ -46,6 +52,7 @@
   },
   "required": [
     "command",
+    "consumers_count",
     "duration_ms",
     "files",
     "format",

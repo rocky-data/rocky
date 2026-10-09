@@ -584,6 +584,7 @@ impl ServerState {
             strict_contracts: false,
             preserve_authored_sql: false,
             external_dependencies: Default::default(),
+            project: None,
         };
 
         // The compile pass walks the model directory, parses every

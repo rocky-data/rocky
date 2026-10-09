@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig};
 
 use crate::output::{
-    ColumnLineageOutput, LineageColumnDef, LineageEdgeRecord, LineageNodeDef, LineageOutput,
-    LineageQualifiedColumn, RowSelectionEdgeRecord, print_json,
+    ColumnLineageOutput, LineageColumnDef, LineageConsumerRecord, LineageEdgeRecord,
+    LineageNodeDef, LineageOutput, LineageQualifiedColumn, RowSelectionEdgeRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -211,6 +211,23 @@ pub fn run_lineage(
         println!("Model: {model_name}");
         println!("Upstream: {}", schema.upstream.join(", "));
         println!("Downstream: {}", schema.downstream.join(", "));
+        let consumers = consumers_downstream_of(&result, model_name);
+        if !consumers.is_empty() {
+            println!("Consumers:");
+            for c in &consumers {
+                let mut line = format!("  {} ({})", c.name, c.kind);
+                if let Some(owner) = &c.owner {
+                    line.push_str(&format!(", owner: {owner}"));
+                }
+                if let Some(url) = &c.url {
+                    line.push_str(&format!(", {url}"));
+                }
+                if !c.direct {
+                    line.push_str(" [via downstream models]");
+                }
+                println!("{line}");
+            }
+        }
         println!();
 
         if let Some(col) = col_name {
@@ -364,7 +381,53 @@ pub fn lineage_output(result: &compile::CompileResult, model_name: &str) -> Resu
         downstream: schema.downstream.clone(),
         edges,
         nodes,
+        consumers: consumers_downstream_of(result, model_name),
     })
+}
+
+/// Downstream consumers of `model_name`: those that read it, or read any model
+/// downstream of it. Sorted by name.
+///
+/// A consumer is not a model, so it never appears in `downstream`. Walks the
+/// semantic graph's model-level `downstream` edges to a fixed point.
+pub(crate) fn consumers_downstream_of(
+    result: &compile::CompileResult,
+    model_name: &str,
+) -> Vec<LineageConsumerRecord> {
+    if result.consumers.is_empty() {
+        return Vec::new();
+    }
+    let mut reachable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut queue = vec![model_name.to_string()];
+    while let Some(name) = queue.pop() {
+        let Some(schema) = result.semantic_graph.model_schema(&name) else {
+            continue;
+        };
+        for next in &schema.downstream {
+            if reachable.insert(next.clone()) {
+                queue.push(next.clone());
+            }
+        }
+    }
+    let mut records: Vec<LineageConsumerRecord> = result
+        .consumers
+        .iter()
+        .filter_map(|c| {
+            let direct = c.depends_on.iter().any(|m| m == model_name);
+            (direct || c.depends_on.iter().any(|m| reachable.contains(m))).then(|| {
+                LineageConsumerRecord {
+                    name: c.name.clone(),
+                    kind: c.kind.as_str().to_string(),
+                    owner: c.owner.clone(),
+                    url: c.url.clone(),
+                    description: c.description.clone(),
+                    direct,
+                }
+            })
+        })
+        .collect();
+    records.sort_by(|a, b| a.name.cmp(&b.name));
+    records
 }
 
 /// Side-effect-free core producing the column-level [`ColumnLineageOutput`]
@@ -470,6 +533,58 @@ mod tests {
             ..Default::default()
         };
         compile::compile(&config).expect("chain compiles")
+    }
+
+    /// A model's lineage lists the consumers that read it directly or through
+    /// a downstream model, and not the ones that read only upstream models.
+    #[test]
+    fn lineage_lists_downstream_consumers() {
+        let root = TempDir::new().unwrap();
+        let models_dir = root.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "a", "SELECT id FROM source.raw.users");
+        write_model(&models_dir, "b", "SELECT id FROM a");
+        write_model(&models_dir, "c", "SELECT id FROM b");
+        let consumers_dir = root.path().join("consumers");
+        std::fs::create_dir_all(&consumers_dir).unwrap();
+        for (file, body) in [
+            (
+                "direct.toml",
+                "kind = \"dashboard\"\nowner = \"x\"\ndepends_on = [\"b\"]\n",
+            ),
+            ("via.toml", "kind = \"ml\"\ndepends_on = [\"c\"]\n"),
+            ("upstream_only.toml", "depends_on = [\"a\"]\n"),
+        ] {
+            std::fs::write(consumers_dir.join(file), body).unwrap();
+        }
+
+        let result = compile_chain(&models_dir);
+        let out = lineage_output(&result, "b").unwrap();
+        let got: Vec<(&str, bool)> = out
+            .consumers
+            .iter()
+            .map(|c| (c.name.as_str(), c.direct))
+            .collect();
+        assert_eq!(got, [("direct", true), ("via", false)]);
+        assert_eq!(out.consumers[0].kind, "dashboard");
+        assert_eq!(out.consumers[0].owner.as_deref(), Some("x"));
+        // Consumers are not models: `downstream` is unchanged.
+        assert_eq!(out.downstream, vec!["c".to_string()]);
+        // `via` reads `c` itself, so it is direct there and the only entry.
+        let leaf = lineage_output(&result, "c").unwrap();
+        assert_eq!(leaf.consumers.len(), 1);
+        assert!(leaf.consumers[0].direct);
+        // Every consumer is downstream of `a`.
+        assert_eq!(lineage_output(&result, "a").unwrap().consumers.len(), 3);
+        // With no consumers declared, the field is left out of the JSON.
+        let none = tempfile::TempDir::new().unwrap();
+        let none_models = none.path().join("models");
+        std::fs::create_dir_all(&none_models).unwrap();
+        write_model(&none_models, "a", "SELECT id FROM source.raw.users");
+        let json =
+            serde_json::to_string(&lineage_output(&compile_chain(&none_models), "a").unwrap())
+                .unwrap();
+        assert!(!json.contains("consumers"), "{json}");
     }
 
     /// The default (upstream) column output must still carry the

@@ -520,6 +520,28 @@ class RunStatus3(StrEnum):
     SkippedInFlight = "SkippedInFlight"
 
 
+class Severity(StrEnum):
+    """
+    Severity level of a diagnostic.
+
+    Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+    """
+
+    Error = "Error"
+    Warning = "Warning"
+    Info = "Info"
+
+
+class SourceSpan(BaseModel):
+    """
+    Location in a source file.
+    """
+
+    col: conint(ge=0)
+    file: str
+    line: conint(ge=0)
+
+
 class TableCompareResult(BaseModel):
     production_count: conint(ge=0) | None = None
     """
@@ -793,6 +815,39 @@ class CompareOutput(BaseModel):
     version: str
 
 
+class Diagnostic(BaseModel):
+    """
+    A compiler diagnostic (error, warning, or informational message).
+
+    `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+    """
+
+    code: str
+    """
+    Diagnostic code (e.g., "E001", "W001").
+    """
+    message: str
+    """
+    Human-readable message.
+    """
+    model: str
+    """
+    Which model this diagnostic relates to.
+    """
+    severity: Severity
+    """
+    Severity level.
+    """
+    span: SourceSpan | None = None
+    """
+    Source location (if available).
+    """
+    suggestion: str | None = None
+    """
+    Suggested fix (if any).
+    """
+
+
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
     attempts: list[AttemptRecord] | None = None
@@ -885,6 +940,10 @@ class RunOutput(BaseModel):
     """
     check_results: list[TableCheckOutput]
     command: str
+    consumer_diagnostics: list[Diagnostic] | None = None
+    """
+    Problems in the project's `consumers/` records (`E060`): a file that does not load, a duplicate name, a `depends_on` entry that names no model, or an unreadable directory. A consumer is metadata about readers of the models, so these never stop a model from being written and are never counted as a failed table. `rocky compile` and `rocky ci` do refuse on them. Empty (and omitted) when the records are sound.
+    """
     contained: list[ContainedModelOutput] | None = None
     """
     Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.

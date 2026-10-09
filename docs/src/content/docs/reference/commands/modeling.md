@@ -325,6 +325,8 @@ rocky lineage fct_revenue
 }
 ```
 
+When the project declares [downstream consumers](/concepts/downstream-consumers/) that read the model, directly or through downstream models, the output adds a `consumers` array. Each entry has `name`, `kind`, `direct`, and `owner`, `url` and `description` when set. The human view prints a `Consumers:` list. The array is left out when no consumer reads the model.
+
 Tracing a single column returns a flat trace shape instead. Use either `--column` or `model.column` syntax:
 
 ```bash

@@ -216,8 +216,8 @@ pub enum ImportDbtStructuredWarning {
     MicrobatchMapped { model: String, mapped_to: String },
     /// A dbt construct the importer does not translate was detected and
     /// skipped (snapshot, source freshness, grants, meta, metric, semantic
-    /// model, exposure). Surfaced with a count so a migration is never
-    /// silently lossy.
+    /// model, an exposure or an exposure dependency that is not a model).
+    /// Surfaced with a count so a migration is never silently lossy.
     DroppedConstruct {
         construct: String,
         name: String,
@@ -297,13 +297,17 @@ pub struct ImportResult {
     /// translate.
     pub unit_tests_skipped: usize,
     /// Number of dbt resources the importer does not translate that were
-    /// detected and skipped (snapshots, metrics, semantic models, exposures).
-    /// Surfaced so a migration is never silently lossy.
+    /// detected and skipped (snapshots, metrics, semantic models), plus the
+    /// exposures and exposure dependencies that could not be carried over to
+    /// a consumer. Surfaced so a migration is never silently lossy.
     pub constructs_dropped: usize,
     /// Number of dbt models whose enforced `contract` was written to a
     /// `{model}.contract.toml` but not fully: a column type Rocky has no name
     /// for, or a constraint Rocky does not check (`unique`, `check`, ...).
     pub contracts_dropped: usize,
+    /// Downstream consumers built from dbt exposures. Each is written as a
+    /// `consumers/<name>.toml` file and reads only models that were imported.
+    pub consumers: Vec<rocky_core::consumers::Consumer>,
 }
 
 /// A successfully imported model.
@@ -384,6 +388,7 @@ pub fn import_from_manifest(
         unit_tests_skipped: 0,
         constructs_dropped: 0,
         contracts_dropped: 0,
+        consumers: Vec::new(),
     };
 
     // A manifest with no compiled SQL means every model falls back to the
@@ -433,6 +438,7 @@ pub fn import_from_manifest(
     // Surface the resource classes the importer does not translate so a
     // migration is never silently lossy.
     record_dropped_constructs(&manifest.dropped, &mut result);
+    import_exposures(manifest, &mut result);
 
     apply_dbt_unit_tests(manifest, &mut result, skip_unit_tests);
 
@@ -478,36 +484,104 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
                 detail: detail.to_string(),
             });
     }
+}
 
-    // Rocky has no record of downstream consumers, so each exposure is listed
-    // by name in the migration notes with its owner and the models it reads.
-    if !dropped.exposures.is_empty() {
-        let count = dropped.exposures.len();
-        result.constructs_dropped += count;
-        result.warnings.push(ImportWarning {
-            model: "<project>".to_string(),
-            category: WarningCategory::UnsupportedMaterialization,
-            message: format!(
-                "{count} exposure(s) skipped — Rocky has no downstream-consumer record; \
-                 they are listed in MIGRATION-NOTES.md"
-            ),
-            suggestion: None,
-        });
-        for exposure in &dropped.exposures {
-            let owner = exposure.owner.as_deref().unwrap_or("none declared");
-            let depends_on = if exposure.depends_on.is_empty() {
-                "nothing".to_string()
-            } else {
-                exposure.depends_on.join(", ")
-            };
+/// The model name at the end of a `model.<project>.<name>` unique id.
+fn extract_tail(id: &str) -> String {
+    id.splitn(3, '.').nth(2).unwrap_or(id).to_string()
+}
+
+/// Turn each dbt exposure into a downstream consumer.
+///
+/// A consumer keeps a dependency only when it names a model that was imported,
+/// because a name that is not a model is an `E060` compile error and the
+/// emitted repo has to compile. Everything else an exposure reads (a source, a
+/// seed, a model that failed to import) is listed in the migration notes. An
+/// exposure whose name is not a valid consumer name is listed and not written.
+fn import_exposures(manifest: &DbtManifest, result: &mut ImportResult) {
+    let imported: std::collections::HashSet<String> =
+        result.imported.iter().map(|m| m.name.clone()).collect();
+    // Keyed by lowercase name: `Board.toml` and `board.toml` are one file on a
+    // case-insensitive filesystem (macOS and Windows defaults), so the second
+    // would silently overwrite the first.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for exposure in &manifest.exposures {
+        let mut note = |construct: &str, detail: String| {
+            result.constructs_dropped += 1;
             result
                 .structured_warnings
                 .push(ImportDbtStructuredWarning::DroppedConstruct {
-                    construct: "exposure".to_string(),
+                    construct: construct.to_string(),
                     name: exposure.name.clone(),
-                    detail: format!("owner: {owner}; depends on: {depends_on}"),
+                    detail,
                 });
+        };
+        if rocky_sql::validation::validate_identifier(&exposure.name).is_err() {
+            note(
+                "exposure",
+                "its name is not a valid consumer name (letters, digits and underscores); \
+                 rename it and add a file under consumers/ by hand"
+                    .to_string(),
+            );
+            continue;
         }
+        if let Some(first) = seen.get(&exposure.name.to_ascii_lowercase()) {
+            let detail = if *first == exposure.name {
+                "another exposure already has this name".to_string()
+            } else {
+                format!(
+                    "its name differs from exposure `{first}` only by letter case, so on a \
+                     case-insensitive filesystem both would be the one file consumers/{}.toml; \
+                     not written. Rename one and add its file under consumers/ by hand",
+                    exposure.name.to_ascii_lowercase()
+                )
+            };
+            note("exposure", detail);
+            continue;
+        }
+        seen.insert(exposure.name.to_ascii_lowercase(), exposure.name.clone());
+        let mut depends_on = Vec::new();
+        let mut not_carried: Vec<String> = exposure.other_dependencies.clone();
+        for id in &exposure.models {
+            // The importer names a versioned dbt model `<name>_v<N>`, so map
+            // through the manifest node instead of reading the name off the id.
+            let rocky_name = manifest
+                .nodes
+                .get(id)
+                .and_then(|node| manifest_rocky_name(node).ok())
+                .unwrap_or_else(|| extract_tail(id));
+            if imported.contains(&rocky_name) {
+                depends_on.push(rocky_name);
+            } else {
+                not_carried.push(format!("model {rocky_name} (not imported)"));
+            }
+        }
+        depends_on.sort();
+        depends_on.dedup();
+        if !not_carried.is_empty() {
+            note(
+                "exposure dependency",
+                format!(
+                    "written to consumers/{}.toml without: {}. A consumer can only depend on \
+                     imported models",
+                    exposure.name,
+                    not_carried.join(", ")
+                ),
+            );
+        }
+        result.consumers.push(rocky_core::consumers::Consumer {
+            name: exposure.name.clone(),
+            kind: exposure
+                .kind
+                .as_deref()
+                .map(rocky_core::consumers::ConsumerKind::from_label)
+                .unwrap_or_default(),
+            owner: exposure.owner.clone(),
+            url: exposure.url.clone(),
+            description: exposure.description.clone(),
+            depends_on,
+            file_path: std::path::PathBuf::new(),
+        });
     }
 }
 
@@ -2160,6 +2234,7 @@ pub fn import_dbt_project(
         unit_tests_skipped: 0,
         constructs_dropped: 0,
         contracts_dropped: 0,
+        consumers: Vec::new(),
     };
 
     // Verify at least one model directory exists
@@ -2277,6 +2352,7 @@ pub(super) fn empty_import_result() -> ImportResult {
         unit_tests_skipped: 0,
         constructs_dropped: 0,
         contracts_dropped: 0,
+        consumers: Vec::new(),
     }
 }
 
@@ -4016,6 +4092,7 @@ models:
             unit_tests_skipped: 0,
             constructs_dropped: 0,
             contracts_dropped: 0,
+            consumers: Vec::new(),
         };
         apply_dbt_tests(dir.path(), &target, &mut result);
 
@@ -4914,24 +4991,81 @@ WHERE e.id > 0
         );
     }
 
-    #[test]
-    fn test_manifest_exposures_are_listed_with_owner_and_dependencies() {
-        let manifest = serde_json::json!({
+    fn exposure_manifest() -> serde_json::Value {
+        serde_json::json!({
             "metadata": { "project_name": "p" },
-            "nodes": {},
+            "nodes": { "model.p.revenue": {
+                "unique_id": "model.p.revenue", "name": "revenue", "resource_type": "model",
+                "compiled_code": "SELECT 1 AS id", "raw_code": "SELECT 1 AS id",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
             "sources": {},
             "exposures": {
                 "exposure.p.weekly_board": {
                     "name": "weekly_board",
+                    "type": "dashboard",
+                    "url": "https://bi.example.com/board",
+                    "description": "Revenue by region",
                     "owner": { "name": "Ana", "email": "ana@example.com" },
-                    "depends_on": { "nodes": ["model.p.revenue", "source.p.shop.orders"] }
+                    "depends_on": { "nodes": [
+                        "model.p.revenue", "model.p.gone", "source.p.shop.orders"
+                    ] }
                 },
-                "exposure.p.ad_hoc": { "name": "ad_hoc" }
+                "exposure.p.ad_hoc": { "name": "ad_hoc", "type": "spreadsheet" },
+                "exposure.p.bad": { "name": "bad name" }
             }
+        })
+    }
+
+    #[test]
+    fn test_manifest_exposures_become_consumers_over_imported_models() {
+        let result = import_from_manifest_json(&exposure_manifest());
+        let names: Vec<&str> = result.consumers.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["ad_hoc", "weekly_board"]);
+        let board = &result.consumers[1];
+        assert_eq!(board.kind, rocky_core::consumers::ConsumerKind::Dashboard);
+        assert_eq!(board.owner.as_deref(), Some("Ana, ana@example.com"));
+        assert_eq!(board.url.as_deref(), Some("https://bi.example.com/board"));
+        assert_eq!(board.description.as_deref(), Some("Revenue by region"));
+        // Only the imported model survives, so the emitted repo compiles.
+        assert_eq!(board.depends_on, ["revenue"]);
+        // An unknown dbt type is `other`.
+        assert_eq!(
+            result.consumers[0].kind,
+            rocky_core::consumers::ConsumerKind::Other
+        );
+    }
+
+    /// Two exposures that differ only by letter case would share one file on a
+    /// case-insensitive filesystem. The second is refused, with a note.
+    #[test]
+    fn test_manifest_exposures_differing_only_by_case_are_not_both_written() {
+        let mut manifest = exposure_manifest();
+        manifest["exposures"] = serde_json::json!({
+            "exposure.p.Board": { "name": "Board", "type": "dashboard" },
+            "exposure.p.board": { "name": "board", "type": "dashboard" }
         });
         let result = import_from_manifest_json(&manifest);
-        assert_eq!(result.constructs_dropped, 2);
-        let details: Vec<(String, String)> = result
+        assert_eq!(result.consumers.len(), 1, "{:?}", result.consumers);
+        let lowered: std::collections::HashSet<String> = result
+            .consumers
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        assert_eq!(lowered.len(), result.consumers.len());
+        assert!(result.structured_warnings.iter().any(|w| matches!(
+            w,
+            ImportDbtStructuredWarning::DroppedConstruct { detail, .. }
+                if detail.contains("only by letter case")
+        )));
+    }
+
+    #[test]
+    fn test_manifest_exposure_leftovers_are_listed_in_the_notes() {
+        let result = import_from_manifest_json(&exposure_manifest());
+        let details: Vec<(String, String, String)> = result
             .structured_warnings
             .iter()
             .filter_map(|w| match w {
@@ -4939,23 +5073,31 @@ WHERE e.id > 0
                     construct,
                     name,
                     detail,
-                } if construct == "exposure" => Some((name.clone(), detail.clone())),
+                } if construct.starts_with("exposure") => {
+                    Some((construct.clone(), name.clone(), detail.clone()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            details,
-            [
-                (
-                    "ad_hoc".to_string(),
-                    "owner: none declared; depends on: nothing".to_string()
-                ),
-                (
-                    "weekly_board".to_string(),
-                    "owner: Ana, ana@example.com; depends on: revenue, shop.orders".to_string()
-                ),
-            ]
+        assert_eq!(details.len(), 2, "{details:?}");
+        let partial = details
+            .iter()
+            .find(|(_, name, _)| name == "weekly_board")
+            .expect("partial exposure is listed");
+        assert_eq!(partial.0, "exposure dependency");
+        assert!(partial.2.contains("source shop.orders"), "{}", partial.2);
+        assert!(
+            partial.2.contains("model gone (not imported)"),
+            "{}",
+            partial.2
         );
+        let refused = details
+            .iter()
+            .find(|(_, name, _)| name == "bad name")
+            .expect("invalid name is listed");
+        assert_eq!(refused.0, "exposure");
+        // A fully mapped exposure (ad_hoc reads nothing) adds no note.
+        assert!(details.iter().all(|(_, name, _)| name != "ad_hoc"));
     }
 
     #[test]

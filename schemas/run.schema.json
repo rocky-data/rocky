@@ -442,6 +442,56 @@
       ],
       "type": "object"
     },
+    "Diagnostic": {
+      "description": "A compiler diagnostic (error, warning, or informational message).\n\n`code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.",
+      "properties": {
+        "code": {
+          "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Which model this diagnostic relates to.",
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ],
+          "description": "Severity level."
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source location (if available)."
+        },
+        "suggestion": {
+          "description": "Suggested fix (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "model",
+        "severity"
+      ],
+      "type": "object"
+    },
     "DriftActionOutput": {
       "properties": {
         "action": {
@@ -1222,6 +1272,39 @@
         }
       ]
     },
+    "Severity": {
+      "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
+      "enum": [
+        "Error",
+        "Warning",
+        "Info"
+      ],
+      "type": "string"
+    },
+    "SourceSpan": {
+      "description": "Location in a source file.",
+      "properties": {
+        "col": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "file",
+        "line"
+      ],
+      "type": "object"
+    },
     "TableCheckOutput": {
       "properties": {
         "asset_key": {
@@ -1402,6 +1485,13 @@
     },
     "command": {
       "type": "string"
+    },
+    "consumer_diagnostics": {
+      "description": "Problems in the project's `consumers/` records (`E060`): a file that does not load, a duplicate name, a `depends_on` entry that names no model, or an unreadable directory. A consumer is metadata about readers of the models, so these never stop a model from being written and are never counted as a failed table. `rocky compile` and `rocky ci` do refuse on them. Empty (and omitted) when the records are sound.",
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      },
+      "type": "array"
     },
     "contained": {
       "description": "Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.",

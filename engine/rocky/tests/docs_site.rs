@@ -316,5 +316,5 @@ fn json_output_reports_format_and_files() {
     let json: serde_json::Value = serde_json::from_slice(&result.stdout).expect("stdout is JSON");
     assert_eq!(json["format"], "parquet");
     assert_eq!(json["sources_count"], 1);
-    assert_eq!(json["files"].as_array().expect("files").len(), 7);
+    assert_eq!(json["files"].as_array().expect("files").len(), 8);
 }

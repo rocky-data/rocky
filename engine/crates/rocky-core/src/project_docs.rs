@@ -143,6 +143,41 @@ pub struct ModelDetail {
     pub declared_sources: Vec<String>,
 }
 
+/// A downstream consumer (dashboard, notebook, ML job, application) that
+/// reads models, flattened for display and export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocConsumer {
+    /// Consumer name.
+    pub name: String,
+    /// `dashboard`, `notebook`, `ml`, `application`, `analysis` or `other`.
+    pub kind: String,
+    /// Who to ask about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Where to find it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// What it is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Models it reads, sorted.
+    pub depends_on: Vec<String>,
+}
+
+impl DocConsumer {
+    /// Flatten a loaded consumer.
+    pub fn from_consumer(consumer: &crate::consumers::Consumer) -> Self {
+        Self {
+            name: consumer.name.clone(),
+            kind: consumer.kind.as_str().to_string(),
+            owner: consumer.owner.clone(),
+            url: consumer.url.clone(),
+            description: consumer.description.clone(),
+            depends_on: consumer.depends_on.clone(),
+        }
+    }
+}
+
 /// Everything the documentation site and the metadata export describe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDocs {
@@ -154,6 +189,10 @@ pub struct ProjectDocs {
     pub sources: Vec<DocSource>,
     /// Column-level lineage edges, sorted.
     pub column_lineage: Vec<DocColumnEdge>,
+    /// Downstream consumers of the documented models, sorted by name. Each
+    /// lists only the documented models it reads.
+    #[serde(default)]
+    pub consumers: Vec<DocConsumer>,
     /// Whether the compile step supplied column types. When `false`, column
     /// tables are empty because the project did not compile.
     pub schema_available: bool,
@@ -264,8 +303,31 @@ impl ProjectDocs {
             details,
             sources,
             column_lineage: lineage,
+            consumers: Vec::new(),
             schema_available,
         }
+    }
+
+    /// Attach downstream consumers. Each keeps only the entries of
+    /// `depends_on` that name a documented model, and one left reading no
+    /// documented model is dropped, so a selection never lists a consumer of
+    /// models the page does not describe.
+    #[must_use]
+    pub fn with_consumers(mut self, consumers: &[crate::consumers::Consumer]) -> Self {
+        let documented: BTreeSet<&str> =
+            self.index.models.iter().map(|m| m.name.as_str()).collect();
+        let mut kept: Vec<DocConsumer> = consumers
+            .iter()
+            .map(DocConsumer::from_consumer)
+            .map(|mut c| {
+                c.depends_on.retain(|m| documented.contains(m.as_str()));
+                c
+            })
+            .filter(|c| !c.depends_on.is_empty())
+            .collect();
+        kept.sort_by(|a, b| a.name.cmp(&b.name));
+        self.consumers = kept;
+        self
     }
 
     /// Model-level edges `(upstream, downstream)`. The upstream is a model
@@ -351,6 +413,41 @@ mod tests {
             target_column: tc.into(),
             transform: "direct".into(),
         }
+    }
+
+    #[test]
+    fn consumers_keep_only_documented_models_and_drop_when_none_remain() {
+        use crate::consumers::{Consumer, ConsumerKind};
+        let consumer = |name: &str, deps: &[&str]| Consumer {
+            name: name.into(),
+            kind: ConsumerKind::Dashboard,
+            owner: None,
+            url: None,
+            description: None,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            file_path: std::path::PathBuf::new(),
+        };
+        let index = DocIndex {
+            models: vec![model("a", &[])],
+            pipeline_count: 0,
+            adapter_count: 0,
+        };
+        let docs = ProjectDocs::build(
+            index,
+            &[],
+            Path::new("models"),
+            &HashMap::new(),
+            vec![],
+            true,
+        )
+        .with_consumers(&[
+            consumer("zeta", &["a", "unselected"]),
+            consumer("alpha", &["a"]),
+            consumer("elsewhere", &["unselected"]),
+        ]);
+        let names: Vec<&str> = docs.consumers.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+        assert_eq!(docs.consumers[1].depends_on, vec!["a"]);
     }
 
     #[test]

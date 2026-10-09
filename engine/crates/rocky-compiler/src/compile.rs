@@ -80,6 +80,20 @@ fn source_column_info(
         .collect()
 }
 
+/// What the compile knows about the project beyond the models it was handed.
+///
+/// A compile can cover part of a project: one `--models` directory, one
+/// pipeline's `models` glob, one model of a multi-pipeline run. Things that
+/// belong to the whole project must not be judged against that part.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectContext {
+    /// The directory that holds `rocky.toml`. `consumers/` is read from here.
+    pub root: PathBuf,
+    /// Every model name in the whole project, across all pipelines. A
+    /// consumer may read any of them.
+    pub model_names: std::collections::BTreeSet<String>,
+}
+
 /// Configuration for the compiler.
 #[derive(Clone, Default)]
 pub struct CompilerConfig {
@@ -158,6 +172,12 @@ pub struct CompilerConfig {
     /// of the model DAG instead of being refused as an unknown model. Empty by
     /// default: every other caller still refuses an unknown name.
     pub external_dependencies: std::collections::BTreeSet<String>,
+    /// The whole project, when this compile covers only part of it. With
+    /// `Some`, `consumers/` is read from [`ProjectContext::root`] and a
+    /// consumer's `depends_on` may name any model in
+    /// [`ProjectContext::model_names`]. With `None`, `consumers/` is the
+    /// sibling of `models_dir` and only the compiled models count.
+    pub project: Option<ProjectContext>,
 }
 
 /// Result of compilation.
@@ -188,6 +208,11 @@ pub struct CompileResult {
     /// bytes reads it here, not from [`rocky_core::models::Model::contract_path`],
     /// which only knows the sidecar.
     pub contract_files: std::collections::BTreeMap<String, PathBuf>,
+    /// Downstream consumers (`consumers/` beside the models directory):
+    /// dashboards, notebooks, ML jobs and applications that read models. Each
+    /// holds only the `depends_on` entries that name a model; an entry that
+    /// does not is an `E060` in [`Self::diagnostics`].
+    pub consumers: Vec<rocky_core::consumers::Consumer>,
 }
 
 /// Compile error.
@@ -557,6 +582,10 @@ pub fn compile_project(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Downstream consumers: every `depends_on` entry must name a model (E060).
+    let (consumers, consumer_diagnostics) =
+        crate::consumers::load_and_check_project(config, &project.models);
+    diagnostics.extend(consumer_diagnostics);
     // User-defined functions: invalid definitions, then invalid calls (E051).
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
@@ -596,6 +625,7 @@ pub fn compile_project(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 
@@ -845,6 +875,11 @@ pub fn compile_incremental(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Same check as the full path; it reads only the consumer files and the
+    // model names, so recomputing it keeps incremental equal to from-scratch.
+    let (consumers, consumer_diagnostics) =
+        crate::consumers::load_and_check_project(config, &project.models);
+    diagnostics.extend(consumer_diagnostics);
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
         &project.models,
@@ -901,6 +936,7 @@ pub fn compile_incremental(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 
