@@ -183,6 +183,11 @@ pub struct CompileResult {
     /// bytes reads it here, not from [`rocky_core::models::Model::contract_path`],
     /// which only knows the sidecar.
     pub contract_files: std::collections::BTreeMap<String, PathBuf>,
+    /// Downstream consumers (`consumers/` beside the models directory):
+    /// dashboards, notebooks, ML jobs and applications that read models. Each
+    /// holds only the `depends_on` entries that name a model; an entry that
+    /// does not is an `E059` in [`Self::diagnostics`].
+    pub consumers: Vec<rocky_core::consumers::Consumer>,
 }
 
 /// Compile error.
@@ -548,6 +553,16 @@ pub fn compile_project(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Downstream consumers: every `depends_on` entry must name a model (E059).
+    let (consumers, consumer_diagnostics) = crate::consumers::load_and_check(
+        &config.models_dir,
+        &project
+            .models
+            .iter()
+            .map(|m| m.config.name.as_str())
+            .collect(),
+    );
+    diagnostics.extend(consumer_diagnostics);
     // User-defined functions: invalid definitions, then invalid calls (E051).
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
@@ -587,6 +602,7 @@ pub fn compile_project(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 
@@ -832,6 +848,17 @@ pub fn compile_incremental(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // Same check as the full path; it reads only the consumer files and the
+    // model names, so recomputing it keeps incremental equal to from-scratch.
+    let (consumers, consumer_diagnostics) = crate::consumers::load_and_check(
+        &config.models_dir,
+        &project
+            .models
+            .iter()
+            .map(|m| m.config.name.as_str())
+            .collect(),
+    );
+    diagnostics.extend(consumer_diagnostics);
     diagnostics.extend(function_diagnostics);
     diagnostics.extend(crate::udf::check_model_calls(
         &project.models,
@@ -888,6 +915,7 @@ pub fn compile_incremental(
         timings,
         model_timings,
         contract_files,
+        consumers,
     })
 }
 

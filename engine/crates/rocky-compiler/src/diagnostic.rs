@@ -220,6 +220,17 @@ pub const E057: &str = "E057";
 /// that model's read of the next model on it. Commands that execute models
 /// (`rocky run`) refuse the project with the same cycle before they write.
 pub const E058: &str = "E058";
+/// A downstream-consumer record in `consumers/` is invalid: the file does not
+/// parse, two consumers share a name, or `depends_on` names something that is
+/// not a model in this project (a typo, a source table, a seed, a removed
+/// model). The message names the consumer and the entry; a near-miss model
+/// name is offered when there is one.
+///
+/// Emitted by `rocky compile` (and so by `rocky ci`, strict and `rocky run
+/// --dag`) from [`crate::consumers`]. A consumer that points at a model that
+/// no longer exists is the failure this exists to catch: the dashboard would
+/// otherwise keep reading a table nobody maintains.
+pub const E059: &str = "E059";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

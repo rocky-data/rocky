@@ -176,7 +176,13 @@ pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
             sources,
         }
     });
-    SelectorGraph::new(nodes)
+    // Consumers feed the `consumer:` method. Files that do not load are the
+    // compiler's `E059`, not this graph's concern.
+    let consumers = rocky_core::consumers::load_consumers_for_models_dir(models_dir)
+        .consumers
+        .into_iter()
+        .map(|c| (c.name, c.depends_on));
+    SelectorGraph::new(nodes).with_consumers(consumers)
 }
 
 /// Compute `state:` sets by diffing `state_ref...HEAD` exactly as
@@ -661,6 +667,31 @@ mod tests {
             format!("{err:#}").contains("unknown saved selector"),
             "{err:#}"
         );
+    }
+
+    /// `consumer:<name>` selects the models a `consumers/` file reads, and
+    /// `+consumer:<name>` adds their upstream.
+    #[test]
+    fn consumer_selector_reads_the_consumers_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_var_project(&models);
+        let consumers = root.path().join("consumers");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::write(consumers.join("board.toml"), "depends_on = [\"m\"]\n").unwrap();
+        let run = |select: &str| {
+            let args = SelectionArgs {
+                select: vec![select.into()],
+                ..Default::default()
+            };
+            resolve_in_dir(&args, &models, None, &ctx(&models))
+                .map(|s| s.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(run("consumer:board").unwrap(), vec!["m"]);
+        assert_eq!(run("+consumer:board").unwrap(), vec!["base", "m"]);
+        let err = run("consumer:borad").unwrap_err();
+        assert!(format!("{err:#}").contains("consumer:borad"), "{err:#}");
     }
 
     #[test]

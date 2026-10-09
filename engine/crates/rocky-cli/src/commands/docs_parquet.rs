@@ -12,6 +12,7 @@
 //! | `tests.parquet`          | declared test                                 |
 //! | `contracts.parquet`      | contract constraint                           |
 //! | `sources.parquet`        | external table the models read                |
+//! | `consumers.parquet`      | downstream consumer and model it reads        |
 //!
 //! Every table is written even when it has no rows, so queries never fail on
 //! a missing file.
@@ -27,7 +28,7 @@ use parquet::arrow::ArrowWriter;
 use rocky_core::project_docs::{DocTest, ProjectDocs};
 
 /// Table file names, in write order.
-pub const TABLE_FILES: [&str; 7] = [
+pub const TABLE_FILES: [&str; 8] = [
     "models.parquet",
     "columns.parquet",
     "edges.parquet",
@@ -35,6 +36,7 @@ pub const TABLE_FILES: [&str; 7] = [
     "tests.parquet",
     "contracts.parquet",
     "sources.parquet",
+    "consumers.parquet",
 ];
 
 /// A column under construction: its Arrow field and values.
@@ -342,6 +344,36 @@ pub fn write_parquet_tables(docs: &ProjectDocs, dir: &Path) -> Result<Vec<String
             Col::Str("name", sname),
             Col::Int("columns_read", scols),
             Col::Int("used_by_count", sused),
+        ],
+    )?;
+
+    // consumers: one row per (consumer, model it reads)
+    let mut cname = vec![];
+    let mut ckind = vec![];
+    let mut cowner = vec![];
+    let mut curl = vec![];
+    let mut cdesc = vec![];
+    let mut cmodel = vec![];
+    for consumer in &docs.consumers {
+        for model in &consumer.depends_on {
+            cname.push(s(&consumer.name));
+            ckind.push(s(&consumer.kind));
+            cowner.push(consumer.owner.clone());
+            curl.push(consumer.url.clone());
+            cdesc.push(consumer.description.clone());
+            cmodel.push(s(model));
+        }
+    }
+    write_table(
+        dir,
+        "consumers.parquet",
+        vec![
+            Col::Str("consumer", cname),
+            Col::Str("kind", ckind),
+            Col::Str("owner", cowner),
+            Col::Str("url", curl),
+            Col::Str("description", cdesc),
+            Col::Str("model", cmodel),
         ],
     )?;
 

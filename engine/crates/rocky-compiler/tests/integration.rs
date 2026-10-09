@@ -1887,3 +1887,66 @@ mod dependency_and_name_checks {
         }
     }
 }
+
+// ---- downstream consumers (`consumers/`, E059) ----
+
+fn write_consumer(dir: &std::path::Path, file: &str, body: &str) {
+    let consumers = dir.join("consumers");
+    std::fs::create_dir_all(&consumers).unwrap();
+    std::fs::write(consumers.join(file), body).unwrap();
+}
+
+fn e059_messages(result: &rocky_compiler::compile::CompileResult) -> Vec<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E059")
+        .map(|d| d.message.to_string())
+        .collect()
+}
+
+/// A consumer over real models compiles clean and appears on the result; one
+/// over a missing model is an E059 error that sets `has_errors`, and the full
+/// and incremental paths agree.
+#[test]
+fn consumer_depends_on_must_name_a_model() {
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project(dir.path(), "type = \"full_refresh\"");
+    write_consumer(
+        dir.path(),
+        "board.toml",
+        "kind = \"dashboard\"\nowner = \"finance\"\ndepends_on = [\"leaf\", \"src\"]\n",
+    );
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    let clean = compile(&config).unwrap();
+    assert!(e059_messages(&clean).is_empty(), "{:?}", clean.diagnostics);
+    assert!(!clean.has_errors, "{:?}", clean.diagnostics);
+    assert_eq!(clean.consumers.len(), 1);
+    assert_eq!(clean.consumers[0].name, "board");
+    assert_eq!(clean.consumers[0].depends_on, vec!["leaf", "src"]);
+
+    // Point it at a model that does not exist.
+    write_consumer(
+        dir.path(),
+        "board.toml",
+        "kind = \"dashboard\"\ndepends_on = [\"lef\", \"src\"]\n",
+    );
+    let broken = compile(&config).unwrap();
+    let messages = e059_messages(&broken);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("`lef`"), "{}", messages[0]);
+    assert!(broken.has_errors);
+    // The valid edge stays visible.
+    assert_eq!(broken.consumers[0].depends_on, vec!["src"]);
+
+    // The incremental path reports the same thing.
+    let incremental = rocky_compiler::compile::compile_incremental(&config, &[], &broken).unwrap();
+    assert_eq!(e059_messages(&incremental), messages);
+    assert!(incremental.has_errors);
+    assert_eq!(incremental.consumers, broken.consumers);
+}

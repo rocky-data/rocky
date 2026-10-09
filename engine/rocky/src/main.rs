@@ -3418,6 +3418,7 @@ struct SelectArgs {
     /// Select models with dbt-style node selection: names and globs
     /// (`stg_*`), graph operators (`+m`, `m+`, `2+m`, `m+3`, `@m`), and
     /// methods (`tag:`, `path:`, `file:`, `config.materialized:`, `source:`,
+    /// `consumer:<name>` for the models a downstream consumer reads,
     /// `selector:<name>` for an entry of the `[selectors]` table in rocky.toml,
     /// `state:modified`, `state:new`). Space-separated terms union;
     /// comma-joined terms intersect. Repeatable.

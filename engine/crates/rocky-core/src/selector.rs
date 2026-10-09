@@ -14,6 +14,9 @@
 //!   <https://docs.getdbt.com/reference/node-selection/set-operators>
 //! - Methods (`tag:`, `path:`, `config.`, `state:`, `source:`, ...):
 //!   <https://docs.getdbt.com/reference/node-selection/methods>
+//! - Consumers: `consumer:<name>` selects the models a downstream consumer
+//!   (a record in `consumers/`) reads, so `+consumer:<name>` is everything
+//!   needed to build what it reads. It takes graph operators and globs.
 //! - Saved selectors: `selector:<name>` expands an entry of the `[selectors]`
 //!   table in `rocky.toml` (name to expression), as dbt's `selector:` method
 //!   expands `selectors.yml`. It takes graph operators like any other method.
@@ -48,7 +51,7 @@ pub enum SelectorError {
     /// The selector names a method Rocky does not support.
     #[error(
         "unknown selector method '{method}' in '{selector}'; supported methods: \
-         name, tag, path, file, config.<key>, state, source, selector"
+         name, tag, path, file, config.<key>, state, source, consumer, selector"
     )]
     UnknownMethod { selector: String, method: String },
     /// `config.<key>` names a key Rocky cannot select on.
@@ -109,6 +112,8 @@ pub struct SelectorGraph {
     nodes: BTreeMap<String, SelectorNode>,
     parents: BTreeMap<String, BTreeSet<String>>,
     children: BTreeMap<String, BTreeSet<String>>,
+    /// Consumer name to the models it reads, for the `consumer:` method.
+    consumers: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl SelectorGraph {
@@ -137,7 +142,26 @@ impl SelectorGraph {
             nodes,
             parents,
             children,
+            consumers: BTreeMap::new(),
         }
+    }
+
+    /// Attach downstream consumers as `(name, models it reads)` pairs, for
+    /// the `consumer:` method. Models that are not nodes are dropped.
+    #[must_use]
+    pub fn with_consumers<I, D>(mut self, consumers: I) -> Self
+    where
+        I: IntoIterator<Item = (String, D)>,
+        D: IntoIterator<Item = String>,
+    {
+        for (name, depends_on) in consumers {
+            let models: BTreeSet<String> = depends_on
+                .into_iter()
+                .filter(|m| self.nodes.contains_key(m))
+                .collect();
+            self.consumers.insert(name, models);
+        }
+        self
     }
 
     /// Every node name, sorted.
@@ -234,6 +258,9 @@ pub enum Method {
     State(StateKind),
     /// External relation read by the model (glob, segment-aligned).
     Source(String),
+    /// `consumer:<name>` (glob): the models the named downstream consumer
+    /// reads.
+    Consumer(String),
     /// `selector:<name>`: a saved selector from the `[selectors]` table,
     /// already parsed. Holds the name and its expression.
     Saved(String, Box<Selector>),
@@ -285,9 +312,12 @@ impl Method {
     /// glob (see [`Resolution::unmatched_named`]).
     pub fn names_project_entity(&self) -> bool {
         match self {
-            Self::Name(p) | Self::Tag(p) | Self::Path(p) | Self::File(p) | Self::Source(p) => {
-                !p.contains(['*', '?', '['])
-            }
+            Self::Name(p)
+            | Self::Tag(p)
+            | Self::Path(p)
+            | Self::File(p)
+            | Self::Source(p)
+            | Self::Consumer(p) => !p.contains(['*', '?', '[']),
             // Whatever the saved selector names is reported by its own atoms.
             Self::Config(..) | Self::State(_) | Self::Saved(..) => false,
         }
@@ -466,6 +496,7 @@ fn parse_method(
         "path" => Ok(Method::Path(value)),
         "file" => Ok(Method::File(value)),
         "source" => Ok(Method::Source(value.to_ascii_lowercase())),
+        "consumer" => Ok(Method::Consumer(value)),
         "selector" => parse_saved(raw, &value, saved, stack),
         "state" => match value.as_str() {
             "modified" => Ok(Method::State(StateKind::Modified)),
@@ -607,6 +638,14 @@ fn match_method(
         }
         return Ok(names.into_iter().filter(|n| graph.contains(n)).collect());
     }
+    if let Method::Consumer(pattern) = &atom.method {
+        return Ok(graph
+            .consumers
+            .iter()
+            .filter(|(name, _)| glob_match(pattern, name))
+            .flat_map(|(_, models)| models.iter().cloned())
+            .collect());
+    }
     Ok(graph
         .nodes
         .values()
@@ -658,7 +697,7 @@ fn node_matches(method: &Method, node: &SelectorNode) -> bool {
         },
         Method::Source(p) => node.sources.iter().any(|s| source_matches(p, s)),
         // Resolved by `Selector::resolve` before it gets here.
-        Method::State(_) | Method::Saved(..) => false,
+        Method::State(_) | Method::Consumer(_) | Method::Saved(..) => false,
     }
 }
 
@@ -977,6 +1016,28 @@ mod tests {
         let x = parse(&["nope".into()]).unwrap();
         let r = select(&g, &Selector::default(), &x, None).unwrap();
         assert!(r.unmatched_named.is_empty());
+    }
+
+    #[test]
+    fn consumer_selects_the_models_it_reads_and_takes_graph_operators() {
+        // diamond: a -> b, c -> d -> e; x alone.
+        let g = diamond().with_consumers(vec![
+            (
+                "board".to_string(),
+                vec!["d".to_string(), "gone".to_string()],
+            ),
+            ("report".to_string(), vec!["x".to_string()]),
+        ]);
+        assert_eq!(sel(&g, "consumer:board"), names(&["d"]));
+        assert_eq!(sel(&g, "+consumer:board"), names(&["a", "b", "c", "d"]));
+        assert_eq!(sel(&g, "1+consumer:board"), names(&["b", "c", "d"]));
+        assert_eq!(sel(&g, "consumer:*"), names(&["d", "x"]));
+        assert_eq!(sel(&g, "consumer:board,tag:none"), names(&[]));
+        // A consumer that does not exist is a named miss, like a typo'd model.
+        let s = parse(&["consumer:borad".into()]).unwrap();
+        let r = select(&g, &s, &Selector::default(), None).unwrap();
+        assert!(r.models.is_empty());
+        assert_eq!(r.unmatched_named, vec!["consumer:borad".to_string()]);
     }
 
     #[test]

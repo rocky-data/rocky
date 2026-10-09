@@ -747,7 +747,7 @@ rocky docs --select "orders+"                           # Only some models
 
 **Parquet tables:**
 
-`--format parquet` writes seven files. Every file exists even when it has no rows.
+`--format parquet` writes eight files. Every file exists even when it has no rows.
 
 | File | One row per | Main columns |
 |------|-------------|--------------|
@@ -758,6 +758,7 @@ rocky docs --select "orders+"                           # Only some models
 | `tests.parquet` | declared test | `model`, `kind`, `column_name`, `severity`, `params`, `filter` |
 | `contracts.parquet` | contract constraint | `model`, `kind` (`column`, `required`, `protected`, `no_new_nullable`), `column_name`, `type_name`, `nullable` |
 | `sources.parquet` | external table | `name`, `columns_read`, `used_by_count` |
+| `consumers.parquet` | downstream consumer and model it reads | `consumer`, `kind`, `owner`, `url`, `description`, `model` |
 
 Example queries with the DuckDB CLI:
 
