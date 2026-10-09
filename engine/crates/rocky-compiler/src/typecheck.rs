@@ -3621,7 +3621,8 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
         Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
-            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
+            // `NULLIF(x, y)` returns `x` or NULL, so it has the type of `x`.
+            "SUM" | "MIN" | "MAX" | "AVG" | "NULLIF" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
@@ -5192,6 +5193,18 @@ mod tests {
             ];
             assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
         }
+    }
+
+    /// `NULLIF(x, y)` is `x` or NULL: it has the type of `x`, and is nullable.
+    /// Over an expression whose type is a guess (`LENGTH`), it stays Unknown.
+    #[test]
+    fn nullif_takes_the_type_of_its_first_argument() {
+        let sql = "SELECT NULLIF(x, 0) AS a, NULLIF(LENGTH(n), 0) AS b FROM t";
+        let expected = vec![
+            ("a".to_string(), RockyType::Int32, true),
+            ("b".to_string(), RockyType::Unknown, true),
+        ];
+        assert_eq!(typecheck_over_t("t", sql), expected);
     }
 
     /// #2318: an outer MAX / SUM over a CTE column built from an expression
