@@ -1,13 +1,16 @@
 //! `rocky ci` — CI/CD integration runner.
 //!
 //! Runs in CI without warehouse credentials:
-//! 1. `rocky compile` — type-check, lineage, contracts
-//! 2. `rocky test` — local execution against DuckDB
-//! 3. Report results with exit code
+//! 1. Run the project's seed file in an in-memory DuckDB
+//! 2. `rocky compile` — type-check (typed from the seed), lineage, contracts
+//! 3. `rocky test` — execute every model on that seed
+//! 4. Report results with exit code
 
 use std::path::Path;
 
 use tracing::info;
+
+use crate::test_runner::{TestModels, TestRunInputs};
 
 /// CI run result.
 #[derive(Debug)]
@@ -34,44 +37,42 @@ impl CiResult {
         self.compile_ok && self.tests_ok
     }
 
-    /// Exit code: 0 if pass, 1 if errors, 4 if warnings-only.
+    /// The process exit code: `0` if compile and tests pass, `1` otherwise.
     ///
-    /// The warnings-only code is deliberately `4`, not `2`: exit `2` is
-    /// reserved for `rocky run` partial-success (Dagster keys on it via
-    /// `allow_partial=True`). A `rocky ci` run that compiled and tested
-    /// clean but emitted advisory warnings is a different condition, so
-    /// it must not collide with that code. See the exit-code convention
-    /// in `rocky/src/main.rs`.
+    /// `rocky ci` exits with this code and reports the same number in its
+    /// JSON. Advisory warnings do not change it: a CI step that wants to act
+    /// on them reads the warning-severity entries of `diagnostics`.
     pub fn exit_code(&self) -> i32 {
-        if !self.compile_ok || !self.tests_ok {
-            1
-        } else if self
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == rocky_compiler::diagnostic::Severity::Warning)
-        {
-            4
-        } else {
-            0
-        }
+        if self.passed() { 0 } else { 1 }
     }
 }
 
-/// Run the full CI pipeline.
-///
-/// `run_vars` supplies per-run `@var(name)` substitutions so a required-var
-/// model passes `rocky ci --var name=value`; pass
-/// [`rocky_core::run_vars::RunVars::new`] when the caller has none.
+/// Run the full CI pipeline on the models at `models_dir`, with the seed
+/// file at `data/seed.sql` beside it. See [`run_ci_with`].
 pub fn run_ci(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> anyhow::Result<CiResult> {
+    run_ci_with(TestRunInputs {
+        models_dir,
+        project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+        models: TestModels::Dir,
+        contracts_dir,
+        model_filter: None,
+        run_vars,
+    })
+}
+
+/// Run the full CI pipeline: compile, typed from the project's seed file,
+/// then execute every model on that seed in one in-memory DuckDB.
+///
+/// `inputs.run_vars` supplies per-run `@var(name)` substitutions so a
+/// required-var model passes `rocky ci --var name=value`.
+pub fn run_ci_with(inputs: TestRunInputs<'_>) -> anyhow::Result<CiResult> {
     info!("running CI pipeline");
 
-    // Step 1: Compile
-    info!("step 1: compile");
-    let test_result = crate::test_runner::run_tests(models_dir, contracts_dir, None, run_vars)?;
+    let test_result = crate::test_runner::run_tests_with(inputs)?;
 
     let compile_ok = !test_result
         .diagnostics
@@ -133,8 +134,21 @@ mod tests {
         assert_eq!(fail.exit_code(), 1);
         assert!(!fail.passed());
 
+        let test_fail = CiResult {
+            compile_ok: true,
+            tests_ok: false,
+            models_compiled: 3,
+            tests_passed: 2,
+            tests_failed: 1,
+            diagnostics: vec![],
+            failures: vec![("m".to_string(), "boom".to_string())],
+        };
+        assert_eq!(test_fail.exit_code(), 1);
+        assert!(!test_fail.passed());
+
         // Warnings-only: compile + tests pass, but a warning diagnostic is
-        // present. Distinct from run's partial-success exit 2.
+        // present. The reported code is the code the process exits with, so
+        // it stays 0 (the process exited 0 while the JSON said 4).
         let warn = CiResult {
             compile_ok: true,
             tests_ok: true,
@@ -146,7 +160,7 @@ mod tests {
             )],
             failures: vec![],
         };
-        assert_eq!(warn.exit_code(), 4);
+        assert_eq!(warn.exit_code(), 0);
         assert!(warn.passed());
     }
 }

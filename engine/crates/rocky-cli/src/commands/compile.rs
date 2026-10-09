@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
+use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::cost_check;
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
@@ -23,6 +23,18 @@ use crate::output::{CompileOutput, CostHint, FunctionDetail, ModelDetail, print_
 use rocky_server::project_gates::ModelSqlForm;
 
 use super::ModelNotFound;
+
+/// Which models a command reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelScope {
+    /// The models under the `--models` directory. The command was given one,
+    /// or the caller names its own directory.
+    Dir,
+    /// No `--models` was named: every transformation pipeline's own models,
+    /// in one project graph. A project with no transformation pipeline, or
+    /// none with a model, reads the default `models/` directory instead.
+    WholeProject,
+}
 
 /// Execute `rocky compile`.
 ///
@@ -49,6 +61,7 @@ pub fn run_compile(
         config_path,
         state_path,
         models_dir,
+        ModelScope::Dir,
         contracts_dir,
         model_filter,
         output_json,
@@ -76,11 +89,15 @@ pub fn run_compile(
 /// project still compiles (types flow across models); only the selected
 /// models' details and diagnostics are reported, and only their errors fail
 /// the command — the same scoping `--model` applies.
+///
+/// `scope` ([`ModelScope`]) picks the models: `models_dir` alone, or every
+/// transformation pipeline's models when no `--models` was named.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compile_with_options(
     config_path: Option<&Path>,
     state_path: &Path,
     models_dir: &Path,
+    scope: ModelScope,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     output_json: bool,
@@ -98,11 +115,16 @@ pub fn run_compile_with_options(
         config_path,
         state_path,
         models_dir,
+        scope,
         contracts_dir,
         model_filter,
         do_expand_macros,
         target_dialect,
-        with_seed,
+        if with_seed {
+            SeedUse::Required
+        } else {
+            SeedUse::IfPresent
+        },
         cache_ttl_override,
         run_vars,
         strict_sources,
@@ -199,6 +221,7 @@ pub fn run_compile_dbt_attach(
         Some(&project_dir.join("rocky.toml")),
         &scratch.path().join("state.redb"),
         &project_dir.join("models"),
+        ModelScope::Dir,
         contracts_dir,
         model_filter,
         output_json,
@@ -211,6 +234,21 @@ pub fn run_compile_dbt_attach(
         deny_warning_codes,
         selection,
     )
+}
+
+/// Whether a compile runs the project's seed file for source schemas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedUse {
+    /// `--with-seed`: the seed's tables only, and a missing or broken seed
+    /// is an error.
+    Required,
+    /// The `rocky compile` default: the seed's tables fill what the schema
+    /// cache lacks, when the project has a seed that runs.
+    IfPresent,
+    /// Never run the seed. For in-process callers ([`compile_output`]: the
+    /// `rocky serve` API and the MCP compile tool), which compile on request
+    /// and must not execute the project's seed SQL each time.
+    Never,
 }
 
 /// Compile body shared by the JSON core ([`compile_output`]) and the text
@@ -226,11 +264,12 @@ fn compile_inner(
     config_path: Option<&Path>,
     state_path: &Path,
     models_dir: &Path,
+    scope: ModelScope,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     do_expand_macros: bool,
     target_dialect: Option<Dialect>,
-    with_seed: bool,
+    seed_use: SeedUse,
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
@@ -267,12 +306,24 @@ fn compile_inner(
             )
         })?;
 
+    // The project root: where `data/seed.sql` lives. A whole-project compile
+    // reads it beside `rocky.toml`; a `--models <dir>` compile beside that
+    // directory, as `--with-seed` always has.
+    let config_file_path = config_path.unwrap_or_else(|| Path::new("rocky.toml"));
+    let project_root = match scope {
+        ModelScope::WholeProject => config_file_path.parent(),
+        ModelScope::Dir => models_dir.parent(),
+    }
+    .unwrap_or_else(|| Path::new("."));
+
     // `source_schemas` precedence:
     //   1. `--with-seed` wins -> seed loader (explicit user intent,
     //      used for tests/playgrounds where the cache is irrelevant).
-    //   2. Otherwise, the schema cache if `[cache.schemas] enabled`.
-    //   3. Cold-cache fallback: empty map — typecheck degrades to
-    //      Unknown.
+    //   2. Otherwise, the schema cache if `[cache.schemas] enabled`, with
+    //      the project's seed file (when it has one) filling every table
+    //      the cache does not hold. The seed runs in an in-memory DuckDB;
+    //      nothing contacts the warehouse.
+    //   3. Neither: empty map — typecheck degrades to Unknown.
     //
     // Each tier also records where its schemas came from, for the E041 /
     // W041 missing-source-column check: a seed is `Seed` (W041 unless
@@ -282,26 +333,38 @@ fn compile_inner(
     let config_strict_sources = project_config
         .as_ref()
         .is_some_and(|config| config.cache.schemas.strict_sources);
-    let (source_schemas, source_provenance) = if with_seed {
+    let (source_schemas, source_provenance) = if seed_use == SeedUse::Required {
         // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
-        let schemas = load_source_schemas_from_seed(models_dir)?;
+        let schemas = load_source_schemas_from_seed_at(project_root)?;
         let provenance = SourceProvenance::uniform(schemas.keys(), &SourceSchemaOrigin::Seed);
         (schemas, provenance)
-    } else if let Some(config) = &project_config {
-        // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
-        // Honours `[cache.schemas] enabled` + `ttl_seconds` (after
-        // applying the optional CLI `--cache-ttl` override).
-        let schema_cfg = config
-            .cache
-            .schemas
-            .clone()
-            .with_ttl_override(cache_ttl_override);
-        crate::source_schemas::load_cached_source_schemas_with_provenance(&schema_cfg, state_path)
     } else {
-        (HashMap::new(), SourceProvenance::default())
+        let (mut schemas, mut provenance) = if let Some(config) = &project_config {
+            // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
+            // Honours `[cache.schemas] enabled` + `ttl_seconds` (after
+            // applying the optional CLI `--cache-ttl` override).
+            let schema_cfg = config
+                .cache
+                .schemas
+                .clone()
+                .with_ttl_override(cache_ttl_override);
+            crate::source_schemas::load_cached_source_schemas_with_provenance(
+                &schema_cfg,
+                state_path,
+            )
+        } else {
+            (HashMap::new(), SourceProvenance::default())
+        };
+        match seed_use {
+            SeedUse::IfPresent => {
+                merge_default_seed_schemas(project_root, &mut schemas, &mut provenance);
+            }
+            SeedUse::Never | SeedUse::Required => {}
+        }
+        (schemas, provenance)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
 
@@ -345,7 +408,20 @@ fn compile_inner(
         external_dependencies: Default::default(),
     };
 
-    let mut result = compile::compile(&config)?;
+    // Without `--models`, one compile over every transformation pipeline's
+    // models: a model of one pipeline that reads another's output gets that
+    // output's column types. A loader refusal (one model name in two files)
+    // fails the command; it would fail `rocky run --dag` the same way.
+    let whole_project = match (scope, &project_config) {
+        (ModelScope::WholeProject, Some(project)) => {
+            crate::models_loader::whole_project_models(config_file_path, project)?
+        }
+        (ModelScope::WholeProject, None) | (ModelScope::Dir, _) => None,
+    };
+    let mut result = match whole_project {
+        Some(models) => compile::compile_preloaded_models(models, &config)?,
+        None => compile::compile(&config)?,
+    };
 
     // `--model` may also name a user-defined function (`functions/`), valid
     // or not, to see its own diagnostics.
@@ -377,7 +453,6 @@ fn compile_inner(
     // The warehouses each model runs on, from the pipelines that target
     // them (not every configured adapter). The adapter gates below judge
     // each model against these, and refuse when any one refuses.
-    let config_file_path = config_path.unwrap_or_else(|| Path::new("rocky.toml"));
     let model_targets = project_config
         .as_ref()
         .map(|config| ModelTargets::resolve(config, config_file_path));
@@ -1304,11 +1379,18 @@ pub fn compile_output(
         config_path,
         state_path,
         models_dir,
+        ModelScope::Dir,
         contracts_dir,
         model_filter,
         do_expand_macros,
         target_dialect,
-        with_seed,
+        // These callers compile on request; only an explicit `with_seed`
+        // runs the project's seed SQL.
+        if with_seed {
+            SeedUse::Required
+        } else {
+            SeedUse::Never
+        },
         cache_ttl_override,
         // `compile_output` backs commands that don't expose `--var`
         // (ci / dag); an `@var()` model would surface an E028 diagnostic.
@@ -1429,15 +1511,66 @@ fn build_p001_diagnostic(
 /// the typecheck `typed_models` injection in
 /// `rocky-compiler/src/typecheck.rs:152` lands the type info on the path
 /// the producing-edge lookup walks.
-#[cfg(feature = "duckdb")]
 pub(crate) fn load_source_schemas_from_seed(
     models_dir: &Path,
+) -> Result<HashMap<String, Vec<TypedColumn>>> {
+    load_source_schemas_from_seed_at(models_dir.parent().unwrap_or(Path::new(".")))
+}
+
+/// Fill `schemas` with the tables of the project's seed file that it does
+/// not already hold, recorded as [`SourceSchemaOrigin::Seed`].
+///
+/// The default source-schema tier of `rocky compile`: with no `--with-seed`,
+/// a project that ships `data/seed.sql` is still typed from it, so a model
+/// that reads a column the seed's tables lack gets W041 with no flag. A
+/// schema-cache entry wins over a seed table of the same name: it describes
+/// the warehouse.
+///
+/// Never fails the compile. The user did not ask for the seed, so a seed
+/// that does not run is logged and skipped, and the compile goes on with the
+/// schemas it had.
+fn merge_default_seed_schemas(
+    project_root: &Path,
+    schemas: &mut HashMap<String, Vec<TypedColumn>>,
+    provenance: &mut SourceProvenance,
+) {
+    // A build without DuckDB cannot run a seed; the default tier is silent.
+    if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
+        return;
+    }
+    match load_source_schemas_from_seed_at(project_root) {
+        Ok(seed) => {
+            for (key, columns) in seed {
+                if schemas.contains_key(&key) {
+                    continue;
+                }
+                provenance
+                    .origins
+                    .insert(key.clone(), SourceSchemaOrigin::Seed);
+                schemas.insert(key, columns);
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "the seed file did not run; compiling without its source schemas"
+        ),
+    }
+}
+
+fn seed_file(project_root: &Path) -> std::path::PathBuf {
+    project_root.join("data").join("seed.sql")
+}
+
+/// [`load_source_schemas_from_seed`] for the seed at
+/// `<project_root>/data/seed.sql`.
+#[cfg(feature = "duckdb")]
+pub(crate) fn load_source_schemas_from_seed_at(
+    project_root: &Path,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
     use anyhow::Context;
     use rocky_duckdb::DuckDbConnector;
 
-    let project_root = models_dir.parent().unwrap_or(Path::new("."));
-    let seed_path = project_root.join("data").join("seed.sql");
+    let seed_path = seed_file(project_root);
     if !seed_path.is_file() {
         anyhow::bail!(
             "--with-seed requested but no seed file found at {}",
@@ -1454,49 +1587,17 @@ pub(crate) fn load_source_schemas_from_seed(
     conn.execute_statement(&seed_sql)
         .map_err(|e| anyhow::anyhow!("seed execution failed for {}: {e}", seed_path.display()))?;
 
-    // One round-trip pulls every (schema, table, column, type, nullable)
-    // tuple. Filtering out DuckDB's internal schemas keeps the resulting
-    // map scoped to user-created tables.
-    let info_sql = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
-                    FROM information_schema.columns \
-                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
-                    ORDER BY table_schema, table_name, ordinal_position";
-    let result = conn
-        .execute_sql(info_sql)
-        .map_err(|e| anyhow::anyhow!("information_schema query failed: {e}"))?;
-
-    let mut by_table: HashMap<String, Vec<TypedColumn>> = HashMap::new();
-    for row in &result.rows {
-        let schema = row[0].as_str().unwrap_or_default();
-        let table = row[1].as_str().unwrap_or_default();
-        let column = row[2].as_str().unwrap_or_default();
-        let data_type = row[3].as_str().unwrap_or_default();
-        let nullable = row[4]
-            .as_str()
-            .map(|s| s.eq_ignore_ascii_case("yes") || s == "true" || s == "1")
-            .unwrap_or(true);
-
-        if schema.is_empty() || table.is_empty() || column.is_empty() {
-            continue;
-        }
-
-        let key = format!("{schema}.{table}");
-        by_table.entry(key).or_default().push(TypedColumn {
-            name: column.to_string(),
-            data_type: default_type_mapper(data_type),
-            nullable,
-        });
-    }
-
-    Ok(by_table)
+    // The same derivation `rocky test` and `rocky ci` type their compile
+    // from, on the database they then execute in.
+    rocky_engine::test_runner::source_schemas_from_db(&conn)
 }
 
 /// Stub used when the binary is built without the `duckdb` feature. The
 /// flag exists in the clap definition unconditionally so feature-stripped
 /// builds give a clear error rather than a silent no-op.
 #[cfg(not(feature = "duckdb"))]
-pub(crate) fn load_source_schemas_from_seed(
-    _models_dir: &Path,
+pub(crate) fn load_source_schemas_from_seed_at(
+    _project_root: &Path,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
     anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
@@ -3018,11 +3119,12 @@ schema_template = "s"
             config,
             &models_dir.join(".rocky-state.redb"),
             models_dir,
+            ModelScope::Dir,
             None,
             None,
             false,
             None,
-            true,
+            SeedUse::Required,
             None,
             &rocky_core::run_vars::RunVars::new(),
             strict_sources,
@@ -3086,6 +3188,7 @@ schema_template = "s"
             None,
             &models_dir.join(".rocky-state.redb"),
             &models_dir,
+            ModelScope::Dir,
             None,
             None,
             true,
@@ -3215,11 +3318,12 @@ schema_template = "s"
                 Some(&config),
                 &state_path,
                 &models_dir,
+                ModelScope::Dir,
                 None,
                 None,
                 false,
                 None,
-                false,
+                SeedUse::IfPresent,
                 None,
                 &rocky_core::run_vars::RunVars::new(),
                 false,
@@ -3245,5 +3349,226 @@ schema_template = "s"
         let unset = compile_with("");
         assert!(!unset.has_errors, "{:?}", unset.diagnostics);
         assert_eq!(count(&unset, "W041"), 1, "{:?}", unset.diagnostics);
+    }
+
+    // ---- whole-project compile (no `--models`) ----
+
+    /// Two transformation pipelines: `transform` (models/**) and
+    /// `reporting` (reporting/**). `models/stg` reads the seed table
+    /// `src.orders`; `reporting/rep` reads `stg`. The contract on `rep`
+    /// declares `id` as text, while the seed makes it BIGINT.
+    #[cfg(feature = "duckdb")]
+    fn scaffold_two_pipeline_project() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+             [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.transform.target]\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\
+             depends_on = [\"transform\"]\n[pipeline.reporting.target]\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        let reporting = dir.path().join("reporting");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::create_dir_all(&reporting).unwrap();
+        write_model(&models_dir, "stg", "SELECT id, status FROM src.orders");
+        write_model(&reporting, "rep", "SELECT id FROM stg");
+        write_seed(
+            dir.path(),
+            "CREATE SCHEMA src;\n\
+             CREATE TABLE src.orders AS SELECT 1::BIGINT AS id, 'a' AS status;\n",
+        );
+        let contracts = dir.path().join("contracts");
+        fs::create_dir_all(&contracts).unwrap();
+        fs::write(
+            contracts.join("rep.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"String\"\nnullable = true\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn compile_scoped(
+        dir: &Path,
+        models_dir: &Path,
+        scope: ModelScope,
+        seed_use: SeedUse,
+    ) -> CompileOutput {
+        compile_inner(
+            Some(&dir.join("rocky.toml")),
+            &dir.join("state.redb"),
+            models_dir,
+            scope,
+            Some(&dir.join("contracts")),
+            None,
+            false,
+            None,
+            seed_use,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+            false,
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    /// No `--models`: both pipelines' models compile in one graph, and the
+    /// reporting model gets the transform model's column types, so its
+    /// contract mismatch is E011. `--models reporting` keeps today's
+    /// meaning: one directory, `stg` unseen, the type Unknown, no E011.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn whole_project_compile_types_flow_across_pipelines() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(whole.models, 2, "{:?}", whole.models_detail);
+        assert!(
+            whole
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "E011" && d.model == "rep"),
+            "{:?}",
+            whole.diagnostics
+        );
+
+        let one_dir = compile_scoped(
+            root,
+            &root.join("reporting"),
+            ModelScope::Dir,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(one_dir.models, 1);
+        assert!(
+            !one_dir.diagnostics.iter().any(|d| &*d.code == "E011"),
+            "{:?}",
+            one_dir.diagnostics
+        );
+    }
+
+    /// The control: with a contract that matches, the whole-project compile
+    /// is clean.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn whole_project_compile_is_clean_on_a_valid_project() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        fs::write(
+            root.join("contracts").join("rep.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n",
+        )
+        .unwrap();
+
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(whole.models, 2);
+        assert!(!whole.has_errors, "{:?}", whole.diagnostics);
+        assert!(
+            !whole
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.code.starts_with("W04")),
+            "{:?}",
+            whole.diagnostics
+        );
+    }
+
+    /// With no `--with-seed`, a project's `data/seed.sql` still types the
+    /// compile: a column the seed table lacks is W041.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn bare_compile_uses_the_seed_without_the_flag() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        write_model(
+            &root.join("models"),
+            "stg",
+            "SELECT id, status, segment FROM src.orders",
+        );
+
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
+        assert!(
+            whole
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "W041" && d.message.contains("segment")),
+            "{:?}",
+            whole.diagnostics
+        );
+    }
+
+    /// `compile_output` (the `rocky serve` API, the MCP compile tool) never
+    /// runs the seed unasked: the same project gives no W041 there.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn compile_output_does_not_run_the_seed_unasked() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        write_model(
+            &root.join("models"),
+            "stg",
+            "SELECT id, status, segment FROM src.orders",
+        );
+
+        let out = compile_output(
+            Some(&root.join("rocky.toml")),
+            &root.join("state.redb"),
+            &root.join("models"),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !out.diagnostics.iter().any(|d| &*d.code == "W041"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// A seed the user did not ask for never fails the compile: a seed that
+    /// does not run is skipped, and the compile goes on untyped. Under
+    /// `--with-seed` the same seed refuses (pinned above).
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn a_broken_default_seed_does_not_fail_the_compile() {
+        let dir = scaffold_two_pipeline_project();
+        let root = dir.path();
+        write_seed(root, "DEFINITELY NOT VALID SQL;");
+
+        let whole = compile_scoped(
+            root,
+            &root.join("models"),
+            ModelScope::WholeProject,
+            SeedUse::IfPresent,
+        );
+        assert_eq!(whole.models, 2);
+        assert!(
+            !whole.diagnostics.iter().any(|d| &*d.code == "E011"),
+            "untyped compile: {:?}",
+            whole.diagnostics
+        );
     }
 }

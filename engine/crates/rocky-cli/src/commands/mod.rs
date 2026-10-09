@@ -136,7 +136,7 @@ pub use ci_diff::{
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::{
-    apply_model_target_gates, compile_output, run_compile, run_compile_dbt_attach,
+    ModelScope, apply_model_target_gates, compile_output, run_compile, run_compile_dbt_attach,
     run_compile_with_options,
 };
 pub use completions::run_completions;

@@ -663,33 +663,25 @@ pub const I002: &str = "I002";
 ///
 /// # Why info and not a warning
 ///
-/// `rocky test` and `rocky ci` compile with empty source schemas
-/// (`rocky-engine::test_runner`, `rocky-engine::ci`), so under those commands
-/// every column that takes its type from a source table infers `Unknown` — a
-/// literal or an expression over literals still resolves. That is most of a
-/// typical model. At warning severity this would fire on those columns in
-/// every project that ships a contract — noise at the severity users are
-/// asked to act on. It would also flip `rocky ci`'s reported exit code
-/// from 0 to 4 for each of those projects: `rocky_engine::ci::CiResult::
-/// exit_code` returns 4 when any diagnostic is a warning, and `rocky ci`
-/// prints that number and puts it in its JSON. (The process itself still
-/// exits 0 — the CLI only calls `process::exit` when compile or tests fail —
-/// so the shell status would not move, but every reader of that field would.)
-/// Info reports the gap and moves nothing. When `rocky test` / `rocky ci`
-/// gain a source-schema producer, this can be reconsidered.
+/// A project with no seed file and no schema cache compiles with empty source
+/// schemas, so every column that takes its type from a source table infers
+/// `Unknown` — a literal or an expression over literals still resolves. That
+/// is most of a typical model. At warning severity this would fire on those
+/// columns in every such project that ships a contract — noise at the
+/// severity users are asked to act on. Info reports the gap and moves
+/// nothing.
 ///
 /// # How to clear it
 ///
 /// Give the compiler source schemas. Many commands read them from the schema
 /// cache, written by `rocky run` / `rocky discover --with-schemas` — both on
 /// replication pipelines only (`discover` refuses a transformation-only
-/// pipeline). `rocky compile` also accepts a seed file via `--with-seed`,
-/// the route that works for a transformation-only project. Several
-/// commands do not — they build a `CompilerConfig` with an empty map, so
-/// nothing clears this code under them today. `rocky test` and `rocky ci`
-/// are the two that matter here (`rocky_engine::test_runner`,
-/// `rocky_engine::ci`); `rocky emit-sql`, `rocky preview-rows` and
-/// `rocky retention-status` do the same. For the current list, run
+/// pipeline). `rocky compile`, `rocky test` and `rocky ci` also read the
+/// project's seed file (`data/seed.sql`) when it has one, the route that
+/// works for a transformation-only project. Several commands do not — they
+/// build a `CompilerConfig` with an empty map, so nothing clears this code
+/// under them today: `rocky emit-sql`, `rocky preview-rows` and
+/// `rocky retention-status`. For the current list, run
 /// `rg 'source_schemas:\s*(std::collections::)?HashMap::new\(\)'` — the
 /// three commands above spell it `std::collections::HashMap::new()`, so a
 /// search for the short form alone finds none of them. It matches explicit

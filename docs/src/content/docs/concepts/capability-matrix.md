@@ -70,14 +70,13 @@ Two limits, stated plainly:
   column as `I003` at info severity, naming the column and the type the
   contract declares. Info changes no exit code: `rocky compile`, `rocky test`
   and `rocky ci` all still pass. To make the check run, give the compiler
-  source schemas. `rocky compile --with-seed` reads them from
-  `data/seed.sql` and works for every pipeline type. For a replication
-  pipeline, `rocky discover --with-schemas` (or `rocky run`) fills the schema
-  cache that `rocky compile` reads. `discover` refuses a transformation-only
-  pipeline, so for those use `--with-seed`. Two limits on that. `rocky test` and `rocky ci` always compile with no source schemas, so
-  every column that takes its type from a source table is `Unknown` under
-  them. And an expression whose result type depends on the warehouse — `AVG`
-  over a `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
+  source schemas. `rocky compile`, `rocky test` and `rocky ci` read them from
+  `data/seed.sql` when the project has one, for every pipeline type. For a
+  replication pipeline, `rocky discover --with-schemas` (or `rocky run`)
+  fills the schema cache that `rocky compile` reads. `discover` refuses a
+  transformation-only pipeline, so for those use a seed. One limit on that:
+  an expression whose result type depends on the warehouse — `AVG` over a
+  `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
   to clear an `I003`. A cast takes its type from the target, not from the
   value, so it reports whatever you cast to whether or not the data matches.
   It silences the message and checks nothing.
