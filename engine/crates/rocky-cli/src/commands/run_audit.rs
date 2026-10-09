@@ -145,7 +145,7 @@ fn detect_triggering_identity() -> Option<String> {
 /// `"cli"`, `"dagster"`, `"lsp"`, `"http_api"`, `"http-api"`, or `"httpapi"`. Anything else is
 /// silently ignored — better to fall back to the env-detected default
 /// than to reject a run over a typo'd audit-stamp var.
-fn detect_session_source() -> SessionSource {
+pub(crate) fn detect_session_source() -> SessionSource {
     #[cfg(test)]
     let _env_guard = crate::testing::lock_pipes_env();
     if let Ok(explicit) = std::env::var(ENV_ROCKY_SESSION_SOURCE) {

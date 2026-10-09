@@ -126,9 +126,25 @@ impl StateTurnstile {
 /// from the graph. Every sub-run compiles with them, so a model whose
 /// `depends_on` names a seed or load pipeline is not refused as naming an
 /// unknown model (#2138): the graph already ordered it after that node.
+///
+/// Tests call this; `run_with_dag_and_contracts` builds the same runner
+/// through [`sub_runner_with_contracts`].
+#[cfg(test)]
 fn default_sub_runner(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
+) -> SubRunner {
+    sub_runner_with_contracts(actor, external_dependencies, None)
+}
+
+/// [`default_sub_runner`] with `rocky run --dag --contracts <DIR>`: every
+/// sub-run compiles against `contracts_dir` instead of the project
+/// `contracts/` directory. A contract error on a model still keeps that node
+/// from writing, and the executor skips its descendants.
+fn sub_runner_with_contracts(
+    actor: rocky_core::config::PrincipalRef,
+    external_dependencies: Arc<std::collections::BTreeSet<String>>,
+    contracts_dir: Option<PathBuf>,
 ) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
@@ -140,12 +156,13 @@ fn default_sub_runner(
               skip_opts,
               shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
+            let contracts_dir = contracts_dir.clone();
             let defer_opts = super::run::DeferOptions {
                 external_dependencies: (*external_dependencies).clone(),
                 ..super::run::DeferOptions::default()
             };
             Box::pin(async move {
-                super::run::run(
+                super::run::run_with_explicit_contracts(
                     &config_path,
                     loaded,
                     None,
@@ -181,7 +198,14 @@ fn default_sub_runner(
                     // `--assume-fresh-state` is not surfaced on the DAG path.
                     false,
                     None, // #1460: DAG sub-run, no persisted plan
+                    // A DAG node is never the selected-model guard: it only
+                    // swaps the contracts directory.
+                    contracts_dir
+                        .as_deref()
+                        .map(super::run::RunContracts::Directory),
                     &actor,
+                    // No adapter registry override.
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -251,6 +275,36 @@ pub async fn run_with_dag(
     node_concurrency: Option<u32>,
     // Who is running (RV4-P1), handed to every sub-run.
     actor: &rocky_core::config::PrincipalRef,
+) -> Result<()> {
+    run_with_dag_and_contracts(
+        config_path,
+        loaded,
+        state_path,
+        json,
+        partition_opts,
+        skip_opts,
+        shadow_config,
+        node_concurrency,
+        actor,
+        None,
+    )
+    .await
+}
+
+/// [`run_with_dag`] with `rocky run --dag --contracts <DIR>`. `None` reads
+/// the project `contracts/` directory, as [`run_with_dag`] does.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_dag_and_contracts(
+    config_path: &Path,
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
+    state_path: &Path,
+    json: bool,
+    partition_opts: &PartitionRunOptions,
+    skip_opts: &super::run::SkipRunOptions,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    node_concurrency: Option<u32>,
+    actor: &rocky_core::config::PrincipalRef,
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     // Seed nodes do not pass through run(), so reject broken Pipes before
     // the DAG can execute any node.
@@ -379,7 +433,11 @@ pub async fn run_with_dag(
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
-        sub_runner: default_sub_runner(actor.clone(), Arc::new(dag_external_dependencies(&dag))),
+        sub_runner: sub_runner_with_contracts(
+            actor.clone(),
+            Arc::new(dag_external_dependencies(&dag)),
+            contracts_dir.map(Path::to_path_buf),
+        ),
         state_turns: StateTurnstile::new(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
@@ -490,7 +548,15 @@ fn plan_runtime_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let mut models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    // Each node's sub-run compiles its model with `@var()` replaced by its
+    // inline default (the DAG driver takes no `--var`). The graph reads the
+    // same SQL, so a model whose `@var()` would not parse still derives its
+    // edges, and a cycle through it is refused before any node runs.
+    let no_vars = rocky_core::run_vars::RunVars::new();
+    for model in models_by_pipeline.values_mut().flatten() {
+        model.sql = rocky_core::run_vars::substitute_run_vars(&model.sql, &no_vars).sql;
+    }
     let ephemeral_nodes: HashSet<NodeId> = models_by_pipeline
         .values()
         .flatten()

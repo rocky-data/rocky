@@ -3,10 +3,10 @@
 //   node record.mjs <scene> --url <printed-url> [--plan <id>] [--out <dir>]
 //
 // `<printed-url>` is the address `rocky serve --ui` prints at start, token
-// fragment and all: http://127.0.0.1:<port>/ui/#token=<secret>. The SPA reads
-// the fragment once, moves it to sessionStorage and rewrites the address
-// without it, so by the first frame worth keeping the location bar carries no
-// secret (engine/ui/src/token.ts).
+// included: http://127.0.0.1:<port>/login?t=<secret>. The server checks the
+// token, sets a session cookie and redirects to /ui/, so by the first frame
+// worth keeping the location bar carries no secret. The cookie lasts for this
+// browser context, so later scene navigation by address stays signed in.
 //
 // Output lands in <out>/<scene>.webm. Convert and intercut with the terminal
 // tapes in ../record-screencast.sh.

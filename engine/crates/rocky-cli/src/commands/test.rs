@@ -15,7 +15,7 @@ use crate::output::{
 };
 use crate::registry::{self, AdapterRegistry};
 
-use super::ModelNotFound;
+use super::{ModelNotFound, ModelScope};
 
 /// Map the engine test runner's `ModelTestResult` to the JsonSchema-derived
 /// output shape. Centralized so `test_output` + `run_test` agree.
@@ -113,6 +113,7 @@ pub fn run_test(
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     run_test_with_selection(
+        None,
         models_dir,
         contracts_dir,
         model_filter,
@@ -144,7 +145,13 @@ fn retain_selected(
 }
 
 /// [`run_test`] scoped by `--select` / `--exclude`.
+///
+/// `config_path` is the project's `rocky.toml`. When it loads, the run
+/// applies the per-model-target checks `rocky ci` applies (see
+/// [`super::ci::with_project_gates`]), so `rocky test` refuses what `rocky ci`
+/// refuses. `None`, or no file there, runs no such check.
 pub fn run_test_with_selection(
+    config_path: Option<&Path>,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
@@ -161,8 +168,27 @@ pub fn run_test_with_selection(
         )?),
         _ => None,
     };
-    let mut result =
-        rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter, run_vars)?;
+    let project_config = match config_path {
+        Some(path) => rocky_core::config::load_optional_project_config(Some(path))
+            .with_context(|| format!("failed to load config from {}", path.display()))?,
+        None => None,
+    };
+    let mut result = super::ci::with_project_gates(
+        project_config.as_ref(),
+        config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+        |gates, inlined_gates| {
+            rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
+                models_dir,
+                project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+                models: rocky_engine::test_runner::TestModels::Dir,
+                contracts_dir,
+                model_filter,
+                run_vars,
+                gates,
+                inlined_gates,
+            })
+        },
+    )?;
     // `run_test` deliberately re-runs the engine rather than calling
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.
@@ -858,6 +884,17 @@ async fn execute_declarative(
     // former must stay exit 0; only the latter is an error.
     reject_unknown_model(model_filter, &model_names(all_models))?;
 
+    Ok(execute_checks(all_models, warehouse_adapter, model_filter).await)
+}
+
+/// Execute the declarative checks of `models` against one warehouse, with
+/// no refusal of an empty set or an unknown `--model`: the caller has made
+/// those checks over the whole project already.
+async fn execute_checks(
+    all_models: &[rocky_core::models::Model],
+    warehouse_adapter: &Arc<dyn WarehouseAdapter>,
+    model_filter: Option<&str>,
+) -> DeclarativeRun {
     // The declared count, on the NAME predicate alone — deliberately not
     // the has-tests closure below. A model the selection names but whose
     // checks never reach the execution loop is a shortfall a caller can
@@ -901,20 +938,98 @@ async fn execute_declarative(
         }
     }
 
-    Ok(DeclarativeRun { declared, results })
+    DeclarativeRun { declared, results }
+}
+
+/// `rocky test --declarative` with neither `--models` nor `--pipeline`:
+/// every transformation pipeline's own models, each checked against the
+/// warehouse its pipeline targets.
+///
+/// Returns `Ok(None)` when the project declares no transformation pipeline;
+/// the caller then reads the `--models` default as before.
+async fn whole_project_declarative_run(
+    config_path: &Path,
+    model_filter: Option<&str>,
+) -> Result<Option<DeclarativeRun>> {
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
+        "failed to load config from {}",
+        config_path.display()
+    ))?;
+    let transformation_pipelines: Vec<(&String, &rocky_core::config::PipelineConfig)> = rocky_cfg
+        .pipelines
+        .iter()
+        .filter(|(_, pipeline)| pipeline.as_transformation().is_some())
+        .collect();
+    if transformation_pipelines.is_empty() {
+        return Ok(None);
+    }
+    let loaded = crate::models_loader::load_transformation_models(config_path, &rocky_cfg)?;
+    let all_models = crate::models_loader::union_by_model_name(&loaded.by_pipeline);
+    if all_models.is_empty() {
+        anyhow::bail!(
+            "no models found in any transformation pipeline of {}",
+            config_path.display()
+        );
+    }
+    reject_unknown_model(model_filter, &model_names(&all_models))?;
+
+    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let mut run = DeclarativeRun {
+        declared: 0,
+        results: Vec::new(),
+    };
+    // One file can be claimed by two pipelines whose roots nest; its tests
+    // run once, under the first pipeline that claims it.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, pipeline) in transformation_pipelines {
+        let Some(models) = loaded.by_pipeline.get(name) else {
+            continue;
+        };
+        let models: Vec<rocky_core::models::Model> = models
+            .iter()
+            .filter(|m| seen.insert(m.config.name.clone()))
+            .cloned()
+            .collect();
+        let has_selected_tests = models
+            .iter()
+            .any(|m| !m.config.tests.is_empty() && model_filter.is_none_or(|f| m.config.name == f));
+        if !has_selected_tests {
+            continue;
+        }
+        let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+        let pipeline_run = execute_checks(&models, &warehouse, model_filter).await;
+        run.declared += pipeline_run.declared;
+        run.results.extend(pipeline_run.results);
+    }
+    Ok(Some(run))
 }
 
 /// Execute `rocky test --declarative`: run `[[tests]]` from model sidecars
 /// against the configured warehouse adapter.
+///
+/// With [`ModelScope::WholeProject`] (no `--models`) and no `--pipeline`,
+/// every transformation pipeline's models run, each against its own
+/// pipeline's warehouse. Otherwise the models under `models_dir` run against
+/// the one pipeline `--pipeline` names (or the only one defined).
 pub async fn run_declarative_tests(
     config_path: &Path,
     models_dir: &Path,
+    scope: ModelScope,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let summary =
-        declarative_test_output(config_path, models_dir, pipeline_name, model_filter).await?;
+    let whole_project = match (scope, pipeline_name) {
+        (ModelScope::WholeProject, None) => {
+            whole_project_declarative_run(config_path, model_filter).await?
+        }
+        (ModelScope::WholeProject, Some(_)) | (ModelScope::Dir, _) => None,
+    };
+    let run = match whole_project {
+        Some(run) => run,
+        None => declarative_run(config_path, models_dir, pipeline_name, model_filter).await?,
+    };
+    let summary = summarize_declarative(run.results);
     let DeclarativeTestSummary {
         total,
         passed,
@@ -1008,8 +1123,13 @@ pub async fn declarative_test_output(
     model_filter: Option<&str>,
 ) -> Result<DeclarativeTestSummary> {
     let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
-    let results = run.results;
-    Ok(DeclarativeTestSummary {
+    Ok(summarize_declarative(run.results))
+}
+
+/// Tally declarative results into the summary `rocky test --declarative`
+/// reports.
+fn summarize_declarative(results: Vec<DeclarativeTestResult>) -> DeclarativeTestSummary {
+    DeclarativeTestSummary {
         total: results.len(),
         passed: results.iter().filter(|r| r.status == "pass").count(),
         failed: results
@@ -1022,7 +1142,7 @@ pub async fn declarative_test_output(
             .count(),
         errored: results.iter().filter(|r| r.status == "error").count(),
         results,
-    })
+    }
 }
 
 /// Execute a single declarative test and return a result.
@@ -1213,8 +1333,116 @@ fn test_type_label(tt: &TestType) -> &'static str {
 mod tests {
     use super::{
         CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme_is_current, declarative_check_digest,
-        declarative_test_count, load_all_models,
+        declarative_test_count, load_all_models, whole_project_declarative_run,
     };
+
+    /// A project with three pipelines — `transform` (models/**), `reporting`
+    /// (reporting/**) and a quality pipeline — and one model with a
+    /// declarative test in each model root, on a DuckDB file that holds
+    /// both tables.
+    fn three_pipeline_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let db_path = root.join("w.duckdb");
+        let db = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open duckdb");
+        db.execute_statement(
+            "CREATE TABLE main.stg AS SELECT 1 AS id; CREATE TABLE main.rep AS SELECT 1 AS id;",
+        )
+        .expect("seed duckdb");
+        drop(db);
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 [pipeline.transform.target]\n\n\
+                 [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\
+                 [pipeline.reporting.target]\n\n\
+                 [pipeline.dq]\ntype = \"quality\"\n[pipeline.dq.target]\nadapter = \"default\"\n\
+                 [pipeline.dq.checks]\nenabled = true\n\
+                 [[pipeline.dq.tables]]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"stg\"\n",
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+        for (dir, name) in [("models", "stg"), ("reporting", "rep")] {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id").expect("sql");
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"{name}\"\n\n\
+                     [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"
+                ),
+            )
+            .expect("sidecar");
+        }
+        tmp
+    }
+
+    /// With neither `--models` nor `--pipeline`, every transformation
+    /// pipeline's declarative tests run, each on its own models. Before, a
+    /// project with more than one pipeline refused with "Use --pipeline".
+    #[tokio::test]
+    async fn declarative_tests_cover_every_transformation_pipeline() {
+        let tmp = three_pipeline_project();
+        let run = whole_project_declarative_run(&tmp.path().join("rocky.toml"), None)
+            .await
+            .expect("run")
+            .expect("transformation pipelines");
+        let mut models: Vec<&str> = run.results.iter().map(|r| r.model.as_str()).collect();
+        models.sort_unstable();
+        assert_eq!(models, ["rep", "stg"], "{:?}", run.results);
+        assert!(
+            run.results.iter().all(|r| r.status == "pass"),
+            "{:?}",
+            run.results
+        );
+        assert_eq!(run.declared, 2);
+    }
+
+    /// Two pipelines whose roots nest claim the same file. Its tests run
+    /// once, not once per pipeline.
+    #[tokio::test]
+    async fn a_model_claimed_by_two_nested_pipelines_runs_its_tests_once() {
+        let tmp = three_pipeline_project();
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        let text = std::fs::read_to_string(&config).expect("read config");
+        std::fs::write(
+            &config,
+            text.replace("models = \"reporting/**\"", "models = \"models/**\""),
+        )
+        .expect("write config");
+        let run = whole_project_declarative_run(&config, None)
+            .await
+            .expect("run")
+            .expect("transformation pipelines");
+        let models: Vec<&str> = run.results.iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(models, ["stg"], "{:?}", run.results);
+        assert_eq!(run.declared, 1);
+    }
+
+    /// `--model` still scopes the run, and a name no pipeline declares is
+    /// refused rather than reported as zero tests.
+    #[tokio::test]
+    async fn whole_project_declarative_run_scopes_and_refuses_unknown_models() {
+        let tmp = three_pipeline_project();
+        let config = tmp.path().join("rocky.toml");
+        let run = whole_project_declarative_run(&config, Some("rep"))
+            .await
+            .expect("run")
+            .expect("transformation pipelines");
+        assert_eq!(run.results.len(), 1);
+        assert_eq!(run.results[0].model, "rep");
+
+        let Err(err) = whole_project_declarative_run(&config, Some("nope")).await else {
+            panic!("an unknown model must be refused");
+        };
+        assert!(err.to_string().contains("nope"), "{err:#}");
+    }
 
     /// Write a one-model project whose sidecar carries `sidecar_extra`,
     /// plus a named-test registry. Returns the models dir.

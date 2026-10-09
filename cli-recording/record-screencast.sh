@@ -99,7 +99,7 @@ if ! curl -fsS "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1; then
     echo "record-screencast.sh: the server never answered — see $OUT/serve.log" >&2
     exit 1
 fi
-URL="http://127.0.0.1:$PORT/ui/#token=$TOKEN"
+URL="http://127.0.0.1:$PORT/login?t=$TOKEN"
 
 tape() {
     echo "▶ tape $1"

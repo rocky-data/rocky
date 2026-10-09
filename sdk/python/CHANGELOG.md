@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-10-09
+
+Pairs with engine 1.79.0.
+
+### Changed
+
+- Generated models follow engine 1.79.0. New: `LintOutput` (`rocky lint`), the `rocky docs` site and Parquet outputs, project metadata, and `[selectors]` in the `rocky.toml` model. `PlanOutput` gains `cost_preview` and `first_run_fills`.
+- The hand-written `PlanOutput` in `rocky_sdk.types` also gains `cost_preview` and `first_run_fills`. Both are kept as loose `dict` values; the typed shape is on the generated model.
+- New enum values and fields: job kind `approve`, approver source `http_api`, and `MetaOutput.token_scope`. `ImportDbtOutput` gains a `not_null_constraints` count, and its contract warning now says the contract was written. Code that matches these enums exhaustively must add the new values.
+
 ## [0.19.0] — 2026-10-08
 
 Pairs with engine 1.78.0.

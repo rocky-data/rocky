@@ -1,6 +1,6 @@
 [package]
 name = "rocky-postgres"
-version = "1.78.0"
+version = "1.79.0"
 description = "PostgreSQL and Amazon Redshift warehouse adapters for Rocky"
 edition.workspace = true
 license.workspace = true

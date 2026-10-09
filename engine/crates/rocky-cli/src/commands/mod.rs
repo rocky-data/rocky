@@ -23,8 +23,10 @@ mod compliance;
 mod containment;
 mod cost;
 mod dag;
+pub mod defer_state;
 mod discover;
 mod docs;
+mod docs_parquet;
 mod doctor;
 mod drift_governance;
 mod emit_sql;
@@ -48,6 +50,7 @@ mod init_adapter;
 mod intent_check;
 mod lineage;
 mod lineage_diff;
+mod lint;
 mod list;
 mod load;
 mod lsp;
@@ -57,6 +60,7 @@ pub mod package;
 #[cfg(test)]
 mod pipes_guard_tests;
 pub mod plan;
+pub mod plan_cost;
 mod playground;
 mod policy;
 mod preview;
@@ -135,7 +139,7 @@ pub use ci_diff::{
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::{
-    apply_model_target_gates, compile_output, run_compile, run_compile_dbt_attach,
+    ModelScope, apply_model_target_gates, compile_output, run_compile, run_compile_dbt_attach,
     run_compile_with_options,
 };
 pub use completions::run_completions;
@@ -143,7 +147,7 @@ pub use compliance::{compute_compliance, run_compliance};
 pub use cost::{CostGroupBy, compute_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
-pub use docs::run_docs;
+pub use docs::{DocsFormat, run_docs};
 pub use doctor::doctor;
 pub use emit_sql::{run_emit_sql, run_emit_sql_with_selection};
 pub use estimate::{EstimateReport, compute_estimate, run_estimate};
@@ -164,6 +168,7 @@ pub use init::init;
 pub use init_adapter::run_init_adapter;
 pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
+pub use lint::run_lint;
 pub use list::{
     list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
     list_models_output, list_models_selected, list_pipelines, list_pipelines_output, list_sources,
@@ -215,13 +220,15 @@ pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_sched
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
+pub use defer_state::{DeferStateError, DeferStateSource};
+pub use plan_cost::CostEstimateMode;
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
-    CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
+    CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions, RunContracts,
     ShadowComparisonFailure, SkipRunOptions, refuse_configured_side_effects,
     require_shadow_support_for_config, resolve_run_selection, run,
 };
-pub use run_dag_exec::run_with_dag;
+pub use run_dag_exec::{run_with_dag, run_with_dag_and_contracts};
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};

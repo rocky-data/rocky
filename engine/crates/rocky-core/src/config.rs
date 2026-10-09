@@ -2493,8 +2493,9 @@ pub struct SchemaCacheConfig {
     /// `trusted_max_age_seconds`: a stale schema must not fail a
     /// valid build. Set this to `true` to escalate those warnings to the
     /// `E041` error, matching a strict "refuse what you cannot prove"
-    /// posture. `rocky compile --strict-sources` sets it for one
-    /// invocation.
+    /// posture. It also escalates `W045` (a read of a table missing from a
+    /// known schema's seed or cache table list) to the `E045` error.
+    /// `rocky compile --strict-sources` sets it for one invocation.
     pub strict_sources: bool,
     /// Age, in seconds, under which a cached source schema is trusted as
     /// current. Defaults to unset: no cache entry is trusted, so a missing
@@ -2951,6 +2952,11 @@ pub struct RockyConfig {
     #[serde(default)]
     pub portability: PortabilityConfig,
 
+    /// Style-lint configuration for `rocky lint`: rules to switch off and
+    /// per-rule severity overrides.
+    #[serde(default)]
+    pub lint: LintConfig,
+
     /// Project-level cache configuration. Today this is just
     /// `[cache.schemas]` (schema cache for `DESCRIBE TABLE` results);
     /// future cache surfaces live as sibling fields under
@@ -3045,6 +3051,19 @@ pub struct RockyConfig {
     /// before the gate existed. See [`RunConfig`].
     #[serde(default)]
     pub run: RunConfig,
+
+    /// Saved selectors: a name mapped to a `--select` expression. Use one
+    /// with `--select selector:<name>` on any command that takes `--select`
+    /// (or `--exclude selector:<name>`). A saved selector may use graph
+    /// operators, `state:` and other `selector:` terms; a loop is an error.
+    ///
+    /// ```toml
+    /// [selectors]
+    /// nightly = "tag:nightly+ config.materialized:incremental"
+    /// finance = "path:marts/finance,tag:certified"
+    /// ```
+    #[serde(default)]
+    pub selectors: std::collections::BTreeMap<String, String>,
 
     /// Auditable reuse for content-addressed models — two orthogonal knobs.
     /// `enabled` (byte-level point-to reuse) is **default-OFF**: an absent
@@ -4704,6 +4723,41 @@ pub struct PortabilityConfig {
     pub allow: Vec<String>,
 }
 
+/// Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it
+/// reports at least one `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LintSeverity {
+    /// Fails the run (non-zero exit).
+    Error,
+    /// Reported; does not fail the run.
+    Warning,
+    /// Reported; does not fail the run.
+    Info,
+}
+
+/// `[lint]` — style-lint settings for `rocky lint`.
+///
+/// ```toml
+/// [lint]
+/// disable = ["S003"]
+///
+/// [lint.severity]
+/// S001 = "error"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LintConfig {
+    /// Rule codes that do not run, e.g. `["S003", "S004"]`.
+    #[serde(default)]
+    pub disable: Vec<String>,
+
+    /// Per-rule severity overrides, keyed by rule code. A rule without an
+    /// entry keeps its default severity.
+    #[serde(default)]
+    pub severity: std::collections::BTreeMap<String, LintSeverity>,
+}
+
 /// Top-level retry configuration applied across every adapter for this
 /// run. See [`RockyConfig::retry`] for the cross-adapter semantics this
 /// unlocks.
@@ -5186,6 +5240,7 @@ impl AdapterConfig {
     /// | `postgres`, `redshift` | `host`, `database`, `port` (from `[extra]`, when set) |
     /// | `clickhouse` | `host`, `port` (from `[extra]`, when set)                  |
     /// | `sqlserver`  | `host`, `database`, `port` (from `[extra]`, when set)     |
+    /// | `spark`      | `host`, `port` (from `[extra]`, when set)                  |
     /// | `fivetran`   | `destination_id`                                           |
     /// | `airbyte`, `iceberg` | `host`                                             |
     /// | `manual`     | the type alone                                             |
@@ -5198,7 +5253,8 @@ impl AdapterConfig {
     /// Never in the identity: `username`, `password`, `token`, `oauth_token`,
     /// `pat`, `private_key_path`, `client_id`, `client_secret`, `api_key`,
     /// `api_secret`, `role`, and the `[extra]` table (except a PostgreSQL /
-    /// Redshift / ClickHouse / SQL Server `port`, which is a locator). A
+    /// Redshift / ClickHouse / SQL Server / Spark `port`, which is a
+    /// locator). A
     /// Snowflake session
     /// with no `database` (a PAT or OAuth session, say) writes into the
     /// session's default database, and the identity does **not** stand a
@@ -5292,6 +5348,16 @@ impl AdapterConfig {
             "clickhouse" => {
                 // Every target names its database, so the session's default
                 // `database` does not locate them; host and port do.
+                push("host", self.host.expose_opt());
+                let port = self.extra.expose().get("port").map(|p| match p {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                });
+                push("port", port.as_deref());
+            }
+            "spark" => {
+                // Every target names its catalog and schema, and a Spark
+                // Connect server is one endpoint: host and port locate it.
                 push("host", self.host.expose_opt());
                 let port = self.extra.expose().get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),

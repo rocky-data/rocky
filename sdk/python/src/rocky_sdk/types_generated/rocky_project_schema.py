@@ -824,6 +824,30 @@ class ImportEntry(BaseModel):
     """
 
 
+class LintSeverity4(StrEnum):
+    """
+    Fails the run (non-zero exit).
+    """
+
+    error = "error"
+
+
+class LintSeverity5(StrEnum):
+    """
+    Reported; does not fail the run.
+    """
+
+    warning = "warning"
+
+
+class LintSeverity6(StrEnum):
+    """
+    Reported; does not fail the run.
+    """
+
+    info = "info"
+
+
 class LoadFileFormat(StrEnum):
     """
     File format for load pipelines, parsed from TOML.
@@ -1617,7 +1641,7 @@ class SchemaCacheConfig(BaseModel):
     """
     Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
 
-    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. It also escalates `W045` (a read of a table missing from a known schema's seed or cache table list) to the `E045` error. `rocky compile --strict-sources` sets it for one invocation.
     """
     trusted_max_age_seconds: conint(ge=0) | None = None
     """
@@ -2312,6 +2336,28 @@ class IsolationConfig(BaseModel):
     workspace_ids: list[WorkspaceBindingConfig] | None = Field(
         [], validate_default=True
     )
+
+
+class LintConfig(BaseModel):
+    """
+    `[lint]` — style-lint settings for `rocky lint`.
+
+    ```toml [lint] disable = ["S003"]
+
+    [lint.severity] S001 = "error" ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    disable: list[str] | None = []
+    """
+    Rule codes that do not run, e.g. `["S003", "S004"]`.
+    """
+    severity: dict[str, LintSeverity4 | LintSeverity5 | LintSeverity6] | None = {}
+    """
+    Per-rule severity overrides, keyed by rule code. A rule without an entry keeps its default severity.
+    """
 
 
 class NullRateConfig(BaseModel):
@@ -3986,6 +4032,12 @@ class RockyConfig(BaseModel):
 
     Each `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.
     """
+    lint: LintConfig | None = Field(
+        {"disable": [], "severity": {}}, validate_default=True
+    )
+    """
+    Style-lint configuration for `rocky lint`: rules to switch off and per-rule severity overrides.
+    """
     mask: (
         dict[
             str,
@@ -4090,6 +4142,12 @@ class RockyConfig(BaseModel):
     )
     """
     Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
+    """
+    selectors: dict[str, str] | None = {}
+    """
+    Saved selectors: a name mapped to a `--select` expression. Use one with `--select selector:<name>` on any command that takes `--select` (or `--exclude selector:<name>`). A saved selector may use graph operators, `state:` and other `selector:` terms; a loop is an error.
+
+    ```toml [selectors] nightly = "tag:nightly+ config.materialized:incremental" finance = "path:marts/finance,tag:certified" ```
     """
     state: StateConfig | None = Field(
         {

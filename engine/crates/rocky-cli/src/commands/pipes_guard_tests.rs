@@ -145,7 +145,9 @@ async fn contracts_refusal_does_not_send_pipes_opened() {
         None,
         false,
         None,
-        Some(&dir.path().join("contracts")),
+        Some(crate::commands::run::RunContracts::SelectedModelGuard(
+            &dir.path().join("contracts"),
+        )),
         &rocky_core::config::PrincipalRef::unnamed(),
         None,
     )
@@ -259,6 +261,7 @@ async fn direct_transformation_guard_refuses_bad_pipes() {
             None,
             None,
             false,
+            None,
             None,
         )
         .await,

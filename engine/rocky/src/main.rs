@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
+use rocky_cli::commands::CostEstimateMode;
 use tracing::warn;
 
 /// Extended help text for the shared `--filter` flag on `rocky plan`,
@@ -1008,6 +1009,17 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, default_value = "main", global = false)]
         base: String,
+        /// How the plan's `cost_preview` is estimated.
+        ///
+        /// `heuristic` (default) uses Rocky's offline cost model over the
+        /// compiled DAG and never contacts the warehouse. `adapter` asks the
+        /// warehouse to estimate each planned model's generated SQL
+        /// (`EXPLAIN` or a dry run, as `rocky estimate` does) and falls back
+        /// to the heuristic for any model it cannot estimate. Either way the
+        /// preview is report-only and never changes the plan or the exit code.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_enum, default_value = "heuristic", global = false)]
+        cost_estimate: CostEstimateMode,
     },
 
     /// Execute the full pipeline in one step: discover → drift → create → copy → check.
@@ -1035,9 +1047,11 @@ enum Command {
         /// `--model`.
         #[command(flatten)]
         selection: SelectArgs,
-        /// Check an explicitly selected model contract in the same compile
-        /// that supplies the model executed by this run.
-        #[arg(long, requires_all = ["model", "pipeline"])]
+        /// Contracts directory for this run's compiles. Defaults to the
+        /// project `contracts/` directory beside the models directory. With
+        /// `--model` and `--pipeline` it also requires the selected model to
+        /// have a contract there.
+        #[arg(long)]
         contracts: Option<PathBuf>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
@@ -1224,6 +1238,30 @@ enum Command {
         #[arg(long, value_name = "SCHEMA", requires = "defer")]
         defer_to: Option<String>,
 
+        /// Saved production state the deferred upstreams resolve from when
+        /// `--defer` is set: the path of a Rocky state store file, for
+        /// example a copy of production's `.rocky-state.redb`.
+        ///
+        /// Each unbuilt upstream a selected model reads resolves to the table
+        /// the newest successful production run in that store recorded for
+        /// it (catalog, schema and table). The store is opened read-only. The
+        /// run refuses before any write when the store is missing, has an
+        /// incompatible state schema version, or has no recorded table for a
+        /// needed upstream. Mutually exclusive with `--defer-to`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "defer",
+            conflicts_with = "defer_to"
+        )]
+        defer_to_state: Option<PathBuf>,
+
+        /// Read deferred upstreams only from this production run in the
+        /// `--defer-to-state` store, instead of the newest run that built each
+        /// upstream.
+        #[arg(long, value_name = "RUN_ID", requires = "defer_to_state")]
+        defer_run_id: Option<String>,
+
         /// Skip re-materializing transformation models whose logic and
         /// upstream data both appear unchanged since the last successful
         /// build.
@@ -1379,14 +1417,29 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Generate project documentation (HTML catalog)
+    /// Generate project documentation: a static site, or Parquet tables
+    ///
+    /// The default writes a navigable site (model and source pages, search,
+    /// an interactive lineage graph) into a directory. It needs no server and
+    /// makes no network requests. `--output-path` ending in `.html` writes a
+    /// single-page catalog instead. `--format parquet` writes the compiled
+    /// project graph as Parquet tables (models, columns, edges,
+    /// column_lineage, tests, contracts, sources) that DuckDB can query.
     Docs {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
-        /// Output file path (default: docs/catalog.html)
-        #[arg(long = "output-path", default_value = "docs/catalog.html")]
+        /// Output directory for the site and for Parquet tables, or a file
+        /// ending in `.html` for a single-page catalog (default: docs/site)
+        #[arg(long = "output-path", default_value = "docs/site")]
         output_path: PathBuf,
+        /// Output shape: `site` (default) or `parquet`
+        #[arg(long, value_enum, default_value = "site")]
+        format: rocky_cli::commands::DocsFormat,
+        /// Directory of `<model>.contract.toml` files to show as contracts,
+        /// in addition to contracts that sit next to a model
+        #[arg(long)]
+        contracts: Option<PathBuf>,
         /// Per-run variable substituted into model SQL (repeatable), as in
         /// `rocky compile --var`. Column metadata comes from an offline
         /// compile; a required `@var(name)` left unset is a compile error,
@@ -1409,9 +1462,11 @@ enum Command {
 
     /// Compile models: resolve dependencies, type check, validate contracts
     Compile {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Without it, every transformation pipeline's
+        /// models compile together, in one project graph (a project with no
+        /// transformation pipeline reads `models`).
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -1438,8 +1493,9 @@ enum Command {
         /// Treat every known source schema as authoritative: a direct
         /// reference to a column the source lacks is the E041 error even when
         /// the schema came from a seed (`--with-seed`) or an untrusted cache
-        /// entry, which otherwise warn with W041. Same as
-        /// `[cache.schemas] strict_sources = true`.
+        /// entry, which otherwise warn with W041. A read of a table missing
+        /// from a known schema is the E045 error instead of the W045 warning.
+        /// Same as `[cache.schemas] strict_sources = true`.
         #[arg(long)]
         strict_sources: bool,
 
@@ -1865,31 +1921,41 @@ enum Command {
         /// route); when unset, a loopback server asks no request for a
         /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
         /// omitted. Required when `--host` is non-loopback, including with
-        /// `--ui`. With `--ui` on loopback and no token, a per-process
-        /// read-only token is generated.
+        /// `--ui`. With `--ui` on loopback and no token, a per-process token
+        /// is generated: full scope (operator mode) unless `--read-only`,
+        /// `--allowed-host` or `--allowed-origin` is given.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
         /// `read-only` authenticates the same way but is refused `403` on any
-        /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
-        /// to hand a browser UI, so one leak can't reach a warehouse mutation.
-        /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
-        /// token is an error, except `read-only` with `--ui` on loopback,
-        /// which gets a generated token.
+        /// request whose method is not `GET`, `HEAD`, or `OPTIONS`. Falls
+        /// back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token
+        /// is an error, except with `--ui` on loopback, which gets a
+        /// generated token of that scope. With `--ui`, `full` is accepted
+        /// only on a loopback bind with no `--allowed-host` and no
+        /// `--allowed-origin`.
         #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
         token_scope: Option<String>,
+        /// The same as `--token-scope read-only`. With `--ui`, it gives a
+        /// view-only UI: the browser cannot run, plan, approve or apply.
+        /// Conflicts with `--token-scope full`.
+        #[arg(long = "read-only")]
+        read_only: bool,
         /// CORS allowlist. Repeat for each origin (e.g.
         /// `--allowed-origin http://localhost:5173`). The default
-        /// allowlist is empty (same-origin only).
+        /// allowlist is empty (same-origin only). With `--ui`, any entry
+        /// marks the server as shared, so the UI keeps a read-only token.
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
         /// Serve the browser UI at `/ui/`. Release binaries carry it; from
-        /// source, build with `--features ui`. The UI token is read-only, so
-        /// it never reaches a mutating route. On loopback with no token
-        /// configured, a per-process read-only token is generated: a new
-        /// one each time the server starts. It is meant for a single-user
-        /// machine. On a shared host, or any non-loopback host, pass
-        /// `--token` with `--token-scope read-only`. With `--scheduler`,
+        /// source, build with `--features ui`. On loopback with no token
+        /// configured, a per-process token is generated: a new one each time
+        /// the server starts. It is full scope (operator mode: the UI can
+        /// run, plan, approve and apply as the user running the server)
+        /// unless `--read-only` is given, or `--allowed-host` /
+        /// `--allowed-origin` mark the server as shared. Operator mode is
+        /// for a single-user machine. On a shared host, or any non-loopback
+        /// host, pass `--token` with `--read-only`. With `--scheduler`,
         /// `ROCKY_WEBHOOK_SECRET` is required. Prints the address to open,
         /// token included.
         #[arg(long)]
@@ -1897,6 +1963,7 @@ enum Command {
         /// With `--ui`: an extra `Host` header value to accept, for a reverse
         /// proxy in front of the UI. Repeat for each. Loopback names and the
         /// bind host are always accepted; any other `Host` is refused `421`.
+        /// Marks the server as shared, so `--ui` keeps a read-only token.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_hosts: Vec<String>,
         /// With `--ui`: open the printed address in the default browser once
@@ -1941,9 +2008,11 @@ enum Command {
     /// the configured warehouse adapter instead of DuckDB.
     #[cfg(feature = "duckdb")]
     Test {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory (default `models`). With `--declarative` and
+        /// neither `--models` nor `--pipeline`, every transformation
+        /// pipeline's own models run, each against its pipeline's warehouse.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -1956,7 +2025,8 @@ enum Command {
         /// Run declarative [[tests]] from model sidecars against the warehouse
         #[arg(long)]
         declarative: bool,
-        /// Pipeline name (only used with --declarative; required if multiple pipelines defined)
+        /// Pipeline name (only used with --declarative). Runs that one
+        /// pipeline's declarative tests.
         #[arg(long)]
         pipeline: Option<String>,
         /// Per-run variable substituted into model SQL (repeatable). Resolves
@@ -1971,9 +2041,11 @@ enum Command {
     /// Run CI pipeline: compile + test without warehouse credentials
     #[cfg(feature = "duckdb")]
     Ci {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Without it, every transformation pipeline's
+        /// models compile together and run in one in-memory DuckDB, so a
+        /// model reads the outputs of the pipelines it depends on.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -2532,6 +2604,22 @@ enum Command {
         /// Check mode: exit non-zero if any file needs formatting (for CI)
         #[arg(long)]
         check: bool,
+    },
+
+    /// Lint model SQL for style (`S001`-`S007`).
+    ///
+    /// Reads `.sql` files and reports ambiguous unqualified columns, bare
+    /// `JOIN`, `SELECT *` in a final result, column order, keyword
+    /// capitalisation, trailing whitespace and tabs. `--fix` rewrites the
+    /// mechanical rules in place. Rules are switched off or re-graded in the
+    /// `[lint]` section of `rocky.toml`. Exits non-zero when a finding has
+    /// `error` severity.
+    Lint {
+        /// `.sql` files or directories to lint (default: `models`)
+        paths: Vec<PathBuf>,
+        /// Rewrite the fixable findings in place (`S002`, `S005`, `S006`, `S007`)
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Export JSON Schema files for every CLI `--output json` payload type.
@@ -3330,6 +3418,7 @@ struct SelectArgs {
     /// Select models with dbt-style node selection: names and globs
     /// (`stg_*`), graph operators (`+m`, `m+`, `2+m`, `m+3`, `@m`), and
     /// methods (`tag:`, `path:`, `file:`, `config.materialized:`, `source:`,
+    /// `selector:<name>` for an entry of the `[selectors]` table in rocky.toml,
     /// `state:modified`, `state:new`). Space-separated terms union;
     /// comma-joined terms intersect. Repeatable.
     #[arg(short = 's', long = "select", value_name = "SELECTOR", num_args = 1..)]
@@ -3443,6 +3532,37 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .map(|(name, _)| *name)
 }
 
+/// The models directory `rocky compile`, `rocky test` and `rocky ci` read:
+/// `--models` as typed, or else `models/` beside the config file. The
+/// compile reads `contracts/` and `functions/` beside this directory, so
+/// `rocky --config sub/rocky.toml ci` run from another directory must find
+/// `sub/models`, `sub/contracts` and `sub/functions`, not the ones under the
+/// working directory. With the default `--config rocky.toml` this is
+/// `models`, as before.
+fn models_dir_or_default(
+    config: &std::path::Path,
+    models: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    match models {
+        Some(dir) => dir.to_path_buf(),
+        None => config
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("models"),
+    }
+}
+
+/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
+/// read: the named `--models` directory, or the whole project when none was
+/// named. Decided by presence, so `--models models` keeps reading that one
+/// directory.
+fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
+    match models {
+        Some(_) => rocky_cli::commands::ModelScope::Dir,
+        None => rocky_cli::commands::ModelScope::WholeProject,
+    }
+}
+
 /// How long process exit waits for blocking-pool work that is still running.
 ///
 /// Dropping a `tokio` runtime waits — with no bound — for every `spawn_blocking`
@@ -3535,6 +3655,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "branch",
             "list",
             "emit-sql",
+            "lint",
             "imports",
             "publish-ir",
         ],
@@ -3793,12 +3914,13 @@ fn parse_governance_override(
 /// | `1`  | total / generic failure (e.g. `rocky run` with no tables copied, config error) |
 /// | `2`  | partial/failed work: `rocky run` some tables materialized + some failed, or `rocky tick` had at least one executed run fail or come back partial (Dagster `allow_partial=True` keys on this) |
 /// | `3`  | `rocky doctor` found a Critical health check |
-/// | `4`  | `rocky ci` passed compile + tests but emitted advisory warnings |
+/// | `4`  | `rocky fulfill` applied a plan whose output fails a declared check |
 /// | `130`| interrupted by SIGINT / SIGTERM |
 ///
 /// `2` is reserved for run/tick partial-or-failed work (both surface it via the
-/// shared `PartialFailure` sentinel); doctor-critical and ci-warnings were split
-/// off to `3` / `4` so they no longer collide with it.
+/// shared `PartialFailure` sentinel); doctor-critical was split off to `3` so
+/// it no longer collides with it. `rocky ci` exits `0` or `1`, and its JSON
+/// `exit_code` reports that same code; warnings do not change it.
 /// Resolve the state-file namespace for this invocation, if any.
 ///
 /// Precedence:
@@ -4208,6 +4330,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             semantic,
             intent,
             base,
+            cost_estimate,
         } => {
             // #1550: a default-plan flag alongside a plan subcommand used to be
             // ACCEPTED and then silently discarded — the dispatch below reads
@@ -4216,6 +4339,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // and only over the flags `plan` itself declares: inherited globals
             // (`--output`, `--principal`) are consumed by the promote path and
             // must keep working before the subcommand.
+            let non_default_cost = cost_estimate != CostEstimateMode::Heuristic;
             if subcommand.is_some()
                 && let Some(flag) = offending_default_plan_flag(&[
                     ("--filter", filter.is_some()),
@@ -4246,6 +4370,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--semantic", semantic),
                     ("--intent", intent.is_some()),
                     ("--base", base != "main"),
+                    ("--cost-estimate", non_default_cost),
                 ])
             {
                 anyhow::bail!(
@@ -4347,6 +4472,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         semantic,
                         &base,
                         &state_path,
+                        cost_estimate,
                         json,
                     )
                     .await
@@ -4407,6 +4533,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             defer,
             defer_to,
+            defer_to_state,
+            defer_run_id,
             skip_unchanged,
             force_rebuild,
             no_reuse,
@@ -4429,12 +4557,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     !dag && !watch
                         && !run_all
                         && filter.is_none()
-                        && contracts.is_none()
                         && resume.is_none()
                         && !resume_latest,
                     "--select / --exclude choose transformation models and cannot be combined \
-                     with --dag, --watch, --all, --filter, --contracts, --resume, or \
-                     --resume-latest"
+                     with --dag, --watch, --all, --filter, --resume, or --resume-latest"
                 );
                 let selection = selection.with_model(model.as_deref())?;
                 let mut set = rocky_cli::commands::resolve_run_selection(
@@ -4506,35 +4632,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if contracts.is_some() {
-                anyhow::ensure!(
-                    model.is_some()
-                        && pipeline.is_some()
-                        && filter.is_none()
-                        && models_dir.is_none()
-                        && !run_all
-                        && resume.is_none()
-                        && !resume_latest
-                        && !shadow
-                        && shadow_schema.is_none()
-                        && branch.is_none()
-                        && partition.is_none()
-                        && from.is_none()
-                        && to.is_none()
-                        && !latest
-                        && !missing
-                        && lookback.is_none()
-                        && !dag
-                        && !watch
-                        && !defer
-                        && defer_to.is_none()
-                        && !skip_unchanged
-                        && !no_prune
-                        && idempotency_key.is_none()
-                        && !assume_fresh_state,
-                    "--contracts supports only a fresh --model/--pipeline run; remove mixed, skip, defer, partition, shadow, resume, idempotency, and other unsupported flags"
+            // Every compile reads the project `contracts/` directory without a
+            // flag, on every run shape, and a model with a contract error is
+            // not written. `--contracts` swaps the directory. With `--model`
+            // outside `--dag` it is also the selected-model guard: the model
+            // must have a contract there, and `run` refuses the options that
+            // guard cannot cover.
+            if contracts.is_some() && watch {
+                anyhow::bail!(
+                    "--contracts is not supported with --watch; put the contracts in the \
+                     project `contracts/` directory, which every run reads"
                 );
             }
+            let run_contracts = contracts.as_deref().map(|dir| {
+                if model.is_some() && !dag {
+                    rocky_cli::commands::RunContracts::SelectedModelGuard(dir)
+                } else {
+                    rocky_cli::commands::RunContracts::Directory(dir)
+                }
+            });
             // `--var` is only threaded through the standard run path. The `--dag`
             // and `--watch` dispatch paths compile their sub-runs with an empty
             // `RunVars`, so a supplied `--var` would be silently dropped —
@@ -4639,6 +4755,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let defer_opts = rocky_cli::commands::DeferOptions {
                 enabled: defer,
                 defer_to,
+                defer_state: defer_to_state.map(|path| rocky_cli::commands::DeferStateSource {
+                    path,
+                    run_id: defer_run_id,
+                }),
                 selected_models,
                 ..Default::default()
             };
@@ -4693,7 +4813,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 if refuse_hooks {
                     rocky_cli::commands::refuse_configured_side_effects(&loaded.config.hooks)?;
                 }
-                let run_future = rocky_cli::commands::run_with_dag(
+                let run_future = rocky_cli::commands::run_with_dag_and_contracts(
                     &cli.config,
                     loaded,
                     &state_path,
@@ -4706,6 +4826,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // the caller asked for a bound (#1288).
                     parallel,
                     &actor,
+                    contracts.as_deref(),
                 );
                 tokio::select! {
                     result = run_future => result,
@@ -4749,7 +4870,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &skip_opts,
                     &run_vars,
                     assume_fresh_state,
-                    contracts.as_deref(),
+                    run_contracts,
                     &actor,
                     refuse_hooks,
                 )
@@ -4840,6 +4961,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Docs {
             models,
             output_path,
+            format,
+            contracts,
             var,
             selection,
         } => {
@@ -4858,6 +4981,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     selection.run_vars = run_vars.clone();
                     selection
                 }),
+                format,
+                contracts.as_deref(),
             )
         }
         Command::State { action } => match action {
@@ -4940,10 +5065,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     selection.as_ref(),
                 )
             } else {
+                let scope = model_scope(models.as_deref());
                 rocky_cli::commands::run_compile_with_options(
                     Some(cli.config.as_path()),
                     &state_path,
-                    &models,
+                    &models_dir_or_default(&cli.config, models.as_deref()),
+                    scope,
                     contracts.as_deref(),
                     model.as_deref(),
                     json,
@@ -5232,6 +5359,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             token,
             token_scope,
+            read_only,
             allowed_origins,
             ui,
             allowed_hosts,
@@ -5283,6 +5411,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 watch,
                 token,
                 token_scope,
+                read_only,
                 allowed_origins,
                 ui,
                 allowed_hosts,
@@ -5313,10 +5442,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "--select / --exclude are not yet supported with --declarative; use --model"
                 );
             }
+            let models_dir = &models_dir_or_default(&cli.config, models.as_deref());
             if declarative {
                 rocky_cli::commands::run_declarative_tests(
                     &cli.config,
-                    &models,
+                    models_dir,
+                    model_scope(models.as_deref()),
                     pipeline.as_deref(),
                     model.as_deref(),
                     json,
@@ -5329,7 +5460,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cache_ttl_override: cli.cache_ttl,
                 };
                 rocky_cli::commands::run_test_with_selection(
-                    &models,
+                    Some(cli.config.as_path()),
+                    models_dir,
                     contracts.as_deref(),
                     model.as_deref(),
                     json,
@@ -5346,7 +5478,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rocky_cli::commands::run_ci(&models, contracts.as_deref(), json, &run_vars)
+            rocky_cli::commands::run_ci(
+                &cli.config,
+                &models_dir_or_default(&cli.config, models.as_deref()),
+                model_scope(models.as_deref()),
+                contracts.as_deref(),
+                json,
+                &run_vars,
+            )
         }
         Command::CiDiff {
             base_ref,
@@ -5983,6 +6122,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             )
             .await
+        }
+        Command::Lint { paths, fix } => {
+            rocky_cli::commands::run_lint(&cli.config, &paths, fix, json)
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
@@ -7047,6 +7189,7 @@ mod tests {
                 select: _,
                 exclude: _,
                 state_ref: _,
+                cost_estimate: _,
             } => extract(
                 filter,
                 pipeline,

@@ -100,6 +100,36 @@ pub(crate) fn approval_scope(
     })
 }
 
+/// [`approval_scope`] for a project at `root`, anchoring every directory at
+/// `root` exactly once.
+///
+/// `config_path` is already resolved against `root` (`root.join(path)`; an
+/// absolute path is kept), so the directories and globs a config declares
+/// come out anchored by it. Only a directory taken from the plan itself
+/// (`--models`, or the `models` default when no transformation pipeline
+/// applies) is relative to the project root, and only those are joined to
+/// `root`. Joining a config-derived directory again would double a relative
+/// root (`proj/proj/models`).
+pub(crate) fn approval_scope_at(
+    config: Option<&RockyConfig>,
+    root: &Path,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<ApprovalScope> {
+    let mut scope = approval_scope(config, config_path, run_plan)?;
+    if !scope.dag {
+        for unit in &mut scope.units {
+            // `run_model_selection` returns a glob exactly when it resolved a
+            // pipeline from the config; a unit without one is the plan's own
+            // directory.
+            if unit.models_glob.is_none() {
+                unit.models_dir = root.join(&unit.models_dir);
+            }
+        }
+    }
+    Ok(scope)
+}
+
 /// One unit per transformation pipeline, name-sorted, resolved exactly as
 /// `run_dag_exec::load_transformation_models` and the DAG's model-only
 /// sub-runs resolve them. A pipeline whose directory is absent is kept: it
@@ -269,7 +299,12 @@ pub(crate) fn scope_fingerprint(
         } else {
             super::apply::resolved_surrogate_keys(&unit.unit.models_dir, models)?
         };
-        let extras = super::apply::ExecutionExtras::build(&keys, models, mask);
+        let empty_contracts = BTreeMap::new();
+        let contract_files = unit
+            .head
+            .as_ref()
+            .map_or(&empty_contracts, |head| &head.contract_files);
+        let extras = super::apply::ExecutionExtras::build(&keys, models, contract_files, mask);
         Ok(super::apply::execution_ir_fingerprint(
             models,
             ids.config,
@@ -418,4 +453,214 @@ pub(crate) fn verify_dag_scope_for_apply(
         ));
     }
     Ok(())
+}
+
+/// Whether apply reconciles masks for this plan, so its fingerprint binds the
+/// env-resolved mask. The same predicate plan time computes (`bind_masks` in
+/// `plan.rs`): a Replication pipeline whose model leg runs (`--all` /
+/// `--models`) on a full, `--model`-less, non-`--dag` run. A backfill
+/// reconciles no masks.
+pub(crate) fn plan_binds_mask(
+    plan: &crate::plan_store::PersistedPlan,
+    scope: &ApprovalScope,
+    cfg: Option<&RockyConfig>,
+    run_plan: &RunPlan,
+) -> bool {
+    cfg.is_some_and(|cfg| {
+        plan.kind != crate::plan_store::PlanKind::Backfill
+            && !scope.dag
+            && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
+            && (run_plan.run_all || run_plan.models_dir.is_some())
+            && run_plan.model.is_none()
+    })
+}
+
+/// The identities a plan's scope fingerprint binds: the config's routing,
+/// governance and execution-control identities, plus the mask where
+/// [`plan_binds_mask`] says apply reconciles one. Review and apply both read
+/// this, so the two recompute the fingerprint the same way.
+pub(crate) fn plan_scope_identities(
+    plan: &crate::plan_store::PersistedPlan,
+    scope: &ApprovalScope,
+    cfg: Option<&RockyConfig>,
+    run_plan: &RunPlan,
+) -> OwnedScopeIdentities {
+    let binds_mask = plan_binds_mask(plan, scope, cfg, run_plan);
+    OwnedScopeIdentities::from_config(cfg, binds_mask.then_some(run_plan.env.as_deref()))
+}
+
+/// The fingerprint of a compiled scope over its models and the masks they
+/// use: no config, governance or execution-control identity. Seeds still
+/// count for a `--dag` scope, because the DAG runs them.
+///
+/// `resolved_mask` is the mask the full fingerprint binds: the plan's `--env`
+/// resolution where [`plan_binds_mask`] says apply reconciles masks, else
+/// empty. Only the strategies of tags the models classify with are hashed,
+/// and a `--dag` scope hashes none. It does not depend on the process
+/// environment, so a person's apply still refuses a `[mask]` strategy change
+/// for a tag the models use.
+///
+/// A person's apply compares this one. The identities hash adapters and
+/// pipelines with their `${VAR}` values resolved, so the full fingerprint
+/// moves when the same plan is applied from another environment, such as a
+/// `rocky serve` job child, or after an edit to an unrelated pipeline.
+pub(crate) fn scope_models_only_fingerprint(
+    scope: &ApprovalScope,
+    compiled: &[CompiledUnit],
+    resolved_mask: &BTreeMap<String, rocky_ir::MaskStrategy>,
+) -> Result<Option<String>> {
+    scope_fingerprint(
+        scope,
+        compiled,
+        &ScopeIdentities {
+            config: "",
+            governance: "",
+            exec_control: "",
+            resolved_mask,
+        },
+    )
+}
+
+/// The stable code `rocky apply` refuses with when the models a plan
+/// fingerprinted no longer match the models on disk. It is in the error text,
+/// so a failed HTTP apply job's `error` carries it.
+pub(crate) const PLAN_MODELS_CHANGED: &str = "plan_models_changed";
+
+/// The stable code an agent's apply refuses with when the plan's models (and
+/// the masks they use) are unchanged but the config they run under is not
+/// (adapters, pipelines, governance or run settings, as resolved in this
+/// environment).
+pub(crate) const PLAN_CONFIG_CHANGED: &str = "plan_config_changed";
+
+/// The stable code `rocky apply` refuses with when a plan carries a
+/// fingerprint but not what the check needs to recompute it: a plan written
+/// before the check existed.
+pub(crate) const PLAN_SNAPSHOT_MISSING: &str = "plan_snapshot_missing";
+
+/// Apply-time check: a plan that carries a models fingerprint executes only
+/// if the models it would run still match it.
+///
+/// `rocky apply` does not replay stored SQL: `run` recompiles the models on
+/// disk. This recomputes the fingerprint with the scope and compile review
+/// uses, seeded from the plan's reviewed source-schema snapshot.
+///
+/// ```text
+///   principal  compares                       on mismatch
+///   agent      full fingerprint               plan_config_changed if the
+///              (models + masks + config       models and masks still
+///              identities)                    match, else plan_models_changed
+///   other      models-only fingerprint        plan_models_changed
+///              (models + masks)
+/// ```
+///
+/// "Masks" is the `[mask]` strategy, resolved for the plan's `--env`, of each
+/// tag the models classify with, where the plan binds masks at all.
+///
+/// An agent's apply is also re-checked inside `run`. A person's is not, so
+/// for a person the models can still change between this check and the
+/// run's own compile.
+///
+/// A plan with no fingerprint (a legacy plan, or one whose models did not
+/// compile at plan time) is not checked here: a review-gated apply already
+/// refuses it elsewhere. A plan with a fingerprint but no source-schema
+/// snapshot, or (for a person) no models-only fingerprint, predates this
+/// check and refuses with [`PLAN_SNAPSHOT_MISSING`].
+///
+/// `config_path` is already resolved against `root`; `root` anchors only a
+/// directory the plan names itself (a backfill's, or `--models`).
+pub(crate) fn verify_plan_models_for_apply(
+    plan: &crate::plan_store::PersistedPlan,
+    plan_id: &str,
+    cfg: Option<&RockyConfig>,
+    config_path: &Path,
+    root: &Path,
+    run_plan: &RunPlan,
+    principal: rocky_core::config::PolicyPrincipal,
+) -> Result<()> {
+    let capabilities = plan.embedded_capabilities();
+    let Some(expected) = capabilities.models_fingerprint.as_deref() else {
+        return Ok(());
+    };
+    if capabilities.fingerprint_version == 0 {
+        return Ok(());
+    }
+    let agent = principal == rocky_core::config::PolicyPrincipal::Agent;
+    let models_changed = |why: &str| {
+        anyhow::anyhow!(
+            "{PLAN_MODELS_CHANGED}: refusing to apply plan '{plan_id}': models changed since \
+             this plan was made; plan again with `rocky plan` (and review the new plan if it \
+             needs approval). {why}."
+        )
+    };
+    let snapshot_missing = |what: &str| {
+        anyhow::anyhow!(
+            "{PLAN_SNAPSHOT_MISSING}: refusing to apply plan '{plan_id}': the plan predates the \
+             check apply runs on a plan's models (it has no {what}), so apply cannot compare \
+             them with the models on disk. Plan again with `rocky plan` (and review the new \
+             plan if it needs approval)."
+        )
+    };
+    let Some(source_schemas) = capabilities.reviewed_source_schemas else {
+        return Err(snapshot_missing("source-schema snapshot"));
+    };
+    let expected_models_only = capabilities.models_only_fingerprint.as_deref();
+    if !agent && expected_models_only.is_none() {
+        return Err(snapshot_missing("models-only fingerprint"));
+    }
+    let source_schemas: HashMap<_, _> = source_schemas.into_iter().collect();
+    let scope = if plan.kind == crate::plan_store::PlanKind::Backfill {
+        // A backfill executes its persisted directory, without a glob.
+        ApprovalScope {
+            dag: false,
+            units: vec![ScopeUnit {
+                pipeline: None,
+                models_dir: PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                models_glob: None,
+            }],
+            seeds_dir: None,
+        }
+        .anchored_at(root)
+    } else {
+        // `config_path` is resolved against `root` by the apply entry point,
+        // as propose and review resolve it, so the directory and the glob
+        // are both anchored at the project root and not at the process cwd.
+        approval_scope_at(cfg, root, config_path, run_plan)?
+    };
+    let compiled = scope
+        .compile(&source_schemas, NoModels::Empty)
+        .map_err(|e| models_changed(&format!("Its models no longer compile ({e:#})")))?;
+    // The mask the plan's full fingerprint binds, resolved for the plan's
+    // stored `--env`. The models-only fingerprint binds the same mask.
+    let ids = plan_scope_identities(plan, &scope, cfg, run_plan);
+    let models_only = scope_models_only_fingerprint(&scope, &compiled, &ids.resolved_mask)
+        .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
+    let models_match =
+        expected_models_only.is_some() && models_only.as_deref() == expected_models_only;
+    if !agent {
+        if !models_match {
+            return Err(models_changed(
+                "A model it runs was added, removed or changed, or the `[mask]` strategy of a \
+                 tag those models classify with changed",
+            ));
+        }
+        return Ok(());
+    }
+    let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
+        .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
+    if actual.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    if models_match {
+        return Err(anyhow::anyhow!(
+            "{PLAN_CONFIG_CHANGED}: refusing to apply plan '{plan_id}': its models are \
+             unchanged, but the config they run under changed since this plan was made \
+             (adapters, pipelines, governance or run settings, as resolved in this \
+             environment). An agent's apply runs only under the config its plan was made \
+             with; plan again with `rocky plan` in this environment."
+        ));
+    }
+    Err(models_changed(
+        "A model it runs was added, removed or changed, the `[mask]` strategy of a tag those \
+         models classify with changed, or the config those models run under changed",
+    ))
 }

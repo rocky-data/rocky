@@ -144,6 +144,32 @@ rocky run --model stg_orders --defer --defer-to analytics_prod
 - With `--defer-to <schema>`, every deferred reference is rewritten to that single schema. The catalog and the table name are preserved.
 - `--defer` applies to transformation models. It is mutually exclusive with `--dag`, because cross-pipeline defer is out of scope.
 
+### Defer to a saved production state
+
+Your development config often names different schemas than production. Then neither form above knows where production wrote. A production state store does. Each successful production run records the table each model wrote. `--defer-to-state` reads those records.
+
+```bash
+# Fetch or copy production's state store, then build one model against it
+rocky run --model report --defer --defer-to-state ./prod-state.redb
+
+# Read only one production run
+rocky run --model report --defer --defer-to-state ./prod-state.redb --defer-run-id run-20261009-011435-427
+```
+
+```text
+prod-state.redb ──read-only──▶ newest successful production run that built "orders"
+                                  │
+report: FROM orders  ──rewrite──▶ FROM prod.orders
+```
+
+- Each unbuilt upstream that a selected model reads resolves to the catalog, schema and table that the newest successful production run recorded for it. Shadow and branch runs never count.
+- When the newest production run did not build an upstream, Rocky uses an older run that did and logs a warning: that table may be stale. Pass `--defer-run-id` to pin one run.
+- `--defer-run-id <RUN_ID>` reads only that run. It must be a production run.
+- Rocky opens the store read-only. It never stamps, upgrades or changes it.
+- The run refuses before any write when the store is missing, when its state schema version is one this binary cannot read, or when it has no recorded table for an upstream a selected model reads. The error names the store, the run and the model.
+- A store written by a Rocky version before this feature has no recorded tables. Run production once with the new version first, or use `--defer-to <schema>`.
+- `--defer-to-state` and `--defer-to` cannot be combined.
+
 :::caution[Defer rewrites SQL with the Databricks dialect]
 To qualify deferred upstream references, `--defer` parses each selected model's SQL. The parser uses Rocky's Databricks dialect. A few constructs it does not yet support therefore **cannot be rewritten**, and fail with a clear error: `SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals. The error names the model and tells you to build it **without `--defer`**, or to adjust its SQL. Default-off means a plain run is unaffected.
 :::

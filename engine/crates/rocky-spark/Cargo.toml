@@ -1,0 +1,41 @@
+[package]
+name = "rocky-spark"
+version = "1.79.0"
+description = "Apache Spark warehouse adapter for Rocky over Spark Connect (beta)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
+rocky-sql = { path = "../rocky-sql" }
+rocky-databricks = { path = "../rocky-databricks" }
+arrow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+prost = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which the dialect
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
+tokio = { workspace = true }
+
+[features]
+# Gates the live conformance harness in `tests/conformance.rs`. It needs a
+# Spark Connect server with Delta Lake reachable at
+# `${SPARK_CONNECT_HOST:-localhost}:${SPARK_CONNECT_PORT:-15002}` (see the
+# crate README for the `docker run` line). Off by default so unit-test runs
+# stay network-free.
+spark-conformance = []
+
+[lints]
+workspace = true

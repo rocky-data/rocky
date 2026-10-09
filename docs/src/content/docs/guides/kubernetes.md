@@ -25,7 +25,7 @@ Then put a project on the volume, and reach it:
 
 ```bash
 kubectl port-forward -n rocky svc/rocky 8080:8080
-# http://localhost:8080/ui/
+# http://localhost:8080/login?t=<token>
 ```
 
 ## Put your project on the volume

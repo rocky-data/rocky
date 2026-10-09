@@ -171,7 +171,7 @@ A sketch of that panel:
 
 ```bash
 rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
-# Rocky UI: http://127.0.0.1:8080/ui/#token=...
+# Rocky UI: http://127.0.0.1:8080/login?t=...
 ```
 
 <p align="center">

@@ -1,6 +1,6 @@
 [package]
 name = "rocky-cli"
-version = "1.78.0"
+version = "1.79.0"
 description = "CLI framework for Rocky"
 edition.workspace = true
 license.workspace = true
@@ -25,6 +25,7 @@ rocky-trino = { path = "../rocky-trino" }
 rocky-postgres = { path = "../rocky-postgres" }
 rocky-clickhouse = { path = "../rocky-clickhouse" }
 rocky-sqlserver = { path = "../rocky-sqlserver" }
+rocky-spark = { path = "../rocky-spark" }
 rocky-fivetran = { path = "../rocky-fivetran", features = ["valkey"] }
 rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-catalog-core = { path = "../rocky-catalog-core" }

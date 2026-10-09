@@ -636,6 +636,16 @@ impl RedshiftDialect {
             "rocky_src"
         }
     }
+
+    /// The temporary table a MERGE reads its source rows from. Not the
+    /// target's own name, so `ON <table>.k = <temp>.k` stays unambiguous.
+    fn merge_temp_table(table: &str) -> &'static str {
+        if table.eq_ignore_ascii_case("rocky_merge_src") {
+            "rocky_merge_src_1"
+        } else {
+            "rocky_merge_src"
+        }
+    }
 }
 
 impl SqlDialect for RedshiftDialect {
@@ -693,6 +703,18 @@ impl SqlDialect for RedshiftDialect {
     /// required. With no non-key column to update there is no valid matched
     /// arm, so the dialect inserts the missing keys with `INSERT … WHERE NOT
     /// EXISTS` instead.
+    ///
+    /// The source rows go through a temporary table first. Redshift refuses
+    /// a `WITH` clause in a MERGE, and a source subquery that reads the
+    /// target ("Source view/subquery in Merge statement cannot reference
+    /// target table"); a model's SQL may do both (CTEs, or an
+    /// `@incremental_filter` reading `MAX(...)` from the target). The three
+    /// statements run as one `;`-joined string, which the connector sends as
+    /// one implicit transaction: a failure rolls the temporary table back
+    /// with everything else, and success drops it. There is no leading
+    /// `DROP`: with no temporary table of that name, `DROP TABLE IF EXISTS`
+    /// would resolve the name on the search path and could drop a permanent
+    /// table.
     fn merge_into(
         &self,
         target: &str,
@@ -725,22 +747,30 @@ impl SqlDialect for RedshiftDialect {
                     .join(", "),
             ));
         }
+        let tmp = Self::merge_temp_table(table);
+        let on = keys
+            .iter()
+            .map(|k| format!("{table}.{k} = {tmp}.{k}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let sets = cols
             .update
             .iter()
-            .map(|c| format!("{c} = {s}.{c}"))
+            .map(|c| format!("{c} = {tmp}.{c}"))
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "MERGE INTO {target}\n\
-             USING (\n{source_sql}\n) AS {s}\n\
+            "CREATE TEMP TABLE {tmp} AS\n{source_sql};\n\
+             MERGE INTO {target}\n\
+             USING {tmp}\n\
              ON {on}\n\
              WHEN MATCHED THEN UPDATE SET {sets}\n\
-             WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+             WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});\n\
+             DROP TABLE {tmp}",
             cols.insert.join(", "),
             cols.insert
                 .iter()
-                .map(|c| format!("{s}.{c}"))
+                .map(|c| format!("{tmp}.{c}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -762,8 +792,17 @@ impl SqlDialect for RedshiftDialect {
         watermark_where(timestamp_col, last_watermark)
     }
 
+    /// `svv_columns`, which the adapter's `describe_table` also reads:
+    /// `information_schema.columns` leaves out late-binding views and
+    /// external (Spectrum) tables.
     fn describe_table_sql(&self, table_ref: &str) -> String {
-        describe_sql(self, table_ref)
+        let (schema, table) = split_ref(table_ref);
+        format!(
+            "SELECT column_name, data_type, is_nullable FROM svv_columns \
+             WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+            rocky_core::sql_gen::string_literal(self, &schema.to_lowercase()),
+            rocky_core::sql_gen::string_literal(self, &table.to_lowercase()),
+        )
     }
 
     fn drop_table_sql(&self, table_ref: &str) -> String {
@@ -842,6 +881,20 @@ impl SqlDialect for RedshiftDialect {
 
     fn date_minus_days_expr(&self, days: u32) -> AdapterResult<String> {
         Ok(format!("DATEADD(day, -{days}, CURRENT_DATE)"))
+    }
+
+    /// `DATEADD(<unit>, -<n>, <expr>)`, Redshift's own date arithmetic,
+    /// rather than the default `<expr> - INTERVAL '<n>' <UNIT>`, whose
+    /// qualifier form is newer on Redshift than the `INTERVAL '<n> <unit>'`
+    /// literal.
+    fn subtract_interval_expr(&self, expr: &str, amount: u32, unit: &str) -> String {
+        format!("DATEADD({}, -{amount}, {expr})", unit.to_ascii_lowercase())
+    }
+
+    /// `INTERVAL '<n> <unit>'`, the interval literal form Redshift has
+    /// always documented.
+    fn interval_literal(&self, amount: u32, unit: &str) -> String {
+        format!("INTERVAL '{amount} {}'", unit.to_ascii_lowercase())
     }
 
     /// `GETDATE()` runs on compute nodes; `CURRENT_TIMESTAMP` / `NOW()` are
@@ -1059,12 +1112,35 @@ mod tests {
             .unwrap();
         assert_eq!(
             sql,
-            "MERGE INTO analytics.marts.fct\n\
-             USING (\nSELECT id, amount FROM s\n) AS rocky_src\n\
-             ON fct.id = rocky_src.id\n\
-             WHEN MATCHED THEN UPDATE SET amount = rocky_src.amount\n\
-             WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (rocky_src.id, rocky_src.amount)"
+            "CREATE TEMP TABLE rocky_merge_src AS\nSELECT id, amount FROM s;\n\
+             MERGE INTO analytics.marts.fct\n\
+             USING rocky_merge_src\n\
+             ON fct.id = rocky_merge_src.id\n\
+             WHEN MATCHED THEN UPDATE SET amount = rocky_merge_src.amount\n\
+             WHEN NOT MATCHED THEN INSERT (id, amount) \
+             VALUES (rocky_merge_src.id, rocky_merge_src.amount);\n\
+             DROP TABLE rocky_merge_src"
         );
+        // The MERGE statement carries no subquery and no WITH, whatever the
+        // model SQL holds: Redshift refuses both inside a MERGE.
+        let cte = RedshiftDialect::new()
+            .merge_into(
+                "m.fct",
+                "WITH x AS (SELECT 1 AS id, 2 AS amount) SELECT * FROM x \
+                 WHERE id > (SELECT MAX(id) FROM m.fct)",
+                &keys(&["id"]),
+                &explicit(&["id", "amount"]),
+            )
+            .unwrap();
+        let merge_stmt = cte
+            .split(";\n")
+            .find(|stmt| stmt.starts_with("MERGE"))
+            .unwrap();
+        assert!(
+            !merge_stmt.contains("WITH") && !merge_stmt.contains("SELECT"),
+            "{merge_stmt}"
+        );
+        assert!(!cte.contains("DROP TABLE IF EXISTS"), "{cte}");
         // Key-only: no MATCHED arm can be valid, so missing keys are inserted.
         let key_only = RedshiftDialect::new()
             .merge_into("m.t", "SELECT 1", &keys(&["id"]), &explicit(&["id"]))
@@ -1084,7 +1160,19 @@ mod tests {
             )
             .unwrap();
         assert!(
-            clash.contains("ON rocky_src.id = rocky_src_1.id"),
+            clash.contains("ON rocky_src.id = rocky_merge_src.id"),
+            "{clash}"
+        );
+        let clash = RedshiftDialect::new()
+            .merge_into(
+                "m.rocky_merge_src",
+                "SELECT 1",
+                &keys(&["id"]),
+                &explicit(&["id", "x"]),
+            )
+            .unwrap();
+        assert!(
+            clash.contains("ON rocky_merge_src.id = rocky_merge_src_1.id"),
             "{clash}"
         );
     }
@@ -1198,6 +1286,14 @@ mod tests {
             "DATEADD(day, -7, CURRENT_DATE)"
         );
         assert!(rs.row_hash_expr(&["id".into()]).is_err());
+        assert_eq!(
+            rs.subtract_interval_expr("MAX(ts)", 3, "HOUR"),
+            "DATEADD(hour, -3, MAX(ts))"
+        );
+        assert_eq!(rs.interval_literal(7, "DAY"), "INTERVAL '7 day'");
+        // MERGE (since 2023) is the upsert; there is no ON CONFLICT.
+        assert_eq!(rs.merge_unsupported_reason(), None);
+        assert!(rs.snapshot_unsupported_reason().is_some());
         let pg = PostgresDialect::new();
         assert_eq!(pg.current_timestamp_expr(), "CURRENT_TIMESTAMP");
         assert_eq!(
@@ -1303,6 +1399,15 @@ mod tests {
             "CREATE SCHEMA IF NOT EXISTS raw"
         );
         assert!(pg.create_catalog_sql("db").is_none());
+    }
+
+    #[test]
+    fn redshift_describe_reads_svv_columns() {
+        assert_eq!(
+            RedshiftDialect::new().describe_table_sql("db.Raw.Orders"),
+            "SELECT column_name, data_type, is_nullable FROM svv_columns \
+             WHERE table_schema = 'raw' AND table_name = 'orders' ORDER BY ordinal_position"
+        );
     }
 
     #[test]

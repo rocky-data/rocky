@@ -57,6 +57,7 @@ use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 use rocky_postgres::PostgresWarehouseAdapter;
 
 use rocky_clickhouse::ClickHouseWarehouseAdapter;
+use rocky_spark::SparkWarehouseAdapter;
 use rocky_sqlserver::SqlServerWarehouseAdapter;
 
 /// Adapter type strings recognised by [`AdapterRegistry::from_config`].
@@ -77,6 +78,7 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "redshift",
     "clickhouse",
     "sqlserver",
+    "spark",
     "fivetran",
     "airbyte",
     "iceberg",
@@ -105,8 +107,67 @@ pub fn warehouse_dialect_for_type(
         // SQL Server / Azure SQL rendering; `flavor = "fabric"` gets its
         // dialect from `sqlserver_dialect_for_config`.
         "sqlserver" => Some(&SQLSERVER_DIALECT),
+        // Delta rendering; `table_format = "iceberg"` gets its dialect from
+        // `spark_dialect_for_config`.
+        "spark" => Some(&SPARK_DIALECT),
         _ => None,
     }
+}
+
+static SPARK_DIALECT: rocky_spark::SparkDialect = rocky_spark::SparkDialect::const_default();
+
+/// `[adapter.<name>.extra] table_format` for a `spark` block: a dialect
+/// option, not a connection setting. Absent means Delta Lake.
+pub(crate) fn spark_table_format(
+    name: &str,
+    adapter_cfg: &AdapterConfig,
+) -> Result<rocky_spark::TableFormat> {
+    match adapter_cfg.extra.expose().get("table_format") {
+        None => Ok(rocky_spark::TableFormat::default()),
+        Some(serde_json::Value::String(s)) => {
+            rocky_spark::TableFormat::parse(s).map_err(|e| anyhow::anyhow!("adapters.{name}: {e}"))
+        }
+        Some(_) => bail!("adapters.{name}: extra.table_format must be a string"),
+    }
+}
+
+/// The Spark Connect settings an `[adapter]` block describes. Shared by the
+/// registry (which connects) and `rocky validate` (which only parses).
+pub(crate) fn spark_config(
+    name: &str,
+    adapter_cfg: &AdapterConfig,
+) -> Result<rocky_spark::SparkConfig> {
+    // `table_format` is a dialect option; `SparkConfig::apply_extra` refuses
+    // keys it does not know, so it is peeled off here.
+    let mut extra = adapter_cfg.extra.expose().clone();
+    extra.remove("table_format");
+    rocky_spark::SparkConfig::new(
+        adapter_cfg.host.expose_opt(),
+        adapter_cfg
+            .token
+            .as_ref()
+            .map(rocky_core::redacted::RedactedString::expose),
+        adapter_cfg.username.expose_opt(),
+        Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
+    )
+    .and_then(|cfg| cfg.apply_extra(&extra))
+    .with_context(|| format!("adapters.{name}: invalid spark configuration"))
+}
+
+/// The dialect a `spark` adapter block renders with, honouring its
+/// `extra.table_format`. `None` for any other adapter type, or when the
+/// format does not parse (the caller falls back to the default dialect;
+/// `rocky validate` and the registry report the error).
+pub(crate) fn spark_dialect_for_config(
+    adapter_cfg: &AdapterConfig,
+) -> Option<Box<dyn rocky_core::traits::SqlDialect>> {
+    if adapter_cfg.adapter_type != "spark" {
+        return None;
+    }
+    let format = spark_table_format("", adapter_cfg).unwrap_or_default();
+    Some(Box::new(rocky_spark::SparkDialect::with_table_format(
+        format,
+    )))
 }
 
 static SQLSERVER_DIALECT: rocky_sqlserver::SqlServerDialect =
@@ -746,6 +807,18 @@ impl AdapterRegistry {
                         .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
                     warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
                 }
+                "spark" => {
+                    // Shared slots: `host` (`host`, `host:port` or
+                    // `sc://host[:port]`), `token` (bearer; turns TLS on),
+                    // `username` (the Spark Connect user id),
+                    // `timeout_secs`. `[adapter.<name>.extra]` carries `port`,
+                    // `use_ssl` and `table_format`; unknown keys are refused.
+                    let format = spark_table_format(name, adapter_cfg)?;
+                    let cfg = spark_config(name, adapter_cfg)?;
+                    let adapter = SparkWarehouseAdapter::new(cfg, format)
+                        .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
+                    warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
+                }
                 "sqlserver" => {
                     // Shared slots: `host` (optionally `host,port`),
                     // `database`, and one auth method — `username` +
@@ -1254,6 +1327,53 @@ fn toml_table_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spark_adapter(extra: &str) -> RockyConfig {
+        toml::from_str(&format!(
+            "[adapter.sp]\ntype = \"spark\"\nhost = \"sc://localhost:15002\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_spark_block_registers_a_warehouse_without_connecting() {
+        let cfg = spark_adapter("");
+        let registry = AdapterRegistry::from_config(&cfg).expect("no connection at build");
+        let wh = registry.warehouse_adapter("sp").expect("registered");
+        assert_eq!(wh.dialect().name(), "spark");
+        assert!(KNOWN_ADAPTER_TYPES.contains(&"spark"));
+        assert_eq!(warehouse_dialect_for_type("spark").unwrap().name(), "spark");
+    }
+
+    #[test]
+    fn spark_table_format_selects_the_dialect_and_bad_extra_is_refused() {
+        let ice = spark_adapter("[adapter.sp.extra]\ntable_format = \"iceberg\"\n");
+        let a = &ice.adapters["sp"];
+        assert_eq!(
+            spark_table_format("sp", a).unwrap(),
+            rocky_spark::TableFormat::Iceberg
+        );
+        // `table_format` is peeled off before the connection parse.
+        spark_config("sp", a).expect("table_format is not a connection key");
+        let ddl = spark_dialect_for_config(a)
+            .unwrap()
+            .insert_overwrite_partition("c.s.t", "d = 1", "SELECT 1")
+            .unwrap();
+        assert_eq!(ddl.len(), 2, "iceberg time_interval is DELETE then INSERT");
+
+        let bad = spark_adapter("[adapter.sp.extra]\ntable_format = \"parquet\"\n");
+        assert!(spark_table_format("sp", &bad.adapters["sp"]).is_err());
+        let typo = spark_adapter("[adapter.sp.extra]\nuse_tls = true\n");
+        let err = spark_config("sp", &typo.adapters["sp"]).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown extra key"), "{err:#}");
+        assert!(spark_dialect_for_config(&cfg_for("duckdb")).is_none());
+    }
+
+    fn cfg_for(adapter_type: &str) -> AdapterConfig {
+        let cfg: RockyConfig =
+            toml::from_str(&format!("[adapter.x]\ntype = \"{adapter_type}\"\n")).unwrap();
+        cfg.adapters["x"].clone()
+    }
 
     #[test]
     fn missing_discovery_config_message_names_pipeline_path_and_toml_block() {

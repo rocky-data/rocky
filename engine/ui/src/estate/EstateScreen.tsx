@@ -8,9 +8,11 @@ import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
+import type { JobClient } from "../operator";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
+import { ProjectActions, planUnavailable } from "./ProjectActions";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
 import { SchedulePanel, SpoolCounts } from "./SchedulePanel";
@@ -60,11 +62,14 @@ export const COMPILE_RECHECK_MS = 5_000;
  */
 export function EstateScreen({
   loaders = defaultLoaders,
+  jobs,
   refreshMs = LEDGER_REFRESH_MS,
   recheckMs = COMPILE_RECHECK_MS,
   now,
 }: {
   loaders?: EstateLoaders;
+  /** Where Run and Plan submit their jobs. Tests hand in a fake. */
+  jobs?: JobClient;
   refreshMs?: number;
   recheckMs?: number;
   now?: number;
@@ -112,6 +117,8 @@ export function EstateScreen({
     if (selected !== null && shown === null) setSelected(null);
   }, [selected, shown]);
 
+  const planReason = planUnavailable(project.kind === "ready" ? project.value : null);
+
   const refreshAll = () => {
     project.reload();
     dag.reload();
@@ -126,6 +133,8 @@ export function EstateScreen({
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium uppercase tracking-wide text-zinc-500">Estate</h2>
+        <div className="flex items-start gap-3">
+          <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
         <button
           type="button"
           onClick={refreshAll}
@@ -133,6 +142,7 @@ export function EstateScreen({
         >
           Refresh
         </button>
+        </div>
       </div>
 
       <Panel title="Project" producer="GET /api/v1/project">
@@ -153,6 +163,14 @@ export function EstateScreen({
                   name={shown}
                   load={loaders.detail}
                   onClose={() => setSelected(null)}
+                  actions={
+                    <ProjectActions
+                      model={shown}
+                      jobs={jobs}
+                      onDone={refreshAll}
+                      planDisabledReason={planReason}
+                    />
+                  }
                 />
               )}
             </div>

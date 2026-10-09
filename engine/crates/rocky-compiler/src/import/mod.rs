@@ -2,6 +2,7 @@
 
 pub mod dbt;
 pub mod dbt_attach;
+pub mod dbt_contract;
 pub mod dbt_governance;
 pub mod dbt_macros;
 pub mod dbt_manifest;

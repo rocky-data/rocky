@@ -311,9 +311,11 @@ pub(crate) fn run_backfill_in(
     let extras = crate::commands::apply::ExecutionExtras::build(
         &crate::commands::apply::resolved_surrogate_keys(models_dir, &compiled.project.models)?,
         &compiled.project.models,
+        &compiled.contract_files,
         &resolved_mask,
     );
     let capabilities = EmbeddedCapabilities {
+        first_run_fills: Default::default(),
         diff_available: true,
         changed: ordered
             .iter()
@@ -324,6 +326,15 @@ pub(crate) fn run_backfill_in(
             &identity,
             &governance_identity,
             &exec_control_identity,
+            &extras,
+        ),
+        // The models alone, as `approval_scope::scope_models_only_fingerprint`
+        // hashes one unit: no identities, and the mask is already empty here.
+        models_only_fingerprint: crate::commands::apply::execution_ir_fingerprint(
+            &compiled.project.models,
+            "",
+            "",
+            "",
             &extras,
         ),
         config_identity,

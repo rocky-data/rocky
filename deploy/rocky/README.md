@@ -27,10 +27,10 @@ Three steps from this directory.
    ```bash
    docker compose up -d
    docker compose logs rocky | grep 'Rocky UI'
-   # Rocky UI: http://localhost:8080/ui/#token=...
+   # Rocky UI: http://localhost:8080/login?t=...
    ```
 
-Open that address. The token travels in the URL fragment, which never reaches the server; the page reads it once and clears it.
+Open that address. The server checks the token, sets a session cookie, and redirects to `/ui/`. A proxy in front may log the query of `/login`: configure it not to.
 
 ## What is in it
 

@@ -3,7 +3,25 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, conint
+
+
+class MetaTokenScope1(StrEnum):
+    """
+    Every route, mutating ones included.
+    """
+
+    full = "full"
+
+
+class MetaTokenScope2(StrEnum):
+    """
+    `GET`, `HEAD` and `OPTIONS` only.
+    """
+
+    read_only = "read_only"
 
 
 class MetaOutput(BaseModel):
@@ -36,4 +54,8 @@ class MetaOutput(BaseModel):
     state_schema_version: conint(ge=0)
     """
     Current state-store schema version, read from the engine's `current_schema_version()` getter at request time (never a literal).
+    """
+    token_scope: MetaTokenScope1 | MetaTokenScope2 | None = None
+    """
+    What the server's bearer token may do: `full` reaches every route, `read_only` only safe methods. `null` when no token is configured (a loopback server without `--ui`, which asks no request for one). The UI reads it to enable or disable its write controls. Never the secret.
     """
