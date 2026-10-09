@@ -343,7 +343,7 @@ pub struct EmbeddedCapabilities {
     /// The same fingerprint over the models and the masks they use: no
     /// config, governance or execution-control identity. The mask is the one
     /// `models_fingerprint` binds (resolved for the plan's `--env`, only where
-    /// the run applies masks). A person's apply compares this
+    /// the run applies masks). A person's apply and every approval compare this
     /// one, so a plan made in one shell and applied from another environment
     /// (or after an edit to an unrelated pipeline) is not refused as changed.
     /// An agent's apply still compares [`Self::models_fingerprint`]. `None`

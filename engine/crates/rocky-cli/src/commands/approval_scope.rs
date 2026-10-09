@@ -500,10 +500,11 @@ pub(crate) fn plan_scope_identities(
 /// environment, so a person's apply still refuses a `[mask]` strategy change
 /// for a tag the models use.
 ///
-/// A person's apply compares this one. The identities hash adapters and
-/// pipelines with their `${VAR}` values resolved, so the full fingerprint
-/// moves when the same plan is applied from another environment, such as a
-/// `rocky serve` job child, or after an edit to an unrelated pipeline.
+/// A person's apply, and every approval (#2326), compare this one. The
+/// identities hash adapters and pipelines with their `${VAR}` values
+/// resolved, so the full fingerprint moves when the same plan is applied or
+/// approved from another environment, such as a `rocky serve` job child, or
+/// after an edit to an unrelated pipeline.
 pub(crate) fn scope_models_only_fingerprint(
     scope: &ApprovalScope,
     compiled: &[CompiledUnit],

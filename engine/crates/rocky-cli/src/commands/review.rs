@@ -623,6 +623,24 @@ fn compile_approval_models(
 /// a previously disclosed DROP into an empty approval. For a `--dag` plan the
 /// snapshot holds every pipeline's models, so a model added, removed or
 /// changed in any pipeline's directory refuses the approval (#2239).
+///
+/// It compares the plan's **models-only** fingerprint (models, SQL, sidecars,
+/// contracts and the masks they use), as a person's `rocky apply` does
+/// (#2326). The full fingerprint also hashes adapters and pipelines with
+/// their `${VAR}` values resolved, so it moves when the same plan is approved
+/// from another environment, such as the browser UI's `rocky serve`, and a
+/// person could not approve a plan whose models had not changed.
+///
+/// The same holds for every kind that reaches this check, AI-authored and
+/// backfill plans included. What a person approves is what review disclosed
+/// (breaking-change findings and conditional DROPs), and both are computed
+/// from the models. The config those models run under is still bound where
+/// it matters: an agent-kind plan applies as an agent
+/// ([`PersistedPlan::enforcement_principal`]), and an agent's apply compares
+/// the full fingerprint ([`super::approval_scope::verify_plan_models_for_apply`]).
+///
+/// A plan written before the models-only fingerprint existed is compared on
+/// its full fingerprint, as before: stricter, never looser.
 fn verify_current_models_for_approval(
     plan: &PersistedPlan,
     run_plan: &RunPlan,
@@ -642,7 +660,14 @@ fn verify_current_models_for_approval(
     }
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
     let ids = super::approval_scope::plan_scope_identities(plan, scope, config.as_ref(), run_plan);
-    let actual = scope_fingerprint(scope, units, &ids.borrowed()).map_err(|_| stale())?;
+    let (actual, expected) = match capabilities.models_only_fingerprint.as_deref() {
+        Some(expected_models_only) => (
+            super::approval_scope::scope_models_only_fingerprint(scope, units, &ids.resolved_mask),
+            expected_models_only,
+        ),
+        None => (scope_fingerprint(scope, units, &ids.borrowed()), expected),
+    };
+    let actual = actual.map_err(|_| stale())?;
     if actual.as_deref() != Some(expected) {
         return Err(stale());
     }
@@ -2620,6 +2645,87 @@ mod tests {
         )
         .await?;
         assert!(approved.marker_written);
+        Ok(())
+    }
+
+    /// #2326: approval compares the models-only fingerprint. The plan is made
+    /// with one adapter value and approved with another, as when a plan made
+    /// in a shell is approved from the browser UI's `rocky serve`, where a
+    /// `${VAR}` resolves differently. No model changed, so the approval
+    /// passes. Before the fix it compared the full fingerprint, which hashes
+    /// the resolved adapter, and refused. A model edit still refuses.
+    ///
+    /// The plan is AI-authored on purpose: an agent-kind plan approved by a
+    /// person takes the same path.
+    #[tokio::test]
+    async fn approval_ignores_a_config_change_that_leaves_the_models_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, GLOB_CONFIG_2236)?;
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("models/a.toml"), sidecar("a"))?;
+
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "p", "models": ["a"]
+        }))?;
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_only_fingerprint.is_some());
+        let plan_id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let state = root.join("state.redb");
+        let approve = || {
+            compute_review_with_state_path(
+                root,
+                Path::new("rocky.toml"),
+                Some(&state),
+                &plan_id,
+                "HEAD",
+                true,
+            )
+        };
+
+        // The approving environment resolves the adapter differently.
+        let edited = GLOB_CONFIG_2236.replacen(
+            "database = \":memory:\"",
+            "database = \"elsewhere.duckdb\"",
+            1,
+        );
+        assert_ne!(edited, GLOB_CONFIG_2236, "the fixture must change");
+        std::fs::write(&config, edited)?;
+        let approved = approve()
+            .await
+            .expect("a config-only change must not refuse a person's approval");
+        assert!(approved.marker_written);
+
+        // A model edit still refuses, and writes no marker.
+        std::fs::remove_file(review_marker_path(root, &plan_id))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 2 AS id\n")?;
+        let err = approve().await.expect_err("a changed model must refuse");
+        assert!(
+            err.to_string()
+                .contains("the models changed since this plan was written"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            review_marker_state(root, &plan_id),
+            ReviewMarkerState::Absent
+        ));
         Ok(())
     }
 
