@@ -578,6 +578,7 @@ pub async fn plan(
                 plan_id,
                 persisted_at,
                 first_run_fills,
+                first_run_fills_unknown,
             }))) => {
                 if let Some(model) = run_plan.model.as_deref()
                     && let Some(shadow) = shadow_config_for_run_plan(state_path, &run_plan)?
@@ -645,6 +646,11 @@ pub async fn plan(
                 cost_preview
                     .notes
                     .extend(first_run_fill_notes(&output.first_run_fills));
+                if first_run_fills_unknown {
+                    cost_preview
+                        .notes
+                        .push(FIRST_RUN_FILLS_UNKNOWN_NOTE.to_string());
+                }
                 output.cost_preview = Some(cost_preview);
             }
             Ok(Some(RunPlanBuild::Refused(refused))) => {
@@ -1843,11 +1849,7 @@ fn build_and_persist_run_plan(
     };
 
     #[allow(clippy::type_complexity)]
-    let plan_id = (|| -> Result<(
-        String,
-        chrono::DateTime<Utc>,
-        Vec<rocky_core::plan_partition::FirstRunFillPreview>,
-    )> {
+    let plan_id = (|| -> Result<(String, chrono::DateTime<Utc>, FirstRunFillPreviews)> {
         let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
         // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
@@ -1905,12 +1907,16 @@ fn build_and_persist_run_plan(
         Ok((plan_id, Utc::now(), fill_previews))
     })()?;
     let (plan_id, persisted_at, fill_previews) = plan_id;
-    let fills = first_run_fills_for_output(&run_plan, fill_previews);
+    // A plan with a partition flag never fills, so unknown fills do not
+    // matter to its apply.
+    let first_run_fills_unknown = fill_previews.unknown && !names_partition_flag(&run_plan);
+    let fills = first_run_fills_for_output(&run_plan, fill_previews.previews);
     Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
         run_plan: Box::new(run_plan),
         plan_id,
         persisted_at,
         first_run_fills: fills,
+        first_run_fills_unknown,
     })))
 }
 
@@ -1921,13 +1927,7 @@ fn first_run_fills_for_output(
     run_plan: &RunPlan,
     previews: Vec<rocky_core::plan_partition::FirstRunFillPreview>,
 ) -> Vec<crate::output::PlanFirstRunFill> {
-    let partition_flag = run_plan.partition.is_some()
-        || run_plan.partition_from.is_some()
-        || run_plan.partition_to.is_some()
-        || run_plan.latest
-        || run_plan.missing
-        || run_plan.lookback.is_some();
-    if partition_flag {
+    if names_partition_flag(run_plan) {
         return Vec::new();
     }
     previews
@@ -1943,12 +1943,26 @@ fn first_run_fills_for_output(
         .collect()
 }
 
+/// `true` when the plan names a partition flag or `--lookback`: its apply
+/// never starts a first-run fill.
+fn names_partition_flag(run_plan: &RunPlan) -> bool {
+    run_plan.partition.is_some()
+        || run_plan.partition_from.is_some()
+        || run_plan.partition_to.is_some()
+        || run_plan.latest
+        || run_plan.missing
+        || run_plan.lookback.is_some()
+}
+
 /// A run plan `rocky plan` wrote, with what its output reports about it.
 struct PersistedRunPlan {
     run_plan: Box<RunPlan>,
     plan_id: String,
     persisted_at: chrono::DateTime<Utc>,
     first_run_fills: Vec<crate::output::PlanFirstRunFill>,
+    /// The state store could not be read, so the first-run fills are not
+    /// known and the plan records none.
+    first_run_fills_unknown: bool,
 }
 
 enum RunPlanBuild {
@@ -2039,10 +2053,7 @@ fn capabilities_and_fill_previews(
     // the plan was persisted with no surrogate key in its fingerprint at all —
     // and the comment below claimed the gate "must keep hashing the resolved
     // whole" while that call made it false.
-) -> anyhow::Result<(
-    EmbeddedCapabilities,
-    Vec<rocky_core::plan_partition::FirstRunFillPreview>,
-)> {
+) -> anyhow::Result<(EmbeddedCapabilities, FirstRunFillPreviews)> {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
 
     // Load the config first — reused for cached source schemas AND the routing
@@ -2120,7 +2131,7 @@ fn capabilities_and_fill_previews(
     };
 
     let Some(scope) = scope else {
-        return Ok((failed(config_identity), Vec::new())); // fail-closed: scope unresolved
+        return Ok((failed(config_identity), FirstRunFillPreviews::default())); // fail-closed: scope unresolved
     };
 
     let identity = config_identity.clone().unwrap_or_default();
@@ -2155,7 +2166,7 @@ fn capabilities_and_fill_previews(
     // A unit that does not compile (or a plain plan's absent directory) means
     // no fingerprint, so a review-gated apply refuses (fail-closed).
     let Ok(heads) = scope.compile(&source_schemas, super::approval_scope::NoModels::Error) else {
-        return Ok((failed(config_identity), Vec::new()));
+        return Ok((failed(config_identity), FirstRunFillPreviews::default()));
     };
     // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
     // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
@@ -2208,11 +2219,15 @@ fn capabilities_and_fill_previews(
         // review-gated apply then refuses it.
         Err(error) if scope.dag => {
             tracing::warn!(error = %format!("{error:#}"), "--dag plan carries no fingerprint");
-            return Ok((failed(config_identity), Vec::new()));
+            return Ok((failed(config_identity), FirstRunFillPreviews::default()));
         }
         Err(error) => return Err(error),
     };
     // The first-run fills this plan shows, over every model apply executes.
+    // The persisted set covers every model in scope, whatever `--model` or
+    // partition flag the plan names; `first_run_fills_for_output` filters
+    // only what `rocky plan` displays. A superset is safe: apply refuses
+    // only a fill missing from this set.
     let fill_previews = first_run_fill_previews(
         heads
             .iter()
@@ -2220,6 +2235,7 @@ fn capabilities_and_fill_previews(
         state_path,
     );
     let first_run_fills: std::collections::BTreeSet<String> = fill_previews
+        .previews
         .iter()
         .filter(|preview| preview.fills)
         .map(|preview| preview.model.clone())
@@ -2302,7 +2318,7 @@ fn capabilities_and_fill_previews(
 pub(crate) fn first_run_fill_previews<'a>(
     models: impl IntoIterator<Item = &'a rocky_core::models::Model>,
     state_path: Option<&Path>,
-) -> Vec<rocky_core::plan_partition::FirstRunFillPreview> {
+) -> FirstRunFillPreviews {
     let mut models = models
         .into_iter()
         .filter(|m| {
@@ -2316,14 +2332,14 @@ pub(crate) fn first_run_fill_previews<'a>(
         })
         .peekable();
     if models.peek().is_none() {
-        return Vec::new();
+        return FirstRunFillPreviews::default();
     }
     let temp_dir;
     let store = match state_path {
         Some(path) => rocky_core::state::StateStore::open_read_only_or_empty(path),
         None => {
             let Ok(dir) = tempfile::TempDir::new() else {
-                return Vec::new();
+                return FirstRunFillPreviews::unknown();
             };
             temp_dir = dir;
             rocky_core::state::StateStore::open(&temp_dir.path().join("state.redb"))
@@ -2331,15 +2347,44 @@ pub(crate) fn first_run_fill_previews<'a>(
     };
     let Ok(store) = store else {
         tracing::warn!("cannot read the state store; the plan reports no first-run fill");
-        return Vec::new();
+        return FirstRunFillPreviews::unknown();
     };
     let mut previews: Vec<_> = models
         .filter_map(|m| rocky_core::plan_partition::preview_first_run_fill(m, &store).ok()?)
         .collect();
     previews.sort_by(|a, b| a.model.cmp(&b.model));
     previews.dedup_by(|a, b| a.model == b.model);
-    previews
+    FirstRunFillPreviews {
+        previews,
+        unknown: false,
+    }
 }
+
+/// What [`first_run_fill_previews`] found.
+#[derive(Debug, Default)]
+pub(crate) struct FirstRunFillPreviews {
+    /// One preview per model whose next run fills, or would but is over the
+    /// limit, sorted by model.
+    pub previews: Vec<rocky_core::plan_partition::FirstRunFillPreview>,
+    /// `true` when the state store could not be read, so the fills are not
+    /// known and `previews` is empty.
+    pub unknown: bool,
+}
+
+impl FirstRunFillPreviews {
+    fn unknown() -> Self {
+        Self {
+            previews: Vec::new(),
+            unknown: true,
+        }
+    }
+}
+
+/// The plan note when the first-run fills could not be computed.
+const FIRST_RUN_FILLS_UNKNOWN_NOTE: &str = "the state store could not be read, so this plan \
+     could not compute first-run fills and records none. An agent's apply of it refuses any \
+     time_interval model whose first run would fill from first_partition. Plan again when the \
+     state store can be read";
 
 /// Build a canonical, sorted source-state snapshot from the discovered
 /// connectors. Used both at plan time (to build the `ReplicationPlan`
@@ -6117,5 +6162,36 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
             verdict.is_none(),
             "an unresolvable base ref must omit the verdict (no fabricated baseline)",
         );
+    }
+
+    /// A state store that cannot be read leaves the first-run fills unknown,
+    /// so `rocky plan` can say so, rather than reporting that nothing fills.
+    #[test]
+    fn unreadable_state_store_leaves_first_run_fills_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("m.sql"), "SELECT CURRENT_DATE AS d").unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"time_interval\"\ntime_column = \"d\"\n\
+             granularity = \"day\"\nfirst_partition = \"2026-01-01\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let model = rocky_core::models::load_model_pair(
+            &dir.path().join("m.sql"),
+            &dir.path().join("m.toml"),
+            None,
+        )
+        .unwrap();
+
+        let known = super::first_run_fill_previews([&model], None);
+        assert!(!known.unknown);
+        assert_eq!(known.previews.len(), 1, "a never-run model fills");
+
+        let garbage = dir.path().join("state.redb");
+        std::fs::write(&garbage, b"not a state store").unwrap();
+        let unknown = super::first_run_fill_previews([&model], Some(&garbage));
+        assert!(unknown.unknown);
+        assert!(unknown.previews.is_empty());
     }
 }
