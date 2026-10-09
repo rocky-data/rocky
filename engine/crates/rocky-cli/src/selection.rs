@@ -343,6 +343,49 @@ fn compute_ci_diff_state(
     Ok(state)
 }
 
+/// Read the `[selectors]` table from `rocky.toml`, only when a selector value
+/// uses the `selector:` method. A project without a config file has none.
+fn load_saved_selectors(
+    config_path: &Path,
+    args: &SelectionArgs,
+) -> Result<selector::SavedSelectors> {
+    let uses_saved = args
+        .select
+        .iter()
+        .chain(&args.exclude)
+        .any(|value| value.contains("selector:"));
+    if !uses_saved {
+        return Ok(selector::SavedSelectors::new());
+    }
+    let raw = match rocky_core::config::parse_rocky_config_raw(config_path) {
+        Ok(raw) => raw,
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => {
+            return Ok(selector::SavedSelectors::new());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to read [selectors] from {}",
+                config_path.display()
+            )));
+        }
+    };
+    let Some(table) = raw.get("selectors") else {
+        return Ok(selector::SavedSelectors::new());
+    };
+    let table = table
+        .as_table()
+        .context("[selectors] in rocky.toml must be a table of name = \"expression\"")?;
+    table
+        .iter()
+        .map(|(name, value)| {
+            let expression = value.as_str().with_context(|| {
+                format!("[selectors] {name} in rocky.toml must be a string expression")
+            })?;
+            Ok((name.clone(), expression.to_string()))
+        })
+        .collect()
+}
+
 /// Resolve the selection against an already-loaded project. Logs a warning
 /// for each criterion that matches nothing, and a dbt-style "Nothing to do"
 /// warning when the final selection is empty.
@@ -352,8 +395,9 @@ pub fn resolve(
     models_dir: &Path,
     ctx: &StateContext<'_>,
 ) -> Result<BTreeSet<String>> {
-    let select = selector::parse(&args.select)?;
-    let exclude = selector::parse(&args.exclude)?;
+    let saved = load_saved_selectors(ctx.config_path, args)?;
+    let select = selector::parse_with(&args.select, &saved)?;
+    let exclude = selector::parse_with(&args.exclude, &saved)?;
     let state = if select.uses_state() || exclude.uses_state() {
         let state_ref = args.state_ref.as_deref().unwrap_or(DEFAULT_STATE_REF);
         Some(compute_state(
@@ -584,5 +628,54 @@ mod tests {
         };
         let got = resolve_buildable_in_dir(&args, dir.path(), None, &ctx(dir.path())).unwrap();
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["m".to_string()]);
+    }
+
+    /// `selector:<name>` reads the `[selectors]` table of the config file.
+    #[test]
+    fn saved_selector_expands_from_rocky_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        write_var_project(dir.path());
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[selectors]\ndownstream = \"base+\"\nonly_m = \"selector:downstream,m\"\n",
+        )
+        .unwrap();
+        let ctx = StateContext {
+            config_path: &config,
+            state_path: dir.path(),
+            cache_ttl_override: None,
+        };
+        let run = |select: &str| {
+            let args = SelectionArgs {
+                select: vec![select.into()],
+                ..Default::default()
+            };
+            resolve_in_dir(&args, dir.path(), None, &ctx)
+                .map(|s| s.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(run("selector:downstream").unwrap(), vec!["base", "m"]);
+        assert_eq!(run("selector:only_m").unwrap(), vec!["m"]);
+        assert_eq!(run("+selector:only_m").unwrap(), vec!["base", "m"]);
+        let err = run("selector:missing").unwrap_err();
+        assert!(format!("{err:#}").contains("unknown saved selector"), "{err:#}");
+    }
+
+    #[test]
+    fn saved_selector_without_a_config_file_is_an_unknown_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        write_var_project(dir.path());
+        let args = SelectionArgs {
+            select: vec!["selector:nightly".into()],
+            ..Default::default()
+        };
+        let missing = dir.path().join("absent.toml");
+        let ctx = StateContext {
+            config_path: &missing,
+            state_path: dir.path(),
+            cache_ttl_override: None,
+        };
+        let err = resolve_in_dir(&args, dir.path(), None, &ctx).unwrap_err();
+        assert!(format!("{err:#}").contains("[selectors]"), "{err:#}");
     }
 }

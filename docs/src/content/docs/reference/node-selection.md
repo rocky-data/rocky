@@ -93,6 +93,7 @@ A method has the form `method:value`. The value accepts globs. See dbt's [node s
 | `config.catalog:<catalog>` | write to this target catalog. `config.database` is an alias. |
 | `config.table:<table>` | write to this target table. `config.alias` is an alias. |
 | `source:<relation>` | read this external table. `source:raw` matches `raw.orders`. `source:raw.orders` matches `raw.orders` and `warehouse.raw.orders`. |
+| `selector:<name>` | match the saved selector `<name>`. See [Saved selectors](#saved-selectors). |
 | `state:modified` | changed since `--state-ref`. New models are included, as in dbt. |
 | `state:new` | do not exist at `--state-ref`. |
 
@@ -114,6 +115,26 @@ Both `tag:finance` and `tag:domain=finance` select this model. `tag:tier` select
 ```sh
 rocky list --select state:modified+ --state-ref origin/main
 ```
+
+## Saved selectors
+
+Name an expression you use often in the `[selectors]` table of `rocky.toml`:
+
+```toml
+[selectors]
+nightly = "tag:nightly+ config.materialized:incremental"
+finance = "path:marts/finance,tag:certified"
+finance_nightly = "selector:finance,selector:nightly"
+```
+
+Then pass `selector:<name>` to `--select` or `--exclude` on any command that takes them:
+
+```bash
+rocky run --select selector:nightly
+rocky list models --select "+selector:finance" --exclude selector:nightly
+```
+
+A saved selector uses the same syntax as `--select`. It may hold graph operators, `state:` and other `selector:` terms. Graph operators outside it apply to its result (`+selector:finance`). Space-separated terms inside it union, and the comma intersects, with the saved expression kept as one unit. An unknown name, an empty expression, or saved selectors that refer to each other in a loop is an error.
 
 ## Rules and errors
 

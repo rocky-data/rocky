@@ -14,6 +14,9 @@
 //!   <https://docs.getdbt.com/reference/node-selection/set-operators>
 //! - Methods (`tag:`, `path:`, `config.`, `state:`, `source:`, ...):
 //!   <https://docs.getdbt.com/reference/node-selection/methods>
+//! - Saved selectors: `selector:<name>` expands an entry of the `[selectors]`
+//!   table in `rocky.toml` (name to expression), as dbt's `selector:` method
+//!   expands `selectors.yml`. It takes graph operators like any other method.
 //!
 //! ```text
 //! values   := value ( value )*        each `--select` value; values union
@@ -45,7 +48,7 @@ pub enum SelectorError {
     /// The selector names a method Rocky does not support.
     #[error(
         "unknown selector method '{method}' in '{selector}'; supported methods: \
-         name, tag, path, file, config.<key>, state, source"
+         name, tag, path, file, config.<key>, state, source, selector"
     )]
     UnknownMethod { selector: String, method: String },
     /// `config.<key>` names a key Rocky cannot select on.
@@ -61,6 +64,17 @@ pub enum SelectorError {
     /// A `state:` selector was used but the caller provided no state.
     #[error("selector '{selector}' needs change state, but none was provided")]
     StateUnavailable { selector: String },
+    /// `selector:<name>` names an entry that `[selectors]` does not define.
+    #[error("unknown saved selector '{name}' in '{selector}'; {known}")]
+    UnknownSavedSelector {
+        selector: String,
+        name: String,
+        /// Human-readable list of the defined names, or a hint to add the table.
+        known: String,
+    },
+    /// Saved selectors refer to each other in a loop.
+    #[error("saved selectors refer to each other in a loop: {chain}")]
+    SavedSelectorCycle { chain: String },
 }
 
 /// One model as seen by the selector.
@@ -220,7 +234,14 @@ pub enum Method {
     State(StateKind),
     /// External relation read by the model (glob, segment-aligned).
     Source(String),
+    /// `selector:<name>`: a saved selector from the `[selectors]` table,
+    /// already parsed. Holds the name and its expression.
+    Saved(String, Box<Selector>),
 }
+
+/// Saved selectors (`[selectors]` in `rocky.toml`): name to selector
+/// expression, in the `--select` grammar.
+pub type SavedSelectors = BTreeMap<String, String>;
 
 /// One selector atom: a method with optional graph operators.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +288,8 @@ impl Method {
             Self::Name(p) | Self::Tag(p) | Self::Path(p) | Self::File(p) | Self::Source(p) => {
                 !p.contains(['*', '?', '['])
             }
-            Self::Config(..) | Self::State(_) => false,
+            // Whatever the saved selector names is reported by its own atoms.
+            Self::Config(..) | Self::State(_) | Self::Saved(..) => false,
         }
     }
 }
@@ -294,6 +316,20 @@ pub fn strategy_kind(strategy: &StrategyConfig) -> &'static str {
 /// Parse `--select` / `--exclude` values. Each value may itself hold several
 /// space-separated terms (`--select "a b"` = `--select a --select b`).
 pub fn parse(values: &[String]) -> Result<Selector, SelectorError> {
+    parse_with(values, &SavedSelectors::new())
+}
+
+/// [`parse`], with `selector:<name>` resolved against `saved`. A saved
+/// selector may use another one; a loop is an error.
+pub fn parse_with(values: &[String], saved: &SavedSelectors) -> Result<Selector, SelectorError> {
+    parse_in(values, saved, &mut Vec::new())
+}
+
+fn parse_in(
+    values: &[String],
+    saved: &SavedSelectors,
+    stack: &mut Vec<String>,
+) -> Result<Selector, SelectorError> {
     let mut terms = Vec::new();
     for value in values {
         for term in value.split_whitespace() {
@@ -305,7 +341,7 @@ pub fn parse(values: &[String]) -> Result<Selector, SelectorError> {
                         reason: "empty selector between commas".to_string(),
                     });
                 }
-                atoms.push(parse_atom(raw)?);
+                atoms.push(parse_atom(raw, saved, stack)?);
             }
             terms.push(atoms);
         }
@@ -331,7 +367,11 @@ fn parse_depth(raw: &str, digits: &str) -> Result<Option<u32>, SelectorError> {
     }
 }
 
-fn parse_atom(raw: &str) -> Result<Atom, SelectorError> {
+fn parse_atom(
+    raw: &str,
+    saved: &SavedSelectors,
+    stack: &mut Vec<String>,
+) -> Result<Atom, SelectorError> {
     let mut rest = raw;
     let mut at = false;
     let mut parents = None;
@@ -371,7 +411,7 @@ fn parse_atom(raw: &str) -> Result<Atom, SelectorError> {
         return Err(syntax(raw, "unexpected '+' or '@' inside the selector"));
     }
 
-    let method = parse_method(raw, rest)?;
+    let method = parse_method(raw, rest, saved, stack)?;
     Ok(Atom {
         raw: raw.to_string(),
         method,
@@ -381,7 +421,12 @@ fn parse_atom(raw: &str) -> Result<Atom, SelectorError> {
     })
 }
 
-fn parse_method(raw: &str, criteria: &str) -> Result<Method, SelectorError> {
+fn parse_method(
+    raw: &str,
+    criteria: &str,
+    saved: &SavedSelectors,
+    stack: &mut Vec<String>,
+) -> Result<Method, SelectorError> {
     let Some((name, value)) = criteria.split_once(':') else {
         // dbt's inference: a value with a separator is a path; a bare file
         // name (`stg_orders.sql`) is the `file` method; anything else is a
@@ -421,6 +466,7 @@ fn parse_method(raw: &str, criteria: &str) -> Result<Method, SelectorError> {
         "path" => Ok(Method::Path(value)),
         "file" => Ok(Method::File(value)),
         "source" => Ok(Method::Source(value.to_ascii_lowercase())),
+        "selector" => parse_saved(raw, &value, saved, stack),
         "state" => match value.as_str() {
             "modified" => Ok(Method::State(StateKind::Modified)),
             "new" => Ok(Method::State(StateKind::New)),
@@ -435,14 +481,54 @@ fn parse_method(raw: &str, criteria: &str) -> Result<Method, SelectorError> {
     }
 }
 
+/// Expand `selector:<name>` into the parsed saved expression.
+fn parse_saved(
+    raw: &str,
+    name: &str,
+    saved: &SavedSelectors,
+    stack: &mut Vec<String>,
+) -> Result<Method, SelectorError> {
+    if stack.iter().any(|n| n == name) {
+        let mut chain = stack.clone();
+        chain.push(name.to_string());
+        return Err(SelectorError::SavedSelectorCycle {
+            chain: chain.join(" -> "),
+        });
+    }
+    let Some(expression) = saved.get(name) else {
+        let known = if saved.is_empty() {
+            "add a `[selectors]` table to rocky.toml".to_string()
+        } else {
+            format!(
+                "defined: {}",
+                saved.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        return Err(SelectorError::UnknownSavedSelector {
+            selector: raw.to_string(),
+            name: name.to_string(),
+            known,
+        });
+    };
+    stack.push(name.to_string());
+    let parsed = parse_in(std::slice::from_ref(expression), saved, stack);
+    stack.pop();
+    let parsed = parsed?;
+    if parsed.is_empty() {
+        return Err(syntax(raw, &format!("saved selector '{name}' is empty")));
+    }
+    Ok(Method::Saved(name.to_string(), Box::new(parsed)))
+}
+
 impl Selector {
     /// Whether any atom uses the `state:` method, so the caller knows to
     /// compute [`StateSets`].
     pub fn uses_state(&self) -> bool {
-        self.terms
-            .iter()
-            .flatten()
-            .any(|a| matches!(a.method, Method::State(_)))
+        self.terms.iter().flatten().any(|a| match &a.method {
+            Method::State(_) => true,
+            Method::Saved(_, inner) => inner.uses_state(),
+            _ => false,
+        })
     }
 
     /// Whether the selector has no terms.
@@ -461,7 +547,15 @@ impl Selector {
         for term in &self.terms {
             let mut acc: Option<BTreeSet<String>> = None;
             for atom in term {
-                let matched = match_method(atom, graph, state)?;
+                let matched = match &atom.method {
+                    Method::Saved(_, inner) => {
+                        let nested = inner.resolve(graph, state)?;
+                        out.unmatched.extend(nested.unmatched);
+                        out.unmatched_named.extend(nested.unmatched_named);
+                        nested.selected
+                    }
+                    _ => match_method(atom, graph, state)?,
+                };
                 if matched.is_empty() {
                     out.unmatched.push(atom.raw.clone());
                     if atom.method.names_project_entity() {
@@ -563,7 +657,8 @@ fn node_matches(method: &Method, node: &SelectorNode) -> bool {
             ConfigKey::Table => glob_match(p, &node.table),
         },
         Method::Source(p) => node.sources.iter().any(|s| source_matches(p, s)),
-        Method::State(_) => false,
+        // Resolved by `Selector::resolve` before it gets here.
+        Method::State(_) | Method::Saved(..) => false,
     }
 }
 
@@ -667,6 +762,10 @@ pub fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_atom(raw: &str) -> Result<Atom, SelectorError> {
+        super::parse_atom(raw, &SavedSelectors::new(), &mut Vec::new())
+    }
 
     fn node(name: &str, deps: &[&str]) -> SelectorNode {
         SelectorNode {
@@ -973,5 +1072,73 @@ mod tests {
         let g = SelectorGraph::new(vec![node("p", &["q", "p"]), node("q", &["p"])]);
         assert_eq!(sel(&g, "+p"), names(&["p", "q"]));
         assert_eq!(sel(&g, "@q"), names(&["p", "q"]));
+    }
+
+    fn saved(pairs: &[(&str, &str)]) -> SavedSelectors {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn sel_saved(graph: &SelectorGraph, defs: &SavedSelectors, s: &str) -> Vec<String> {
+        parse_with(&[s.to_string()], defs)
+            .unwrap()
+            .resolve(graph, None)
+            .unwrap()
+            .selected
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn saved_selector_expands_with_its_own_union_and_intersection() {
+        let defs = saved(&[("tail", "d e"), ("lower", "b,c"), ("wide", "selector:tail x")]);
+        let g = diamond();
+        assert_eq!(sel_saved(&g, &defs, "selector:tail"), names(&["d", "e"]));
+        // The saved union binds as a unit: `d e` intersected with `e`.
+        assert_eq!(sel_saved(&g, &defs, "selector:tail,e"), names(&["e"]));
+        assert_eq!(sel_saved(&g, &defs, "selector:wide"), names(&["d", "e", "x"]));
+    }
+
+    #[test]
+    fn saved_selector_takes_graph_operators() {
+        let defs = saved(&[("mid", "d")]);
+        let g = diamond();
+        assert_eq!(
+            sel_saved(&g, &defs, "+selector:mid"),
+            names(&["a", "b", "c", "d"])
+        );
+        assert_eq!(sel_saved(&g, &defs, "selector:mid+1"), names(&["d", "e"]));
+    }
+
+    #[test]
+    fn saved_selector_errors_are_named() {
+        let g = diamond();
+        let none = parse(&["selector:nightly".to_string()]).unwrap_err();
+        assert!(matches!(none, SelectorError::UnknownSavedSelector { .. }));
+        assert!(none.to_string().contains("[selectors]"));
+        let defs = saved(&[("a", "selector:b"), ("b", "selector:a"), ("e", "")]);
+        let cycle = parse_with(&["selector:a".to_string()], &defs).unwrap_err();
+        assert!(matches!(cycle, SelectorError::SavedSelectorCycle { .. }), "{cycle}");
+        assert!(cycle.to_string().contains("a -> b -> a"));
+        assert!(parse_with(&["selector:e".to_string()], &defs).is_err());
+        let _ = g;
+    }
+
+    #[test]
+    fn saved_selector_state_use_and_unmatched_names_propagate() {
+        let defs = saved(&[("changed", "state:modified"), ("typo", "does_not_exist")]);
+        let g = diamond();
+        assert!(
+            parse_with(&["selector:changed".to_string()], &defs)
+                .unwrap()
+                .uses_state()
+        );
+        let r = parse_with(&["selector:typo".to_string()], &defs)
+            .unwrap()
+            .resolve(&g, None)
+            .unwrap();
+        assert_eq!(r.unmatched_named, ["does_not_exist"]);
     }
 }

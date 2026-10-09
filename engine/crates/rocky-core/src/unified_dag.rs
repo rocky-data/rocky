@@ -2259,6 +2259,7 @@ mod tests {
             freshness: Default::default(),
             imports: Default::default(),
             run: Default::default(),
+            selectors: Default::default(),
             reuse: Default::default(),
             gc: Default::default(),
             policy: None,
