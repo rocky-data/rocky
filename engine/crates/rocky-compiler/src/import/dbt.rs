@@ -229,8 +229,13 @@ pub enum ImportDbtStructuredWarning {
         model: String,
         /// Number of columns whose `data_type` has no Rocky type name.
         typed_columns: usize,
-        /// Number of constraints other than `not_null` and `primary_key`.
+        /// Number of constraints Rocky does not check, other than
+        /// `not_null` and `primary_key`.
         constraints: usize,
+        /// Number of `not_null` and `primary_key` constraints. The contract
+        /// does not check them: Rocky cannot prove a column NOT NULL from the
+        /// sources, so `nullable = false` would refuse a valid model.
+        not_null_constraints: usize,
         /// Path (relative to the emitted repo) of the generated contract.
         contract_path: String,
     },
@@ -405,6 +410,7 @@ pub fn import_from_manifest(
             &manifest.successfully_compiled_nodes,
             &model_relations,
             &manifest.groups,
+            manifest.metadata.adapter_type.as_deref(),
             &mut result,
         );
     }
@@ -1070,6 +1076,7 @@ fn import_manifest_node(
     successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
     groups: &std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
+    adapter: Option<&str>,
     result: &mut ImportResult,
 ) {
     // A snapshot node converts to a `type = "snapshot"` model, or fails with
@@ -1282,7 +1289,7 @@ fn import_manifest_node(
     // Surface a dropped model contract (`contract: { enforced: true }` +
     // column data_type/constraints). Rocky enforces contracts via a sidecar
     // the importer doesn't generate — point the user at where to author it.
-    let contract_toml = collect_contract(node, &rocky_name, result);
+    let contract_toml = collect_contract(node, &rocky_name, adapter, result);
 
     // Detect unresolvable Jinja macros that survived `dbt compile`. dbt's
     // compile step inlines in-tree macros, so anything still present
@@ -1928,11 +1935,15 @@ fn collect_dropped_config_warnings(
 fn collect_contract(
     node: &DbtManifestNode,
     rocky_name: &str,
+    adapter: Option<&str>,
     result: &mut ImportResult,
 ) -> Option<String> {
-    let contract = super::dbt_contract::contract_from_node(node)?;
+    let contract = super::dbt_contract::contract_from_node(node, adapter)?;
     let contract_path = format!("models/{rocky_name}.contract.toml");
-    if contract.untyped_columns > 0 || contract.unmapped_constraints > 0 {
+    if contract.untyped_columns > 0
+        || contract.unmapped_constraints > 0
+        || contract.not_null_constraints > 0
+    {
         result.contracts_dropped += 1;
         result
             .structured_warnings
@@ -1940,6 +1951,7 @@ fn collect_contract(
                 model: node.name.clone(),
                 typed_columns: contract.untyped_columns,
                 constraints: contract.unmapped_constraints,
+                not_null_constraints: contract.not_null_constraints,
                 contract_path: contract_path.clone(),
             });
         result.warnings.push(ImportWarning {
@@ -1947,11 +1959,14 @@ fn collect_contract(
             category: WarningCategory::DroppedContract,
             message: format!(
                 "{contract_path} was generated from the enforced dbt contract, but {} column type(s) \
-                 have no Rocky type name and {} constraint(s) (`unique`, `check`, ...) are not checked",
-                contract.untyped_columns, contract.unmapped_constraints
+                 are not checked (no Rocky type for them on this warehouse), {} `not_null` or \
+                 `primary_key` constraint(s) are not checked (Rocky cannot prove NOT NULL from the \
+                 sources), and {} other constraint(s) (`unique`, `check`, ...) are not checked",
+                contract.untyped_columns, contract.not_null_constraints, contract.unmapped_constraints
             ),
             suggestion: Some(format!(
-                "review {contract_path}; check the unchecked rules with a data test or a `[[checks]]` block"
+                "review {contract_path}; check the unchecked rules with a data test (a `not_null` \
+                 test for a not_null constraint) or a `[[checks]]` block"
             )),
         });
     }
@@ -4853,7 +4868,11 @@ WHERE e.id > 0
             .contract_toml
             .as_deref()
             .expect("an enforced contract generates a contract file");
-        assert!(toml.contains("name = \"id\"\ntype = \"Int64\"\nnullable = false"));
+        assert!(toml.contains("name = \"id\"\ntype = \"Int64\"\n"));
+        assert!(
+            !toml.contains("nullable = false"),
+            "a not_null constraint must not become an E012 check: {toml}"
+        );
         assert!(toml.contains("required = [\"email\", \"id\", \"loc\"]"));
         assert_eq!(
             result.contracts_dropped, 1,
@@ -4873,14 +4892,21 @@ WHERE e.id > 0
                 ImportDbtStructuredWarning::DroppedContract {
                     typed_columns,
                     constraints,
+                    not_null_constraints,
                     contract_path,
                     ..
-                } => Some((*typed_columns, *constraints, contract_path.clone())),
+                } => Some((
+                    *typed_columns,
+                    *constraints,
+                    contract_path.clone(),
+                    *not_null_constraints,
+                )),
                 _ => None,
             })
             .expect("must emit a DroppedContract structured warning");
         assert_eq!(structured.0, 1, "one column type has no Rocky name");
         assert_eq!(structured.1, 1, "one constraint is not checked");
+        assert_eq!(structured.3, 2, "not_null and primary_key are not checked");
         assert!(
             structured.2.contains("dim_customer.contract.toml"),
             "warning must point at the contract sidecar path: {}",

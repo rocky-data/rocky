@@ -386,11 +386,13 @@ fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructur
             model,
             typed_columns,
             constraints,
+            not_null_constraints,
             contract_path,
         } => ImportDbtStructuredWarning::DroppedContract {
             model: model.clone(),
             typed_columns: *typed_columns,
             constraints: *constraints,
+            not_null_constraints: *not_null_constraints,
             contract_path: contract_path.clone(),
         },
     }

@@ -68,6 +68,7 @@ export type ImportDbtStructuredWarning =
       contract_path: string;
       kind: "dropped_contract";
       model: string;
+      not_null_constraints: number;
       typed_columns: number;
       [k: string]: unknown;
     };

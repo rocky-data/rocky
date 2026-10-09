@@ -190,13 +190,14 @@ class Kind40(StrEnum):
 
 class ImportDbtStructuredWarning9(BaseModel):
     """
-    A dbt model `contract` (`enforced: true`) was written to `{model}.contract.toml`, but part of it has no Rocky check: a column `data_type` Rocky has no name for, or a constraint other than `not_null` and `primary_key`. Review the generated file.
+    A dbt model `contract` (`enforced: true`) was written to `{model}.contract.toml`, but part of it has no Rocky check. `typed_columns` counts columns whose `data_type` is left unchecked (no Rocky type for it on the manifest's warehouse). `not_null_constraints` counts `not_null` and `primary_key` constraints, which are not checked because Rocky cannot prove a column NOT NULL from the sources. `constraints` counts the others (`unique`, `check`, ...). Review the generated file.
     """
 
     constraints: conint(ge=0)
     contract_path: str
     kind: Kind40
     model: str
+    not_null_constraints: conint(ge=0)
     typed_columns: conint(ge=0)
 
 

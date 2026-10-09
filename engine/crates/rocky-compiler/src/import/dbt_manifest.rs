@@ -126,6 +126,9 @@ pub struct DbtManifestMetadata {
     pub dbt_version: String,
     pub generated_at: String,
     pub project_name: String,
+    /// The dbt adapter the manifest was compiled for (`snowflake`,
+    /// `postgres`, ...), from `metadata.adapter_type`. `None` when absent.
+    pub adapter_type: Option<String>,
 }
 
 /// A model/test/seed node in the manifest.
@@ -375,6 +378,8 @@ struct RawMetadata {
     project_name: Option<String>,
     #[serde(default)]
     invocation_id: Option<String>,
+    #[serde(default)]
+    adapter_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +640,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         dbt_version: raw.metadata.dbt_version.unwrap_or_default(),
         generated_at: raw.metadata.generated_at.unwrap_or_default(),
         project_name: raw.metadata.project_name.unwrap_or_default(),
+        adapter_type: raw.metadata.adapter_type.filter(|a| !a.trim().is_empty()),
     };
 
     let dropped = DbtDroppedCounts {
