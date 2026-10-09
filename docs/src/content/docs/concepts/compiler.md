@@ -182,18 +182,19 @@ To fail the compile on the warnings, run
 
 #### Unknown functions
 
-Rocky reports `E045` when a model calls a function that the target warehouse
+Rocky reports `E057` when a model calls a function that the target warehouse
 does not have and that the project does not declare in `functions/`:
 
 ```sql
--- E045: function `SUMM` does not exist in DuckDB and is not a project function in `functions/`
+-- E057: function `SUMM` does not exist in DuckDB and is not a project function in `functions/`
 SELECT customer_id, SUMM(amount) AS lifetime_value FROM fct_orders GROUP BY customer_id
 ```
 
 The message suggests close names (`did you mean sum?`). The check runs only for
 models that run on DuckDB, because only DuckDB has a complete function list in
 Rocky. The list holds DuckDB's built-in functions and the functions its
-extensions load on first use. Other warehouses are not checked.
+extensions load on first use. Other warehouses are not checked, and neither is
+a project whose `[portability] target_dialect` names another warehouse.
 
 These calls are never reported:
 
@@ -461,7 +462,7 @@ span, and sometimes a suggested fix.
 | `E039` | A model reads a column absent from a complete in-project upstream model. See [The type system](#the-type-system) |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
-| `E045` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB only). See [Unknown functions](#unknown-functions) |
+| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB only). See [Unknown functions](#unknown-functions) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |

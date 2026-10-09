@@ -1,4 +1,4 @@
-//! Calls to functions the target warehouse does not have (E045).
+//! Calls to functions the target warehouse does not have (E057).
 //!
 //! `SUMM(amount)` parses and type-checks as an unknown function returning
 //! `Unknown`, so it used to compile clean and fail at run time. This pass
@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 use sqlparser::ast::{self, Expr, Spanned, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E045, SourceSpan};
+use crate::diagnostic::{Diagnostic, E057, SourceSpan};
 use crate::operand_check::{OperandDialect, OperandTarget};
 use crate::udf::FunctionRegistry;
 
@@ -91,7 +91,7 @@ fn duckdb_knows(lower_name: &str) -> bool {
     DUCKDB_FUNCTIONS.contains(lower_name) || DUCKDB_SPECIAL_FORMS.contains(&lower_name)
 }
 
-/// Report calls to functions the target dialect does not have (E045).
+/// Report calls to functions the target dialect does not have (E057).
 ///
 /// `target_for` maps a model name to the warehouses it runs on, as for the
 /// operand checks. Only DuckDB targets are checked; see the module docs.
@@ -147,7 +147,7 @@ fn check_model(model: &rocky_core::models::Model, registry: &FunctionRegistry) -
         };
         diagnostics.push(
             Diagnostic::error(
-                E045,
+                E057,
                 &model.config.name,
                 format!(
                     "function `{name}` does not exist in DuckDB and is not a project function \
@@ -306,7 +306,7 @@ mod tests {
             &FunctionRegistry::default(),
         );
         assert_eq!(diags.len(), 1, "{diags:?}");
-        assert_eq!(&*diags[0].code, "E045");
+        assert_eq!(&*diags[0].code, "E057");
         assert!(diags[0].is_error());
         assert!(diags[0].message.contains("`SUMM`"), "{diags:?}");
         let suggestion = diags[0].suggestion.as_deref().unwrap();

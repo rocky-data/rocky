@@ -197,8 +197,9 @@ pub const E044: &str = "E044";
 /// Emitted by `rocky compile` from [`crate::function_check`] only for models
 /// that run on DuckDB, the one dialect with a complete function list here.
 /// Schema-qualified calls (`main.my_macro(x)`) and quoted names are not
-/// checked.
-pub const E045: &str = "E045";
+/// checked, nor is a project whose `[portability] target_dialect` names
+/// another warehouse.
+pub const E057: &str = "E057";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
