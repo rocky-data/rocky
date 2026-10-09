@@ -154,7 +154,9 @@ fn contract_type_name(data_type: &str, adapter: Option<&str>) -> Option<String> 
 ///   32-bit on DuckDB, Databricks and Spark. On BigQuery, PostgreSQL and
 ///   Redshift Rocky reads the landed column as `Float64`. On Snowflake it
 ///   reads the landed `FLOAT` as `Float32`, so neither type would be right:
-///   unchecked.
+///   unchecked. Snowflake lands every floating-point name (`double`,
+///   `double precision`, `real`, `float4`, `float8`) as that same `FLOAT`,
+///   so they are unchecked there too.
 /// - A bare `timestamp` is a timestamp Rocky reads as `Timestamp` on DuckDB,
 ///   PostgreSQL, Redshift, BigQuery, Databricks and Spark. On Snowflake it is
 ///   `TIMESTAMP_NTZ` by default, which Rocky reads as `TimestampNtz`, while
@@ -165,6 +167,11 @@ fn adapter_type_name(normalized: &str, adapter: Option<&str>) -> Option<Option<&
     let adapter = adapter.map(str::to_ascii_lowercase);
     let adapter = adapter.as_deref();
     match normalized {
+        "double" | "double precision" | "real" | "float4" | "float8"
+            if adapter == Some("snowflake") =>
+        {
+            Some(None)
+        }
         "float" => Some(match adapter {
             Some("bigquery" | "postgres" | "redshift") => Some("Float64"),
             Some("duckdb" | "databricks" | "spark") => Some("Float32"),
@@ -327,12 +334,15 @@ mod tests {
             assert_eq!(n, s("Int32"));
             assert_eq!(untyped, 0);
         }
-        // Snowflake: FLOAT and integers land as types Rocky reads differently
-        // from the name, and a bare timestamp is NTZ: all unchecked.
+        // Snowflake: every float name lands as FLOAT, and integers land as
+        // NUMBER, types Rocky reads differently from the name; a bare
+        // timestamp is NTZ: all unchecked.
         let (amount, at, n, ratio, untyped) = types(Some("snowflake"));
-        assert_eq!((amount, at, n), (None, None, None));
-        assert_eq!(ratio, s("Float64"));
-        assert_eq!(untyped, 3);
+        assert_eq!((amount, at, n, ratio), (None, None, None, None));
+        assert_eq!(untyped, 4);
+        for name in ["double", "DOUBLE PRECISION", "real", "float4", "float8"] {
+            assert_eq!(contract_type_name(name, Some("snowflake")), None, "{name}");
+        }
         // No adapter: the names that depend on it are unchecked.
         let (amount, at, n, ratio, untyped) = types(None);
         assert_eq!((amount, at), (None, None));
