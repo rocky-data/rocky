@@ -2293,6 +2293,25 @@ mod tests {
             );
             assert_eq!(code, "host_not_allowed", "{method} {path}");
         }
+        // A request that names no host at all (no `Host`, no URI authority)
+        // is refused, not waved through.
+        {
+            use tower::ServiceExt as _;
+            let response = crate::api::router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/jobs/run")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::MISDIRECTED_REQUEST
+            );
+        }
         // A cross-site page that names the server correctly but sends its own
         // Origin is refused too.
         let (status, code) = send_with_host(

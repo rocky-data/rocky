@@ -1927,8 +1927,9 @@ enum Command {
         /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
         /// route); when unset, a loopback server asks no request for a
         /// token, but still refuses a request whose `Host` does not name it
-        /// (see `--allowed-host`). Falls back to the `ROCKY_SERVE_TOKEN` env var when
-        /// omitted. Required when `--host` is non-loopback, including with
+        /// (see `--allowed-host`). Falls back to the `ROCKY_SERVE_TOKEN` env
+        /// var when omitted. Required when `--host` is non-loopback,
+        /// including with
         /// `--ui`. With `--ui` on loopback and no token, a per-process token
         /// is generated: full scope (operator mode) unless `--read-only`,
         /// `--allowed-host` or `--allowed-origin` is given.

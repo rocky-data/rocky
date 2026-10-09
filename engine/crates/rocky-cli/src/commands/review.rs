@@ -639,6 +639,13 @@ fn compile_approval_models(
 /// ([`PersistedPlan::enforcement_principal`]), and an agent's apply compares
 /// the full fingerprint ([`super::approval_scope::verify_plan_models_for_apply`]).
 ///
+/// So approval can pass where apply still refuses. An agent-kind plan
+/// approved in another environment is refused at apply there with
+/// `plan_config_changed` when its config resolves differently, and a
+/// person's `--dag` apply compares the full fingerprint
+/// ([`super::approval_scope::verify_dag_scope_for_apply`]). Apply is the
+/// stricter side in both cases, so nothing runs unchecked.
+///
 /// A plan written before the models-only fingerprint existed is compared on
 /// its full fingerprint, as before: stricter, never looser.
 fn verify_current_models_for_approval(
@@ -2726,6 +2733,66 @@ mod tests {
             review_marker_state(root, &plan_id),
             ReviewMarkerState::Absent
         ));
+        Ok(())
+    }
+
+    /// A plan with no models-only fingerprint (written before it existed) is
+    /// still compared on its full fingerprint, so a config-only change
+    /// refuses its approval as it did before #2326: stricter, never looser.
+    #[tokio::test]
+    async fn approval_of_a_plan_without_a_models_only_fingerprint_compares_the_full_one()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, GLOB_CONFIG_2236)?;
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("models/a.toml"), sidecar("a"))?;
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "p", "models": ["a"]
+        }))?;
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        let mut capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        capabilities.models_only_fingerprint = None;
+        let plan_id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        std::fs::write(
+            &config,
+            GLOB_CONFIG_2236.replacen(
+                "database = \":memory:\"",
+                "database = \"elsewhere.duckdb\"",
+                1,
+            ),
+        )?;
+        let err = compute_review_with_state_path(
+            root,
+            Path::new("rocky.toml"),
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            true,
+        )
+        .await
+        .expect_err("a legacy plan keeps the full compare");
+        assert!(
+            err.to_string()
+                .contains("the models changed since this plan was written"),
+            "{err:#}"
+        );
         Ok(())
     }
 
