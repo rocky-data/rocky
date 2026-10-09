@@ -178,7 +178,7 @@ enforces it):
 
 A model that sets `first_partition` and has no recorded partition has never run. With no selection flag, its first run fills every partition from `first_partition` up to now, as if you had passed `--missing`. A dbt microbatch model fills from `begin` the same way. The fill adds no `lookback` partitions before `first_partition`.
 
-The fill has a limit of 1000 partitions. If `first_partition` is further back than that (an hourly model that starts years ago), the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. Every later run, with at least one partition recorded, builds the latest partition as before. A model with no `first_partition` always builds the latest partition.
+The fill has a limit of 1000 partitions. If `first_partition` is further back than that (an hourly model that starts years ago), the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. Every later run, with at least one partition recorded, builds the latest partition as before. A model with no `first_partition` always builds the latest partition. So does a first run whose `first_partition` is after the current partition: there is nothing to fill yet.
 
 ```bash
 # Run today's partition

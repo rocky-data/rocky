@@ -182,7 +182,8 @@ pub const FIRST_RUN_FILL_LIMIT: usize = 1000;
 /// What a `time_interval` model does on a run that names no partition flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstRunFill {
-    /// Not a first run, or no `first_partition`: build the latest partition.
+    /// Not a first run, no `first_partition`, or a `first_partition` after
+    /// the current partition: build the latest partition.
     NotApplicable,
     /// First run: build every partition from `first_partition` up to now.
     Fill(Vec<PartitionPlan>),
@@ -206,13 +207,22 @@ pub enum FirstRunFill {
 /// [`FirstRunFill::NotApplicable`].
 pub fn plan_first_run_fill(model: &Model, state: &StateStore) -> Result<FirstRunFill, PlanError> {
     let StrategyConfig::TimeInterval {
-        first_partition: Some(_),
+        first_partition: Some(first),
+        granularity,
         ..
     } = &model.config.strategy
     else {
         return Ok(FirstRunFill::NotApplicable);
     };
     if !state.list_partitions(&model.config.name)?.is_empty() {
+        return Ok(FirstRunFill::NotApplicable);
+    }
+    // A `first_partition` after the current partition has nothing to fill
+    // yet: build the latest partition, as a model with no `first_partition`
+    // does. A key that does not parse still fails below, with its error.
+    if let Ok(window) = partition_key_to_window(*granularity, first)
+        && window.start > granularity.truncate(chrono::Utc::now())
+    {
         return Ok(FirstRunFill::NotApplicable);
     }
     let plans = plan_partitions(model, &PartitionSelection::Missing, Some(0), state)?;
@@ -613,6 +623,40 @@ mod tests {
             plan_first_run_fill(&model, &state).unwrap(),
             FirstRunFill::NotApplicable
         );
+    }
+
+    #[test]
+    fn first_run_fill_does_not_apply_to_a_future_first_partition() {
+        for (grain, offset) in [
+            (TimeGrain::Day, chrono::Duration::days(3)),
+            (TimeGrain::Hour, chrono::Duration::hours(2)),
+            (TimeGrain::Month, chrono::Duration::days(62)),
+            (TimeGrain::Year, chrono::Duration::days(800)),
+        ] {
+            let future = grain.format_key(grain.truncate(chrono::Utc::now() + offset));
+            let model = make_model("m", grain, 0, 1, Some(&future));
+            let (state, _dir) = temp_state();
+            assert_eq!(
+                plan_first_run_fill(&model, &state).unwrap(),
+                FirstRunFill::NotApplicable,
+                "a first_partition of {future} has nothing to fill yet"
+            );
+            // The run then builds the latest partition, as before.
+            let plans = plan_partitions(&model, &PartitionSelection::Latest, None, &state).unwrap();
+            assert_eq!(plans.len(), 1);
+        }
+    }
+
+    #[test]
+    fn first_run_fill_covers_a_first_partition_of_today() {
+        let today = TimeGrain::Day.format_key(TimeGrain::Day.truncate(chrono::Utc::now()));
+        let model = make_model("m", TimeGrain::Day, 0, 1, Some(&today));
+        let (state, _dir) = temp_state();
+        let FirstRunFill::Fill(plans) = plan_first_run_fill(&model, &state).unwrap() else {
+            panic!("today's partition is the one partition to fill");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].partition_key, today);
     }
 
     #[test]
