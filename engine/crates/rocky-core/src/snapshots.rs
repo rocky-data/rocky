@@ -302,18 +302,25 @@ pub fn generate_snapshot_sql(
     if config.invalidate_hard_deletes {
         let (update_target, update_qualifier) = dialect.snapshot_update_target(&target);
         let update_join_cond = build_join_condition(&keys, &update_qualifier, "source");
-        let invalidate = format!(
-            "UPDATE {update_target} SET \
-             {vt} = CURRENT_TIMESTAMP, \
-             {ic} = FALSE \
-             WHERE {ic} = TRUE \
-             AND NOT EXISTS (\
-               SELECT 1 FROM {source} AS source \
-               WHERE {update_join_cond}\
-             )",
-            vt = COL_VALID_TO,
-            ic = COL_IS_CURRENT,
-        );
+        let set = format!("{COL_VALID_TO} = CURRENT_TIMESTAMP, {COL_IS_CURRENT} = FALSE");
+        let invalidate = dialect
+            .snapshot_close_absent_sql(
+                &target,
+                &source,
+                &keys,
+                &set,
+                &format!("{update_qualifier}.{COL_IS_CURRENT} = TRUE"),
+            )
+            .unwrap_or_else(|| {
+                format!(
+                    "UPDATE {update_target} SET {set} \
+                     WHERE {COL_IS_CURRENT} = TRUE \
+                     AND NOT EXISTS (\
+                       SELECT 1 FROM {source} AS source \
+                       WHERE {update_join_cond}\
+                     )"
+                )
+            });
         stmts.push(invalidate);
     }
 

@@ -1132,6 +1132,29 @@ pub trait SqlDialect: Send + Sync {
         (format!("{target} AS target"), "target".to_string())
     }
 
+    /// A single statement that closes the current snapshot versions whose key
+    /// is absent from `source` (the hard-delete step), for a warehouse that
+    /// refuses the generic `UPDATE … WHERE NOT EXISTS (subquery)`.
+    ///
+    /// `target` is the formatted target table, `source` a table reference or
+    /// parenthesised query, `keys` the key columns as quoted references
+    /// (usable as `target.<key>` and `source.<key>`), `set` the `SET`
+    /// assignments with unqualified column names, and `condition` a predicate
+    /// over the current version, written with the qualifier
+    /// [`SqlDialect::snapshot_update_target`] returns (`target` by default).
+    ///
+    /// The default is `None`: the generic `UPDATE` is used.
+    fn snapshot_close_absent_sql(
+        &self,
+        _target: &str,
+        _source: &str,
+        _keys: &[String],
+        _set: &str,
+        _condition: &str,
+    ) -> Option<String> {
+        None
+    }
+
     /// Quote a column returned by snapshot source schema discovery exactly.
     fn snapshot_column_identifier(&self, name: &str) -> String {
         match self.name() {

@@ -671,15 +671,22 @@ pub fn generate_snapshot_model_sql_with(
         "NOT EXISTS (SELECT 1 FROM {model} AS source WHERE {})",
         join(&q, "source")
     );
+    // A dialect that refuses a subquery in `UPDATE` closes the absent keys
+    // with one `MERGE` instead. Its condition names the target `target`.
+    let close_absent = |condition: String| {
+        dialect
+            .snapshot_close_absent_sql(target, &model, &keys, &close(&now), &condition)
+            .unwrap_or_else(|| {
+                format!(
+                    "UPDATE {update_target} SET {set}\nWHERE {condition} AND {absent_from_model}",
+                    set = close(&now),
+                )
+            })
+    };
     match spec.hard_deletes {
         SnapshotHardDeletes::Ignore => {}
         SnapshotHardDeletes::Invalidate => {
-            stmts.push(format!(
-                "UPDATE {update_target} SET {set}\n\
-                 WHERE {is_current} AND {absent_from_model}",
-                set = close(&now),
-                is_current = current(&q),
-            ));
+            stmts.push(close_absent(current(&q)));
         }
         SnapshotHardDeletes::NewRecord => {
             // 3a. A deletion marker copies the vanished key's last values.
@@ -710,13 +717,11 @@ pub fn generate_snapshot_model_sql_with(
                 marker_deleted = is_deleted("marker"),
             ));
             // 3b. Close the version the marker replaced.
-            stmts.push(format!(
-                "UPDATE {update_target} SET {set}\n\
-                 WHERE {is_current} AND {not_deleted} = FALSE AND {absent_from_model}",
-                set = close(&now),
-                is_current = current(&q),
-                not_deleted = is_deleted(&q),
-            ));
+            stmts.push(close_absent(format!(
+                "{} AND {} = FALSE",
+                current(&q),
+                is_deleted(&q)
+            )));
         }
     }
 

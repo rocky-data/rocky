@@ -1443,14 +1443,25 @@ pub fn generate_snapshot_sql(
             .map(|key| format!("{update_qualifier}.{key} = source.{key}"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let invalidate = format!(
-            "UPDATE {update_target} SET valid_to = CURRENT_TIMESTAMP \
-             WHERE valid_to IS NULL \
-             AND NOT EXISTS (\
-               SELECT 1 FROM {source} AS source \
-               WHERE {update_join_cond}\
-             )",
-        );
+        let set = "valid_to = CURRENT_TIMESTAMP";
+        let invalidate = dialect
+            .snapshot_close_absent_sql(
+                &target,
+                &source,
+                &keys,
+                set,
+                &format!("{update_qualifier}.valid_to IS NULL"),
+            )
+            .unwrap_or_else(|| {
+                format!(
+                    "UPDATE {update_target} SET {set} \
+                     WHERE valid_to IS NULL \
+                     AND NOT EXISTS (\
+                       SELECT 1 FROM {source} AS source \
+                       WHERE {update_join_cond}\
+                     )",
+                )
+            });
         stmts.push(invalidate);
     }
 
