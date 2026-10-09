@@ -1205,14 +1205,14 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
     out.push_str("- **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.\n");
     out.push_str("- **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. Hand-port any ");
     out.push_str("logic to plain SQL or to a Rocky AI prompt.\n");
-    out.push_str("- **Raw Jinja control flow** — unresolved Jinja that references the ");
-    out.push_str(
-        "`is_incremental` macro, including callable aliases, is refused on every raw import path. ",
-    );
-    out.push_str("With `--no-manifest`, ");
-    out.push_str("`{% for %}` / `{% set %}` models are also refused. Other `{% if %}` bodies ");
-    out.push_str("are emitted with ");
-    out.push_str("`# TODO: dbt-jinja-not-translated` comments and must be reviewed.\n");
+    out.push_str("- **Raw Jinja control flow** — a model with `{% if %}`, `{% for %}`, ");
+    out.push_str("`{% set %}` or any other statement tag is refused on the raw (no-manifest) ");
+    out.push_str("path, and listed under **Failed models** with the fix: run ");
+    out.push_str("`dbt compile --full-refresh` and import with the manifest. The one exception ");
+    out.push_str("is the `is_incremental()` filter of an incremental model, which is converted. ");
+    out.push_str("Declared tests of a refused model are counted as skipped, not converted. ");
+    out.push_str("An expression the importer cannot lower is left as a ");
+    out.push_str("`/* TODO: unsupported Jinja expression */` comment.\n");
     if !ctx.unknown_materializations.is_empty() {
         out.push_str("- **Unmapped `materialized` values** (treated as `full_refresh`):\n");
         for name in ctx.unknown_materializations {

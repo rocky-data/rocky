@@ -84,7 +84,7 @@ rocky playground my-experiment
 
 Import an existing dbt project and emit a Rocky project you can run. The importer reads `dbt_project.yml` and `profiles.yml`, and translates each `.sql` model body. It writes a self-contained directory that `rocky compile` and `rocky plan` plus `rocky apply` accept as is.
 
-Translation expands `{{ ref(...) }}` and `{{ source(...) }}` into plain identifiers. Any other Jinja is left in place with a `# TODO: dbt-jinja-not-translated` comment above it, so nothing is dropped silently.
+Translation expands `{{ ref(...) }}` and `{{ source(...) }}` into plain identifiers. A model with a Jinja statement tag (`{% if %}`, `{% for %}`, `{% set %}`) is refused on a no-manifest import and listed under "Failed models" with the reason. Run `dbt compile --full-refresh` and import with the manifest. A `{{ ... }}` expression the importer cannot lower is left as a `/* TODO: unsupported Jinja expression */` comment, so nothing is dropped silently.
 
 ```bash
 rocky import-dbt --dbt-project <PATH> [flags]
