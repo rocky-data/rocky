@@ -3536,6 +3536,26 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// read: the named `--models` directory, or the whole project when none was
 /// named. Decided by presence, so `--models models` keeps reading that one
 /// directory.
+/// The models directory `rocky compile`, `rocky test` and `rocky ci` read:
+/// `--models` as typed, or else `models/` beside the config file. The
+/// compile reads `contracts/` and `functions/` beside this directory, so
+/// `rocky --config sub/rocky.toml ci` run from another directory must find
+/// `sub/models`, `sub/contracts` and `sub/functions`, not the ones under the
+/// working directory. With the default `--config rocky.toml` this is
+/// `models`, as before.
+fn models_dir_or_default(
+    config: &std::path::Path,
+    models: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    match models {
+        Some(dir) => dir.to_path_buf(),
+        None => config
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("models"),
+    }
+}
+
 fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
     match models {
         Some(_) => rocky_cli::commands::ModelScope::Dir,
@@ -5049,9 +5069,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 rocky_cli::commands::run_compile_with_options(
                     Some(cli.config.as_path()),
                     &state_path,
-                    models
-                        .as_deref()
-                        .unwrap_or_else(|| std::path::Path::new("models")),
+                    &models_dir_or_default(&cli.config, models.as_deref()),
                     scope,
                     contracts.as_deref(),
                     model.as_deref(),
@@ -5424,9 +5442,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "--select / --exclude are not yet supported with --declarative; use --model"
                 );
             }
-            let models_dir = models
-                .as_deref()
-                .unwrap_or_else(|| std::path::Path::new("models"));
+            let models_dir = &models_dir_or_default(&cli.config, models.as_deref());
             if declarative {
                 rocky_cli::commands::run_declarative_tests(
                     &cli.config,
@@ -5444,6 +5460,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cache_ttl_override: cli.cache_ttl,
                 };
                 rocky_cli::commands::run_test_with_selection(
+                    Some(cli.config.as_path()),
                     models_dir,
                     contracts.as_deref(),
                     model.as_deref(),
@@ -5463,9 +5480,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             rocky_cli::commands::run_ci(
                 &cli.config,
-                models
-                    .as_deref()
-                    .unwrap_or_else(|| std::path::Path::new("models")),
+                &models_dir_or_default(&cli.config, models.as_deref()),
                 model_scope(models.as_deref()),
                 contracts.as_deref(),
                 json,

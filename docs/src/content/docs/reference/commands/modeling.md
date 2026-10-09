@@ -22,9 +22,7 @@ rocky compile [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | every pipeline | Compile only the `.sql`, `.rocky` and `.toml` model files in this directory. Without it, Rocky compiles the models of every transformation pipeline together. See [The whole project by default](#the-whole-project-by-default). |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
 | `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
@@ -953,7 +951,7 @@ rocky test [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--models <PATH>` | `PathBuf` | `models/` beside the config file | Directory containing model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 | `--model <NAME>` | `string` | | Run tests for a single model only. |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
@@ -961,6 +959,8 @@ rocky test [flags]
 | `--pipeline <NAME>` | `string` | | With `--declarative`: run the tests of the models in `--models` against this pipeline's warehouse. Without it and without `--models`, every transformation pipeline runs its own models' tests against its own warehouse. |
 
 `rocky test` runs `data/seed.sql` first, when the project has one, and types its compile from the tables the seed made. The models then run on those tables. So a contract type mismatch (`E011`) or a column the seed lacks (`W041`) is reported before any model runs.
+
+With a `rocky.toml`, the compile also runs the per-model-target checks of [`rocky ci`](#rocky-ci) (`E042`/`E043`, `E057`, `E044`, `E049`, `E051`, `E053` and `E054`). An error from them fails `rocky test` before any model runs.
 
 ### Examples
 
@@ -1073,9 +1073,7 @@ rocky ci [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | every pipeline | Run only the models in this directory. Without it, `rocky ci` runs the models of every transformation pipeline. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
-| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
+| `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
 
 With no `--models`, `rocky ci` compiles every transformation pipeline's models as one project graph, as [`rocky compile`](#the-whole-project-by-default) does. Then it runs them all in one in-memory DuckDB, in dependency order. So a model in a downstream pipeline reads the tables its upstream pipelines made.
 
@@ -1085,7 +1083,9 @@ data/seed.sql ─► in-memory DuckDB ─► compile (typed from the seed) ─�
 
 The seed is `data/seed.sql` beside `rocky.toml`. The compile is typed from the tables it made, so `rocky ci` finds a contract type mismatch (`E011`) from the seed alone.
 
-The compile runs the same per-model-target checks as [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`.
+The compile runs the same per-model-target checks as [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`. `E054` is judged on the SQL each model runs, with its ephemeral upstreams inlined, as `rocky run` sends it.
+
+The project files are found beside the config file, not the working directory. So `rocky --config sub/rocky.toml ci` run from the directory above reads `sub/contracts/` and `sub/functions/`. `rocky compile` and `rocky test` do the same when you pass no `--models`.
 
 A dependency cycle is the `E058` error, one for each model on the cycle. `rocky ci` prints its JSON with these diagnostics, runs no model, and exits `1`. See [Dependency cycles](/concepts/compiler/#dependency-cycles-e058).
 

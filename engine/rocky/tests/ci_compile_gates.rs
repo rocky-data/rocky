@@ -251,3 +251,102 @@ fn ci_passes_valid_controls() {
     assert_eq!(output.status.code(), Some(0), "{json}");
     assert!(errors(&json).is_empty(), "{json}");
 }
+
+/// `rocky test` applies the same per-model-target checks as `rocky ci`,
+/// before any model executes.
+#[test]
+fn test_reports_the_compile_gates_before_executing() {
+    let ltv = LTV.replace("COUNT(*) AS order_count", "SUM(status) AS status_sum");
+    let tmp = project(&[("fct_orders", FCT), ("customer_ltv", &ltv)]);
+    let output = rocky(tmp.path(), &["test"]);
+    assert_ne!(output.status.code(), Some(0));
+    let json = parse(&output);
+    assert_eq!(errors(&json), [pair("E042", "customer_ltv")], "{json}");
+    assert_eq!(json["passed"], 0, "nothing executes: {json}");
+
+    // The valid project passes.
+    let tmp = project(&[("fct_orders", FCT), ("customer_ltv", LTV)]);
+    let output = rocky(tmp.path(), &["test"]);
+    let json = parse(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert!(errors(&json).is_empty(), "{json}");
+}
+
+/// A project whose pipeline loads into SQL Server, with an ephemeral model
+/// whose CTE cannot be lifted to the head of the statement, and a consumer
+/// whose own SQL has no CTE.
+fn sqlserver_project(consumer: &str) -> tempfile::TempDir {
+    let tmp = project(&[("fct_orders", FCT)]);
+    fs::write(
+        tmp.path().join("rocky.toml"),
+        "[adapter.wh]\ntype = \"sqlserver\"\nhost = \"localhost\"\n\
+         database = \"an\"\nusername = \"u\"\npassword = \"x\"\n\n\
+         [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         target = { adapter = \"wh\" }\n",
+    )
+    .unwrap();
+    let models = tmp.path().join("models");
+    fs::write(
+        models.join("eph.sql"),
+        "SELECT v FROM (WITH v AS (SELECT order_id AS v FROM raw.orders) SELECT v FROM v) AS s\n",
+    )
+    .unwrap();
+    fs::write(
+        models.join("eph.toml"),
+        "name = \"eph\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"eph\"\n",
+    )
+    .unwrap();
+    fs::write(models.join("consumer.sql"), consumer).unwrap();
+    fs::write(
+        models.join("consumer.toml"),
+        "name = \"consumer\"\ndepends_on = [\"eph\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"consumer\"\n",
+    )
+    .unwrap();
+    tmp
+}
+
+/// `E054` is judged on the SQL each model executes, with its ephemeral
+/// upstream inlined, in `rocky ci` and `rocky test` alike.
+#[test]
+fn ci_and_test_judge_e054_on_the_inlined_sql() {
+    let tmp = sqlserver_project("SELECT v FROM eph\n");
+    for command in ["ci", "test"] {
+        let output = rocky(tmp.path(), &[command]);
+        let json = parse(&output);
+        assert_ne!(output.status.code(), Some(0), "{command}: {json}");
+        assert!(
+            errors(&json).contains(&pair("E054", "consumer")),
+            "{command}: {json}"
+        );
+    }
+}
+
+/// `rocky --config sub/rocky.toml ci` from the directory above the project
+/// reads the project's `contracts/`, not one under the working directory.
+#[test]
+fn ci_with_a_config_in_another_directory_reads_its_contracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = project(&[("fct_orders", FCT), ("customer_ltv", LTV)]);
+    let sub = tmp.path().join("sub");
+    fs::rename(project.path(), &sub).unwrap();
+    fs::create_dir(sub.join("contracts")).unwrap();
+    let run = |contract: &str| {
+        fs::write(sub.join("contracts/customer_ltv.contract.toml"), contract).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_rocky"))
+            .current_dir(tmp.path())
+            .args(["--config", "sub/rocky.toml", "--output", "json", "ci"])
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("spawn rocky")
+    };
+    let output = run("[rules]\nrequired = [\"missing_column\"]\n");
+    let json = parse(&output);
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert_eq!(errors(&json), [pair("E010", "customer_ltv")], "{json}");
+
+    let output = run("[rules]\nrequired = [\"customer_id\"]\n");
+    let json = parse(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+}

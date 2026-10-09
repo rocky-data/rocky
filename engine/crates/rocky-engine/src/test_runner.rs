@@ -95,9 +95,14 @@ pub struct TestRunInputs<'a> {
     ///
     /// The result still holds each model's authored SQL: ephemeral upstreams
     /// are inlined after the checks run, as `rocky compile` orders them.
-    /// `rocky ci` passes the per-model-target checks of `rocky compile`
-    /// here; `None` runs none.
+    /// `rocky ci` and `rocky test` pass the per-model-target checks of
+    /// `rocky compile` here; `None` runs none.
     pub gates: Option<&'a CompileGates<'a>>,
+    /// Checks that judge the SQL each model executes, run after ephemeral
+    /// upstreams are inlined (`rocky compile`'s `E054` on SQL Server). An
+    /// error they add fails the run without executing a model. `None` runs
+    /// none.
+    pub inlined_gates: Option<&'a CompileGates<'a>>,
 }
 
 /// Checks a caller runs over a test run's compile result. See
@@ -114,6 +119,7 @@ impl std::fmt::Debug for TestRunInputs<'_> {
             .field("model_filter", &self.model_filter)
             .field("run_vars", &self.run_vars)
             .field("gates", &self.gates.is_some())
+            .field("inlined_gates", &self.inlined_gates.is_some())
             .finish()
     }
 }
@@ -188,6 +194,7 @@ pub fn run_tests(
         model_filter,
         run_vars,
         gates: None,
+        inlined_gates: None,
     })
 }
 
@@ -214,6 +221,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         model_filter,
         run_vars,
         gates,
+        inlined_gates,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
@@ -290,6 +298,13 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
     // E038 diagnostics this returns were already reported by the compile.
     let _already_reported =
         rocky_compiler::ephemeral::apply_ephemerals(&mut compile_result.project, true);
+    if let Some(gates) = inlined_gates {
+        gates(&mut compile_result);
+        compile_result.has_errors |= compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
 
     let mut result = TestResult {
         total: 0,
@@ -1205,6 +1220,7 @@ mod tests {
             model_filter: None,
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: None,
+            inlined_gates: None,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1429,6 +1445,7 @@ mod tests {
             model_filter: None,
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&refuse),
+            inlined_gates: None,
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1447,16 +1464,35 @@ mod tests {
             model_filter: None,
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&silent),
+            inlined_gates: None,
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert_eq!(result.passed, 1);
+
+        // An error the inlined gates add fails the run the same way.
+        let result = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
+            inlined_gates: Some(&refuse),
+        })
+        .unwrap();
+        assert_eq!(result.passed, 0, "{:?}", result.model_results);
+        assert_eq!(
+            result.failures,
+            [("stg".to_string(), "refused".to_string())]
+        );
     }
 
-    /// The gates see each model's authored SQL; the model then executes with
-    /// its ephemeral upstream inlined.
+    /// The gates see each model's authored SQL; the inlined gates see the
+    /// SQL the model executes, with its ephemeral upstream inlined.
     #[test]
-    fn gates_see_authored_sql_and_ephemerals_still_inline() {
+    fn gates_see_authored_sql_and_inlined_gates_see_the_executed_sql() {
         let dir = scaffold_seeded_project();
         let models_dir = dir.path().join("models");
         std::fs::write(models_dir.join("eph.sql"), "SELECT id FROM stg").unwrap();
@@ -1471,6 +1507,11 @@ mod tests {
             let mart = result.project.model("mart").unwrap();
             *seen.borrow_mut() = mart.sql.clone();
         };
+        let seen_inlined = std::cell::RefCell::new(String::new());
+        let record_inlined = |result: &mut rocky_compiler::compile::CompileResult| {
+            let mart = result.project.model("mart").unwrap();
+            *seen_inlined.borrow_mut() = mart.sql.clone();
+        };
         let result = run_tests_with(TestRunInputs {
             models_dir: &models_dir,
             project_root: dir.path(),
@@ -1479,9 +1520,15 @@ mod tests {
             model_filter: None,
             run_vars: &rocky_core::run_vars::RunVars::new(),
             gates: Some(&record),
+            inlined_gates: Some(&record_inlined),
         })
         .unwrap();
         assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");
+        assert!(
+            seen_inlined.borrow().contains("WITH"),
+            "the inlined gates see the ephemeral inlined: {}",
+            seen_inlined.borrow()
+        );
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert!(
             result

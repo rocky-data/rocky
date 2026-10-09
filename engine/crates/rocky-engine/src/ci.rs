@@ -62,6 +62,7 @@ pub fn run_ci(
         model_filter: None,
         run_vars,
         gates: None,
+        inlined_gates: None,
     })
 }
 

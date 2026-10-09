@@ -113,6 +113,7 @@ pub fn run_test(
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     run_test_with_selection(
+        None,
         models_dir,
         contracts_dir,
         model_filter,
@@ -144,7 +145,13 @@ fn retain_selected(
 }
 
 /// [`run_test`] scoped by `--select` / `--exclude`.
+///
+/// `config_path` is the project's `rocky.toml`. When it loads, the run
+/// applies the per-model-target checks `rocky ci` applies (see
+/// [`super::ci::with_project_gates`]), so `rocky test` refuses what `rocky ci`
+/// refuses. `None`, or no file there, runs no such check.
 pub fn run_test_with_selection(
+    config_path: Option<&Path>,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
@@ -161,8 +168,27 @@ pub fn run_test_with_selection(
         )?),
         _ => None,
     };
-    let mut result =
-        rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter, run_vars)?;
+    let project_config = match config_path {
+        Some(path) => rocky_core::config::load_optional_project_config(Some(path))
+            .with_context(|| format!("failed to load config from {}", path.display()))?,
+        None => None,
+    };
+    let mut result = super::ci::with_project_gates(
+        project_config.as_ref(),
+        config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+        |gates, inlined_gates| {
+            rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
+                models_dir,
+                project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+                models: rocky_engine::test_runner::TestModels::Dir,
+                contracts_dir,
+                model_filter,
+                run_vars,
+                gates,
+                inlined_gates,
+            })
+        },
+    )?;
     // `run_test` deliberately re-runs the engine rather than calling
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.

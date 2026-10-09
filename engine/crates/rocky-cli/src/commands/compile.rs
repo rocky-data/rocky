@@ -762,9 +762,11 @@ fn cycle_output(diagnostics: &[Diagnostic]) -> (CompileOutput, CompileTextData) 
 }
 
 /// The project-level, per-model-target checks of `rocky compile`, for the
-/// surfaces that compile through `rocky_compiler::compile` directly:
-/// `rocky serve`, `rocky lsp` and `rocky ci` (through
-/// `rocky_engine::test_runner::TestRunInputs::gates`).
+/// surfaces that compile through `rocky_compiler::compile` directly and
+/// check one SQL form: `rocky serve` and `rocky lsp`. `rocky ci` and
+/// `rocky test` run the same checks in two halves, around ephemeral
+/// inlining: [`apply_authored_model_target_gates`] and
+/// [`apply_inlined_model_target_gates`].
 ///
 /// This is the ONE funnel for those surfaces. `rocky compile` runs the same
 /// three steps ([`apply_adapter_gates`], [`apply_operand_gates`],
@@ -785,6 +787,35 @@ pub fn apply_model_target_gates(
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
     apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_inlined_sql_gates(result, &targets);
+    result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
+}
+
+/// The checks of [`apply_model_target_gates`] that read each model's
+/// authored SQL: E044/W044, E051, E049, E053, E042/E043 and E057. Run them
+/// before ephemeral upstreams are inlined, so an ephemeral's body is not
+/// judged once more inside each consumer.
+pub fn apply_authored_model_target_gates(
+    result: &mut compile::CompileResult,
+    config: &rocky_config::RockyConfig,
+    config_path: &Path,
+) {
+    let targets = ModelTargets::resolve(config, config_path);
+    apply_adapter_gates(result, &targets);
+    apply_operand_gates(result, Some(config), Some(&targets), None);
+    result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
+}
+
+/// The check of [`apply_model_target_gates`] that reads the SQL each model
+/// executes: E054 (SQL Server lifts every CTE to the head of the statement).
+/// Run it after ephemeral upstreams are inlined, on the statement
+/// `rocky run` sends, so a CTE that only inlining adds is found too.
+pub fn apply_inlined_model_target_gates(
+    result: &mut compile::CompileResult,
+    config: &rocky_config::RockyConfig,
+    config_path: &Path,
+) {
+    let targets = ModelTargets::resolve(config, config_path);
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }

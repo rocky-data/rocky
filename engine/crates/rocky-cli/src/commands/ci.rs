@@ -28,29 +28,22 @@ pub fn run_ci(
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let (models, project_root) =
         ci_models(config_path, project_config.as_ref(), models_dir, scope)?;
-    // The per-model-target checks of `rocky compile` (E042/E043, E057, E044,
-    // E049, E051, E053, E054), judged against the warehouses of the
-    // pipelines that load each model. A project without `rocky.toml` has no
-    // targets, so there is nothing to judge against.
-    let gates = project_config.as_ref().map(|config| {
-        move |result: &mut rocky_compiler::compile::CompileResult| {
-            super::compile::apply_model_target_gates(
-                result,
-                config,
-                config_path,
-                rocky_server::project_gates::ModelSqlForm::Authored,
-            );
-        }
-    });
-    let result = rocky_engine::ci::run_ci_with(TestRunInputs {
-        models_dir,
-        project_root: &project_root,
-        models,
-        contracts_dir,
-        model_filter: None,
-        run_vars,
-        gates: gates.as_ref().map(|g| g as &CompileGates<'_>),
-    })?;
+    let result = with_project_gates(
+        project_config.as_ref(),
+        config_path,
+        |gates, inlined_gates| {
+            rocky_engine::ci::run_ci_with(TestRunInputs {
+                models_dir,
+                project_root: &project_root,
+                models,
+                contracts_dir,
+                model_filter: None,
+                run_vars,
+                gates,
+                inlined_gates,
+            })
+        },
+    )?;
 
     if output_json {
         let failures: Vec<TestFailure> = result
@@ -106,6 +99,29 @@ pub fn run_ci(
 
 /// The models `rocky ci` runs, and the project root its seed file is read
 /// from.
+/// Run `run` with the per-model-target checks of `rocky compile` (E042/E043,
+/// E057, E044, E049, E051, E053, E054) as the test runner's two hooks:
+/// `gates` on the authored SQL, `inlined_gates` on the SQL each model
+/// executes. They judge each model against the warehouses of the pipelines
+/// that load it. With no project config there are no targets, so both hooks
+/// are `None`. `rocky ci` and `rocky test` both take this path.
+pub(crate) fn with_project_gates<R>(
+    project_config: Option<&rocky_core::config::RockyConfig>,
+    config_path: &Path,
+    run: impl FnOnce(Option<&CompileGates<'_>>, Option<&CompileGates<'_>>) -> R,
+) -> R {
+    let Some(config) = project_config else {
+        return run(None, None);
+    };
+    let gates = |result: &mut rocky_compiler::compile::CompileResult| {
+        super::compile::apply_authored_model_target_gates(result, config, config_path);
+    };
+    let inlined_gates = |result: &mut rocky_compiler::compile::CompileResult| {
+        super::compile::apply_inlined_model_target_gates(result, config, config_path);
+    };
+    run(Some(&gates), Some(&inlined_gates))
+}
+
 fn ci_models(
     config_path: &Path,
     project_config: Option<&rocky_core::config::RockyConfig>,
