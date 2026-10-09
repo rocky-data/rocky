@@ -435,12 +435,29 @@ pub(crate) fn verify_dag_scope_for_apply(
     let ids = OwnedScopeIdentities::from_config(Some(cfg), None);
     let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
         .map_err(|e| refuse(&format!("its fingerprint cannot be recomputed ({e:#})")))?;
-    if actual.as_deref() != Some(expected) {
-        return Err(refuse(
-            "a model the DAG runs was added, removed or changed since the plan was written",
+    if actual.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    // The full fingerprint also binds the config the DAG runs under. When the
+    // models still match, say so, so the refusal does not blame a model
+    // change that did not happen (#2326). Either way the apply refuses.
+    let models_only = scope_models_only_fingerprint(&scope, &compiled, &ids.resolved_mask)
+        .map_err(|e| refuse(&format!("its fingerprint cannot be recomputed ({e:#})")))?;
+    if let Some(expected_models_only) = capabilities.models_only_fingerprint.as_deref()
+        && models_only.as_deref() == Some(expected_models_only)
+    {
+        return Err(anyhow::anyhow!(
+            "{PLAN_CONFIG_CHANGED}: refusing to apply plan '{plan_id}': the models the DAG \
+             runs are unchanged, but the config they run under changed since this plan was \
+             written (adapters, pipelines, governance or run settings, as resolved in this \
+             environment). A reviewed --dag plan applies only under the config it was planned \
+             under. Re-run `rocky plan --dag` in this environment and review the new \
+             plan."
         ));
     }
-    Ok(())
+    Err(refuse(
+        "a model the DAG runs was added, removed or changed since the plan was written",
+    ))
 }
 
 /// Whether apply reconciles masks for this plan, so its fingerprint binds the

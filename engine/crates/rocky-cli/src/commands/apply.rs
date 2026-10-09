@@ -11289,6 +11289,40 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// #2326: a reviewed `--dag` plan applied where the adapter resolves to
+    /// another database still refuses, and the refusal names the config
+    /// (`plan_config_changed`), not a model change that did not happen.
+    #[tokio::test]
+    async fn reviewed_dag_plan_names_a_config_change_as_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+
+        let toml = std::fs::read_to_string(&config)?;
+        let edited = toml.replacen("proj.duckdb", "elsewhere.duckdb", 1);
+        assert_ne!(edited, toml, "the fixture must change");
+        std::fs::write(&config, edited)?;
+
+        let msg = format!(
+            "{:#}",
+            apply_dag_plan_as_human(root, &config, &plan_id)
+                .await
+                .expect_err("a reviewed --dag plan applies only under its reviewed config")
+        );
+        assert!(
+            msg.contains(super::super::approval_scope::PLAN_CONFIG_CHANGED),
+            "{msg}"
+        );
+        assert!(!msg.contains("was added, removed or changed"), "{msg}");
+        assert!(
+            !root.join("elsewhere.duckdb").exists() && !root.join("proj.duckdb").exists(),
+            "refused before the warehouse is opened"
+        );
+        Ok(())
+    }
+
     /// A human-authored `--dag` plan is not review-gated, but it carries a
     /// models fingerprint, so an edit after planning now refuses the apply
     /// (`plan_models_changed`) instead of running the edited models. Before
@@ -11434,6 +11468,89 @@ autonomy_budget = { failures = 3, window = "7d" }
                 check_plan_models(root, &config, &plan_id, principal).expect_err("edited")
             );
             assert!(msg.starts_with(PLAN_MODELS_CHANGED), "{principal:?}: {msg}");
+        }
+        Ok(())
+    }
+
+    /// #2326: an agent-kind plan (`ai_authored` applies as an agent whoever
+    /// runs it) made in one environment and applied from another, such as the
+    /// browser UI's `rocky serve`.
+    ///
+    /// A credential `${VAR}` that resolves differently there (a token) does
+    /// not refuse the apply: a credential is a `RedactedString`, which the
+    /// config identity hashes as `"***"`. A target `${VAR}` that resolves
+    /// differently (the host, the warehouse's `http_path`) still refuses with
+    /// `plan_config_changed`, because that apply would write to another
+    /// warehouse than the one the plan was made for.
+    ///
+    /// The plan is made from literal values. The apply-time config is built
+    /// the way `${VAR}` substitution builds it, with the value from the
+    /// environment, so the test also shows that the identity hashes a
+    /// target field by its value, not by its `${NAME}` placeholder.
+    #[test]
+    fn an_agent_plan_ignores_a_credential_env_value_but_not_a_target_one() -> anyhow::Result<()> {
+        use super::super::approval_scope::PLAN_CONFIG_CHANGED;
+        use rocky_core::env_string::EnvString;
+        use rocky_core::redacted::RedactedString;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let mut toml = std::fs::read_to_string(&config)?;
+        toml.push_str(
+            "[adapter.wh]\ntype = \"databricks\"\nhost = \"a.example.com\"\n\
+             http_path = \"/sql/1.0/warehouses/aaaa\"\ntoken = \"dapi_plan_shell_token\"\n",
+        );
+        std::fs::write(&config, toml)?;
+        let plan_id =
+            write_pipeline_plan_of(root, &config, PlanKind::AiAuthored, PolicyPrincipal::Agent)?;
+        let plan = crate::plan_store::read_plan(root, &plan_id)?;
+        assert_eq!(
+            plan.enforcement_principal(PolicyPrincipal::Human),
+            PolicyPrincipal::Agent,
+            "an ai_authored plan applies as an agent even when a person applies it"
+        );
+
+        // The apply environment: `host`, `http_path` and `token` all come
+        // from `${VAR}`s. `token` resolves to another value than at plan time.
+        let apply_env =
+            |host: &str, http_path: &str| -> anyhow::Result<rocky_core::config::RockyConfig> {
+                let mut cfg = rocky_core::config::load_rocky_config(&config)?;
+                let wh = cfg.adapters.get_mut("wh").expect("wh adapter");
+                wh.host = Some(EnvString::substituted("DATABRICKS_HOST", host));
+                wh.http_path = Some(EnvString::substituted("DATABRICKS_HTTP_PATH", http_path));
+                wh.token = Some(RedactedString::new("dapi_ui_serve_token".to_string()));
+                Ok(cfg)
+            };
+        let check = |cfg: &rocky_core::config::RockyConfig| {
+            super::super::approval_scope::verify_plan_models_for_apply(
+                &plan,
+                &plan_id,
+                Some(cfg),
+                &config,
+                root,
+                &gold_run_plan(),
+                PolicyPrincipal::Agent,
+            )
+        };
+
+        check(&apply_env("a.example.com", "/sql/1.0/warehouses/aaaa")?)
+            .map_err(|e| anyhow::anyhow!("a different token alone must not refuse: {e:#}"))?;
+
+        for (label, cfg) in [
+            (
+                "host",
+                apply_env("b.example.com", "/sql/1.0/warehouses/aaaa")?,
+            ),
+            (
+                "http_path",
+                apply_env("a.example.com", "/sql/1.0/warehouses/bbbb")?,
+            ),
+        ] {
+            let msg = format!(
+                "{:#}",
+                check(&cfg).expect_err("a different target must refuse an agent's apply")
+            );
+            assert!(msg.starts_with(PLAN_CONFIG_CHANGED), "{label}: {msg}");
         }
         Ok(())
     }
