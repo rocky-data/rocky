@@ -6,6 +6,13 @@
  */
 
 /**
+ * Severity level of a diagnostic.
+ *
+ * Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+ */
+export type Severity = "Error" | "Warning" | "Info";
+
+/**
  * Output of `rocky run --dag`: per-node execution results plus aggregate counts.
  */
 export interface DagRunOutput {
@@ -14,6 +21,10 @@ export interface DagRunOutput {
    * Nodes that completed successfully.
    */
   completed: number;
+  /**
+   * Problems in the project's `consumers/` records (`E060`). Reported once for the whole graph; they never fail a node. Empty (and omitted) when the records are sound.
+   */
+  consumer_diagnostics?: Diagnostic[];
   /**
    * Wall-clock duration of the entire DAG execution.
    */
@@ -43,6 +54,47 @@ export interface DagRunOutput {
    * Scheduling warnings from dependency inference — physical-read derivation (mutual reads serialized deterministically, unparseable models, colliding targets) and label inference (label collisions where only one claimant orders the reader, unparseable models). Empty when none.
    */
   warnings?: string[];
+  [k: string]: unknown;
+}
+/**
+ * A compiler diagnostic (error, warning, or informational message).
+ *
+ * `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+ */
+export interface Diagnostic {
+  /**
+   * Diagnostic code (e.g., "E001", "W001").
+   */
+  code: string;
+  /**
+   * Human-readable message.
+   */
+  message: string;
+  /**
+   * Which model this diagnostic relates to.
+   */
+  model: string;
+  /**
+   * Severity level.
+   */
+  severity: Severity;
+  /**
+   * Source location (if available).
+   */
+  span?: SourceSpan | null;
+  /**
+   * Suggested fix (if any).
+   */
+  suggestion?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Location in a source file.
+ */
+export interface SourceSpan {
+  col: number;
+  file: string;
+  line: number;
   [k: string]: unknown;
 }
 /**

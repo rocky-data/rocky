@@ -6695,6 +6695,13 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "consumer_diagnostics": {
+            "description": "Problems in the project's `consumers/` records (`E060`). Reported once for the whole graph; they never fail a node. Empty (and omitted) when the records are sound.",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
           "duration_ms": {
             "description": "Wall-clock duration of the entire DAG execution.",
             "format": "uint64",
@@ -20939,6 +20946,13 @@
           },
           "command": {
             "type": "string"
+          },
+          "consumer_diagnostics": {
+            "description": "Problems in the project's `consumers/` records (`E060`): a file that does not load, a duplicate name, a `depends_on` entry that names no model, or an unreadable directory. A consumer is metadata about readers of the models, so these never stop a model from being written and are never counted as a failed table. `rocky compile` and `rocky ci` do refuse on them. Empty (and omitted) when the records are sound.",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
           },
           "contained": {
             "description": "Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.",
