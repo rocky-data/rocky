@@ -359,3 +359,214 @@ async fn arrow_fetch_case_branch_clone_and_checksums() {
         plan.raw_explain
     );
 }
+
+const SNAPSHOT_SOURCE: [&str; 3] = [
+    "SELECT 1 AS id, 'alice' AS name, TIMESTAMP '2024-01-01 00:00:00' AS updated_at \
+     UNION ALL SELECT 2, 'bob', TIMESTAMP '2024-01-01 00:00:00' \
+     UNION ALL SELECT 3, 'carol', TIMESTAMP '2024-01-01 00:00:00'",
+    // id 1 updated, id 3 deleted at the source.
+    "SELECT 1 AS id, 'alice2' AS name, TIMESTAMP '2024-02-01 00:00:00' AS updated_at \
+     UNION ALL SELECT 2, 'bob', TIMESTAMP '2024-01-01 00:00:00'",
+    // id 3 comes back.
+    "SELECT 1 AS id, 'alice2' AS name, TIMESTAMP '2024-02-01 00:00:00' AS updated_at \
+     UNION ALL SELECT 2, 'bob', TIMESTAMP '2024-01-01 00:00:00' \
+     UNION ALL SELECT 3, 'carol', TIMESTAMP '2024-03-01 00:00:00'",
+];
+
+/// Replace `tgt` with the rows of `select_sql`.
+async fn set_source(a: &SparkWarehouseAdapter, tgt: &str, select_sql: &str) {
+    a.execute_statement(&format!("DROP TABLE IF EXISTS {tgt}"))
+        .await
+        .unwrap();
+    a.execute_statement(&a.dialect().create_table_as(tgt, select_sql))
+        .await
+        .unwrap();
+}
+
+/// `id:name:is_current` of every version, oldest first per key.
+async fn history(a: &SparkWarehouseAdapter, tgt: &str) -> Vec<String> {
+    rows(
+        a,
+        &format!("SELECT id, name, is_current FROM {tgt} ORDER BY id, valid_from, valid_to"),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.join(":"))
+    .collect()
+}
+
+/// A snapshot model with hard deletes runs on Delta: the close step is a
+/// `MERGE … WHEN NOT MATCHED BY SOURCE`, not the `UPDATE … WHERE NOT EXISTS`
+/// that open-source Delta refuses (`DELTA_UNSUPPORTED_SUBQUERY`).
+#[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
+async fn snapshot_model_hard_deletes_invalidate_and_new_record() {
+    use rocky_core::snapshot_model::{
+        generate_snapshot_bootstrap_select, generate_snapshot_model_sql,
+    };
+    use rocky_ir::{
+        SnapshotChangeStrategy, SnapshotHardDeletes, SnapshotMetaColumns, SnapshotSpec,
+    };
+
+    let a = adapter();
+    let d = a.dialect();
+    let s = schema(&a, "snapm").await;
+    let cols: Vec<String> = ["id", "name", "updated_at"].map(String::from).to_vec();
+
+    for (mode, hard_deletes) in [
+        ("inv", SnapshotHardDeletes::Invalidate),
+        ("rec", SnapshotHardDeletes::NewRecord),
+    ] {
+        let new_record = hard_deletes == SnapshotHardDeletes::NewRecord;
+        let src = target(&a, &table(&s, &format!("src_{mode}")));
+        let tgt = target(&a, &table(&s, &format!("snap_{mode}")));
+        let spec = SnapshotSpec {
+            unique_key: vec![Arc::from("id")],
+            change: SnapshotChangeStrategy::Timestamp {
+                updated_at: Arc::from("updated_at"),
+            },
+            hard_deletes,
+            meta_columns: SnapshotMetaColumns::default(),
+            valid_to_current: None,
+        };
+        let model_sql = format!("SELECT id, name, updated_at FROM {src}");
+
+        set_source(&a, &src, SNAPSHOT_SOURCE[0]).await;
+        let boot =
+            generate_snapshot_bootstrap_select(&spec, &model_sql, d, chrono::Utc::now()).unwrap();
+        a.execute_statement(&d.create_table_as(&tgt, &boot))
+            .await
+            .unwrap();
+        assert_eq!(
+            history(&a, &tgt).await,
+            ["1:alice:true", "2:bob:true", "3:carol:true"],
+            "{mode} initial load"
+        );
+
+        // A source update (id 1) and a source delete (id 3).
+        set_source(&a, &src, SNAPSHOT_SOURCE[1]).await;
+        for stmt in
+            generate_snapshot_model_sql(&spec, &tgt, &model_sql, d, &cols, chrono::Utc::now())
+                .unwrap()
+        {
+            a.execute_statement(&stmt).await.unwrap();
+        }
+        let expected: &[&str] = if new_record {
+            &[
+                "1:alice:false",
+                "1:alice2:true",
+                "2:bob:true",
+                "3:carol:false",
+                "3:carol:true",
+            ]
+        } else {
+            &[
+                "1:alice:false",
+                "1:alice2:true",
+                "2:bob:true",
+                "3:carol:false",
+            ]
+        };
+        assert_eq!(
+            history(&a, &tgt).await,
+            expected,
+            "{mode} after update and delete"
+        );
+
+        // A rerun over the same source writes nothing.
+        for stmt in
+            generate_snapshot_model_sql(&spec, &tgt, &model_sql, d, &cols, chrono::Utc::now())
+                .unwrap()
+        {
+            a.execute_statement(&stmt).await.unwrap();
+        }
+        assert_eq!(history(&a, &tgt).await, expected, "{mode} idempotent rerun");
+
+        // The deleted key comes back and is current again.
+        set_source(&a, &src, SNAPSHOT_SOURCE[2]).await;
+        for stmt in
+            generate_snapshot_model_sql(&spec, &tgt, &model_sql, d, &cols, chrono::Utc::now())
+                .unwrap()
+        {
+            a.execute_statement(&stmt).await.unwrap();
+        }
+        let current = rows(
+            &a,
+            &format!("SELECT id FROM {tgt} WHERE is_current = TRUE ORDER BY id"),
+        )
+        .await;
+        let ids: Vec<&str> = current.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(ids, ["1", "2", "3"], "{mode} current keys after re-insert");
+        let versions_of_3 = history(&a, &tgt)
+            .await
+            .iter()
+            .filter(|r| r.starts_with("3:"))
+            .count();
+        assert_eq!(
+            versions_of_3,
+            if new_record { 3 } else { 2 },
+            "{mode} versions of the re-inserted key"
+        );
+    }
+}
+
+/// The `snapshot` pipeline generator with `invalidate_hard_deletes`.
+#[tokio::test]
+#[ignore = "requires a live Spark Connect server at SPARK_CONNECT_HOST:SPARK_CONNECT_PORT (default localhost:15002); run with `--ignored`"]
+async fn snapshot_pipeline_invalidates_hard_deletes() {
+    use rocky_core::snapshots::{
+        SnapshotConfig, SnapshotStrategy, generate_initial_load_sql, generate_snapshot_sql,
+    };
+    use rocky_ir::{SourceRef, TargetRef};
+
+    let a = adapter();
+    let d = a.dialect();
+    let s = schema(&a, "snapp").await;
+    let src_t = table(&s, "src");
+    let tgt_t = table(&s, "hist");
+    let (src, tgt) = (target(&a, &src_t), target(&a, &tgt_t));
+    let cfg = SnapshotConfig {
+        source: SourceRef {
+            catalog: src_t.catalog.clone(),
+            schema: src_t.schema.clone(),
+            table: src_t.table.clone(),
+        },
+        target: TargetRef {
+            catalog: tgt_t.catalog.clone(),
+            schema: tgt_t.schema.clone(),
+            table: tgt_t.table.clone(),
+        },
+        unique_key: vec!["id".into()],
+        strategy: SnapshotStrategy::Timestamp {
+            updated_at: "updated_at".into(),
+        },
+        invalidate_hard_deletes: true,
+    };
+    let cols: Vec<String> = ["id", "name", "updated_at"].map(String::from).to_vec();
+
+    set_source(&a, &src, SNAPSHOT_SOURCE[0]).await;
+    a.execute_statement(&generate_initial_load_sql(&cfg, d).unwrap())
+        .await
+        .unwrap();
+    for stmt in generate_snapshot_sql(&cfg, d, &cols).unwrap() {
+        a.execute_statement(&stmt).await.unwrap();
+    }
+    assert_eq!(
+        history(&a, &tgt).await,
+        ["1:alice:true", "2:bob:true", "3:carol:true"]
+    );
+
+    set_source(&a, &src, SNAPSHOT_SOURCE[1]).await;
+    for stmt in generate_snapshot_sql(&cfg, d, &cols).unwrap() {
+        a.execute_statement(&stmt).await.unwrap();
+    }
+    assert_eq!(
+        history(&a, &tgt).await,
+        [
+            "1:alice:false",
+            "1:alice2:true",
+            "2:bob:true",
+            "3:carol:false"
+        ]
+    );
+}

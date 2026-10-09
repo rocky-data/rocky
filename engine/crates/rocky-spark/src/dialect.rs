@@ -16,6 +16,7 @@
 //! | `insert_overwrite_partition` | Delta: one `INSERT INTO … REPLACE WHERE`; Iceberg: `DELETE` then `INSERT` |
 //! | `snapshot_column_identifier` | backticks, as Databricks (the trait default picks `"x"` for any other dialect name) |
 //! | `delete_partitions_sql` | `MERGE … WHEN MATCHED THEN DELETE`: open-source Delta refuses a subquery in `DELETE` |
+//! | `snapshot_close_absent_sql` | Delta: `MERGE … WHEN NOT MATCHED BY SOURCE … THEN UPDATE`: open-source Delta refuses a subquery in `UPDATE`. Iceberg: the generic `UPDATE` |
 //! | `supports_lakehouse_format_ddl`, `supports_delta_maintenance` | `false`: not verified on open-source Spark |
 //!
 //! Everything else (three-part names, backtick quoting, backslash string
@@ -238,6 +239,41 @@ impl SqlDialect for SparkDialect {
              ON {on}\n\
              WHEN MATCHED THEN DELETE"
         )
+    }
+
+    /// Delta: one `MERGE … WHEN NOT MATCHED BY SOURCE`, in place of the
+    /// generic `UPDATE … WHERE NOT EXISTS (…)` that open-source Delta Lake
+    /// refuses (`DELTA_UNSUPPORTED_SUBQUERY`). The `ON` clause joins on the
+    /// key alone, so every version of a key still in the source is matched
+    /// and left alone; a target row whose key is missing (or `NULL`) is
+    /// "not matched by source", and `condition` keeps the action to current
+    /// versions. `DISTINCT` keeps one source row per key. Iceberg runs the
+    /// generic `UPDATE`, which its row-level plans accept.
+    fn snapshot_close_absent_sql(
+        &self,
+        target: &str,
+        source: &str,
+        keys: &[String],
+        set: &str,
+        condition: &str,
+    ) -> Option<String> {
+        match self.format {
+            TableFormat::Delta => {
+                let cols = keys.join(", ");
+                let on = keys
+                    .iter()
+                    .map(|k| format!("target.{k} = source.{k}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                Some(format!(
+                    "MERGE INTO {target} AS target\n\
+                     USING (SELECT DISTINCT {cols} FROM {source} AS source) AS source\n\
+                     ON {on}\n\
+                     WHEN NOT MATCHED BY SOURCE AND ({condition}) THEN UPDATE SET {set}"
+                ))
+            }
+            TableFormat::Iceberg => None,
+        }
     }
 
     /// Backticks, as Databricks. The trait default picks its quote by
@@ -504,6 +540,80 @@ mod tests {
             d().select_clause(&ColumnSelection::Explicit(vec!["a".into()]), &[])
                 .unwrap(),
             "SELECT a"
+        );
+    }
+
+    #[test]
+    fn delta_closes_absent_snapshot_keys_with_a_merge_not_an_update() {
+        let sql = d()
+            .snapshot_close_absent_sql(
+                "`c`.`s`.`snap`",
+                "(\nSELECT 1\n)",
+                &["`id`".into(), "`region`".into()],
+                "`valid_to` = CURRENT_TIMESTAMP",
+                "target.`is_current` = TRUE",
+            )
+            .unwrap();
+        assert_eq!(
+            sql,
+            "MERGE INTO `c`.`s`.`snap` AS target\n\
+             USING (SELECT DISTINCT `id`, `region` FROM (\nSELECT 1\n) AS source) AS source\n\
+             ON target.`id` = source.`id` AND target.`region` = source.`region`\n\
+             WHEN NOT MATCHED BY SOURCE AND (target.`is_current` = TRUE) \
+             THEN UPDATE SET `valid_to` = CURRENT_TIMESTAMP"
+        );
+        assert!(!sql.contains("NOT EXISTS"));
+    }
+
+    #[test]
+    fn snapshot_generators_emit_no_update_with_a_subquery_on_delta() {
+        use rocky_core::snapshot_model::generate_snapshot_model_sql;
+        use rocky_ir::{
+            SnapshotChangeStrategy, SnapshotHardDeletes, SnapshotMetaColumns, SnapshotSpec,
+        };
+        let cols: Vec<String> = ["id", "name", "updated_at"].map(String::from).to_vec();
+        for (format, hard_deletes, merges, updates) in [
+            (TableFormat::Delta, SnapshotHardDeletes::Invalidate, 2, 0),
+            (TableFormat::Delta, SnapshotHardDeletes::NewRecord, 2, 0),
+            (TableFormat::Iceberg, SnapshotHardDeletes::Invalidate, 1, 1),
+            (TableFormat::Iceberg, SnapshotHardDeletes::NewRecord, 1, 1),
+        ] {
+            let spec = SnapshotSpec {
+                unique_key: vec![std::sync::Arc::from("id")],
+                change: SnapshotChangeStrategy::Timestamp {
+                    updated_at: std::sync::Arc::from("updated_at"),
+                },
+                hard_deletes,
+                meta_columns: SnapshotMetaColumns::default(),
+                valid_to_current: None,
+            };
+            let stmts = generate_snapshot_model_sql(
+                &spec,
+                "`c`.`s`.`snap`",
+                "SELECT id, name, updated_at FROM `c`.`s`.`src`",
+                &SparkDialect::with_table_format(format),
+                &cols,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let count = |prefix: &str| stmts.iter().filter(|s| s.starts_with(prefix)).count();
+            assert_eq!(count("MERGE INTO"), merges, "{format:?} {hard_deletes:?}");
+            assert_eq!(count("UPDATE "), updates, "{format:?} {hard_deletes:?}");
+            if format == TableFormat::Delta {
+                assert!(
+                    stmts.last().unwrap().contains("WHEN NOT MATCHED BY SOURCE"),
+                    "{stmts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iceberg_keeps_the_generic_snapshot_update() {
+        let ice = SparkDialect::with_table_format(TableFormat::Iceberg);
+        assert!(
+            ice.snapshot_close_absent_sql("t", "s", &["`id`".into()], "x = 1", "c")
+                .is_none()
         );
     }
 

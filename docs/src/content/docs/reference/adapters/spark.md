@@ -77,7 +77,7 @@ Identifiers are quoted with backticks. String literals use Spark's default backs
 | `merge` | `MERGE INTO … USING (…) ON … WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` | Explicit `update_columns` render `UPDATE SET t.c = s.c`. |
 | `delete_insert` | `MERGE … WHEN MATCHED THEN DELETE`, then `INSERT INTO` | Open-source Delta Lake refuses a subquery in a `DELETE`, so the delete is a `MERGE`. Two statements, not atomic. |
 | `time_interval` | Delta: `INSERT INTO … REPLACE WHERE <window>`. Iceberg: `DELETE` then `INSERT`. | Delta is one atomic commit. The Iceberg form is two statements, not atomic. |
-| `snapshot` | The generic SCD2 SQL | Runs with `hard_deletes = "ignore"`. `hard_deletes = "invalidate"` or `"new_record"` fails at run time with `DELTA_UNSUPPORTED_SUBQUERY`: its `UPDATE … WHERE NOT EXISTS (…)` is refused by open-source Delta Lake. |
+| `snapshot` | The generic SCD2 SQL | Runs with every `hard_deletes` mode. On Delta, the step that closes keys gone from the source is one `MERGE … WHEN NOT MATCHED BY SOURCE`, because open-source Delta Lake refuses a subquery in `UPDATE`. On Iceberg it is the generic `UPDATE`, which has not run live. |
 
 Schema drift never alters a column type in place on Spark. A type change rebuilds the table with a full refresh.
 
@@ -90,7 +90,7 @@ Schema drift never alters a column type in place on Spark. A type change rebuild
 
 ## Testing
 
-`cargo test -p rocky-spark --features spark-conformance -- --ignored` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above. It proves the string-literal round trip, every strategy's SQL, `DESCRIBE TABLE`, the view/table probe, Arrow fetch and the checksum query.
+`cargo test -p rocky-spark --features spark-conformance -- --ignored` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above. It proves the string-literal round trip, every strategy's SQL (snapshots with `invalidate` and `new_record` hard deletes included), `DESCRIBE TABLE`, the view/table probe, Arrow fetch and the checksum query.
 
 ## See also
 
