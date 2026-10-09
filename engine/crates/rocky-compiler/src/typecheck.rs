@@ -631,6 +631,7 @@ fn compute_model_typecheck(
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
+                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
                     {
                         // A function over one column that Step 1 cannot type
                         // from its name alone (`COALESCE(id, 0)`): take
@@ -3512,9 +3513,9 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
                 ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
                     continue;
                 }
-                ast::Value::SingleQuotedString(_)
-                | ast::Value::DoubleQuotedString(_)
-                | ast::Value::Boolean(_) => {}
+                // A double-quoted value is an identifier in DuckDB and
+                // PostgreSQL, so it is not a text literal here.
+                ast::Value::SingleQuotedString(_) | ast::Value::Boolean(_) => {}
                 _ => return false,
             }
         } else if !has_exact_type(branch, scope) {

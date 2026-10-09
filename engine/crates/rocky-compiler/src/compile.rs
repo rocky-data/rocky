@@ -649,7 +649,12 @@ pub fn compile_incremental(
     // state. Both sides are now the bytes the filesystem gave us.
     let changed_paths: HashSet<&Path> = changed_files.iter().map(PathBuf::as_path).collect();
     for m in &project.models {
-        if changed_paths.contains(m.file_path.as_path()) {
+        // A sidecar edit (`[target]`, `[strategy]`) changes what a reader's
+        // checks bind to (E039 binds a bare read by the target table), so it
+        // counts as an edit of the model.
+        if changed_paths.contains(m.file_path.as_path())
+            || changed_paths.contains(m.file_path.with_extension("toml").as_path())
+        {
             affected.insert(m.config.name.clone());
         }
     }
