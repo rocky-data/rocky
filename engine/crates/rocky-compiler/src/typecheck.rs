@@ -569,13 +569,24 @@ fn compute_model_typecheck(
                 col,
                 inferred.exact_type_outputs.contains(&index),
                 inferred.count_outputs.contains(&index),
+                inferred.cast_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count)) = inferred_by_name.get(col.name.as_str())
+            let Some(&(inferred_col, exact_type, count, cast)) =
+                inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
+            // A cast's output type is its target type, whatever the input
+            // is (or whether it has a traceable column at all). Only the
+            // type is taken here: nullability keeps following the input
+            // rules below, so an unresolved input stays nullable. A bare
+            // `DECIMAL` target has no digits, so inference returns
+            // `Unknown` for it and nothing is fabricated (#1721).
+            if cast && col.data_type == RockyType::Unknown {
+                col.data_type = inferred_col.data_type.clone();
+            }
             let Some(edge) = graph.producing_edge(model_name, &col.name) else {
                 // No traceable source column. Only `COUNT(...)` is typed here:
                 // it is a non-null BIGINT whatever its argument (#2295). Other
@@ -609,8 +620,8 @@ fn compute_model_typecheck(
                 // inference's answer only when the type comes straight from
                 // the SQL (a cast target, `COUNT`, `SUM`/`MIN`/`MAX`/`AVG` over
                 // one, or a `CASE`/`COALESCE` whose branches agree) and the
-                // traced input column is known — the same "Unknown input stays
-                // Unknown" rule as cast refinement.
+                // traced input column is known. (A projection that is itself a
+                // cast was typed above, whatever its input.)
                 rocky_sql::lineage::TransformKind::Expression => {
                     if exact_type
                         && inferred_col.data_type != RockyType::Unknown
@@ -759,7 +770,26 @@ fn compute_model_typecheck(
             &typed_cols,
             model_schema.schema_is_complete(),
         ));
-        diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
+        let mut time_interval_diagnostics = check_time_interval_strategy(model, &typed_cols);
+        // E022 reads the column's nullable bit, which is only a fact when every
+        // column it traces back to has a known type. A cast takes its target
+        // type whatever its input is, so `CAST(d AS DATE)` over a source with
+        // no schema is typed `Date` but still has the nullable bit of an
+        // unknown input. That guess must not refuse the model.
+        if let rocky_core::models::StrategyConfig::TimeInterval { time_column, .. } =
+            &model.config.strategy
+            && !nullability_is_proven(
+                graph,
+                typed_models,
+                col_index,
+                &relation_key,
+                model_name,
+                time_column,
+            )
+        {
+            time_interval_diagnostics.retain(|d| &*d.code != E022);
+        }
+        diagnostics.extend(time_interval_diagnostics);
         diagnostics.extend(check_merge_strategy(
             model,
             &typed_cols,
@@ -2659,34 +2689,57 @@ fn edge_input_is_known(
         .is_some_and(|input| input.data_type != RockyType::Unknown)
 }
 
+/// Whether the nullable bit of `(model, column)` rests on known types: every
+/// lineage edge on the way back to its sources reads a column whose type is
+/// known. A column with no edges (a literal, a constant expression) is proven.
+///
+/// A column typed by a cast over an unknown input has a type but only a
+/// guessed nullable bit (nullable, the safe answer for a contract or a
+/// `NOT NULL` check, but not evidence). A check that would refuse a model
+/// because the column "is nullable" must ask this first.
+fn nullability_is_proven(
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    col_index: &HashMap<String, HashMap<String, usize>>,
+    relation_key: &dyn Fn(&str) -> String,
+    model: &str,
+    column: &str,
+) -> bool {
+    graph
+        .trace_column(model, column)
+        .into_iter()
+        .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
+}
+
 /// Refine explicit casts by parsing their target types from the model SQL.
 ///
-/// Only columns that lineage left `Unknown` **and** that are produced by a cast
-/// edge — infallible [`Cast`] or fallible [`TryCast`] — whose input type is
-/// known are refined, substituting the parsed cast target (so `CAST(id AS
-/// STRING) AS id` resolves to `String`, not the source's pre-cast type — see
-/// #1145). This refines only the *type*; the nullable bit was already set in
-/// Step 1 (a `TryCast` output is nullable regardless of input — #1148) and is
-/// left untouched here.
+/// A projection that is itself a cast takes its target type in the inference
+/// merge in `compute_model_typecheck`, whatever its input is: a cast's output type
+/// is its target (so `CAST(id AS STRING) AS id` resolves to `String`, not the
+/// source's pre-cast type — see #1145 — and still does when `id` has no known
+/// type). This pass is the fallback for a cast edge that merge left `Unknown`
+/// and whose input type is known. It refines only the *type*; the nullable
+/// bit was already set in Step 1 (a `TryCast` output is nullable regardless
+/// of input — #1148) and is left untouched here.
 ///
 /// [`Cast`]: rocky_sql::lineage::TransformKind::Cast
 /// [`TryCast`]: rocky_sql::lineage::TransformKind::TryCast
 ///
-/// Two deliberate restrictions, both erring toward `Unknown` — the safe
-/// "cannot type-check" state, where a contract on the column is skipped rather
-/// than validated against a fabricated type:
+/// One deliberate restriction, erring toward `Unknown` — the safe "cannot
+/// type-check" state, where a contract on the column is skipped rather than
+/// validated against a fabricated type:
 ///
 /// - **No alias-based fallback.** A remaining `Unknown` column is not resolved
 ///   by matching its output name against an upstream column. That lookup was
 ///   unsound: an expression aliased back to a source name (e.g.
 ///   `amount_cents / 100 AS amount`) would inherit the source type even though
 ///   the expression can change it. Such columns are left `Unknown`.
-/// - **Unknown input stays Unknown.** The cast target is knowable from the SQL
-///   alone, but the target is only applied when the cast's *input* column
-///   resolves to a known type. Rocky cannot say whether such a cast is
-///   nullable: a nullable guess would refuse a valid model under a
-///   `nullable = false` contract (E012) or a `time_interval` column (E022),
-///   and a non-null guess would pass a NULL.
+///
+/// A cast whose input is unknown is typed by the merge, not left `Unknown`:
+/// the target is stated in the SQL. Its nullability is not guessed non-null —
+/// an unknown input keeps the column nullable, since a non-null guess would
+/// pass a NULL under a `nullable = false` contract. A bare `DECIMAL` target
+/// names no digits and stays `Unknown` (#1721).
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
@@ -3498,6 +3551,10 @@ pub(crate) struct SelectInference {
     exact_type_outputs: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
+    /// Outputs whose projection is itself a cast (`CAST`, `TRY_CAST`,
+    /// `SAFE_CAST`, `::`), looking through parentheses. Such an output has
+    /// the cast's target type whatever its input.
+    cast_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -3518,12 +3575,24 @@ impl SelectInference {
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
+        if is_cast_expr(expr) {
+            self.cast_outputs.insert(self.columns.len());
+        }
 
         self.columns.push(TypedColumn {
             name,
             data_type,
             nullable,
         });
+    }
+}
+
+/// Whether `expr` is a cast, looking through parentheses.
+fn is_cast_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_cast_expr(inner),
+        Expr::Cast { .. } => true,
+        _ => false,
     }
 }
 
@@ -3733,6 +3802,9 @@ fn combine_set_operation(
         columns: left.columns,
         exact_type_outputs,
         count_outputs,
+        // A combined column's type is a supertype across branches, not a
+        // single cast target.
+        cast_outputs: HashSet::new(),
         set_operation: true,
     })
 }
@@ -6181,42 +6253,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cast_over_unknown_input_stays_unknown() {
-        // The cast target (`STRING`) is knowable from the SQL alone, but when the
-        // cast's input column resolves to `Unknown` — e.g. a source type Rocky
-        // can't map, or a missing/unresolved reference — the output is left
-        // `Unknown` rather than asserting the parsed target. This is the
-        // conservative branch of the cast-alias fix (#1145): a contract on the
-        // column is skipped instead of validated against a fabricated type.
+    /// Type the first output column of `SELECT <projection> FROM
+    /// source.raw.users`. `id_type` is the type the source schema gives `id`
+    /// (`None` = no schema for the table at all).
+    fn first_column_over(projection: &str, id_type: Option<RockyType>) -> TypedColumn {
         let models = vec![make_model(
-            "cast_unknown",
-            "SELECT CAST(id AS STRING) AS id FROM source.raw.users",
+            "casted",
+            &format!("SELECT {projection} FROM source.raw.users"),
         )];
         let project = Project::from_models(models).unwrap();
-
         let mut external = HashMap::new();
-        external.insert(
-            "source.raw.users".to_string(),
-            vec![rocky_ir::ColumnInfo {
-                name: "id".to_string(),
-                data_type: "SOME_UNMAPPED_TYPE".to_string(),
-                nullable: true,
-            }],
-        );
-        let graph = build_semantic_graph(&project, &external).unwrap();
-
-        // The typed source column resolves to Unknown, so `input_is_known` is
-        // false and the cast output must remain Unknown.
         let mut sources = HashMap::new();
-        sources.insert(
-            "source.raw.users".to_string(),
-            source_schema(&[("id", RockyType::Unknown, true)]),
-        );
-
+        if let Some(id_type) = id_type {
+            external.insert(
+                "source.raw.users".to_string(),
+                vec![rocky_ir::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "SOME_UNMAPPED_TYPE".to_string(),
+                    nullable: true,
+                }],
+            );
+            sources.insert(
+                "source.raw.users".to_string(),
+                source_schema(&[("id", id_type, true)]),
+            );
+        }
+        let graph = build_semantic_graph(&project, &external).unwrap();
         let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
-        let cast_id = &result.typed_models["cast_unknown"][0];
-        assert_eq!(cast_id.data_type, RockyType::Unknown);
+        result.typed_models["casted"][0].clone()
+    }
+
+    #[test]
+    fn test_cast_over_unknown_input_takes_the_target_type() {
+        // A cast's output type is its target, whatever the input is. The
+        // input column resolves to `Unknown` (a source type Rocky cannot map)
+        // and the target is still `STRING`. Nullability stays what Rocky can
+        // back: the input is unknown, so the column is nullable (the old
+        // "leave it Unknown" rule of #1145 existed to avoid guessing that).
+        let col = first_column_over("CAST(id AS STRING) AS id", Some(RockyType::Unknown));
+        assert_eq!(col.data_type, RockyType::String);
+        assert!(col.nullable, "an unresolved input must stay nullable");
+    }
+
+    #[test]
+    fn test_cast_with_no_source_schema_takes_the_target_type() {
+        let decimal = RockyType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        for projection in [
+            "CAST(id AS DECIMAL(12, 2)) AS id",
+            "id::DECIMAL(12, 2) AS id",
+            "TRY_CAST(id AS DECIMAL(12, 2)) AS id",
+            "SAFE_CAST(id AS DECIMAL(12, 2)) AS id",
+            "CAST(id + 1 AS DECIMAL(12, 2)) AS id",
+            "CAST('1.50' AS DECIMAL(12, 2)) AS id",
+            "(CAST(id AS DECIMAL(12, 2))) AS id",
+        ] {
+            let col = first_column_over(projection, None);
+            assert_eq!(col.data_type, decimal, "{projection}");
+            assert!(col.nullable, "{projection}: nothing proves non-null");
+        }
+    }
+
+    #[test]
+    fn test_cast_to_a_bare_decimal_stays_unknown_without_a_schema() {
+        // A bare `DECIMAL` names no digits, so the target is not a type
+        // (#1721). The cast must not manufacture one.
+        for projection in [
+            "CAST(id AS DECIMAL) AS id",
+            "id::NUMERIC AS id",
+            "TRY_CAST(id AS DECIMAL) AS id",
+        ] {
+            let col = first_column_over(projection, None);
+            assert_eq!(col.data_type, RockyType::Unknown, "{projection}");
+        }
+    }
+
+    #[test]
+    fn test_try_cast_over_unknown_input_is_typed_and_nullable() {
+        let col = first_column_over("TRY_CAST(id AS BIGINT) AS id", None);
+        assert_eq!(col.data_type, RockyType::Int64);
+        assert!(col.nullable);
+    }
+
+    #[test]
+    fn test_a_function_over_a_cast_is_not_typed_as_the_cast() {
+        // Only a projection that IS a cast takes the target. `LENGTH(CAST(..))`
+        // is an integer of a width the dialect picks, not the cast's target.
+        let col = first_column_over("LENGTH(CAST(id AS STRING)) AS id", None);
+        assert_ne!(col.data_type, RockyType::String);
     }
 
     #[test]
@@ -8683,7 +8809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cast_over_a_known_input_takes_its_target_and_an_unknown_one_does_not() {
+    fn a_cast_takes_its_target_with_or_without_a_known_input() {
         let sql = "SELECT o.id, \
                    CAST(o.qty * o.price AS DECIMAL(12, 2)) AS amount, \
                    CAST(o.id AS BIGINT) AS id_big, \
@@ -8719,17 +8845,74 @@ mod tests {
             RockyType::Unknown
         );
 
-        // No schema: Rocky cannot say whether the casts are nullable, so it
-        // claims no type (a nullable guess would refuse a valid model under a
-        // NOT NULL contract or a time_interval column).
+        // No schema: the target is still the type, whatever the input is. The
+        // nullable bit stays true, because an unknown input proves nothing.
         let result = compile_typed(&[("m", sql)], HashMap::new());
+        assert_eq!(
+            column(&result, "m", "amount").data_type,
+            RockyType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
+        assert_eq!(
+            column(&result, "m", "bare_decimal").data_type,
+            RockyType::Unknown
+        );
         for name in ["amount", "id_big"] {
-            assert_eq!(
-                column(&result, "m", name).data_type,
-                RockyType::Unknown,
-                "{name}"
-            );
+            assert!(column(&result, "m", name).nullable, "{name}");
         }
+    }
+
+    /// Why `E022` is withheld for a cast over an unknown input: the cast gives
+    /// the column its type, but the nullable bit is only a guess about an
+    /// input Rocky knows nothing of. Refusing the model on that guess is the
+    /// false positive the old "leave it Unknown" rule existed to avoid.
+    fn time_interval_compile(
+        sql: &str,
+        sources: HashMap<String, Vec<TypedColumn>>,
+    ) -> crate::compile::CompileResult {
+        let mut model = make_model("m", sql);
+        model.config.strategy = StrategyConfig::TimeInterval {
+            time_column: "order_date".to_string(),
+            granularity: TimeGrain::Day,
+            lookback: 0,
+            batch_size: NonZeroU32::new(1).unwrap(),
+            first_partition: None,
+        };
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources,
+            ..Default::default()
+        };
+        crate::compile::compile_preloaded_models(vec![model], &config).expect("compile")
+    }
+
+    fn has_code(result: &crate::compile::CompileResult, code: &str) -> bool {
+        result.diagnostics.iter().any(|d| &*d.code == code)
+    }
+
+    #[test]
+    fn a_typed_cast_over_an_unknown_input_does_not_raise_e022() {
+        let sql = "SELECT CAST(order_date AS DATE) AS order_date FROM raw.orders \
+                   WHERE order_date >= @start_date AND order_date < @end_date";
+        let result = time_interval_compile(sql, HashMap::new());
+        let col = column(&result, "m", "order_date");
+        assert_eq!(col.data_type, RockyType::Date);
+        assert!(col.nullable);
+        assert!(!has_code(&result, "E022"), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_nullable_known_input_still_raises_e022() {
+        let sql = "SELECT CAST(order_date AS DATE) AS order_date FROM raw.orders \
+                   WHERE order_date >= @start_date AND order_date < @end_date";
+        let sources = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[("order_date", RockyType::Date, true)]),
+        )]);
+        let result = time_interval_compile(sql, sources);
+        assert!(has_code(&result, "E022"), "{:?}", result.diagnostics);
     }
 
     #[test]

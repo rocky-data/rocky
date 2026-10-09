@@ -186,6 +186,9 @@ pub fn run_test_with_selection(
                 run_vars,
                 gates,
                 inlined_gates,
+                strict_contracts: project_config
+                    .as_ref()
+                    .is_some_and(|config| config.contracts.strict),
             })
         },
     )?;

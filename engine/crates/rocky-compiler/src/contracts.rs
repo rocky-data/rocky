@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, I003, W010};
+use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, E059, I003, W010};
 use crate::types::{RockyType, TypedColumn};
 
 /// A compile-time contract for a model's output schema.
@@ -207,6 +207,25 @@ pub fn validate_contract(
     inferred_schema: &[TypedColumn],
     contract: &CompilerContract,
 ) -> Vec<Diagnostic> {
+    validate_contract_with(model_name, inferred_schema, contract, None)
+}
+
+/// Why a contract column's type is unknown, given the column name. Passed to
+/// [`validate_contract_with`] to turn an unchecked declared type into the
+/// [`E059`] error (`--strict-contracts`).
+pub type UnknownTypeReason<'a> = &'a dyn Fn(&str) -> String;
+
+/// [`validate_contract`] with an optional strict mode.
+///
+/// With `strict_reason` set, a column whose contract declares a type but
+/// whose inferred type is `Unknown` is an [`E059`] error instead of the
+/// [`I003`] info note. The callback explains why the type is unknown.
+pub fn validate_contract_with(
+    model_name: &str,
+    inferred_schema: &[TypedColumn],
+    contract: &CompilerContract,
+    strict_reason: Option<UnknownTypeReason<'_>>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let col_names: Vec<&str> = inferred_schema.iter().map(|c| c.name.as_str()).collect();
 
@@ -244,7 +263,32 @@ pub fn validate_contract(
                 // decides anything, and `type_name_matches` no longer treats
                 // it as a match.
                 if let Some(ref expected_type) = contract_col.type_name {
-                    if col.data_type == RockyType::Unknown {
+                    if col.data_type == RockyType::Unknown
+                        && let Some(reason) = strict_reason
+                    {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                E059,
+                                model_name,
+                                format!(
+                                    "column '{col}' of model '{model_name}': the contract declares type \
+                                     {expected_type}, but Rocky cannot work out the column's type, so the \
+                                     declared type cannot be checked ({why})",
+                                    col = contract_col.name,
+                                    why = reason(&contract_col.name),
+                                ),
+                            )
+                            .with_suggestion(format!(
+                                "cast `{0}` to a fully specified type in the SELECT (not a bare DECIMAL; the \
+                                 cast is then checked against the contract's {1}), or give the compiler source \
+                                 schemas so the type resolves (`data/seed.sql`, or \
+                                 `rocky discover --with-schemas`), or drop the type from the \
+                                 contract. `--strict-contracts` refuses a declared type Rocky \
+                                 cannot check",
+                                contract_col.name, expected_type
+                            )),
+                        );
+                    } else if col.data_type == RockyType::Unknown {
                         // Report, don't fail: see `I003` for why this is info
                         // severity and not a warning.
                         diagnostics.push(
@@ -257,25 +301,19 @@ pub fn validate_contract(
                                     contract_col.name, expected_type
                                 ),
                             )
-                            // Do NOT suggest a CAST here. `infer_expr_type`'s
-                            // cast arm takes the type purely from the target
-                            // (`sql_type_to_rocky(data_type)`, typecheck.rs);
-                            // only `nullable` reads the input expression. So a
-                            // CAST silences this diagnostic whatever the value
-                            // really is — and for a bare decimal target it
-                            // resolves to Decimal(38,0), the exact fabricated
-                            // type #1646 removed from the load gate. Advice
-                            // that manufactures the answer is worse than no
-                            // advice (#1721).
+                            // A CAST to a fully specified type does clear
+                            // this: the cast's target is the column's type
+                            // whatever the input is. A bare DECIMAL names no
+                            // digits and stays Unknown, so the advice below
+                            // says "fully specified" (#1721).
                             .with_suggestion(format!(
                                 "give the compiler source schemas so `{0}`'s type resolves — \
                                  `rocky compile`, `rocky test` and `rocky ci` read them from \
                                  `data/seed.sql` when the project has one; for a replication \
                                  pipeline, `rocky discover --with-schemas` fills the schema \
-                                 cache (it refuses transformation-only pipelines). Do not add \
-                                 a CAST to silence this: a cast \
-                                 takes its type from the target, so it would report {1} whatever \
-                                 the column actually holds",
+                                 cache (it refuses transformation-only pipelines). Or cast \
+                                 `{0}` to a fully specified type in the SELECT (not a bare \
+                                 DECIMAL): the cast's target is then checked against {1}",
                                 contract_col.name, expected_type
                             )),
                         );

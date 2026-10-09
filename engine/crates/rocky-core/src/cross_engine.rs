@@ -606,6 +606,7 @@ mod tests {
             pipeline_map.insert(name.to_owned(), pipeline);
         }
         RockyConfig {
+            contracts: Default::default(),
             state: Default::default(),
             adapters: adapter_map,
             pipelines: pipeline_map,

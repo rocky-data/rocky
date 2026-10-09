@@ -297,6 +297,7 @@ mod tests {
 
     fn empty_config() -> RockyConfig {
         RockyConfig {
+            contracts: Default::default(),
             state: Default::default(),
             adapters: Default::default(),
             pipelines: Default::default(),

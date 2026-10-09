@@ -1499,6 +1499,13 @@ enum Command {
         #[arg(long)]
         strict_sources: bool,
 
+        /// Refuse a contract column whose declared type Rocky cannot check:
+        /// the `I003` info note becomes the `E059` error, which names the
+        /// model, the column and why its type is unknown. Same as
+        /// `[contracts] strict = true`.
+        #[arg(long)]
+        strict_contracts: bool,
+
         /// Per-run variable substituted into model SQL (repeatable). Resolves
         /// `@var(name)` markers to the supplied value so `rocky compile` type-
         /// checks the same SQL `rocky run --var …` would execute. A required
@@ -2056,6 +2063,11 @@ enum Command {
         /// default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+        /// Refuse a contract column whose declared type Rocky cannot check:
+        /// the `I003` info note becomes the `E059` error. Same as
+        /// `[contracts] strict = true`.
+        #[arg(long)]
+        strict_contracts: bool,
     },
 
     /// Detect changed models between git refs and generate a structural diff report
@@ -5043,6 +5055,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_dialect,
             with_seed,
             strict_sources,
+            strict_contracts,
             var,
             deny_warnings,
             dbt_project,
@@ -5061,6 +5074,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     &run_vars,
                     strict_sources,
+                    strict_contracts,
                     &deny_warnings,
                     selection.as_ref(),
                 )
@@ -5080,6 +5094,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     &run_vars,
                     strict_sources,
+                    strict_contracts,
                     &deny_warnings,
                     selection.as_ref(),
                 )
@@ -5475,6 +5490,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             contracts,
             var,
+            strict_contracts,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -5485,6 +5501,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 contracts.as_deref(),
                 json,
                 &run_vars,
+                strict_contracts,
             )
         }
         Command::CiDiff {

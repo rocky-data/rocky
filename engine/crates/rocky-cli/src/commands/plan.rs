@@ -1223,6 +1223,7 @@ pub(crate) fn conditional_drops_for_run_plan(
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -1451,6 +1452,7 @@ fn plan_preview_output_for_pipeline(
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -1738,6 +1740,7 @@ fn build_and_persist_run_plan(
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -2749,6 +2752,7 @@ pub fn populate_governance_actions(
     let tag_to_strategy = cfg.resolve_mask_for_env(env);
 
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
@@ -2854,6 +2858,7 @@ async fn check_plan_budget(
 
     // Compile models offline — no catalog I/O here.
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,

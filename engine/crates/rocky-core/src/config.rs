@@ -2509,6 +2509,28 @@ pub struct SchemaCacheConfig {
     pub trusted_max_age_seconds: Option<u64>,
 }
 
+/// `[contracts]` — project-level contract settings.
+///
+/// ```toml
+/// [contracts]
+/// strict = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContractsConfig {
+    /// Refuse a contract column whose declared type Rocky cannot check.
+    /// Defaults to `false`.
+    ///
+    /// A contract that declares a column `type` is checked against the type
+    /// the compiler infers. When the compiler cannot infer the column's type
+    /// (a source with no known schema, an expression whose result type
+    /// depends on the warehouse), the declared type goes unchecked and the
+    /// compile reports the `I003` info note. With `strict = true` that is the
+    /// `E059` error instead. `rocky compile --strict-contracts` sets it for
+    /// one invocation; `rocky ci` and `rocky run` read this key.
+    pub strict: bool,
+}
+
 impl Default for SchemaCacheConfig {
     fn default() -> Self {
         Self {
@@ -3025,6 +3047,12 @@ pub struct RockyConfig {
     /// `expected_lag_seconds`.
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
+
+    /// Project-level contract settings (`[contracts]`). Today this is
+    /// `strict`: refuse a contract column whose declared type Rocky cannot
+    /// check. See [`ContractsConfig`].
+    #[serde(default)]
+    pub contracts: ContractsConfig,
 
     /// Project-level schedule defaults for native demand reconciliation.
     /// Supplies the fallback timezone for per-pipeline `[…schedule]` cron

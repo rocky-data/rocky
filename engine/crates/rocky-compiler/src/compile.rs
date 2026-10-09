@@ -141,6 +141,11 @@ pub struct CompilerConfig {
     /// [`crate::source_refs`]. The default records no origin, so the check
     /// stays off for callers that don't know their schemas' provenance.
     pub source_provenance: crate::source_refs::SourceProvenance,
+    /// Refuse a contract column whose declared type Rocky cannot check
+    /// (its inferred type is `Unknown`): the `I003` info note becomes the
+    /// `E059` error. `rocky compile --strict-contracts` and
+    /// `[contracts] strict = true` set it. Off by default.
+    pub strict_contracts: bool,
     /// Keep each consumer's authored SQL instead of replacing it with the
     /// form that inlines its ephemeral upstreams as CTEs
     /// ([`crate::ephemeral::apply_ephemerals`]). The language server sets
@@ -441,7 +446,11 @@ pub fn compile_project(
         let diagnostics = if contracts.is_empty() {
             Vec::new()
         } else {
-            validate_all_contracts(&contracts, &type_check.typed_models)
+            validate_all_contracts(
+                &contracts,
+                &type_check.typed_models,
+                config.strict_contracts.then_some(&semantic_graph),
+            )
         };
         (diagnostics, files)
     };
@@ -736,7 +745,11 @@ pub fn compile_incremental(
         let diagnostics = if contracts.is_empty() {
             Vec::new()
         } else {
-            validate_all_contracts(&contracts, &type_check.typed_models)
+            validate_all_contracts(
+                &contracts,
+                &type_check.typed_models,
+                config.strict_contracts.then_some(&semantic_graph),
+            )
         };
         (diagnostics, files)
     };
@@ -1003,9 +1016,56 @@ fn load_contract_map(
     })
 }
 
+/// Why `column` of `model` has no known type, for the `E059` message.
+fn unknown_type_reason(
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    model: &str,
+    column: &str,
+) -> String {
+    use rocky_sql::lineage::TransformKind;
+    let Some(edge) = graph.producing_edge(model, column) else {
+        return "the column is a literal or an expression with no source column to trace, \
+                and Rocky does not infer a type for it"
+            .to_string();
+    };
+    let source = &*edge.source.model;
+    let source_column = &*edge.source.column;
+    let input_type = typed_models
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(source))
+        .and_then(|(_, columns)| columns.iter().find(|c| &*c.name == source_column))
+        .map(|c| &c.data_type);
+    match (input_type, &edge.transform) {
+        (None, _) => {
+            format!("it reads `{source}.{source_column}` and Rocky has no schema for `{source}`")
+        }
+        (Some(RockyType::Unknown), TransformKind::Cast | TransformKind::TryCast) => format!(
+            "its CAST target has no fixed type (a bare DECIMAL or NUMERIC names no precision, \
+             or the type name is not one Rocky maps), and `{source}.{source_column}` is also \
+             of unknown type"
+        ),
+        (Some(RockyType::Unknown), _) => {
+            format!("it reads `{source}.{source_column}`, whose type is unknown")
+        }
+        (Some(_), TransformKind::Cast | TransformKind::TryCast) => {
+            "its CAST target has no fixed type (a bare DECIMAL or NUMERIC names no precision, \
+             or the type name is not one Rocky maps)"
+                .to_string()
+        }
+        (Some(_), _) => format!(
+            "the result type of the expression over `{source}.{source_column}` depends on the \
+             warehouse (for example AVG over a DECIMAL), so Rocky does not state one"
+        ),
+    }
+}
+
+/// `strict_graph` is `Some` under strict contracts: a declared type Rocky
+/// cannot check is then the `E059` error, with the reason read from the graph.
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    strict_graph: Option<&SemanticGraph>,
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
@@ -1020,7 +1080,14 @@ fn validate_all_contracts(
     for model_name in model_names {
         let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
-            let diags = contracts::validate_contract(model_name, schema, contract);
+            let diags = match strict_graph {
+                Some(graph) => {
+                    let reason =
+                        |column: &str| unknown_type_reason(graph, typed_models, model_name, column);
+                    contracts::validate_contract_with(model_name, schema, contract, Some(&reason))
+                }
+                None => contracts::validate_contract(model_name, schema, contract),
+            };
             all_diags.extend(diags);
         } else {
             all_diags.push(Diagnostic::warning(
@@ -1682,7 +1749,7 @@ mod tests {
 
         let mut expected = names.clone();
         expected.sort();
-        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models)
+        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models, None)
             .iter()
             .map(|d| d.model.clone())
             .collect();

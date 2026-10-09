@@ -71,6 +71,7 @@ pub fn run_compile(
         cache_ttl_override,
         run_vars,
         false,
+        false,
         deny_warning_codes,
         None,
     )
@@ -84,6 +85,10 @@ pub fn run_compile(
 /// to E045
 /// for this invocation. It ORs with `[cache.schemas] strict_sources`; it can
 /// turn strictness on, never off.
+///
+/// `strict_contracts` (`rocky compile --strict-contracts`) turns `I003` (a
+/// contract declares a column type Rocky cannot check) into the `E059` error.
+/// It ORs with `[contracts] strict`; it can turn strictness on, never off.
 ///
 /// `selection` (`--select` / `--exclude`) scopes the report: the whole
 /// project still compiles (types flow across models); only the selected
@@ -107,6 +112,7 @@ pub fn run_compile_with_options(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     deny_warning_codes: &[String],
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
@@ -128,6 +134,7 @@ pub fn run_compile_with_options(
         cache_ttl_override,
         run_vars,
         strict_sources,
+        strict_contracts,
         selection,
     )?;
 
@@ -171,6 +178,7 @@ pub fn run_compile_dbt_attach(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     deny_warning_codes: &[String],
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
@@ -231,6 +239,7 @@ pub fn run_compile_dbt_attach(
         cache_ttl_override,
         run_vars,
         strict_sources,
+        strict_contracts,
         deny_warning_codes,
         selection,
     )
@@ -273,6 +282,7 @@ fn compile_inner(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    strict_contracts: bool,
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
@@ -367,6 +377,12 @@ fn compile_inner(
         (schemas, provenance)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
+    // `--strict-contracts` ORs with `[contracts] strict`; it can turn
+    // strictness on, never off.
+    let strict_contracts = strict_contracts
+        || project_config
+            .as_ref()
+            .is_some_and(|config| config.contracts.strict);
 
     // Load `[mask]` + `[classifications.allow_unmasked]` for the W004
     // classification-tag completeness check. No rocky.toml (standalone
@@ -399,6 +415,7 @@ fn compile_inner(
         project_freshness,
         run_vars: run_vars.clone(),
         source_provenance,
+        strict_contracts,
         // The lints below (P001, E042/E043, imports E030/E033) judge each
         // model's SQL as authored. Against the inlined form, an ephemeral
         // model's defect would be reported again on every consumer, at
@@ -1474,6 +1491,8 @@ pub fn compile_output(
         &rocky_core::run_vars::RunVars::new(),
         // No `--strict-sources` flag on these surfaces; `[cache.schemas]
         // strict_sources` still applies.
+        false,
+        // Likewise `[contracts] strict` still applies.
         false,
         None,
     )?;
@@ -3205,6 +3224,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             strict_sources,
+            false,
             None,
         )
         .expect("compile should produce output")
@@ -3275,6 +3295,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             true,
+            false,
             &[],
             None,
         )
@@ -3404,6 +3425,7 @@ schema_template = "s"
                 None,
                 &rocky_core::run_vars::RunVars::new(),
                 false,
+                false,
                 None,
             )
             .unwrap()
@@ -3486,6 +3508,7 @@ schema_template = "s"
             seed_use,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            false,
             false,
             None,
         )

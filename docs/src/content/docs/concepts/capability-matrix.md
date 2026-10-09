@@ -76,10 +76,20 @@ Two limits, stated plainly:
   fills the schema cache that `rocky compile` reads. `discover` refuses a
   transformation-only pipeline, so for those use a seed. One limit on that:
   an expression whose result type depends on the warehouse — `AVG` over a
-  `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
-  to clear an `I003`. A cast takes its type from the target, not from the
-  value, so it reports whatever you cast to whether or not the data matches.
-  It silences the message and checks nothing.
+  `DECIMAL` column — stays `Unknown` either way. A `CAST` (also `::`,
+  `TRY_CAST` and `SAFE_CAST`) to a fully specified type clears an `I003`: the
+  column has the cast's target type whatever the input is, and the contract is
+  compared with that target. A cast to a bare `DECIMAL` or `NUMERIC` names no
+  digits, so it stays `Unknown`. A `TRY_CAST` or `SAFE_CAST` column is
+  nullable.
+- To refuse a declared type Rocky cannot check, run `rocky compile
+  --strict-contracts` or `rocky ci --strict-contracts`, or set
+  `[contracts] strict = true` in `rocky.toml` (which `rocky run` and
+  `rocky test` also read). Each `I003` is then the `E059` error. It names the
+  model and the column, says why the type is unknown, and says how to fix it:
+  give the compiler source schemas, or cast the column to a fully specified
+  type in the SELECT. `rocky run` first describes the sources in the
+  warehouse, so it refuses only what stays unknown after that.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision
   and scale exactly.

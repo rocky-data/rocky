@@ -203,6 +203,7 @@ pub async fn run_transformation(
                 // Finding #4: the transformation route reconciles no masks.
                 false,
                 contracts_dir.map(super::run::RunContracts::Directory),
+                rocky_cfg.contracts.strict,
             )
             .await;
 

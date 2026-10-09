@@ -207,6 +207,7 @@ fn prepare_preview(
     }
 
     let compiler_cfg = CompilerConfig {
+        strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
