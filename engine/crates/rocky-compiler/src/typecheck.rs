@@ -5814,6 +5814,23 @@ mod tests {
                 true,
             ),
             ("WITH c AS (SELECT x FROM t) SELECT MAX(x) FROM c", true),
+            // A USING key is a guess when either side's is.
+            (
+                "SELECT MAX(l) FROM (SELECT LENGTH(n) AS l FROM t) a \
+                 JOIN (SELECT LENGTH(n) AS l FROM t) b USING (l)",
+                false,
+            ),
+            // A set operation is exact only when both branches are.
+            (
+                "WITH c AS (SELECT CAST(x AS DOUBLE) AS d FROM t \
+                 UNION ALL SELECT CAST(n AS DOUBLE) FROM t) SELECT MAX(d) FROM c",
+                true,
+            ),
+            (
+                "WITH c AS (SELECT CAST(x AS DOUBLE) AS d FROM t \
+                 UNION ALL SELECT LENGTH(n) FROM t) SELECT MAX(d) FROM c",
+                false,
+            ),
         ] {
             let inferred = infer_select_types_with_lookup(
                 sql,
@@ -7681,6 +7698,36 @@ mod tests {
         assert_eq!(typed(both(D::DuckDb, D::Databricks), "INT"), i32);
         assert_eq!(typed(both(D::DuckDb, D::Snowflake), "INT"), unknown);
         assert_eq!(typed(both(D::Postgres, D::Snowflake), "FLOAT"), f64);
+    }
+
+    /// #2333: each model is typed for its own warehouse; a model with no
+    /// entry takes the default.
+    #[test]
+    fn each_model_casts_for_its_own_warehouse() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("x", RockyType::Int64, false)]),
+        )]);
+        let sql = "SELECT CAST(x AS INT) AS i FROM t";
+        let project =
+            Project::from_models(vec![make_model("on_duck", sql), make_model("on_sf", sql)])
+                .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let mut targets = TargetDialects::uniform(duckdb());
+        targets.set("on_sf", Some(OperandDialect::Snowflake).into());
+        let result =
+            typecheck_project_for_targets(&graph, &sources, &project.models, None, &targets);
+        assert_eq!(
+            result.typed_models["on_duck"][0].data_type,
+            RockyType::Int32
+        );
+        assert_eq!(
+            result.typed_models["on_sf"][0].data_type,
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
     }
 
     /// #2333: on Snowflake `CAST(int_col AS BIGINT)` is `NUMBER(38,0)`. The
