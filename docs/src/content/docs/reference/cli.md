@@ -709,11 +709,14 @@ table = "customers_history"
 
 ### `rocky docs`
 
-Generate project documentation as a single-page HTML catalog. Discovers models from the models directory and renders them with metadata, dependencies, and tests.
+Generate project documentation. By default Rocky writes a static site into a directory. The site has a page for each model and source, search, and an interactive lineage graph. `--format parquet` writes the same project facts as Parquet tables that DuckDB can query.
 
 ```bash
-rocky docs                                        # Generate to docs/catalog.html
-rocky docs --models models/ --output-path site/api.html  # Custom paths
+rocky docs                                            # Site in docs/site/
+rocky docs --output-path public/docs                  # Site in another directory
+rocky docs --output-path catalog.html                 # One self-contained HTML page
+rocky docs --format parquet --output-path meta        # Parquet tables in meta/
+rocky docs --select "orders+"                           # Only some models
 ```
 
 **Flags:**
@@ -721,27 +724,85 @@ rocky docs --models models/ --output-path site/api.html  # Custom paths
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--models <PATH>` | `models` | Models directory to scan. |
-| `--output-path <PATH>` | `docs/catalog.html` | Output HTML file path. |
+| `--output-path <PATH>` | `docs/site` | Output directory. A path that ends in `.html` writes one single-page catalog instead. |
+| `--format <site\|parquet>` | `site` | `site` writes the static site. `parquet` writes the metadata tables. |
+| `--contracts <PATH>` | (none) | Directory of `<model>.contract.toml` files to show, in addition to contracts that sit next to a model. |
+| `--var NAME=VALUE` | (none) | Run variable for the offline compile, as in `rocky compile --var`. |
+| `--select`, `--exclude` | (all) | Narrow the documented models. See [node selection](/reference/node-selection/). |
+
+**What the site shows:**
+
+- **Overview.** Counts, a filterable model table, and the sources.
+- **Model pages.** Description, target, source file, strategy, tags, freshness, access and owner. A column table with type, nullability, classification, description, and the upstream and downstream columns of each column. Tests, the contract, upstream and downstream models, and the SQL.
+- **Source pages.** External tables that models read, with the columns they use and the columns those feed.
+- **Lineage.** One interactive graph of models and sources. Click a node to highlight its upstream and downstream. Click a column to list its column-level lineage. Open it from a model page to focus on that model.
+- **Search.** Press `/` on any page. It matches model names, column names and descriptions.
 
 **Behavior:**
 
-- Loads all `.sql` and `.rocky` model files with their TOML sidecars.
-- Extracts: name, description (from `intent`), target table, strategy, dependencies, tests.
-- Renders a self-contained HTML page with dark theme, search, and model cards.
-- No external dependencies; the HTML is fully self-contained.
+- Reads the same offline compile that `rocky compile` runs. Column types, nullability and lineage come from that compile. Rocky does not infer them again.
+- The site needs no server and makes no network request. Open `index.html` from disk, or host the directory on any static host.
+- A rerun replaces the files under `models/` and `sources/` that end in `.html`, so a deleted model leaves no page. Other files in the directory stay.
+- When the project does not compile, `rocky docs` warns and renders without column types and lineage. It does not fail.
+
+**Parquet tables:**
+
+`--format parquet` writes seven files. Every file exists even when it has no rows.
+
+| File | One row per | Main columns |
+|------|-------------|--------------|
+| `models.parquet` | model | `name`, `target`, `strategy`, `description`, `file`, `sql`, `access`, `freshness_max_lag_seconds`, `tags`, `has_contract` |
+| `columns.parquet` | model output column | `model`, `ordinal`, `name`, `data_type`, `nullable`, `description`, `classification` |
+| `edges.parquet` | model-level dependency | `upstream`, `downstream`, `upstream_kind` (`model` or `source`) |
+| `column_lineage.parquet` | column-level lineage edge | `source_model`, `source_column`, `target_model`, `target_column`, `transform` |
+| `tests.parquet` | declared test | `model`, `kind`, `column_name`, `severity`, `params`, `filter` |
+| `contracts.parquet` | contract constraint | `model`, `kind` (`column`, `required`, `protected`, `no_new_nullable`), `column_name`, `type_name`, `nullable` |
+| `sources.parquet` | external table | `name`, `columns_read`, `used_by_count` |
+
+Example queries with the DuckDB CLI:
+
+```sql
+-- Which models read raw.orders.amount, directly or through other models?
+WITH RECURSIVE reach(model, col) AS (
+  SELECT target_model, target_column
+  FROM 'meta/column_lineage.parquet'
+  WHERE source_model = 'raw.orders' AND source_column = 'amount'
+  UNION
+  SELECT l.target_model, l.target_column
+  FROM 'meta/column_lineage.parquet' l JOIN reach r
+    ON l.source_model = r.model AND l.source_column = r.col
+)
+SELECT DISTINCT model FROM reach;
+
+-- Columns tagged pii that no test covers.
+SELECT c.model, c.name
+FROM 'meta/columns.parquet' c
+LEFT JOIN 'meta/tests.parquet' t
+  ON t.model = c.model AND t.column_name = c.name
+WHERE c.classification = 'pii' AND t.model IS NULL;
+
+-- Models with no description or no test.
+SELECT name FROM 'meta/models.parquet'
+WHERE description IS NULL OR test_count = 0;
+```
 
 **JSON output:**
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.78.0",
   "command": "docs",
-  "output_path": "docs/catalog.html",
+  "output_path": "docs/site",
   "models_count": 12,
   "pipelines_count": 2,
-  "duration_ms": 15
+  "duration_ms": 15,
+  "format": "site",
+  "sources_count": 3,
+  "files": ["index.html", "lineage.html", "assets/site.css", "models/orders.html"]
 }
 ```
+
+`format` is `site`, `html` or `parquet`. `files` lists the files written, relative to `output_path`.
 
 ---
 

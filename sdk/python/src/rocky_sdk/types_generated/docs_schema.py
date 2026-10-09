@@ -13,7 +13,19 @@ class DocsOutput(BaseModel):
 
     command: str
     duration_ms: conint(ge=0)
+    files: list[str]
+    """
+    Files written, relative to `output_path` (for `html`, the file name).
+    """
+    format: str
+    """
+    What was written: `site` (a directory), `html` (one file) or `parquet` (a directory of tables).
+    """
     models_count: conint(ge=0)
     output_path: str
     pipelines_count: conint(ge=0)
+    sources_count: conint(ge=0)
+    """
+    External tables the models read.
+    """
     version: str
