@@ -454,9 +454,16 @@ pub(crate) fn plan_scope_identities(
     OwnedScopeIdentities::from_config(cfg, binds_mask.then_some(run_plan.env.as_deref()))
 }
 
-/// The fingerprint of a compiled scope over its models alone: no config,
-/// governance or execution-control identity and no mask. Seeds still count
-/// for a `--dag` scope, because the DAG runs them.
+/// The fingerprint of a compiled scope over its models and the masks they
+/// use: no config, governance or execution-control identity. Seeds still
+/// count for a `--dag` scope, because the DAG runs them.
+///
+/// `resolved_mask` is the mask the full fingerprint binds: the plan's `--env`
+/// resolution where [`plan_binds_mask`] says apply reconciles masks, else
+/// empty. Only the strategies of tags the models classify with are hashed,
+/// and a `--dag` scope hashes none. It does not depend on the process
+/// environment, so a person's apply still refuses a `[mask]` strategy change
+/// for a tag the models use.
 ///
 /// A person's apply compares this one. The identities hash adapters and
 /// pipelines with their `${VAR}` values resolved, so the full fingerprint
@@ -465,8 +472,8 @@ pub(crate) fn plan_scope_identities(
 pub(crate) fn scope_models_only_fingerprint(
     scope: &ApprovalScope,
     compiled: &[CompiledUnit],
+    resolved_mask: &BTreeMap<String, rocky_ir::MaskStrategy>,
 ) -> Result<Option<String>> {
-    let no_mask = BTreeMap::new();
     scope_fingerprint(
         scope,
         compiled,
@@ -474,7 +481,7 @@ pub(crate) fn scope_models_only_fingerprint(
             config: "",
             governance: "",
             exec_control: "",
-            resolved_mask: &no_mask,
+            resolved_mask,
         },
     )
 }
@@ -484,9 +491,10 @@ pub(crate) fn scope_models_only_fingerprint(
 /// so a failed HTTP apply job's `error` carries it.
 pub(crate) const PLAN_MODELS_CHANGED: &str = "plan_models_changed";
 
-/// The stable code an agent's apply refuses with when the plan's models are
-/// unchanged but the config they run under is not (adapters, pipelines,
-/// governance, run settings, or the mask, as resolved in this environment).
+/// The stable code an agent's apply refuses with when the plan's models (and
+/// the masks they use) are unchanged but the config they run under is not
+/// (adapters, pipelines, governance or run settings, as resolved in this
+/// environment).
 pub(crate) const PLAN_CONFIG_CHANGED: &str = "plan_config_changed";
 
 /// The stable code `rocky apply` refuses with when a plan carries a
@@ -504,10 +512,14 @@ pub(crate) const PLAN_SNAPSHOT_MISSING: &str = "plan_snapshot_missing";
 /// ```text
 ///   principal  compares                       on mismatch
 ///   agent      full fingerprint               plan_config_changed if the
-///              (models + config identities)   models alone still match,
-///                                             else plan_models_changed
+///              (models + masks + config       models and masks still
+///              identities)                    match, else plan_models_changed
 ///   other      models-only fingerprint        plan_models_changed
+///              (models + masks)
 /// ```
+///
+/// "Masks" is the `[mask]` strategy, resolved for the plan's `--env`, of each
+/// tag the models classify with, where the plan binds masks at all.
 ///
 /// An agent's apply is also re-checked inside `run`. A person's is not, so
 /// for a person the models can still change between this check and the
@@ -573,24 +585,30 @@ pub(crate) fn verify_plan_models_for_apply(
         }
         .anchored_at(root)
     } else {
-        approval_scope(cfg, config_path, run_plan)?
+        // Resolved against the config path joined to `root`, as propose and
+        // review do, so the directory and the glob are both anchored at the
+        // project root and not at the process cwd.
+        approval_scope(cfg, &root.join(config_path), run_plan)?.anchored_at(root)
     };
     let compiled = scope
         .compile(&source_schemas, NoModels::Empty)
         .map_err(|e| models_changed(&format!("Its models no longer compile ({e:#})")))?;
-    let models_only = scope_models_only_fingerprint(&scope, &compiled)
+    // The mask the plan's full fingerprint binds, resolved for the plan's
+    // stored `--env`. The models-only fingerprint binds the same mask.
+    let ids = plan_scope_identities(plan, &scope, cfg, run_plan);
+    let models_only = scope_models_only_fingerprint(&scope, &compiled, &ids.resolved_mask)
         .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
     let models_match =
         expected_models_only.is_some() && models_only.as_deref() == expected_models_only;
     if !agent {
         if !models_match {
             return Err(models_changed(
-                "A model it runs was added, removed or changed",
+                "A model it runs was added, removed or changed, or the `[mask]` strategy of a \
+                 tag those models classify with changed",
             ));
         }
         return Ok(());
     }
-    let ids = plan_scope_identities(plan, &scope, cfg, run_plan);
     let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
         .map_err(|e| models_changed(&format!("Its fingerprint cannot be recomputed ({e:#})")))?;
     if actual.as_deref() == Some(expected) {
@@ -600,13 +618,13 @@ pub(crate) fn verify_plan_models_for_apply(
         return Err(anyhow::anyhow!(
             "{PLAN_CONFIG_CHANGED}: refusing to apply plan '{plan_id}': its models are \
              unchanged, but the config they run under changed since this plan was made \
-             (adapters, pipelines, governance, run settings or masks, as resolved in this \
+             (adapters, pipelines, governance or run settings, as resolved in this \
              environment). An agent's apply runs only under the config its plan was made \
              with; plan again with `rocky plan` in this environment."
         ));
     }
     Err(models_changed(
-        "A model it runs was added, removed or changed, or the config those models run under \
-         changed",
+        "A model it runs was added, removed or changed, the `[mask]` strategy of a tag those \
+         models classify with changed, or the config those models run under changed",
     ))
 }

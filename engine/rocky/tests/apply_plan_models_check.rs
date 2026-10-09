@@ -1,9 +1,11 @@
 //! `rocky apply` checks a plan's models before it runs them, through the
 //! real `rocky plan` and `rocky apply` binaries.
 //!
-//! A person's apply compares the models only. So a plan whose models are
-//! unchanged applies, even from another environment; a plan whose model was
-//! edited refuses with `plan_models_changed`. Each case plans through the
+//! A person's apply compares the models only, plus the `[mask]` strategy of
+//! each tag they classify with where the run applies masks. So a plan whose
+//! models are unchanged applies, even from another environment; a plan whose
+//! model, or whose used tag's mask strategy, was edited refuses with
+//! `plan_models_changed`. Each case plans through the
 //! real entry point, edits a model and expects the refusal, then restores
 //! the model and expects the apply to succeed.
 //!
@@ -194,4 +196,35 @@ fn a_different_env_value_applies_for_a_person_and_refuses_an_agent() {
         CONFIG_CHANGED,
     );
     refuses_when_edited_then_applies(root, &plan_id, &root.join("models/totals.sql"), &other_env);
+}
+
+/// Replace `old` with `new` in `rocky.toml`; return the original text.
+fn edit_config(root: &Path, old: &str, new: &str) -> String {
+    let path = root.join("rocky.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(original.matches(old).count(), 1, "{old} in {original}");
+    std::fs::write(&path, original.replacen(old, new, 1)).unwrap();
+    original
+}
+
+/// (f) A `--all` plan binds the mask of each tag its models classify with,
+/// resolved for the plan's `--env`. A person's apply refuses when that
+/// strategy changes (`hash` to `none` unmasks the column), from another
+/// environment too, and applies once it is restored. A change to a tag no
+/// model classifies with still applies.
+#[test]
+fn a_mask_change_for_a_used_tag_refuses_a_person() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    replication_project(root, "${ROCKY_TEST_DB}", true);
+
+    let plan_id = plan(root, &["--all"], &[("ROCKY_TEST_DB", "fixture.duckdb")]);
+    let other_env = [("ROCKY_TEST_DB", "./fixture.duckdb")];
+
+    let original = edit_config(root, "pii = \"hash\"", "pii = \"none\"");
+    assert_refused(&apply(root, &plan_id, None, &other_env), MODELS_CHANGED);
+    std::fs::write(root.join("rocky.toml"), &original).unwrap();
+
+    edit_config(root, "pii = \"hash\"", "pii = \"hash\"\nunused = \"none\"");
+    assert_applied(&apply(root, &plan_id, None, &other_env));
 }

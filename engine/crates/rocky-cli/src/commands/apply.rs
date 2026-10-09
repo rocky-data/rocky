@@ -11320,6 +11320,39 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// A relative config path resolves against the project root, not the
+    /// process cwd, as propose and review resolve it. The test process runs
+    /// in the crate directory, which has no `gold/`: resolved against the
+    /// cwd, the check finds no models and refuses an unchanged plan.
+    #[test]
+    fn a_relative_config_path_resolves_against_the_project_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_pipeline_plan(root, &config, PolicyPrincipal::Human)?;
+        let cwd = std::env::current_dir()?;
+        assert!(
+            !cwd.join("gold").exists(),
+            "the cwd must not hold the models"
+        );
+
+        let plan = crate::plan_store::read_plan(root, &plan_id)?;
+        let cfg = rocky_core::config::load_rocky_config(&config)?;
+        for principal in [PolicyPrincipal::Human, PolicyPrincipal::Agent] {
+            super::super::approval_scope::verify_plan_models_for_apply(
+                &plan,
+                &plan_id,
+                Some(&cfg),
+                Path::new("rocky.toml"),
+                root,
+                &gold_run_plan(),
+                principal,
+            )
+            .map_err(|e| anyhow::anyhow!("{principal:?}: {e:#}"))?;
+        }
+        Ok(())
+    }
+
     /// A plan with a fingerprint but no source-schema snapshot predates the
     /// check: it refuses with `plan_snapshot_missing` and says to plan again
     /// because of that, not "models changed". So does a person's apply of a

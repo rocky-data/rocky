@@ -2089,11 +2089,13 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             resolved_mask: &resolved_mask,
         },
     );
-    // The models-only fingerprint a person's apply compares: the same scope
-    // and compile, with no config, governance or execution-control identity
-    // and no mask, so a different environment does not read as a change.
+    // The models-only fingerprint a person's apply compares: the same scope,
+    // compile and mask, with no config, governance or execution-control
+    // identity, so a different environment does not read as a change but a
+    // `[mask]` strategy change for a tag the models use does.
     let fingerprints = models_fingerprint.and_then(|full| {
-        let models_only = super::approval_scope::scope_models_only_fingerprint(scope, &heads)?;
+        let models_only =
+            super::approval_scope::scope_models_only_fingerprint(scope, &heads, &resolved_mask)?;
         // Both or neither: a plan never carries a models-only fingerprint
         // its full one could not back.
         Ok(match full {
