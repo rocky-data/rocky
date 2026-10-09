@@ -3519,9 +3519,10 @@ fn sanitize_result_errors(result: &mut serde_json::Value) {
     }
 }
 
-/// An indented backtrace frame: `  at <location>:<line>` or
-/// `  at <location>:<line>:<column>`. Other indented lines, such as SQL that
-/// opens `    with cte as (`, are kept.
+/// An indented backtrace frame: `  at <location>`, where the location ends
+/// in `:<line>` (or `:<line>:<column>`), or is a single token that names a
+/// path (`crates/x/src/y.rs`). Other indented lines, such as SQL that opens
+/// `    with cte as (` or `    at time zone 'UTC'`, are kept.
 fn is_backtrace_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.len() == line.len() {
@@ -3530,7 +3531,8 @@ fn is_backtrace_line(line: &str) -> bool {
     let Some(location) = trimmed.strip_prefix("at ") else {
         return false;
     };
-    let mut rest = location.trim_end();
+    let location = location.trim();
+    let mut rest = location;
     let mut numbers = 0;
     while numbers < 2 {
         match rest.rsplit_once(':') {
@@ -3543,7 +3545,11 @@ fn is_backtrace_line(line: &str) -> bool {
             _ => break,
         }
     }
-    numbers > 0 && !rest.trim().is_empty()
+    if numbers > 0 {
+        return !rest.trim().is_empty();
+    }
+    // Without a line number, only a single path-like token is a frame.
+    !rest.is_empty() && !rest.contains(char::is_whitespace) && rest.contains(['/', '\\'])
 }
 
 /// `thread 'main' panicked at src/x.rs:1:2:` keeps `thread 'main' panicked:`.
@@ -3566,62 +3572,44 @@ fn closes_path_token(c: char) -> bool {
     c.is_whitespace() || "'\"`)]}>,;".contains(c)
 }
 
-/// The Unix directories a local filesystem path starts under. A path under
-/// another root, such as a REST path (`/api/2.0/…`, `/v1/statements`), is
-/// not redacted: it names no file on the server.
-const FILESYSTEM_ROOTS: &[&str] = &[
-    "/Users/",
-    "/home/",
-    "/tmp/",
-    "/var/",
-    "/private/",
-    "/etc/",
-    "/opt/",
-    "/root/",
-    "/mnt/",
-    "/media/",
-    "/usr/",
-    "/srv/",
-    "/run/",
-    "/proc/",
-    "/nix/",
-    "/Volumes/",
-    "/Library/",
-    "/Applications/",
-    // Common container and CI working directories.
-    "/app/",
-    "/workspace/",
-    "/workspaces/",
-    "/data/",
-    "/build/",
-    "/builds/",
-    "/code/",
-    "/src/",
-    "/github/",
-    "/__w/",
+/// The URL-path prefixes of API routes. A token that opens with one names a
+/// REST endpoint (`/api/2.0/sql/statements`, `/v1/statements`), not a file
+/// on the server, and is kept. Every other absolute path is redacted.
+const API_ROUTE_PREFIXES: &[&str] = &[
+    "/api/", "/v1/", "/v2/", "/v3/", "/v4/", "/v5/", "/v6/", "/v7/", "/v8/", "/v9/", "/2.0/",
+    "/1.2/", "/rest/", "/oauth", "/sql/",
 ];
 
-/// Whether `rest` opens a Unix path under a [`FILESYSTEM_ROOTS`] directory
-/// with at least one more segment (`/etc/passwd`, not `/etc/`).
+/// Whether `rest` opens a Unix path with at least two segments (`/etc/passwd`,
+/// not `/etc/` or `//host`) that is not an API route.
 fn opens_filesystem_path(rest: &str) -> bool {
-    FILESYSTEM_ROOTS.iter().any(|root| {
-        rest.strip_prefix(root)
-            .and_then(|tail| tail.chars().next())
-            .is_some_and(|c| c != '/' && !closes_path_token(c))
-    })
+    let token = &rest[..rest.find(closes_path_token).unwrap_or(rest.len())];
+    let Some(tail) = token.strip_prefix('/') else {
+        return false;
+    };
+    let Some((first, second)) = tail.split_once('/') else {
+        return false;
+    };
+    !first.is_empty()
+        && !second.is_empty()
+        && !second.starts_with('/')
+        && !API_ROUTE_PREFIXES
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
 }
 
 /// The byte length of a local filesystem path starting at `rest`, or
-/// `None`: a Unix path under a [`FILESYSTEM_ROOTS`] directory, a `file:///x…`
-/// URL, a home path (`~/x…`), a Windows path (`C:\x…` or `C:/x…`) or a UNC
-/// path (`\\host\x…`).
+/// `None`. Fails closed: any Unix path of two or more segments that is not
+/// an API route (see [`API_ROUTE_PREFIXES`]), a `file://` URL, a home path
+/// (`~/x…`), a Windows path (`C:\x…` or `C:/x…`) or a UNC path (`\\host\x…`).
+/// A path inside another URL (`https://host/a/b`) is not reached here: its
+/// slashes follow a host character, which opens no token.
 fn absolute_path_at(rest: &str) -> Option<usize> {
     let bytes = rest.as_bytes();
     let starts = match bytes {
-        [b'f', b'i', b'l', b'e', b':', b'/', b'/', b'/', ..] => true,
+        _ if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"file://") => true,
         [b'\\', b'\\', next, ..] => next.is_ascii_alphanumeric(),
         [letter, b':', b'/', next, ..] => letter.is_ascii_alphabetic() && *next != b'/',
-        // `https://host` never reaches a root here: `//host` is no root.
         [b'/', ..] => opens_filesystem_path(rest),
         [b'~', b'/', ..] => true,
         [letter, b':', b'\\', ..] => letter.is_ascii_alphabetic(),
@@ -3635,8 +3623,8 @@ fn contains_absolute_path(line: &str) -> bool {
 }
 
 /// Replace every local filesystem path in `text` with `<path>`. A URL's
-/// `//host/x` is not a path: its slashes follow `:` or a host character. A
-/// REST path is not one either (see [`FILESYSTEM_ROOTS`]).
+/// `//host/x` is not a path: its slashes follow `:` or a host character. An
+/// API route is not one either (see [`API_ROUTE_PREFIXES`]).
 fn redact_absolute_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev: Option<char> = None;
@@ -11433,7 +11421,14 @@ adapter = "db"
     #[tokio::test]
     async fn the_webhook_still_needs_its_hmac_under_a_writable_ui() {
         let dir = tempfile::tempdir().unwrap();
-        let state = ui_state_scoped(TokenScope::Full, &[], Some(("hook-secret", &dir)));
+        // A per-run secret: the temp dir's random name.
+        let hook_secret = dir
+            .path()
+            .file_name()
+            .expect("a temp dir has a name")
+            .to_string_lossy()
+            .into_owned();
+        let state = ui_state_scoped(TokenScope::Full, &[], Some((&hook_secret, &dir)));
         let base = spawn_router(state).await;
         let client = no_redirect_client();
         let cookie = login_cookie(&client, &base).await;
@@ -11457,7 +11452,7 @@ adapter = "db"
         let body = b"{}";
         let resp = client
             .post(&url)
-            .header(WEBHOOK_SIGNATURE_HEADER, sign("hook-secret", body))
+            .header(WEBHOOK_SIGNATURE_HEADER, sign(&hook_secret, body))
             .body(body.to_vec())
             .send()
             .await
@@ -11768,8 +11763,11 @@ Caused by:
         assert!(error.contains("a model it runs was changed"), "{error}");
         // A warehouse error body is JSON too, but not a tracing event: kept.
         assert!(error.contains("TABLE_NOT_FOUND"), "{error}");
-        for leaked in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"] {
-            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+        for (i, leaked) in ["SELECT", ".cargo/registry", "DEBUG", "TRACE", "INFO"]
+            .iter()
+            .enumerate()
+        {
+            assert!(!error.contains(leaked), "probe {i} leaked into the error");
         }
     }
 
@@ -11813,24 +11811,30 @@ Caused by:
 "
         );
         let error = concise_job_error(&stderr).expect("an error");
-        for leaked in [
+        for (i, leaked) in [
             "/Users/me",
             "C:\\Users",
             "/rustc",
             "~/secret",
             "crates/rocky-cli",
             secret,
-        ] {
-            assert!(!error.contains(leaked), "{leaked} leaked: {error}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(!error.contains(leaked), "probe {i} leaked into the error");
         }
         assert!(
             error.starts_with("Error: failed to open '<path>'"),
-            "{error}"
+            "a quoted path is redacted"
         );
-        assert!(error.contains("<path> is locked"), "{error}");
+        assert!(
+            error.contains("<path> is locked"),
+            "a Windows path is redacted"
+        );
         assert!(
             error.contains("https://docs.example.com/a/b"),
-            "a URL is not a path: {error}"
+            "a URL is not a path"
         );
 
         // Other spellings of an absolute path.
@@ -11887,6 +11891,53 @@ POST /v1/statements returned an error
         assert_eq!(error, "Error: /etc/ and /v2/x and <path> and <path>");
     }
 
+    /// Redaction fails closed: every absolute path of two or more segments
+    /// is redacted, whatever directory it starts under, unless it is an API
+    /// route or sits inside a non-`file` URL. Quoted paths are redacted. An
+    /// indented `at <path>` frame is dropped with or without a line number;
+    /// indented SQL is kept.
+    #[test]
+    fn redacts_every_absolute_path_but_api_routes_and_urls() {
+        for (text, leaked) in [
+            ("Error: open /work/x/y failed", "/work/x"),
+            ("Error: open /scratch/a/b failed", "/scratch/a"),
+            ("Error: open \"/home/u/x\" failed", "/home/u"),
+            ("Error: open '/home/u/x' failed", "/home/u"),
+            ("Error: open 'C:\\Users\\u\\x' failed", "Users"),
+            ("Error: see file:///Users/u/x", "/Users/u"),
+            ("Error: see FILE://host/share/x", "host/share"),
+        ] {
+            let error = concise_job_error(text).expect("an error");
+            assert!(!error.contains(leaked), "{leaked:?} leaked: {error}");
+            assert!(error.contains("<path>"), "{error}");
+        }
+        for kept in [
+            "Error: POST /api/2.0/sql/statements returned 400",
+            "Error: GET https://host/v1/x returned 500",
+            "Error: GET https://host/home/u/x returned 500",
+            "Error: GET /v3/jobs/run returned 500",
+            "Error: GET /2.0/clusters/list returned 500",
+            "Error: GET /1.2/contexts/create returned 500",
+            "Error: GET /rest/api/latest returned 500",
+            "Error: POST /oauth2/token returned 401",
+            "Error: POST /sql/statements/x returned 400",
+            "Error: /etc/ alone is not a path",
+        ] {
+            assert_eq!(concise_job_error(kept).as_deref(), Some(kept));
+        }
+        let stderr = "\
+Error: boom
+  at crates/x/src/y.rs
+  at crates/x/src/y.rs:12
+    with cte as (
+    at time zone 'UTC'
+";
+        let error = concise_job_error(stderr).expect("an error");
+        assert!(!error.contains("crates/x"), "{error}");
+        assert!(error.contains("    with cte as ("), "{error}");
+        assert!(error.contains("    at time zone 'UTC'"), "{error}");
+    }
+
     /// A failed job's `error` is never empty: when cleaning leaves nothing,
     /// it says the job failed and to see the server log. So does an
     /// `errors[].error` that cleans to nothing.
@@ -11924,10 +11975,10 @@ POST /v1/statements returned an error
         });
         super::sanitize_result_errors(&mut result);
         let first = result["errors"][0]["error"].as_str().unwrap();
-        assert!(first.starts_with("bad "), "{first}");
-        assert!(first.ends_with(" at <path>"), "{first}");
-        for leaked in [secret, "/home/me", "src/y.rs"] {
-            assert!(!first.contains(leaked), "{leaked} leaked: {first}");
+        assert!(first.starts_with("bad "), "the message is kept");
+        assert!(first.ends_with(" at <path>"), "the path is redacted");
+        for (i, leaked) in [secret, "/home/me", "src/y.rs"].iter().enumerate() {
+            assert!(!first.contains(leaked), "probe {i} leaked into the error");
         }
         let long = result["errors"][1]["error"].as_str().unwrap();
         assert!(long.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8());
