@@ -148,6 +148,7 @@ fn model_exec(name: &str) -> ModelExecution {
         output_column_hashes: None,
         attempts: Vec::new(),
         output_version: None,
+        output_target: None,
     }
 }
 

@@ -372,6 +372,7 @@ mod tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 

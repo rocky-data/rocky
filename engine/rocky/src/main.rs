@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
+use rocky_cli::commands::CostEstimateMode;
 use tracing::warn;
 
 /// Extended help text for the shared `--filter` flag on `rocky plan`,
@@ -1008,6 +1009,17 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, default_value = "main", global = false)]
         base: String,
+        /// How the plan's `cost_preview` is estimated.
+        ///
+        /// `heuristic` (default) uses Rocky's offline cost model over the
+        /// compiled DAG and never contacts the warehouse. `adapter` asks the
+        /// warehouse to estimate each planned model's generated SQL
+        /// (`EXPLAIN` or a dry run, as `rocky estimate` does) and falls back
+        /// to the heuristic for any model it cannot estimate. Either way the
+        /// preview is report-only and never changes the plan or the exit code.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_enum, default_value = "heuristic", global = false)]
+        cost_estimate: CostEstimateMode,
     },
 
     /// Execute the full pipeline in one step: discover → drift → create → copy → check.
@@ -1225,6 +1237,30 @@ enum Command {
         /// reference at a single schema instead (catalog + table preserved).
         #[arg(long, value_name = "SCHEMA", requires = "defer")]
         defer_to: Option<String>,
+
+        /// Saved production state the deferred upstreams resolve from when
+        /// `--defer` is set: the path of a Rocky state store file, for
+        /// example a copy of production's `.rocky-state.redb`.
+        ///
+        /// Each unbuilt upstream a selected model reads resolves to the table
+        /// the newest successful production run in that store recorded for
+        /// it (catalog, schema and table). The store is opened read-only. The
+        /// run refuses before any write when the store is missing, has an
+        /// incompatible state schema version, or has no recorded table for a
+        /// needed upstream. Mutually exclusive with `--defer-to`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "defer",
+            conflicts_with = "defer_to"
+        )]
+        defer_to_state: Option<PathBuf>,
+
+        /// Read deferred upstreams only from this production run in the
+        /// `--defer-to-state` store, instead of the newest run that built each
+        /// upstream.
+        #[arg(long, value_name = "RUN_ID", requires = "defer_to_state")]
+        defer_run_id: Option<String>,
 
         /// Skip re-materializing transformation models whose logic and
         /// upstream data both appear unchanged since the last successful
@@ -4263,6 +4299,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             semantic,
             intent,
             base,
+            cost_estimate,
         } => {
             // #1550: a default-plan flag alongside a plan subcommand used to be
             // ACCEPTED and then silently discarded — the dispatch below reads
@@ -4271,6 +4308,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // and only over the flags `plan` itself declares: inherited globals
             // (`--output`, `--principal`) are consumed by the promote path and
             // must keep working before the subcommand.
+            let non_default_cost = cost_estimate != CostEstimateMode::Heuristic;
             if subcommand.is_some()
                 && let Some(flag) = offending_default_plan_flag(&[
                     ("--filter", filter.is_some()),
@@ -4301,6 +4339,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--semantic", semantic),
                     ("--intent", intent.is_some()),
                     ("--base", base != "main"),
+                    ("--cost-estimate", non_default_cost),
                 ])
             {
                 anyhow::bail!(
@@ -4402,6 +4441,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         semantic,
                         &base,
                         &state_path,
+                        cost_estimate,
                         json,
                     )
                     .await
@@ -4462,6 +4502,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             defer,
             defer_to,
+            defer_to_state,
+            defer_run_id,
             skip_unchanged,
             force_rebuild,
             no_reuse,
@@ -4682,6 +4724,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let defer_opts = rocky_cli::commands::DeferOptions {
                 enabled: defer,
                 defer_to,
+                defer_state: defer_to_state.map(|path| rocky_cli::commands::DeferStateSource {
+                    path,
+                    run_id: defer_run_id,
+                }),
                 selected_models,
                 ..Default::default()
             };
@@ -7115,6 +7161,7 @@ mod tests {
                 select: _,
                 exclude: _,
                 state_ref: _,
+                cost_estimate: _,
             } => extract(
                 filter,
                 pipeline,

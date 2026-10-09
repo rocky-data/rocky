@@ -305,7 +305,7 @@ Four plan kinds are always gated, whatever the policy: `ai_authored`, `backfill`
 
 ### Flags
 
-Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic`, `--intent` and `--base`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
+Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic`, `--intent`, `--base` and `--cost-estimate`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
 
 Rocky records the execution flags in the plan file, so `rocky apply` replays the same intent. The recorded set is:
 
@@ -346,6 +346,25 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
 | `--intent <INTENT>` | `string` | | **Experimental.** State what the change is meant to do, and check it on the data. The only value is `refactor`. See [Check a refactor with `--intent`](#check-a-refactor-with---intent). |
 | `--base <ref>` | `string` | `main` | Git ref the working tree is compared against. `--semantic` and `--intent` use it. The change classification that every run plan carries uses it too. |
+| `--cost-estimate <MODE>` | `string` | `heuristic` | How `cost_preview` is estimated. `heuristic` is offline and never contacts the warehouse. `adapter` asks the warehouse with `EXPLAIN`. See [Cost preview](#cost-preview). Not recorded in the plan. |
+
+### Cost preview
+
+When the plan covers transformation models, the JSON output has a `cost_preview` object. It shows what applying the plan would rebuild, and roughly what it would cost, before any model runs.
+
+| Field | Meaning |
+|---|---|
+| `is_estimate` | Always `true`. Every figure is an estimate. |
+| `source` | `heuristic`, `adapter`, or `mixed` when the adapter could not estimate some models. Each row in `models` has its own `source`. |
+| `models_to_rebuild` | The rebuild scope: the number of models the plan rebuilds. |
+| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over every model. A total is absent when any model lacks the figure. |
+| `previous_cost_usd` | The observed cost of the same models in the last successful production run, priced from the state store. Absent when any model has no such run. |
+| `cost_delta_usd` | `estimated_cost_usd - previous_cost_usd`. Set only when every model has an adapter estimate and a previous cost. |
+| `notes` | Why a figure is missing, for example a failed `EXPLAIN`. |
+
+The default `heuristic` uses the same cost model as `cost_hint` in `rocky compile`. It assumes placeholder statistics for source tables, so its confidence is always `low`. Use it to compare plans, not to set a budget. A DuckDB target costs `0`. `--cost-estimate adapter` runs `EXPLAIN` for each planned model, as [`rocky estimate`](/reference/cli/#rocky-estimate) does. A model the adapter cannot estimate falls back to the heuristic, with a note.
+
+The preview is report-only. It never changes the planned models, the budget check or the exit code, and it is not part of `plan_id`.
 
 > The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal: the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
 
@@ -627,6 +646,8 @@ rocky run [flags]
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
+| `--defer-to-state <PATH>` | `PathBuf` | | Saved production state store file the deferred upstreams resolve from. Requires `--defer`; conflicts with `--defer-to`. Each unbuilt upstream a selected model reads resolves to the table the newest successful production run recorded for it. Opened read-only. Refuses before any write when the store is missing, has an incompatible state schema version, or has no recorded table for a needed upstream. See [Defer to a saved production state](/guides/skip-and-defer/#defer-to-a-saved-production-state). |
+| `--defer-run-id <RUN_ID>` | `string` | | Read deferred upstreams only from this production run in the `--defer-to-state` store. Requires `--defer-to-state`. |
 | `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
 | `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
 | `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`, so the table holds the model's full result. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and rebuilding from it would drop history. The flag also turns off the `--skip-unchanged` gate. |

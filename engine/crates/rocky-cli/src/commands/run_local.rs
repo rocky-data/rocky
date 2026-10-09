@@ -1699,6 +1699,7 @@ pub async fn run_snapshot(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: None,
         });
     } else {
         output.tables_failed = 1;

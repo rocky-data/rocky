@@ -1099,6 +1099,12 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// `--defer-to-state <PATH>` (and optional `--defer-run-id`). When set,
+    /// each unbuilt upstream a selected model reads resolves to the table a
+    /// production run in that state store recorded for it, and the run
+    /// refuses with a [`super::DeferStateError`] when the state cannot
+    /// answer. Mutually exclusive with [`Self::defer_to`].
+    pub defer_state: Option<super::DeferStateSource>,
     /// Multi-model graph selection (`--select` / `--exclude`), already
     /// resolved to model names. `None` (every caller that does not pass a
     /// selector) keeps today's behavior. When `Some`, `rocky run` takes the
@@ -10170,16 +10176,63 @@ fn apply_defer_rewrite(
     // for a `--select` that resolved to more than one model.
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
+    // `--defer-to-state`: resolve each unselected upstream a selected model
+    // reads from the recorded production state, before any SQL is touched.
+    // Every needed upstream must resolve, or the run refuses.
+    let state_targets = match &defer_opts.defer_state {
+        Some(source) => {
+            anyhow::ensure!(
+                defer_opts.defer_to.is_none(),
+                "--defer-to and --defer-to-state cannot be combined"
+            );
+            let needed = deferred_upstreams_needed(
+                compile_result,
+                &selected_set,
+                dialect_case_rules(dialect)?,
+                dialect_recursive_cte_visibility(dialect),
+            );
+            Some(super::defer_state::resolve_deferred_upstreams(
+                source, &needed,
+            )?)
+        }
+        None => None,
+    };
+
     // The deferred set = every compiled model not in the selection, mapped to
     // its qualified defer target. `--defer-to` overrides the schema part;
     // catalog + table always come from the upstream's own configured target.
+    // Under `--defer-to-state` all three parts come from the recorded state,
+    // and an unselected model no selected model reads is left out.
     let mut deferred: HashMap<String, rocky_sql::defer::DeferTarget> = HashMap::new();
     for model in &compile_result.project.models {
         let name = model.config.name.as_str();
         if selected_set.contains(name) {
             continue;
         }
-        let target = &model.config.target;
+        let recorded;
+        let target = match &state_targets {
+            Some(targets) => {
+                let Some(resolved) = targets.get(name) else {
+                    continue;
+                };
+                recorded = rocky_core::models::TargetConfig {
+                    catalog: resolved.target.catalog.clone(),
+                    schema: resolved.target.schema.clone(),
+                    table: resolved.target.table.clone(),
+                };
+                tracing::info!(
+                    upstream = name,
+                    run_id = %resolved.run_id,
+                    target = %format!(
+                        "{}.{}.{}",
+                        recorded.catalog, recorded.schema, recorded.table
+                    ),
+                    "--defer-to-state: deferred upstream resolved from recorded state"
+                );
+                &recorded
+            }
+            None => &model.config.target,
+        };
         let schema = defer_opts
             .defer_to
             .clone()
@@ -10279,6 +10332,76 @@ fn apply_defer_rewrite(
     }
 
     Ok(())
+}
+
+/// For each selected model, the unselected project models it reads. These
+/// are the upstreams `--defer-to-state` must resolve.
+///
+/// Two sources, unioned: the compiled DAG's `depends_on`, and every bare
+/// reference the defer rewrite itself would qualify. The second matters
+/// because `depends_on` can lack a name the SQL reads (the compiler drops an
+/// auto-binding that would close a cycle). Leaving such a reference out would
+/// let it stay bare and read the working schema. A selected model whose SQL
+/// does not parse adds nothing here; the rewrite itself then refuses it.
+fn deferred_upstreams_needed(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: &std::collections::HashSet<&str>,
+    case_rules: rocky_sql::defer::IdentifierCaseRules,
+    recursive_visibility: rocky_sql::defer::RecursiveCteVisibility,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let unselected: std::collections::HashSet<&str> = compile_result
+        .project
+        .models
+        .iter()
+        .map(|model| model.config.name.as_str())
+        .filter(|name| !selected.contains(name))
+        .collect();
+    // Every unselected model mapped to a placeholder: the probe only asks
+    // which names the rewrite would touch, and its SQL is discarded.
+    let probe: std::collections::HashMap<String, rocky_sql::defer::DeferTarget> = unselected
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                rocky_sql::defer::DeferTarget {
+                    catalog: String::new(),
+                    schema: "probe".to_string(),
+                    table: "probe".to_string(),
+                    quote_style: None,
+                },
+            )
+        })
+        .collect();
+    let mut needed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in &compile_result.project.dag_nodes {
+        if !selected.contains(node.name.as_str()) {
+            continue;
+        }
+        needed.entry(node.name.clone()).or_default().extend(
+            node.depends_on
+                .iter()
+                .filter(|dep| unselected.contains(dep.as_str()))
+                .cloned(),
+        );
+    }
+    for model in &compile_result.project.models {
+        if !selected.contains(model.config.name.as_str()) {
+            continue;
+        }
+        if let Ok(outcome) = rocky_sql::defer::qualify_deferred_refs(
+            &model.sql,
+            &probe,
+            case_rules,
+            recursive_visibility,
+        ) {
+            needed
+                .entry(model.config.name.clone())
+                .or_default()
+                .extend(outcome.qualified);
+        }
+    }
+    needed.retain(|_, upstreams| !upstreams.is_empty());
+    needed
 }
 
 /// Identifier quoting a rewritten upstream reference must use so that it names
@@ -13818,6 +13941,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                                     &model_ir, &summary,
                                 ),
                             ),
+                            output_target: Some(recorded_output_target(&model_ir)),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -15719,7 +15843,19 @@ async fn execute_one_plain_model(
         // Consumer baseline is content-addressed-path only.
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(&model_ir)),
     })
+}
+
+/// The model and table a transformation materialization wrote, for the
+/// persisted run record. `rocky run --defer-state` reads it back.
+fn recorded_output_target(model_ir: &rocky_ir::ModelIr) -> rocky_core::state::RecordedTarget {
+    rocky_core::state::RecordedTarget {
+        model: model_ir.name.to_string(),
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    }
 }
 
 /// The run note for an incremental load against an existing target. The
@@ -15980,6 +16116,7 @@ async fn execute_snapshot_model(
         output_column_hashes: None,
         consumed_column_baseline: None,
         output_version: Some(output_version),
+        output_target: Some(recorded_output_target(model_ir)),
     })
 }
 
@@ -16510,6 +16647,7 @@ async fn run_one_partition(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: Some(recorded_output_target(&tplan_ir)),
         }),
     }
 }
@@ -17985,6 +18123,7 @@ async fn process_table(
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
             output_version: Some(output_version),
+            output_target: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -24275,6 +24414,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            output_target: None,
         }
     }
 
@@ -34946,6 +35086,96 @@ backend = "local"
         assert!(!sql("wide").contains("prod.stg"), "{}", sql("wide"));
     }
 
+    /// `--defer-to-state` resolves every upstream the SQL reads, even one the
+    /// compiled DAG's `depends_on` lacks, and refuses when the state has no
+    /// table for it. Without the SQL probe the reference would stay bare and
+    /// read the working schema.
+    #[test]
+    fn defer_to_state_resolves_sql_references_missing_from_depends_on() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "dev", "orders");
+        write_model_with_target(&models_dir, "stg", "SELECT id FROM orders", "dev", "stg");
+        let compile = || {
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir: models_dir.clone(),
+                    ..Default::default()
+                })
+                .expect("compile models");
+            // Simulate a dropped auto-binding: the DAG no longer lists the
+            // edge the SQL still reads.
+            for node in &mut compiled.project.dag_nodes {
+                node.depends_on.clear();
+            }
+            compiled
+        };
+        let selected: BTreeSet<String> = ["stg".to_string()].into();
+        let state_dir = tempfile::TempDir::new().expect("state dir");
+        let state = super::super::defer_state::tests::store_recording(
+            state_dir.path(),
+            "orders",
+            "prod",
+            "orders_t",
+        );
+
+        let mut compiled = compile();
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: state,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect("defer rewrite");
+        let stg = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "stg")
+            .expect("stg");
+        assert!(stg.sql.contains("prod.orders_t"), "{}", stg.sql);
+
+        // A state that never built `orders` refuses rather than leaving the
+        // reference bare.
+        let empty_dir = tempfile::TempDir::new().expect("empty state dir");
+        let empty = super::super::defer_state::tests::store_recording(
+            empty_dir.path(),
+            "other",
+            "prod",
+            "other",
+        );
+        let mut compiled = compile();
+        let err = super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_state: Some(super::super::DeferStateSource {
+                    path: empty,
+                    run_id: None,
+                }),
+                ..Default::default()
+            },
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+        )
+        .expect_err("orders has no recorded table");
+        assert!(
+            matches!(
+                err.downcast_ref::<super::super::DeferStateError>(),
+                Some(super::super::DeferStateError::UpstreamMissing { upstream, .. }) if upstream == "orders"
+            ),
+            "{err:#}"
+        );
+    }
+
     /// #1350: the model-only fallback answers identically to naming the
     /// same pipeline explicitly — adapter, governance, and glob. The
     /// hardcoded-false governance was a #1305 fossil.
@@ -38512,6 +38742,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -40912,6 +41143,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -41113,6 +41345,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            output_target: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -41246,6 +41479,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
             attempts: Vec::new(),
+            output_target: None,
         };
         let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
             "run_id": "run-prod",
@@ -41389,6 +41623,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -42372,6 +42607,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -42678,6 +42914,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                output_target: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {
