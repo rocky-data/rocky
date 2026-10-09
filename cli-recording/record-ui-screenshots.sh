@@ -82,13 +82,14 @@ PIDS=()
 cleanup() { for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# The default scope, so the screens show operator mode as a reader gets it.
-# The capture clicks only links and the sample-rows read; nothing it clicks
-# changes the project.
+# Full scope, so the screens show operator mode as a reader gets it by
+# default. Pinned, so an exported ROCKY_SERVE_TOKEN_SCOPE cannot turn the
+# capture read-only. The capture only navigates by URL and screenshots, and
+# the curl calls are GETs, so nothing changes the project.
 serve() { # <dir> <port> [global rocky flag...]
   local dir="$1" port="$2"
   shift 2
-  (cd "$dir" && exec rocky "$@" serve --ui --token "$TOKEN" --port "$port") >"$dir/serve.log" 2>&1 &
+  (cd "$dir" && exec rocky "$@" serve --ui --token "$TOKEN" --token-scope full --port "$port") >"$dir/serve.log" 2>&1 &
   local child="$!"
   PIDS+=("$child")
   # Probe an authenticated route: /health is token-exempt, so a stale server
