@@ -39,7 +39,8 @@ if ! rocky import-dbt \
     --output-dir imported \
     --no-manifest \
     --overwrite \
-    2>&1 | tee expected/import.log; then
+    2>expected/import.stderr | tee expected/import.log; then
+    cat expected/import.stderr >&2
     echo "FAIL: rocky import-dbt exited non-zero"
     exit 1
 fi
@@ -113,8 +114,7 @@ for refused in stg_orders stg_loop; do
 done
 if ! python3 - <<'PY'
 import json, sys
-log = open("expected/import.log").read()
-data = json.loads(log[log.index("{"):])
+data = json.load(open("expected/import.log"))
 refused = sorted(
     f["name"] for f in data.get("failed_details") or []
     if "cannot evaluate Jinja control flow" in f.get("reason", "")
