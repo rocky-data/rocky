@@ -44,7 +44,8 @@
 //! - A name the project declares in `functions/`, valid or not (E051 covers
 //!   an invalid one).
 //! - SQL forms the parser or the warehouse rewrites before catalog lookup
-//!   (`COALESCE`, `IF`, `IFNULL`, `GROUPING`, `COLUMNS`, `TRY`, ...).
+//!   (`COALESCE`, `IF`, `IFNULL`, `GROUPING`, `COLUMNS`, `TRY`, and DuckDB's
+//!   `DATE(x)`, a cast, ...).
 //! - A model whose SQL does not parse.
 //! - A dialect the model's SQL was not written for, when
 //!   `[portability] target_dialect` names another warehouse (P001 covers
@@ -262,8 +263,10 @@ const SPARK_GRAMMAR_FORMS: &[&str] = &["timestampadd", "timestampdiff", "identif
 /// Snowflake `IDENTIFIER('name')` and `TABLE(...)` clauses.
 const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 
-/// Special forms only DuckDB has.
-const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try"];
+/// Special forms only DuckDB has. DuckDB's parser also turns `date(x)` into
+/// `CAST(x AS DATE)`, so `duckdb_functions()` never lists `date`; every other
+/// dialect's list already holds it.
+const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
 
 /// Report calls to functions the target dialect does not have.
 ///
@@ -802,6 +805,23 @@ mod tests {
             let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
             assert_eq!(diags.len(), 1, "{call}: {diags:?}");
             assert_eq!(&*diags[0].code, "E057", "{call}");
+        }
+    }
+
+    #[test]
+    fn duckdb_accepts_the_casts_its_parser_writes_as_calls() {
+        // Live DuckDB 1.5.5 runs `date(x)` as `CAST(x AS DATE)`, so
+        // `duckdb_functions()` never lists it. It is the common way to take
+        // the day of a timestamp.
+        let registry = FunctionRegistry::default();
+        for call in [
+            "date(occurred_at)",
+            "DATE(occurred_at)",
+            "date('2024-01-01')",
+            "interval('1 day')",
+        ] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert!(diags.is_empty(), "{call}: {diags:?}");
         }
     }
 
