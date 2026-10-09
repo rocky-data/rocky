@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.80.0] — 2026-10-09
+
+`rocky compile` now checks function names on every warehouse that has a function list, types more casts, and can refuse a contract type it cannot check. The release also adds downstream consumers and fixes Spark snapshots with hard deletes.
+
+Read these first. Each one can change what an existing project does.
+
+- **New `W057` warnings off DuckDB.** A PostgreSQL, Snowflake, Databricks, Spark, BigQuery, Trino or Redshift model that calls a function not on that warehouse's list now gets `W057`. It is a warning, so a compile still passes, unless you pass `--deny-warnings W057`. A UDF or extension function gets it too; call it schema-qualified, or declare it in `functions/`.
+- **`E011` where there was `I003`.** A cast such as `CAST(x AS DECIMAL(12, 2))` now gives the column its target type even when `x` has no known type. A contract that declares a different type for that column now fails with `E011`. Before, the check was skipped with the `I003` note. Newly typed columns can also bring new `E042`, `E043` or `W043` diagnostics.
+- **A `consumers/` directory is now read.** If the project root already has a `consumers/` directory for something else, `rocky compile` and `rocky ci` refuse each `.toml` file in it that is not a consumer record, with `E060`. Other files are ignored. `rocky run` and `rocky plan` do not stop for it.
+
 ### Added
 
 - **Downstream consumers: `consumers/<name>.toml`.** A consumer records a dashboard, notebook, ML job or application that reads models, with its `kind`, `owner`, `url`, `description` and `depends_on`. Rocky reads `consumers/` from the project root, the directory of `rocky.toml`. `rocky compile` and `rocky ci` refuse with `E060` a file that does not parse, an unreadable `consumers/`, a duplicate name, or a `depends_on` entry that is a model nowhere in the project; a compile of part of the project still checks names against every model. `rocky ci` also fails on it, and so does `rocky test` when it covers the whole project; with `--model`, `--select` or `--exclude`, `rocky test` still lists it in `diagnostics` but does not fail on it. Both report it as a diagnostic, never as a failed model, and still run the model tests. `rocky run`, `run --select`, `run --dag`, `rocky plan`, `rocky propose` and the compile check of `rocky fulfill` (which reports it in the verify detail) do not stop for an `E060` and never count it as a failed table: `run` lists it in a new `consumer_diagnostics` array (once per command, also under `--dag`). The language server shows `E060` on the consumer file. `rocky lineage <model>` lists the consumers that read it, in a new `consumers` array. `rocky docs` adds a Consumers table, a "Read by" row on model pages, and `consumers.parquet`; `rocky docs --output json` gains `consumers_count`. `--select consumer:<name>` selects the models a consumer reads, so `+consumer:<name>` selects everything it needs.

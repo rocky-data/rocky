@@ -1,6 +1,6 @@
 [package]
 name = "rocky-sqlserver"
-version = "1.79.0"
+version = "1.80.0"
 description = "Microsoft SQL Server, Azure SQL and Fabric Warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true
