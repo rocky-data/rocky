@@ -205,9 +205,9 @@ pub const E044: &str = "E044";
 /// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
 ///
 /// Emitted by `rocky compile` from [`crate::function_check`] for models that
-/// run on DuckDB, the one dialect whose list was verified against a live
-/// engine. Every other warehouse with a list gets the warning [`W057`]
-/// instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
+/// run on DuckDB, PostgreSQL, Spark or Trino, the dialects whose list was
+/// verified against a live engine. Every other warehouse with a list gets the
+/// warning [`W057`] instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
 /// not checked, nor is a model whose SQL `[portability] target_dialect` says
 /// was written for another warehouse.
 pub const E057: &str = "E057";
@@ -648,7 +648,7 @@ pub const W056: &str = "W056";
 ///
 /// The warning form of [`E057`], for warehouses whose list Rocky built from
 /// the vendor's reference but has not verified against a live engine
-/// (Snowflake, Databricks, Spark, BigQuery, Trino, PostgreSQL, Redshift).
+/// (Snowflake, Databricks, BigQuery, Redshift).
 /// A warehouse can have functions the list lacks (a newer release, an
 /// extension, a UDF created outside Rocky), so this never fails a compile on
 /// its own. Escalate with `rocky compile --deny-warnings W057`.

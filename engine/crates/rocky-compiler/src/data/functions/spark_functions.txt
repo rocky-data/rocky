@@ -1,6 +1,6 @@
 # Function names callable on spark, lower-cased, one per line.
-# Built 2026-10-09. Source: Apache Spark 4.0.1 "Spark SQL, Built-in Functions", https://spark.apache.org/docs/4.0.1/api/sql/index.html . Includes aggregate, window, generator (table) functions and operators spelled as names.
-# Not verified against a live engine (see function_check.rs, tier table).
+# Built 2026-10-09. Source: 'SHOW FUNCTIONS' (system and user functions) on a live Apache Spark 4.0.1 with Delta Lake 4.0.0 (the table_changes functions come from Delta). Includes aggregate, window, generator (table) functions and operators spelled as names.
+# Verified against live Apache Spark 4.0.1 with Delta Lake 4.0.0 on 2026-10-09 (see function_check.rs, tier table).
 !
 !=
 %
@@ -10,16 +10,16 @@
 -
 /
 <
-<&lt;
+<<
 <=
 <=>
 <>
 =
 ==
 >
->&gt;
->&gt;&gt;
 >=
+>>
+>>>
 ^
 abs
 acos
@@ -390,6 +390,8 @@ substr
 substring
 substring_index
 sum
+table_changes
+table_changes_by_path
 tan
 tanh
 timestamp

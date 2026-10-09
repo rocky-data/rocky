@@ -1,18 +1,17 @@
 # Function names callable on postgres, lower-cased, one per line.
-# Built 2026-10-09. Source: PostgreSQL 17 built-in function catalog: `proname` of every entry in src/include/catalog/pg_proc.dat plus the SQL-defined functions in src/backend/catalog/system_functions.sql (REL_17_STABLE). Aggregate and window functions are catalog entries too. A superset of the documented functions (it includes internal and operator-support names). Extension functions (pgcrypto, uuid-ossp, PostGIS, ...) are NOT in it.
-# Not verified against a live engine (see function_check.rs, tier table).
-RI_FKey_cascade_del
-RI_FKey_cascade_upd
-RI_FKey_check_ins
-RI_FKey_check_upd
-RI_FKey_noaction_del
-RI_FKey_noaction_upd
-RI_FKey_restrict_del
-RI_FKey_restrict_upd
-RI_FKey_setdefault_del
-RI_FKey_setdefault_upd
-RI_FKey_setnull_del
-RI_FKey_setnull_upd
+# Built 2026-10-09. Source: PostgreSQL 17 built-in function catalog (pg_proc.dat plus system_functions.sql, REL_17_STABLE), unioned with 'SELECT DISTINCT proname FROM pg_proc' on a live server, plus the SQL-standard special forms that have no pg_proc row (XML and SQL/JSON constructors, COLLATION FOR, MERGE_ACTION). A superset of the documented functions (it includes internal and operator-support names). Extension functions (pgcrypto, uuid-ossp, PostGIS, ...) are NOT in it.
+# Verified against live PostgreSQL 17.11 on 2026-10-09 (see function_check.rs, tier table).
+_pg_char_max_length
+_pg_char_octet_length
+_pg_datetime_precision
+_pg_expandarray
+_pg_index_position
+_pg_interval_type
+_pg_numeric_precision
+_pg_numeric_precision_radix
+_pg_numeric_scale
+_pg_truetypid
+_pg_truetypmod
 abbrev
 abs
 aclcontains
@@ -451,6 +450,7 @@ close_pl
 close_ps
 close_sb
 col_description
+collation_for
 concat
 concat_ws
 contjoinsel
@@ -568,6 +568,8 @@ dpow
 dround
 dsimple_init
 dsimple_lexize
+dsnowball_init
+dsnowball_lexize
 dsqrt
 dsynonym_init
 dsynonym_lexize
@@ -1128,15 +1130,18 @@ json_agg_finalfn
 json_agg_strict
 json_agg_strict_transfn
 json_agg_transfn
+json_array
 json_array_element
 json_array_element_text
 json_array_elements
 json_array_elements_text
 json_array_length
+json_arrayagg
 json_build_array
 json_build_object
 json_each
 json_each_text
+json_exists
 json_extract_path
 json_extract_path_text
 json_in
@@ -1153,16 +1158,22 @@ json_object_agg_unique_transfn
 json_object_field
 json_object_field_text
 json_object_keys
+json_objectagg
 json_out
 json_populate_record
 json_populate_recordset
+json_query
 json_recv
+json_scalar
 json_send
+json_serialize
 json_strip_nulls
+json_table
 json_to_record
 json_to_recordset
 json_to_tsvector
 json_typeof
+json_value
 jsonb_agg
 jsonb_agg_finalfn
 jsonb_agg_strict
@@ -1371,6 +1382,7 @@ matchingjoinsel
 matchingsel
 max
 md5
+merge_action
 mic_to_big5
 mic_to_euc_cn
 mic_to_euc_jp
@@ -2007,6 +2019,9 @@ pg_xact_status
 phraseto_tsquery
 pi
 plainto_tsquery
+plpgsql_call_handler
+plpgsql_inline_handler
+plpgsql_validator
 point
 point_above
 point_add
@@ -2207,6 +2222,18 @@ regtypesend
 repeat
 replace
 reverse
+ri_fkey_cascade_del
+ri_fkey_cascade_upd
+ri_fkey_check_ins
+ri_fkey_check_upd
+ri_fkey_noaction_del
+ri_fkey_noaction_upd
+ri_fkey_restrict_del
+ri_fkey_restrict_upd
+ri_fkey_setdefault_del
+ri_fkey_setdefault_upd
+ri_fkey_setnull_del
+ri_fkey_setnull_upd
 right
 round
 row_number
@@ -2708,9 +2735,18 @@ xml_out
 xml_recv
 xml_send
 xmlagg
+xmlattributes
 xmlcomment
+xmlconcat
 xmlconcat2
+xmlelement
 xmlexists
+xmlforest
+xmlparse
+xmlpi
+xmlroot
+xmlserialize
+xmltable
 xmltext
 xmlvalidate
 xpath

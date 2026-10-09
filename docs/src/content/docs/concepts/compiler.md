@@ -219,20 +219,22 @@ aliases. How Rocky treats a miss depends on how the list was made:
 | Warehouse | List | Checked against a live engine | Code |
 |---|---|---|---|
 | DuckDB | `duckdb_functions()` of DuckDB 1.5, plus functions its extensions load on first use | yes | `E057` (error) |
-| PostgreSQL | The PostgreSQL 17 built-in function catalog | no, built from source | `W057` (warning) |
-| Snowflake | Vendor function reference | no, built from the docs | `W057` |
+| PostgreSQL | The PostgreSQL 17 built-in function catalog (`pg_proc`), plus the SQL-standard forms it lacks | yes, PostgreSQL 17.11 | `E057` |
+| Snowflake | Vendor function reference | no, built from the docs | `W057` (warning) |
 | Databricks | Vendor function reference and the Spark list | no, built from the docs | `W057` |
-| Spark | Spark 4.0.1 function reference | no, built from the docs | `W057` |
+| Spark | `SHOW FUNCTIONS` of Spark 4.0.1 with Delta Lake 4.0.0 | yes | `E057` |
 | BigQuery | Vendor function reference | no, built from the docs | `W057` |
-| Trino | Vendor function reference | no, built from the docs | `W057` |
+| Trino | `SHOW FUNCTIONS` of Trino 483, plus the names it hides (`version`, `format`, SQL special forms) | yes | `E057` |
 | Redshift | Vendor function reference and the PostgreSQL list | no, built from the docs | `W057` |
 | SQL Server, ClickHouse | none yet | | not checked |
 
 A false refusal of a real function costs more than a missed typo. A list built
-from documentation can lag a release or miss an extension, so those warehouses
-get the warning `W057`, which never fails a compile alone. To fail on it, run
-`rocky compile --deny-warnings W057`. The lists were built on 2026-10-09 and
-each file under `engine/crates/rocky-compiler/src/data/` names its source.
+from documentation can lag a release or miss an extension, so Snowflake,
+Databricks, BigQuery and Redshift get the warning `W057`, which never fails a compile alone. To fail on it, run
+`rocky compile --deny-warnings W057`. The lists were built and checked on 2026-10-09. The PostgreSQL list covers the
+core catalog only: a function from an extension such as pgcrypto or PostGIS is
+not in it, so call it schema-qualified. The Trino list covers the global
+functions only, not those a connector adds. Each file under `engine/crates/rocky-compiler/src/data/` names its source.
 A model that runs on several warehouses is checked against each. When
 `[portability] target_dialect` names a warehouse, a model is checked only
 against that warehouse.
@@ -582,7 +584,7 @@ span, and sometimes a suggested fix.
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
 | `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
 | `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
-| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB; other warehouses get `W057`). See [Unknown functions](#unknown-functions) |
+| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB, PostgreSQL, Spark and Trino; the other warehouses get `W057`). See [Unknown functions](#unknown-functions) |
 | `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
@@ -620,7 +622,7 @@ span, and sometimes a suggested fix.
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
-| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, where it is `E057`). The list is built from the vendor's reference, so the call may still be valid. Escalate with `--deny-warnings W057` |
+| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (Snowflake, Databricks, BigQuery and Redshift; the other warehouses with a list get `E057`). The list is built from the vendor's reference, so the call may still be valid. Escalate with `--deny-warnings W057` |
 | `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |

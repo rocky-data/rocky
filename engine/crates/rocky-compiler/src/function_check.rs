@@ -13,12 +13,12 @@
 //! | Dialect | List | Verified | Code |
 //! |---|---|---|---|
 //! | DuckDB | `data/duckdb_functions.txt` | against a live DuckDB (`duckdb_functions()`) | `E057` |
-//! | PostgreSQL | PostgreSQL 17 `pg_proc.dat` | built from source, not run | `W057` |
+//! | PostgreSQL | PostgreSQL 17 `pg_proc` | against a live PostgreSQL 17.11 (`pg_proc`) | `E057` |
 //! | Snowflake | vendor reference | built from docs, not run | `W057` |
-//! | Databricks | vendor reference + Spark | built from docs, not run | `W057` |
-//! | Spark | Spark 4.0.1 reference | built from docs, not run | `W057` |
+//! | Databricks | vendor reference + Spark | built from docs, not run (a superset of the live Spark list) | `W057` |
+//! | Spark | Spark 4.0.1 `SHOW FUNCTIONS` | against a live Spark 4.0.1 with Delta | `E057` |
 //! | BigQuery | vendor reference | built from docs, not run | `W057` |
-//! | Trino | vendor reference | built from docs, not run | `W057` |
+//! | Trino | Trino 483 `SHOW FUNCTIONS` | against a live Trino 483 | `E057` |
 //! | Redshift | vendor reference + PostgreSQL | built from docs, not run | `W057` |
 //! | SQL Server, ClickHouse | none | | silent |
 //!
@@ -159,14 +159,10 @@ impl FunctionDialect {
     /// Whether this dialect's list was checked against a live engine.
     pub fn tier(self) -> Tier {
         match self {
-            Self::DuckDb => Tier::Verified,
-            Self::Postgres
-            | Self::Snowflake
-            | Self::Databricks
-            | Self::Spark
-            | Self::BigQuery
-            | Self::Trino
-            | Self::Redshift => Tier::Documented,
+            Self::DuckDb | Self::Postgres | Self::Spark | Self::Trino => Tier::Verified,
+            Self::Snowflake | Self::Databricks | Self::BigQuery | Self::Redshift => {
+                Tier::Documented
+            }
         }
     }
 
@@ -540,7 +536,7 @@ mod tests {
             (
                 "PostgreSQL",
                 Some(OperandDialect::Postgres).into(),
-                "W057",
+                "E057",
                 "date_trunc('day', d)",
             ),
             (
@@ -555,7 +551,7 @@ mod tests {
                 "W057",
                 "try_divide(a, b)",
             ),
-            ("Spark", spark(), "W057", "array_distinct(a)"),
+            ("Spark", spark(), "E057", "array_distinct(a)"),
             (
                 "BigQuery",
                 Some(OperandDialect::BigQuery).into(),
@@ -565,7 +561,7 @@ mod tests {
             (
                 "Trino",
                 Some(OperandDialect::Trino).into(),
-                "W057",
+                "E057",
                 "approx_distinct(a)",
             ),
             (
@@ -673,27 +669,32 @@ mod tests {
     }
 
     #[test]
-    fn a_documented_dialect_never_reports_an_error() {
-        for (_, target, _, _) in dialect_cases() {
+    fn only_a_list_checked_against_a_live_engine_reports_an_error() {
+        for (name, target, code, _) in dialect_cases() {
             let diags = run(
                 "SELECT no_such_fn(a) AS x FROM t",
                 &target,
                 &FunctionRegistry::default(),
             );
-            assert_eq!(diags.len(), 1);
+            assert_eq!(diags.len(), 1, "{name}");
+            assert_eq!(diags[0].is_error(), code == "E057", "{name}");
         }
         for dialect in [
-            FunctionDialect::Postgres,
             FunctionDialect::Snowflake,
             FunctionDialect::Databricks,
-            FunctionDialect::Spark,
             FunctionDialect::BigQuery,
-            FunctionDialect::Trino,
             FunctionDialect::Redshift,
         ] {
             assert_eq!(dialect.tier(), Tier::Documented, "{dialect:?}");
         }
-        assert_eq!(FunctionDialect::DuckDb.tier(), Tier::Verified);
+        for dialect in [
+            FunctionDialect::DuckDb,
+            FunctionDialect::Postgres,
+            FunctionDialect::Spark,
+            FunctionDialect::Trino,
+        ] {
+            assert_eq!(dialect.tier(), Tier::Verified, "{dialect:?}");
+        }
     }
 
     #[test]
@@ -732,5 +733,39 @@ mod tests {
             assert!(FunctionDialect::DuckDb.knows(name), "{name}");
         }
         assert!(!FunctionDialect::DuckDb.knows("summ"));
+    }
+
+    #[test]
+    fn the_live_checked_lists_hold_names_the_catalog_hides() {
+        for (dialect, names) in [
+            (
+                FunctionDialect::Postgres,
+                [
+                    "xmlelement",
+                    "json_value",
+                    "_pg_expandarray",
+                    "ri_fkey_check_ins",
+                ],
+            ),
+            (
+                FunctionDialect::Spark,
+                ["table_changes", "<<", "array_distinct", "try_divide"],
+            ),
+            (
+                FunctionDialect::Trino,
+                ["version", "format", "dot_product", "approx_distinct"],
+            ),
+        ] {
+            for name in names {
+                assert!(dialect.knows(name), "{dialect:?}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn databricks_holds_every_spark_name() {
+        for name in SPARK_FUNCTIONS.iter() {
+            assert!(FunctionDialect::Databricks.knows(name), "{name}");
+        }
     }
 }

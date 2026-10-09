@@ -863,9 +863,9 @@ fn apply_operand_gates(
         &result.type_check.typed_models,
         &target_for,
     );
-    // Calls to functions the target warehouse does not have: E057 on DuckDB,
-    // W057 on the warehouses whose list is built from documentation. A model
-    // is not judged against a warehouse other than the one `[portability]
+    // Calls to functions the target warehouse does not have: E057 on the
+    // warehouses whose list was checked against a live engine, W057 on the
+    // others (their list is built from documentation). A model is not judged against a warehouse other than the one `[portability]
     // target_dialect` says its SQL is written for: P001 covers portability.
     let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
