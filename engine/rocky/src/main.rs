@@ -1438,8 +1438,9 @@ enum Command {
         /// Treat every known source schema as authoritative: a direct
         /// reference to a column the source lacks is the E041 error even when
         /// the schema came from a seed (`--with-seed`) or an untrusted cache
-        /// entry, which otherwise warn with W041. Same as
-        /// `[cache.schemas] strict_sources = true`.
+        /// entry, which otherwise warn with W041. A read of a table missing
+        /// from a known schema is the E045 error instead of the W045 warning.
+        /// Same as `[cache.schemas] strict_sources = true`.
         #[arg(long)]
         strict_sources: bool,
 

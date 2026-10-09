@@ -2493,8 +2493,9 @@ pub struct SchemaCacheConfig {
     /// `trusted_max_age_seconds`: a stale schema must not fail a
     /// valid build. Set this to `true` to escalate those warnings to the
     /// `E041` error, matching a strict "refuse what you cannot prove"
-    /// posture. `rocky compile --strict-sources` sets it for one
-    /// invocation.
+    /// posture. It also escalates `W045` (a read of a table missing from a
+    /// known schema's seed or cache table list) to the `E045` error.
+    /// `rocky compile --strict-sources` sets it for one invocation.
     pub strict_sources: bool,
     /// Age, in seconds, under which a cached source schema is trusted as
     /// current. Defaults to unset: no cache entry is trusted, so a missing

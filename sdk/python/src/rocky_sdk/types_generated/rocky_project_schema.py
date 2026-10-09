@@ -1617,7 +1617,7 @@ class SchemaCacheConfig(BaseModel):
     """
     Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
 
-    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. It also escalates `W045` (a read of a table missing from a known schema's seed or cache table list) to the `E045` error. `rocky compile --strict-sources` sets it for one invocation.
     """
     trusted_max_age_seconds: conint(ge=0) | None = None
     """

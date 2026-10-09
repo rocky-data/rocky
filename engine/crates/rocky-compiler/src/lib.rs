@@ -14,6 +14,7 @@
 //! bodies. Cross-model passes (join keys, contracts, blast-radius,
 //! classification) stay in the plain orchestration layer for now.
 
+pub mod ambiguous;
 pub mod arena;
 pub mod blast_radius;
 pub mod cache;

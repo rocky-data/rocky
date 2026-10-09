@@ -654,9 +654,9 @@ fn compute_model_typecheck(
         model_by_name,
     ));
 
-    // Step 2c: GROUP BY validity (E044). Names resolve only against upstream
-    // models this model depends on and known source schemas; anything else
-    // is unknown and stays silent.
+    // Step 2c: GROUP BY validity (E044) and ambiguous bare names (E029).
+    // Names resolve only against upstream models this model depends on and
+    // known source schemas; anything else is unknown and stays silent.
     if let Some(model) = model_by_name.get(model_name) {
         let relation_columns = |name: &str| -> Option<Vec<String>> {
             let columns = if name.contains('.') {
@@ -674,6 +674,12 @@ fn compute_model_typecheck(
             Some(columns.iter().map(|column| column.name.clone()).collect())
         };
         diagnostics.extend(crate::group_by::check_group_by(
+            model_name,
+            &model.sql,
+            &relation_columns,
+        ));
+        // E029: a bare column name two joined relations both provably have.
+        diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
             model_name,
             &model.sql,
             &relation_columns,

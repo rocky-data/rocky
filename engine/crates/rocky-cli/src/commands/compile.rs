@@ -66,7 +66,9 @@ pub fn run_compile(
 /// [`run_compile`] with every invocation option.
 ///
 /// `strict_sources` (`rocky compile --strict-sources`) escalates every W041
-/// (a source column missing from a seed or untrusted cached schema) to E041
+/// (a source column missing from a seed or untrusted cached schema) to E041,
+/// and every W045 (a source table missing from a seed or cached table list)
+/// to E045
 /// for this invocation. It ORs with `[cache.schemas] strict_sources`; it can
 /// turn strictness on, never off.
 ///

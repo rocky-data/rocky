@@ -71,6 +71,16 @@ pub const E027: &str = "E027";
 /// give the reference an inline default. Distinct from the config-time
 /// `${ENV}` interpolation, which resolves while parsing `rocky.toml`.
 pub const E028: &str = "E028";
+/// A column name read without a qualifier is ambiguous: two or more relations
+/// joined in the same `FROM` clause provably have a column of that name.
+///
+/// Emitted by `rocky compile` from `crate::ambiguous`. Every warehouse Rocky
+/// targets refuses such a query. A relation counts only when Rocky knows its
+/// columns: an upstream model of the project, a source schema (seed file or
+/// schema cache), a CTE or a derived table. A name merged by `JOIN … USING`
+/// or `NATURAL JOIN`, a `SELECT` alias, and a name resolved by an inner
+/// sub-query's own relations are not ambiguous, so they are not reported.
+pub const E029: &str = "E029";
 
 // Errors — imported producer contracts
 /// Consumer references a column that an imported producer snapshot dropped.
@@ -224,6 +234,18 @@ pub const E043: &str = "E043";
 /// Anything else keeps the conservative `Unknown` result. The
 /// message names the column and the source, and suggests close column names.
 pub const E041: &str = "E041";
+/// A two-part read (`schema.table`) names a table absent from a schema whose
+/// table list Rocky holds as complete.
+///
+/// Emitted by `rocky compile` (and the compile `rocky run` performs before it
+/// executes) from [`crate::source_refs::check_source_table_refs`]. The table
+/// list counts as complete when strict sources are on
+/// (`rocky compile --strict-sources` or `[cache.schemas] strict_sources`), or
+/// when every table of the schema was introspected live during this
+/// invocation (an embedding caller; no CLI command does this yet).
+/// It never fires for a schema Rocky has no source schema in, or for a schema
+/// a model of the project writes to.
+pub const E045: &str = "E045";
 /// A user-defined function (`functions/`) or a call to one is invalid.
 ///
 /// Emitted by `rocky compile` (`rocky_compiler::udf`). Attributed to the
@@ -521,6 +543,14 @@ pub const W044: &str = "W044";
 /// `rocky discover --with-schemas`), or escalate to [`E041`] with
 /// `rocky compile --strict-sources` or `[cache.schemas] strict_sources = true`.
 pub const W041: &str = "W041";
+/// Same finding as [`E045`], at warning severity, for a table list Rocky
+/// cannot treat as complete: one read from a seed file
+/// (`rocky compile --with-seed`) or from the schema cache. The warehouse may
+/// have the table, so the compile still succeeds. Add the table to the seed,
+/// re-warm the cache with `rocky discover --with-schemas`, or escalate to
+/// [`E045`] with `rocky compile --strict-sources` or
+/// `[cache.schemas] strict_sources = true`.
+pub const W045: &str = "W045";
 /// A call to a user-defined function could not be fully verified.
 ///
 /// Emitted by `rocky compile` (`rocky_compiler::udf`) when an argument's
@@ -597,7 +627,7 @@ pub const W056: &str = "W056";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W046, W048, W049, W050, W051, W052, W053, W056, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

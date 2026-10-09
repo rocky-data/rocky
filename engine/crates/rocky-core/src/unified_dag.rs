@@ -40,6 +40,8 @@ use crate::seeds::SeedFile;
 /// Errors from unified DAG construction or analysis.
 #[derive(Debug, Error)]
 pub enum UnifiedDagError {
+    /// `nodes` lists the nodes on or between cycles; a node that only reads
+    /// from a cycle is left out, so the message names the cycle itself.
     #[error("circular dependency detected involving: {nodes:?}")]
     CyclicDependency { nodes: Vec<String> },
 
@@ -2098,10 +2100,32 @@ pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, Unif
 
     if processed != dag.nodes.len() {
         let processed_ids: HashSet<&NodeId> = node_layer.keys().copied().collect();
+        // Every unprocessed node is on a cycle or downstream of one. Drop the
+        // downstream ones: repeatedly remove a node that no other leftover
+        // node depends on.
+        let mut left: HashSet<&NodeId> = dag
+            .nodes
+            .iter()
+            .map(|n| &n.id)
+            .filter(|id| !processed_ids.contains(id))
+            .collect();
+        loop {
+            let needed: HashSet<&NodeId> = dag
+                .edges
+                .iter()
+                .filter(|e| left.contains(&e.to) && left.contains(&e.from))
+                .map(|e| &e.from)
+                .collect();
+            let before = left.len();
+            left.retain(|id| needed.contains(id));
+            if left.len() == before {
+                break;
+            }
+        }
         let cyclic: Vec<String> = dag
             .nodes
             .iter()
-            .filter(|n| !processed_ids.contains(&n.id))
+            .filter(|n| left.contains(&n.id))
             .map(|n| n.id.0.clone())
             .collect();
         return Err(UnifiedDagError::CyclicDependency { nodes: cyclic });
@@ -3733,6 +3757,43 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, UnifiedDagError::CyclicDependency { .. }))
         );
+    }
+
+    /// The cycle refusal names the nodes on the cycle, not the nodes that
+    /// only read from it.
+    #[test]
+    fn a_cycle_refusal_names_only_the_cycle() {
+        let node = |name: &str| UnifiedNode {
+            id: NodeId::new("transformation", name),
+            kind: NodeKind::Transformation,
+            label: name.into(),
+            pipeline: None,
+        };
+        let edge = |from: &str, to: &str| UnifiedEdge {
+            from: NodeId::new("transformation", from),
+            to: NodeId::new("transformation", to),
+            edge_type: EdgeType::DataDependency,
+        };
+        let dag = UnifiedDag {
+            nodes: vec![
+                node("src"),
+                node("a"),
+                node("b"),
+                node("reader"),
+                node("report"),
+            ],
+            edges: vec![
+                edge("src", "a"),
+                edge("a", "b"),
+                edge("b", "a"),
+                edge("b", "reader"),
+                edge("reader", "report"),
+            ],
+        };
+        let Err(UnifiedDagError::CyclicDependency { nodes }) = execution_phases(&dag) else {
+            panic!("expected a cycle");
+        };
+        assert_eq!(nodes, vec!["transformation:a", "transformation:b"]);
     }
 
     // ---------- the label pass ----------

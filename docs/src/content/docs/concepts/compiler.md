@@ -265,6 +265,34 @@ the name `Unknown`:
 model is excluded like any model with an error, before Rocky touches the
 warehouse. A `W041` is logged as a warning and the model runs.
 
+### Missing tables in external sources (`E045` / `W045`)
+
+A two-part read such as `FROM staging.orderz` names a schema and a table. When
+Rocky has source schemas for other tables in `staging`, but none for `orderz`,
+the table may not exist. The code depends on how complete Rocky's table list
+for that schema is:
+
+| Where the table list came from | Without strict sources | With strict sources |
+|---|---|---|
+| Every table read from the warehouse during this invocation (an embedding caller; no CLI command does this for a compile yet) | `E045` (error) | `E045` |
+| Seed file (`--with-seed`) or schema cache | `W045` (warning) | `E045` |
+
+A seed or the cache lists only the tables it was given, so by default these
+only warn, and the compile exits `0`. `--strict-sources` and
+`[cache.schemas] strict_sources = true` turn every `W045` into `E045`. The
+message suggests a close table name, or lists the schema's known tables.
+
+These reads stay silent:
+
+- A schema Rocky has no source schema in.
+- A schema that a model of the project writes to. The project adds tables
+  that no source schema lists.
+- A one-part name (a model, a CTE, or a table on the search path) and a
+  three-part name (its catalog may hold a different schema of that name).
+- A name bound by `WITH`.
+
+`rocky run` logs a `W045` as a warning and the model runs.
+
 During `rocky run`, a selected model with an `Error` diagnostic records a
 `compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
 branches can still run. Retained target tables are old output, not validated
@@ -315,6 +343,41 @@ These shapes stay silent:
 - `QUALIFY`, and outer references inside a subquery.
 - Names Rocky cannot place: unknown relations, stale schemas, session
   variables.
+
+Each subquery and CTE is checked as its own query.
+
+### Ambiguous column names (`E029`)
+
+Rocky reports `E029` when a bare column name could come from two relations in
+the same `FROM` clause. Every warehouse Rocky targets refuses such a query.
+
+```sql
+-- E029: column 'customer_id' is ambiguous: the joined relations 'c', 'l' all have a column called 'customer_id'
+SELECT customer_id, c.name
+FROM stg_customers AS c
+LEFT JOIN customer_ltv AS l ON c.customer_id = l.customer_id
+```
+
+Fix it by qualifying the name (`c.customer_id`), or join with
+`USING (customer_id)` when the columns are the same key.
+
+`E029` fires only when Rocky knows that both relations have the column: each
+is an upstream model, a source schema from `--with-seed` or the schema cache,
+a CTE, or a subquery in `FROM`. These stay silent:
+
+- A relation whose columns Rocky does not know, such as an external table
+  with no source schema, or a model of another pipeline compiled separately.
+- A name merged by `USING (…)`. A scope with `NATURAL`, semi, anti or
+  `ARRAY JOIN`, or `LATERAL VIEW` is not checked.
+- A name that is also a `SELECT` alias, or the output name of a qualified
+  projection such as `c.customer_id`. `ORDER BY` is not checked when the
+  `SELECT` list has a star.
+- A relation binding name (a whole-row reference), a quoted name, a date-part
+  keyword, or a niladic keyword such as `current_date`.
+- A scope that uses `->`. A lambda parses as that operator, so its parameter
+  looks like a column.
+- A name inside a subquery that the subquery's own `FROM` does not bind. It
+  resolves to the outer query (a correlated reference).
 
 Each subquery and CTE is checked as its own query.
 
@@ -414,6 +477,8 @@ span, and sometimes a suggested fix.
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
+| `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
+| `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
@@ -446,6 +511,7 @@ span, and sometimes a suggested fix.
 | `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
 | `W044` | `E044`'s finding on a model that runs only on PostgreSQL, which accepts a column that depends on a grouped primary key (escalate with `--deny-warnings W044`) |
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
+| `W045` | A two-part read names a table absent from a known schema whose table list came from a seed or the schema cache (escalate with `--strict-sources`) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
