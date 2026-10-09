@@ -1,13 +1,22 @@
-//! Missing-column checks against external source schemas (E041 / W041), and
-//! missing-table checks against the schemas they live in (E045 / W045, see
+//! Missing-column checks against external source schemas (E041 / W041) and
+//! complete in-project upstream models (E039), and missing-table checks
+//! against the schemas they live in (E045 / W045, see
 //! [`check_source_table_refs`]).
 //!
 //! The type checker treats a reference it cannot resolve as
-//! [`crate::types::RockyType::Unknown`]. For an in-project upstream, E039
-//! (see `typecheck.rs`) already refuses a projection that names a column the
-//! upstream provably does not output. This module is the counterpart for
-//! **external sources** — the `FROM raw.orders` tables Rocky knows only
-//! through [`crate::compile::CompilerConfig::source_schemas`].
+//! [`crate::types::RockyType::Unknown`]. This module proves a reference
+//! absent instead, against two kinds of relation:
+//!
+//! - **External sources** — the `FROM raw.orders` tables Rocky knows only
+//!   through [`crate::compile::CompilerConfig::source_schemas`]
+//!   ([`check_source_column_refs`], E041 / W041).
+//! - **Upstream models** whose output names are complete
+//!   ([`check_upstream_model_column_refs`], E039, called by the type checker
+//!   per model). The model's own SQL decides its output, so absence is always
+//!   an error.
+//!
+//! The rest of this page describes sources; models follow the same binding
+//! rules, with the model's output columns in place of a schema.
 //!
 //! Absence is only a fact when two things hold:
 //!
@@ -48,7 +57,7 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E041, E045, SourceSpan, W041, W045};
+use crate::diagnostic::{Diagnostic, E039, E041, E045, SourceSpan, W041, W045};
 use crate::types::TypedColumn;
 
 /// Where a source schema handed to the compiler came from.
@@ -125,12 +134,38 @@ impl SourceProvenance {
     }
 }
 
-/// A source schema eligible to prove absence.
+/// Where a known relation's column list came from.
+#[derive(Clone, Copy)]
+enum Provenance<'a> {
+    /// An external source schema.
+    Source(&'a SourceSchemaOrigin),
+    /// An in-project upstream model whose output names are complete.
+    Model,
+}
+
+impl Provenance<'_> {
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Source(origin) => origin.is_current(),
+            Self::Model => true,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Source(origin) => origin.describe(),
+            Self::Model => "in-project model with a complete output".to_string(),
+        }
+    }
+}
+
+/// A relation whose column set is known well enough to prove absence: a
+/// source schema, or a complete upstream model.
 struct KnownSource<'a> {
     key: &'a str,
     columns: HashSet<String>,
     display_columns: Vec<&'a str>,
-    origin: &'a SourceSchemaOrigin,
+    origin: Provenance<'a>,
 }
 
 impl KnownSource<'_> {
@@ -178,7 +213,12 @@ struct Finding<'s, 'a> {
 }
 
 struct Binder<'s, 'a> {
+    /// Known relations a qualified read (`schema.table`, ...) binds to, keyed
+    /// by the lower-cased dotted name.
     sources: &'s HashMap<String, KnownSource<'a>>,
+    /// Known relations a bare read (`FROM orders`) binds to, keyed by the
+    /// lower-cased name. Only upstream models are here.
+    bare: &'s HashMap<String, KnownSource<'a>>,
     findings: Vec<Finding<'s, 'a>>,
 }
 
@@ -196,11 +236,55 @@ pub fn check_source_column_refs(
     if sources.is_empty() {
         return Vec::new();
     }
+    let bare = HashMap::new();
     let mut diagnostics = Vec::new();
     for model in models {
-        diagnostics.extend(check_model(model, &sources, provenance.strict));
+        diagnostics.extend(check_model(model, &sources, &bare, provenance.strict));
     }
     diagnostics
+}
+
+/// One upstream model of a reader, with its complete output column names.
+pub(crate) struct UpstreamModelColumns<'a> {
+    /// The model's name, as the message shows it.
+    pub(crate) name: &'a str,
+    /// Whether a bare read of [`Self::name`] reaches this model.
+    pub(crate) bare_binding: bool,
+    /// Every output column name, including columns the model's strategy adds
+    /// (snapshot metadata).
+    pub(crate) columns: Vec<&'a str>,
+}
+
+/// E039 for every direct reference in `model` to a column that a complete
+/// upstream model does not output. Same binder and rules as the source check;
+/// only `upstreams` read by their bare name are known relations, so a read of
+/// anything else (a qualified target name included) keeps the name
+/// unprovable. `rocky run --defer` relies on this: it rewrites exactly the
+/// bare reads to external tables and then drops E039.
+pub(crate) fn check_upstream_model_column_refs(
+    model: &rocky_core::models::Model,
+    upstreams: &[UpstreamModelColumns<'_>],
+) -> Vec<Diagnostic> {
+    if upstreams.is_empty() {
+        return Vec::new();
+    }
+    fn known<'a>(up: &UpstreamModelColumns<'a>) -> KnownSource<'a> {
+        KnownSource {
+            key: up.name,
+            columns: up.columns.iter().map(|c| c.to_lowercase()).collect(),
+            display_columns: up.columns.clone(),
+            origin: Provenance::Model,
+        }
+    }
+    let bare: HashMap<String, KnownSource<'_>> = upstreams
+        .iter()
+        .filter(|up| up.bare_binding)
+        .map(|up| (up.name.to_lowercase(), known(up)))
+        .collect();
+    if bare.is_empty() {
+        return Vec::new();
+    }
+    check_model(model, &HashMap::new(), &bare, false)
 }
 
 /// Index source schemas by lower-cased key. Keys that collide
@@ -231,7 +315,7 @@ fn known_sources<'a>(
                 key,
                 columns: columns.iter().map(|c| c.name.to_lowercase()).collect(),
                 display_columns: columns.iter().map(|c| c.name.as_str()).collect(),
-                origin,
+                origin: Provenance::Source(origin),
             },
         );
     }
@@ -244,6 +328,7 @@ fn known_sources<'a>(
 fn check_model(
     model: &rocky_core::models::Model,
     sources: &HashMap<String, KnownSource<'_>>,
+    bare: &HashMap<String, KnownSource<'_>>,
     strict: bool,
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
@@ -255,6 +340,7 @@ fn check_model(
     };
     let mut binder = Binder {
         sources,
+        bare,
         findings: Vec::new(),
     };
     binder.check_query(query, &[], &HashSet::new());
@@ -324,6 +410,30 @@ fn build_diagnostic(model_name: &str, finding: &Finding<'_, '_>, strict: bool) -
     let mut sources = finding.sources.clone();
     sources.sort_by_key(|s| s.key);
     sources.dedup_by_key(|s| s.key);
+    if sources
+        .iter()
+        .all(|s| matches!(s.origin, Provenance::Model))
+    {
+        let message = match sources.as_slice() {
+            [single] => format!(
+                "column '{column}' does not exist in complete upstream model '{}'",
+                single.key
+            ),
+            many => format!(
+                "column '{column}' does not exist in any complete upstream model in scope: {}",
+                many.iter()
+                    .map(|s| format!("'{}'", s.key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let suggestion = format!(
+            "{}. Use a column the upstream model produces, or add the intended derivation \
+             upstream",
+            close_names_hint(column, &sources)
+        );
+        return Diagnostic::error(E039, model_name, message).with_suggestion(suggestion);
+    }
     let current = sources.iter().all(|s| s.origin.is_current());
     let is_error = current || strict;
 
@@ -709,13 +819,18 @@ impl<'s, 'a> Binder<'s, 'a> {
                     && sample.is_none()
                     && index_hints.is_empty()
                     && alias.as_ref().is_none_or(|alias| alias.columns.is_empty());
-                let source = parts
-                    .filter(|parts| plain && parts.len() >= 2)
-                    .map(|parts| parts.join(".").to_lowercase())
-                    // A CTE only shadows a single-part name today, but a
-                    // quoted dotted CTE name must still win over a source.
-                    .filter(|dotted| !ctes.contains(dotted))
-                    .and_then(|dotted| self.sources.get(&dotted));
+                let source = parts.filter(|_| plain).and_then(|parts| {
+                    let dotted = parts.join(".").to_lowercase();
+                    // A CTE shadows a single-part name, and a quoted
+                    // dotted CTE name must still win over a source.
+                    if ctes.contains(&dotted) {
+                        None
+                    } else if parts.len() == 1 {
+                        self.bare.get(&dotted)
+                    } else {
+                        self.sources.get(&dotted)
+                    }
+                });
                 scope.rels.push(Rel {
                     binding,
                     kind: source.map_or(RelKind::Opaque, RelKind::Source),

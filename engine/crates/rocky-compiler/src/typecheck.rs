@@ -18,10 +18,10 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E046, I001, I002,
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
-use crate::semantic::{LineageEdge, ModelSchema, SemanticGraph};
+use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
@@ -453,6 +453,13 @@ fn compute_model_typecheck(
         ReferenceMap::default()
     };
 
+    // A qualified read of an upstream model's own target table
+    // (`FROM tour.main.customer_ltv`) types from that model.
+    let relation_key = |name: &str| -> String {
+        qualified_upstream_model(name, &model_schema.upstream, model_by_name)
+            .map_or_else(|| name.to_string(), str::to_string)
+    };
+
     // Step 1: Lineage-based type propagation
     let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(model_schema.columns.len());
 
@@ -460,11 +467,12 @@ fn compute_model_typecheck(
         let producing_edge = graph.producing_edge(model_name, &col_def.name);
 
         let (data_type, nullable) = if let Some(edge) = producing_edge {
+            let source_model = relation_key(&edge.source.model);
             let upstream_type = typed_models
-                .get(&*edge.source.model)
+                .get(&source_model)
                 .and_then(|cols| {
                     col_index
-                        .get(&*edge.source.model)
+                        .get(&source_model)
                         .and_then(|idx| idx.get(&*edge.source.column))
                         .map(|&i| &cols[i])
                 })
@@ -530,7 +538,7 @@ fn compute_model_typecheck(
         .filter(|_| needs_inference)
         .map(|model| {
             infer_select_types_with_lookup(&model.sql, &|name| {
-                typed_models.get(name).map(Vec::as_slice)
+                typed_models.get(&relation_key(name)).map(Vec::as_slice)
             })
             .ok()
         });
@@ -599,13 +607,14 @@ fn compute_model_typecheck(
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
                 // inference's answer only when the type comes straight from
-                // the SQL (a cast target, `COUNT`, or `SUM`/`MIN`/`MAX`/`AVG`
-                // over one) and the traced input column is known — the same
-                // "Unknown input stays Unknown" rule as cast refinement.
+                // the SQL (a cast target, `COUNT`, `SUM`/`MIN`/`MAX`/`AVG` over
+                // one, or a `CASE`/`COALESCE` whose branches agree) and the
+                // traced input column is known — the same "Unknown input stays
+                // Unknown" rule as cast refinement.
                 rocky_sql::lineage::TransformKind::Expression => {
                     if exact_type
                         && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index)
+                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
                     {
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
@@ -619,6 +628,16 @@ fn compute_model_typecheck(
                         col.nullable |= inferred_col.nullable;
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if col.data_type == RockyType::Unknown
+                        && exact_type
+                        && inferred_col.data_type != RockyType::Unknown
+                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                    {
+                        // A function over one column that Step 1 cannot type
+                        // from its name alone (`COALESCE(id, 0)`): take
+                        // inference's exact answer, as for `Expression`.
+                        col.data_type = inferred_col.data_type.clone();
+                        col.nullable = inferred_col.nullable;
                     }
                 }
             }
@@ -635,6 +654,7 @@ fn compute_model_typecheck(
         graph,
         typed_models,
         col_index,
+        &relation_key,
         inferred_cols
             .as_ref()
             .map(|inferred| inferred.columns.as_slice()),
@@ -644,10 +664,10 @@ fn compute_model_typecheck(
 
     // A missing type is normally conservative Unknown: unsupported functions,
     // incomplete source schemas, and expressions outside our inference subset
-    // are all valid reasons not to know. Refuse only the narrow case where the
-    // SQL directly projects a name from one complete in-project upstream model
-    // and that name is absent from the model's proven output schema.
-    diagnostics.extend(check_known_missing_projection_refs(
+    // are all valid reasons not to know. Refuse only a reference that binds
+    // unambiguously to a complete in-project upstream model and is absent from
+    // that model's proven output schema.
+    diagnostics.extend(check_known_missing_upstream_refs(
         model_name,
         model_schema,
         graph,
@@ -660,7 +680,7 @@ fn compute_model_typecheck(
     if let Some(model) = model_by_name.get(model_name) {
         let relation_columns = |name: &str| -> Option<Vec<String>> {
             let columns = if name.contains('.') {
-                typed_models.get(name).or_else(|| {
+                typed_models.get(&relation_key(name)).or_else(|| {
                     typed_models
                         .iter()
                         .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
@@ -785,219 +805,137 @@ fn compute_model_typecheck(
     }
 }
 
-/// Refuse a direct projection only when absence is proven from a complete
-/// in-project relation.
+/// E039: a reference, in any clause, to a column that a complete upstream
+/// model does not output.
 ///
-/// This deliberately skips expression traversal, external source schemas,
-/// CTEs, derived relations, joins, stars, set operations, and relation aliases
-/// with column lists. Those forms need more scope or provenance than the
-/// compiler currently carries, so they retain the existing `Unknown` fallback.
-fn check_known_missing_projection_refs(
+/// An upstream counts only when absence is provable: the reader depends on
+/// it, its lineage schema is complete ([`ModelSchema::schema_is_complete`]),
+/// its output names are fixed by its own SQL ([`has_provably_fixed_output_names`]),
+/// and no two of them collide case-insensitively. A bare read binds to the
+/// model only when the model writes a table of that name (or is ephemeral). A
+/// qualified read of the model's target is not checked. Scope resolution, aliases,
+/// CTEs, subqueries and struct-field reads follow
+/// [`crate::source_refs::check_upstream_model_column_refs`]: anything it
+/// cannot bind stays `Unknown`.
+fn check_known_missing_upstream_refs(
     model_name: &str,
     model_schema: &ModelSchema,
     graph: &SemanticGraph,
     model_by_name: &HashMap<&str, &rocky_core::models::Model>,
 ) -> Vec<Diagnostic> {
+    use rocky_core::physical_edges::fold_identifier;
     let Some(model) = model_by_name.get(model_name) else {
         return Vec::new();
     };
-    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
-    else {
-        return Vec::new();
-    };
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Vec::new();
-    };
-    if query.with.is_some() {
-        return Vec::new();
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Vec::new();
-    };
-    if !select.lateral_views.is_empty()
-        || select.exclude.is_some()
-        || select.value_table_mode.is_some()
-        || select.flavor != ast::SelectFlavor::Standard
-    {
-        return Vec::new();
-    }
-    let [from] = select.from.as_slice() else {
-        return Vec::new();
-    };
-    if !from.joins.is_empty() {
-        return Vec::new();
-    }
-    let TableFactor::Table {
-        name,
-        alias,
-        args,
-        with_hints,
-        version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
-    } = &from.relation
-    else {
-        return Vec::new();
-    };
-    if args.is_some()
-        || !with_hints.is_empty()
-        || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
-    {
-        return Vec::new();
-    }
-    if alias
-        .as_ref()
-        .is_some_and(|alias| !alias.columns.is_empty())
-    {
-        return Vec::new();
-    }
-    let [part] = name.0.as_slice() else {
-        return Vec::new();
-    };
-    let Some(relation_name) = part.as_ident().map(|ident| ident.value.as_str()) else {
-        return Vec::new();
-    };
-
-    // Bind only through the dependency graph's exact logical model name. A
-    // physical `catalog.schema.name` must never be shortened into a project
-    // model merely because the last component happens to match.
-    if !model_schema
-        .upstream
-        .iter()
-        .any(|upstream| upstream == relation_name)
-    {
-        return Vec::new();
-    }
-    let Some(upstream_model) = model_by_name.get(relation_name) else {
-        return Vec::new();
-    };
-    if !has_provably_fixed_output_names(&upstream_model.sql) {
-        return Vec::new();
-    }
-    let Some(upstream_schema) = graph
-        .model_schema(relation_name)
-        .filter(|schema| schema.schema_is_complete())
-    else {
-        return Vec::new();
-    };
-    let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
-    if upstream_schema
-        .columns
-        .iter()
-        .any(|column| !output_names.insert(CiKey::owned(column.name.clone())))
-    {
-        // Warehouses can rename duplicate projected names while materializing
-        // the model (DuckDB turns the second `id` into `id_1`). The semantic
-        // graph preserves both source spellings, so it cannot prove absence
-        // from the physical relation in this shape.
-        return Vec::new();
-    }
-
-    let qualifier = alias
-        .as_ref()
-        .map_or(relation_name, |alias| alias.name.value.as_str());
-    // A snapshot model's table holds its SELECT's columns plus the SCD2
-    // metadata columns (`valid_from`, `is_current`, ...), which the semantic
-    // graph does not list. Readers of the snapshot may project them.
-    let snapshot_meta: Vec<String> = upstream_model
-        .config
-        .strategy
-        .snapshot_lowered()
-        .map(|lowered| {
-            lowered
-                .spec
-                .meta_columns
-                .reserved()
-                .into_iter()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let column_exists = |name: &str| {
-        upstream_schema
+    let mut snapshot_meta: Vec<Vec<String>> = Vec::new();
+    let mut candidates: Vec<(&rocky_core::models::Model, &ModelSchema)> = Vec::new();
+    for upstream in &model_schema.upstream {
+        let Some(upstream_model) = model_by_name.get(upstream.as_str()) else {
+            continue;
+        };
+        let Some(upstream_schema) = graph
+            .model_schema(upstream)
+            .filter(|schema| schema.schema_is_complete())
+        else {
+            continue;
+        };
+        if !has_provably_fixed_output_names(&upstream_model.sql) {
+            continue;
+        }
+        let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
+        if upstream_schema
             .columns
             .iter()
-            .any(|column| column.name.eq_ignore_ascii_case(name))
-            || snapshot_meta
-                .iter()
-                .any(|meta| meta.eq_ignore_ascii_case(name))
-    };
-
-    let mut diagnostics = Vec::new();
-    let mut prior_projection_aliases: Vec<&str> = Vec::new();
-    for item in &select.projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-            _ => None,
-        };
-        let missing = expr.and_then(|expr| match expr {
-            Expr::Identifier(identifier) => {
-                let name = identifier.value.as_str();
-                // DuckDB/Postgres accept a relation binding as a whole-row
-                // value. A prior SELECT alias may also be visible in dialects
-                // Rocky supports. Neither is a source-column absence proof.
-                if name.eq_ignore_ascii_case(qualifier)
-                    || name.eq_ignore_ascii_case(relation_name)
-                    || is_warehouse_pseudo_column(name)
-                    || prior_projection_aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(name))
-                    || column_exists(name)
-                {
-                    None
-                } else {
-                    Some(name)
-                }
-            }
-            Expr::CompoundIdentifier(parts) => {
-                let [qualifier_part, column_part] = parts.as_slice() else {
-                    return None;
-                };
-                // `s.foo` is not necessarily relation-alias qualification:
-                // when the upstream outputs a STRUCT column named `s`,
-                // DuckDB resolves this as field dereference. Prefer the valid
-                // expression over an absence diagnostic when both readings
-                // are possible.
-                if !qualifier_part.value.eq_ignore_ascii_case(qualifier)
-                    || column_exists(&qualifier_part.value)
-                    || is_warehouse_pseudo_column(&qualifier_part.value)
-                    || is_warehouse_pseudo_column(&column_part.value)
-                    || column_exists(&column_part.value)
-                {
-                    None
-                } else {
-                    Some(column_part.value.as_str())
-                }
-            }
-            _ => None,
-        });
-        if let Some(column) = missing {
-            diagnostics.push(
-                Diagnostic::error(
-                    E039,
-                    model_name,
-                    format!(
-                        "column '{column}' does not exist in complete upstream model '{relation_name}'"
-                    ),
-                )
-                .with_suggestion(format!(
-                    "use a column produced by '{relation_name}', or add the intended derivation upstream"
-                )),
-            );
+            .any(|column| !output_names.insert(CiKey::owned(column.name.clone())))
+        {
+            // Warehouses can rename duplicate projected names while
+            // materializing the model (DuckDB turns the second `id` into
+            // `id_1`), so the graph cannot prove absence from that relation.
+            continue;
         }
-        if let SelectItem::ExprWithAlias { alias, .. } = item {
-            prior_projection_aliases.push(alias.value.as_str());
-        }
+        // A snapshot model's table holds its SELECT's columns plus the SCD2
+        // metadata columns (`valid_from`, `is_current`, ...), which the
+        // semantic graph does not list. Readers may read them.
+        snapshot_meta.push(
+            upstream_model
+                .config
+                .strategy
+                .snapshot_lowered()
+                .map(|lowered| {
+                    lowered
+                        .spec
+                        .meta_columns
+                        .reserved()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        candidates.push((upstream_model, upstream_schema));
     }
-    diagnostics
+    let upstreams: Vec<crate::source_refs::UpstreamModelColumns<'_>> = candidates
+        .iter()
+        .zip(&snapshot_meta)
+        .map(|((upstream_model, upstream_schema), meta)| {
+            let ephemeral = matches!(
+                upstream_model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            );
+            let name = upstream_model.config.name.as_str();
+            // A bare `FROM x` reaches the table `x`: this model only when it
+            // writes that table, or is ephemeral (inlined by name).
+            let bare_binding = ephemeral
+                || fold_identifier(&upstream_model.config.target.table) == fold_identifier(name);
+            crate::source_refs::UpstreamModelColumns {
+                name,
+                bare_binding,
+                columns: upstream_schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .chain(meta.iter().map(String::as_str))
+                    .collect(),
+            }
+        })
+        .collect();
+    crate::source_refs::check_upstream_model_column_refs(model, &upstreams)
+}
+
+/// The upstream model whose `[target]` table a qualified read names, for a
+/// reader that depends on it: `catalog.schema.table`, or `schema.table` when
+/// exactly one upstream writes that schema and table.
+///
+/// Only models in `upstream` (the reader's DAG edges) are candidates, so a
+/// physical name never binds to a model the reader does not read (#1631). An
+/// ephemeral model writes no table and never matches. A bare name returns
+/// `None`: it is already a model key.
+pub(crate) fn qualified_upstream_model<'m>(
+    name: &str,
+    upstream: &[String],
+    model_by_name: &HashMap<&str, &'m rocky_core::models::Model>,
+) -> Option<&'m str> {
+    use rocky_core::physical_edges::fold_identifier;
+    let parts: Vec<String> = name.split('.').map(fold_identifier).collect();
+    if parts.len() < 2 || parts.len() > 3 || parts.iter().any(String::is_empty) {
+        return None;
+    }
+    let mut matches = upstream.iter().filter_map(|up| {
+        let model = model_by_name.get(up.as_str())?;
+        if matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            return None;
+        }
+        let target = &model.config.target;
+        let table_matches = fold_identifier(&target.schema) == parts[parts.len() - 2]
+            && fold_identifier(&target.table) == parts[parts.len() - 1];
+        let catalog_matches = parts.len() == 2 || fold_identifier(&target.catalog) == parts[0];
+        (table_matches && catalog_matches).then_some(model.config.name.as_str())
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
@@ -1010,6 +948,14 @@ pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("metadata$"))
 }
 
+/// Whether a model's output column names are fixed by its own SQL: one
+/// `SELECT` (CTEs allowed) whose every projection item is a column reference
+/// or carries an alias.
+///
+/// An alias over a function that can expand into several output columns
+/// (`unnest` of a struct in DuckDB, `explode` of a map in Spark, `COLUMNS`,
+/// `UNPACK`, `json_tuple`, `stack`, `inline`) does not fix the names, and
+/// neither does a set operation, a star, or a string-quoted alias.
 fn has_provably_fixed_output_names(sql: &str) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
@@ -1020,20 +966,52 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    query.with.is_none()
-        && select.exclude.is_none()
+    select.exclude.is_none()
         && select.value_table_mode.is_none()
+        && select.lateral_views.is_empty()
         && select.flavor == ast::SelectFlavor::Standard
-        && select.projection.iter().all(|item| {
-            matches!(
-                item,
-                SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                    | SelectItem::ExprWithAlias {
-                        expr: Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_),
-                        ..
-                    }
-            )
+        && select.projection.iter().all(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => true,
+            SelectItem::ExprWithAlias { expr, alias } => {
+                alias.quote_style != Some('\'') && !calls_expanding_function(expr)
+            }
+            _ => false,
         })
+}
+
+/// Whether `expr` calls a function that can return several columns.
+fn calls_expanding_function(expr: &Expr) -> bool {
+    use std::ops::ControlFlow;
+    ast::visit_expressions(expr, |e| match e {
+        Expr::Function(function)
+            if function
+                .name
+                .0
+                .last()
+                .and_then(ast::ObjectNamePart::as_ident)
+                .is_some_and(|ident| {
+                    matches!(
+                        ident.value.to_ascii_lowercase().as_str(),
+                        "unnest"
+                            | "explode"
+                            | "explode_outer"
+                            | "posexplode"
+                            | "posexplode_outer"
+                            | "inline"
+                            | "inline_outer"
+                            | "json_tuple"
+                            | "stack"
+                            | "columns"
+                            | "unpack"
+                            | "flatten"
+                    )
+                }) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// Validate a model's `time_interval` strategy against its typed output schema.
@@ -2664,15 +2642,17 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
 
 /// Whether the source column a lineage edge reads has a known type.
 fn edge_input_is_known(
-    edge: &LineageEdge,
+    edge: &crate::semantic::LineageEdge,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     col_index: &HashMap<String, HashMap<String, usize>>,
+    relation_key: &dyn Fn(&str) -> String,
 ) -> bool {
+    let source = relation_key(&edge.source.model);
     typed_models
-        .get(&*edge.source.model)
+        .get(&source)
         .and_then(|columns| {
             col_index
-                .get(&*edge.source.model)
+                .get(&source)
                 .and_then(|index| index.get(&*edge.source.column))
                 .map(|&index| &columns[index])
         })
@@ -2703,14 +2683,16 @@ fn edge_input_is_known(
 ///   the expression can change it. Such columns are left `Unknown`.
 /// - **Unknown input stays Unknown.** The cast target is knowable from the SQL
 ///   alone, but the target is only applied when the cast's *input* column
-///   resolves to a known type. This avoids fabricating a type for a cast over a
-///   missing or unresolved column, whose input reads as `Unknown` for the same
-///   reason a broken reference would.
+///   resolves to a known type. Rocky cannot say whether such a cast is
+///   nullable: a nullable guess would refuse a valid model under a
+///   `nullable = false` contract (E012) or a `time_interval` column (E022),
+///   and a non-null guess would pass a NULL.
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     col_index: &HashMap<String, HashMap<String, usize>>,
+    relation_key: &dyn Fn(&str) -> String,
     inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
@@ -2728,7 +2710,7 @@ fn enhanced_inference(
             continue;
         }
 
-        if !edge_input_is_known(edge, typed_models, col_index) {
+        if !edge_input_is_known(edge, typed_models, col_index, relation_key) {
             continue;
         }
 
@@ -2940,6 +2922,19 @@ fn infer_binary_op_type(
         // Boolean logic
         ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
 
+        // Date arithmetic is dialect-dependent: `DATE - DATE` is a BIGINT in
+        // DuckDB, an INTERVAL in Databricks, and `DATE - 5` is a DATE in
+        // DuckDB. `common_supertype` would call `DATE - DATE` a DATE.
+        // An `Unknown` operand may be a date too, so the result is unknown
+        // (`common_supertype` would take the other side's type).
+        ast::BinaryOperator::Plus | ast::BinaryOperator::Minus
+            if left_type.is_temporal()
+                || right_type.is_temporal()
+                || left_type == RockyType::Unknown
+                || right_type == RockyType::Unknown =>
+        {
+            (RockyType::Unknown, nullable)
+        }
         // Arithmetic → numeric promotion
         ast::BinaryOperator::Plus | ast::BinaryOperator::Minus | ast::BinaryOperator::Multiply => {
             let result_type = crate::types::common_supertype(&left_type, &right_type)
@@ -3517,12 +3512,13 @@ impl SelectInference {
         // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
         let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
             && matches!(data_type, RockyType::Decimal { .. });
-        if has_exact_type(expr) && !widened_decimal {
+        if has_exact_type(expr, scope) && !widened_decimal {
             self.exact_type_outputs.insert(self.columns.len());
         }
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
+
         self.columns.push(TypedColumn {
             name,
             data_type,
@@ -3543,28 +3539,104 @@ fn function_name(expr: &Expr) -> Option<String> {
 
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
 /// itself rather than from a guess: a column, a cast (its target), `COUNT`,
-/// or `SUM` / `MIN` / `MAX` / `AVG` over one of these.
+/// `SUM` / `MIN` / `MAX` / `AVG` over one of these, or a `CASE` / `COALESCE`
+/// whose branches agree (see [`branches_agree`]).
 ///
 /// Anything else — a scalar function whose result width is dialect-dependent
-/// (`LENGTH`), a numeric literal, `COALESCE` over a literal — is not exact, so
-/// a nested expression built from it stays `Unknown` (#2295).
-fn has_exact_type(expr: &Expr) -> bool {
+/// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
+/// type — is not exact, so a nested expression built from it stays `Unknown`
+/// (#2295).
+fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
-        Expr::Nested(inner) => has_exact_type(inner),
+        Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
             "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
-                        if has_exact_type(arg)
+                        if has_exact_type(arg, scope)
                 ),
+                _ => false,
+            },
+            "COALESCE" if func.over.is_none() && func.filter.is_none() => match &func.args {
+                ast::FunctionArguments::List(list)
+                    if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
+                {
+                    let mut branches = Vec::with_capacity(list.args.len());
+                    for arg in &list.args {
+                        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
+                            return false;
+                        };
+                        branches.push(arg);
+                    }
+                    branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
+                }
                 _ => false,
             },
             _ => false,
         },
+        // Simple `CASE x WHEN ...` and searched `CASE WHEN ...`: the type
+        // comes from the results only.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            let branches: Vec<&Expr> = conditions
+                .iter()
+                .map(|when| &when.result)
+                .chain(else_result.as_deref())
+                .collect();
+            branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
+        }
         _ => false,
+    }
+}
+
+/// Whether the branches of a `CASE` or `COALESCE` fix its type `result`:
+/// every branch is exact (see [`has_exact_type`]), a text or boolean literal,
+/// an integer literal, or `NULL`; at least one branch is neither `NULL` nor a
+/// number; and every branch that is neither infers to `result` exactly.
+///
+/// An integer literal takes its type from the context in DuckDB
+/// (`COALESCE(int_col, 0)` is `INTEGER`), so Rocky's `BIGINT` for it is a
+/// guess. It is accepted only because the other branches must already infer
+/// to `result`: if the literal had widened the type, they would not.
+fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> bool {
+    if *result == RockyType::Unknown {
+        return false;
+    }
+    let mut typed_branch = false;
+    for branch in branches {
+        let branch = strip_nested(branch);
+        if let Expr::Value(value) = branch {
+            match &value.value {
+                ast::Value::Null => continue,
+                ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
+                    continue;
+                }
+                // A double-quoted value is an identifier in DuckDB and
+                // PostgreSQL, so it is not a text literal here.
+                ast::Value::SingleQuotedString(_) | ast::Value::Boolean(_) => {}
+                _ => return false,
+            }
+        } else if !has_exact_type(branch, scope) {
+            return false;
+        }
+        if infer_expr_type(branch, scope).0 != *result {
+            return false;
+        }
+        typed_branch = true;
+    }
+    typed_branch
+}
+
+fn strip_nested(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => strip_nested(inner),
+        other => other,
     }
 }
 
@@ -4135,6 +4207,7 @@ fn emit_join_key_diagnostic(
 mod tests {
     use super::*;
     use crate::contracts::{CompilerContract, ContractColumn, ContractRules, validate_contract};
+    use crate::diagnostic::E039;
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
@@ -4346,7 +4419,10 @@ mod tests {
             assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
             assert_eq!(col.nullable, nullable, "{}", col.name);
         }
-        assert_eq!(columns[3].data_type, RockyType::Unknown);
+        // `COALESCE(b.id, 0)`: the BIGINT branch fixes the type, and the
+        // non-null literal makes it non-null even over the null-extended side.
+        assert_eq!(columns[3].data_type, RockyType::Int64);
+        assert!(!columns[3].nullable);
         assert!(
             !columns[4].nullable,
             "COUNT stays non-null even over null-extended input"
@@ -8500,5 +8576,380 @@ mod tests {
         let plain = make_model("plain_m", "SELECT 1 AS id");
         let diags = check_lakehouse_format_options(&[delta, plain]);
         assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    /// Compile `models` with `sources` and return the typed columns and the
+    /// diagnostics.
+    fn compile_typed(
+        models: &[(&str, &str)],
+        sources: HashMap<String, Vec<TypedColumn>>,
+    ) -> crate::compile::CompileResult {
+        let models: Vec<Model> = models.iter().map(|(n, s)| make_model(n, s)).collect();
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources,
+            ..Default::default()
+        };
+        crate::compile::compile_preloaded_models(models, &config).expect("compile")
+    }
+
+    fn column<'a>(
+        result: &'a crate::compile::CompileResult,
+        model: &str,
+        name: &str,
+    ) -> &'a TypedColumn {
+        result.type_check.typed_models[model]
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{model}.{name} missing"))
+    }
+
+    fn product_sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([(
+            "raw.products".to_string(),
+            source_schema(&[
+                ("product_id", RockyType::Int64, false),
+                ("name", RockyType::String, true),
+                ("qty", RockyType::Int32, true),
+                (
+                    "price",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ]),
+        )])
+    }
+
+    #[test]
+    fn case_over_text_literals_is_text() {
+        let result = compile_typed(
+            &[(
+                "stg_products",
+                "SELECT product_id, name, price, \
+                 CASE WHEN price < 20 THEN 'budget' WHEN price < 60 THEN 'standard' \
+                 ELSE 'premium' END AS price_band FROM raw.products",
+            )],
+            product_sources(),
+        );
+        let band = column(&result, "stg_products", "price_band");
+        assert_eq!(band.data_type, RockyType::String);
+        assert!(!band.nullable, "every branch is a non-null literal");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "I002"),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn case_and_coalesce_type_only_when_branches_agree() {
+        let result = compile_typed(
+            &[(
+                "m",
+                "SELECT product_id, \
+                 CASE WHEN qty > 1 THEN 'x' END AS no_else, \
+                 COALESCE(product_id, 0) AS id_or_zero, \
+                 COALESCE(name, 'unknown') AS name_or_default, \
+                 COALESCE(qty, 0) AS qty_or_zero, \
+                 COALESCE(price, 0) AS price_or_zero, \
+                 COALESCE(product_id, 1.5) AS id_or_fraction, \
+                 CASE WHEN qty > 1 THEN 1 ELSE 2 END AS literals_only, \
+                 CASE WHEN qty > 1 THEN qty ELSE product_id END AS widened, \
+                 CASE WHEN qty > 1 THEN name ELSE NULL END AS name_or_null \
+                 FROM raw.products",
+            )],
+            product_sources(),
+        );
+        let ty = |name: &str| column(&result, "m", name).data_type.clone();
+        let no_else = column(&result, "m", "no_else");
+        assert_eq!(no_else.data_type, RockyType::String);
+        assert!(no_else.nullable, "no ELSE yields NULL");
+        assert_eq!(ty("id_or_zero"), RockyType::Int64);
+        assert!(!column(&result, "m", "id_or_zero").nullable);
+        assert_eq!(ty("name_or_default"), RockyType::String);
+        assert_eq!(ty("name_or_null"), RockyType::String);
+        // DuckDB types `COALESCE(INTEGER, 0)` INTEGER and
+        // `COALESCE(DECIMAL(10,2), 0)` DECIMAL(10,2); Rocky would widen
+        // both, so it claims no type.
+        assert_eq!(ty("qty_or_zero"), RockyType::Unknown);
+        assert_eq!(ty("price_or_zero"), RockyType::Unknown);
+        // `1.5` is not an integer literal; numeric-literal-only and widening
+        // branches have no exact type.
+        assert_eq!(ty("id_or_fraction"), RockyType::Unknown);
+        assert_eq!(ty("literals_only"), RockyType::Unknown);
+        assert_eq!(ty("widened"), RockyType::Unknown);
+    }
+
+    #[test]
+    fn a_cast_over_a_known_input_takes_its_target_and_an_unknown_one_does_not() {
+        let sql = "SELECT o.id, \
+                   CAST(o.qty * o.price AS DECIMAL(12, 2)) AS amount, \
+                   CAST(o.id AS BIGINT) AS id_big, \
+                   CAST(o.id AS DECIMAL) AS bare_decimal \
+                   FROM raw.orders AS o";
+        let known = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("id", RockyType::Int32, false),
+                ("qty", RockyType::Int32, false),
+                (
+                    "price",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+            ]),
+        )]);
+        let result = compile_typed(&[("m", sql)], known);
+        assert_eq!(
+            column(&result, "m", "amount").data_type,
+            RockyType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
+        // A bare DECIMAL names no precision: still Unknown.
+        assert_eq!(
+            column(&result, "m", "bare_decimal").data_type,
+            RockyType::Unknown
+        );
+
+        // No schema: Rocky cannot say whether the casts are nullable, so it
+        // claims no type (a nullable guess would refuse a valid model under a
+        // NOT NULL contract or a time_interval column).
+        let result = compile_typed(&[("m", sql)], HashMap::new());
+        for name in ["amount", "id_big"] {
+            assert_eq!(
+                column(&result, "m", name).data_type,
+                RockyType::Unknown,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_arithmetic_is_unknown() {
+        let sources = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("first_order", RockyType::Date, false),
+                ("last_order", RockyType::Date, false),
+                ("n", RockyType::Int64, false),
+            ]),
+        )]);
+        let columns = infer_select_types(
+            "SELECT last_order - first_order AS span, last_order - 5 AS earlier, \
+             first_order + n AS later, missing + 1 AS unknown_plus, n + 1 AS next_n \
+             FROM raw.orders",
+            &sources,
+            "m",
+        )
+        .unwrap();
+        let ty = |name: &str| {
+            columns
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.data_type.clone())
+                .unwrap()
+        };
+        for name in ["span", "earlier", "later", "unknown_plus"] {
+            assert_eq!(ty(name), RockyType::Unknown, "{name}");
+        }
+        assert_eq!(ty("next_n"), RockyType::Int64);
+    }
+
+    #[test]
+    fn a_qualified_read_of_an_upstream_target_types_from_that_model() {
+        let sources = HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("customer_id", RockyType::Int64, false),
+                ("amount", RockyType::Float64, true),
+            ]),
+        )]);
+        let ltv = make_model(
+            "customer_ltv",
+            "SELECT customer_id, SUM(amount) AS lifetime_value, COUNT(*) AS order_count \
+             FROM raw.orders GROUP BY customer_id",
+        );
+        // Ephemeral, reads its upstream by the physical name it writes, and
+        // declares the dependency.
+        let mut active = make_model(
+            "int_active",
+            "SELECT customer_id, lifetime_value, order_count \
+             FROM warehouse.silver.customer_ltv WHERE order_count > 0",
+        );
+        active.config.depends_on = vec!["customer_ltv".to_string()];
+        active.config.strategy = StrategyConfig::Ephemeral;
+        let top = make_model(
+            "top",
+            "WITH ranked AS (SELECT customer_id, lifetime_value AS ltv, order_count \
+             FROM int_active) SELECT customer_id, ltv, order_count FROM ranked",
+        );
+        // Same read, but no dependency on the model: the name may be any
+        // physical table, so nothing binds.
+        let stray = make_model(
+            "stray",
+            "SELECT customer_id FROM warehouse.silver.customer_ltv",
+        );
+        let models = vec![ltv, active, top, stray];
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources,
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
+        for model in ["int_active", "top"] {
+            let ty = |name: &str| column(&result, model, name).data_type.clone();
+            assert_eq!(ty("customer_id"), RockyType::Int64, "{model}");
+            assert_eq!(ty("order_count"), RockyType::Int64, "{model}");
+        }
+        assert_eq!(column(&result, "top", "ltv").data_type, RockyType::Float64);
+        assert_eq!(
+            column(&result, "stray", "customer_id").data_type,
+            RockyType::Unknown
+        );
+    }
+
+    /// An upstream whose output names are fixed by aliases over expressions.
+    const ORDER_LINES: &str = "SELECT o.order_id, o.customer_id, o.status, o.order_date, \
+                               CAST(o.quantity * o.price AS DECIMAL(12, 2)) AS amount \
+                               FROM raw.orders AS o";
+
+    #[test]
+    fn known_missing_upstream_column_is_refused_in_every_clause() {
+        for sql in [
+            "SELECT order_id FROM order_lines WHERE stats = 'completed'",
+            "SELECT l.order_id FROM order_lines AS l WHERE l.stats = 'completed'",
+            "SELECT a.order_id FROM order_lines AS a JOIN order_lines AS b ON a.order_id = b.ordr_id",
+            "SELECT customer_id, COUNT(*) AS n FROM order_lines GROUP BY customer_id, stats",
+            "SELECT customer_id FROM order_lines GROUP BY customer_id HAVING MAX(amout) > 0",
+            "SELECT CASE WHEN stats = 'x' THEN 1 END AS flag FROM order_lines",
+            "SELECT UPPER(stats) AS s FROM order_lines",
+            "SELECT order_id FROM order_lines WHERE stats IN ('a', 'b')",
+            "SELECT order_id FROM order_lines WHERE order_id IN (SELECT order_id FROM order_lines WHERE stats = 'x')",
+            "WITH c AS (SELECT order_id, stats FROM order_lines) SELECT order_id FROM c",
+        ] {
+            let mut consumer = make_model("consumer", sql);
+            consumer.config.depends_on = vec!["order_lines".to_string()];
+            let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), consumer]);
+            let found = e039_diagnostics(&result);
+            assert_eq!(found.len(), 1, "`{sql}`: {:?}", result.diagnostics);
+            assert!(found[0].message.contains("'order_lines'"), "{:?}", found[0]);
+            assert!(found[0].is_error());
+        }
+    }
+
+    #[test]
+    fn known_missing_column_of_a_case_aliased_upstream_is_refused() {
+        // The upstream projects an aliased CASE (what a `.rocky` derive
+        // lowers to) and drops `category`; the reader still reads it.
+        let result = compile_typechecks(vec![
+            make_model(
+                "products",
+                "SELECT product_id, name, price, \
+                 CASE WHEN price < 20 THEN 'budget' ELSE 'premium' END AS price_band \
+                 FROM raw.products",
+            ),
+            make_model("order_lines", ORDER_LINES),
+            make_model(
+                "lines",
+                "SELECT o.order_id, p.category FROM order_lines AS o \
+                 JOIN products AS p ON o.order_id = p.product_id",
+            ),
+        ]);
+        let found = e039_diagnostics(&result);
+        assert_eq!(found.len(), 1, "{:?}", result.diagnostics);
+        assert!(found[0].message.contains("'category'"));
+        assert!(found[0].message.contains("'products'"));
+    }
+
+    #[test]
+    fn known_missing_upstream_controls_stay_clean() {
+        for sql in [
+            // Every column exists.
+            "SELECT order_id, status, amount FROM order_lines WHERE status = 'completed' \
+             AND order_id >= '1'",
+            // A SELECT alias reused later in the projection (DuckDB lateral alias).
+            "SELECT customer_id, MIN(order_date) AS first_order, MAX(order_date) AS last_order, \
+             last_order - first_order AS span_days FROM order_lines GROUP BY customer_id",
+            // ORDER BY an output alias.
+            "SELECT order_id AS id FROM order_lines ORDER BY id",
+            // A correlated subquery reading the outer relation.
+            "SELECT c.customer_id, (SELECT COUNT(*) FROM order_lines AS so \
+             WHERE so.customer_id = c.customer_id) AS n FROM raw.customers AS c",
+            // A join with a relation Rocky cannot enumerate: unqualified names
+            // may come from it.
+            "SELECT tier FROM order_lines JOIN raw.customers USING (customer_id)",
+            // A CTE that shadows the model's name.
+            "WITH order_lines AS (SELECT 1 AS stats) SELECT stats FROM order_lines",
+            // A derived table with its own columns.
+            "SELECT d.stats FROM (SELECT status AS stats FROM order_lines) AS d",
+            // A lambda parameter is not a column.
+            "SELECT list_transform([1], x -> x + 1) AS l FROM order_lines",
+            // A qualified read of the target is not checked (`rocky run
+            // --defer` keeps such a read local).
+            "SELECT order_id FROM warehouse.silver.order_lines WHERE stats = 'x'",
+            "SELECT order_id FROM silver.order_lines WHERE stats = 'x'",
+        ] {
+            let mut consumer = make_model("consumer", sql);
+            consumer.config.depends_on = vec!["order_lines".to_string()];
+            let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), consumer]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "`{sql}`: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_read_binds_only_to_the_model_that_writes_that_table() {
+        // `order_lines` writes `silver.order_lines_v2`: a bare `order_lines`
+        // reaches some other table, so nothing is provable about it.
+        let mut renamed = make_model("order_lines", ORDER_LINES);
+        renamed.config.target.table = "order_lines_v2".to_string();
+        let mut reader = make_model("consumer", "SELECT stats FROM order_lines");
+        reader.config.depends_on = vec!["order_lines".to_string()];
+        let result = compile_typechecks(vec![renamed, reader]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+        // The same reader with the default target is refused.
+        let mut reader = make_model("consumer", "SELECT stats FROM order_lines");
+        reader.config.depends_on = vec!["order_lines".to_string()];
+        let result = compile_typechecks(vec![make_model("order_lines", ORDER_LINES), reader]);
+        assert_eq!(
+            e039_diagnostics(&result).len(),
+            1,
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn an_upstream_with_an_expanding_or_unaliased_expression_proves_nothing() {
+        for upstream in [
+            "SELECT order_id, unnest(items) AS item FROM raw.orders",
+            "SELECT order_id, amount * 2 FROM raw.orders",
+            "SELECT order_id FROM raw.a UNION ALL SELECT order_id FROM raw.b",
+            "SELECT order_id, 'x' AS 'quoted' FROM raw.orders",
+        ] {
+            let result = compile_typechecks(vec![
+                make_model("up", upstream),
+                make_model("consumer", "SELECT order_id FROM up WHERE missing = 1"),
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "`{upstream}`: {:?}",
+                result.diagnostics
+            );
+        }
     }
 }

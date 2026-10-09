@@ -179,10 +179,12 @@ pub const E037: &str = "E037";
 ///   by the CLI, not by `rocky compile`).
 pub const E038: &str = "E038";
 
-/// A direct projection reads a column absent from a complete in-project model.
+/// A model reads a column absent from a complete in-project upstream model,
+/// in any clause (`SELECT`, `WHERE`, join `ON`, `GROUP BY`, `HAVING`, ...).
 ///
 /// Emitted only when Rocky can prove the upstream model's output names are
-/// complete. External sources are covered separately, by [`E041`] / [`W041`],
+/// complete and the read binds to it by its bare name; see
+/// `check_known_missing_upstream_refs` in `typecheck.rs`. External sources are covered separately, by [`E041`] / [`W041`],
 /// which weigh where the source schema came from.
 pub const E039: &str = "E039";
 
@@ -199,6 +201,15 @@ pub const E040: &str = "E040";
 /// projection aliases, and arguments of unknown functions stay silent. See
 /// `rocky_compiler::group_by` for the full rule set.
 pub const E044: &str = "E044";
+/// A call names a function the target warehouse does not have, and the
+/// project does not declare it in `functions/` (e.g. `SUMM(amount)`).
+///
+/// Emitted by `rocky compile` from [`crate::function_check`] only for models
+/// that run on DuckDB, the one dialect with a complete function list here.
+/// Schema-qualified calls (`main.my_macro(x)`) and quoted names are not
+/// checked, nor is a project whose `[portability] target_dialect` names
+/// another warehouse.
+pub const E057: &str = "E057";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

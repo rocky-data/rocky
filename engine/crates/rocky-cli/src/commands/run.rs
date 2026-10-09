@@ -1127,9 +1127,12 @@ pub struct DeferOptions {
 /// rewritten the selected model's exact in-project references to external
 /// targets. Other diagnostics on the selected model remain errors.
 ///
-/// E039's emitter admits exactly one plain in-project relation binding. Under
-/// the single-model defer path that binding is necessarily unselected and the
-/// successful rewrite externalizes it. The external target's schema remains
+/// E039's emitter binds only bare reads of in-project models (never a
+/// qualified target name), in any clause. Under the single-model defer path
+/// every such model is unselected, so every E039 on the selected model is
+/// dropped, including one from a read the rewrite did not externalize (for
+/// example inside a CTE, if the rewrite skips it); that read then fails at
+/// warehouse execution instead. The external target's schema remains
 /// unknown here: an invalid column still fails at warehouse execution.
 ///
 /// With a multi-model selection a selected model may read another selected
