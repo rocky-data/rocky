@@ -5046,9 +5046,9 @@ pub struct ImportDbtOutput {
     /// detected and skipped (snapshots, metrics, semantic models, exposures).
     #[serde(default)]
     pub constructs_dropped: usize,
-    /// Number of dbt models whose enforced `contract` (column `data_type`s /
-    /// `constraints`) was dropped on import. Rocky enforces contracts via a
-    /// `{model}.contract.toml` sidecar the importer does not auto-generate.
+    /// Number of dbt models whose enforced `contract` was written to a
+    /// `{model}.contract.toml` but not fully: a column type Rocky has no name
+    /// for, or a constraint Rocky does not check (`unique`, `check`, ...).
     #[serde(default)]
     pub contracts_dropped: usize,
     pub macros_detected: usize,
@@ -5176,10 +5176,10 @@ pub enum ImportDbtStructuredWarning {
         name: String,
         detail: String,
     },
-    /// A dbt model `contract` (`enforced: true`), column `data_type`s, and/or
-    /// `constraints` were dropped on import. Rocky enforces contracts via a
-    /// `{model}.contract.toml` sidecar the importer does not auto-generate;
-    /// the user must hand-author it. Visibility only — no stub generated.
+    /// A dbt model `contract` (`enforced: true`) was written to
+    /// `{model}.contract.toml`, but part of it has no Rocky check: a column
+    /// `data_type` Rocky has no name for, or a constraint other than
+    /// `not_null` and `primary_key`. Review the generated file.
     DroppedContract {
         model: String,
         typed_columns: usize,

@@ -526,6 +526,7 @@ mod tests {
             name: name.to_string(),
             sql: "SELECT 1".to_string(),
             unit_tests: vec![],
+            contract_toml: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],
