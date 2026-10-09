@@ -73,7 +73,8 @@ pub struct DbtExposure {
     pub url: Option<String>,
     /// dbt's `description`, else its `label`.
     pub description: Option<String>,
-    /// Names of the models the exposure reads, sorted.
+    /// `unique_id`s of the models the exposure reads, sorted (for example
+    /// `model.shop.orders`). The importer maps each to its Rocky name.
     pub models: Vec<String>,
     /// Everything else it reads, spelled `<kind> <name>` (for example
     /// `source shop.orders`, `seed countries`). Rocky consumers read models
@@ -112,9 +113,7 @@ fn collect_exposures(raw: &HashMap<String, serde_json::Value>) -> Vec<DbtExposur
                 // `model.<project>.<name>` -> `<name>`; a source keeps its
                 // `<source>.<table>` tail.
                 match node.split_once('.') {
-                    Some(("model", rest)) => {
-                        models.push(rest.split_once('.').map_or(rest, |(_, n)| n).to_string());
-                    }
+                    Some(("model", _)) => models.push(node.to_string()),
                     Some((kind, rest)) => {
                         other_dependencies.push(format!(
                             "{kind} {}",

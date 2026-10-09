@@ -438,7 +438,7 @@ pub fn import_from_manifest(
     // Surface the resource classes the importer does not translate so a
     // migration is never silently lossy.
     record_dropped_constructs(&manifest.dropped, &mut result);
-    import_exposures(&manifest.exposures, &mut result);
+    import_exposures(manifest, &mut result);
 
     apply_dbt_unit_tests(manifest, &mut result, skip_unit_tests);
 
@@ -486,6 +486,11 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
     }
 }
 
+/// The model name at the end of a `model.<project>.<name>` unique id.
+fn extract_tail(id: &str) -> String {
+    id.splitn(3, '.').nth(2).unwrap_or(id).to_string()
+}
+
 /// Turn each dbt exposure into a downstream consumer.
 ///
 /// A consumer keeps a dependency only when it names a model that was imported,
@@ -493,11 +498,11 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
 /// emitted repo has to compile. Everything else an exposure reads (a source, a
 /// seed, a model that failed to import) is listed in the migration notes. An
 /// exposure whose name is not a valid consumer name is listed and not written.
-fn import_exposures(exposures: &[dbt_manifest::DbtExposure], result: &mut ImportResult) {
+fn import_exposures(manifest: &DbtManifest, result: &mut ImportResult) {
     let imported: std::collections::HashSet<String> =
         result.imported.iter().map(|m| m.name.clone()).collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for exposure in exposures {
+    for exposure in &manifest.exposures {
         let mut note = |construct: &str, detail: String| {
             result.constructs_dropped += 1;
             result
@@ -526,13 +531,22 @@ fn import_exposures(exposures: &[dbt_manifest::DbtExposure], result: &mut Import
         }
         let mut depends_on = Vec::new();
         let mut not_carried: Vec<String> = exposure.other_dependencies.clone();
-        for model in &exposure.models {
-            if imported.contains(model) {
-                depends_on.push(model.clone());
+        for id in &exposure.models {
+            // The importer names a versioned dbt model `<name>_v<N>`, so map
+            // through the manifest node instead of reading the name off the id.
+            let rocky_name = manifest
+                .nodes
+                .get(id)
+                .and_then(|node| manifest_rocky_name(node).ok())
+                .unwrap_or_else(|| extract_tail(id));
+            if imported.contains(&rocky_name) {
+                depends_on.push(rocky_name);
             } else {
-                not_carried.push(format!("model {model} (not imported)"));
+                not_carried.push(format!("model {rocky_name} (not imported)"));
             }
         }
+        depends_on.sort();
+        depends_on.dedup();
         if !not_carried.is_empty() {
             note(
                 "exposure dependency",

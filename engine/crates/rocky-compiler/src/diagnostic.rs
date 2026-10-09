@@ -226,8 +226,9 @@ pub const E058: &str = "E058";
 /// model). The message names the consumer and the entry; a near-miss model
 /// name is offered when there is one.
 ///
-/// Emitted by `rocky compile` (and so by `rocky ci`, strict and `rocky run
-/// --dag`) from [`crate::consumers`]. A consumer that points at a model that
+/// Emitted by `rocky compile` (and so by `rocky ci` and strict compiles) from
+/// [`crate::consumers`]. `rocky run` does not stop for it: a run keys error
+/// diagnostics on model names, and a consumer is not a model. A consumer that points at a model that
 /// no longer exists is the failure this exists to catch: the dashboard would
 /// otherwise keep reading a table nobody maintains.
 pub const E059: &str = "E059";

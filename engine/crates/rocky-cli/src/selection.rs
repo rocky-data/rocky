@@ -178,10 +178,19 @@ pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
     });
     // Consumers feed the `consumer:` method. Files that do not load are the
     // compiler's `E059`, not this graph's concern.
-    let consumers = rocky_core::consumers::load_consumers_for_models_dir(models_dir)
-        .consumers
-        .into_iter()
-        .map(|c| (c.name, c.depends_on));
+    // A name used twice is ambiguous (the compiler refuses both with E059), so
+    // neither holder is selectable.
+    let loaded = rocky_core::consumers::load_consumers_for_models_dir(models_dir).consumers;
+    let mut holders: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for c in &loaded {
+        *holders.entry(c.name.as_str()).or_default() += 1;
+    }
+    let unique: Vec<_> = loaded
+        .iter()
+        .filter(|c| holders[c.name.as_str()] == 1)
+        .map(|c| (c.name.clone(), c.depends_on.clone()))
+        .collect();
+    let consumers = unique.into_iter();
     SelectorGraph::new(nodes).with_consumers(consumers)
 }
 

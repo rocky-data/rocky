@@ -892,6 +892,11 @@ class ModelLineageResult(BaseModel):
     #: model). Loose ``dict`` entries — the nested shape lives on the generated
     #: ``LineageOutput.nodes``. Empty when the engine doesn't emit node metadata.
     nodes: list[dict] = Field(default_factory=list)
+    #: Downstream consumers (dashboards, notebooks, ML jobs, applications)
+    #: that read the model, directly or through downstream models. Loose
+    #: ``dict`` entries; the nested shape lives on the generated
+    #: ``LineageOutput.consumers``. Empty when none are declared.
+    consumers: list[dict] = Field(default_factory=list)
 
 
 class RowSelectionEdge(BaseModel):

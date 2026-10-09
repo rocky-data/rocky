@@ -52,19 +52,24 @@ An unknown key is an error, so a typo such as `ownr` does not pass silently.
 `rocky compile` reads every consumer file. It reports `E059` for each problem:
 
 - A file that does not parse, or has an unknown `kind` or key.
-- Two consumers with the same name. Rocky refuses both, because nothing says which one a selector means.
+- Two consumers with the same name. Rocky refuses both, because nothing says which one is meant. `consumer:<name>` selects neither.
 - A `depends_on` entry that is not a model in the project.
 
 ```
-error[E059] weekly_board: consumer `weekly_board` depends on `fct_order`, which is not a model in this project
+error[E059]: consumer `weekly_board` depends on `fct_order`, which is not a model in this project
   help: did you mean `fct_orders`?
 ```
 
 `depends_on` takes model names only. A source table or a seed is not a model.
 This check is what catches a dashboard that still reads a model someone removed.
 
-`E059` is an ordinary compile error. `rocky ci`, strict compiles and
-`rocky run --dag` refuse it in the same way as any other error.
+`E059` is an ordinary compile error. `rocky compile` and `rocky ci` fail on it,
+and so do strict compiles. `rocky run` does not stop for it, because a run
+checks diagnostics model by model and a consumer is not a model. Run
+`rocky compile` or `rocky ci` first.
+
+Rocky looks for `consumers/` beside the models directory you pass. If you pass a
+subdirectory of `models/`, Rocky looks beside that subdirectory.
 
 One bad consumer file also stops `rocky docs` from showing column types and
 lineage, as any other compile error does. The consumer list itself still renders.
