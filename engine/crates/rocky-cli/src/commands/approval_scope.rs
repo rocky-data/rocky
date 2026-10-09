@@ -171,18 +171,6 @@ impl ScopeUnit {
 }
 
 impl ApprovalScope {
-    /// Anchor every relative unit directory at `root` (review runs against an
-    /// explicit project root, not the process cwd).
-    pub(crate) fn anchored_at(mut self, root: &Path) -> Self {
-        for unit in &mut self.units {
-            unit.models_dir = root.join(&unit.models_dir);
-        }
-        if let Some(seeds_dir) = &mut self.seeds_dir {
-            *seeds_dir = root.join(&*seeds_dir);
-        }
-        self
-    }
-
     /// The units whose directory exists. A `--dag` run skips a pipeline whose
     /// directory is absent, so review has nothing to compare there.
     pub(crate) fn present_units(&self) -> impl Iterator<Item = &ScopeUnit> {
@@ -615,12 +603,11 @@ pub(crate) fn verify_plan_models_for_apply(
             dag: false,
             units: vec![ScopeUnit {
                 pipeline: None,
-                models_dir: PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                models_dir: super::apply::backfill_models_dir(root, run_plan),
                 models_glob: None,
             }],
             seeds_dir: None,
         }
-        .anchored_at(root)
     } else {
         // `config_path` is resolved against `root` by the apply entry point,
         // as propose and review resolve it, so the directory and the glob

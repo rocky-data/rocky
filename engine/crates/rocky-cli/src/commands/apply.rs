@@ -3263,6 +3263,18 @@ fn run_models_dir(
     }
 }
 
+/// The models directory a backfill plan executes: the plan's own directory,
+/// or the `models` default, anchored at `root` exactly once (#2336).
+///
+/// A backfill reads no pipeline glob, so this is its whole selection. Review,
+/// the apply-time models check, the policy gate and `execute_backfill_set`
+/// all take the directory from here, so they read the same models. An
+/// absolute directory is kept as is. The CLI passes the absolute cwd as
+/// `root`, so its behaviour does not change.
+pub(crate) fn backfill_models_dir(root: &Path, run_plan: &RunPlan) -> PathBuf {
+    root.join(run_plan.models_dir.as_deref().unwrap_or("models"))
+}
+
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
 /// execute, using the same directory, file glob, and `--model` selection.
 ///
@@ -5268,7 +5280,10 @@ async fn run_apply_backfill_plan(
             )));
         }
     };
-    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    // The gate and `execute_backfill_set` read this one directory, anchored
+    // at the project root as review and the models check anchor it (#2336).
+    let models_dir = backfill_models_dir(root, &run_plan);
+    let models_dir = models_dir.as_path();
     // A backfill's `models` list IS the authoritative rebuild closure the
     // engine composed and will execute (see `execute_backfill_set` below), not
     // an informational hint — gate on it directly.
@@ -11679,6 +11694,117 @@ autonomy_budget = { failures = 3, window = "7d" }
             db.execute_sql("SELECT * FROM marts.totals")?.columns,
             vec!["checked".to_string()],
             "the run must execute the root's `totals`, the model the gate checked"
+        );
+        Ok(())
+    }
+
+    /// #2336: the backfill twin of the test above. `<cwd>/<dir>` and
+    /// `<root>/<dir>` hold DIFFERENT `totals` models. Only the cwd's carries
+    /// a `pii` column, and the policy denies `pii` models. The policy gate
+    /// must read the root's (no `pii`, so it allows) and the backfill must
+    /// rebuild the root's. Read against the cwd, the gate denies the apply,
+    /// or the run materializes the `unchecked` column.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn a_backfill_gates_and_runs_the_models_under_the_project_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        assert!(root.is_relative() && root != Path::new("."));
+        let config = two_pipeline_dag_project(&root)?;
+        let mut toml = std::fs::read_to_string(&config)?;
+        toml.push_str("[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n");
+        for capability in [
+            "apply",
+            "backfill",
+            "schema_change.additive",
+            "schema_change.breaking",
+        ] {
+            toml.push_str(&format!(
+                "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"{capability}\"\n\
+                 scope = {{ classifications = [\"pii\"] }}\neffect = \"deny\"\n"
+            ));
+        }
+        std::fs::write(&config, toml)?;
+
+        let decoy = tempfile::Builder::new()
+            .prefix("backfill-root-decoy-")
+            .tempdir_in(&cwd)?;
+        let models_dir = PathBuf::from(decoy.path().file_name().context("decoy name")?);
+        let totals = |base: &Path, column: &str, extra: &str| -> anyhow::Result<()> {
+            std::fs::create_dir_all(base)?;
+            std::fs::write(base.join("totals.sql"), format!("SELECT 2 AS {column}\n"))?;
+            std::fs::write(
+                base.join("totals.toml"),
+                format!(
+                    "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"totals\"\n{extra}"
+                ),
+            )?;
+            Ok(())
+        };
+        totals(&root.join(&models_dir), "checked", "")?;
+        totals(
+            &cwd.join(&models_dir),
+            "unchecked",
+            "\n[classification]\nunchecked = \"pii\"\n",
+        )?;
+        // A backfill does not create schemas: the closure was built before.
+        rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?
+            .execute_sql("CREATE SCHEMA IF NOT EXISTS marts")?;
+
+        let rp = RunPlan {
+            models_dir: Some(models_dir.to_string_lossy().into_owned()),
+            ..gold_run_plan()
+        };
+        let scope = super::super::approval_scope::ApprovalScope {
+            dag: false,
+            units: vec![super::super::approval_scope::ScopeUnit {
+                pipeline: None,
+                models_dir: super::backfill_models_dir(&root, &rp),
+                models_glob: None,
+            }],
+            seeds_dir: None,
+        };
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let plan_id = crate::plan_store::write_plan_governed(
+            &root,
+            PlanKind::Backfill,
+            &rp,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        crate::commands::review::write_test_review_marker(&root, &plan_id);
+
+        super::run_apply_core_in(
+            &root,
+            &config,
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT * FROM marts.totals")?.columns,
+            vec!["checked".to_string()],
+            "the backfill must rebuild the root's `totals`, the model the gate checked"
         );
         Ok(())
     }

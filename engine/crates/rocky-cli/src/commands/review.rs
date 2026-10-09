@@ -381,10 +381,7 @@ async fn compute_review_with_disclosure_and_seam(
     let (models_dir, models_glob) = if plan.kind == PlanKind::Backfill {
         // Backfill executes its persisted directory and model set, without the
         // transformation pipeline's glob.
-        (
-            root.join(run_plan.models_dir.as_deref().unwrap_or("models")),
-            None,
-        )
+        (super::apply::backfill_models_dir(root, &run_plan), None)
     } else {
         match rocky_core::config::load_optional_project_config(Some(&resolved_config_path))
             .with_context(|| {
