@@ -97,8 +97,6 @@ pub fn run_ci(
     Ok(())
 }
 
-/// The models `rocky ci` runs, and the project root its seed file is read
-/// from.
 /// Run `run` with the per-model-target checks of `rocky compile` (E042/E043,
 /// E057, E044, E049, E051, E053, E054) as the test runner's two hooks:
 /// `gates` on the authored SQL, `inlined_gates` on the SQL each model
@@ -122,6 +120,8 @@ pub(crate) fn with_project_gates<R>(
     run(Some(&gates), Some(&inlined_gates))
 }
 
+/// The models `rocky ci` runs, and the project root its seed file is read
+/// from.
 fn ci_models(
     config_path: &Path,
     project_config: Option<&rocky_core::config::RockyConfig>,

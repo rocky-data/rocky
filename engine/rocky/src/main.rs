@@ -3532,10 +3532,6 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .map(|(name, _)| *name)
 }
 
-/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
-/// read: the named `--models` directory, or the whole project when none was
-/// named. Decided by presence, so `--models models` keeps reading that one
-/// directory.
 /// The models directory `rocky compile`, `rocky test` and `rocky ci` read:
 /// `--models` as typed, or else `models/` beside the config file. The
 /// compile reads `contracts/` and `functions/` beside this directory, so
@@ -3556,6 +3552,10 @@ fn models_dir_or_default(
     }
 }
 
+/// Which models `rocky compile` / `rocky ci` / `rocky test --declarative`
+/// read: the named `--models` directory, or the whole project when none was
+/// named. Decided by presence, so `--models models` keeps reading that one
+/// directory.
 fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelScope {
     match models {
         Some(_) => rocky_cli::commands::ModelScope::Dir,
