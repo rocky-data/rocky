@@ -42,5 +42,5 @@ HTTP Basic Auth using `api_key` and `api_secret`. Source-adapter authentication 
 ## See also
 
 - [`[adapter.NAME]`](/reference/configuration/#adaptername) — fields shared by every adapter type, including the retry policy.
-- [Fivetran state cache](/reference/fivetran-state-cache/) — sharing the resolved state envelope across processes.
+- [Fivetran state cache](/reference/fivetran-state-cache/) — the `cache`, `ratelimit`, `stampede` and `circuit_breaker` blocks that share work across processes.
 - [`rocky discover --emit-fivetran-state-to`](/reference/commands/core-pipeline/#emitting-the-fivetran-state-envelope) — write the state envelope to a file.

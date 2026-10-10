@@ -2,7 +2,7 @@
 
 > **Category:** 03-ai
 > **Credentials:** `ANTHROPIC_API_KEY`
-> **Runtime:** ~10s (one LLM round-trip, plus up to 3 retries on compile failure)
+> **Runtime:** ~10s per LLM round-trip, up to 3 attempts on compile failure
 > **Rocky features:** `rocky ai`, `ValidationContext`, compile-verify retry loop
 
 ## What it shows
@@ -17,15 +17,15 @@ that real:
    so it can't invent `order_total` when the real column is `amount`.
 2. **Compile-verify retry.** Each LLM response is fed through the
    Rocky compiler; on failure the compiler errors are appended to the
-   prompt and the LLM is re-asked. Up to 3 retries. A successful
-   return = at least one compile-clean output.
+   prompt and the LLM is re-asked. Up to 3 attempts in total. A
+   successful return = at least one compile-clean output.
 
 ## Why it's distinctive
 
-- **Hallucinated columns cannot escape.** Non-grounded AI SQL commonly
-  hallucinates plausible-but-nonexistent columns. The
-  `ValidationContext` makes that impossible; the compile gate catches
-  whatever slips through.
+- **Hallucinated columns are caught before the file lands.** Non-grounded
+  AI SQL commonly invents plausible-but-nonexistent columns. The
+  `ValidationContext` shows the LLM the real columns, and the compile gate
+  refuses an output that does not compile.
 - **The compiler is the spec.** There's no separate "verify that the
   AI output is valid" pass: if `rocky compile` passes, the model is
   valid. The gate and the dev-loop use the same tool.
@@ -62,8 +62,13 @@ export ANTHROPIC_API_KEY=sk-...
 2. `rocky ai` calls the Anthropic API with a prompt that embeds the
    typed schema. The response is a candidate `.rocky` model.
 3. The candidate is compiled. On failure, the compiler errors are
-   added to the next prompt and the LLM is re-asked, up to 3 times.
-4. The final clean output is written to `expected/generation.log`.
+   added to the next prompt and the LLM is re-asked, up to 3 attempts in total.
+4. Rocky writes the clean model and its `.toml` sidecar into `models/`. The
+   console output goes to `expected/generation.log`.
+
+`run.sh` does not delete the generated model, and it does not pass
+`--overwrite`. Delete the generated files under `models/` before a second run,
+or `rocky ai` refuses to overwrite them.
 
 ## Related
 

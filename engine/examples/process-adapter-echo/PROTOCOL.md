@@ -24,7 +24,8 @@ adapter named after the suffix. `rocky-echo` registers as the adapter
 plus its manifest. `rocky adapter info <name>` prints the manifest for a
 single adapter. `rocky test-adapter --adapter <name>` resolves `<name>`
 against the same lookup before falling through to the static built-in
-list (`databricks`, `snowflake`, `duckdb`).
+list (`databricks`, `snowflake`, `duckdb`, `postgres`, `redshift`,
+`clickhouse`, `sqlserver`, `spark`).
 
 Names colliding with first-party binaries — currently `rocky-lsp` — are
 filtered out of `rocky adapter list` so the bundled language server isn't

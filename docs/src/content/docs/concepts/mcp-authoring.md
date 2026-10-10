@@ -182,10 +182,10 @@ generators — is absent from the listing, and calling one returns
 tool-not-found. The list is an allowlist: a tool added in a future release
 stays out of the worker profile unless it is added deliberately.
 
-`draft_check` is the one that moved recently. A check's expression is put
+`draft_check` is not in the worker profile. A check's expression is put
 straight into SQL, and `rocky fulfill` now runs a product's declared checks
 against the live table after every apply, with no human watching. So the
-worker profile no longer serves it. Read that for exactly what it is: it
+worker profile does not serve it. Read that for exactly what it is: it
 closes the tool route. It does not confine the worker's filesystem, and the
 lowering keeps a check it finds in a sidecar, so a worker that can write
 files can still write one. What catches a check changed after the plan was
@@ -214,9 +214,9 @@ rocky apply  <plan_id>              # refused until that marker names it
 A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected by
 the engine, not by convention.
 [The three gates](/concepts/operating-rocky-with-agents/#the-three-gates)
-describes all three, including what a `deny` verdict rolls back, and
-[Cross-team contracts](/concepts/cross-team-contracts/) shows how `[policy]`
-rules are written.
+describes all three, including what a `deny` verdict rolls back. The
+[`[policy]` reference](/reference/configuration/#policy) shows how the rules
+are written.
 
 ## Structured errors
 

@@ -1,5 +1,11 @@
 # Rocky vs dbt Benchmark Report — Round 2 (post-optimization)
 
+> **Status: historical record. Not the current report.** This file keeps
+> Rounds 1, 2 and 3 (2026-04-07 to 2026-04-10). They measured Rocky 0.1.0
+> to 0.3.0, not the current engine. The latest run on record is
+> [`REPORT_CURRENT.md`](REPORT_CURRENT.md). The numbers below are unchanged
+> from the original runs.
+
 **Date:** 2026-04-07
 **Author:** Generated from `rocky-playground/benchmarks/`
 **Workload:** Synthetic 4-layer transformation DAG (sources → staging → intermediate → marts) at **10k, 20k, and 50k** models
@@ -362,12 +368,13 @@ To reproduce these exact results:
 
 ```bash
 # Build Rocky in release mode (must include commit 7fa9086 or later)
+# (paths below are for the current monorepo layout)
 cd engine
 git log --oneline | head -3   # confirm 7fa9086 is in history
 cargo build --release
 
 # Set up Python env
-cd ../rocky-playground/benchmarks
+cd ../examples/playground/benchmarks
 uv venv .venv
 source .venv/bin/activate
 uv pip install dbt-core dbt-duckdb psutil matplotlib
@@ -380,7 +387,7 @@ python3 run_benchmark.py \
   --scale 10000 20000 50000 \
   --iterations 3 \
   --tool all \
-  --rocky-bin ../../rocky/target/release/rocky \
+  --rocky-bin ../../../engine/target/release/rocky \
   --dbt-core-bin .venv/bin/dbt \
   --dbt-fusion-bin ~/.local/bin/dbt
 
@@ -481,4 +488,4 @@ Rocky 0.3.0 is **10-17% faster** than 0.1.0 at every scale despite significant f
 
 4. **Rocky 0.3.0 is faster than 0.1.0** despite adding multi-type pipeline config, Dagster Pipes, config UX overhaul. New features don't regress the hot path.
 
-See `REPORT_CURRENT.md` for the full Round 3 report with methodology and analysis.
+See [`REPORT_CURRENT.md`](REPORT_CURRENT.md) for the full Round 3 report with methodology and analysis.

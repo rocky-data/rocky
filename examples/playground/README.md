@@ -48,7 +48,7 @@ cd pocs/02-performance/01-incremental-watermark
 ./run.sh
 ```
 
-**Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`).
+**Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
 **89 of 101 POCs run with no external credentials.** See each POC's README for prerequisites.
 

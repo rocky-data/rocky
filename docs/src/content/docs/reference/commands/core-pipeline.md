@@ -11,7 +11,7 @@ The two commands to know first are `rocky plan` and `rocky apply`. `rocky plan` 
 
 ## Global Flags
 
-The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--principal`, `--cache-ttl`) apply to every command. Put `--config`, `--state-path` and `--state-namespace` before the subcommand: `rocky --config prod.toml run`, not `rocky run --config prod.toml`. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
+The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--principal`, `--principal-id`, `--cache-ttl`) apply to every command. Put `--config`, `--state-path` and `--state-namespace` before the subcommand: `rocky --config prod.toml run`, not `rocky run --config prod.toml`. See [Global flags](/reference/cli/#global-flags) for the defaults.
 
 ### `--state-namespace`
 
@@ -84,10 +84,12 @@ No command-specific flags. Uses [global flags](#global-flags) only.
 
 ### Checks Performed
 
+The main checks are below. Each finding carries a `V` code.
+
 | Check | Description |
 |-------|-------------|
 | TOML syntax | The config file parses without errors as v2 (named adapters + named pipelines). |
-| Adapters | Each `[adapter.NAME]` is a recognized type (`databricks`, `snowflake`, `duckdb`, `fivetran`, `bigquery`, `trino`, `airbyte`, `iceberg`, `manual`) with the required fields populated. For Databricks, at least one of `token` or `client_id`/`client_secret` must be set. The known-types list is driven directly off the adapter registry, so new first-party adapters propagate without a follow-up edit. |
+| Adapters | Each `[adapter.NAME]` has a known type with its required fields set. The known types are `databricks`, `duckdb`, `snowflake`, `bigquery`, `trino`, `postgres`, `redshift`, `clickhouse`, `sqlserver`, `spark`, `fivetran`, `airbyte`, `iceberg` and `manual`. An unknown type is `V017`. For Databricks, set `token` or `client_id`/`client_secret`. |
 | Pipelines | Each `[pipeline.NAME]` references existing adapters for source, target, and (optional) discovery, and its `schema_pattern` parses. |
 | DAG validation | If `models/` exists, loads all models and checks for dependency cycles. |
 
@@ -341,7 +343,7 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--lookback <N>` | `integer` | | Also recompute the previous N partitions. The flag overrides the model's TOML `lookback`. This is the standard handling for late-arriving data. |
 | `--parallel <N>` | `integer` | `1` | Run N partitions at a time. Warehouse-query parallelism only: state writes serialize through the state store. |
 | `--dag` | `bool` | `false` | Plan all pipelines as one DAG in dependency order. Each pipeline is a node, cross-pipeline `depends_on` edges set the order, and layers run in parallel. Mutually exclusive with `--resume` / `--resume-latest`: the DAG runner does not consume them, so a plan carrying both would apply as a fresh run of every pipeline. With `--principal agent`, the plan's fingerprint and review cover every pipeline's models. |
-| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Opaque caller-supplied key that dedups this run against prior runs with the same key. Supported on the `local`, `valkey`, and `tiered` state backends; an `s3`-only or `gcs`-only backend errors when the flag is parsed. Keys are stored verbatim, so never put a secret in one. |
+| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Opaque caller-supplied key that dedups this run against prior runs with the same key. Works on every state backend: `local`, `valkey`, `tiered`, `s3` and `gcs`. The first claim is race-free. Recovery from a crashed claim is best-effort: two callers can both adopt one stale claim. Keys are stored as given, so never put a secret in one. |
 | `--env <NAME>` | `string` | | Scope the governance preview (`mask_actions`) to one environment, so `[mask.<env>]` overrides overlay the workspace `[mask]` defaults. Classification tagging and retention policies are the same in every environment and are previewed regardless. |
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
 | `--intent <INTENT>` | `string` | | **Experimental.** State what the change is meant to do, and check it on the data. The only value is `refactor`. See [Check a refactor with `--intent`](#check-a-refactor-with---intent). |
@@ -636,7 +638,7 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, or `--resume`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` / `--state-working-tree` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, or `--resume`. |
 | `--contracts <PATH>` | `PathBuf` | | Contracts directory for this run. Default: the project `contracts/` directory. With `--model` and `--pipeline`, the selected model must have a contract there. Not with `--watch`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
@@ -648,17 +650,27 @@ rocky run [flags]
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. The run records `<NAME>` as `rocky_branch` in [run history](/reference/commands/administration/#rocky-history). |
-
+| `--partition <KEY>` | `string` | | Run one partition by its canonical key (`2026-04-07` for daily, `2026-04` for monthly). Mutually exclusive with `--from`, `--to`, `--latest` and `--missing`. |
+| `--from <KEY>` / `--to <KEY>` | `string` | | Closed partition range, both bounds inclusive. Each requires the other. Both bounds must align to the model's grain. |
+| `--latest` | `bool` | `false` | Run the partition that contains now (UTC). The default for a `time_interval` model when no other partition flag is given. |
+| `--missing` | `bool` | `false` | Run the partitions missing from the state store, from the model's `first_partition` up to now. Errors if `first_partition` is unset. |
+| `--lookback <N>` | `integer` | | Also recompute the previous N partitions, for late-arriving data. Overrides the model's TOML `lookback`. |
+| `--dag` | `bool` | `false` | Run all pipelines as one DAG in dependency order. Each pipeline is a node, cross-pipeline `depends_on` edges set the order, and layers run in parallel. Rejected with `--resume` and `--resume-latest`. |
+| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Skip this run when a run with the same key already succeeded (`status = "skipped_idempotent"`), or holds the key now (`skipped_in_flight`). Both exit `0`. Works on every state backend. Recovery from a crashed claim is best-effort: two callers can both adopt one stale claim. Rejected with `--resume` and `--resume-latest`. Keys are stored as given, so never put a secret in one. See [`[state.idempotency]`](/reference/configuration/). |
+| `--env <NAME>` | `string` | | Apply the `[mask.<env>]` overrides on top of the `[mask]` defaults in the post-run governance pass. Classification tags and retention are the same in every environment. |
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
 | `--defer-to-state <PATH>` | `PathBuf` | | Saved production state store file the deferred upstreams resolve from. Requires `--defer`; conflicts with `--defer-to`. Each unbuilt upstream a selected model reads resolves to the table the newest successful production run recorded for it. Opened read-only. Refuses before any write when the store is missing, has an incompatible state schema version, or has no recorded table for a needed upstream. See [Defer to a saved production state](/guides/skip-and-defer/#defer-to-a-saved-production-state). |
 | `--defer-run-id <RUN_ID>` | `string` | | Read deferred upstreams only from this production run in the `--defer-to-state` store. Requires `--defer-to-state`. |
 | `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
-| `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
+| `--force-rebuild` | `bool` | `false` | Force every selected model to build. Bypasses the `--skip-unchanged` gate and the content-addressed column-level skip. Use it after a change the IR hash cannot see, such as a UDF redefinition or a session setting. |
+| `--no-reuse` | `bool` | `false` | Turn off content-addressed reuse for this run, even when `[reuse]` is on. Every content-addressed model builds. Also turns off the `[reuse] column_level` skip. |
+| `--no-prune` | `bool` | `false` | Force a full replication pass: turn off `prune_unchanged` for this run, so every table is copied again. Use it after a manual change to a target. No effect when `prune_unchanged` is off. |
 | `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`, so the table holds the model's full result. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and rebuilding from it would drop history. The flag also turns off the `--skip-unchanged` gate. |
 | `--refuse-hooks` | `bool` | `false` | Refuse the run when the config defines any `[hook]` command or `[hook.webhooks]` entry that would fire, before anything fires or any model builds. For CI jobs that run a config they do not trust, such as a pull request's `rocky.toml`. Not supported with `--watch`. |
 | `--var <name=value>` | `string` (repeatable) | | Bind a per-run variable substituted into model SQL wherever an `@var(name)` / `@var(name, default)` marker appears. Repeat for multiple variables. Distinct from config-time `${ENV}` substitution: `@var()` resolves the run's logical inputs at compile time, `${ENV}` resolves connection/config values while parsing `rocky.toml`. A model that references `@var(name)` with no `--var` binding and no inline default fails to compile, naming the missing variable. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
+| `--assume-fresh-state` | `bool` | `false` | Disaster recovery only, and audited. Treat a failed download of remote state as a deliberate fresh start, so the run proceeds with an empty ledger and uploads turned back on. Requires a remote `[state]` backend (`s3`, `gcs`, `valkey` or `tiered`). Rejected with `--dag` and `--watch`. Without it, a failed download refuses auto-applies and suppresses the run's state uploads. |
 | `--parallel <N>` | `integer` | `4` without `--dag` | Models in a topological layer (and partitions of a `time_interval` model) run up to N at a time. Pass `--parallel 1` to run one model or partition at a time. Under `--dag` the flag bounds how many pipeline **nodes** run at once, and it has no default there: left unset, a `--dag` run keeps its unbounded node fan-out. It does **not** bound a replication pipeline's table fan-out, which comes from that pipeline's `[execution] concurrency` (default 32), so `--parallel 1` alone does not make a replication run serial. DuckDB always runs serially regardless of this flag (its adapter holds a single connection mutex); Snowflake and Databricks parallelize up to N. |
 
 :::caution[`--defer` SQL-rewrite limitation]
@@ -863,12 +875,11 @@ rocky run --watch
 Show the [watermarks](/reference/glossary/) stored in the embedded state file. A watermark is the newest source value Rocky has already loaded for a table, so the next run knows where to resume. The output lists every tracked table, its last watermark value, and the time Rocky recorded it.
 
 ```bash
-rocky state [flags]
+rocky state
+rocky state show      # the same, named explicitly
 ```
 
-### Flags
-
-No command-specific flags. Uses [global flags](#global-flags) only.
+`rocky state` also has maintenance subcommands: `reconcile-watermark`, `clear-schema-cache`, `retention sweep` and `schedule`. See [`rocky state` in Administration](/reference/commands/administration/#rocky-state).
 
 ### Examples
 

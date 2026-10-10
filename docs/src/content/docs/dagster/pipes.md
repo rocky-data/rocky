@@ -144,7 +144,7 @@ result = rocky.run(filter="tenant=acme")
 ```
 
 For scripts, tests, notebooks, or any code that just wants the typed
-result without a Dagster context. Buffered via `subprocess.run`.
+result without a Dagster context. Engine stderr goes to the `dagster_rocky.resource` logger, not to `context.log`.
 
 ### `run_streaming()`: Pipes-style (live progress, batch result)
 

@@ -31,8 +31,8 @@ strategy.
 
 ## Status — what works, what doesn't
 
-The adapter registers as a standard `WarehouseAdapter` — it is not
-gated behind `is_experimental` (the trait default `false` applies, and
+The Rocky docs list the Trino adapter as Beta. It registers as a standard
+`WarehouseAdapter` and is not gated behind `is_experimental` (the trait default `false` applies, and
 `rocky-trino`'s `is_not_experimental` test pins it), so no startup
 warning fires. v0 coverage:
 

@@ -76,7 +76,7 @@ Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 
 A sidecar declares at most one `[strategy]`. If it declares none, Rocky takes one from the config group, then from the directory defaults, and otherwise uses `full_refresh`. Pick the block that matches what you need.
 
-**Merge.** `update_columns` is optional and defaults to all non-key columns.
+**Merge.** `update_columns` is optional. Without it, a matched row updates every column, the keys included. DuckDB, Snowflake and BigQuery have no `UPDATE SET *`. When Rocky cannot resolve the column list for them, the run fails and asks you to declare `update_columns`.
 
 ```toml
 [strategy]

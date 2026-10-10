@@ -71,9 +71,12 @@ export default {
 };
 ```
 
-The driver (`lib/driver.mjs`) is deliberately **keyboard-only**: Playwright's
-Electron video has no visible mouse cursor, so click flows look broken. Available
+The driver (`lib/driver.mjs`) is **keyboard-first**: Playwright's Electron
+video has no visible mouse cursor, so click flows look broken. Available
 actions: `openFile`, `palette`, `command`, `key`, `type`, `escape`, `pause`.
+Two more reach into a webview: `webview(marker)` finds the panel's iframe, and
+`clickInWebview(marker, name)` clicks a button in it. The GIF then shows only
+the resulting state change, not the click.
 
 Boot + preamble are auto-trimmed (recording starts at launch; everything before
 `run()` is cut). Per-run scratch (the `.webm`) is kept in `.run/` for debugging.

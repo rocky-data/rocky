@@ -1,11 +1,11 @@
 ---
 title: Development Commands
-description: "Sample projects, dbt import, the HTTP server, the language server, and adapter scaffolding"
+description: "Sample projects, dbt import, the HTTP server and browser UI, the language server, adapters, hooks, health checks and project listings"
 sidebar:
   order: 4
 ---
 
-These commands support local development. Build a sample project, import a dbt project, or scaffold a new adapter. Run the semantic-graph server or the language server.
+These commands support local development. Build a sample project, import a dbt project or package, or scaffold an adapter. Run the HTTP server with its browser UI, or the language server. Check the project's health, and list what it holds.
 
 ---
 
@@ -316,6 +316,8 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
   "diagnostics": []
 }
 ```
+
+---
 
 ## `rocky serve`
 
@@ -703,39 +705,31 @@ rocky adapter info snowplow
 
 ## `rocky test-adapter`
 
-Run conformance tests against a warehouse adapter.
+Run the conformance suite against an adapter. Pass `--adapter` or `--command`. With neither, the command fails.
 
 ```bash
-rocky test-adapter [flags]
+rocky test-adapter --adapter <NAME> [--adapter-config <JSON>]
+rocky test-adapter --command <PATH> [--adapter-config <JSON>]
 ```
-
-### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--adapter` | string | — | Adapter name. Resolves a built-in adapter (`databricks`, `snowflake`, `duckdb`) first, then falls back to an installed `rocky-<name>` executable on your `PATH`. |
-| `--command` | string | — | Path to a process adapter binary |
-| `--adapter-config` | string | — | JSON config to pass to the adapter |
-
-### Examples
+| `--adapter <NAME>` | `string` | | Adapter name. Built-in names are `databricks`, `snowflake`, `duckdb`, `postgres`, `redshift`, `clickhouse`, `sqlserver` and `spark`. Any other name resolves to a `rocky-<name>` executable on your `PATH`. |
+| `--command <PATH>` | `string` | | Path to a process adapter binary. |
+| `--adapter-config <JSON>` | `string` | | Adapter config as a JSON string. |
 
 ```bash
 $ rocky test-adapter --adapter duckdb
 Adapter Conformance: duckdb (SDK 1.x)
 ==================================================
 ...
-Result: 1 passed, 0 failed, 25 skipped
 ```
 
-Most specs report `skipped` today. The suite declares 26 specs and
-implements the check for one of them (`format_table_ref`); the rest are
-declared surface with no check written yet, and they say so rather than
-counting as passes. A run where **nothing** was verified prints an explicit
-warning — it is not a passing conformance run, even though the exit status
-is zero (the status keys on failures).
+Most specs report `skipped` today. The suite declares 26 specs. Three of them (`format_table_ref`, `watermark_where` and `row_hash`) run real dialect calls, and only against a process adapter. On a built-in adapter, those three are skipped too. A skipped spec never counts as a pass. A run that verified nothing prints a warning. It still exits `0`, because the exit status keys on failures only.
 
 ### Related Commands
 
+- [`rocky adapter`](#rocky-adapter) -- list the process adapters on your `PATH`
 - [`rocky init-adapter`](#rocky-init-adapter) -- scaffold a new adapter crate
 
 ---

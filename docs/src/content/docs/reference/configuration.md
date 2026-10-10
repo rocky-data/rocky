@@ -435,7 +435,7 @@ Support depends on the target adapter. The two `auto_create_*` flags work on eve
 | BigQuery | Schema and table labels only. A catalog (project) label logs a warning. | No: logs a warning. Use Google Cloud IAM. | No |
 | Other adapters | No | No | No |
 
-Where a row says No, the call does nothing and the run continues.
+Where a row says No, the call does nothing and the run continues. Catalog tags, grants and isolation run only with `auto_create_catalogs = true`. Schema tags and `schema_grants` run only with `auto_create_schemas = true`. Rocky adds grants and never revokes one. See [Permissions](/reference/permissions/).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

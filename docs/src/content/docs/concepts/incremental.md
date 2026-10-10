@@ -1,11 +1,11 @@
 ---
 title: Incremental Processing
-description: How Rocky reprocesses only what changed, using watermarks, partition checksums, and column-level change propagation.
+description: How Rocky reprocesses only what changed, using watermarks, per-partition state, and the skip-unchanged gate.
 sidebar:
   order: 10
 ---
 
-Rocky reprocesses only what changed. This page covers the mechanisms it uses to decide what "changed" means: watermarks, partition checksums, column-level propagation, and the skip-unchanged gate.
+Rocky reprocesses only what changed. This page covers how it decides what "changed" means: watermarks, per-partition state, and the skip-unchanged gate. It also marks two building blocks that `rocky run` does not use yet: partition checksums and column-level propagation.
 
 ## Materialization strategies
 
@@ -72,7 +72,7 @@ strategy = "incremental"
 timestamp_column = "_fivetran_synced"
 ```
 
-The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Partition checksums, below, catch that case.
+The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Rocky does not detect that case today. Run a full refresh to pick them up.
 
 ### Recovering an interrupted replication
 
@@ -175,8 +175,7 @@ Then restore `strategy = "incremental"`.
 Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
 an INSERT but before its watermark flush can leave a stale cursor. The first
 run after upgrading can append those rows again. Repair the cursor from the
-target before that run if the old flush is uncertain. #2235 stays open for
-recovery gaps that this checkpoint rule does not address.
+target before that run if the old flush is uncertain.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
 `rocky state reconcile-watermark --pipeline <name>` sets the replacement
@@ -212,9 +211,13 @@ If `update_columns` is omitted, all columns are updated on match.
 
 ## Partition-level checksums
 
-A watermark only finds appended rows. Partition checksums find changes to rows that are already there. The `incremental` module of `rocky-core` implements them.
+:::caution[Not wired into runs]
+`rocky run` does not compare partition checksums today. The `incremental` module of `rocky-core` holds the building blocks (`diff_checksums`, `generate_checksum_sql`). No run path calls them, and the state store keeps no checksums. Only `rocky compact --measure-dedup` computes table checksums.
+:::
 
-### How Rocky compares partition checksums
+A watermark only finds appended rows. Partition checksums are designed to find changes to rows that are already there.
+
+### How the checksum comparison works
 
 1. Each partition of a model, for example one partition per date, gets a checksum: a hash of the partition contents and its row count.
 2. On the next run, Rocky compares the current checksums against the stored ones.
@@ -228,11 +231,15 @@ Result:        Changed: ["2026-03-29", "2026-03-30"]
                Unchanged: ["2026-03-28"]
 ```
 
-This catches what watermarks miss: backfills, late-arriving corrections, and retroactive edits to historical data.
+This would catch what watermarks miss: backfills, late-arriving corrections, and retroactive edits to historical data.
 
 ## Column-level change propagation
 
-The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler/)) tracks column-level lineage across the whole DAG. Lineage is the map of which columns feed which. Rocky reads it to skip downstream models that do not depend on any changed column.
+:::caution[Not wired into runs]
+`rocky run` does not skip models by column-level propagation today. `compute_propagation` in `rocky-core` holds the logic, but no run path calls it. To skip unchanged models, use the [skip-unchanged gate](#skipping-unchanged-models).
+:::
+
+The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler/)) tracks column-level lineage across the whole DAG. Lineage is the map of which columns feed which. The propagation logic reads it to find downstream models that do not depend on any changed column.
 
 ### Example
 
@@ -243,14 +250,12 @@ orders (source) → orders_summary (uses: amount, customer_id)
                 → orders_audit   (uses: status, updated_at)
 ```
 
-If an upstream schema change only affects the `status` column, Rocky determines:
+If an upstream schema change only affects the `status` column, the logic decides:
 
 - `orders_summary` does not depend on `status`, so it is skipped
 - `orders_audit` depends on `status`, so it is recomputed
 
-This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`. Rocky logs the skip reason so you can check the decision.
-
-Column propagation works with any incremental strategy. It runs on top of watermarks or checksums and prunes the DAG to what actually needs to change.
+This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`.
 
 ## Skipping unchanged models
 
@@ -353,7 +358,7 @@ The state store tracks:
 - **Watermarks:** last successfully replicated timestamp per table
 - **Check history:** historical row counts for anomaly detection
 - **Run history:** metadata about previous runs
-- **Partition checksums:** per-partition hashes for checksum-based incremental
+- **Partition records:** per-partition state for `time_interval` models, which `--missing` reads
 - **DAG snapshots:** previous DAG structure for change detection
 
 All state is scoped per environment. Dev, staging, and prod maintain independent state with no cross-environment coordination.

@@ -4,6 +4,8 @@
 **Rocky version:** 0.3.0 (post-optimization)
 
 > **Partial refresh, 2026-06-01:** This is an April 2026 snapshot. Only a handful of cells have been refreshed against current sources — e.g. the open-source license, the Fusion runtime rename, column-level lineage, manifest/artifacts, and the orchestration row (including a current `dagster-sqlmesh` correction); the remaining cells still reflect the April snapshot and have not been re-verified. This file is kept as a dated benchmark artifact. The published comparison at [docs: Feature Comparison](../../../docs/src/content/docs/getting-started/comparison.md) no longer covers dbt, so it is not a refreshed version of this table. In these tables, **dbt-core** is the dbt Core 1.x Python line; **dbt-fusion** tracks the Rust dbt Core v2.0 runtime plus Fusion's SQL-comprehension layer.
+>
+> **Rocky's own column is stale too.** It describes Rocky 0.3.0. For example, §2 lists PostgreSQL and Redshift as "Planned" and Spark, Trino and ClickHouse as "No". The current engine ships adapters for all five (most in Beta), plus SQL Server. For current Rocky capabilities, read the docs ([Connect a warehouse](../../../docs/src/content/docs/guides/connect-a-warehouse.mdx)), not this file.
 
 This document provides a factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features are verified against official documentation and source code as of April 2026.
 

@@ -13,6 +13,7 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
 | `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
 | `drift/run.sh` | `incremental` (replication) | Replication-from-BQ + per-table drift detection: `add_columns` (ALTER TABLE ADD COLUMN), `drop_and_recreate` (unsafe type change), and `alter_column_types` (safe widening, e.g. INT64 → NUMERIC) |
+| `cost-cross-check/run.sh` | `full_refresh` (scans a real source) | Rocky's `bytes_scanned` equals the `totalBytesBilled` that `bq show -j` reports for the same job ID |
 
 Each driver:
 
@@ -31,7 +32,8 @@ Each driver:
 - Time-interval failure-path (forced mid-transaction error → BQ
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
-- MERGE without explicit `update_columns` (see finding 5).
+- MERGE without explicit `update_columns` (see finding 5): no live driver
+  runs it yet.
 
 ## Run
 
@@ -44,6 +46,7 @@ export BQ_LOCATION="EU"   # optional; default EU
 ./merge/run.sh             # merge (bootstrap + UPSERT)
 ./discover/run.sh          # discover (lists matching datasets via INFORMATION_SCHEMA)
 ./drift/run.sh             # drift (replication + drop_and_recreate on column type change)
+./cost-cross-check/run.sh  # cost (rocky bytes_scanned vs bq show -j totalBytesBilled)
 ```
 
 Each script exits 0 on success after dropping its target dataset.
@@ -78,17 +81,15 @@ Adapter-side gaps to revisit separately:
    pipelines work end-to-end (see `discover/run.sh`).
 2. **Model SQL bodies skip env substitution — sidecar TOMLs don't.**
    Both `rocky.toml` and model `.toml` sidecars are piped through
-   `substitute_env_vars` at parse time
-   (`engine/crates/rocky-core/src/models.rs:1387`), so `${VAR}` resolves
-   in the sidecar. But the model **SQL file** is read raw
-   (`models.rs:1377`) with no substitution, so the 3-part source
+   `substitute_env_vars` at parse time (`engine/crates/rocky-core/src/models.rs`),
+   so `${VAR}` resolves in the sidecar. But the model **SQL file** is read
+   raw with no substitution, so the 3-part source
    references in the merge / time-interval / cost SQL bodies still need
    the `__GCP_PROJECT__` placeholder + runtime `sed`.
 3. **Transformation runs need the target dataset unless
-   `auto_create_schemas = true`.** The transformation run path now reads
-   `pipeline.target.governance.auto_create_schemas`
-   (`run_local.rs:132` → `execute_models`, which emits `CREATE SCHEMA`
-   at `run.rs:5507`; covered by the
+   `auto_create_schemas = true`.** The transformation run path reads
+   `pipeline.target.governance.auto_create_schemas` (`run_local.rs` →
+   `execute_models`, which emits `CREATE SCHEMA`; covered by the
    `transformation_auto_create_schemas_materializes_fresh_schema` test).
    It defaults to `false` and these drivers don't opt in, so `rocky run`
    errors with 404 unless the dataset exists — the drivers pre-create it
@@ -96,18 +97,17 @@ Adapter-side gaps to revisit separately:
    would let the run create it instead.
 4. **Time-interval `time_column` must be TIMESTAMP on BigQuery.** The
    runtime emits the partition filter as `'YYYY-MM-DD HH:MM:SS'`
-   string literals (`sql_gen.rs:239`). BigQuery refuses to coerce a
+   string literals (`rocky-core/src/sql_gen.rs`). BigQuery refuses to coerce a
    timestamp-shape literal to a DATE column, so the model output's
    partition column has to be TIMESTAMP. Other dialects are more
    permissive. The time-interval model uses `TIMESTAMP_TRUNC(...)` to
    produce a TIMESTAMP partition column.
-5. **MERGE requires explicit `update_columns` on BigQuery.** When the
-   model TOML omits the list, the dialect emits the shorthand
-   `UPDATE SET target = source` (`dialect.rs:54`). BigQuery rejects
-   this with `UPDATE ... SET does not support updating the entire row`,
-   requiring explicit per-column assignments. The merge model
-   declares `update_columns = ["name", "amount"]` to sidestep it.
-   Snowflake/DuckDB may accept the shorthand; not verified.
+5. ~~MERGE emits the invalid whole-row `UPDATE SET target = source`~~:
+   **fixed**. BigQuery has no whole-row update form. When the model omits
+   `update_columns`, the runner resolves the list from the model's
+   columns. If it cannot, the BigQuery dialect refuses with a clear error
+   instead of emitting invalid SQL (`rocky-bigquery/src/dialect.rs`). The
+   merge model still declares `update_columns = ["name", "amount"]`.
 6. ~~`bytes_scanned` is `totalBytesProcessed`, not `totalBytesBilled`~~:
    **fixed**. `execute_statement_with_stats` now follows up
    `jobs.query` with a `jobs.get` call to enrich the response with

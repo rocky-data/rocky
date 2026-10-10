@@ -1,6 +1,6 @@
 ---
 title: AI Commands
-description: Generate a model from a description, reconcile it with the warehouse, explain it, and draft its tests
+description: Generate a model from a description, reconcile it with the warehouse, explain it, draft its tests and contract, and serve Rocky's tools to an agent over MCP
 sidebar:
   order: 3
 ---
@@ -360,6 +360,44 @@ rocky ai-test fct_revenue --models src/transformations --save
 
 ---
 
+## `rocky ai-contract`
+
+Draft a data contract from a model's observed data, instead of writing the column list by hand. Rocky profiles the target table, sends the shape to Anthropic, and prints the draft. DuckDB only.
+
+```bash
+rocky ai-contract <model> [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `model` | `string` | **(required)** | Model whose target table to profile. |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--save` | `bool` | `false` | Write the draft to `<model>.contract.toml` in the models directory instead of printing it. |
+| `--with-data` | `bool` | `false` | Also send observed cell **values** (min/max and samples of low-cardinality columns). Without it, only the schema and the row, null and distinct counts leave the machine. |
+| `--models <PATH>` | `string` | `models` | Models directory, and the destination for `--save`. |
+
+Rocky reads the API key from the `ANTHROPIC_API_KEY` environment variable, never from `rocky.toml`. See [`[ai]`](/reference/configuration/#ai) for the token budget.
+
+### Examples
+
+```bash
+rocky ai-contract fct_orders           # print the draft
+rocky ai-contract fct_orders --save    # write models/fct_orders.contract.toml
+```
+
+### Related Commands
+
+- [`rocky profile`](/reference/cli/#rocky-profile) -- the per-column profile the draft starts from
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- check the model against the saved contract
+
+---
+
 ## `rocky mcp`
 
 Run a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server over stdio, exposing Rocky's verification, data-grounding, and draft-generation surface to any MCP-capable agent harness (Claude Desktop, Claude Code, your own client). The server is long-running: it serves until the client disconnects.
@@ -461,6 +499,17 @@ Three rules keep that boundary in place:
 | `draft_metadata` | Parse-merge a structured freshness / classification patch into the model's sidecar and compile. The policy check runs against the sidecar as patched. |
 
 A `draft_*` call made without its content `spec` returns an actionable error pointing at the matching `ai_*` generator.
+
+**Governor** (read the ledger and the scheduler; one safe-direction write):
+
+| Tool | What it does |
+|---|---|
+| `estate_brief` | The governor's digest, as [`rocky brief`](/reference/commands/governance-reclamation/#rocky-brief) prints it. Read-only. |
+| `audit_query` | The custody chain for a model, a run id or a plan id, as `rocky audit --for`. Read-only. |
+| `scorecard` | Acceptance, denial and review rates per principal, rule or scope, as `rocky audit --scorecard`. Read-only. |
+| `schedule_status` | The scheduler's stored state per pipeline and the queued webhook demands. Read-only: it does not evaluate demand. |
+| `pause_schedule` | Pause a pipeline's schedule. Requires `confirm: true`. There is no resume tool: resume is human-only. |
+| `review_queue` | List the pending-review queue. On `--profile approver` only, it can also write an approval marker. See the safety model above. |
 
 **Propose** (the one plan write: not a materialization; no Anthropic key required):
 

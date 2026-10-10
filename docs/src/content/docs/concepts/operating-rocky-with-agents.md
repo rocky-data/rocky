@@ -133,8 +133,8 @@ change what. Rocky evaluates every `draft_*` and `propose` call against it befor
 anything persists. A `deny` removes a new file, or restores the prior content of
 a file the agent re-drafted, so a denial leaves nothing behind. This is the same
 evaluator that gates `apply` and `promote`, so an agent learns the verdict with
-the write rather than three steps later. See
-[Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
+the write rather than three steps later. The
+[`[policy]` reference](/reference/configuration/#policy) shows how the rules are
 written.
 
 Rocky records policy decisions in an audit ledger, and `rocky audit` lists them.
@@ -249,8 +249,11 @@ committed file and hashed there, exactly as if the agent had written it.
 The window is open only between the loop's own repair dispatch and its next
 merge, and only a process that can write your models directory can use it. That
 same process can write an approval marker, which is a larger capability than
-this one. Trusted handling of the repair agent's output bytes is planned work.
-Tracked in [#1515](https://github.com/rocky-data/rocky/issues/1515).
+this one. Issue [#1515](https://github.com/rocky-data/rocky/issues/1515), which
+tracked trusted handling of the repair agent's output, is closed. `rocky fulfill`
+now refuses a round whose model files differ from the copy the agent handed off
+through `draft_model`. That check does not stop a process that runs as the same
+user, which can write the hand-off copy too.
 
 **The committed manifest is data, not a credential.** The lowering manifest
 records which files belong to a product generation, which phase it is in, and
@@ -260,7 +263,7 @@ file in your project, so a process that can edit it can change what gets checked
 the loop skip that file rather than report drift. The engine already treats
 manifests this way: matching identity fields in a manifest authenticate nothing.
 The verification is a check on files, not a proof about them. This needs the same
-write access as the point above, and is covered by the same planned work.
+write access as the point above, and has the same limit.
 
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
 its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
@@ -373,4 +376,4 @@ that need a language model add their scores when a key is present.
 - [MCP Authoring](/concepts/mcp-authoring/) — the full tool catalog, what data leaves your environment, and the bring-your-own-key boundaries.
 - [AI and Intent](/concepts/ai-intent/) — the compiler-as-guardrail loop both the CLI and MCP surfaces rely on.
 - [AI Commands](/reference/commands/ai/) — the `rocky ai-*` CLI verbs, the human-facing counterpart to the `ai_*` tools.
-- [Cross-team contracts](/concepts/cross-team-contracts/) — how a `[policy]` block declares who may change what.
+- [`[policy]` reference](/reference/configuration/#policy) — how a `[policy]` block declares who may change what.

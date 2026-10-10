@@ -56,6 +56,7 @@ Five completed orders sum to `12500 + 7500 + 30000 + 5000 + 45000 = 100000` cent
 
 - `rocky` on PATH (the script also auto-detects a local `engine/target/{release,debug}/rocky` build)
 - `duckdb` CLI for seeding and materializing (`brew install duckdb`)
+- `python3` (reads the compile and test JSON)
 
 ## Run
 

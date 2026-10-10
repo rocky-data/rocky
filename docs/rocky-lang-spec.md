@@ -34,7 +34,7 @@ path.
                              │
    compile                   │ type check, resolve depends_on
                              ▼
-                        one ModelIr ────► compile errors E001-E036
+                        one ModelIr ────► compile errors E001-E060
                              │            (nothing runs)
    generate                  │ per-dialect SQL generation
                              ▼
@@ -94,7 +94,7 @@ What Rocky fills in depends on whether the sidecar exists at all:
 | Setting | No sidecar | Sidecar present |
 |---|---|---|
 | `name` | the file name without its extension | the same |
-| `[strategy] type` | `full_refresh` | `_defaults.toml`, else `full_refresh` |
+| `[strategy] type` | `_defaults.toml`, else `full_refresh` | `_defaults.toml`, else `full_refresh` |
 | `[target] catalog` | `_defaults.toml`, else `warehouse` | `_defaults.toml`, else the load fails |
 | `[target] schema` | `_defaults.toml`, else `default` | `_defaults.toml`, else the load fails |
 | `[target] table` | the model name | the model name |
@@ -534,8 +534,8 @@ partition range     replicate rows      select    sort
 take      true      unbounded union     where     window
 ```
 
-Six of them are reserved but unused. The parser has no construct today that
-accepts `by`, `check`, `in`, `order`, `union`, or `window`. They are reserved
+Five of them are reserved but unused. The parser has no construct today that
+accepts `by`, `check`, `order`, `union`, or `window`. They are reserved
 so a future release can use them without breaking a file that already parses.
 
 The join-type words are not on this list. `left`, `right`, `full` and `cross`

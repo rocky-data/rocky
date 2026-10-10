@@ -69,7 +69,7 @@ Runs `rocky plan` and returns the planned SQL statements without executing them.
 
 ### `run(filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, shadow_suffix=None, idempotency_key=None, defer=False, defer_to=None, timeout_seconds=None) -> RunResult`
 
-Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
+Runs Rocky and returns the full execution result: materializations, check results, drift detection, and permission changes. It needs no Dagster context, so engine stderr goes to the `dagster_rocky.resource` logger, not to `context.log`.
 
 **Wraps**: `rocky run --filter <filter> --output json`, the engine's fused plan+apply path, spawned as a single subprocess. No intermediate plan artifact is persisted. Every CLI subprocess also gets `ROCKY_SUPPRESS_DEPRECATION=1`, so alias deprecation notices stay out of the Dagster logs.
 

@@ -32,3 +32,17 @@ export DATABRICKS_HTTP_PATH="..."
 once the env vars are set) to show the `materialized_view` strategy parse
 and the target DDL Rocky emits. Live execution against Databricks requires
 a real warehouse; the compile step is the credential-free checkpoint.
+
+## Expected output
+
+`rocky compile` writes `expected/compile.json` with one model,
+`customer_revenue`, whose `strategy` is `{ "type": "materialized_view" }`.
+The run ends with:
+
+```
+POC complete: materialized_view strategy parsed; live execution requires the Databricks adapter.
+```
+
+## Related
+
+- [`01-snowflake-dynamic-table`](../01-snowflake-dynamic-table/) — the same idea against Snowflake (`dynamic_table`).

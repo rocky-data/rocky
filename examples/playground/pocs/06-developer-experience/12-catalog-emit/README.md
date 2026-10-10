@@ -26,8 +26,7 @@ self-contained, machine-consumable lineage artefact under
 
 ## Why it's distinctive
 
-- **The catalog is a *queryable artefact*, not a JSON dump.** dbt's
-  `target/manifest.json` is a single 100K+ line monster; Rocky emits
+- **The catalog is a *queryable artefact*, not a JSON dump.** Rocky emits
   a flat Parquet table you can query with `read_parquet('.../edges.parquet')`.
 - **Column-level lineage is compiler-derived, not regex-derived.**
   Aggregations, joins, and DSL-based group-bys all carry through with
@@ -59,7 +58,7 @@ self-contained, machine-consumable lineage artefact under
 
 ## Prerequisites
 
-- `rocky` ≥ 1.25.0 on PATH
+- `rocky` on PATH
 - `duckdb` CLI (only used in the demo to read back the Parquet file)
 - `python3` (used to pretty-print the JSON in `run.sh`)
 - `jq` (used to filter the per-column descriptions out of `catalog.json`)

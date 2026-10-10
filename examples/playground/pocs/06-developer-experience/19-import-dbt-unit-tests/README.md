@@ -7,15 +7,14 @@
 
 ## What it shows
 
-Two pieces of `rocky import-dbt` coverage added in engine v1.39.0:
+Two pieces of `rocky import-dbt` coverage:
 
 1. **`data_tests:` accepted as an alias for `tests:`** on column-level YAML tests.
    dbt 1.7+ renamed the column-test key from `tests:` to `data_tests:` (the legacy
-   spelling still works on the dbt side). Before v1.39.0 the importer only saw the
-   legacy key, so any modern dbt project converted to zero column tests. This POC's
-   `schema.yml` uses `data_tests:` exclusively to pin the alias in a runnable demo.
+   spelling still works on the dbt side). This POC's `schema.yml` uses
+   `data_tests:` only, so the demo fails if the alias breaks.
 
-2. **`manifest.unit_tests` → Rocky `[[test]]` sidecars.** The manifest path now walks
+2. **`manifest.unit_tests` → Rocky `[[test]]` sidecars.** The manifest path walks
    `manifest.unit_tests` and emits each entry as a `[[test]]` block on the matching
    model's sidecar TOML. `ref('upstream')` / `source('a', 'b')` wrappers on
    `given.input` are stripped to bare references. CSV / SQL fixtures are deliberately
@@ -98,13 +97,13 @@ ok  All assertions passed.
 1. `rocky import-dbt --manifest` reads `target/manifest.json`, walks `nodes` (models)
    and `unit_tests`, and emits a Rocky repo under `imported/`.
 2. `apply_dbt_tests` (called from both the regex and manifest paths) reads
-   `dbt_project/models/schema.yml`, recognises `data_tests:` via the new serde alias,
+   `dbt_project/models/schema.yml`, recognises `data_tests:` via a serde alias,
    and emits canonical-four `[[tests]]` blocks on `stg_orders.toml`.
 3. `apply_dbt_unit_tests` walks `manifest.unit_tests`, strips `ref(...)` / `source(...)`
    wrappers on `given.input`, and emits `[[test]]` blocks on the matching model
    sidecar. The CSV-format fixture surfaces as an `UnsupportedUnitTestFormat`
    warning and bumps `unit_tests_skipped` by one.
-4. New counters (`unit_tests_found / unit_tests_converted / unit_tests_skipped`) show
+4. The counters (`unit_tests_found / unit_tests_converted / unit_tests_skipped`) show
    up on the `--output json` payload (`ImportDbtOutput`) and in `MIGRATION-NOTES.md`.
 
 ## Related

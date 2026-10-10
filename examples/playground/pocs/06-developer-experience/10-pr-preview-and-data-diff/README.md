@@ -14,7 +14,7 @@ driven end-to-end on a 5-model DuckDB transformation pipeline:
    identifies the model files that changed *between two committed refs*;
    those changed models plus their transitive downstream form the
    **prune set**; every model *not* in the prune set is copied from the
-   base schema via CTAS into a per-PR branch schema (`branch__<name>`).
+   base schema (a clone or CTAS, per adapter) into a per-PR branch schema (`branch__<name>`).
    `preview create` runs no model itself. You run the branch with
    `rocky run --branch <name>`, which builds the whole pipeline, or one
    model with `--model`.
