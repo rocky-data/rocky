@@ -3679,6 +3679,9 @@ async fn cancel_job(
     State(state): State<Arc<ServerState>>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Response, ApiError> {
+    // The state file is the server's own, never derived from the request.
+    // Resolve it before the request id is handed to `job_cancels`.
+    let state_path = state_path_for(&state);
     match state.job_cancels.request(&id) {
         CancelRequest::Sent(signal, answer) => {
             // The job's task answers as soon as its select loop takes the
@@ -3711,7 +3714,6 @@ async fn cancel_job(
     let record = match state.jobs.get(&id).await {
         Some(record) => Some(record),
         None => {
-            let state_path = state_path_for(&state);
             if !state_path.exists() {
                 None
             } else {
