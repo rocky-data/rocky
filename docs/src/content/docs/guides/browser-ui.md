@@ -79,6 +79,8 @@ To run the UI somewhere other than your own machine, use the [container image](/
 
 ## Needs you
 
+The sidebar shows a badge on Needs you and on Review when decisions wait on you. The number is the review queue's total, read again on each navigation and every 30 seconds. No badge means nothing waits, or the count could not be read.
+
 The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: how many decisions wait on you, how the runs went, and whether a freeze or a degraded rule is in force. Then there is a card for each part of the digest.
 
 The first card, which gives the area its name, is what needs you. Each pending plan is its own row, with a **Review plan** button that opens it in Review. The rest are the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler. A bar over the policy decisions shows how many were allowed, needed review, or were denied.

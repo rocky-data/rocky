@@ -9,6 +9,7 @@ import {
 import { Dialog, DialogBackdrop, DialogPanel, useClose } from "@headlessui/react";
 import { Bars3Icon, ChevronRightIcon, XMarkIcon } from "@heroicons/react/24/outline";
 import type { MetaOutput } from "@rocky-types/meta";
+import type { ReviewQueueOutput } from "@rocky-types/review_queue";
 import { ApiError, SESSION_EXPIRED_EVENT, apiGet } from "./api";
 import {
   AREAS,
@@ -76,6 +77,64 @@ type EngineState =
  * `/api/v1/meta` about 15 times a second, for as long as it was open (#2075).
  */
 const fetchMetaFromEngine = (): Promise<MetaOutput> => apiGet<MetaOutput>("meta");
+
+/**
+ * How many decisions wait on a person: the review queue's total. The brief's
+ * "Needs you" section and the queue select the same outstanding escalations
+ * (`select_outstanding` in the engine), so one read counts both areas. At
+ * module scope for the same reason as `fetchMetaFromEngine`.
+ */
+const fetchWaitingFromEngine = (): Promise<number> =>
+  apiGet<ReviewQueueOutput>("review/queue").then((queue) => queue.total);
+
+/** How often the sidebar reads the waiting count again, while the page is open. */
+export const WAITING_REFRESH_MS = 30_000;
+
+/**
+ * The waiting count for the sidebar badges, or `null` when it is not known.
+ *
+ * Read only once the engine has answered `meta`, again on every navigation
+ * (an approval on the plan page changes it), and on an interval. A failed
+ * read shows no badge: a badge is a hint, and a wrong zero would say nothing
+ * waits. A `401` still ends the session through `apiGet`'s own event.
+ */
+export function useWaitingCount(
+  fetchWaiting: () => Promise<number>,
+  enabled: boolean,
+  pathname: string,
+  refreshMs: number = WAITING_REFRESH_MS,
+): number | null {
+  const [count, setCount] = useState<number | null>(null);
+  useEffect(() => {
+    if (!enabled) {
+      setCount(null);
+      return;
+    }
+    let cancelled = false;
+    const read = () => {
+      fetchWaiting().then(
+        (total) => {
+          if (!cancelled) setCount(total);
+        },
+        () => {
+          if (!cancelled) setCount(null);
+        },
+      );
+    };
+    read();
+    const timer = refreshMs > 0 ? window.setInterval(read, refreshMs) : undefined;
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearInterval(timer);
+    };
+  }, [fetchWaiting, enabled, pathname, refreshMs]);
+  return count;
+}
+
+/** The words a waiting count is announced with. Exported so tests pin one string. */
+export function waitingLine(count: number): string {
+  return count === 1 ? "1 decision waits on you" : `${count} decisions wait on you`;
+}
 
 /**
  * The engine read, as a hook, so the shell can own it.
@@ -272,18 +331,34 @@ function Wordmark({ className }: { className: string }) {
  * name and the reason as plain text — not a link, not in the tab order, and
  * marked disabled for assistive technology.
  */
-function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: AreaId }) {
+function AreaLink({
+  area,
+  current,
+  waiting,
+}: {
+  area: Area & { kind: "link" };
+  current: AreaId;
+  /** What waits on a person in this area, when known and above zero. */
+  waiting?: number;
+}) {
   const here = area.id === current;
   const Icon = area.icon;
+  // Unique per sidebar copy: the rail and the drawer each draw this link.
+  const waitingId = useId();
+  const showWaiting = waiting !== undefined && waiting > 0;
   // Folds the drawer this link is drawn in. Outside a dialog — the fixed rail
   // — the default context is a no-op, so the same link works in both copies.
   const close = useClose();
   return (
+    <>
     <a
       href={area.href}
       // "page" unless the area's screen has tabs of its own; then the tab is
       // the page and this is the section it is in.
       aria-current={here ? (areaHasTabs(area.id) ? "true" : "page") : undefined}
+      // The count is the link's description, not its name: the name stays
+      // the area's, so finding the link by name still works.
+      aria-describedby={showWaiting ? waitingId : undefined}
       onClick={(event) => {
         event.preventDefault();
         navigateTo(area.href);
@@ -309,6 +384,22 @@ function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: A
       />
       {area.label}
     </a>
+    {showWaiting && (
+      <>
+        {/* Beside the link, not inside it, so the link's text stays the
+            area's name. Drawn over the link's right end. */}
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute top-1/2 right-2 flex h-5 min-w-5 -translate-y-1/2 items-center justify-center rounded-full bg-orange-500 px-1.5 text-xs font-semibold text-zinc-950 tabular-nums"
+        >
+          {waiting}
+        </span>
+        <span id={waitingId} hidden>
+          {waitingLine(waiting)}
+        </span>
+      </>
+    )}
+    </>
   );
 }
 
@@ -321,7 +412,10 @@ function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: A
  * assistive technology. The disclosure is a native `<details>`: keyboard and
  * screen-reader behaviour come from the browser, with no state here.
  */
-function AreaNav({ current }: { current: AreaId }) {
+/** The areas whose badge shows the waiting count: both answer "what waits on me". */
+const WAITING_AREAS: ReadonlySet<AreaId> = new Set<AreaId>(["needs-you", "review"]);
+
+function AreaNav({ current, waiting }: { current: AreaId; waiting: number | null }) {
   const open = AREAS.filter((area) => area.kind === "link");
   const notYet = AREAS.filter((area) => area.kind === "disabled");
   return (
@@ -330,8 +424,12 @@ function AreaNav({ current }: { current: AreaId }) {
         <li>
           <ul className="-mx-2 space-y-1">
             {open.map((area) => (
-              <li key={area.id}>
-                <AreaLink area={area as Area & { kind: "link" }} current={current} />
+              <li key={area.id} className="relative">
+                <AreaLink
+                  area={area as Area & { kind: "link" }}
+                  current={current}
+                  waiting={waiting !== null && WAITING_AREAS.has(area.id) ? waiting : undefined}
+                />
               </li>
             ))}
           </ul>
@@ -376,13 +474,21 @@ function AreaNav({ current }: { current: AreaId }) {
  * drawer — never both at the same time: the drawer exists only while it is
  * open, and above the breakpoint it closes itself.
  */
-function SidebarContents({ current, engine }: { current: AreaId; engine: ReactNode }) {
+function SidebarContents({
+  current,
+  engine,
+  waiting,
+}: {
+  current: AreaId;
+  engine: ReactNode;
+  waiting: number | null;
+}) {
   return (
     <div className="flex grow flex-col gap-y-5 overflow-y-auto border-r border-zinc-200 bg-white px-6 dark:border-white/10 dark:bg-zinc-900">
       <div className="flex h-16 shrink-0 items-center">
         <Wordmark className="flex" />
       </div>
-      <AreaNav current={current} />
+      <AreaNav current={current} waiting={waiting} />
       {engine !== null && (
         <section
           aria-label="Engine"
@@ -429,12 +535,15 @@ export function App({
   review,
   governor,
   fetchMeta = fetchMetaFromEngine,
+  fetchWaiting = fetchWaitingFromEngine,
 }: {
   engine?: ReactNode;
   estate?: ReactNode;
   review?: ReactNode;
   governor?: ReactNode;
   fetchMeta?: () => Promise<MetaOutput>;
+  /** The sidebar's waiting count. Tests hand in a fake. */
+  fetchWaiting?: () => Promise<number>;
 }) {
   const pathname = usePathname();
   const lane: Lane = laneFromPath(pathname);
@@ -448,6 +557,9 @@ export function App({
   const access: WriteAccess | null =
     engineState.kind === "ready" ? accessFromScope(engineState.meta.token_scope) : null;
   const areaLabel = AREAS.find((entry) => entry.id === area)?.label ?? "Rocky";
+  // Read once the engine has answered, never before: until then the page
+  // does not know it has a session, and after expiry there is none.
+  const waiting = useWaitingCount(fetchWaiting, engineState.kind === "ready", pathname);
 
   // Fold on any route change, Back and Forward included, not only on a click.
   useEffect(() => setMenuOpen(false), [pathname]);
@@ -497,14 +609,14 @@ export function App({
                   <XMarkIcon aria-hidden="true" className="size-6 text-white" />
                 </button>
               </div>
-              <SidebarContents current={area} engine={engineLine} />
+              <SidebarContents current={area} engine={engineLine} waiting={waiting} />
             </DialogPanel>
           </div>
         </Dialog>
 
         {/* The fixed sidebar, `lg` and up. */}
         <div className="hidden lg:fixed lg:inset-y-0 lg:z-50 lg:flex lg:w-72 lg:flex-col">
-          <SidebarContents current={area} engine={engineLine} />
+          <SidebarContents current={area} engine={engineLine} waiting={waiting} />
         </div>
 
         <div className="sticky top-0 z-40 lg:pl-72">

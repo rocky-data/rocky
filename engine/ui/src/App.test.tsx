@@ -3,7 +3,13 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, SESSION_EXPIRED_EVENT } from "./api";
-import { App, EnginePanel, SESSION_EXPIRED_TITLE, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
+import {
+  App,
+  EnginePanel,
+  SESSION_EXPIRED_TITLE,
+  WIDE_ENOUGH_FOR_THE_SIDEBAR,
+  waitingLine,
+} from "./App";
 import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { OPERATOR_MODE_LABEL, READ_ONLY_REASON } from "./operator";
@@ -221,6 +227,53 @@ describe("App", () => {
     for (const entry of disabled) expect(entry.closest("a")).toBeNull();
     expect(within(nav).getByText("No page of its own yet. The runs table is on Estate.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
+  });
+
+  it("badges Needs you and Review with what waits, keeping each link's name", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} fetchWaiting={async () => 2} {...slots} />);
+    const needs = await waitFor(() => {
+      const link = areas().getByRole("link", { name: "Needs you" });
+      expect(link).toHaveAccessibleDescription(waitingLine(2));
+      return link;
+    });
+    // The digit is beside the link, never in its text or its name.
+    expect(needs.textContent).toBe("Needs you");
+    expect(needs.parentElement?.querySelector('span[aria-hidden="true"]')?.textContent).toBe("2");
+    expect(areas().getByRole("link", { name: "Review" })).toHaveAccessibleDescription(
+      "2 decisions wait on you",
+    );
+    // Only those two: nothing else in the sidebar waits on a person.
+    expect(areas().getByRole("link", { name: "Estate" })).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("shows no badge for zero, for a failed read, or before the engine answers", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    const zero = vi.fn(async () => 0);
+    const { unmount } = render(<App fetchMeta={readyMeta} fetchWaiting={zero} {...slots} />);
+    await waitFor(() => expect(zero).toHaveBeenCalled());
+    expect(areas().getByRole("link", { name: "Needs you" })).not.toHaveAttribute("aria-describedby");
+    unmount();
+
+    const refused = vi.fn(async (): Promise<number> => {
+      throw new Error("refused");
+    });
+    const second = render(<App fetchMeta={readyMeta} fetchWaiting={refused} {...slots} />);
+    await waitFor(() => expect(refused).toHaveBeenCalled());
+    expect(areas().getByRole("link", { name: "Review" })).not.toHaveAttribute("aria-describedby");
+    second.unmount();
+
+    // Until meta answers, the page does not know it has a session.
+    const never = vi.fn(async () => 1);
+    render(
+      <App
+        fetchMeta={() => new Promise<MetaOutput>(() => {})}
+        fetchWaiting={never}
+        {...slots}
+      />,
+    );
+    await act(async () => {});
+    expect(never).not.toHaveBeenCalled();
   });
 
   it("switches areas on a click without a reload, and marks exactly one current", async () => {
