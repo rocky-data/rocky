@@ -58,7 +58,7 @@ fn build_http_client() -> Client {
 }
 
 /// Errors from the Databricks SCIM API.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ScimError {
     #[error("auth error: {0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -71,6 +71,14 @@ pub enum ScimError {
 
     #[error("SCIM response missing field: {0}")]
     MissingField(&'static str),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ScimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ScimError", self)
+    }
 }
 
 /// Minimal SCIM 2.0 Group representation as returned by Databricks.
@@ -266,6 +274,20 @@ impl ScimClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn scim_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "dbx-scim-1919-e7f8";
+        rocky_core::secret_registry::register_substitution("RV_DBX_SCIM_DBG", SECRET);
+        let err = ScimError::ApiError {
+            status: 409,
+            body: format!("group {SECRET} exists"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DBX_SCIM_DBG}"), "{debug}");
+    }
 
     #[test]
     fn create_group_request_serializes_with_schemas() {

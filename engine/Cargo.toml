@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rocky-core",
+    "crates/rocky-secret-registry",
     "crates/rocky-core-compiletest",
     "crates/rocky-cli-compiletest",
     "crates/rocky-ir",

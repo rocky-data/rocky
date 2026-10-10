@@ -5,9 +5,17 @@ type = "duckdb"
 path = "poc.duckdb"
 
 # Project-wide portability settings. Per-model overrides via `-- rocky-allow` pragma.
-# Baseline compile (no `--target-dialect`) emits no portability lints; pass
-# `--target-dialect bq` on the CLI to fire P001 on the non-portable model.
+#
+# `target_dialect` says the models' SQL is written for Snowflake (they use
+# NVL). Two things follow:
+#   - P001 judges each model against Snowflake, where NVL is native, so the
+#     baseline compile reports no portability issue. `--target-dialect bq` on
+#     the CLI judges against BigQuery instead and fires P001 on NVL.
+#   - Rocky does not check function names against the DuckDB adapter's
+#     function list. Without this line, `rocky compile` refuses NVL with
+#     `E057` (DuckDB has no NVL; since engine 1.79.0, #2329).
 [portability]
+target_dialect = "snowflake"
 allow = ["QUALIFY"]  # QUALIFY is BigQuery-supported, so allow it project-wide
 
 [pipeline.poc]

@@ -13,7 +13,7 @@ pub struct PermissionManager<'a> {
     connector: &'a DatabricksConnector,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum PermissionError {
     #[error("connector error: {0}")]
     Connector(#[from] ConnectorError),
@@ -38,6 +38,14 @@ pub enum PermissionError {
         summary: String,
         failures: Vec<FailedGrant>,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for PermissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "PermissionError", self)
+    }
 }
 
 /// Permissions that Rocky manages. Others (OWNERSHIP, ALL PRIVILEGES, CREATE SCHEMA) are skipped.
@@ -555,6 +563,17 @@ fn format_target(target: &GrantTarget) -> Result<String, PermissionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn permission_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "dbx-grant-1919-a9b0";
+        rocky_core::secret_registry::register_substitution("RV_DBX_PERM_DBG", SECRET);
+        let err = PermissionError::ParseError(format!("grant on {SECRET}.raw"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DBX_PERM_DBG}"), "{debug}");
+    }
 
     #[test]
     fn applied_diff_into_result_clean_passes() {

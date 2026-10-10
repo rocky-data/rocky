@@ -64,6 +64,7 @@ pub fn run_ci(
         gates: None,
         inlined_gates: None,
         strict_contracts: false,
+        target_dialects: Default::default(),
     })
 }
 

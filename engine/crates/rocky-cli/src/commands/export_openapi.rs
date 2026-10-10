@@ -274,6 +274,9 @@ enum Body {
     Component(&'static str),
     /// The `202 Accepted` job-submission body: `{ "job_id": string }`.
     JobAccepted,
+    /// The `202 Accepted` job-cancel body:
+    /// `{ "job_id": string, "signal": "terminate" | "kill" }`.
+    JobCancelAccepted,
     /// An ad-hoc object explicitly outside the `/api/v1` value contract.
     OutOfContract,
 }
@@ -837,6 +840,48 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "post",
+            path: "/api/v1/jobs/{id}/cancel",
+            operation_id: "cancelJob",
+            tag: "jobs",
+            summary: "Cancel a running job",
+            description: "Stop a job this server process started. The first request sends \
+                 the job's process group SIGTERM, which `rocky run` handles like Ctrl-C; \
+                 once that is delivered, a later request sends SIGKILL. On Windows every \
+                 request kills the child. The answer is 202 only after the signal is \
+                 delivered. The job keeps the single-mutating-job permit until its child \
+                 has exited. Its final state is `cancelled` when the child then failed, or \
+                 `succeeded` when it finished first. Takes no request body.",
+            path_params: &["id"],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "202",
+                    description: "The signal was delivered to the job's process group. \
+                         Poll `GET /api/v1/jobs/{id}` for the final state.",
+                    body: Body::JobCancelAccepted,
+                },
+                Resp {
+                    status: "404",
+                    description: "No job with this id (neither in-memory nor persisted).",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "409",
+                    description: "`job_not_running`: the job has finished, or its child \
+                         exited before the signal could be delivered. \
+                         `job_not_cancellable`: the job is in flight but this server \
+                         process did not start it (a scheduled run, or a record from \
+                         another process).",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
             method: "get",
             path: "/api/v1/products",
             operation_id: "listProducts",
@@ -1332,7 +1377,7 @@ fn route_table() -> Vec<Route> {
             tag: "meta",
             summary: "Server posture",
             description: "How this server is bound and what it will accept: bind host, the \
-                 CORS allowlist, the `Host` values the UI guard accepts, whether the \
+                 CORS allowlist, the `Host` values the Host guard accepts, whether the \
                  scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a \
                  webhook, and the token's scope. An allowlist, not a config dump — no \
                  secret appears, and nothing is reached through serde of `RockyConfig`. \
@@ -1559,6 +1604,19 @@ fn response_object(resp: &Resp) -> Value {
             "type": "object",
             "properties": { "job_id": { "type": "string" } },
             "required": ["job_id"]
+        }),
+        Body::JobCancelAccepted => json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "signal": {
+                    "type": "string",
+                    "enum": ["terminate", "kill"],
+                    "description": "The signal delivered: \
+                         `terminate` (SIGTERM) until one is delivered, `kill` (SIGKILL) after."
+                }
+            },
+            "required": ["job_id", "signal"]
         }),
         Body::OutOfContract => json!({
             "type": "object",

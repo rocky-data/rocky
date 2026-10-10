@@ -149,7 +149,7 @@ impl IdempotencyCheck {
 }
 
 /// Errors surfaced by the idempotency subsystem.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum IdempotencyError {
     #[error("state store error: {0}")]
     State(#[from] StateError),
@@ -176,6 +176,14 @@ pub enum IdempotencyError {
 
     #[error("task join error: {0}")]
     TaskJoin(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for IdempotencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "IdempotencyError", self)
+    }
 }
 
 /// Idempotency dispatch handle.
@@ -914,6 +922,17 @@ pub fn in_flight_stale_after(config: &IdempotencyConfig) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn idempotency_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "idem-valkey-1919-c9d0";
+        crate::secret_registry::register_substitution("RV_IDEM_DBG", SECRET);
+        let err = IdempotencyError::Valkey(format!("{SECRET}:6379 refused"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_IDEM_DBG}"), "{debug}");
+    }
     use crate::config::{DedupPolicy, IdempotencyConfig};
 
     fn mk_entry(

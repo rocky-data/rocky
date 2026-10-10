@@ -118,6 +118,9 @@ pub struct ServerState {
     /// table, serving `GET /api/v1/jobs/{id}` without touching redb on the hot
     /// path. Repopulated lazily from redb after a restart.
     pub jobs: crate::jobs::JobRegistry,
+    /// Cancel channels of the jobs this process launched and has not settled,
+    /// read by `POST /api/v1/jobs/{id}/cancel` and by the shutdown path.
+    pub job_cancels: crate::jobs::JobCancels,
     /// Bearer token required by the HTTP API auth middleware, together with
     /// the [`crate::auth::TokenScope`] it grants. `None` means "no auth"; in
     /// that mode `rocky_cli::api::serve` refuses to bind a non-loopback host.
@@ -146,9 +149,14 @@ pub struct ServerState {
     /// answers `404` — a webhook can only be consumed by a resident reconciler,
     /// so ingress without one is disabled.
     pub webhook: Option<crate::webhook_ingress::WebhookIngress>,
-    /// The browser UI (`rocky serve --ui`): its files, the `Host` values it
-    /// accepts. `None` means no UI routes and no host guard.
+    /// The browser UI (`rocky serve --ui`): its files. `None` means no UI
+    /// routes.
     pub ui: Option<crate::ui::UiConfig>,
+    /// The `Host`/`Origin` guard ([`crate::auth::require_known_host`]).
+    /// `rocky serve` sets it on every loopback bind and on every `--ui` bind
+    /// (#2322). `None` means no guard, which `rocky serve` leaves only on a
+    /// non-loopback bind without `--ui`, where a token is required.
+    pub host_guard: Option<crate::ui::HostGuard>,
     /// Server posture frozen at startup, served by `GET /api/v1/settings`.
     ///
     /// Carries only what is not already on this struct; `ui`, `allowed_origins`
@@ -396,6 +404,7 @@ impl ServerState {
             state_path,
             None,
             None,
+            None,
             // This constructor backs the LSP, the scheduler and tests — none of
             // which binds the HTTP server, so there is no posture to report.
             // `rocky serve` goes through `build_serve_state`, which always
@@ -420,6 +429,7 @@ impl ServerState {
         state_path: Option<PathBuf>,
         webhook: Option<crate::webhook_ingress::WebhookIngress>,
         ui: Option<crate::ui::UiConfig>,
+        host_guard: Option<crate::ui::HostGuard>,
         settings: SettingsSnapshot,
     ) -> Arc<Self> {
         let state = Arc::new(Self {
@@ -430,6 +440,7 @@ impl ServerState {
             state_path,
             webhook,
             ui,
+            host_guard,
             settings,
             compile_result: RwLock::new(None),
             compile_failure: RwLock::new(None),
@@ -441,6 +452,7 @@ impl ServerState {
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
+            job_cancels: crate::jobs::JobCancels::new(),
             auth,
             ui_session_key: crate::ui_session::UiSessionKey::generate(),
             allowed_origins,
@@ -585,6 +597,9 @@ impl ServerState {
             preserve_authored_sql: false,
             external_dependencies: Default::default(),
             project: None,
+            // The language server and `rocky serve` do not resolve each model's
+            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            target_dialects: Default::default(),
         };
 
         // The compile pass walks the model directory, parses every

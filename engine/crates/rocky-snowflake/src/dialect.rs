@@ -426,6 +426,17 @@ impl SqlDialect for SnowflakeSqlDialect {
             || is_safe_snowflake_varchar_widening(target_type, source_type)
     }
 
+    /// Every Snowflake float is one 64-bit type, which this adapter stores
+    /// as `DOUBLE PRECISION` ([`crate::types::canonical_type`], #2333). A
+    /// source column spelled `FLOAT`, `REAL` or `DOUBLE` (DuckDB, Databricks)
+    /// lands in that type, so it is not drift. Without this, each run of
+    /// such a replication would see `FLOAT` against `DOUBLE PRECISION` and
+    /// drop and recreate the table.
+    fn types_equivalent(&self, source_type: &str, target_type: &str) -> bool {
+        crate::types::canonical_type(source_type)
+            .eq_ignore_ascii_case(&crate::types::canonical_type(target_type))
+    }
+
     /// Snowflake folds unquoted identifiers to UPPERCASE at parse time.
     /// The default `alter_column_type_sql` interpolates `column` without
     /// quotes, which silently breaks against any column created with
@@ -501,6 +512,37 @@ mod tests {
 
     fn dialect() -> SnowflakeSqlDialect {
         SnowflakeSqlDialect
+    }
+
+    /// #2333: a source float spelled `FLOAT` (DuckDB, Databricks) against a
+    /// Snowflake target this adapter reports as `DOUBLE PRECISION` is the
+    /// same type: no drift, so no drop and recreate on every run. A real
+    /// change still drifts.
+    #[test]
+    fn a_float_source_does_not_drift_against_a_snowflake_double() {
+        use rocky_core::drift::detect_drift;
+        use rocky_ir::{ColumnInfo, DriftAction, TableRef};
+        let col = |name: &str, data_type: &str| ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: true,
+        };
+        let table = TableRef {
+            catalog: "db".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let target = [col("f", &crate::types::canonical_type("FLOAT"))];
+        for source in ["FLOAT", "float", "DOUBLE", "REAL", "DOUBLE PRECISION"] {
+            let result = detect_drift(&table, &[col("f", source)], &target, &dialect());
+            assert!(result.drifted_columns.is_empty(), "{source}: {result:?}");
+            assert!(matches!(result.action, DriftAction::Ignore), "{source}");
+        }
+        let result = detect_drift(&table, &[col("f", "VARCHAR")], &target, &dialect());
+        assert_eq!(result.drifted_columns.len(), 1);
+        // The same-adapter path: both sides already canonical.
+        let result = detect_drift(&table, &target, &target, &dialect());
+        assert!(result.drifted_columns.is_empty());
     }
 
     #[test]

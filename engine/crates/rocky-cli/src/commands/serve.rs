@@ -5,7 +5,17 @@
 //! The server binds `127.0.0.1:8080` by default. Binding a non-loopback
 //! host (e.g. `--host 0.0.0.0`) requires a Bearer token — otherwise the
 //! server refuses to start so model SQL, file paths, and run history
-//! don't leak to the LAN. Token sources, in priority order:
+//! don't leak to the LAN.
+//!
+//! A loopback bind, with or without `--ui`, also runs the `Host`/`Origin`
+//! guard (`rocky_server::auth::require_known_host`): a request whose `Host`
+//! is not a loopback name, the bind host or an `--allowed-host` entry is
+//! refused `421`, and one whose `Origin` is another site's is refused `403`.
+//! Without it, a web page that rebinds its own name to `127.0.0.1` could
+//! reach a token-less server's writes (#2322). A non-loopback bind runs the
+//! guard only with `--ui`.
+//!
+//! Token sources, in priority order:
 //!
 //! 1. `--token <secret>` flag
 //! 2. `ROCKY_SERVE_TOKEN` env var
@@ -192,7 +202,8 @@ pub async fn run_serve(
     // `build_serve_state` (the token matrix in `validate_ui_flags`; webhook
     // secret with `--scheduler`; the feature compiled in).
     ui: bool,
-    // `--allowed-host`: extra `Host` values the `--ui` guard accepts.
+    // `--allowed-host`: extra `Host` values the `Host`/`Origin` guard accepts
+    // (on a loopback or `--ui` bind).
     allowed_hosts: Vec<String>,
     // `--open`: hand the printed page address to the system browser once the
     // listener is bound. Refused without `--ui` (`validate_open_flag`).
@@ -567,7 +578,8 @@ fn merge_read_only_flag(read_only: bool, token_scope: Option<String>) -> Result<
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiExposure {
     /// No `--ui`. Nothing is generated and nothing here applies: a loopback
-    /// server with no token serves every route with no auth, as it always has.
+    /// server with no token serves every route with no auth, behind the
+    /// `Host`/`Origin` guard (#2322).
     NoUi,
     /// `--ui` on a loopback bind with no `--allowed-host` / `--allowed-origin`.
     /// Operator mode: a generated token is full scope unless the operator
@@ -814,14 +826,20 @@ fn build_serve_state(
                  build` in engine/ui and rebuild with `cargo build --features ui`."
             ),
         };
-        Some(rocky_server::ui::UiConfig {
-            bind_host: host.to_string(),
-            allowed_hosts,
-            assets,
-        })
+        Some(rocky_server::ui::UiConfig { assets })
     } else {
         None
     };
+    // The `Host`/`Origin` guard: on every `--ui` bind, and on every loopback
+    // bind with or without `--ui` (#2322). A loopback server with no token
+    // answers every route, so without the guard a web page that rebinds its
+    // own name to 127.0.0.1 could submit jobs. A non-loopback bind without
+    // `--ui` is reached by names it cannot know (a container's service name,
+    // a pod IP) and must carry a token, so it keeps no guard.
+    let host_guard = (ui || crate::api::is_loopback(host)).then(|| rocky_server::ui::HostGuard {
+        bind_host: host.to_string(),
+        allowed_hosts,
+    });
 
     // The config file the scheduler reads (falls back to the conventional
     // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
@@ -899,6 +917,7 @@ fn build_serve_state(
         state_path.map(std::path::Path::to_path_buf),
         webhook,
         ui_config,
+        host_guard,
         settings,
     );
     Ok((state, token_origin))
@@ -1281,15 +1300,12 @@ mod tests {
                 .strip_prefix("http://")
                 .and_then(|rest| rest.split('/').next())
                 .expect("the printed address is an http URL with a path");
-            let ui = rocky_server::ui::UiConfig {
+            let guard = rocky_server::ui::HostGuard {
                 bind_host: bind.to_string(),
                 allowed_hosts: Vec::new(),
-                assets: std::sync::Arc::new(rocky_server::ui::InMemoryAssets(
-                    std::collections::BTreeMap::new(),
-                )),
             };
             assert!(
-                ui.host_allowed(authority),
+                guard.host_allowed(authority),
                 "bind {bind} advertises {authority}, which its own guard refuses"
             );
         }
@@ -1933,8 +1949,9 @@ mod tests {
                 false,
                 Vec::new(),
                 false,
-                // Passed WITHOUT `--ui`, so the guard never exists and the
-                // reported list must stay empty.
+                // Passed WITHOUT `--ui`: a loopback bind still guards `Host`
+                // and honours the list (#2322); a non-loopback one has no
+                // guard, so the list is not installed.
                 vec!["example.test".to_string()],
                 scheduler,
                 None,
@@ -1947,10 +1964,16 @@ mod tests {
                 "the snapshot must report the host the listener binds"
             );
             assert_eq!(state.settings.scheduler, scheduler);
-            assert!(
-                state.ui.is_none(),
-                "no --ui, so there is no host guard to report"
-            );
+            assert!(state.ui.is_none(), "no --ui");
+            let guarded_hosts = state
+                .host_guard
+                .as_ref()
+                .map(|guard| guard.allowed_hosts.clone());
+            if host == "127.0.0.1" {
+                assert_eq!(guarded_hosts, Some(vec!["example.test".to_string()]));
+            } else {
+                assert_eq!(guarded_hosts, None, "a non-loopback bind has no guard");
+            }
         }
     }
 
@@ -2197,6 +2220,164 @@ mod tests {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Send one request through the router `serve` builds for `state`, and
+    /// return its status and envelope `code` (empty when the body has none).
+    async fn send_with_host(
+        state: std::sync::Arc<rocky_server::state::ServerState>,
+        method: &str,
+        path: &str,
+        host: &str,
+        extra: &[(&str, &str)],
+    ) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt as _;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(axum::http::header::HOST, host);
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        let response = crate::api::router(state)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        (status, code)
+    }
+
+    /// **#2322: a loopback `rocky serve` with no `--ui` and no token runs the
+    /// `Host`/`Origin` guard.** Without it, a web page that rebinds its own
+    /// name to 127.0.0.1 could `POST /api/v1/jobs/run` on the visitor's
+    /// machine. Built through `build_serve_state`, the function `run_serve`
+    /// calls, so the bind-to-guard handoff is what is tested.
+    ///
+    /// ```text
+    ///   bind       --ui  token  Host / Origin               -> result
+    ///   127.0.0.1  no    none   evil.example (rebinding)    -> 421 host_not_allowed
+    ///   127.0.0.1  no    none   127.0.0.1, Origin evil      -> 403 origin_not_allowed
+    ///   127.0.0.1  no    none   localhost / 127.0.0.1 /
+    ///                           [::1], any port             -> served
+    ///   127.0.0.1  no    none   --allowed-host name         -> served
+    ///   0.0.0.0    no    given  10.0.0.5 (a pod IP)         -> served, no guard
+    /// ```
+    #[tokio::test]
+    async fn a_loopback_serve_without_ui_refuses_a_host_that_does_not_name_it() {
+        if serve_token_env_is_set() {
+            return;
+        }
+        let plain_loopback = UiCase {
+            ui: false,
+            ..UiCase::local()
+        };
+        let (state, _) = build_ui_matrix_state(plain_loopback.clone()).unwrap();
+        assert!(state.auth.is_none(), "no token: every route is open");
+        assert!(state.ui.is_none(), "no --ui");
+
+        // The rebinding request: a write, naming the attacker's host.
+        for (method, path) in [("POST", "/api/v1/jobs/run"), ("GET", "/api/v1/meta")] {
+            let (status, code) =
+                send_with_host(state.clone(), method, path, "evil.example:8080", &[]).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::MISDIRECTED_REQUEST,
+                "{method} {path}"
+            );
+            assert_eq!(code, "host_not_allowed", "{method} {path}");
+        }
+        // A request that names no host at all (no `Host`, no URI authority)
+        // is refused, not waved through.
+        {
+            use tower::ServiceExt as _;
+            let response = crate::api::router(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/jobs/run")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::MISDIRECTED_REQUEST
+            );
+        }
+        // A cross-site page that names the server correctly but sends its own
+        // Origin is refused too.
+        let (status, code) = send_with_host(
+            state.clone(),
+            "POST",
+            "/api/v1/jobs/run",
+            "127.0.0.1:8080",
+            &[("origin", "https://evil.example")],
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(code, "origin_not_allowed");
+
+        // Every loopback name, with any port, keeps working.
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "127.0.0.1:1",
+            "[::1]:8080",
+        ] {
+            let (status, _) = send_with_host(state.clone(), "GET", "/api/v1/meta", host, &[]).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "Host: {host}");
+        }
+        // So does a page served from a loopback origin (the `just ui-dev`
+        // Vite proxy forwards Host and Origin `localhost:<vite port>`).
+        let (status, _) = send_with_host(
+            state.clone(),
+            "GET",
+            "/api/v1/meta",
+            "localhost:5173",
+            &[("origin", "http://localhost:5173")],
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // `--allowed-host` is honoured without `--ui`, for a reverse proxy
+        // on the same machine.
+        let (proxied, _) = build_ui_matrix_state(UiCase {
+            allowed_hosts: vec!["rocky.example.test".to_string()],
+            ..plain_loopback
+        })
+        .unwrap();
+        let (status, _) =
+            send_with_host(proxied, "GET", "/api/v1/meta", "rocky.example.test", &[]).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // A non-loopback bind without `--ui` (a container) keeps no guard:
+        // it is reached by names it cannot know, and it carries a token.
+        let (container, _) = build_ui_matrix_state(UiCase {
+            ui: false,
+            host: "0.0.0.0",
+            secret: Some("t0ken"),
+            ..UiCase::local()
+        })
+        .unwrap();
+        assert!(container.host_guard.is_none());
+        let (status, _) = send_with_host(
+            container,
+            "GET",
+            "/api/v1/meta",
+            "10.0.0.5:8080",
+            &[("authorization", "Bearer t0ken")],
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
     }
 
     /// **The `--ui` token matrix, row by row, through `build_serve_state`.**

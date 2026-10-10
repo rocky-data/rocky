@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 /// Error type for Valkey/Redis cache operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ValkeyCacheError {
     #[error("Valkey connection error: {0}")]
     Connection(#[source] redis::RedisError),
@@ -15,6 +15,14 @@ pub enum ValkeyCacheError {
 
     #[error("Valkey serialization error: {0}")]
     Serialization(#[source] serde_json::Error),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ValkeyCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_secret_registry::fmt_rendered_debug(f, "ValkeyCacheError", self)
+    }
 }
 
 /// Async Valkey/Redis distributed cache client.
@@ -125,6 +133,21 @@ impl ValkeyCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn valkey_cache_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "valkey-host-1919-c3d4";
+        rocky_secret_registry::register_substitution("RV_VALKEY_DBG", SECRET);
+        let err = super::ValkeyCacheError::Connection(redis::RedisError::from((
+            redis::ErrorKind::Io,
+            "connect failed",
+            format!("{SECRET}:6379 refused"),
+        )));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_VALKEY_DBG}"), "{debug}");
+    }
     #[test]
     fn test_key_prefixing() {
         // Verify key prefixing logic without needing a live Redis instance.

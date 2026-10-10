@@ -433,7 +433,7 @@ function Approval({
             busy={jobBusy(approve.view)}
             onClick={() => approve.start({ plan_id: planId })}
           />
-          <JobLine label="Approve" view={approve.view} />
+          <JobLine label="Approve" view={approve.view} cancel={approve.cancel} />
           {access.kind === "operator" && (
             <p className="text-xs text-zinc-600 dark:text-zinc-300">
               Approving records this server's git identity as the approver, over the HTTP API.
@@ -468,7 +468,7 @@ function Approval({
             disabledReason={status.reviewed ? undefined : "Approve the plan first."}
             onClick={() => apply.start({ plan_id: planId })}
           />
-          <JobLine label="Apply" view={apply.view} />
+          <JobLine label="Apply" view={apply.view} cancel={apply.cancel} />
           {status.reviewed && (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Apply runs the models on disk, and first checks they still match this plan. If

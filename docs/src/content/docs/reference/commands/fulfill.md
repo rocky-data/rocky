@@ -118,6 +118,21 @@ kill_grace_seconds = 30
 
 Bring your own model: the command template is the whole integration. `type = "replay"` executes a recorded session file instead — deterministic and credential-free, which is how CI exercises the loop.
 
+### Wrapping the worker in an OS sandbox
+
+You can run the agent inside an operating-system sandbox today. Put the sandbox program first in `command`. Rocky starts `command[0]` as given and does not look inside it. The only checks are that `command` is not empty and that exactly one argument contains `{brief}`. The wrapper becomes the leader of the worker's process group, and its children stay in that group.
+
+```toml
+[fulfill.driver]
+type = "subprocess"
+command = ["/usr/bin/sandbox-exec", "-f", "/etc/rocky/agent.sb", "claude", "-p", "{brief}"]
+env_allow = ["ANTHROPIC_API_KEY", "PATH"]
+```
+
+On Linux, `["/usr/bin/unshare", "--pid", "--fork", "claude", "-p", "{brief}"]` has the same shape. The sandbox profile, and whether the host allows the sandbox, are yours to set up. Rocky starts the worker with an empty environment, so list `PATH` in `env_allow` if the wrapper needs it to find `claude`.
+
+Rocky does not require a wrapper, and it does not check that you use one or that it works. It does not provide OS-level containment. A descendant that deliberately leaves the group, for example with `setsid`, can outlive the group kill unless your sandbox stops it. See [#1491](https://github.com/rocky-data/rocky/issues/1491).
+
 ## What v0 does not defend
 
 The worker runs on the same machine as the runner and the review markers, and markers are unsigned. The gates defend against mistakes, prompt-injection-shaped drift, and tool misuse — not against a hostile local process acting as your user. Do not point the driver at an agent binary you do not trust. Signed approvals and OS sandboxing are named follow-up work.

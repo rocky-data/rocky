@@ -151,6 +151,44 @@ fn selected_model_refuses_its_error_or_required_model_but_not_unrelated_error() 
     assert!(value["plan_id"].as_str().is_some(), "{value}");
 }
 
+/// #2333: `rocky plan` types a cast for the model's warehouse, as `rocky run`
+/// does, so it refuses what the run would refuse. On DuckDB `FLOAT` is
+/// 32-bit, so a `Float64` contract on `CAST(.. AS FLOAT)` is `E011` in both.
+/// Before, the plan typed the cast `Unknown` (`I003`) and wrote a plan the
+/// run then refused.
+#[test]
+fn plan_refuses_a_cast_contract_the_run_would_refuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    model(
+        tmp.path(),
+        "casted",
+        "SELECT CAST(1.5 AS FLOAT) AS f",
+        "full_refresh",
+    );
+    fs::write(
+        tmp.path().join("models/casted.contract.toml"),
+        "[[columns]]\nname = \"f\"\ntype = \"Float64\"\n",
+    )
+    .unwrap();
+    let out = rocky(tmp.path(), &["plan"], true);
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["model"] == "casted" && s["reason"].as_str().unwrap().contains("E011")),
+        "{value}"
+    );
+    assert_no_plan(tmp.path());
+}
+
 #[test]
 fn warning_only_project_still_persists_plan() {
     let tmp = tempfile::tempdir().unwrap();

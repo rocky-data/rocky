@@ -56,9 +56,15 @@ Three escape hatches:
 
 ## What happened
 
-1. **Baseline compile** — no dialect flag, no portability diagnostics;
-   every model type-checks.
-2. **`rocky compile --target-dialect bq`** — fires exactly one P001 on
+1. **Baseline compile** — no dialect flag. `rocky.toml` declares the SQL
+   as Snowflake SQL (`[portability] target_dialect = "snowflake"`), where
+   NVL is native, so there is no portability diagnostic and every model
+   type-checks. Without that line, `rocky compile` refuses NVL with
+   `E057`: the project's adapter is DuckDB, and DuckDB has no NVL (engine
+   1.79.0, #2329). Declaring the dialect tells Rocky not to judge the
+   SQL's function names against the DuckDB adapter.
+2. **`rocky compile --target-dialect bq`** — the flag overrides the
+   configured dialect for P001 and fires exactly one P001 on
    `non_portable_nvl.sql`. `portable.sql` is clean (COALESCE works
    everywhere); `suppressed_via_pragma.sql` is suppressed per-file.
 3. The diagnostic carries `severity: Error`, a file:line span, the

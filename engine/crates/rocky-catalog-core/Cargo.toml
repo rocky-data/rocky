@@ -14,6 +14,7 @@ default = []
 testing = []
 
 [dependencies]
+rocky-secret-registry = { path = "../rocky-secret-registry" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

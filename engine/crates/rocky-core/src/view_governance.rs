@@ -213,7 +213,7 @@ pub fn parse_probe_rows(result: &QueryResult) -> Result<Vec<AttachedGovernance>,
 }
 
 /// Rocky refuses to replace a view (#2234).
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ViewReplaceRefused {
     /// The view carries governance Rocky does not declare.
     #[error(
@@ -239,6 +239,14 @@ pub enum ViewReplaceRefused {
         #[source]
         source: AdapterError,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ViewReplaceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ViewReplaceRefused", self)
+    }
 }
 
 /// Check that replacing `view` drops no governance Rocky cannot restore.
@@ -286,6 +294,21 @@ pub async fn check_view_replace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn view_replace_refused_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "view-catalog-1919-a3b4";
+        crate::secret_registry::register_substitution("RV_VIEWGOV_DBG", SECRET);
+        let err = ViewReplaceRefused::Foreign {
+            view: format!("{SECRET}.sales.v_orders"),
+            items: "tag pii".into(),
+            attached: Vec::new(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_VIEWGOV_DBG}"), "{debug}");
+    }
 
     fn item(
         kind: AttachedGovernanceKind,

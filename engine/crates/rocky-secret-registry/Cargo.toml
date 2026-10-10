@@ -1,0 +1,15 @@
+[package]
+name = "rocky-secret-registry"
+version = "1.80.0"
+description = "Process-wide registry of resolved ${VAR} values, and the helpers that print them as ${NAME}"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# No dependencies, on purpose. Crates that must not depend on rocky-core (the
+# adapter SDK, rocky-cache, rocky-sql, rocky-catalog-core) use this registry
+# too, so it sits below all of them.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1132,6 +1132,13 @@ pub struct DeferOptions {
     /// graph and already logged each problem, so a sub-run does not log them
     /// again.
     pub consumers_logged_by_caller: bool,
+    /// The warehouse each project model runs on, resolved from the project's
+    /// pipelines the way `rocky compile` does
+    /// ([`super::compile::target_dialects`]). The compile types a `CAST`
+    /// whose width differs between warehouses for it (#2333). `None`
+    /// outside a project run: the compile then uses the warehouse the run
+    /// executes on.
+    pub target_dialects: Option<rocky_compiler::operand_check::TargetDialects>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -3577,13 +3584,17 @@ pub async fn run_with_explicit_contracts(
     // Every compile in this run judges `consumers/` against the whole project,
     // not against the models of one pipeline, glob or selection. A `--dag`
     // sub-run arrives with the context already built, once for the graph.
+    // Likewise each compile types a model's casts for the warehouse that
+    // model's pipelines write to, not for this pipeline's (#2333).
     let defer_with_project;
-    let defer_opts = if defer_opts.project.is_none() {
+    let defer_opts = if defer_opts.project.is_none() || defer_opts.target_dialects.is_none() {
         defer_with_project = DeferOptions {
-            project: Some(rocky_compiler::consumers::project_context(
-                config_path,
-                rocky_cfg,
-            )),
+            project: Some(defer_opts.project.clone().unwrap_or_else(|| {
+                rocky_compiler::consumers::project_context(config_path, rocky_cfg)
+            })),
+            target_dialects: Some(defer_opts.target_dialects.clone().unwrap_or_else(|| {
+                super::compile::target_dialects(Some(rocky_cfg), config_path)
+            })),
             ..defer_opts.clone()
         };
         &defer_with_project
@@ -4368,6 +4379,7 @@ pub async fn run_with_explicit_contracts(
                 Some(&hook_registry),
                 contracts.map(RunContracts::dir),
                 defer_opts.project.as_ref(),
+                defer_opts.target_dialects.as_ref(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -11432,8 +11444,11 @@ pub(crate) fn model_phase_ok<T>(
 /// (#1292/#1348), and the pipeline picked chooses the adapter the model
 /// MATERIALIZES on — so a wrong guess is wrong-adapter DDL, not a wrong flag.
 ///
-/// A project with no transformation pipeline keeps its prior answer: the
-/// first replication adapter, governance off, no glob.
+/// A project with no transformation pipeline answers from its first
+/// replication pipeline: that pipeline's adapter and its
+/// `auto_create_schemas`, and no glob. The `--all` model leg builds the same
+/// models under the same pipeline's governance, so `--model` must not
+/// disagree with it about creating a missing target schema (#2324).
 pub(crate) fn resolve_model_run_target(
     rocky_cfg: &rocky_core::config::RockyConfig,
     pipeline_name_arg: Option<&str>,
@@ -11475,20 +11490,18 @@ pub(crate) fn resolve_model_run_target(
                 Some(t.models.clone()),
             ));
         }
-        Ok((
-            rocky_cfg
-                .pipelines
-                .values()
-                .find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Replication(r) => {
-                        Some(r.target.adapter.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "default".to_string()),
-            false,
-            None,
-        ))
+        let replication = rocky_cfg.pipelines.values().find_map(|p| match p {
+            rocky_core::config::PipelineConfig::Replication(r) => Some(r),
+            _ => None,
+        });
+        Ok(match replication {
+            Some(r) => (
+                r.target.adapter.clone(),
+                r.target.governance.auto_create_schemas,
+                None,
+            ),
+            None => ("default".to_string(), false, None),
+        })
     }
 }
 
@@ -11656,6 +11669,10 @@ pub(crate) async fn execute_backfill_set(
     // `config_hash` describes the executed snapshot too (formerly a separate
     // path re-read — #1120/F10).
     loaded: &rocky_core::config::LoadedConfig,
+    // The path `loaded` was read from: the anchor its pipelines' model globs
+    // resolve against, so each model's casts are typed for its own
+    // warehouse (#2333).
+    config_path: &Path,
     // WP-01 PR-B (2b, R3-4): the ONE backfill session, constructed + acquired
     // + `require_synced` by the caller (`run_apply_backfill_plan`) BEFORE the
     // policy gate. Moved in (not borrowed) so the executor owns the terminal
@@ -11790,7 +11807,15 @@ pub(crate) async fn execute_backfill_set(
             // auto-create, matching the `--model` entry point.
             false,
             None, // backfills always target production
-            &DeferOptions::default(),
+            // Each model's casts are typed for the warehouse its own pipelines
+            // write to, not for this backfill's warehouse (#2333).
+            &DeferOptions {
+                target_dialects: Some(super::compile::target_dialects(
+                    Some(rocky_cfg),
+                    config_path,
+                )),
+                ..DeferOptions::default()
+            },
             skip_gate,
             reuse_enabled,
             column_level_enabled,
@@ -12556,6 +12581,19 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         source_provenance,
         external_dependencies: defer_opts.external_dependencies.clone(),
         project: defer_opts.project.clone(),
+        // A `CAST` whose width differs between warehouses is typed for the
+        // warehouse each model's pipelines write to, as `rocky compile`
+        // resolves it (#2333): a model of another pipeline compiled in this
+        // run keeps its own warehouse's widths. Only a run with no project
+        // config falls back to the warehouse it executes on.
+        target_dialects: defer_opts.target_dialects.clone().unwrap_or_else(|| {
+            rocky_compiler::operand_check::TargetDialects::uniform(
+                rocky_compiler::operand_check::OperandDialect::from_adapter_type(
+                    warehouse.dialect().name(),
+                )
+                .into(),
+            )
+        }),
         ..Default::default()
     };
 
@@ -26555,6 +26593,7 @@ adapter = "default"
                 let model_set = std::collections::BTreeSet::from(["m".to_string()]);
                 let backfill = super::execute_backfill_set(
                     &loaded,
+                    &config_path,
                     session,
                     &state_path,
                     &models,
@@ -26804,6 +26843,7 @@ adapter = "default"
         let model_set = std::collections::BTreeSet::from(["m".to_string()]);
         let result = super::execute_backfill_set(
             &loaded,
+            &config_path,
             session,
             &state_path,
             &models,
@@ -27217,6 +27257,100 @@ schema = "mart"
         .expect(
             "transformation run with auto_create_schemas=true must succeed even when the \
              target schema doesn't exist yet",
+        );
+    }
+
+    /// #2324: a project with only a replication pipeline that opts into
+    /// `auto_create_schemas`. `run --all` builds its models under that
+    /// pipeline's governance and creates their target schemas; `run --model`
+    /// must too. It used to answer governance OFF here and fail with
+    /// "Schema with name mart does not exist".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_model_run_creates_its_schema_under_the_replication_pipelines_governance() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let duckdb_path = config_dir.join("warehouse.duckdb");
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.r]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.r.source.discovery]
+adapter = "default"
+
+[pipeline.r.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.r.target]
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.r.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        let models_dir = config_dir.join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("summary.sql"), "SELECT 1 AS one\n")
+            .expect("write summary.sql");
+        std::fs::write(
+            models_dir.join("summary.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"mart\"\n",
+        )
+        .expect("write summary.toml");
+
+        super::run(
+            &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
+            None,
+            None,
+            &config_dir.join("state.redb"),
+            None,
+            true,
+            Some(&models_dir),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            Some("summary"),
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await
+        .expect("a --model run must create the missing target schema");
+        let conn = rocky_duckdb::DuckDbConnector::open(&duckdb_path).expect("open db");
+        assert_eq!(
+            conn.execute_sql("SELECT one FROM mart.summary")
+                .expect("mart.summary exists")
+                .rows,
+            vec![vec![serde_json::json!("1")]]
         );
     }
 
@@ -33157,6 +33291,83 @@ backend = "local"
         );
     }
 
+    /// #2333: the run's contract gate types a cast for the warehouse the
+    /// model's own pipelines write to (resolved per model, as `rocky
+    /// compile` does), not for the warehouse this run executes on. A model
+    /// whose pipeline writes to Snowflake keeps `FLOAT` = Float64 even when
+    /// it is compiled during a DuckDB run. With no project context the run
+    /// falls back to its own warehouse (DuckDB: Float32, so E011).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_run_contract_gate_types_casts_for_the_models_own_warehouse() {
+        use rocky_compiler::operand_check::{OperandDialect, TargetDialects};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let run = |defer: DeferOptions| async move {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let models = dir.path().join("models");
+            let contracts = dir.path().join("contracts");
+            std::fs::create_dir(&models).expect("models dir");
+            std::fs::create_dir(&contracts).expect("contracts dir");
+            write_plain_model(&models, "m", "SELECT CAST(1.5 AS FLOAT) AS f");
+            std::fs::write(
+                contracts.join("m.contract.toml"),
+                "[[columns]]\nname = \"f\"\ntype = \"Float64\"\n",
+            )
+            .expect("contract");
+            let adapter =
+                DuckDbWarehouseAdapter::open(&dir.path().join("t.duckdb")).expect("open warehouse");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            super::execute_models_with_explicit_contracts(
+                &models,
+                None,
+                &adapter,
+                None,
+                &PartitionRunOptions::default(),
+                "cast-target-test",
+                Some("m"),
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &defer,
+                super::SkipGateConfig::off(),
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                false,
+                true,
+                None,
+                None,
+                false,
+                Some(super::RunContracts::SelectedModelGuard(&contracts)),
+                false,
+            )
+            .await
+            .expect("a contract rejection is carried in RunOutput");
+            output
+                .errors
+                .iter()
+                .any(|error| error.error.contains("E011"))
+        };
+
+        let mut snowflake = TargetDialects::default();
+        snowflake.set("m", Some(OperandDialect::Snowflake).into());
+        let on_snowflake = DeferOptions {
+            target_dialects: Some(snowflake),
+            ..DeferOptions::default()
+        };
+        assert!(!run(on_snowflake).await, "Snowflake FLOAT is Float64");
+        assert!(
+            run(DeferOptions::default()).await,
+            "no project: the run's DuckDB FLOAT is Float32"
+        );
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn selected_contract_failure_preserves_the_existing_duckdb_table() {
@@ -35899,13 +36110,14 @@ auto_create_schemas = true
         assert!(explicit.1, "naming the pipeline honors its governance");
     }
 
-    /// The third arm is unchanged by #1350: with no transformation pipeline
-    /// to attribute the model to, the fallback still answers with the first
-    /// replication adapter, governance OFF, and no glob. Extracting the
-    /// resolver rewrote this arm from an `or_else` chain into an `else`, so
-    /// "prior answer preserved" is pinned rather than asserted in prose.
+    /// With no transformation pipeline to attribute the model to, the
+    /// fallback answers with the first replication pipeline's adapter, ITS
+    /// `auto_create_schemas`, and no glob. #1350 pinned governance OFF here
+    /// to preserve a prior answer, but the `--all` model leg builds the same
+    /// models under that pipeline's governance, so `run --all` created a
+    /// missing target schema and `run --model` failed on it (#2324).
     #[test]
-    fn replication_only_fallback_keeps_the_adapter_with_governance_off() {
+    fn replication_only_fallback_uses_the_replication_pipelines_governance() {
         let toml = r#"
 [adapter.db]
 type = "duckdb"
@@ -35932,10 +36144,18 @@ auto_create_schemas = true
         let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("config");
         assert_eq!(
             super::resolve_model_run_target(&cfg, None).expect("fallback"),
+            ("db".to_string(), true, None),
+            "no transformation pipeline: the first replication pipeline's adapter and \
+             governance, no glob"
+        );
+        let off: rocky_core::config::RockyConfig = toml::from_str(
+            &toml.replace("auto_create_schemas = true", "auto_create_schemas = false"),
+        )
+        .expect("config");
+        assert_eq!(
+            super::resolve_model_run_target(&off, None).expect("fallback"),
             ("db".to_string(), false, None),
-            "no transformation pipeline: first replication adapter, governance off, no glob \
-             — and governance stays off even though the replication pipeline enables it, \
-             because there is no transformation pipeline whose grant it could be"
+            "a replication pipeline that does not opt in creates no schema"
         );
     }
 

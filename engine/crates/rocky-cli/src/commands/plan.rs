@@ -1223,6 +1223,7 @@ pub(crate) fn conditional_drops_for_run_plan(
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -1439,6 +1440,12 @@ fn plan_preview_output_for_pipeline(
                     .unwrap_or_default(),
             )
         })?;
+    // Casts are typed for each model's warehouse, as `rocky compile` and
+    // `rocky run` type them (#2333).
+    let target_dialects = super::compile::target_dialects(
+        loaded.as_ref(),
+        config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+    );
     let dialect = match loaded {
         Some(cfg) if !cfg.pipelines.is_empty() => {
             let adapter_name = super::run::resolve_model_run_target(&cfg, pipeline_name)?.0;
@@ -1453,6 +1460,7 @@ fn plan_preview_output_for_pipeline(
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
+        target_dialects,
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -1765,7 +1773,12 @@ fn build_and_persist_run_plan(
 ) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
+    // Casts are typed for each model's warehouse, as `rocky run` types them
+    // (#2333).
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let config = CompilerConfig {
+        target_dialects: super::compile::target_dialects(project_config.as_ref(), config_path),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -2768,6 +2781,7 @@ pub fn populate_governance_actions(
     let tag_to_strategy = cfg.resolve_mask_for_env(env);
 
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -2875,6 +2889,7 @@ async fn check_plan_budget(
 
     // Compile models offline — no catalog I/O here.
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

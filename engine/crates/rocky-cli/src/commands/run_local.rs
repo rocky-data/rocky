@@ -134,6 +134,10 @@ pub async fn run_transformation(
     // not against this pipeline's alone. `None` reads the sibling of the
     // models directory.
     project: Option<&rocky_compiler::compile::ProjectContext>,
+    // The warehouse each project model runs on, resolved by the caller from
+    // the project's pipelines (#2333). `None` only with no project context:
+    // the compile then types casts for this pipeline's warehouse.
+    target_dialects: Option<&rocky_compiler::operand_check::TargetDialects>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -192,6 +196,7 @@ pub async fn run_transformation(
                 // Only the project rides along, for the consumer check.
                 &super::run::DeferOptions {
                     project: project.cloned(),
+                    target_dialects: target_dialects.cloned(),
                     ..super::run::DeferOptions::default()
                 },
                 skip_gate,
@@ -3868,6 +3873,7 @@ auto_create_schemas = true
             None,  // hook_registry
             None,  // contracts_dir
             None,  // project
+            None,  // target_dialects
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

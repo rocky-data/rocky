@@ -7443,12 +7443,12 @@ pub struct SettingsOutput {
     /// The same `String` `ServeConfig` binds — `serve` lends one value to both,
     /// so this cannot name a host the server is not actually on.
     pub bind_host: String,
-    /// Extra `Host` header values the UI guard accepts.
+    /// Extra `Host` header values the `Host`/`Origin` guard accepts.
     ///
-    /// This is what is **enforced**, not what was typed: `--allowed-host` is
-    /// only wired into a guard when `--ui` is on, so this is `[]` whenever `ui`
-    /// is `false`. Reporting the raw flag list would claim a guard that is not
-    /// running.
+    /// This is what is **enforced**, not what was typed: the guard runs on a
+    /// loopback bind and on a `--ui` bind, so this is `[]` on a non-loopback
+    /// bind without `--ui`, whatever `--allowed-host` said. Reporting the raw
+    /// flag list would claim a guard that is not running.
     pub allowed_hosts: Vec<String>,
     /// The CORS allowlist actually installed. Empty means same-origin only.
     ///
@@ -12234,7 +12234,10 @@ impl PreviewCostOutput {
 /// `rocky run` — migrates it; not retryable), `model_not_found`,
 /// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
 /// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
-/// `bad_request`, `unauthorized`, `internal_error`.
+/// `job_not_running` (`409`: a cancel named a job that has finished),
+/// `job_not_cancellable` (`409`: a cancel named a job this server process
+/// did not start, such as a scheduled run), `bad_request`, `unauthorized`,
+/// `internal_error`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {
     /// Stable machine token, e.g. `"model_not_found"`.
@@ -12681,6 +12684,10 @@ pub enum JobState {
     Succeeded,
     /// The subprocess exited non-zero, or could not be launched.
     Failed,
+    /// `POST /api/v1/jobs/{id}/cancel` signalled the subprocess, and it then
+    /// exited non-zero. A job that exits 0 after the signal is `succeeded`:
+    /// it finished before the signal could stop it.
+    Cancelled,
 }
 
 impl JobState {
@@ -12691,6 +12698,7 @@ impl JobState {
             "running" => Some(JobState::Running),
             "succeeded" => Some(JobState::Succeeded),
             "failed" => Some(JobState::Failed),
+            "cancelled" => Some(JobState::Cancelled),
             _ => None,
         }
     }
@@ -12722,7 +12730,8 @@ pub struct JobStatus {
     /// The advisory, spoofable `X-Rocky-Principal` recorded for audit, or `null`.
     /// Never an authorization input under the single-shared-secret auth ceiling.
     pub principal: Option<String>,
-    /// Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.
+    /// Failure detail when [`state`](Self::state) is [`JobState::Failed`], what
+    /// stopped the job when it is [`JobState::Cancelled`], else `null`.
     pub error: Option<String>,
     /// The canonical output of the underlying `rocky <kind>` command, embedded
     /// verbatim once the job is terminal (`null` while queued/running). Its

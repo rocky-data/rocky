@@ -22,7 +22,7 @@ fn variant_mismatch(model_ir: &ModelIr, expected: &'static str) -> SqlGenError {
 }
 
 /// Errors from SQL generation, including identifier validation and unsafe fragment detection.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SqlGenError {
     #[error("validation error: {0}")]
     Validation(#[from] validation::ValidationError),
@@ -65,6 +65,14 @@ pub enum SqlGenError {
         operation: &'static str,
         dialect: String,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SqlGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "SqlGenError", self)
+    }
 }
 
 /// Generates the SELECT SQL for a replication model using the given dialect.
@@ -1485,6 +1493,20 @@ pub fn generate_transformations_parallel(
 
 #[cfg(test)]
 mod tests {
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn sql_gen_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "sqlgen-frag-1919-a7b8";
+        crate::secret_registry::register_substitution("RV_SQLGEN_DBG", SECRET);
+        let err = SqlGenError::UnsafeFragment {
+            value: format!("{SECRET}; drop"),
+            reason: "terminator".into(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SQLGEN_DBG}"), "{debug}");
+    }
     use crate::traits::{AdapterError, AdapterResult, SqlDialect};
     use rocky_ir::*;
 

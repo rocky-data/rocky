@@ -36,9 +36,16 @@ pub use rocky_sql::literal::LiteralEscape;
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
 /// Boxed error from an adapter operation.
-#[derive(Debug)]
 pub struct AdapterError {
     inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "AdapterError", self)
+    }
 }
 
 impl AdapterError {
@@ -1844,6 +1851,16 @@ pub trait SqlDialect: Send + Sync {
         crate::drift::default_is_safe_type_widening(source_type, target_type)
     }
 
+    /// Whether a source column of type `source_type` and a column of this
+    /// warehouse reported as `target_type` are the same type, so drift
+    /// detection sees no change. The default compares the strings, ignoring
+    /// case. A warehouse whose `DESCRIBE` reports several names as one type
+    /// (Snowflake: every float is 64-bit) overrides, so a source that spells
+    /// the type another way does not drift on every run.
+    fn types_equivalent(&self, source_type: &str, target_type: &str) -> bool {
+        source_type.eq_ignore_ascii_case(target_type)
+    }
+
     /// SQL to change a column's data type as part of drift evolution.
     ///
     /// Default emits the ANSI `ALTER TABLE x ALTER COLUMN y TYPE z`
@@ -2826,6 +2843,17 @@ pub trait BatchCheckAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn adapter_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "adapter-host-1919-e2f7";
+        crate::secret_registry::register_substitution("RV_ADAPTER_DBG", SECRET);
+        let err = AdapterError::msg(format!("connect to {SECRET} failed"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_ADAPTER_DBG}"), "{debug}");
+    }
 
     // Verify that trait objects can be constructed (compile-time check).
     fn _assert_discovery_object_safe(_: &dyn DiscoveryAdapter) {}

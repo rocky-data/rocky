@@ -630,11 +630,13 @@ async fn run_apply_run_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    let run_models_dir = run_models_dir(root, &run_plan, &models_dir, models_glob.as_deref());
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
         run_plan,
+        run_models_dir,
         state_path,
         output_json,
         &apply_run_id,
@@ -1078,6 +1080,9 @@ async fn execute_run_plan(
     loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
     plan_id: &str,
     run_plan: RunPlan,
+    // The models directory `run` reads, from [`run_models_dir`]: anchored at
+    // the project root, so the run executes the models the gate checked.
+    run_models_dir: Option<PathBuf>,
     state_path: &Path,
     output_json: bool,
     // The unique run_id this apply forces `run` to record under, so the
@@ -1151,7 +1156,7 @@ async fn execute_run_plan(
         None
     };
 
-    let models_dir_path = run_plan.models_dir.as_ref().map(std::path::PathBuf::from);
+    let models_dir_path = run_models_dir;
 
     // `--dag` runs every pipeline as a unified DAG. The DAG runner is still
     // flag-light — it reads config + tooling defaults rather than walking the
@@ -3214,7 +3219,7 @@ pub(crate) fn run_model_selection(
 /// pre-execution check. A directory resolved from the config is already
 /// anchored by `config_path`; an absolute directory is kept as is. The CLI
 /// passes the absolute cwd as `root`, so its behaviour does not change.
-fn run_model_selection_at(
+pub(crate) fn run_model_selection_at(
     config: &rocky_core::config::RockyConfig,
     root: &Path,
     config_path: &Path,
@@ -3229,6 +3234,45 @@ fn run_model_selection_at(
         models_dir
     };
     Ok((models_dir, models_glob))
+}
+
+/// The models directory an apply hands `run`, anchored at `root` the way
+/// [`run_model_selection_at`] anchors the gate's (#2328).
+///
+/// `run` reads a plan-named directory (`--models`) as given, and falls back to
+/// a bare `models` for `--model` and `--all` when no transformation pipeline
+/// supplies a glob. Both are relative to the cwd, so a root that is not the
+/// cwd would gate one directory and execute another. A plan-named directory
+/// is joined to `root`; the bare fallback is replaced by the gate's own
+/// `<root>/models`. `run` keys several checks on whether a directory was
+/// passed at all, so the fallback is only filled in where `run` would read
+/// `models` anyway, and a pipeline glob is never overridden. The CLI passes
+/// the absolute cwd as `root`, so its behaviour does not change.
+fn run_models_dir(
+    root: &Path,
+    run_plan: &RunPlan,
+    selected_dir: &Path,
+    selected_glob: Option<&str>,
+) -> Option<PathBuf> {
+    match run_plan.models_dir.as_deref() {
+        Some(dir) => Some(root.join(dir)),
+        None if selected_glob.is_none() && (run_plan.model.is_some() || run_plan.run_all) => {
+            Some(selected_dir.to_path_buf())
+        }
+        None => None,
+    }
+}
+
+/// The models directory a backfill plan executes: the plan's own directory,
+/// or the `models` default, anchored at `root` exactly once (#2336).
+///
+/// A backfill reads no pipeline glob, so this is its whole selection. Review,
+/// the apply-time models check, the policy gate and `execute_backfill_set`
+/// all take the directory from here, so they read the same models. An
+/// absolute directory is kept as is. The CLI passes the absolute cwd as
+/// `root`, so its behaviour does not change.
+pub(crate) fn backfill_models_dir(root: &Path, run_plan: &RunPlan) -> PathBuf {
+    root.join(run_plan.models_dir.as_deref().unwrap_or("models"))
 }
 
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
@@ -4984,11 +5028,13 @@ async fn run_apply_ai_authored_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    let run_models_dir = run_models_dir(root, &run_plan, &models_dir, models_glob.as_deref());
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
         run_plan,
+        run_models_dir,
         state_path,
         output_json,
         &apply_run_id,
@@ -5234,7 +5280,10 @@ async fn run_apply_backfill_plan(
             )));
         }
     };
-    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    // The gate and `execute_backfill_set` read this one directory, anchored
+    // at the project root as review and the models check anchor it (#2336).
+    let models_dir = backfill_models_dir(root, &run_plan);
+    let models_dir = models_dir.as_path();
     // A backfill's `models` list IS the authoritative rebuild closure the
     // engine composed and will execute (see `execute_backfill_set` below), not
     // an informational hint — gate on it directly.
@@ -5475,6 +5524,7 @@ async fn run_apply_backfill_plan(
     // success).
     crate::commands::run::execute_backfill_set(
         &loaded,
+        config_path,
         session,
         state_path,
         models_dir,
@@ -7107,6 +7157,7 @@ mod tests {
             loaded,
             "plan-dag-shadow",
             run_plan,
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -7234,6 +7285,7 @@ mod tests {
             loaded,
             "plan-dag-partition",
             run_plan,
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -7342,6 +7394,7 @@ mod tests {
                 execution_layers: vec![],
                 ..minimal_run_plan()
             },
+            None,
             &root.join(".rocky-state.redb"),
             false,
             "apply-run-id",
@@ -11237,6 +11290,40 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// #2326: a reviewed `--dag` plan applied where the adapter resolves to
+    /// another database still refuses, and the refusal names the config
+    /// (`plan_config_changed`), not a model change that did not happen.
+    #[tokio::test]
+    async fn reviewed_dag_plan_names_a_config_change_as_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+
+        let toml = std::fs::read_to_string(&config)?;
+        let edited = toml.replacen("proj.duckdb", "elsewhere.duckdb", 1);
+        assert_ne!(edited, toml, "the fixture must change");
+        std::fs::write(&config, edited)?;
+
+        let msg = format!(
+            "{:#}",
+            apply_dag_plan_as_human(root, &config, &plan_id)
+                .await
+                .expect_err("a reviewed --dag plan applies only under its reviewed config")
+        );
+        assert!(
+            msg.contains(super::super::approval_scope::PLAN_CONFIG_CHANGED),
+            "{msg}"
+        );
+        assert!(!msg.contains("was added, removed or changed"), "{msg}");
+        assert!(
+            !root.join("elsewhere.duckdb").exists() && !root.join("proj.duckdb").exists(),
+            "refused before the warehouse is opened"
+        );
+        Ok(())
+    }
+
     /// A human-authored `--dag` plan is not review-gated, but it carries a
     /// models fingerprint, so an edit after planning now refuses the apply
     /// (`plan_models_changed`) instead of running the edited models. Before
@@ -11386,6 +11473,89 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// #2326: an agent-kind plan (`ai_authored` applies as an agent whoever
+    /// runs it) made in one environment and applied from another, such as the
+    /// browser UI's `rocky serve`.
+    ///
+    /// A credential `${VAR}` that resolves differently there (a token) does
+    /// not refuse the apply: a credential is a `RedactedString`, which the
+    /// config identity hashes as `"***"`. A target `${VAR}` that resolves
+    /// differently (the host, the warehouse's `http_path`) still refuses with
+    /// `plan_config_changed`, because that apply would write to another
+    /// warehouse than the one the plan was made for.
+    ///
+    /// The plan is made from literal values. The apply-time config is built
+    /// the way `${VAR}` substitution builds it, with the value from the
+    /// environment, so the test also shows that the identity hashes a
+    /// target field by its value, not by its `${NAME}` placeholder.
+    #[test]
+    fn an_agent_plan_ignores_a_credential_env_value_but_not_a_target_one() -> anyhow::Result<()> {
+        use super::super::approval_scope::PLAN_CONFIG_CHANGED;
+        use rocky_core::env_string::EnvString;
+        use rocky_core::redacted::RedactedString;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let mut toml = std::fs::read_to_string(&config)?;
+        toml.push_str(
+            "[adapter.wh]\ntype = \"databricks\"\nhost = \"a.example.com\"\n\
+             http_path = \"/sql/1.0/warehouses/aaaa\"\ntoken = \"dapi_plan_shell_token\"\n",
+        );
+        std::fs::write(&config, toml)?;
+        let plan_id =
+            write_pipeline_plan_of(root, &config, PlanKind::AiAuthored, PolicyPrincipal::Agent)?;
+        let plan = crate::plan_store::read_plan(root, &plan_id)?;
+        assert_eq!(
+            plan.enforcement_principal(PolicyPrincipal::Human),
+            PolicyPrincipal::Agent,
+            "an ai_authored plan applies as an agent even when a person applies it"
+        );
+
+        // The apply environment: `host`, `http_path` and `token` all come
+        // from `${VAR}`s. `token` resolves to another value than at plan time.
+        let apply_env =
+            |host: &str, http_path: &str| -> anyhow::Result<rocky_core::config::RockyConfig> {
+                let mut cfg = rocky_core::config::load_rocky_config(&config)?;
+                let wh = cfg.adapters.get_mut("wh").expect("wh adapter");
+                wh.host = Some(EnvString::substituted("DATABRICKS_HOST", host));
+                wh.http_path = Some(EnvString::substituted("DATABRICKS_HTTP_PATH", http_path));
+                wh.token = Some(RedactedString::new("dapi_ui_serve_token".to_string()));
+                Ok(cfg)
+            };
+        let check = |cfg: &rocky_core::config::RockyConfig| {
+            super::super::approval_scope::verify_plan_models_for_apply(
+                &plan,
+                &plan_id,
+                Some(cfg),
+                &config,
+                root,
+                &gold_run_plan(),
+                PolicyPrincipal::Agent,
+            )
+        };
+
+        check(&apply_env("a.example.com", "/sql/1.0/warehouses/aaaa")?)
+            .map_err(|e| anyhow::anyhow!("a different token alone must not refuse: {e:#}"))?;
+
+        for (label, cfg) in [
+            (
+                "host",
+                apply_env("b.example.com", "/sql/1.0/warehouses/aaaa")?,
+            ),
+            (
+                "http_path",
+                apply_env("a.example.com", "/sql/1.0/warehouses/bbbb")?,
+            ),
+        ] {
+            let msg = format!(
+                "{:#}",
+                check(&cfg).expect_err("a different target must refuse an agent's apply")
+            );
+            assert!(msg.starts_with(PLAN_CONFIG_CHANGED), "{label}: {msg}");
+        }
+        Ok(())
+    }
+
     /// A relative project root other than `.` is joined to the scope once.
     /// The config-derived directory (`<root>/gold`) is already anchored by
     /// the config path; anchoring it again (`<root>/<root>/gold`) finds no
@@ -11447,10 +11617,12 @@ autonomy_budget = { failures = 3, window = "7d" }
 
     /// A plan that names its own relative `--models` directory, applied with
     /// a relative project root that is not the process cwd (as `rocky
-    /// fulfill`'s typed apply can be): the policy gate and the models check
-    /// both read `<root>/gold`. Read against the cwd, the gate compiles a
-    /// directory that does not exist and the `[policy]` block refuses the
-    /// apply.
+    /// fulfill`'s typed apply can be): the policy gate, the models check and
+    /// the run all read `<root>/gold`. Read against the cwd, the gate
+    /// compiles a directory that does not exist and the `[policy]` block
+    /// refuses the apply; the run fails with `models directory 'gold' not
+    /// found` (#2328).
+    #[cfg(all(unix, feature = "duckdb"))]
     #[tokio::test]
     async fn a_plan_named_models_dir_is_read_under_the_project_root() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -11497,10 +11669,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             capabilities,
         )?;
 
-        // The gate and the check pass. The run itself still reads the plan's
-        // `--models` directory against the cwd, so it stops there: that is
-        // the first step after both, and the only one left unanchored.
-        let error = super::run_apply_core_in(
+        super::run_apply_core_in(
             &root,
             &config,
             &plan_id,
@@ -11510,12 +11679,250 @@ autonomy_budget = { failures = 3, window = "7d" }
             None,
             true,
         )
-        .await
-        .expect_err("the run reads `gold` against the cwd");
-        let msg = format!("{error:#}");
-        assert!(
-            msg.contains("models directory 'gold' not found (required for --model)"),
-            "the gate and the models check must pass before the run: {msg}"
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT v FROM marts.totals")?.rows,
+            vec![vec![serde_json::json!("2")]],
+            "the run must execute `<root>/gold/totals`"
+        );
+        Ok(())
+    }
+
+    /// #2328: the directory an apply hands `run`. A plan-named directory is
+    /// joined to the root. With none, `run` reads a bare `models` for
+    /// `--model` and `--all` when no pipeline glob applies, so that is
+    /// replaced by the gate's `<root>/models`. Everywhere else `run` keeps
+    /// `None`: it keys checks on whether a directory was passed, and a
+    /// directory would override a pipeline glob.
+    #[test]
+    fn run_models_dir_anchors_only_where_run_reads_a_directory() {
+        let root = Path::new("rel/proj");
+        let gate_dir = root.join("models");
+        let named = RunPlan {
+            models_dir: Some("gold".to_string()),
+            ..minimal_run_plan()
+        };
+        assert_eq!(
+            super::run_models_dir(root, &named, &root.join("gold"), None),
+            Some(root.join("gold"))
+        );
+        for plan in [
+            RunPlan {
+                model: Some("m".to_string()),
+                ..minimal_run_plan()
+            },
+            RunPlan {
+                run_all: true,
+                ..minimal_run_plan()
+            },
+        ] {
+            assert_eq!(
+                super::run_models_dir(root, &plan, &gate_dir, None),
+                Some(gate_dir.clone())
+            );
+            assert_eq!(
+                super::run_models_dir(root, &plan, &gate_dir, Some("rel/proj/models/**")),
+                None,
+                "a pipeline glob is never overridden"
+            );
+        }
+        assert_eq!(
+            super::run_models_dir(root, &minimal_run_plan(), &gate_dir, None),
+            None,
+            "a replication-only plan passes no directory"
+        );
+    }
+
+    /// The hazard behind #2328: `<cwd>/<dir>` exists and holds a DIFFERENT
+    /// model of the same name. The gate and the models check read
+    /// `<root>/<dir>`, so the run must execute that model too, not the cwd's.
+    /// Read against the cwd, the apply passes the gate on one model and
+    /// materializes the other.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn the_run_executes_the_models_the_gate_checked() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        let config = two_pipeline_dag_project(&root)?;
+
+        // A uniquely named directory in the cwd (removed on drop), so no
+        // other test sees it. The plan names it relative, and it exists
+        // under both the cwd and the root, with different `totals` models.
+        let decoy = tempfile::Builder::new()
+            .prefix("apply-root-decoy-")
+            .tempdir_in(&cwd)?;
+        let models_dir = PathBuf::from(decoy.path().file_name().context("decoy name")?);
+        let totals = |base: &Path, column: &str| -> anyhow::Result<()> {
+            std::fs::create_dir_all(base)?;
+            std::fs::write(base.join("totals.sql"), format!("SELECT 2 AS {column}\n"))?;
+            std::fs::write(
+                base.join("totals.toml"),
+                "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"totals\"\n",
+            )?;
+            Ok(())
+        };
+        totals(&root.join(&models_dir), "checked")?;
+        totals(&cwd.join(&models_dir), "unchecked")?;
+
+        let rp = RunPlan {
+            model: Some("totals".to_string()),
+            models_dir: Some(models_dir.to_string_lossy().into_owned()),
+            ..gold_run_plan()
+        };
+        let cfg = rocky_core::config::load_rocky_config(&config)?;
+        let scope =
+            super::super::approval_scope::approval_scope_at(Some(&cfg), &root, &config, &rp)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let plan_id = crate::plan_store::write_plan_governed(
+            &root,
+            PlanKind::Run,
+            &rp,
+            PolicyPrincipal::Human,
+            capabilities,
+        )?;
+        super::run_apply_core_in(
+            &root,
+            &config,
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT * FROM marts.totals")?.columns,
+            vec!["checked".to_string()],
+            "the run must execute the root's `totals`, the model the gate checked"
+        );
+        Ok(())
+    }
+
+    /// #2336: the backfill twin of the test above. `<cwd>/<dir>` and
+    /// `<root>/<dir>` hold DIFFERENT `totals` models. Only the cwd's carries
+    /// a `pii` column, and the policy denies `pii` models. The policy gate
+    /// must read the root's (no `pii`, so it allows) and the backfill must
+    /// rebuild the root's. Read against the cwd, the gate denies the apply,
+    /// or the run materializes the `unchecked` column.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn a_backfill_gates_and_runs_the_models_under_the_project_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj)?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let root = relative.join(proj.strip_prefix("/")?);
+        assert!(root.is_relative() && root != Path::new("."));
+        let config = two_pipeline_dag_project(&root)?;
+        let mut toml = std::fs::read_to_string(&config)?;
+        toml.push_str("[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n");
+        for capability in [
+            "apply",
+            "backfill",
+            "schema_change.additive",
+            "schema_change.breaking",
+        ] {
+            toml.push_str(&format!(
+                "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"{capability}\"\n\
+                 scope = {{ classifications = [\"pii\"] }}\neffect = \"deny\"\n"
+            ));
+        }
+        std::fs::write(&config, toml)?;
+
+        let decoy = tempfile::Builder::new()
+            .prefix("backfill-root-decoy-")
+            .tempdir_in(&cwd)?;
+        let models_dir = PathBuf::from(decoy.path().file_name().context("decoy name")?);
+        let totals = |base: &Path, column: &str, extra: &str| -> anyhow::Result<()> {
+            std::fs::create_dir_all(base)?;
+            std::fs::write(base.join("totals.sql"), format!("SELECT 2 AS {column}\n"))?;
+            std::fs::write(
+                base.join("totals.toml"),
+                format!(
+                    "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"totals\"\n{extra}"
+                ),
+            )?;
+            Ok(())
+        };
+        totals(&root.join(&models_dir), "checked", "")?;
+        totals(
+            &cwd.join(&models_dir),
+            "unchecked",
+            "\n[classification]\nunchecked = \"pii\"\n",
+        )?;
+        // A backfill does not create schemas: the closure was built before.
+        rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?
+            .execute_sql("CREATE SCHEMA IF NOT EXISTS marts")?;
+
+        let rp = RunPlan {
+            models_dir: Some(models_dir.to_string_lossy().into_owned()),
+            ..gold_run_plan()
+        };
+        let scope = super::super::approval_scope::ApprovalScope {
+            dag: false,
+            units: vec![super::super::approval_scope::ScopeUnit {
+                pipeline: None,
+                models_dir: super::backfill_models_dir(&root, &rp),
+                models_glob: None,
+            }],
+            seeds_dir: None,
+        };
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let plan_id = crate::plan_store::write_plan_governed(
+            &root,
+            PlanKind::Backfill,
+            &rp,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        crate::commands::review::write_test_review_marker(&root, &plan_id);
+
+        super::run_apply_core_in(
+            &root,
+            &config,
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT * FROM marts.totals")?.columns,
+            vec!["checked".to_string()],
+            "the backfill must rebuild the root's `totals`, the model the gate checked"
         );
         Ok(())
     }

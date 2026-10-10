@@ -1,6 +1,6 @@
 //! The browser UI's server-side contract: where its files come from, which
-//! `Host` and `Origin` values a `--ui` server accepts, and the headers every
-//! UI response carries.
+//! `Host` and `Origin` values a server accepts (with or without `--ui`), and
+//! the headers every UI response carries.
 //!
 //! The routes themselves live in `rocky_cli::ui`, next to the API router,
 //! and the embedded files live there too, behind the `ui` cargo feature.
@@ -34,17 +34,41 @@ impl UiAssetSource for InMemoryAssets {
 }
 
 /// The `--ui` configuration on the server state. `None` on the state means
-/// the UI routes do not exist and the host guard is off.
+/// the UI routes do not exist. The `Host`/`Origin` guard is configured apart
+/// from it, in [`HostGuard`], because it also runs without `--ui`.
 pub struct UiConfig {
-    /// The `--host` the server bound; a `Host` header naming it is accepted.
-    pub bind_host: String,
-    /// Extra `Host` values to accept (`--allowed-host`), for a reverse proxy.
-    pub allowed_hosts: Vec<String>,
     /// The files under `/ui/`.
     pub assets: Arc<dyn UiAssetSource>,
 }
 
 impl UiConfig {
+    /// The file at `path`, typed by its extension.
+    pub fn file(&self, path: &str) -> Option<UiFile> {
+        self.assets.read(path).map(|bytes| UiFile {
+            bytes,
+            content_type: content_type_for(path),
+        })
+    }
+}
+
+/// The `Host` and `Origin` values a `rocky serve` accepts
+/// (`rocky_server::auth::require_known_host`).
+///
+/// `rocky serve` installs one on every loopback bind, and on every `--ui`
+/// bind. A loopback server is reachable from a browser on the same machine,
+/// and a name can be pointed at `127.0.0.1` by an attacker's DNS (rebinding),
+/// so the server must answer only requests that name it (#2322). A
+/// non-loopback bind without `--ui` has none: it is reached by names the
+/// server cannot know (a container's service name, a pod IP), and it must
+/// carry a token anyway.
+pub struct HostGuard {
+    /// The `--host` the server bound; a `Host` header naming it is accepted.
+    pub bind_host: String,
+    /// Extra `Host` values to accept (`--allowed-host`), for a reverse proxy.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl HostGuard {
     /// Whether a `Host` header value names this server: loopback by any of
     /// its names, the bind host, or an `--allowed-host` entry. The port is
     /// ignored; a proxy may rewrite it.
@@ -91,14 +115,6 @@ impl UiConfig {
             return false;
         }
         self.host_allowed(authority)
-    }
-
-    /// The file at `path`, typed by its extension.
-    pub fn file(&self, path: &str) -> Option<UiFile> {
-        self.assets.read(path).map(|bytes| UiFile {
-            bytes,
-            content_type: content_type_for(path),
-        })
     }
 }
 
@@ -210,11 +226,10 @@ pub const UI_SECURITY_HEADERS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
-    fn config(bind_host: &str, allowed_hosts: &[&str]) -> UiConfig {
-        UiConfig {
+    fn config(bind_host: &str, allowed_hosts: &[&str]) -> HostGuard {
+        HostGuard {
             bind_host: bind_host.to_string(),
             allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
-            assets: Arc::new(InMemoryAssets(BTreeMap::new())),
         }
     }
 

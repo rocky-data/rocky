@@ -81,7 +81,7 @@ export function ProjectActions({
           onClick={() => run.start(body)}
         />
       </div>
-      <JobLine label={`Plan ${scope}`} view={plan.view} />
+      <JobLine label={`Plan ${scope}`} view={plan.view} cancel={plan.cancel} />
       {planned !== null && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
           Plan written:{" "}
@@ -97,7 +97,7 @@ export function ProjectActions({
           </a>
         </p>
       )}
-      <JobLine label={`Run ${scope}`} view={run.view} />
+      <JobLine label={`Run ${scope}`} view={run.view} cancel={run.cancel} />
     </div>
   );
 }

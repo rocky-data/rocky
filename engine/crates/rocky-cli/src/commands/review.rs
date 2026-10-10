@@ -374,14 +374,14 @@ async fn compute_review_with_disclosure_and_seam(
 
     // Run plans use apply's execution selection, including the pipeline glob.
     // Backfills below use their persisted directory and rebuild set instead.
-    // A relative directory belongs to this project root.
-    let (selected_dir, models_glob) = if plan.kind == PlanKind::Backfill {
+    // Every arm anchors at this project root exactly once: a directory the
+    // plan names is joined to `root`, and one from the config is already
+    // anchored by `resolved_config_path`. Joining that one again would double
+    // a relative root (#2328).
+    let (models_dir, models_glob) = if plan.kind == PlanKind::Backfill {
         // Backfill executes its persisted directory and model set, without the
         // transformation pipeline's glob.
-        (
-            PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
-            None,
-        )
+        (super::apply::backfill_models_dir(root, &run_plan), None)
     } else {
         match rocky_core::config::load_optional_project_config(Some(&resolved_config_path))
             .with_context(|| {
@@ -390,14 +390,16 @@ async fn compute_review_with_disclosure_and_seam(
                     resolved_config_path.display()
                 )
             })? {
-            Some(cfg) => super::apply::run_model_selection(&cfg, &resolved_config_path, &run_plan)?,
+            Some(cfg) => {
+                super::apply::run_model_selection_at(&cfg, root, &resolved_config_path, &run_plan)?
+            }
             None => (
-                PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                root.join(run_plan.models_dir.as_deref().unwrap_or("models")),
                 None,
             ),
         }
     };
-    let (models_dir, default_state_path) = review_gate_paths(root, &selected_dir);
+    let default_state_path = review_state_path(&models_dir);
     let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
@@ -623,6 +625,31 @@ fn compile_approval_models(
 /// a previously disclosed DROP into an empty approval. For a `--dag` plan the
 /// snapshot holds every pipeline's models, so a model added, removed or
 /// changed in any pipeline's directory refuses the approval (#2239).
+///
+/// It compares the plan's **models-only** fingerprint (models, SQL, sidecars,
+/// contracts and the masks they use), as a person's `rocky apply` does
+/// (#2326). The full fingerprint also hashes adapters and pipelines with
+/// their `${VAR}` values resolved, so it moves when the same plan is approved
+/// from another environment, such as the browser UI's `rocky serve`, and a
+/// person could not approve a plan whose models had not changed.
+///
+/// The same holds for every kind that reaches this check, AI-authored and
+/// backfill plans included. What a person approves is what review disclosed
+/// (breaking-change findings and conditional DROPs), and both are computed
+/// from the models. The config those models run under is still bound where
+/// it matters: an agent-kind plan applies as an agent
+/// ([`PersistedPlan::enforcement_principal`]), and an agent's apply compares
+/// the full fingerprint ([`super::approval_scope::verify_plan_models_for_apply`]).
+///
+/// So approval can pass where apply still refuses. An agent-kind plan
+/// approved in another environment is refused at apply there with
+/// `plan_config_changed` when its config resolves differently, and a
+/// person's `--dag` apply compares the full fingerprint
+/// ([`super::approval_scope::verify_dag_scope_for_apply`]). Apply is the
+/// stricter side in both cases, so nothing runs unchecked.
+///
+/// A plan written before the models-only fingerprint existed is compared on
+/// its full fingerprint, as before: stricter, never looser.
 fn verify_current_models_for_approval(
     plan: &PersistedPlan,
     run_plan: &RunPlan,
@@ -642,7 +669,14 @@ fn verify_current_models_for_approval(
     }
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
     let ids = super::approval_scope::plan_scope_identities(plan, scope, config.as_ref(), run_plan);
-    let actual = scope_fingerprint(scope, units, &ids.borrowed()).map_err(|_| stale())?;
+    let (actual, expected) = match capabilities.models_only_fingerprint.as_deref() {
+        Some(expected_models_only) => (
+            super::approval_scope::scope_models_only_fingerprint(scope, units, &ids.resolved_mask),
+            expected_models_only,
+        ),
+        None => (scope_fingerprint(scope, units, &ids.borrowed()), expected),
+    };
+    let actual = actual.map_err(|_| stale())?;
     if actual.as_deref() != Some(expected) {
         return Err(stale());
     }
@@ -795,12 +829,10 @@ fn build_message(
     }
 }
 
-/// Anchor apply's selected model directory at the review project root, then
-/// resolve the schema-cache state path from that directory.
-fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
-    let models_dir = root.join(selected_dir);
-    let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
-    (models_dir, state_path)
+/// The schema-cache state path for a models directory already anchored at
+/// the review project root: the CLI/MCP default under that directory.
+fn review_state_path(models_dir: &Path) -> PathBuf {
+    rocky_core::state::resolve_state_path(None, models_dir).path
 }
 
 /// Compute the breaking-change findings between `base_ref` and the working
@@ -2385,6 +2417,43 @@ mod tests {
         Ok(())
     }
 
+    /// #2328: a project root that is not the cwd, given relative to it (as
+    /// `rocky fulfill`'s typed apply can pass one). The pipeline glob's
+    /// directory is anchored by the config path, which is already under the
+    /// root. Joining the root to it again doubled a relative root
+    /// (`proj/proj/models`): the directory was missing, so the
+    /// breaking-change gate was skipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_root_reads_the_pipeline_directory_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cwd = std::env::current_dir()?;
+        let mut root = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            root.push("..");
+        }
+        let root = root.join(dir.path().strip_prefix("/")?);
+        assert!(root.is_relative());
+        let a_toml = sidecar("a");
+        git_project(
+            &root,
+            GLOB_CONFIG_2236,
+            &[
+                ("models/a.sql", "SELECT 1 AS id, 'x' AS name\n"),
+                ("models/a.toml", &a_toml),
+            ],
+            &[("models/a.sql", "SELECT 1 AS id\n")],
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(&root, PlanKind::AiAuthored, &payload)?;
+        let review = dry_review(&root, &plan_id).await?;
+        assert_eq!(
+            finding_models(&review),
+            BTreeSet::from([".main.a".to_string()])
+        );
+        Ok(())
+    }
+
     /// #2236: a backfill's findings come from its persisted directory and
     /// keep only its rebuild closure; a `--model` run plan keeps only that
     /// model. Pre-fix, both reported the breaking change in `b`, which the
@@ -2620,6 +2689,147 @@ mod tests {
         )
         .await?;
         assert!(approved.marker_written);
+        Ok(())
+    }
+
+    /// #2326: approval compares the models-only fingerprint. The plan is made
+    /// with one adapter value and approved with another, as when a plan made
+    /// in a shell is approved from the browser UI's `rocky serve`, where a
+    /// `${VAR}` resolves differently. No model changed, so the approval
+    /// passes. Before the fix it compared the full fingerprint, which hashes
+    /// the resolved adapter, and refused. A model edit still refuses.
+    ///
+    /// The plan is AI-authored on purpose: an agent-kind plan approved by a
+    /// person takes the same path.
+    #[tokio::test]
+    async fn approval_ignores_a_config_change_that_leaves_the_models_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, GLOB_CONFIG_2236)?;
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("models/a.toml"), sidecar("a"))?;
+
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "p", "models": ["a"]
+        }))?;
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_only_fingerprint.is_some());
+        let plan_id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let state = root.join("state.redb");
+        let approve = || {
+            compute_review_with_state_path(
+                root,
+                Path::new("rocky.toml"),
+                Some(&state),
+                &plan_id,
+                "HEAD",
+                true,
+            )
+        };
+
+        // The approving environment resolves the adapter differently.
+        let edited = GLOB_CONFIG_2236.replacen(
+            "database = \":memory:\"",
+            "database = \"elsewhere.duckdb\"",
+            1,
+        );
+        assert_ne!(edited, GLOB_CONFIG_2236, "the fixture must change");
+        std::fs::write(&config, edited)?;
+        let approved = approve()
+            .await
+            .expect("a config-only change must not refuse a person's approval");
+        assert!(approved.marker_written);
+
+        // A model edit still refuses, and writes no marker.
+        std::fs::remove_file(review_marker_path(root, &plan_id))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 2 AS id\n")?;
+        let err = approve().await.expect_err("a changed model must refuse");
+        assert!(
+            err.to_string()
+                .contains("the models changed since this plan was written"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            review_marker_state(root, &plan_id),
+            ReviewMarkerState::Absent
+        ));
+        Ok(())
+    }
+
+    /// A plan with no models-only fingerprint (written before it existed) is
+    /// still compared on its full fingerprint, so a config-only change
+    /// refuses its approval as it did before #2326: stricter, never looser.
+    #[tokio::test]
+    async fn approval_of_a_plan_without_a_models_only_fingerprint_compares_the_full_one()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, GLOB_CONFIG_2236)?;
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("models/a.toml"), sidecar("a"))?;
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "p", "models": ["a"]
+        }))?;
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        let mut capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        capabilities.models_only_fingerprint = None;
+        let plan_id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        std::fs::write(
+            &config,
+            GLOB_CONFIG_2236.replacen(
+                "database = \":memory:\"",
+                "database = \"elsewhere.duckdb\"",
+                1,
+            ),
+        )?;
+        let err = compute_review_with_state_path(
+            root,
+            Path::new("rocky.toml"),
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            true,
+        )
+        .await
+        .expect_err("a legacy plan keeps the full compare");
+        assert!(
+            err.to_string()
+                .contains("the models changed since this plan was written"),
+            "{err:#}"
+        );
         Ok(())
     }
 
@@ -3365,9 +3575,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("models")).unwrap();
+        let cfg: rocky_core::config::RockyConfig =
+            toml::from_str("[adapter.default]\ntype = \"duckdb\"\n").unwrap();
+        let select = |models_dir: &Path| {
+            let plan: RunPlan = serde_json::from_value(serde_json::json!({
+                "parallel": 1, "model": "m", "models_dir": models_dir,
+            }))
+            .unwrap();
+            super::super::apply::run_model_selection_at(&cfg, root, &root.join("rocky.toml"), &plan)
+                .unwrap()
+        };
 
-        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
+        let (models_dir, glob) = select(Path::new("models"));
         assert_eq!(models_dir, root.join("models"));
+        assert!(glob.is_none());
         assert!(
             models_dir.is_dir(),
             "root-joined models dir must be found regardless of cwd"
@@ -3375,11 +3596,15 @@ mod tests {
         // The schema-cache state path follows the CLI/MCP default
         // (`<models_dir>/.rocky-state.redb`), not the old hardcoded
         // cwd-relative `.rocky/state.redb`.
-        assert_eq!(state_path, root.join("models").join(".rocky-state.redb"));
+        assert_eq!(
+            review_state_path(&models_dir),
+            root.join("models").join(".rocky-state.redb")
+        );
 
         // An absolute selected directory is used verbatim.
-        let (abs_dir, _) = review_gate_paths(Path::new("/somewhere/else"), &root.join("models"));
-        assert_eq!(abs_dir, root.join("models"));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (abs_dir, _) = select(elsewhere.path());
+        assert_eq!(abs_dir, elsewhere.path());
     }
 
     /// FIX: an approved plan's later apply-time re-evaluation rows (same
@@ -3542,7 +3767,8 @@ mod tests {
         // REFUSE on a broken one. Without this the assertion below would pass
         // for the wrong reason — the marker is written here anyway, because
         // the base compile has no git repo to read.
-        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
+        let models_dir = root.join("models");
+        let state_path = review_state_path(&models_dir);
         assert!(
             compute_review_findings(
                 &config_path,

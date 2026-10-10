@@ -10,7 +10,9 @@
 //! - When `auth` is `None`, the server refuses to start unless the
 //!   bind host is `127.0.0.1` / `localhost` (loopback only). This keeps
 //!   the LAN-leak class of bug from regressing on a forgotten `--host`
-//!   override.
+//!   override. A loopback bind also runs the `Host`/`Origin` guard
+//!   ([`require_known_host`]), so a web page that rebinds its own name to
+//!   `127.0.0.1` cannot use the token-less server (#2322).
 //! - A configured token also carries a [`TokenScope`]. `Full` is the
 //!   historical all-or-nothing token. `ReadOnly` authenticates exactly the
 //!   same way but is refused `403` on any request whose HTTP method is not
@@ -260,7 +262,8 @@ fn is_webhook_trigger_path(path: &str) -> bool {
 ///
 /// When no token is configured (loopback-only deployments) the middleware
 /// is a no-op — but `rocky serve` refuses to bind a non-loopback host
-/// without one, so the no-op path is safe.
+/// without one, and on a loopback bind [`require_known_host`] refuses a
+/// request that does not name this server, so the no-op path is safe.
 ///
 /// An authenticated request is then checked against the token's
 /// [`TokenScope`]. A [`TokenScope::ReadOnly`] token is refused `403` unless
@@ -320,9 +323,9 @@ pub async fn require_bearer_token(
         // UI. A browser adds a cookie by itself, so a cookie-authenticated
         // write must also prove it came from this server's own page.
         None => {
-            let Some(ui) = state.ui.as_ref() else {
+            if state.ui.is_none() {
                 return unauthorized_response();
-            };
+            }
             let cookies: Vec<&str> = request
                 .headers()
                 .get_all(header::COOKIE)
@@ -345,7 +348,12 @@ pub async fn require_bearer_token(
                     .and_then(|h| h.to_str().ok())
                     .map(str::to_owned)
                     .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
-                let origin_ok = ui.host_allowed(host.as_deref().unwrap_or(""))
+                // A `--ui` server always carries a host guard; a state built
+                // with a UI but none names no host, so the write is refused.
+                let origin_ok = state
+                    .host_guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.host_allowed(host.as_deref().unwrap_or("")))
                     && request
                         .headers()
                         .get(header::ORIGIN)
@@ -427,16 +435,23 @@ fn forbidden_read_only_response() -> Response {
     (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
-/// The `Host` and `Origin` guard of `rocky serve --ui`, applied before
-/// routing to every request, UI files and API alike.
+/// The `Host` and `Origin` guard of `rocky serve`, applied before routing to
+/// every request, UI files and API alike.
 ///
-/// A browser reaches the sidecar by a name, and a name can be made to point
-/// at `127.0.0.1` by an attacker's DNS (rebinding). The bearer token still
-/// protects the API, but the UI files are public, and defence in depth is
-/// cheap here: a `Host` that is not one of this server's names is answered
-/// `421`, and a present `Origin` that is neither the server's own nor an
-/// `--allowed-origin` entry is answered `403`. Both carry the envelope.
-/// Without `--ui` the guard is off, so existing embedders see no change.
+/// A browser reaches a loopback server by a name, and a name can be made to
+/// point at `127.0.0.1` by an attacker's DNS (rebinding). A loopback server
+/// with no token answers every route, writes included, so without this guard
+/// a web page could rebind its own name and `POST /api/v1/jobs/run` on the
+/// visitor's machine (#2322). So a `Host` that is not one of this server's
+/// names is answered `421`, and a present `Origin` that is neither the
+/// server's own nor an `--allowed-origin` entry is answered `403`. Both carry
+/// the envelope.
+///
+/// It runs wherever [`ServerState::host_guard`] is set: `rocky serve` sets it
+/// on every loopback bind and on every `--ui` bind. A non-loopback bind
+/// without `--ui` has no guard: it is reached by names the server cannot know
+/// (a container's service name, a pod IP), and it must carry a token. A state
+/// with a UI but no guard is refused outright, so the UI never runs unguarded.
 ///
 /// Two edges the first version got wrong. The liveness route
 /// (`AUTH_EXEMPT_PATHS`) is exempt: a kubelet probes it with the pod IP as
@@ -450,8 +465,10 @@ pub async fn require_known_host(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(ui) = state.ui.as_ref() else {
-        return next.run(request).await;
+    let guard = match (state.host_guard.as_ref(), state.ui.is_some()) {
+        (Some(guard), _) => Some(guard),
+        (None, false) => return next.run(request).await,
+        (None, true) => None,
     };
     // The liveness route is exempt. A kubelet or a load balancer probes it
     // with the pod's IP as `Host`, a name this server cannot know in advance,
@@ -470,25 +487,27 @@ pub async fn require_known_host(
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned)
         .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
-    let accepted = host.as_deref().is_some_and(|h| ui.host_allowed(h));
+    let accepted =
+        guard.is_some_and(|guard| host.as_deref().is_some_and(|h| guard.host_allowed(h)));
     if !accepted {
         return envelope_response(
             StatusCode::MISDIRECTED_REQUEST,
             "host_not_allowed",
             "the request's Host header does not name this server",
-            "reach the UI by a loopback name, the bind host, or a name passed with --allowed-host",
+            "reach the server by a loopback name (localhost, 127.0.0.1, [::1]), the bind host, \
+             or a name passed with --allowed-host",
         );
     }
     if let Some(origin) = request.headers().get(header::ORIGIN) {
-        let accepted = origin
-            .to_str()
-            .is_ok_and(|o| ui.origin_allowed(o, &state.allowed_origins));
+        let accepted = origin.to_str().is_ok_and(|o| {
+            guard.is_some_and(|guard| guard.origin_allowed(o, &state.allowed_origins))
+        });
         if !accepted {
             return envelope_response(
                 StatusCode::FORBIDDEN,
                 "origin_not_allowed",
                 "the request's Origin is neither this server's own nor an allowed origin",
-                "open the UI at the address the server printed, or pass the origin with --allowed-origin",
+                "use the address the server printed, or pass the origin with --allowed-origin",
             );
         }
     }

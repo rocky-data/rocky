@@ -200,6 +200,7 @@ fn emit_models_selected(
     let models_dir = models_dir.as_path();
 
     let config = CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

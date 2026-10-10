@@ -391,6 +391,7 @@ fn compile_for_docs(
         .clone()
         .with_ttl_override(cache_ttl_override);
     let compiler_cfg = CompilerConfig {
+        target_dialects: Default::default(),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

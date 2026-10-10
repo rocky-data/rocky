@@ -125,11 +125,10 @@ a no-manifest import:
   stg_wide: contains unsupported Jinja control flow ({% for %} or {% set %}) that the no-manifest importer cannot faithfully render — re-run after `dbt compile` (the manifest path resolves Jinja) or rewrite the model without loops/assignments
 ```
 
-A `{% if %}` block that is not `is_incremental()` is a warning, not a failure.
-The importer keeps the model, heads it with
-`-- TODO: dbt-jinja-not-translated — see MIGRATION-NOTES.md`, and wraps the
-block in `/* TODO: unsupported Jinja block */`. The conditional body then runs
-unconditionally, so review those models.
+A `{% if %}` block that is not `is_incremental()` is refused too (#2059). The
+importer cannot evaluate it, and dropping the tags would run the conditional
+body unconditionally. The model lands under "Failed models" with the fix named:
+run `dbt compile --full-refresh` and import with the manifest.
 
 `rocky import-dbt` still exits `0` when a model fails either way, so read the
 report rather than the exit code. Neither model in `dbt-project/` hits either
