@@ -102,16 +102,39 @@ export type JobView =
   | { kind: "running"; jobId: string }
   | { kind: "done"; job: JobStatus };
 
-/** The routes a job is submitted to and read from. Tests hand in fakes. */
+/** What `POST /api/v1/jobs/{id}/cancel` asked the job to do. */
+export type CancelSignal = "interrupt" | "kill";
+
+/** The routes a job is submitted to, read from and cancelled at. Tests hand in fakes. */
 export interface JobClient {
   submit: (kind: JobKind, body: Record<string, unknown>) => Promise<{ job_id: string }>;
   status: (jobId: string) => Promise<JobStatus>;
+  cancel: (jobId: string) => Promise<{ job_id: string; signal: CancelSignal }>;
 }
 
 export const defaultJobClient: JobClient = {
   submit: (kind, body) => apiPost<{ job_id: string }>(`jobs/${kind}`, body),
   status: (jobId) => apiGet<JobStatus>(`jobs/${encodeURIComponent(jobId)}`),
+  cancel: (jobId) =>
+    apiPost<{ job_id: string; signal: CancelSignal }>(`jobs/${encodeURIComponent(jobId)}/cancel`, {}),
 };
+
+/**
+ * Where a cancel of the running job stands. The engine interrupts the job
+ * on the first request (as Ctrl-C does) and kills it on the next, so after
+ * an interrupt the button offers a forced stop.
+ */
+export type CancelView =
+  | { kind: "idle" }
+  | { kind: "sending" }
+  | { kind: "sent"; signal: CancelSignal }
+  | { kind: "refused"; error: ApiError | Error };
+
+/** The cancel control `useJob` hands to `JobLine`. */
+export interface JobCancel {
+  view: CancelView;
+  request: () => void;
+}
 
 /** How often a running job is read again. */
 export const JOB_POLL_MS = 1_000;
@@ -126,8 +149,11 @@ export function useJob(
   client: JobClient = defaultJobClient,
   onDone?: (job: JobStatus) => void,
   pollMs: number = JOB_POLL_MS,
-): { view: JobView; start: (body?: Record<string, unknown>) => void } {
+): { view: JobView; start: (body?: Record<string, unknown>) => void; cancel: JobCancel } {
   const [view, setView] = useState<JobView>({ kind: "idle" });
+  const [cancelView, setCancelView] = useState<CancelView>({ kind: "idle" });
+  // A second cancel click before the first answers is ignored, like `start`.
+  const cancelInFlight = useRef(false);
   const done = useRef(onDone);
   useEffect(() => {
     done.current = onDone;
@@ -176,6 +202,7 @@ export function useJob(
     (body: Record<string, unknown> = {}) => {
       if (inFlight.current) return;
       inFlight.current = true;
+      setCancelView({ kind: "idle" });
       setView({ kind: "submitting" });
       client
         .submit(kind, body)
@@ -192,7 +219,29 @@ export function useJob(
     [client, kind, follow, settle],
   );
 
-  return { view, start };
+  // Cancel the job this hook is following. The job keeps being polled: its
+  // final state (`cancelled`, or `succeeded` if it finished first) is what
+  // the line shows in the end.
+  const jobId = view.kind === "running" ? view.jobId : null;
+  const requestCancel = useCallback(() => {
+    if (jobId === null || cancelInFlight.current) return;
+    cancelInFlight.current = true;
+    setCancelView({ kind: "sending" });
+    client
+      .cancel(jobId)
+      .then(({ signal }) => {
+        cancelInFlight.current = false;
+        if (!alive.current) return;
+        setCancelView({ kind: "sent", signal });
+      })
+      .catch((error: unknown) => {
+        cancelInFlight.current = false;
+        if (!alive.current) return;
+        setCancelView({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
+      });
+  }, [client, jobId]);
+
+  return { view, start, cancel: { view: cancelView, request: requestCancel } };
 }
 
 /** Whether a job is in flight, so its button stays pressed. */
@@ -214,12 +263,15 @@ export const RUNNING_LABEL = "running…";
 export function WriteButton({
   label,
   busy = false,
+  busyLabel = RUNNING_LABEL,
   disabledReason,
   onClick,
   primary = false,
 }: {
   label: string;
   busy?: boolean;
+  /** What the button says after its label while busy. */
+  busyLabel?: string;
   /** A reason this action cannot run now, beyond read-only mode. */
   disabledReason?: string;
   onClick: () => void;
@@ -248,7 +300,7 @@ export function WriteButton({
             : "border-amber-400 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100 dark:hover:bg-amber-900"
         }`}
       >
-        {busy ? `${label}: ${RUNNING_LABEL}` : label}
+        {busy ? `${label}: ${busyLabel}` : label}
       </button>
       {ownReason !== undefined && (
         <span className="max-w-xs text-xs text-zinc-500 dark:text-zinc-400">{ownReason}</span>
@@ -317,11 +369,49 @@ export function failureSummary(job: JobStatus): string {
   return text === "" ? "The job ended without a message." : cap(text);
 }
 
+/** What the Cancel button says once the job was interrupted. */
+export const FORCE_STOP_LABEL = "Force stop";
+
+/**
+ * Cancel for a running job, in operator mode only (a read-only page did not
+ * start the job and cannot stop it, so it shows nothing). The first press
+ * interrupts the job, as Ctrl-C does: a replication run finishes the copies
+ * in flight and saves its state before it stops. If it does not stop, the
+ * button then offers a forced stop, which kills it at once.
+ */
+function CancelControl({ cancel }: { cancel: JobCancel }) {
+  const access = useWriteAccess();
+  if (access.kind !== "operator") return null;
+  const view = cancel.view;
+  const interrupted = view.kind === "sent";
+  const label = interrupted ? FORCE_STOP_LABEL : "Cancel";
+  const busy = view.kind === "sending" || (view.kind === "sent" && view.signal === "kill");
+  return (
+    <div className="space-y-0.5">
+      <WriteButton label={label} busy={busy} busyLabel="stopping…" onClick={cancel.request} />
+      {view.kind === "sent" && view.signal === "interrupt" && (
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+          Asked the job to stop, as Ctrl-C does. A run finishes the copies in flight first.
+        </p>
+      )}
+      {view.kind === "refused" && (
+        <p role="alert" className="text-[11px] text-red-700 dark:text-red-300">
+          Cancel refused.{" "}
+          {view.error instanceof ApiError
+            ? `${view.error.envelope.code}: ${view.error.envelope.message}`
+            : view.error.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /**
  * One line saying where a job stands. A `409 mutation_in_progress` says so
- * plainly: another run, apply or approve is going, wait for it.
+ * plainly: another run, apply or approve is going, wait for it. Given a
+ * `cancel`, a running job also shows the Cancel button (operator mode only).
  */
-export function JobLine({ label, view }: { label: string; view: JobView }) {
+export function JobLine({ label, view, cancel }: { label: string; view: JobView; cancel?: JobCancel }) {
   switch (view.kind) {
     case "idle":
       return null;
@@ -329,9 +419,12 @@ export function JobLine({ label, view }: { label: string; view: JobView }) {
       return <p className="text-xs text-zinc-600 dark:text-zinc-300">{label}: submitting…</p>;
     case "running":
       return (
-        <p className="text-xs text-zinc-600 dark:text-zinc-300">
-          {label}: running (job <code>{view.jobId}</code>)…
-        </p>
+        <div className="space-y-1">
+          <p className="text-xs text-zinc-600 dark:text-zinc-300">
+            {label}: running (job <code>{view.jobId}</code>)…
+          </p>
+          {cancel !== undefined && <CancelControl cancel={cancel} />}
+        </div>
       );
     case "refused": {
       const error = view.error;
@@ -354,6 +447,13 @@ export function JobLine({ label, view }: { label: string; view: JobView }) {
       );
     }
     case "done":
+      if (view.job.state === "cancelled") {
+        return (
+          <p role="status" className="text-xs text-amber-800 dark:text-amber-300">
+            {label}: cancelled.
+          </p>
+        );
+      }
       return view.job.state === "succeeded" ? (
         <p className="text-xs text-emerald-700 dark:text-emerald-300">{label}: done.</p>
       ) : (

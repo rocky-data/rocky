@@ -8,6 +8,7 @@ import { ApiError } from "./api";
 import type { ProjectOutput } from "@rocky-types/project";
 import { ProjectActions, planUnavailable } from "./estate/ProjectActions";
 import {
+  FORCE_STOP_LABEL,
   JobLine,
   READ_ONLY_REASON,
   WriteAccessProvider,
@@ -36,6 +37,7 @@ function fakeJobs(statuses: JobStatus[] = [job("run", "succeeded")]) {
       return { job_id: "job_1" };
     }),
     status: vi.fn(async () => statuses[Math.min(read++, statuses.length - 1)]),
+    cancel: vi.fn(async (jobId: string) => ({ job_id: jobId, signal: "interrupt" as const })),
   };
   return { client, submitted };
 }
@@ -104,6 +106,7 @@ describe("Run and Plan on the estate", () => {
         });
       }),
       status: vi.fn(),
+      cancel: vi.fn(),
     };
     render(
       <WriteAccessProvider value={OPERATOR}>
@@ -350,6 +353,7 @@ describe("a write button while its job runs", () => {
           finish = resolve;
         });
       }),
+      cancel: vi.fn(),
     };
     render(
       <WriteAccessProvider value={OPERATOR}>
@@ -424,5 +428,91 @@ describe("a failed job, said concisely", () => {
     expect(alert).toHaveTextContent(/Apply: failed\. Error: plan_models_changed/);
     expect(alert.textContent).not.toContain("SELECT");
     expect(alert.textContent).not.toContain(".cargo/registry");
+  });
+});
+
+describe("Cancel on a running job", () => {
+  /** A job that runs until cancelled, then reads `cancelled`. */
+  function cancellableJobs() {
+    let cancelled = false;
+    let answerCancel: (value: { job_id: string; signal: "interrupt" | "kill" }) => void = () => {};
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => job("run", cancelled ? "cancelled" : "running")),
+      cancel: vi.fn(
+        () =>
+          new Promise<{ job_id: string; signal: "interrupt" | "kill" }>((resolve) => {
+            answerCancel = resolve;
+          }),
+      ),
+    };
+    return {
+      client,
+      answer: (signal: "interrupt" | "kill") => answerCancel({ job_id: "job_1", signal }),
+      settle: () => {
+        cancelled = true;
+      },
+    };
+  }
+
+  it("shows Cancel in operator mode, sends it once, offers a forced stop, and ends cancelled", async () => {
+    const jobs = cancellableJobs();
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={jobs.client} />
+      </WriteAccessProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    // Two clicks before the engine answers: one request (the busy guard).
+    fireEvent.click(cancel);
+    fireEvent.click(cancel);
+    expect(jobs.client.cancel).toHaveBeenCalledTimes(1);
+    expect(jobs.client.cancel).toHaveBeenCalledWith("job_1");
+    expect(screen.getByRole("button", { name: "Cancel: stopping…" })).toBeDisabled();
+
+    jobs.answer("interrupt");
+    const force = await screen.findByRole("button", { name: FORCE_STOP_LABEL });
+    expect(force).toBeEnabled();
+
+    jobs.settle();
+    expect(
+      await screen.findByText("Run the project: cancelled.", {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: FORCE_STOP_LABEL })).toBeNull();
+  });
+
+  it("is not shown on a read-only page", () => {
+    const jobs = cancellableJobs();
+    render(
+      <WriteAccessProvider value={READ_ONLY}>
+        <JobLine
+          label="Run the project"
+          view={{ kind: "running", jobId: "job_1" }}
+          cancel={{ view: { kind: "idle" }, request: () => void jobs.client.cancel("job_1") }}
+        />
+      </WriteAccessProvider>,
+    );
+    expect(screen.getByText(/running \(job/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("says why when the engine refuses the cancel", () => {
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <JobLine
+          label="Run the project"
+          view={{ kind: "running", jobId: "job_1" }}
+          cancel={{
+            view: {
+              kind: "refused",
+              error: new ApiError(409, { code: "job_not_running", message: "job 'job_1' is not running" }),
+            },
+            request: () => {},
+          }}
+        />
+      </WriteAccessProvider>,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/Cancel refused\. job_not_running/);
   });
 });
