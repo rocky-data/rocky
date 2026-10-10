@@ -95,9 +95,9 @@ that would clear it. Rocky will not delete an object it did not create.
 
 A named branch is a persistent workspace. Its objects survive the run so you can
 query them, and the next run on that branch replaces them. Rocky does **not**
-check them for prior occupancy — a branch namespace is yours wholesale, and
-per-object ownership there is still open (issue #1273). Give a branch a
-namespace nothing else writes to.
+check them for prior occupancy. A branch namespace is yours wholesale, and
+Rocky tracks no per-object ownership there. Give a branch a namespace nothing
+else writes to.
 
 Cleanup is best effort. A drop that fails is reported as a run warning rather
 than failing the run: the comparison already happened, and the answer you came
@@ -223,7 +223,7 @@ that the command redirects. That covers a deferred model on `--defer`, a routed
 upstream on a shadow or branch run, an upstream on `branch promote`, and a
 recorded upstream on `rocky replay --execute`. To fix it, spell the CTE alias
 and the reference alike: both unquoted, or both quoted with the same case. Or
-rename the CTE. Tracked in issue #1622.
+rename the CTE.
 
 ## Shadow target rewriting
 
@@ -272,7 +272,7 @@ from the source, and transformation reads them off its models. It then compares
 each pair the same way. `rocky branch compare` does the same for a branch's
 shadow schema.
 
-The comparison evaluates three dimensions:
+The comparison evaluates two dimensions: the row count and the schema.
 
 ### Row count
 
@@ -296,13 +296,17 @@ Rocky compares column names, types, and order:
 | `ColumnTypeDiff` | Same column, different type |
 | `ColumnOrderDiff` | Same columns, different order |
 
-### Sample comparison
+### No value comparison yet
 
-Rocky hashes a sample of rows from each side and compares the hashes. This finds value differences that the row count misses, because two tables can hold the same number of rows and different data.
+The comparison reads no rows. Two tables can hold the same number of rows and
+different data, and the verdict cannot see that. The JSON field
+`sample_mismatches` is always empty today. For a row-level diff, use
+[`rocky preview diff --algorithm bisection`](/concepts/preview-internals/#--algorithm-bisection).
 
 ## Thresholds
 
-Set the pass, warn, and fail thresholds:
+`rocky run --shadow` uses the defaults below. `rocky compare` takes others as
+JSON, for example `--thresholds '{"row_count_diff_pct_fail": 0.10}'`.
 
 | Threshold | Default | Description |
 |-----------|---------|-------------|
