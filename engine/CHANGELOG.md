@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The browser UI's sidebar counts what waits on you.** Needs you and Review each show a badge with the number of decisions waiting for a person. The count is the review queue's total, which is the same set the brief lists under Needs you. It is read when the page opens, on every navigation, and every 30 seconds. No badge shows when nothing waits, or when the count cannot be read: a hint is never a wrong zero. A screen reader hears the count as the link's description, so each link's name is still the area's name.
+- **The browser UI's sidebar counts what waits on you.** Needs you and Review each show a badge with the number of decisions waiting for a person. The count is the brief's escalation total (`GET /api/v1/brief`), the list Needs you shows. That read compiles nothing; the review queue's read compiles the project, so it is not used. The count is read once the engine answers, on every navigation, and every 30 seconds while the tab is visible. A read still running is never doubled. No badge shows when nothing waits, or when the count cannot be read: a hint is never a wrong zero. A screen reader hears the count as the link's description when the link has focus, so each link's name is still the area's name.
 
 ### Changed
 

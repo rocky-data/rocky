@@ -2,6 +2,7 @@ import {
   Component,
   useEffect,
   useId,
+  useRef,
   useState,
   type ErrorInfo,
   type ReactNode,
@@ -9,7 +10,7 @@ import {
 import { Dialog, DialogBackdrop, DialogPanel, useClose } from "@headlessui/react";
 import { Bars3Icon, ChevronRightIcon, XMarkIcon } from "@heroicons/react/24/outline";
 import type { MetaOutput } from "@rocky-types/meta";
-import type { ReviewQueueOutput } from "@rocky-types/review_queue";
+import type { BriefOutput } from "@rocky-types/brief";
 import { ApiError, SESSION_EXPIRED_EVENT, apiGet } from "./api";
 import {
   AREAS,
@@ -79,13 +80,19 @@ type EngineState =
 const fetchMetaFromEngine = (): Promise<MetaOutput> => apiGet<MetaOutput>("meta");
 
 /**
- * How many decisions wait on a person: the review queue's total. The brief's
- * "Needs you" section and the queue select the same outstanding escalations
- * (`select_outstanding` in the engine), so one read counts both areas. At
- * module scope for the same reason as `fetchMetaFromEngine`.
+ * How many decisions wait on a person: the brief's escalation count, the
+ * number the Needs you screen lists. `/brief` compiles nothing and reads only
+ * the ledger, so it is cheap enough to poll; `/review/queue` compiles the
+ * project on every call to rank by blast radius, under the store's one
+ * permit, and is not. Escalations are a current-state projection that the
+ * window does not cut, so the shortest window reads the least. A section the
+ * engine could not read is no count at all, never zero. At module scope for
+ * the same reason as `fetchMetaFromEngine`.
  */
-const fetchWaitingFromEngine = (): Promise<number> =>
-  apiGet<ReviewQueueOutput>("review/queue").then((queue) => queue.total);
+const fetchWaitingFromEngine = (): Promise<number | null> =>
+  apiGet<BriefOutput>("brief?since=24h").then(({ escalations }) =>
+    escalations.availability === "unavailable" ? null : escalations.total,
+  );
 
 /** How often the sidebar reads the waiting count again, while the page is open. */
 export const WAITING_REFRESH_MS = 30_000;
@@ -94,17 +101,23 @@ export const WAITING_REFRESH_MS = 30_000;
  * The waiting count for the sidebar badges, or `null` when it is not known.
  *
  * Read only once the engine has answered `meta`, again on every navigation
- * (an approval on the plan page changes it), and on an interval. A failed
- * read shows no badge: a badge is a hint, and a wrong zero would say nothing
- * waits. A `401` still ends the session through `apiGet`'s own event.
+ * (an approval on the plan page changes it), and on an interval while the
+ * tab is visible; a tab coming back reads at once. A read still in flight is
+ * never doubled. A failed read clears the badge rather than keep a count it
+ * can no longer vouch for: a badge is a hint, and a stale one says something
+ * waits, or does not, that the engine did not just say. A `401` still ends
+ * the session through `apiGet`'s own event.
  */
 export function useWaitingCount(
-  fetchWaiting: () => Promise<number>,
+  fetchWaiting: () => Promise<number | null>,
   enabled: boolean,
   pathname: string,
   refreshMs: number = WAITING_REFRESH_MS,
 ): number | null {
   const [count, setCount] = useState<number | null>(null);
+  // Shared across effect runs, so a navigation does not stack a second read
+  // on one still running.
+  const inFlight = useRef(false);
   useEffect(() => {
     if (!enabled) {
       setCount(null);
@@ -112,20 +125,31 @@ export function useWaitingCount(
     }
     let cancelled = false;
     const read = () => {
-      fetchWaiting().then(
-        (total) => {
-          if (!cancelled) setCount(total);
-        },
-        () => {
-          if (!cancelled) setCount(null);
-        },
-      );
+      if (inFlight.current || document.visibilityState === "hidden") return;
+      inFlight.current = true;
+      fetchWaiting()
+        .then(
+          (total) => {
+            if (!cancelled) setCount(total);
+          },
+          () => {
+            if (!cancelled) setCount(null);
+          },
+        )
+        .finally(() => {
+          inFlight.current = false;
+        });
     };
     read();
     const timer = refreshMs > 0 ? window.setInterval(read, refreshMs) : undefined;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") read();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
       if (timer !== undefined) window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [fetchWaiting, enabled, pathname, refreshMs]);
   return count;
@@ -368,7 +392,9 @@ function AreaLink({
         // would stay open over the page it just failed to navigate away from.
         close();
       }}
-      className={`group flex gap-x-3 rounded-md p-2 text-sm/6 font-semibold ${
+      // Room at the end for the badge, so a long label or a large count
+      // never runs under it.
+      className={`group flex gap-x-3 rounded-md p-2 text-sm/6 font-semibold ${showWaiting ? "pr-12" : ""} ${
         here
           ? "bg-zinc-100 text-zinc-900 dark:bg-white/5 dark:text-white"
           : "text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-white"
@@ -390,7 +416,9 @@ function AreaLink({
             area's name. Drawn over the link's right end. */}
         <span
           aria-hidden="true"
-          className="pointer-events-none absolute top-1/2 right-2 flex h-5 min-w-5 -translate-y-1/2 items-center justify-center rounded-full bg-orange-500 px-1.5 text-xs font-semibold text-zinc-950 tabular-nums"
+          // orange-600: its shape keeps 3:1 against the white rail
+          // as well as the dark one; the digit stays 4.5:1 on it.
+          className="pointer-events-none absolute top-1/2 right-2 flex h-5 min-w-5 -translate-y-1/2 items-center justify-center rounded-full bg-orange-600 px-1.5 text-xs font-semibold text-zinc-950 tabular-nums"
         >
           {waiting}
         </span>
@@ -543,7 +571,7 @@ export function App({
   governor?: ReactNode;
   fetchMeta?: () => Promise<MetaOutput>;
   /** The sidebar's waiting count. Tests hand in a fake. */
-  fetchWaiting?: () => Promise<number>;
+  fetchWaiting?: () => Promise<number | null>;
 }) {
   const pathname = usePathname();
   const lane: Lane = laneFromPath(pathname);
