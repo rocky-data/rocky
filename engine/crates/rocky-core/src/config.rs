@@ -2448,7 +2448,7 @@ impl ModelBudgetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValkeyCacheConfig {
     /// Valkey/Redis URL. May embed a password, so it prints without its
-    /// userinfo and query (#2339).
+    /// password, query and fragment (#2339).
     pub valkey_url: CredentialUrl,
 }
 
@@ -5589,7 +5589,7 @@ pub struct FivetranCacheConfig {
     /// `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`,
     /// `file:///path/`.
     ///
-    /// A [`CredentialUrl`], like `valkey_url`: a userinfo or a query (an
+    /// A [`CredentialUrl`], like `valkey_url`: a password or a query (an
     /// Azure SAS token, say) is dropped from every printed form (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_store_url: Option<CredentialUrl>,
@@ -5598,8 +5598,8 @@ pub struct FivetranCacheConfig {
     /// (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
     ///
     /// It may embed a password (`redis://:password@host`), so it is a
-    /// [`CredentialUrl`]: it prints and serializes without its userinfo and
-    /// query, and the config identity ignores a rotated password (#2339).
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<CredentialUrl>,
 
@@ -5747,8 +5747,8 @@ pub struct FivetranRatelimitConfig {
     /// (plain) or `rediss://` (TLS).
     ///
     /// It may embed a password (`redis://:password@host`), so it is a
-    /// [`CredentialUrl`]: it prints and serializes without its userinfo and
-    /// query, and the config identity ignores a rotated password (#2339).
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<CredentialUrl>,
 
@@ -5844,8 +5844,8 @@ pub struct FivetranStampedeConfig {
     /// (plain) or `rediss://` (TLS).
     ///
     /// It may embed a password (`redis://:password@host`), so it is a
-    /// [`CredentialUrl`]: it prints and serializes without its userinfo and
-    /// query, and the config identity ignores a rotated password (#2339).
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<CredentialUrl>,
 
@@ -5951,8 +5951,8 @@ pub struct FivetranCircuitBreakerConfig {
     /// (plain) or `rediss://` (TLS).
     ///
     /// It may embed a password (`redis://:password@host`), so it is a
-    /// [`CredentialUrl`]: it prints and serializes without its userinfo and
-    /// query, and the config identity ignores a rotated password (#2339).
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<CredentialUrl>,
 
@@ -15903,10 +15903,10 @@ valkey_url = "rediss://:BREAKER_PW_SECRET@breaker.example:6379"
             );
         }
         for host in [
-            "rediss://***@cache.example:6379/0",
-            "rediss://***@ratelimit.example:6379",
-            "rediss://***@stampede.example:6379",
-            "rediss://***@breaker.example:6379",
+            "rediss://default:***@cache.example:6379/0",
+            "rediss://:***@ratelimit.example:6379",
+            "rediss://:***@stampede.example:6379",
+            "rediss://:***@breaker.example:6379",
             "az://container/prefix/?***",
         ] {
             assert!(debug.contains(host), "{host} missing from Debug: {debug}");

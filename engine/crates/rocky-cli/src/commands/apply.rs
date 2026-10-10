@@ -10221,6 +10221,21 @@ auto_create_schemas = true
             identity("rediss://default:PASSWORD_A@valkey-b:6379/0"),
             "another Valkey host must change the config identity"
         );
+        // Each pair selects another database, TLS mode, server or container.
+        for (a, b) in [
+            ("redis+unix:///s.sock?db=1", "redis+unix:///s.sock?db=2"),
+            ("rediss://h:6379/", "rediss://h:6379/#insecure"),
+            (
+                "redis://hostA/0?client_name=a@b",
+                "redis://hostB/0?client_name=a@b",
+            ),
+            (
+                "az://container-a@account.dfs.core.windows.net/p",
+                "az://container-b@account.dfs.core.windows.net/p",
+            ),
+        ] {
+            assert_ne!(identity(a), identity(b), "{a} and {b} must differ");
+        }
     }
 
     #[test]

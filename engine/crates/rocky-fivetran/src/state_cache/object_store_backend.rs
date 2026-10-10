@@ -86,14 +86,20 @@ impl ObjectStoreCache {
     /// - `az://container/prefix` — Azure Blob Storage
     /// - `file:///path/prefix` — local filesystem (for tests and dev)
     pub fn from_url(url: &str) -> Result<Self, CacheError> {
-        // The error names the URL without its userinfo or query, which can
-        // hold a credential (#2339).
-        let shown = rocky_core::credential_url::CredentialUrl::from(url);
-        let parsed =
-            Url::parse(url).map_err(|e| CacheError::ObjectStoreUrl(format!("{shown}: {e}")))?;
+        // The URL can hold a credential (#2339), and `object_store` echoes
+        // it: `Unable to recognise URL "<url>"`, and each builder's
+        // `Unable parse source url. Url: <url>`. So the message names the
+        // shown form, and the error text is scrubbed of every secret part.
+        let credential = rocky_core::credential_url::CredentialUrl::from(url);
+        let fail = |e: &dyn std::fmt::Display| {
+            CacheError::ObjectStoreUrl(format!(
+                "{credential}: {}",
+                credential.scrub(&e.to_string())
+            ))
+        };
+        let parsed = Url::parse(url).map_err(|e| fail(&e))?;
         let scheme = parsed.scheme().to_string();
-        let (store, prefix) = object_store::parse_url(&parsed)
-            .map_err(|e| CacheError::ObjectStoreUrl(format!("{shown}: {e}")))?;
+        let (store, prefix) = object_store::parse_url(&parsed).map_err(|e| fail(&e))?;
         Ok(ObjectStoreCache {
             store: Arc::from(store),
             prefix,
@@ -221,6 +227,20 @@ impl FivetranStateCache for ObjectStoreCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2339: `object_store` echoes the URL it cannot recognise, so the
+    /// error must not carry the URL's secrets back out.
+    #[test]
+    fn an_unrecognised_url_error_holds_no_secret() {
+        let Err(err) =
+            ObjectStoreCache::from_url("nope://user:PW-SECRET@host/p?sig=SIG-SECRET#F-SECRET")
+        else {
+            panic!("an unknown scheme must not build a store");
+        };
+        let text = err.to_string();
+        assert!(text.contains("recognise"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
 
     #[test]
     fn md5_hex_round_trip() {
