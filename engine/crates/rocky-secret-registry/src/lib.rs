@@ -1,0 +1,400 @@
+//! Every value this process substituted into config from the environment.
+//!
+//! `${VAR}` is expanded *before* the TOML is parsed, so a resolved value is an
+//! ordinary run of bytes by the time anything downstream sees it. A diagnostic
+//! that echoes the offending source line echoes the resolved value; a
+//! successful response that carries a scope field carries it too. Neither
+//! producer knows it is holding a credential.
+//!
+//! This registry is how the serve boundary finds out. Every expansion records
+//! its name and value here, and the outermost HTTP middleware rewrites any
+//! registered value back to the `${NAME}` the operator actually wrote.
+//!
+//! ## Why a process-global
+//!
+//! The alternative is threading a report from the expander to the HTTP
+//! boundary through every producer. There are eight substitution call sites in
+//! `models.rs` alone, plus the config loader, and each one would have to carry
+//! the report through a type that has no other reason to hold it. A producer
+//! that forgot would leak silently, which is the defect this closes.
+//!
+//! Registering inside the expander means a future caller is covered by
+//! construction: there is no "remember to register" step to skip.
+//!
+//! **The limit of "by construction".** It holds for callers that reach the
+//! environment through `substitute_env_vars` and its expander. A producer that
+//! calls `std::env::var` DIRECTLY and puts the result into a response bypasses
+//! this entirely — the value is never registered, so the filter has nothing to
+//! match, and if nothing else had registered, `is_empty()` would make the
+//! filter skip the body altogether. Every path converges on the expander today
+//! and that was checked, but it is an invariant held by convention rather than
+//! by the type system. Anyone reaching for `std::env::var` on a response path
+//! is opting out of this.
+//!
+//! ## Monotonic, on purpose
+//!
+//! An entry is never removed. A config that stops referencing `${OLD_TOKEN}`
+//! does not make the old value safe to print — a persisted `RunRecord` written
+//! while it *was* referenced still carries it, and `GET /api/v1/runs` still
+//! serves that record. Forgetting a rotated value would re-expose exactly the
+//! history a rotation was meant to retire.
+//!
+//! ### The bound, and why it holds
+//!
+//! Monotonic is not unbounded. Both production call sites — the two branches
+//! of the `${VAR}` expander in `rocky-core`'s `config.rs` — take their value from
+//! `std::env::var`, and a process's environment does not change while it runs.
+//! So the set is bounded by the distinct `${VAR}` values the loaded config
+//! references, however long the process lives.
+//!
+//! Reloading does not grow it. `rocky serve` re-reads config on every watched
+//! change, but re-registering a value it already holds is a no-op, so a server
+//! that reloads a thousand times with an unchanged environment holds exactly as
+//! many entries as one that never reloaded.
+//!
+//! The bound is worth stating because the cost is paid per response, not once.
+//! The filter scans the whole body for each entry, so `n` entries cost `O(n*b)`
+//! on a body of length `b` — memory is two `String`s per entry and is not the
+//! concern. Bounded by the config's distinct values, that work is bounded too
+//! (#1946).
+//!
+//! ## Why the replacement is `${NAME}` and not an opaque token
+//!
+//! Redaction is by VALUE and by substring, so a value that is also part of a
+//! legitimate identifier is rewritten there too: with `CATALOG=analytics`, a
+//! compile error about `analytics_orders` becomes `${CATALOG}_orders`.
+//!
+//! That is the accepted cost of the owner's ruling (see
+//! [`SECRET_LENGTH_FLOOR`]), and the `${NAME}` form is what keeps it workable.
+//! `[REDACTED]_orders` would leave an operator unable to tell which model
+//! failed; `${CATALOG}_orders` names the variable whose value is in there, so
+//! anyone who can read the environment can reconstruct the identifier. The
+//! variable NAME is not a secret — `format_env_var_hint` already lists names
+//! in config diagnostics, and the ruling is about values.
+//!
+//! ## What this does NOT cover
+//!
+//! **A value substituted by a child process.** `execute_job_subprocess` spawns
+//! a separate `rocky` process with its own registry, and the parent scrubs the
+//! child's output against the *parent's* set. When the parent loaded the same
+//! config — the ordinary case — the sets agree. When the child expanded
+//! something the parent never loaded, the parent cannot redact it. This is a
+//! known limitation, not a closed hole; it is named here so a test can point
+//! at it rather than rediscover it.
+//!
+//! ## Why its own crate
+//!
+//! The adapter SDK, `rocky-cache`, `rocky-sql` and `rocky-catalog-core` do
+//! not depend on `rocky-core`, and the SDK is kept independent of it on
+//! purpose, yet their error types print config text in `Debug` too. This crate
+//! has no dependencies, so every one of them can render through the same
+//! registry `rocky-core` writes to. `rocky_core::secret_registry` re-exports
+//! all of it, so a caller there sees no change (#1919).
+
+use std::collections::BTreeMap;
+use std::sync::{LazyLock, RwLock};
+
+/// The shortest value treated as a secret, in bytes.
+///
+/// **Owner ruling (#1897, 2026-09-11):** every `${VAR}` value is redacted, with
+/// an 8-byte floor. A value shorter than this is shown.
+///
+/// The trade is deliberate and it cuts both ways. Below the floor, a short
+/// credential is displayed. At or above it, a value that is not a secret —
+/// `${CATALOG}` resolving to `analytics` — is rewritten wherever those bytes
+/// appear, including inside longer identifiers like `analytics_orders`. The
+/// floor exists because redacting a 1-byte value would replace every `1` in
+/// every response, which destroys the diagnostic without protecting anything.
+///
+/// It also means the boundary itself is observable: a reader can tell whether
+/// a value is shorter than 8 bytes by whether it was rewritten. That is a
+/// real, small disclosure, and it is inherent in the ruling rather than chosen
+/// here.
+///
+/// An exemption for values that match a model, pipeline or target identifier
+/// was considered and rejected. It fails open — a secret that happens to equal
+/// an identifier would be shown — and, decisively, the identifier set is
+/// derived from a successful compile. A config that fails to parse produces no
+/// compile result (`rocky-server`'s `RecompileOutcome` returns on `Err`), so
+/// the exemption list would be empty in exactly the case that leaks.
+pub const SECRET_LENGTH_FLOOR: usize = 8;
+
+/// Value -> the `${NAME}` it is rewritten to.
+///
+/// Keyed by value because that is what the filter searches for. When two
+/// variables resolve to the same value, the name that sorts first wins. Either
+/// is equally true, but the choice must not depend on the order the config
+/// mentions them: a plan's config snapshot is compared by its rendered text, so
+/// reordering two sections must not change it.
+static SUBSTITUTED: LazyLock<RwLock<BTreeMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+
+/// Record a value expanded from the environment.
+///
+/// Call this for values that came from `std::env`, **not** for the literal in
+/// a `${VAR:-default}` fallback. A default is written in `rocky.toml` in
+/// cleartext, so anyone who can read the config can already read it; rewriting
+/// it would mangle diagnostics for no secrecy gain.
+///
+/// Values shorter than [`SECRET_LENGTH_FLOOR`] are ignored — see that
+/// constant for the ruling and its cost.
+pub fn register_substitution(name: &str, value: &str) {
+    if value.len() < SECRET_LENGTH_FLOOR {
+        return;
+    }
+    // A panic elsewhere cannot leave this map malformed — it is owned strings
+    // with no cross-field invariant — so a poisoned lock is recovered rather
+    // than propagated. Treating poison as "refuse every response" would let
+    // one unrelated panicking thread take the server's output down.
+    let mut map = SUBSTITUTED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let replacement = format!("${{{name}}}");
+    map.entry(value.to_string())
+        .and_modify(|current| {
+            if replacement < *current {
+                current.clone_from(&replacement);
+            }
+        })
+        .or_insert(replacement);
+}
+
+/// Every registered `(value, replacement)` pair, **longest value first**.
+///
+/// The order is load-bearing. A value that contains another must be replaced
+/// first: replacing the shorter one first leaves a fragment of the longer
+/// secret behind, which is a leak the redactor itself would have created.
+pub fn substitutions() -> Vec<(String, String)> {
+    let map = SUBSTITUTED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pairs: Vec<(String, String)> = map
+        .iter()
+        .map(|(value, replacement)| (value.clone(), replacement.clone()))
+        .collect();
+    pairs.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    pairs
+}
+
+/// Rewrite every registered value in `text` to the `${NAME}` that carries it.
+///
+/// This is the in-process form of the `rocky serve` response filter. It works
+/// on plain text, not on a JSON body, so it searches for each value as it is,
+/// with no escaped forms. `rocky_core::env_string::EnvString` uses it to build the
+/// form it prints, and error renderers that echo config text use it directly.
+///
+/// Every match of every value is collected as a byte span first. Overlapping
+/// spans are merged and rewritten once. So two values that overlap are both
+/// covered, and no fragment of either one survives. A merged span names every
+/// variable that touched it.
+pub fn render_placeholders(text: &str) -> String {
+    let pairs = substitutions();
+    if pairs.is_empty() {
+        return text.to_string();
+    }
+    // (start, end, replacement)
+    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+    for (value, replacement) in &pairs {
+        // Advance one CHARACTER past each match, not past its end, so an
+        // overlapping occurrence of the same value is found too. The merge
+        // below collapses the run. Stepping by one byte would land inside a
+        // multi-byte character, and slicing there panics.
+        let mut from = 0;
+        while let Some(found) = text[from..].find(value.as_str()) {
+            let start = from + found;
+            spans.push((start, start + value.len(), replacement.as_str()));
+            from = start + 1;
+            while from < text.len() && !text.is_char_boundary(from) {
+                from += 1;
+            }
+            if from >= text.len() {
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < spans.len() {
+        let (start, mut end, first) = spans[i];
+        let mut names: Vec<&str> = vec![first];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].0 < end {
+            end = end.max(spans[j].1);
+            if !names.contains(&spans[j].2) {
+                names.push(spans[j].2);
+            }
+            j += 1;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&names.concat());
+        cursor = end;
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Whether anything has been registered.
+///
+/// The middleware uses this to skip the scan entirely on a server whose config
+/// expands nothing.
+pub fn is_empty() -> bool {
+    SUBSTITUTED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty()
+}
+
+/// The body of a hand-written `Debug` for an error type: `Name(<Display>)`
+/// with each resolved value rendered. A derived `Debug` prints the plaintext
+/// of every field and wrapped error (#1919). Rendering here, not relying on
+/// `Display`, keeps the guarantee for a `Display` that does not render.
+pub fn fmt_rendered_debug(
+    f: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    err: &dyn std::fmt::Display,
+) -> std::fmt::Result {
+    write!(f, "{name}({})", render_placeholders(&err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Long enough to clear the floor, distinctive enough that no other test's
+    /// fixture can collide with it. The registry is process-global and every
+    /// test in the binary shares it, so a generic value would make these
+    /// assertions depend on test ordering.
+    const LONG: &str = "ROCKY-REGISTRY-TEST-VALUE-8e26660e";
+
+    fn replacement_for(value: &str) -> Option<String> {
+        substitutions()
+            .into_iter()
+            .find(|(v, _)| v == value)
+            .map(|(_, r)| r)
+    }
+
+    #[test]
+    fn a_value_at_or_above_the_floor_is_registered_against_its_name() {
+        register_substitution("ROCKY_REGISTRY_TEST", LONG);
+        assert_eq!(
+            replacement_for(LONG).as_deref(),
+            Some("${ROCKY_REGISTRY_TEST}"),
+            "the replacement names the variable, so an operator can reconstruct \
+             a mangled identifier"
+        );
+    }
+
+    #[test]
+    fn a_value_below_the_floor_is_ignored() {
+        // 7 bytes: one under. The floor is a ruling, so pin the boundary
+        // rather than a comfortable example.
+        register_substitution("ROCKY_REGISTRY_SHORT", "1234567");
+        assert_eq!(replacement_for("1234567"), None);
+    }
+
+    /// A short `location`, project or destination id (for example `US`) is
+    /// not rewritten, so it prints as itself. This is the documented floor
+    /// behaviour, not a gap to close here.
+    #[test]
+    fn a_value_under_the_floor_prints_as_itself() {
+        let short = "Zq7x9kP";
+        assert!(short.len() < SECRET_LENGTH_FLOOR);
+        register_substitution("ROCKY_REGISTRY_PRINTS_SHORT", short);
+        assert_eq!(
+            render_placeholders(&format!("project {short} in US")),
+            format!("project {short} in US")
+        );
+    }
+
+    #[test]
+    fn the_floor_is_inclusive_at_exactly_eight_bytes() {
+        let eight = "12345678";
+        assert_eq!(eight.len(), SECRET_LENGTH_FLOOR);
+        register_substitution("ROCKY_REGISTRY_EIGHT", eight);
+        assert!(
+            replacement_for(eight).is_some(),
+            "exactly SECRET_LENGTH_FLOOR bytes is a secret, not one short of one"
+        );
+    }
+
+    /// The ordering is what stops a shorter value eating a longer one's
+    /// replacement, so it is pinned rather than assumed from `BTreeMap`.
+    #[test]
+    fn an_overlapping_pair_reads_back_longest_first() {
+        let short = "ROCKY-ORDER-AAAAAAA";
+        let long = "ROCKY-ORDER-AAAAAAA-AND-LONGER";
+        assert!(long.contains(short), "PRECONDITION: the pair must overlap");
+
+        register_substitution("ROCKY_ORDER_SHORT", short);
+        register_substitution("ROCKY_ORDER_LONG", long);
+
+        let pairs = substitutions();
+        let long_at = pairs.iter().position(|(v, _)| v == long).expect("long");
+        let short_at = pairs.iter().position(|(v, _)| v == short).expect("short");
+        assert!(
+            long_at < short_at,
+            "the longer value must come first, or replacing the shorter one \
+             first leaves `-AND-LONGER` of the longer secret behind"
+        );
+    }
+
+    /// Two registered values that overlap in a text are rewritten as one run,
+    /// so no fragment of either survives.
+    #[test]
+    fn render_placeholders_leaves_no_fragment_of_overlapping_values() {
+        // The registry is process-wide, so the values must not contain one
+        // another test registers (`12345678` does, in the floor test).
+        let a = "ROCKY-RENDER-ABCDEFGHQWZX";
+        let b = "QWZXJKLV-ROCKY-RENDER-XYZ";
+        register_substitution("ROCKY_RENDER_A", a);
+        register_substitution("ROCKY_RENDER_B", b);
+        let text = "x ROCKY-RENDER-ABCDEFGHQWZXJKLV-ROCKY-RENDER-XYZ y";
+        let out = render_placeholders(text);
+        assert!(!out.contains("ABCDEFGH"), "{out}");
+        assert!(!out.contains("RENDER-XYZ"), "{out}");
+        assert_eq!(out, "x ${ROCKY_RENDER_A}${ROCKY_RENDER_B} y");
+        assert_eq!(render_placeholders("nothing here"), "nothing here");
+    }
+
+    /// Two variables carrying the same value is not an error, and the map must
+    /// not end up with two entries that a longest-first sweep would apply
+    /// twice.
+    #[test]
+    fn the_same_value_under_two_names_registers_once() {
+        let shared = "ROCKY-SHARED-VALUE-b95661f6";
+        register_substitution("ROCKY_FIRST_NAME", shared);
+        register_substitution("ROCKY_SECOND_NAME", shared);
+        let matches: Vec<_> = substitutions()
+            .into_iter()
+            .filter(|(v, _)| v == shared)
+            .collect();
+        assert_eq!(matches.len(), 1, "one entry per value");
+        assert_eq!(
+            matches[0].1, "${ROCKY_FIRST_NAME}",
+            "the name that sorts first wins"
+        );
+    }
+
+    /// #1919 follow-up: when two variables share a value, the rendered name
+    /// must not depend on which one the config mentions first. A plan's config
+    /// snapshot is compared by its rendered text, so reordering two sections
+    /// would otherwise make `rocky apply` report a config change.
+    #[test]
+    fn the_shared_value_name_does_not_depend_on_registration_order() {
+        let shared = "ROCKY-SHARED-ORDER-7f1c2d90";
+        register_substitution("ROCKY_ORDER_ZULU", shared);
+        register_substitution("ROCKY_ORDER_ALPHA", shared);
+        assert_eq!(
+            replacement_for(shared).as_deref(),
+            Some("${ROCKY_ORDER_ALPHA}"),
+            "the later-registered name sorts first, so it must win"
+        );
+    }
+}

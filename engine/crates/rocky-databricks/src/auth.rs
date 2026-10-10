@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 const REFRESH_SLACK: Duration = Duration::from_secs(60);
 
 /// Errors from Databricks authentication (PAT or OAuth M2M).
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum AuthError {
     #[error(
         "no auth configured: set DATABRICKS_TOKEN or (DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET)"
@@ -26,6 +26,14 @@ pub enum AuthError {
 
     #[error("OAuth token response missing access_token")]
     MissingToken,
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "AuthError", self)
+    }
 }
 
 /// Databricks authentication provider.
@@ -234,6 +242,23 @@ impl std::fmt::Debug for Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[tokio::test]
+    async fn auth_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "dbx-host-1919-b5c0";
+        rocky_core::secret_registry::register_substitution("RV_DBX_AUTH_DBG", SECRET);
+        // Port 1 on loopback refuses at once; the transport error carries the URL.
+        let source = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:1/{SECRET}/oidc/v1/token"))
+            .send()
+            .await
+            .expect_err("port 1 refuses the connection");
+        let err = AuthError::TokenRequest(source);
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DBX_AUTH_DBG}"), "{debug}");
+    }
 
     #[test]
     fn test_pat_auth() {

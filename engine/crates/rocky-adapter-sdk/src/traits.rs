@@ -69,9 +69,17 @@ use serde::{Deserialize, Serialize};
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
 /// Error from an adapter operation.
-#[derive(Debug)]
 pub struct AdapterError {
     inner: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of the wrapped error, such as a message built from config
+/// (#1919).
+impl std::fmt::Debug for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_secret_registry::fmt_rendered_debug(f, "AdapterError", self)
+    }
 }
 
 impl AdapterError {
@@ -968,6 +976,17 @@ pub trait LoaderAdapter: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn adapter_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "sdk-volume-1919-a1b2";
+        rocky_secret_registry::register_substitution("RV_SDK_ADAPTER_DBG", SECRET);
+        let err = AdapterError::msg(format!("volume {SECRET} is missing"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SDK_ADAPTER_DBG}"), "{debug}");
+    }
     /// The `rocky-core` twin of this test is
     /// `manual_default_matches_serde_default_for_every_config_with_field_defaults`
     /// in `config.rs`. This copy exists because `LoadOptions` lives here, and

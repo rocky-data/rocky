@@ -29,7 +29,7 @@ pub type CatalogResult<T> = Result<T, CatalogError>;
 ///   [`CatalogError::AuthFailed`], [`CatalogError::InvalidResponse`],
 ///   [`CatalogError::PermissionDenied`]) are general failure modes that
 ///   surface from the underlying transport or authorization layer.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum CatalogError {
     /// The catalog has no record of the requested table.
     #[error("table not found: {0}")]
@@ -72,4 +72,28 @@ pub enum CatalogError {
     /// caller is who they say they are, but lacks the required privilege.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for CatalogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_secret_registry::fmt_rendered_debug(f, "CatalogError", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn catalog_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "catalog-core-1919-a5b6";
+        rocky_secret_registry::register_substitution("RV_CATALOG_CORE_DBG", SECRET);
+        let err = CatalogError::TableNotFound(format!("{SECRET}.orders"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CATALOG_CORE_DBG}"), "{debug}");
+    }
 }

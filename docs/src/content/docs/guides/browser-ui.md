@@ -129,7 +129,7 @@ A plan bound to a data product shows no Apply button. Apply it in a terminal. Th
 
 The plan status records approval, not apply. So the Applied step shows as done only after an apply from this page succeeds. Otherwise, once the plan is approved, Applied shows as not known. The page cannot tell an applied plan from one that waits. The run itself is on Estate.
 
-Apply runs the models as they are on disk, not SQL stored in the plan. So it checks the plan's models before it runs them. If a model was added, removed or edited after the plan was made, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. A person's apply compares the models only, so a different environment or an edit to another pipeline does not refuse it. It also means a config edit made after approval is not caught. The models can still change between this check and the run's own compile. An agent's apply is checked again inside the run. A plan whose models did not compile at plan time has no fingerprint and is not checked. A plan made before this check refuses with `plan_snapshot_missing`; plan again.
+Apply runs the models as they are on disk, not SQL stored in the plan. So it checks the plan's models before it runs them. If a model was added, removed or edited after the plan was made, apply refuses with `plan_models_changed`: "models changed since this plan was made; plan again". Plan again, review the new plan, and apply that. A person's apply compares the models only, so a different environment or an edit to another pipeline does not refuse it. Approving compares the models only too, so a plan made in a shell can be approved here. It also means a config edit made after approval is not caught. The models can still change between this check and the run's own compile. An agent's apply is checked again inside the run. A plan whose models did not compile at plan time has no fingerprint and is not checked. A plan made before this check refuses with `plan_snapshot_missing`; plan again.
 
 ## Products
 
@@ -172,7 +172,28 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+
+### Cancel a running job
+
+While a job runs, operator mode shows a **Cancel** button under it. A read-only page does not show it. The button calls `POST /api/v1/jobs/{id}/cancel`:
+
+```
+Cancel ─▶ SIGTERM to the job's process group (handled like Ctrl-C) ─▶ the button becomes "Force stop"
+Force stop ─▶ SIGKILL to the job's process group                ─▶ the job stops at once
+```
+
+The engine answers only once the signal reached the job. The job then ends `cancelled`. If it exits 0 anyway, it ends `succeeded`. A job that exited before the signal reached it answers `409 job_not_running`. A cancelled run, apply or approve keeps the project's single write slot until its process has exited, so a new one waits for it (`409 mutation_in_progress`).
+
+What a cancelled job leaves:
+
+- **A run or apply of a replication pipeline, after Cancel**, stops like Ctrl-C in a terminal. It starts no new table copies and lets the copies in flight finish. It saves their watermarks, marks the other tables `Interrupted`, and exits `130`. Run history shows it as a partial failure. `rocky run --resume-latest` copies the rest.
+- **Any other job, after Cancel** (models, a plan, an approval), stops at once. Rocky has no clean-stop step for these yet ([#1606](https://github.com/rocky-data/rocky/issues/1606)). A warehouse statement in flight is cut, and the warehouse keeps or drops it whole. A state write in flight is all or nothing. Models that finished stay built. Run the job again to finish.
+- **After Force stop**, any job stops like a crash. An incremental replication table can have its rows landed before its watermark was saved. On DuckDB, Databricks, Snowflake and BigQuery, the next run of that table reads the watermark back from the target table first, so it does not copy the same rows twice. On other warehouses, prefer Cancel.
+
+A plan file cut part-way no longer reads as its plan id, so Rocky refuses to apply it.
+
+Cancel reaches only jobs this server process started. A scheduled run (`--scheduler`) answers `409 job_not_cancellable`, and a finished job answers `409 job_not_running`. On Windows there is no SIGTERM, so Cancel kills the job at once. Stopping `rocky serve` with Ctrl-C or `SIGTERM` sends each of its running jobs the same SIGTERM as Cancel, and waits up to 5 seconds for it to be sent.
 
 `rocky serve --ui` turns it on by itself when all of these hold:
 
@@ -211,7 +232,7 @@ An approval from the UI records the approver source `http_api` and the server's 
 With `--ui`, the server adds checks that a plain `rocky serve` does not run:
 
 - On a host that is not loopback, `--ui` refuses to start without a token, and refuses a full-scope token. On a loopback host with no token, it generates a per-process token: full scope, or read-only when `--read-only` or `--allowed-host`/`--allowed-origin` is set. A loopback server with `--allowed-host` or `--allowed-origin` refuses a full-scope token.
-- A request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry gets `421 host_not_allowed`. This defends against DNS rebinding, where an attacker's domain is made to resolve to `127.0.0.1`. `GET /api/v1/health` skips this check, so a load balancer probe still works.
+- A request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry gets `421 host_not_allowed`. This defends against DNS rebinding, where an attacker's domain is made to resolve to `127.0.0.1`. The check also runs on a loopback `rocky serve` without `--ui`. `GET /api/v1/health` skips this check, so a load balancer probe still works.
 - A request whose `Origin` is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`. The check reads the origin's host, not the whole origin, so an `http` or `https` origin on an allowed host passes whatever its port. On a loopback server that includes `http://localhost:5173`, a local dev server. `GET /api/v1/health` skips this check too.
 - Every UI file response carries a Content Security Policy. The page loads scripts and fonts from this server only, and styles from this server or inline. Nothing may frame it.
 - `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`, because a browser can reach the webhook route.

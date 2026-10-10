@@ -209,6 +209,10 @@ pub fn run_test_with_selection(
                 strict_contracts: project_config
                     .as_ref()
                     .is_some_and(|config| config.contracts.strict),
+                target_dialects: super::compile::target_dialects(
+                    project_config.as_ref(),
+                    config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+                ),
             })
         },
     )?;

@@ -61,6 +61,7 @@ engine/                         # this directory, inside the rocky monorepo
 │   │   │   └── unit_test.rs    # In-process test utilities
 │   │   └── tests/
 │   │       └── e2e.rs          # E2E integration tests (DuckDB-backed, no credentials needed)
+│   ├── rocky-secret-registry/  # Resolved ${VAR} values -> ${NAME}; no deps, so crates without rocky-core use it too
 │   ├── rocky-sql/              # SQL parsing + typed AST (sqlparser-rs)
 │   │   └── src/
 │   │       ├── parser.rs       # sqlparser-rs wrapper with typed extensions

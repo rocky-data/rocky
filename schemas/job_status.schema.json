@@ -64,6 +64,13 @@
             "failed"
           ],
           "type": "string"
+        },
+        {
+          "description": "`POST /api/v1/jobs/{id}/cancel` signalled the subprocess, and it then exited non-zero. A job that exits 0 after the signal is `succeeded`: it finished before the signal could stop it.",
+          "enum": [
+            "cancelled"
+          ],
+          "type": "string"
         }
       ]
     }
@@ -71,7 +78,7 @@
   "description": "Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).\n\nThe presentation type over `rocky-core`'s `PersistedJob`: it carries the same lifecycle facts with typed [`JobKind`]/[`JobState`] enums for embedder ergonomics, and — once the job is terminal — the canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying subprocess emitted, embedded **verbatim** in [`result`](Self::result). An embedder switches on [`kind`](Self::kind) to know which schema `result` conforms to (the same `run` / `plan` / `apply` schemas the CLI exports).",
   "properties": {
     "error": {
-      "description": "Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.",
+      "description": "Failure detail when [`state`](Self::state) is [`JobState::Failed`], what stopped the job when it is [`JobState::Cancelled`], else `null`.",
       "type": [
         "string",
         "null"

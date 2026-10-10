@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 /// for 3600s, so a 60s slack is well below the TTL.
 const REFRESH_SLACK: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum AuthError {
     #[error("failed to read service account key: {0}")]
     ReadKey(#[from] std::io::Error),
@@ -37,6 +37,14 @@ pub enum AuthError {
         "no authentication method available — set GOOGLE_APPLICATION_CREDENTIALS or provide a bearer token"
     )]
     NoAuth,
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "AuthError", self)
+    }
 }
 
 /// Logs a warning when the service-account key file is group- or
@@ -292,6 +300,17 @@ async fn read_fresh_token(cache: &RwLock<Option<CachedToken>>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn auth_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "bq-project-1919-a4b9";
+        rocky_core::secret_registry::register_substitution("RV_BQ_AUTH_DBG", SECRET);
+        let err = AuthError::TokenExchange(format!("project {SECRET} refused"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_BQ_AUTH_DBG}"), "{debug}");
+    }
 
     fn fake_key() -> ServiceAccountKey {
         ServiceAccountKey {

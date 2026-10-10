@@ -21,6 +21,7 @@ use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E046, I001, I002,
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
+use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
 use rocky_core::column_map::{CiKey, CiStr};
@@ -76,14 +77,47 @@ pub(crate) struct TypeScope {
     columns: HashMap<CiKey<'static>, (RockyType, bool)>,
     /// table → { column → (type, nullable) } for qualified references.
     qualified: HashMap<CiKey<'static>, HashMap<CiKey<'static>, (RockyType, bool)>>,
+    /// Bare column names whose type is a guess: a CTE or derived-table
+    /// column built from an expression that is not exact (see
+    /// [`has_exact_type`]). A column read from a table or a model is exact.
+    inexact: HashSet<CiKey<'static>>,
+    /// table → columns whose type is a guess, for qualified references.
+    qualified_inexact: HashMap<CiKey<'static>, HashSet<CiKey<'static>>>,
+    /// The warehouses the SQL runs on. A `CAST` target whose width differs
+    /// between warehouses is typed from them (#2333).
+    target: OperandTarget,
 }
 
 impl TypeScope {
+    /// A scope with no known warehouse.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_target(OperandTarget::Unconfigured)
+    }
+
+    fn with_target(target: OperandTarget) -> Self {
         Self {
             columns: HashMap::new(),
             qualified: HashMap::new(),
+            inexact: HashSet::new(),
+            qualified_inexact: HashMap::new(),
+            target,
         }
+    }
+
+    /// Whether the bare column `name` has a type read from the SQL, not a
+    /// guess.
+    fn is_exact(&self, name: &str) -> bool {
+        !self.inexact.contains(CiStr::new(name))
+    }
+
+    /// Whether the qualified column `table.col` has a type read from the
+    /// SQL, not a guess.
+    fn is_exact_qualified(&self, table: &str, col: &str) -> bool {
+        !self
+            .qualified_inexact
+            .get(CiStr::new(table))
+            .is_some_and(|cols| cols.contains(CiStr::new(col)))
     }
 
     fn lookup(&self, name: &str) -> (RockyType, bool) {
@@ -120,6 +154,26 @@ pub fn typecheck_project_with_models(
     _type_map: Option<&dyn Fn(&str) -> RockyType>,
     models: &[rocky_core::models::Model],
     join_keys_acc: Option<&Arc<AtomicU64>>,
+) -> TypeCheckResult {
+    typecheck_project_for_targets(
+        graph,
+        source_schemas,
+        models,
+        join_keys_acc,
+        &TargetDialects::default(),
+    )
+}
+
+/// [`typecheck_project_with_models`], knowing the warehouse each model runs
+/// on. A `CAST` to a type whose width differs between warehouses (`INT`,
+/// `FLOAT`, `TIMESTAMP`, …) is typed for that warehouse, and stays
+/// [`RockyType::Unknown`] for a model with no known target (#2333).
+pub fn typecheck_project_for_targets(
+    graph: &SemanticGraph,
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+    models: &[rocky_core::models::Model],
+    join_keys_acc: Option<&Arc<AtomicU64>>,
+    targets: &TargetDialects,
 ) -> TypeCheckResult {
     let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -194,6 +248,7 @@ pub fn typecheck_project_with_models(
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
+                    targets.for_model(model_name),
                 ))
             })
             .collect();
@@ -238,6 +293,9 @@ pub fn typecheck_project_with_models(
 /// The `reference_map` is always rebuilt in full (SQL scanning is cheap),
 /// and diagnostics / timings are stitched so the result is observationally
 /// identical to a full `typecheck_project_with_models` in shape.
+///
+/// `previous` must have been computed with the same `targets`: a model whose
+/// target changed is not in `affected` by that alone.
 pub fn typecheck_project_incremental(
     graph: &SemanticGraph,
     source_schemas: &HashMap<String, Vec<TypedColumn>>,
@@ -245,6 +303,7 @@ pub fn typecheck_project_incremental(
     affected: &HashSet<String>,
     previous: &TypeCheckResult,
     join_keys_acc: Option<&Arc<AtomicU64>>,
+    targets: &TargetDialects,
 ) -> TypeCheckResult {
     let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -369,6 +428,7 @@ pub fn typecheck_project_incremental(
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
+                    targets.for_model(model_name),
                 ))
             })
             .collect();
@@ -432,6 +492,7 @@ fn compute_model_typecheck(
     model_by_name: &HashMap<&str, &rocky_core::models::Model>,
     model_names: &HashSet<String>,
     join_keys_acc: Option<&Arc<AtomicU64>>,
+    target: &OperandTarget,
 ) -> ModelTypecheckOutput {
     let model_start = Instant::now();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -537,9 +598,11 @@ fn compute_model_typecheck(
         .get(model_name)
         .filter(|_| needs_inference)
         .map(|model| {
-            infer_select_types_with_lookup(&model.sql, &|name| {
-                typed_models.get(&relation_key(name)).map(Vec::as_slice)
-            })
+            infer_select_types_with_lookup(
+                &model.sql,
+                &|name| typed_models.get(&relation_key(name)).map(Vec::as_slice),
+                target,
+            )
             .ok()
         });
     // Inference was needed and could not answer (a query form it does not
@@ -2845,7 +2908,7 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
             kind,
             ..
         } => {
-            let target = sql_type_to_rocky(data_type);
+            let target = cast_target_type(data_type, &scope.target);
             let nullable = match kind {
                 ast::CastKind::Cast | ast::CastKind::DoubleColon => {
                     let (source, source_nullable) = infer_expr_type(expr, scope);
@@ -2854,7 +2917,7 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
                     // that does not convert (#2299). Say nullable unless the
                     // cast provably cannot fail.
                     source_nullable
-                        || (cast_can_fail(&source, data_type, &target)
+                        || (cast_can_fail(&source, has_exact_type(expr, scope), data_type, &target)
                             && !integer_literal_fits(expr, data_type, &target))
                 }
                 ast::CastKind::TryCast | ast::CastKind::SafeCast => true,
@@ -3331,8 +3394,14 @@ fn sql_mentions_set_operation(sql: &str) -> bool {
 ///
 /// Only the conversions listed as safe return `false`; everything else,
 /// including an `Unknown` source, is treated as fallible. Inference may wrongly
-/// say nullable, never wrongly non-null (#2299).
-fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyType) -> bool {
+/// say nullable, never wrongly non-null (#2299). `source_exact` says whether
+/// `source` is read from the SQL ([`has_exact_type`]) rather than guessed.
+fn cast_can_fail(
+    source: &RockyType,
+    source_exact: bool,
+    target_sql: &ast::DataType,
+    target: &RockyType,
+) -> bool {
     use RockyType as T;
     // A VARIANT can hold a JSON null, which casts to SQL NULL (Databricks,
     // Snowflake), and an Unknown source may be one. Both stay fallible.
@@ -3363,12 +3432,36 @@ fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyT
                 scale: ts,
             },
         ) => {
-            // Safe only when no integer digit and no fractional digit is lost.
+            // Safe only when no integer digit and no fractional digit is lost,
+            // and only when the input's digits are read from the SQL: Rocky
+            // types `a * b` over two DECIMALs with the wider operand's digits,
+            // but the product can need more, and a non-ANSI cast of a value
+            // that does not fit returns NULL.
             let source_int_digits = i16::from(*sp) - i16::from(*ss);
             let target_int_digits = i16::from(*tp) - i16::from(*ts);
-            target_int_digits < source_int_digits || ts < ss
+            !source_exact || target_int_digits < source_int_digits || ts < ss
         }
         (a, b) if a == b => false,
+        // An integer fits a DECIMAL with as many integer digits as the
+        // integer's widest value: 10 for a 32-bit one, 19 for a 64-bit one.
+        // Snowflake's `INTEGER` / `BIGINT` are `NUMBER(38,0)` (#2333). Only
+        // when the input's integer type is read from the SQL: a guessed
+        // width (`x * 1000000` read as INT) may hold a value that does not
+        // fit, and a non-ANSI cast returns NULL for it.
+        (
+            T::Int32,
+            T::Decimal {
+                precision: tp,
+                scale: ts,
+            },
+        ) => !source_exact || i16::from(*tp) - i16::from(*ts) < 10,
+        (
+            T::Int64,
+            T::Decimal {
+                precision: tp,
+                scale: ts,
+            },
+        ) => !source_exact || i16::from(*tp) - i16::from(*ts) < 19,
         (T::Boolean, T::Int32 | T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int32, T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int64, T::Float32 | T::Float64) => false,
@@ -3432,7 +3525,118 @@ fn decimal_digits(info: &ast::ExactNumberInfo) -> Option<(u8, u8)> {
     Some((u8::try_from(precision).ok()?, u8::try_from(scale).ok()?))
 }
 
+/// The type of a `CAST` to `dt` on the warehouses of `target` (#2333).
+///
+/// - A name that means the same on every warehouse
+///   ([`data_type_is_warehouse_independent`]) has that type.
+/// - Any other name is typed per warehouse ([`dialect_cast_type`]). It has a
+///   type only when every target warehouse is known and they all agree.
+/// - With no known target it stays [`RockyType::Unknown`], the same answer a
+///   cast over an unknown input gives (#2334): a wrong concrete type would
+///   fail a correct contract with `E011`.
+fn cast_target_type(dt: &ast::DataType, target: &OperandTarget) -> RockyType {
+    if data_type_is_warehouse_independent(dt) {
+        return sql_type_to_rocky(dt);
+    }
+    let mut types = target
+        .known_dialects()
+        .iter()
+        .map(|dialect| dialect_cast_type(dt, *dialect));
+    let Some(first) = types.next() else {
+        return RockyType::Unknown;
+    };
+    if types.all(|ty| ty == first) {
+        first
+    } else {
+        RockyType::Unknown
+    }
+}
+
+/// The type a `CAST` to `dt` produces on `dialect`, for the names whose
+/// meaning differs between warehouses. `Unknown` where the warehouse has no
+/// such type or Rocky does not know its width.
+///
+/// - Integers: Snowflake's `TINYINT` … `BIGINT` are all `NUMBER(38,0)`, which
+///   Rocky reads as `Decimal(38,0)` (`rocky-snowflake/src/loader.rs`).
+///   BigQuery's are all `INT64`. PostgreSQL and Redshift have no `TINYINT`.
+///   Elsewhere `BIGINT` is 64-bit and the narrower names are `Int32`, the
+///   width Rocky gives a `TINYINT` / `SMALLINT` column too.
+/// - `REAL` is 32-bit except on Snowflake, where every float is 64-bit.
+///   BigQuery has only `FLOAT64`.
+/// - `FLOAT` is 32-bit on DuckDB and Databricks, 64-bit on Snowflake,
+///   PostgreSQL, Redshift and SQL Server. `FLOAT(p)` is 32-bit for
+///   `p <= 24` and 64-bit for `25 <= p <= 53` on PostgreSQL and SQL Server.
+///   BigQuery and Trino have no `FLOAT`.
+/// - A bare `TIMESTAMP` on Snowflake is `TIMESTAMP_NTZ`, `_LTZ` or `_TZ` by
+///   the session's `TIMESTAMP_TYPE_MAPPING`, so it is not known. On SQL
+///   Server `TIMESTAMP` is a row version, not a time.
+fn dialect_cast_type(dt: &ast::DataType, dialect: OperandDialect) -> RockyType {
+    use OperandDialect as D;
+    let integer = |wide: bool| match dialect {
+        D::Snowflake => RockyType::Decimal {
+            precision: 38,
+            scale: 0,
+        },
+        D::BigQuery => RockyType::Int64,
+        D::DuckDb | D::Databricks | D::Trino | D::SqlServer | D::Postgres | D::Redshift => {
+            if wide {
+                RockyType::Int64
+            } else {
+                RockyType::Int32
+            }
+        }
+    };
+    match dt {
+        ast::DataType::TinyInt(_) => match dialect {
+            D::Postgres | D::Redshift => RockyType::Unknown,
+            D::DuckDb | D::Snowflake | D::Databricks | D::BigQuery | D::Trino | D::SqlServer => {
+                integer(false)
+            }
+        },
+        ast::DataType::SmallInt(_) | ast::DataType::Int(_) | ast::DataType::Integer(_) => {
+            integer(false)
+        }
+        ast::DataType::BigInt(_) => integer(true),
+        ast::DataType::Real => match dialect {
+            D::Snowflake => RockyType::Float64,
+            D::BigQuery => RockyType::Unknown,
+            D::DuckDb | D::Databricks | D::Trino | D::SqlServer | D::Postgres | D::Redshift => {
+                RockyType::Float32
+            }
+        },
+        ast::DataType::Float(ast::ExactNumberInfo::None) => match dialect {
+            D::DuckDb | D::Databricks => RockyType::Float32,
+            D::Snowflake | D::Postgres | D::Redshift | D::SqlServer => RockyType::Float64,
+            D::BigQuery | D::Trino => RockyType::Unknown,
+        },
+        ast::DataType::Float(ast::ExactNumberInfo::Precision(p)) => match dialect {
+            D::Postgres | D::SqlServer => match p {
+                1..=24 => RockyType::Float32,
+                25..=53 => RockyType::Float64,
+                _ => RockyType::Unknown,
+            },
+            D::DuckDb | D::Snowflake | D::Databricks | D::BigQuery | D::Trino | D::Redshift => {
+                RockyType::Unknown
+            }
+        },
+        ast::DataType::Timestamp(_, _) => match dialect {
+            D::Snowflake | D::SqlServer => RockyType::Unknown,
+            D::DuckDb | D::Databricks | D::BigQuery | D::Trino | D::Postgres | D::Redshift => {
+                RockyType::Timestamp
+            }
+        },
+        // `MEDIUMINT` is MySQL's; no warehouse here has it.
+        ast::DataType::MediumInt(_)
+        | ast::DataType::Float(ast::ExactNumberInfo::PrecisionAndScale(_, _)) => RockyType::Unknown,
+        _ => sql_type_to_rocky(dt),
+    }
+}
+
 /// Convert an sqlparser DataType to RockyType.
+///
+/// This is the reading with no warehouse in view. A `CAST` target goes
+/// through [`cast_target_type`] instead, which only uses this for names that
+/// mean the same everywhere or once the warehouse is known.
 fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
     match dt {
         ast::DataType::Boolean => RockyType::Boolean,
@@ -3443,7 +3647,9 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
         | ast::DataType::MediumInt(_) => RockyType::Int32,
         ast::DataType::BigInt(_) => RockyType::Int64,
         ast::DataType::Float(_) | ast::DataType::Real => RockyType::Float32,
-        ast::DataType::Double(_) | ast::DataType::DoublePrecision => RockyType::Float64,
+        ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float64 => {
+            RockyType::Float64
+        }
         ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
             // Out-of-range digits (`NUMERIC(300, 0)`) are not a type Rocky
             // can name; narrowing them with `as u8` wrapped to a wrong one.
@@ -3565,12 +3771,16 @@ pub fn infer_select_types(
     scope: &HashMap<String, Vec<TypedColumn>>,
     _model_name: &str,
 ) -> Result<Vec<TypedColumn>, String> {
-    infer_select_types_with_lookup(sql, &|name| {
-        scope
-            .get(name)
-            .or_else(|| scope.get(name.rsplit('.').next().unwrap_or(name)))
-            .map(Vec::as_slice)
-    })
+    infer_select_types_with_lookup(
+        sql,
+        &|name| {
+            scope
+                .get(name)
+                .or_else(|| scope.get(name.rsplit('.').next().unwrap_or(name)))
+                .map(Vec::as_slice)
+        },
+        &OperandTarget::Unconfigured,
+    )
     .map(|inferred| inferred.columns)
 }
 
@@ -3581,6 +3791,11 @@ pub(crate) struct SelectInference {
     /// Outputs whose inferred type comes straight from the SQL — see
     /// [`has_exact_type`].
     exact_type_outputs: HashSet<usize>,
+    /// Outputs whose type is a guess for a query that reads this one as a
+    /// relation (a CTE or derived table): an expression that is not exact,
+    /// or a `*` column that was not exact where it came from. An outer
+    /// expression over such a column is not exact either (#2320).
+    relation_inexact: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
     /// Outputs whose projection is itself a cast (`CAST`, `TRY_CAST`,
@@ -3603,11 +3818,17 @@ impl SelectInference {
             && matches!(data_type, RockyType::Decimal { .. });
         if has_exact_type(expr, scope) && !widened_decimal {
             self.exact_type_outputs.insert(self.columns.len());
+        } else {
+            self.relation_inexact.insert(self.columns.len());
         }
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
-        if is_cast_expr(expr) && cast_target_is_warehouse_independent(expr) {
+        // The cast's type was read for the model's warehouses
+        // ([`cast_target_type`]): a name whose meaning differs between them
+        // is `Unknown` unless they are known, so the merge takes nothing
+        // from it.
+        if is_cast_expr(expr) {
             self.cast_outputs.insert(self.columns.len());
         }
 
@@ -3619,44 +3840,39 @@ impl SelectInference {
     }
 }
 
-/// Whether the cast `expr` names a target type that means the same thing on
-/// every warehouse Rocky targets. Only then may a cast over an input Rocky
-/// cannot type take the target as its output type.
+/// Whether the cast target `dt` means the same thing on every warehouse
+/// Rocky targets, so it has a type when the warehouse is not known.
 ///
 /// The list: BOOLEAN; DOUBLE / DOUBLE PRECISION / FLOAT64 (every warehouse
 /// that accepts one of these spellings means a 64-bit float; BigQuery has no
 /// `DOUBLE` and rejects it); DECIMAL / NUMERIC with `1 <= p <= 38` and
 /// `0 <= s <= p`; VARCHAR, CHAR, TEXT, STRING; BINARY, VARBINARY, BLOB; DATE.
 ///
-/// `sql_type_to_rocky` reads `FLOAT` / `REAL` and `INT` / `INTEGER` as
-/// 32-bit, but Snowflake's `FLOAT` is 64-bit, its `INTEGER` and `BIGINT` are
+/// Snowflake's `FLOAT` is 64-bit, its `INTEGER` and `BIGINT` are
 /// `NUMBER(38,0)`, PostgreSQL's `FLOAT` is `DOUBLE PRECISION`, and Snowflake's
-/// bare `TIMESTAMP` is `TIMESTAMP_NTZ`. Those names, and any name not listed
-/// here, stay `Unknown`, like a bare `DECIMAL`.
-fn cast_target_is_warehouse_independent(expr: &Expr) -> bool {
-    match expr {
-        Expr::Nested(inner) => cast_target_is_warehouse_independent(inner),
-        Expr::Cast { data_type, .. } => match data_type {
-            ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
-                decimal_digits(info).is_some()
-            }
-            _ => matches!(
-                data_type,
-                ast::DataType::Boolean
-                    | ast::DataType::Double(_)
-                    | ast::DataType::DoublePrecision
-                    | ast::DataType::Float64
-                    | ast::DataType::Varchar(_)
-                    | ast::DataType::Char(_)
-                    | ast::DataType::Text
-                    | ast::DataType::String(_)
-                    | ast::DataType::Binary(_)
-                    | ast::DataType::Varbinary(_)
-                    | ast::DataType::Blob(_)
-                    | ast::DataType::Date
-            ),
-        },
-        _ => false,
+/// bare `TIMESTAMP` follows a session parameter. Those names, and any name
+/// not listed here, are typed only for a known warehouse
+/// ([`dialect_cast_type`]); a bare `DECIMAL` never is.
+fn data_type_is_warehouse_independent(dt: &ast::DataType) -> bool {
+    match dt {
+        ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
+            decimal_digits(info).is_some()
+        }
+        _ => matches!(
+            dt,
+            ast::DataType::Boolean
+                | ast::DataType::Double(_)
+                | ast::DataType::DoublePrecision
+                | ast::DataType::Float64
+                | ast::DataType::Varchar(_)
+                | ast::DataType::Char(_)
+                | ast::DataType::Text
+                | ast::DataType::String(_)
+                | ast::DataType::Binary(_)
+                | ast::DataType::Varbinary(_)
+                | ast::DataType::Blob(_)
+                | ast::DataType::Date
+        ),
     }
 }
 
@@ -3680,9 +3896,10 @@ fn function_name(expr: &Expr) -> Option<String> {
 }
 
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
-/// itself rather than from a guess: a column, a cast (its target), `COUNT`,
-/// `SUM` / `MIN` / `MAX` / `AVG` over one of these, or a `CASE` / `COALESCE`
-/// whose branches agree (see [`branches_agree`]).
+/// itself rather than from a guess: a column (of a CTE or derived table,
+/// only when the expression that built it is exact — #2320), a cast (its
+/// target), `COUNT`, `SUM` / `MIN` / `MAX` / `AVG` over one of these, or a
+/// `CASE` / `COALESCE` whose branches agree (see [`branches_agree`]).
 ///
 /// Anything else — a scalar function whose result width is dialect-dependent
 /// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
@@ -3690,7 +3907,13 @@ fn function_name(expr: &Expr) -> Option<String> {
 /// (#2295).
 fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
+        // A column of a CTE or derived table is exact only when the
+        // expression that built it is (#2320).
+        Expr::Identifier(ident) => scope.is_exact(&ident.value),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            scope.is_exact_qualified(&parts[parts.len() - 2].value, &parts[parts.len() - 1].value)
+        }
+        Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
         Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
@@ -3805,50 +4028,110 @@ fn strip_nested(expr: &Expr) -> &Expr {
     }
 }
 
+/// The columns of one relation a query reads: a table, a model, a CTE.
+#[derive(Clone, Copy)]
+pub(crate) struct RelationRef<'a> {
+    pub(crate) columns: &'a [TypedColumn],
+    /// Positions in `columns` whose type is a guess (a CTE column built
+    /// from an expression that is not exact). `None`: every column is exact,
+    /// as for a table or a model.
+    pub(crate) inexact: Option<&'a HashSet<usize>>,
+}
+
+impl<'a> From<&'a [TypedColumn]> for RelationRef<'a> {
+    fn from(columns: &'a [TypedColumn]) -> Self {
+        Self {
+            columns,
+            inexact: None,
+        }
+    }
+}
+
+/// What expression inference reads besides the SQL: the relations in scope
+/// and the warehouses the SQL runs on.
+#[derive(Clone, Copy)]
+pub(crate) struct InferEnv<'e, 'a> {
+    pub(crate) lookup: &'e dyn Fn(&str) -> Option<RelationRef<'a>>,
+    pub(crate) target: &'e OperandTarget,
+}
+
 fn infer_select_types_with_lookup<'a>(
     sql: &str,
     lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    target: &OperandTarget,
 ) -> Result<SelectInference, String> {
     let dialect = rocky_sql::dialect::DatabricksDialect;
     let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
     let Statement::Query(query) = stmts.first().ok_or("empty SQL")? else {
         return Err("only SELECT statements supported".to_string());
     };
-    infer_query_types(query, lookup)
+    let relation = |name: &str| lookup(name).map(RelationRef::from);
+    infer_query_types(
+        query,
+        InferEnv {
+            lookup: &relation,
+            target,
+        },
+    )
 }
 
-pub(crate) fn infer_query_types<'a>(
+pub(crate) fn infer_query_types(
     query: &ast::Query,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    env: InferEnv<'_, '_>,
 ) -> Result<SelectInference, String> {
-    let mut ctes: HashMap<String, Vec<TypedColumn>> = HashMap::new();
+    // Each CTE keeps which of its columns are exact, so an outer expression
+    // over one is exact only when the CTE's expression is (#2320).
+    let mut ctes: HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> = HashMap::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let mut columns = infer_query_types(&cte.query, &|name| {
-                ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name))
-            })
-            .unwrap_or_default()
-            .columns;
+            let inferred = {
+                let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
+                infer_query_types(
+                    &cte.query,
+                    InferEnv {
+                        lookup: &lookup,
+                        target: env.target,
+                    },
+                )
+                .unwrap_or_default()
+            };
+            let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(cte.alias.name.value.clone(), columns);
+            ctes.insert(
+                cte.alias.name.value.clone(),
+                (columns, inferred.relation_inexact),
+            );
         }
     }
-    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
-    infer_set_expr_types(query.body.as_ref(), &lookup)
+    let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
+    infer_set_expr_types(
+        query.body.as_ref(),
+        InferEnv {
+            lookup: &lookup,
+            target: env.target,
+        },
+    )
+}
+
+fn cte_relation<'c>(
+    ctes: &'c HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
+    name: &str,
+) -> Option<RelationRef<'c>> {
+    ctes.get(name).map(|(columns, inexact)| RelationRef {
+        columns,
+        inexact: Some(inexact),
+    })
 }
 
 /// Infer the output columns of one query body: a `SELECT`, a parenthesised
 /// query, or a set operation over bodies (#2303).
-fn infer_set_expr_types<'a>(
-    body: &SetExpr,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
-) -> Result<SelectInference, String> {
+fn infer_set_expr_types(body: &SetExpr, env: InferEnv<'_, '_>) -> Result<SelectInference, String> {
     match body {
-        SetExpr::Select(select) => infer_select_types_in_scope(select, lookup),
-        SetExpr::Query(query) => infer_query_types(query, lookup),
+        SetExpr::Select(select) => infer_select_types_in_scope(select, env),
+        SetExpr::Query(query) => infer_query_types(query, env),
         SetExpr::SetOperation { left, right, .. } => {
-            let left = infer_set_expr_types(left, lookup)?;
-            let right = infer_set_expr_types(right, lookup)?;
+            let left = infer_set_expr_types(left, env)?;
+            let right = infer_set_expr_types(right, env)?;
             combine_set_operation(left, &right)
         }
         _ => Err("unsupported query form".to_string()),
@@ -3875,6 +4158,7 @@ fn combine_set_operation(
         return Err("set operation branches differ in column count".to_string());
     }
     let mut exact_type_outputs = HashSet::new();
+    let mut relation_inexact = HashSet::new();
     let mut count_outputs = HashSet::new();
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
@@ -3888,6 +4172,12 @@ fn combine_set_operation(
         if both_exact && same_type && data_type != RockyType::Unknown {
             exact_type_outputs.insert(index);
         }
+        if left.relation_inexact.contains(&index)
+            || right.relation_inexact.contains(&index)
+            || !same_type
+        {
+            relation_inexact.insert(index);
+        }
         if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
             count_outputs.insert(index);
         }
@@ -3897,6 +4187,7 @@ fn combine_set_operation(
     Ok(SelectInference {
         columns: left.columns,
         exact_type_outputs,
+        relation_inexact,
         count_outputs,
         // A combined column's type is a supertype across branches, not a
         // single cast target.
@@ -3922,11 +4213,11 @@ fn set_operation_column_type(
     }
 }
 
-fn infer_select_types_in_scope<'a>(
+fn infer_select_types_in_scope(
     select: &ast::Select,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    env: InferEnv<'_, '_>,
 ) -> Result<SelectInference, String> {
-    let (from_scope, type_scope) = select_type_scope(select, &lookup);
+    let (from_scope, type_scope) = select_type_scope(select, env);
 
     let mut inferred = SelectInference::default();
 
@@ -3949,7 +4240,12 @@ fn infer_select_types_in_scope<'a>(
                 }
             }
             SelectItem::Wildcard(_) => {
-                inferred.columns.extend(from_scope.columns.iter().cloned());
+                for col in &from_scope.columns {
+                    if from_scope.inexact.contains(CiStr::new(&col.name)) {
+                        inferred.relation_inexact.insert(inferred.columns.len());
+                    }
+                    inferred.columns.push(col.clone());
+                }
             }
             SelectItem::QualifiedWildcard(
                 ast::SelectItemQualifiedWildcardKind::ObjectName(name),
@@ -3960,7 +4256,12 @@ fn infer_select_types_in_scope<'a>(
                 };
                 for relation in &from_scope.relations {
                     if relation.qualifier.eq_ignore_ascii_case(&name.value) {
-                        inferred.columns.extend(relation.columns.iter().cloned());
+                        for col in &relation.columns {
+                            if relation.inexact.contains(CiStr::new(&col.name)) {
+                                inferred.relation_inexact.insert(inferred.columns.len());
+                            }
+                            inferred.columns.push(col.clone());
+                        }
                     }
                 }
             }
@@ -3975,17 +4276,28 @@ fn infer_select_types_in_scope<'a>(
 /// and the [`TypeScope`] that resolves bare and qualified column names
 /// against them. A bare name exposed by more than one relation is ambiguous
 /// and resolves to `Unknown`.
-pub(crate) fn select_type_scope<'a>(
+pub(crate) fn select_type_scope(
     select: &ast::Select,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    env: InferEnv<'_, '_>,
 ) -> (JoinScope, TypeScope) {
     let mut from_scope = JoinScope::default();
     for from in &select.from {
-        let joined = infer_join_relations(from, lookup);
+        let joined = infer_join_relations(from, env);
         from_scope.relations.extend(joined.relations);
         from_scope.columns.extend(joined.columns);
+        from_scope.inexact.extend(joined.inexact);
     }
-    let mut type_scope = TypeScope::new();
+    let mut type_scope = TypeScope::with_target(env.target.clone());
+    type_scope.inexact.clone_from(&from_scope.inexact);
+    for relation in &from_scope.relations {
+        if !relation.inexact.is_empty() {
+            type_scope
+                .qualified_inexact
+                .entry(CiKey::owned(relation.qualifier.clone()))
+                .or_default()
+                .extend(relation.inexact.iter().cloned());
+        }
+    }
     for col in &from_scope.columns {
         type_scope
             .columns
@@ -4011,6 +4323,8 @@ pub(crate) fn select_type_scope<'a>(
 pub(crate) struct RelationColumns {
     qualifier: String,
     columns: Vec<TypedColumn>,
+    /// Names in `columns` whose type is a guess (see [`RelationRef`]).
+    inexact: HashSet<CiKey<'static>>,
 }
 
 #[derive(Default)]
@@ -4019,17 +4333,18 @@ pub(crate) struct JoinScope {
     // merge only in the unqualified output used by SELECT * and bare names.
     relations: Vec<RelationColumns>,
     columns: Vec<TypedColumn>,
+    /// Names in `columns` whose type is a guess. A name that is a guess in
+    /// any relation counts, which also covers a merged USING key.
+    inexact: HashSet<CiKey<'static>>,
 }
 
-fn infer_join_relations<'a>(
-    from: &ast::TableWithJoins,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
-) -> JoinScope {
+fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> JoinScope {
     use ast::JoinOperator;
 
-    let mut left = infer_relation_columns(&from.relation, lookup);
+    let mut left = infer_relation_columns(&from.relation, env);
     for join in &from.joins {
-        let mut right = infer_relation_columns(&join.relation, lookup);
+        let mut right = infer_relation_columns(&join.relation, env);
+        left.inexact.extend(std::mem::take(&mut right.inexact));
         let merged = merged_join_columns(&left.columns, &right.columns, &join.join_operator);
         if matches!(
             join.join_operator,
@@ -4145,35 +4460,49 @@ fn null_extend_scope(scope: &mut JoinScope) {
     }
 }
 
-fn infer_relation_columns<'a>(
-    factor: &TableFactor,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
-) -> JoinScope {
-    let (qualifier, mut columns, alias) = match factor {
+fn infer_relation_columns(factor: &TableFactor, env: InferEnv<'_, '_>) -> JoinScope {
+    // `inexact` holds positions, so it survives the alias renaming below.
+    let (qualifier, mut columns, inexact, alias) = match factor {
         TableFactor::Table { name, alias, .. } => {
             let name = name.to_string();
             let short = name.rsplit('.').next().unwrap_or(&name);
-            let columns = lookup(&name).unwrap_or_default().to_vec();
-            (short.to_string(), columns, alias)
+            let relation = (env.lookup)(&name);
+            let columns = relation.map(|r| r.columns).unwrap_or_default().to_vec();
+            let inexact = relation
+                .and_then(|r| r.inexact)
+                .cloned()
+                .unwrap_or_default();
+            (short.to_string(), columns, inexact, alias)
         }
+        // A derived table keeps which columns are exact, as a CTE does
+        // (#2320).
         TableFactor::Derived {
             subquery, alias, ..
-        } => (
-            String::new(),
-            infer_query_types(subquery, lookup)
-                .unwrap_or_default()
-                .columns,
-            alias,
-        ),
+        } => {
+            let inferred = infer_query_types(subquery, env).unwrap_or_default();
+            (
+                String::new(),
+                inferred.columns,
+                inferred.relation_inexact,
+                alias,
+            )
+        }
         TableFactor::NestedJoin {
             table_with_joins,
             alias,
         } => {
-            let scope = infer_join_relations(table_with_joins, lookup);
+            let scope = infer_join_relations(table_with_joins, env);
             if alias.is_none() {
                 return scope;
             }
-            (String::new(), scope.columns, alias)
+            let inexact = scope
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| scope.inexact.contains(CiStr::new(&col.name)))
+                .map(|(index, _)| index)
+                .collect();
+            (String::new(), scope.columns, inexact, alias)
         }
         _ => return JoinScope::default(),
     };
@@ -4183,12 +4512,19 @@ fn infer_relation_columns<'a>(
     } else {
         qualifier
     };
+    let inexact: HashSet<CiKey<'static>> = inexact
+        .iter()
+        .filter_map(|&index| columns.get(index))
+        .map(|col| CiKey::owned(col.name.clone()))
+        .collect();
     JoinScope {
         relations: vec![RelationColumns {
             qualifier,
             columns: columns.clone(),
+            inexact: inexact.clone(),
         }],
         columns,
+        inexact,
     }
 }
 
@@ -4573,7 +4909,7 @@ mod tests {
         let sql = "SELECT CAST(a.id AS BIGINT) AS kept, CAST(b.id AS BIGINT) AS extended, \
                    TRY_CAST(a.id AS BIGINT) AS fallible, COALESCE(b.id, 0) AS fallback, \
                    COUNT(b.id) AS count_id FROM users a LEFT JOIN users b ON a.id = b.id";
-        let columns = infer_select_types(sql, &sources, "joined").unwrap();
+        let columns = infer_select_types_on(sql, &sources, &duckdb());
         assert_eq!(columns.len(), 5);
         for (col, nullable) in columns.iter().zip([false, true, true, false, false]) {
             assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
@@ -4581,7 +4917,13 @@ mod tests {
         }
         let project = Project::from_models(vec![make_model("joined", sql)]).unwrap();
         let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
-        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
         let columns = &result.typed_models["joined"];
         for (col, nullable) in columns[..3].iter().zip([false, true, true]) {
             assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
@@ -4609,7 +4951,43 @@ mod tests {
 
     /// Typecheck one model over a source `t` (`x INT NOT NULL`, `n STRING NOT
     /// NULL`, `y INT NOT NULL`) and return its `(name, type, nullable)` rows.
+    /// A model that runs on DuckDB, so a cast to `INT` / `BIGINT` /
+    /// `TIMESTAMP` has a type (#2333).
+    fn duckdb() -> OperandTarget {
+        Some(OperandDialect::DuckDb).into()
+    }
+
+    /// [`infer_select_types`] for SQL that runs on `target`.
+    fn infer_select_types_on(
+        sql: &str,
+        sources: &HashMap<String, Vec<TypedColumn>>,
+        target: &OperandTarget,
+    ) -> Vec<TypedColumn> {
+        infer_select_types_with_lookup(
+            sql,
+            &|name| {
+                sources
+                    .get(name)
+                    .or_else(|| sources.get(name.rsplit('.').next().unwrap_or(name)))
+                    .map(Vec::as_slice)
+            },
+            target,
+        )
+        .unwrap()
+        .columns
+    }
+
+    /// Typecheck model `m` over `source` (`x INT`, `n STRING`, `y INT`, all
+    /// NOT NULL) on DuckDB.
     fn typecheck_over_t(source: &str, sql: &str) -> Vec<(String, RockyType, bool)> {
+        typecheck_over_t_on(duckdb(), source, sql)
+    }
+
+    fn typecheck_over_t_on(
+        target: OperandTarget,
+        source: &str,
+        sql: &str,
+    ) -> Vec<(String, RockyType, bool)> {
         let sources = HashMap::from([(
             source.to_string(),
             source_schema(&[
@@ -4620,7 +4998,13 @@ mod tests {
         )]);
         let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
         let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
-        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(target),
+        );
         result.typed_models["m"]
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
@@ -4712,7 +5096,13 @@ mod tests {
         let sources = HashMap::from([("t".to_string(), schema()), ("u".to_string(), schema())]);
         let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
         let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
-        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
         result.typed_models["m"]
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
@@ -5205,7 +5595,7 @@ mod tests {
     #[test]
     fn cast_fallibility_by_source_type() {
         let d = |precision, scale| RockyType::Decimal { precision, scale };
-        let mut scope = TypeScope::new();
+        let mut scope = TypeScope::with_target(duckdb());
         for (name, ty) in [
             ("d102", d(10, 2)),
             ("i64", RockyType::Int64),
@@ -5224,11 +5614,18 @@ mod tests {
             ("CAST(d102 AS DECIMAL(10,2))", false),
             ("CAST(d102 AS DECIMAL(5,2))", true),
             ("CAST(d102 AS DECIMAL(12,0))", true),
+            // A product of DECIMALs is typed with the wider operand's digits,
+            // a guess: the true product can overflow the target.
+            ("CAST(d102 * d102 AS DECIMAL(12,2))", true),
+            ("CAST(d102 * d102 AS DECIMAL(10,2))", true),
             ("CAST(d102 AS DOUBLE)", false),
             ("CAST(d102 AS BIGINT)", true),
             ("CAST(i64 AS DOUBLE)", false),
             ("CAST(i64 AS INT)", true),
-            ("CAST(i64 AS DECIMAL(20,0))", true),
+            // 19 integer digits hold every 64-bit integer (#2333).
+            ("CAST(i64 AS DECIMAL(20,0))", false),
+            ("CAST(i64 AS DECIMAL(19,0))", false),
+            ("CAST(i64 AS DECIMAL(20,2))", true),
             ("CAST(f64 AS FLOAT)", true),
             ("CAST(f64 AS BIGINT)", true),
             ("CAST(dt AS TIMESTAMP)", false),
@@ -5315,45 +5712,151 @@ mod tests {
         let sql = "WITH c AS (SELECT CASE WHEN x > 0 THEN 'hi' ELSE 'lo' END AS label, \
                    x * 1.5 AS amt FROM t) \
                    SELECT MAX(label) AS a, SUM(amt) AS b, CAST(amt AS BIGINT) AS d FROM c";
-        let typed = typecheck_over_t("t", sql);
-        let by_name: HashMap<_, _> = typed.iter().map(|(n, t, _)| (n.as_str(), t)).collect();
-        // `x` is INT: neither result may be an integer. Unknown or the
-        // inferred type are both sound.
-        assert!(
-            matches!(by_name["a"], RockyType::Unknown | RockyType::String),
-            "{:?}",
-            by_name["a"]
+        // `x` is INT: no result may be an integer from `x`. `MAX` over the
+        // all-text CASE is text, and NULL over zero rows. `SUM(amt)` reads
+        // `x * 1.5`, whose type Rocky guesses, so it is Unknown (#2320).
+        // `CAST(amt AS BIGINT)` is the cast's target on DuckDB.
+        assert_eq!(
+            typecheck_over_t("t", sql),
+            vec![
+                ("a".to_string(), RockyType::String, true),
+                ("b".to_string(), RockyType::Unknown, true),
+                ("d".to_string(), RockyType::Int64, false),
+            ]
         );
-        // `b` (SUM over `x * 1.5`) is typed by expression inference, which
-        // reads the arithmetic as an integer: not asserted; the edge kind is
-        // pinned in rocky-sql.
         // Scenarios A and B: a wrapper over a cast or an aggregate column.
-        {
-            let typed = typecheck_over_t(
-                "t",
-                "WITH c AS (SELECT CAST(x AS VARCHAR) AS s, COUNT(n) AS k, MAX(x) AS mx FROM t) \
+        let typed = typecheck_over_t(
+            "t",
+            "WITH c AS (SELECT CAST(x AS VARCHAR) AS s, COUNT(n) AS k, MAX(x) AS mx FROM t) \
              SELECT MAX(s) AS a, MAX(k) AS b, SUM(k) AS e, CAST(mx AS BIGINT) AS f FROM c",
-            );
-            let by_name: HashMap<_, _> = typed
-                .iter()
-                .map(|(n, t, nl)| (n.as_str(), (t, *nl)))
+        );
+        let by_name: HashMap<_, _> = typed
+            .iter()
+            .map(|(n, t, nl)| (n.as_str(), (t.clone(), *nl)))
+            .collect();
+        // Each outer aggregate is NULL over zero rows.
+        assert_eq!(by_name["a"], (RockyType::String, true));
+        assert_eq!(by_name["b"], (RockyType::Int64, true));
+        // `SUM` of a BIGINT is wider than BIGINT on some warehouses (DuckDB
+        // HUGEINT); only that it is not text, and nullable, is pinned here.
+        assert!(!matches!(by_name["e"].0, RockyType::String), "{by_name:?}");
+        assert!(by_name["e"].1, "{by_name:?}");
+        // MAX(x) is NULL over zero rows, so the cast of it is nullable even
+        // though `x` is NOT NULL.
+        assert_eq!(by_name["f"], (RockyType::Int64, true));
+    }
+
+    /// #2320: a CTE column is exact only when the expression that built it
+    /// is. `LENGTH`'s width and `x * 1.5`'s type are guesses, so an outer
+    /// aggregate over them is Unknown, as the same expression written inline
+    /// is (#2295). A CTE column that is a cast or a bare column stays exact,
+    /// also through `SELECT *` and a qualified read.
+    #[test]
+    fn an_outer_expression_over_a_cte_column_is_exact_only_when_the_column_is() {
+        type Expected<'a> = Vec<(&'a str, RockyType, bool)>;
+        let cases: Vec<(&str, Expected)> = vec![
+            (
+                "WITH c AS (SELECT LENGTH(n) AS l FROM t) \
+                 SELECT MAX(l) AS m, MAX(c.l) AS q FROM c",
+                vec![
+                    ("m", RockyType::Unknown, true),
+                    ("q", RockyType::Unknown, true),
+                ],
+            ),
+            // The inline form, for comparison.
+            (
+                "SELECT MAX(LENGTH(n)) AS m FROM t",
+                vec![("m", RockyType::Unknown, true)],
+            ),
+            (
+                "WITH c AS (SELECT x * 1.5 AS amt FROM t) SELECT SUM(amt) AS s FROM c",
+                vec![("s", RockyType::Unknown, true)],
+            ),
+            // Controls: a cast and a bare column keep their types.
+            (
+                "WITH c AS (SELECT CAST(x AS DOUBLE) AS d, x FROM t) \
+                 SELECT MAX(d) AS m, MAX(c.d) AS q, MAX(x) AS mx FROM c",
+                vec![
+                    ("m", RockyType::Float64, true),
+                    ("q", RockyType::Float64, true),
+                    ("mx", RockyType::Int32, true),
+                ],
+            ),
+            // `SELECT *` carries each column's exactness.
+            (
+                "WITH c AS (SELECT LENGTH(n) AS l, CAST(x AS DOUBLE) AS d FROM t), \
+                 w AS (SELECT * FROM c) SELECT MAX(l) AS m, MAX(d) AS md FROM w",
+                vec![
+                    ("m", RockyType::Unknown, true),
+                    ("md", RockyType::Float64, true),
+                ],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let expected: Vec<(String, RockyType, bool)> = expected
+                .into_iter()
+                .map(|(n, t, nl)| (n.to_string(), t, nl))
                 .collect();
-            assert!(!by_name["a"].0.is_integer(), "{:?}", by_name["a"]);
-            assert!(
-                !matches!(by_name["b"].0, RockyType::String),
-                "{:?}",
-                by_name["b"]
-            );
-            assert!(
-                !matches!(by_name["e"].0, RockyType::String),
-                "{:?}",
-                by_name["e"]
-            );
-            // MAX(x) is NULL over zero rows, so the cast of it is nullable even
-            // though `x` is NOT NULL.
-            assert!(by_name["f"].1, "{:?}", by_name["f"]);
+            assert_eq!(typecheck_over_t("t", sql), expected, "{sql}");
         }
-        assert_eq!(by_name["d"], &RockyType::Int64);
+    }
+
+    /// #2320 one layer down: the exact flag an outer query reads for a CTE or
+    /// derived-table column. A derived table keeps it the way a CTE does.
+    #[test]
+    fn a_cte_or_derived_column_built_from_a_guess_is_not_exact() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        for (sql, exact) in [
+            (
+                "WITH c AS (SELECT LENGTH(n) AS l FROM t) SELECT MAX(l) FROM c",
+                false,
+            ),
+            ("SELECT MAX(l) FROM (SELECT LENGTH(n) AS l FROM t) s", false),
+            (
+                "SELECT MAX(s.l) FROM (SELECT LENGTH(n) AS l FROM t) s",
+                false,
+            ),
+            (
+                "SELECT MAX(l) FROM (SELECT * FROM (SELECT LENGTH(n) AS l FROM t) a) s",
+                false,
+            ),
+            (
+                "SELECT MAX(d) FROM (SELECT CAST(x AS DOUBLE) AS d FROM t) s",
+                true,
+            ),
+            ("WITH c AS (SELECT x FROM t) SELECT MAX(x) FROM c", true),
+            // A USING key is a guess when either side's is.
+            (
+                "SELECT MAX(l) FROM (SELECT LENGTH(n) AS l FROM t) a \
+                 JOIN (SELECT LENGTH(n) AS l FROM t) b USING (l)",
+                false,
+            ),
+            // A set operation is exact only when both branches are.
+            (
+                "WITH c AS (SELECT CAST(x AS DOUBLE) AS d FROM t \
+                 UNION ALL SELECT CAST(n AS DOUBLE) FROM t) SELECT MAX(d) FROM c",
+                true,
+            ),
+            (
+                "WITH c AS (SELECT CAST(x AS DOUBLE) AS d FROM t \
+                 UNION ALL SELECT LENGTH(n) FROM t) SELECT MAX(d) FROM c",
+                false,
+            ),
+        ] {
+            let inferred = infer_select_types_with_lookup(
+                sql,
+                &|name| sources.get(name).map(Vec::as_slice),
+                &duckdb(),
+            )
+            .unwrap();
+            assert_eq!(inferred.exact_type_outputs.contains(&0), exact, "{sql}");
+        }
     }
 
     /// Golden table for #2298: expression -> (type, nullable) through direct
@@ -5514,8 +6017,13 @@ mod tests {
             let sql = format!("SELECT {expr} AS c FROM t");
             let project = Project::from_models(vec![make_model("m", &sql)]).unwrap();
             let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
-            let result =
-                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let result = typecheck_project_for_targets(
+                &graph,
+                &sources,
+                &project.models,
+                None,
+                &TargetDialects::uniform(duckdb()),
+            );
             let columns = &result.typed_models["m"];
             let has_e012 = validate_contract("m", columns, &contract(type_name))
                 .iter()
@@ -5864,9 +6372,11 @@ mod tests {
                 assert_eq!(col.nullable, nullable, "{sql}");
             }
         }
-        let columns = infer_select_types_with_lookup("SELECT u.id FROM raw.users u", &|name| {
-            sources.get(name).map(Vec::as_slice)
-        })
+        let columns = infer_select_types_with_lookup(
+            "SELECT u.id FROM raw.users u",
+            &|name| sources.get(name).map(Vec::as_slice),
+            &OperandTarget::Unconfigured,
+        )
         .unwrap()
         .columns;
         assert_eq!(columns[0].data_type, RockyType::Unknown);
@@ -5906,6 +6416,7 @@ mod tests {
             &affected,
             &previous,
             None,
+            &TargetDialects::default(),
         );
         let full = typecheck_project_with_models(&graph, &sources, None, &updated.models, None);
         assert_eq!(incremental.typed_models, full.typed_models);
@@ -6561,8 +7072,13 @@ mod tests {
                 source_schema(&[("id", RockyType::Int64, false)]),
             );
 
-            let result =
-                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let result = typecheck_project_for_targets(
+                &graph,
+                &sources,
+                &project.models,
+                None,
+                &TargetDialects::uniform(duckdb()),
+            );
             let casted = &result.typed_models["casted"][0];
             assert_eq!(
                 casted.data_type,
@@ -6623,7 +7139,13 @@ mod tests {
             source_schema(&[("id", RockyType::String, false)]),
         );
 
-        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
         let casted = &result.typed_models["casted"][0];
         assert_eq!(
             casted.data_type,
@@ -7064,9 +7586,220 @@ mod tests {
 
     #[test]
     fn test_infer_expr_cast() {
-        let scope = TypeScope::new();
+        let scope = TypeScope::with_target(duckdb());
         let expr = parse_expr("CAST(x AS BIGINT)");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
+    }
+
+    /// #2333: a cast to a name whose width differs between warehouses takes
+    /// the width of the model's warehouse, and is `Unknown` when that is not
+    /// known. The input `x` is a known `BIGINT NOT NULL`.
+    #[test]
+    fn a_cast_target_is_typed_for_the_models_warehouse() {
+        use OperandDialect as D;
+        let f32 = RockyType::Float32;
+        let f64 = RockyType::Float64;
+        let i32 = RockyType::Int32;
+        let i64 = RockyType::Int64;
+        let n38 = RockyType::Decimal {
+            precision: 38,
+            scale: 0,
+        };
+        let ts = RockyType::Timestamp;
+        let unknown = RockyType::Unknown;
+        // (target, [DuckDB, Snowflake, Databricks, BigQuery, Trino, SQL Server,
+        //  PostgreSQL, Redshift], no known warehouse)
+        let rows: Vec<(&str, [&RockyType; 8], &RockyType)> = vec![
+            (
+                "FLOAT",
+                [&f32, &f64, &f32, &unknown, &unknown, &f64, &f64, &f64],
+                &unknown,
+            ),
+            (
+                "REAL",
+                [&f32, &f64, &f32, &unknown, &f32, &f32, &f32, &f32],
+                &unknown,
+            ),
+            (
+                "FLOAT(24)",
+                [
+                    &unknown, &unknown, &unknown, &unknown, &unknown, &f32, &f32, &unknown,
+                ],
+                &unknown,
+            ),
+            (
+                "FLOAT(53)",
+                [
+                    &unknown, &unknown, &unknown, &unknown, &unknown, &f64, &f64, &unknown,
+                ],
+                &unknown,
+            ),
+            (
+                "INT",
+                [&i32, &n38, &i32, &i64, &i32, &i32, &i32, &i32],
+                &unknown,
+            ),
+            (
+                "INTEGER",
+                [&i32, &n38, &i32, &i64, &i32, &i32, &i32, &i32],
+                &unknown,
+            ),
+            (
+                "SMALLINT",
+                [&i32, &n38, &i32, &i64, &i32, &i32, &i32, &i32],
+                &unknown,
+            ),
+            (
+                "TINYINT",
+                [&i32, &n38, &i32, &i64, &i32, &i32, &unknown, &unknown],
+                &unknown,
+            ),
+            (
+                "BIGINT",
+                [&i64, &n38, &i64, &i64, &i64, &i64, &i64, &i64],
+                &unknown,
+            ),
+            (
+                "TIMESTAMP",
+                [&ts, &unknown, &ts, &ts, &ts, &unknown, &ts, &ts],
+                &unknown,
+            ),
+            // Names that mean the same everywhere keep their type with no
+            // known warehouse.
+            ("DOUBLE", [&f64; 8], &f64),
+            ("DATE", [&RockyType::Date; 8], &RockyType::Date),
+        ];
+        let dialects = [
+            D::DuckDb,
+            D::Snowflake,
+            D::Databricks,
+            D::BigQuery,
+            D::Trino,
+            D::SqlServer,
+            D::Postgres,
+            D::Redshift,
+        ];
+        let typed = |target: OperandTarget, cast: &str| {
+            let mut scope = TypeScope::with_target(target);
+            scope
+                .columns
+                .insert(CiKey::owned("x".to_string()), (RockyType::Int64, false));
+            infer_expr_type(&parse_expr(&format!("CAST(x AS {cast})")), &scope).0
+        };
+        for (cast, per_dialect, none) in &rows {
+            for (dialect, expected) in dialects.iter().zip(per_dialect) {
+                assert_eq!(
+                    &typed(Some(*dialect).into(), cast),
+                    *expected,
+                    "CAST(x AS {cast}) on {}",
+                    dialect.name()
+                );
+            }
+            assert_eq!(
+                &typed(OperandTarget::Unconfigured, cast),
+                *none,
+                "CAST(x AS {cast}) with no target"
+            );
+            // A warehouse Rocky has no width table for leaves it unknown too.
+            let unruled = OperandTarget::Targets {
+                dialects: vec![D::DuckDb],
+                unruled: vec!["clickhouse".to_string()],
+            };
+            assert_eq!(&typed(unruled, cast), *none, "CAST(x AS {cast}) + unruled");
+        }
+        // A model on two warehouses has a type only where they agree.
+        let both = |a, b| OperandTarget::Targets {
+            dialects: vec![a, b],
+            unruled: Vec::new(),
+        };
+        assert_eq!(typed(both(D::DuckDb, D::Databricks), "INT"), i32);
+        assert_eq!(typed(both(D::DuckDb, D::Snowflake), "INT"), unknown);
+        assert_eq!(typed(both(D::Postgres, D::Snowflake), "FLOAT"), f64);
+    }
+
+    /// #2333: each model is typed for its own warehouse; a model with no
+    /// entry takes the default.
+    #[test]
+    fn each_model_casts_for_its_own_warehouse() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("x", RockyType::Int64, false)]),
+        )]);
+        let sql = "SELECT CAST(x AS INT) AS i FROM t";
+        let project =
+            Project::from_models(vec![make_model("on_duck", sql), make_model("on_sf", sql)])
+                .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let mut targets = TargetDialects::uniform(duckdb());
+        targets.set("on_sf", Some(OperandDialect::Snowflake).into());
+        let result =
+            typecheck_project_for_targets(&graph, &sources, &project.models, None, &targets);
+        assert_eq!(
+            result.typed_models["on_duck"][0].data_type,
+            RockyType::Int32
+        );
+        assert_eq!(
+            result.typed_models["on_sf"][0].data_type,
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
+    }
+
+    /// #2333: on Snowflake `CAST(int_col AS BIGINT)` is `NUMBER(38,0)`. The
+    /// integer fits, so the cast cannot fail and a NOT NULL input stays NOT
+    /// NULL; a narrower DECIMAL can overflow.
+    #[test]
+    fn an_integer_cast_to_a_wide_decimal_keeps_the_inputs_nullability() {
+        let mut scope = TypeScope::with_target(Some(OperandDialect::Snowflake).into());
+        for (name, ty) in [("i32", RockyType::Int32), ("i64", RockyType::Int64)] {
+            scope
+                .columns
+                .insert(CiKey::owned(name.to_string()), (ty, false));
+        }
+        let n38 = RockyType::Decimal {
+            precision: 38,
+            scale: 0,
+        };
+        for (expr, ty, nullable) in [
+            ("CAST(i64 AS BIGINT)", &n38, false),
+            ("CAST(i32 AS INT)", &n38, false),
+            // The input's integer width is a guess: the product may not
+            // fit, and a non-ANSI cast of it returns NULL.
+            ("CAST(i32 * 1000000 AS BIGINT)", &n38, true),
+            ("CAST(i64 * i64 AS DECIMAL(38,0))", &n38, true),
+            (
+                "CAST(i32 AS DECIMAL(10,0))",
+                &RockyType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                },
+                false,
+            ),
+            (
+                "CAST(i32 AS DECIMAL(9,0))",
+                &RockyType::Decimal {
+                    precision: 9,
+                    scale: 0,
+                },
+                true,
+            ),
+            (
+                "CAST(i64 AS DECIMAL(18,0))",
+                &RockyType::Decimal {
+                    precision: 18,
+                    scale: 0,
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(
+                infer_expr_type(&parse_expr(expr), &scope),
+                (ty.clone(), nullable),
+                "{expr}"
+            );
+        }
     }
 
     #[test]
@@ -8894,9 +9627,19 @@ mod tests {
         models: &[(&str, &str)],
         sources: HashMap<String, Vec<TypedColumn>>,
     ) -> crate::compile::CompileResult {
+        compile_typed_on(models, sources, OperandTarget::Unconfigured)
+    }
+
+    /// [`compile_typed`] for models that run on `target`.
+    fn compile_typed_on(
+        models: &[(&str, &str)],
+        sources: HashMap<String, Vec<TypedColumn>>,
+        target: OperandTarget,
+    ) -> crate::compile::CompileResult {
         let models: Vec<Model> = models.iter().map(|(n, s)| make_model(n, s)).collect();
         let config = crate::compile::CompilerConfig {
             source_schemas: sources,
+            target_dialects: TargetDialects::uniform(target),
             ..Default::default()
         };
         crate::compile::compile_preloaded_models(models, &config).expect("compile")
@@ -9014,7 +9757,7 @@ mod tests {
                 ),
             ]),
         )]);
-        let result = compile_typed(&[("m", sql)], known);
+        let result = compile_typed_on(&[("m", sql)], known.clone(), duckdb());
         assert_eq!(
             column(&result, "m", "amount").data_type,
             RockyType::Decimal {
@@ -9027,6 +9770,17 @@ mod tests {
         assert_eq!(
             column(&result, "m", "bare_decimal").data_type,
             RockyType::Unknown
+        );
+        // With no known warehouse, BIGINT has no single width (#2333): a
+        // known input does not change that.
+        let result = compile_typed(&[("m", sql)], known);
+        assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Unknown);
+        assert_eq!(
+            column(&result, "m", "amount").data_type,
+            RockyType::Decimal {
+                precision: 12,
+                scale: 2
+            }
         );
 
         // No schema: the target is still the type, whatever the input is. The

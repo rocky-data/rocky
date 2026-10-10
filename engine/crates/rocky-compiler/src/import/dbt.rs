@@ -639,6 +639,15 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
 
         let (decls, unsupported) = super::dbt_tests::tests_to_test_decls(model_yaml, &resolver);
 
+        // A model the importer refused (or did not pick up) has no sidecar,
+        // so its tests are written nowhere: count them as skipped, not
+        // converted (#2337).
+        let model_imported = result.imported.iter().any(|m| &m.name == model_name);
+        if !model_imported {
+            result.tests_skipped += decls.len();
+        }
+        let decls = if model_imported { decls } else { Vec::new() };
+
         result.tests_converted += decls.len();
         // "custom" = converted tests that aren't the canonical column-level
         // built-ins (not_null / unique / accepted_values / relationships):
@@ -4052,6 +4061,7 @@ FROM raw.orders
         let dir = tempfile::TempDir::new().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("fct_orders.sql"), "select 1 as order_id").unwrap();
         std::fs::write(
             models_dir.join("schema.yml"),
             r#"
@@ -4069,32 +4079,8 @@ models:
             schema: "s".to_string(),
             table: String::new(),
         };
-        let mut result = ImportResult {
-            imported: Vec::new(),
-            warnings: Vec::new(),
-            structured_warnings: Vec::new(),
-            failed: Vec::new(),
-            sources_found: 0,
-            sources_mapped: 0,
-            import_method: ImportMethod::Regex,
-            project_name: None,
-            dbt_version: None,
-            tests_found: 0,
-            tests_converted: 0,
-            tests_converted_custom: 0,
-            tests_skipped: 0,
-            macros_detected: 0,
-            macros_expanded: 0,
-            macros_manifest_resolved: 0,
-            macros_unsupported: 0,
-            unit_tests_found: 0,
-            unit_tests_converted: 0,
-            unit_tests_skipped: 0,
-            constructs_dropped: 0,
-            contracts_dropped: 0,
-            consumers: Vec::new(),
-        };
-        apply_dbt_tests(dir.path(), &target, &mut result);
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
 
         assert_eq!(result.tests_found, 1, "model-level test must be found");
         assert_eq!(result.tests_converted, 1);
@@ -4103,6 +4089,48 @@ models:
             "the composite must count as a custom conversion"
         );
         assert_eq!(result.tests_skipped, 0);
+    }
+
+    #[test]
+    fn refused_model_tests_are_not_counted_as_converted() {
+        // #2337: a refused model has no sidecar, so its declared tests are
+        // written nowhere and must not count as converted.
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("kept.sql"), "select 1 as id").unwrap();
+        std::fs::write(
+            models_dir.join("refused.sql"),
+            "select 1 as id {% if target.name == 'prod' %}where id > 0{% endif %}",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("schema.yml"),
+            r#"
+models:
+  - name: kept
+    columns:
+      - name: id
+        tests: [not_null]
+  - name: refused
+    columns:
+      - name: id
+        tests: [not_null, unique]
+"#,
+        )
+        .unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.tests_found, 3);
+        assert_eq!(result.tests_converted, 1, "only the kept model's test");
+        assert_eq!(result.tests_skipped, 2, "the refused model's tests");
+        assert_eq!(result.imported[0].config.tests.len(), 1);
     }
 
     #[test]

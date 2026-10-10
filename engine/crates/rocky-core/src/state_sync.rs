@@ -28,7 +28,7 @@ use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
 use crate::state::StateStore;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum StateSyncError {
     #[error("S3 download failed: {0}")]
     S3Download(String),
@@ -136,6 +136,14 @@ pub enum StateSyncError {
     /// concurrency control is `off`. A lost publish is silent there, so it is
     /// refused before any download.
     PublishRequiresCas { backend: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for StateSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "StateSyncError", self)
+    }
 }
 
 /// State file name within the configured prefix.
@@ -5268,6 +5276,17 @@ async fn publish_pointers_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn state_sync_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "state-bucket-1919-d1e6";
+        crate::secret_registry::register_substitution("RV_STATESYNC_DBG", SECRET);
+        let err = StateSyncError::S3Download(format!("s3://{SECRET}/state.redb: denied"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_STATESYNC_DBG}"), "{debug}");
+    }
     use tempfile::TempDir;
 
     /// WP-01 PR-B (2b) — the `rocky load` remote-key collision mechanism (ADR

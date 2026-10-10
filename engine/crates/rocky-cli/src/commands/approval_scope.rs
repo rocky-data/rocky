@@ -171,18 +171,6 @@ impl ScopeUnit {
 }
 
 impl ApprovalScope {
-    /// Anchor every relative unit directory at `root` (review runs against an
-    /// explicit project root, not the process cwd).
-    pub(crate) fn anchored_at(mut self, root: &Path) -> Self {
-        for unit in &mut self.units {
-            unit.models_dir = root.join(&unit.models_dir);
-        }
-        if let Some(seeds_dir) = &mut self.seeds_dir {
-            *seeds_dir = root.join(&*seeds_dir);
-        }
-        self
-    }
-
     /// The units whose directory exists. A `--dag` run skips a pipeline whose
     /// directory is absent, so review has nothing to compare there.
     pub(crate) fn present_units(&self) -> impl Iterator<Item = &ScopeUnit> {
@@ -447,12 +435,29 @@ pub(crate) fn verify_dag_scope_for_apply(
     let ids = OwnedScopeIdentities::from_config(Some(cfg), None);
     let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
         .map_err(|e| refuse(&format!("its fingerprint cannot be recomputed ({e:#})")))?;
-    if actual.as_deref() != Some(expected) {
-        return Err(refuse(
-            "a model the DAG runs was added, removed or changed since the plan was written",
+    if actual.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    // The full fingerprint also binds the config the DAG runs under. When the
+    // models still match, say so, so the refusal does not blame a model
+    // change that did not happen (#2326). Either way the apply refuses.
+    let models_only = scope_models_only_fingerprint(&scope, &compiled, &ids.resolved_mask)
+        .map_err(|e| refuse(&format!("its fingerprint cannot be recomputed ({e:#})")))?;
+    if let Some(expected_models_only) = capabilities.models_only_fingerprint.as_deref()
+        && models_only.as_deref() == Some(expected_models_only)
+    {
+        return Err(anyhow::anyhow!(
+            "{PLAN_CONFIG_CHANGED}: refusing to apply plan '{plan_id}': the models the DAG \
+             runs are unchanged, but the config they run under changed since this plan was \
+             written (adapters, pipelines, governance or run settings, as resolved in this \
+             environment). A reviewed --dag plan applies only under the config it was planned \
+             under. Re-run `rocky plan --dag` in this environment and review the new \
+             plan."
         ));
     }
-    Ok(())
+    Err(refuse(
+        "a model the DAG runs was added, removed or changed since the plan was written",
+    ))
 }
 
 /// Whether apply reconciles masks for this plan, so its fingerprint binds the
@@ -500,10 +505,11 @@ pub(crate) fn plan_scope_identities(
 /// environment, so a person's apply still refuses a `[mask]` strategy change
 /// for a tag the models use.
 ///
-/// A person's apply compares this one. The identities hash adapters and
-/// pipelines with their `${VAR}` values resolved, so the full fingerprint
-/// moves when the same plan is applied from another environment, such as a
-/// `rocky serve` job child, or after an edit to an unrelated pipeline.
+/// A person's apply, and every approval (#2326), compare this one. The
+/// identities hash adapters and pipelines with their `${VAR}` values
+/// resolved, so the full fingerprint moves when the same plan is applied or
+/// approved from another environment, such as a `rocky serve` job child, or
+/// after an edit to an unrelated pipeline.
 pub(crate) fn scope_models_only_fingerprint(
     scope: &ApprovalScope,
     compiled: &[CompiledUnit],
@@ -614,12 +620,11 @@ pub(crate) fn verify_plan_models_for_apply(
             dag: false,
             units: vec![ScopeUnit {
                 pipeline: None,
-                models_dir: PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                models_dir: super::apply::backfill_models_dir(root, run_plan),
                 models_glob: None,
             }],
             seeds_dir: None,
         }
-        .anchored_at(root)
     } else {
         // `config_path` is resolved against `root` by the apply entry point,
         // as propose and review resolve it, so the directory and the glob

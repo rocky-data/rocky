@@ -34,7 +34,7 @@ use tracing::debug;
 use crate::auth::{AuthError, BigQueryAuth};
 
 /// Errors produced by the Storage Read API path.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum StorageReadError {
     #[error("authentication error: {0}")]
     Auth(#[from] AuthError),
@@ -56,6 +56,14 @@ pub enum StorageReadError {
 
     #[error("Arrow IPC decode error: {0}")]
     Arrow(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for StorageReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "StorageReadError", self)
+    }
 }
 
 /// gRPC endpoint for the BigQuery Storage Read API. The Storage Read
@@ -258,6 +266,17 @@ impl tonic::service::Interceptor for AuthInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn storage_read_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "bq-read-1919-e3f4";
+        rocky_core::secret_registry::register_substitution("RV_BQ_READ_DBG", SECRET);
+        let err = StorageReadError::InvalidToken(format!("header for {SECRET} rejected"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_BQ_READ_DBG}"), "{debug}");
+    }
 
     #[test]
     fn endpoint_is_https() {

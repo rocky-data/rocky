@@ -107,6 +107,10 @@ pub struct TestRunInputs<'a> {
     /// (`E059` in place of the `I003` note). `rocky ci` sets it from
     /// `--strict-contracts` or `[contracts] strict`.
     pub strict_contracts: bool,
+    /// The warehouse each model runs on in production, which types a `CAST`
+    /// whose width differs between warehouses (#2333). The models still
+    /// execute on DuckDB here. The default knows none.
+    pub target_dialects: rocky_compiler::operand_check::TargetDialects,
 }
 
 /// Checks a caller runs over a test run's compile result. See
@@ -200,6 +204,7 @@ pub fn run_tests(
         gates: None,
         inlined_gates: None,
         strict_contracts: false,
+        target_dialects: Default::default(),
     })
 }
 
@@ -228,6 +233,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         gates,
         inlined_gates,
         strict_contracts,
+        target_dialects,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
@@ -273,6 +279,7 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         // are inlined after them, below.
         preserve_authored_sql: true,
         strict_contracts,
+        target_dialects,
         ..Default::default()
     };
 
@@ -1266,6 +1273,7 @@ mod tests {
             gates: None,
             inlined_gates: None,
             strict_contracts: false,
+            target_dialects: Default::default(),
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1492,6 +1500,7 @@ mod tests {
             gates: Some(&refuse),
             inlined_gates: None,
             strict_contracts: false,
+            target_dialects: Default::default(),
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1512,6 +1521,7 @@ mod tests {
             gates: Some(&silent),
             inlined_gates: None,
             strict_contracts: false,
+            target_dialects: Default::default(),
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1528,6 +1538,7 @@ mod tests {
             gates: None,
             inlined_gates: Some(&refuse),
             strict_contracts: false,
+            target_dialects: Default::default(),
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1570,6 +1581,7 @@ mod tests {
             gates: Some(&record),
             inlined_gates: Some(&record_inlined),
             strict_contracts: false,
+            target_dialects: Default::default(),
         })
         .unwrap();
         assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");

@@ -264,6 +264,7 @@ async fn direct_transformation_guard_refuses_bad_pipes() {
             None,
             None,
             None,
+            None,
         )
         .await,
     );

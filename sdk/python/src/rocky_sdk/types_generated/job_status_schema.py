@@ -73,6 +73,14 @@ class JobState4(StrEnum):
     failed = "failed"
 
 
+class JobState5(StrEnum):
+    """
+    `POST /api/v1/jobs/{id}/cancel` signalled the subprocess, and it then exited non-zero. A job that exits 0 after the signal is `succeeded`: it finished before the signal could stop it.
+    """
+
+    cancelled = "cancelled"
+
+
 class JobStatus(BaseModel):
     """
     Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).
@@ -82,7 +90,7 @@ class JobStatus(BaseModel):
 
     error: str | None = None
     """
-    Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.
+    Failure detail when [`state`](Self::state) is [`JobState::Failed`], what stopped the job when it is [`JobState::Cancelled`], else `null`.
     """
     finished_at: str | None = None
     """
@@ -108,7 +116,7 @@ class JobStatus(BaseModel):
     """
     When execution started (RFC 3339), or `null` if not yet.
     """
-    state: JobState1 | JobState2 | JobState3 | JobState4
+    state: JobState1 | JobState2 | JobState3 | JobState4 | JobState5
     """
     Current lifecycle state.
     """

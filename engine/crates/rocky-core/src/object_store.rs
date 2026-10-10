@@ -57,7 +57,7 @@ fn default_client_options() -> ClientOptions {
 }
 
 /// Errors returned by [`ObjectStoreProvider`] operations.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ObjectStoreError {
     #[error("invalid cloud URI '{0}': {1}")]
     InvalidUri(String, String),
@@ -70,6 +70,14 @@ pub enum ObjectStoreError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ObjectStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ObjectStoreError", self)
+    }
 }
 
 /// Result type for object store operations.
@@ -591,6 +599,17 @@ impl ObjectStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn object_store_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "bucket-1919-c9d5";
+        crate::secret_registry::register_substitution("RV_OBJSTORE_DBG", SECRET);
+        let err = ObjectStoreError::InvalidUri(format!("s3://{SECRET}/state"), "bad".into());
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_OBJSTORE_DBG}"), "{debug}");
+    }
 
     #[tokio::test]
     async fn test_in_memory_put_get() {

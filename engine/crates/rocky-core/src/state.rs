@@ -4054,7 +4054,7 @@ impl PersistedJob {
     /// never make a record permanently unevictable.
     ///
     /// This is **not** the negation of [`is_terminal`](Self::is_terminal). The
-    /// two agree on the four states `rocky-cli`'s `JobState` defines and
+    /// two agree on the five states `rocky-cli`'s `JobState` defines and
     /// deliberately err in opposite directions on anything else, so each caller
     /// gets the conservative answer for what it is deciding. A new `JobState`
     /// variant must therefore be classified in both — this crate cannot see
@@ -4064,7 +4064,8 @@ impl PersistedJob {
         matches!(self.state.as_str(), "running" | "queued")
     }
 
-    /// Whether the job reached a terminal state — `"succeeded"` or `"failed"`.
+    /// Whether the job reached a terminal state — `"succeeded"`, `"failed"` or
+    /// `"cancelled"`.
     ///
     /// Errs toward *unfinished*: an unrecognized `state` reads as **not**
     /// terminal, because this version cannot claim a state it does not know has
@@ -4085,7 +4086,7 @@ impl PersistedJob {
     /// result. See `MIN_TRUSTED_REDACTION_VERSION` for the same contract stated
     /// for the redaction stamp.
     pub fn is_terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "failed")
+        matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled")
     }
 }
 

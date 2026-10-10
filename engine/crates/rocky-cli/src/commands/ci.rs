@@ -49,6 +49,10 @@ pub fn run_ci(
                     || project_config
                         .as_ref()
                         .is_some_and(|config| config.contracts.strict),
+                target_dialects: super::compile::target_dialects(
+                    project_config.as_ref(),
+                    config_path,
+                ),
             })
         },
     )?;

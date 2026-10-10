@@ -7,7 +7,7 @@ cd "$HERE"
 
 mkdir -p expected
 
-echo "==> 1. Baseline compile — every model type-checks, no dialect gate yet"
+echo "==> 1. Baseline compile — the SQL is written for Snowflake ([portability] target_dialect), so NVL is fine"
 rocky compile --models models > expected/compile_no_dialect.json 2>/dev/null
 
 echo "==> 2. Compile with --target-dialect=bq — fires P001 on NVL"
@@ -27,6 +27,9 @@ for d in diags:
     print(f"         at {d['span']['file']}:{d['span']['line']}")
     if d.get("suggestion"):
         print(f"         suggestion: {d['suggestion']}")
+errors = sorted((d["code"], d["model"]) for d in (data.get("diagnostics") or []) if d.get("severity") == "Error")
+if errors != [("P001", "non_portable_nvl")]:
+    raise SystemExit(f"expected exactly one P001 error, on non_portable_nvl; got {errors}")
 PY
 
 echo

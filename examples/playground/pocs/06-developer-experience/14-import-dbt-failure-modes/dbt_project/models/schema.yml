@@ -1,12 +1,16 @@
 version: 2
 
 # Exercises the importer's test mapping. `unique` and `not_null` translate
-# cleanly; `dbt_utils.accepted_range` now maps to a native `[[tests]]` block
-# of type `in_range` on the emitted model sidecar (was an UnsupportedTest
-# warning in earlier versions).
+# cleanly; `dbt_utils.accepted_range` maps to a native `[[tests]]` block of
+# type `in_range` on the emitted model sidecar (was an UnsupportedTest
+# warning in earlier versions). The tests sit on `stg_variables`, the model
+# the raw importer emits: `stg_orders` is refused for its `{% if %}` block,
+# so tests on it would land nowhere.
 models:
   - name: stg_orders
     description: Staged orders with one branched-by-target predicate.
+  - name: stg_variables
+    description: Orders above a per-run cutoff.
     columns:
       - name: order_id
         tests:

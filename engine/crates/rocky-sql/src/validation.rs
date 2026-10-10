@@ -21,7 +21,7 @@ static GCP_PROJECT_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$").unwrap());
 
 /// Errors from SQL identifier and principal name validation.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ValidationError {
     #[error("invalid SQL identifier '{value}': must match [a-zA-Z0-9_]+")]
     InvalidIdentifier { value: String },
@@ -194,6 +194,14 @@ pub enum ValidationError {
         function: String,
         use_: ExpressionUse,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_secret_registry::fmt_rendered_debug(f, "ValidationError", self)
+    }
 }
 
 /// Validates a SQL identifier (catalog, schema, table, column names).
@@ -549,6 +557,19 @@ pub fn format_principal(name: &str) -> Result<String, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
+    #[test]
+    fn validation_error_debug_prints_a_resolved_value_as_its_name() {
+        const SECRET: &str = "sql-ident-1919-e5f6";
+        rocky_secret_registry::register_substitution("RV_VALIDATION_DBG", SECRET);
+        let err = ValidationError::InvalidIdentifier {
+            value: format!("{SECRET}-x"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_VALIDATION_DBG}"), "{debug}");
+    }
 
     #[test]
     fn test_valid_identifiers() {

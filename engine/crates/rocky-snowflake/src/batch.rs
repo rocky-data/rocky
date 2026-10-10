@@ -121,11 +121,10 @@ impl BatchCheckAdapter for SnowflakeBatchCheckAdapter {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let data_type = row
-                .get(2)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+            // A Snowflake float is 64-bit whatever its name (#2333).
+            let data_type = crate::types::canonical_type(
+                row.get(2).and_then(|v| v.as_str()).unwrap_or_default(),
+            );
             // Snowflake's `is_nullable` is "YES" / "NO".
             let nullable = row
                 .get(3)

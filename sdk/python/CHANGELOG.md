@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `datamodel-code-generator` is now 0.83.0 (Dependabot #100). The generated model-detail types change shape: the recursive `RockyType` is now a `RootModel` class, not an inline union, so a column's `data_type` value is read through `.root`. Nothing else in the generated models changes.
+
 ## [0.21.0] — 2026-10-09
 
 Pairs with engine 1.80.0.

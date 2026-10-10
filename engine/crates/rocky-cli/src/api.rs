@@ -117,7 +117,9 @@ use crate::output::{
 };
 
 use crate::output::ConfigStatus;
+use rocky_core::process::GroupSignal;
 use rocky_server::auth::TokenScope;
+use rocky_server::jobs::{CancelMessage, CancelRequest};
 
 /// Bind config for [`serve`].
 ///
@@ -189,6 +191,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/approve", post(submit_approve))
         .route("/api/v1/jobs/{id}", get(get_job))
+        .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/schedule/spool", get(schedule_spool))
         .route("/api/v1/settings", get(settings))
@@ -236,7 +239,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
 
     app
         // The `Host`/`Origin` guard is outermost so it precedes routing for
-        // every request, UI files included. It is a no-op without `--ui`.
+        // every request, UI files included. It runs on every loopback bind
+        // and every `--ui` bind; it is a no-op only on a non-loopback bind
+        // without `--ui`.
         .layer(middleware::from_fn_with_state(
             state,
             rocky_server::auth::require_known_host,
@@ -320,6 +325,27 @@ pub async fn serve(
         }
     }
 
+    // Each job child leads its own process group (`run_job_child`), so the
+    // Ctrl-C that stops this server no longer reaches a running job by
+    // itself. Forward it: on shutdown every job this process started gets
+    // the same terminate signal a Cancel sends. Only a job's own task can
+    // signal its child, so the forward is awaited below, before this function
+    // returns and the runtime with it.
+    let forward = {
+        let cancels = state.job_cancels.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.signalled().await;
+            let answers = cancels.terminate_all();
+            let _ = tokio::time::timeout(SHUTDOWN_TERMINATE_TIMEOUT, async {
+                for answer in answers {
+                    let _ = answer.await;
+                }
+            })
+            .await;
+        })
+    };
+
     let app = router(state);
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -333,9 +359,16 @@ pub async fn serve(
     ready.signal();
     // Graceful shutdown: on `shutdown` (SIGTERM/ctrl-c, shared with the scheduler
     // loop) axum stops accepting and drains in-flight requests before returning.
-    axum::serve(listener, app)
+    let raise = shutdown.clone();
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.signalled().await })
-        .await?;
+        .await;
+    // A clean return means `shutdown` was raised. An error return may not
+    // have raised it, and the jobs must still be stopped: their children no
+    // longer share this process's group. Raising it twice is harmless.
+    raise.signal();
+    let _ = forward.await;
+    served?;
     Ok(())
 }
 
@@ -535,6 +568,32 @@ impl ApiError {
             "job_not_found",
             format!("job '{id}' not found"),
             Some("use the job_id returned by POST /api/v1/jobs/{run|plan|apply}"),
+        )
+    }
+
+    /// `409` — a cancel named a job that has already finished, or whose
+    /// child has exited and is writing its terminal record.
+    fn job_not_running(id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "job_not_running",
+            format!("job '{id}' is not running"),
+            Some("read the job's final state at GET /api/v1/jobs/{id}"),
+        )
+    }
+
+    /// `409` — a cancel named an in-flight job this server process did not
+    /// start: a scheduled run, or a record left by another process. This
+    /// process holds no child for it, so it cannot signal one.
+    fn job_not_cancellable(id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "job_not_cancellable",
+            format!("job '{id}' was not started by this server process, so it cannot cancel it"),
+            Some(
+                "a scheduled run stops when `rocky serve` shuts down; a record from an \
+                 earlier server is marked failed when the server restarts",
+            ),
         )
     }
 
@@ -900,6 +959,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "POST /api/v1/jobs/approve",
         "GET /api/v1/jobs/{id}",
+        "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
         "GET /api/v1/schedule/spool",
         "GET /api/v1/settings",
@@ -2428,12 +2488,12 @@ pub(crate) fn settings_output(
     SettingsOutput {
         bind_host: snapshot.bind_host.clone(),
         // What the guard ENFORCES. `--allowed-host` is only wired into a guard
-        // under `--ui`, so with no UI there is no list -- reporting the flags
-        // anyway would claim a check that is not running.
+        // on a loopback or `--ui` bind, so with no guard there is no list --
+        // reporting the flags anyway would claim a check that is not running.
         allowed_hosts: state
-            .ui
+            .host_guard
             .as_ref()
-            .map(|ui| ui.allowed_hosts.clone())
+            .map(|guard| guard.allowed_hosts.clone())
             .unwrap_or_default(),
         // The ENFORCED allowlist, not the typed one: `build_cors_layer` drops
         // an origin that is not a valid header value, so the raw list can name
@@ -2748,6 +2808,7 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
         JobState::Running => "running",
         JobState::Succeeded => "succeeded",
         JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
     }
 }
 
@@ -2931,9 +2992,10 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
         // IN FLIGHT, not "not terminal". The two are deliberately not
         // complements: an unrecognized `state` is neither. Sweeping those was a
         // DOWNGRADE DATA-LOSS path — `state` is a plain string precisely so a
-        // newer sidecar can add a state, so a newer binary's terminal
-        // `"cancelled"` record, carrying a real result, reads as non-terminal
-        // here and the clear below would delete that result. That contradicts
+        // newer sidecar can add a state, so a newer binary's terminal record in
+        // a state this one does not know, carrying a real result, reads as
+        // non-terminal here and the clear below would delete that result.
+        // (`"cancelled"` was that case before this binary learned it.) That contradicts
         // the preservation contract on `MIN_TRUSTED_REDACTION_VERSION`.
         //
         // Skipping them costs nothing ON THE HTTP SURFACE: `job_status_from`
@@ -3239,11 +3301,17 @@ async fn submit_job(
     // Background task: run the subprocess, then record the terminal state. The
     // permit is moved in and released when the task ends. Nothing between the
     // cache write and `tokio::spawn` may await.
+    //
+    // The cancel registration rides with the task too. It is dropped only
+    // after `finish_job`, so a cancel that lands while the terminal record is
+    // being written is answered `409 job_not_running`, not a `202` for a
+    // child that is already gone.
+    let (cancel_guard, cancel_rx) = state.job_cancels.register(&job_id);
     cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
         let (final_state, result, error) =
-            execute_job_subprocess(kind, config_path, state_path.clone(), request).await;
+            execute_job_subprocess(kind, config_path, state_path.clone(), request, cancel_rx).await;
 
         finish_job(
             task_state,
@@ -3255,6 +3323,7 @@ async fn submit_job(
             permit,
         )
         .await;
+        drop(cancel_guard);
     });
 
     Ok((
@@ -3382,6 +3451,7 @@ async fn execute_job_subprocess(
     config_path: Option<std::path::PathBuf>,
     state_path: std::path::PathBuf,
     request: JobRequest,
+    cancel: tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
 ) -> (JobState, Option<serde_json::Value>, Option<String>) {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -3394,9 +3464,9 @@ async fn execute_job_subprocess(
         }
     };
 
-    let mut cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
+    let cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
 
-    let output = match cmd.output().await {
+    let output = match run_job_child(cmd, cancel).await {
         Ok(output) => output,
         Err(e) => {
             return (
@@ -3408,6 +3478,8 @@ async fn execute_job_subprocess(
     };
 
     // The canonical output is emitted on stdout; embed it verbatim when parseable.
+    // A `rocky run` stopped by a terminate signal still prints its partial
+    // `RunOutput` (`interrupted: true`), so a cancelled job keeps it too.
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
     // The UI shows each `errors[].error` as a failure line. Clean them here,
@@ -3417,14 +3489,251 @@ async fn execute_job_subprocess(
         sanitize_result_errors(result);
     }
 
-    if output.status.success() {
-        (JobState::Succeeded, result, None)
-    } else {
-        // Surface the actionable part of stderr as the error: the final
-        // `Error:` / `Caused by:` block, never the child's tracing lines.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = failed_job_error(kind.verb(), &output.status, &stderr);
-        (JobState::Failed, result, Some(msg))
+    let state = settled_job_state(output.status.success(), output.signalled);
+    match state {
+        JobState::Succeeded => (state, result, None),
+        JobState::Cancelled => {
+            let how = match output.signalled {
+                Some(GroupSignal::Kill) => "a forced stop (SIGKILL)",
+                Some(GroupSignal::Terminate) | None => "a terminate signal (SIGTERM)",
+            };
+            let msg = format!(
+                "cancelled: `rocky {}` was sent {how} and exited with {}",
+                kind.verb(),
+                output.status
+            );
+            (state, result, Some(msg))
+        }
+        JobState::Queued | JobState::Running | JobState::Failed => {
+            // Surface the actionable part of stderr as the error: the final
+            // `Error:` / `Caused by:` block, never the child's tracing lines.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = failed_job_error(kind.verb(), &output.status, &stderr);
+            (JobState::Failed, result, Some(msg))
+        }
+    }
+}
+
+/// The terminal state of a job child that exited.
+///
+/// A job is `cancelled` only when this server signalled it AND it then failed.
+/// A child that exits 0 after the signal finished its work first, so it is
+/// `succeeded`: saying otherwise would hide work that landed.
+fn settled_job_state(success: bool, signalled: Option<GroupSignal>) -> JobState {
+    match (success, signalled) {
+        (true, _) => JobState::Succeeded,
+        (false, Some(_)) => JobState::Cancelled,
+        (false, None) => JobState::Failed,
+    }
+}
+
+/// What a job child left when it exited.
+struct JobChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// The strongest signal this server delivered to the child's group.
+    signalled: Option<GroupSignal>,
+}
+
+/// Run a job child to its exit, acting on cancel requests on the way.
+///
+/// On unix the child leads its own process group (`process_group(0)`), so a
+/// cancel reaches everything it started, such as a hook command, and never
+/// this server. A cancel request is acted on only while this function still
+/// holds the child UNREAPED: until it is reaped, its id cannot be handed to
+/// another process, so the signal cannot land on a stranger.
+///
+/// Elsewhere there is no process group and no terminate signal: a cancel kills the
+/// child alone (`Child::start_kill`).
+///
+/// stdin is closed and stdout and stderr are read to the end in parallel with
+/// the wait, as `Command::output` did, so a child that writes more than a pipe
+/// buffer never blocks.
+async fn run_job_child(
+    mut cmd: tokio::process::Command,
+    mut cancel: tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
+) -> std::io::Result<JobChildOutput> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let mut signalled = None;
+    let mut cancel_open = true;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            request = cancel.recv(), if cancel_open => match request {
+                Some((signal, reply)) => {
+                    let delivered = signal_job_child(&mut child, signal);
+                    if delivered {
+                        signalled = Some(match (signalled, signal) {
+                            (Some(GroupSignal::Kill), _) | (_, GroupSignal::Kill) => GroupSignal::Kill,
+                            (Some(GroupSignal::Terminate) | None, GroupSignal::Terminate) => {
+                                GroupSignal::Terminate
+                            }
+                        });
+                    }
+                    let _ = reply.send(delivered);
+                }
+                None => cancel_open = false,
+            },
+        }
+    };
+    // The child has exited, so nothing is left to signal. Close the channel
+    // now, not when the pipes reach EOF: a process the child left behind can
+    // hold a pipe open, and a cancel sent meanwhile must be answered
+    // `job_not_running`, not accepted and then never acted on. Pending
+    // requests are dropped with it, which answers each one "not delivered".
+    drop(cancel);
+    let status = status?;
+
+    Ok(JobChildOutput {
+        status,
+        stdout: stdout.await.unwrap_or_default(),
+        stderr: stderr.await.unwrap_or_default(),
+        signalled,
+    })
+}
+
+/// Deliver `signal` to a job child that has not been reaped. `false` when
+/// nothing was delivered: the child had already exited, or the OS refused.
+fn signal_job_child(child: &mut tokio::process::Child, signal: GroupSignal) -> bool {
+    // `try_wait` reaps a child that has exited. From then on its id may name
+    // another process, so an exited child is never signalled.
+    match child.try_wait() {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return false,
+    }
+    #[cfg(unix)]
+    {
+        let Some(pgid) = child.id() else {
+            return false;
+        };
+        match rocky_core::process::signal_process_group(pgid, signal) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, ?signal, "could not signal a job's process group");
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        child.start_kill().is_ok()
+    }
+}
+
+/// How long the cancel route waits for a job's task to say whether it
+/// delivered the signal. The task answers within one turn of its select
+/// loop, so this bounds only a wedged runtime.
+const CANCEL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `rocky serve` waits at shutdown for its jobs' tasks to deliver
+/// the terminate signal before the process exits.
+const SHUTDOWN_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `POST /api/v1/jobs/{id}/cancel` — stop a job this server process started.
+///
+/// The first request sends the child's process group `SIGTERM`, which
+/// `rocky run` handles like Ctrl-C; once that has been delivered, a later
+/// request sends `SIGKILL`. Returns `202 {job_id, signal}` only after the
+/// job's task reports the signal delivered; a child that exited first is a
+/// `409 job_not_running`. The job's final state, read at
+/// `GET /api/v1/jobs/{id}`, says what happened: `cancelled` when the child
+/// then failed, `succeeded` when it finished first.
+///
+/// Takes no mutation permit: the job being cancelled holds it, and keeps it
+/// until its child has exited and its terminal record is written. So the
+/// next run cannot start while a cancelled one is still stopping.
+///
+/// `404 job_not_found` for an unknown id, `409 job_not_running` for a job
+/// that has finished, `409 job_not_cancellable` for an in-flight job this
+/// process holds no child for (a scheduled run, or another process's
+/// record).
+async fn cancel_job(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<Response, ApiError> {
+    // The state file is the server's own, never derived from the request.
+    // Resolve it before the request id is handed to `job_cancels`.
+    let state_path = state_path_for(&state);
+    match state.job_cancels.request(&id) {
+        CancelRequest::Sent(signal, answer) => {
+            // The job's task answers as soon as its select loop takes the
+            // request; it never blocks between the two. A dropped reply means
+            // the child exited before the request was read.
+            let delivered = matches!(
+                tokio::time::timeout(CANCEL_REPLY_TIMEOUT, answer).await,
+                Ok(Ok(true))
+            );
+            if !delivered {
+                return Err(ApiError::job_not_running(&id));
+            }
+            state.job_cancels.delivered(&id);
+            tracing::info!(job_id = %id, ?signal, "job cancel delivered");
+            let signal = match signal {
+                GroupSignal::Terminate => "terminate",
+                GroupSignal::Kill => "kill",
+            };
+            return Ok((
+                StatusCode::ACCEPTED,
+                PrettyJson(serde_json::json!({ "job_id": id, "signal": signal })),
+            )
+                .into_response());
+        }
+        CancelRequest::Settling => return Err(ApiError::job_not_running(&id)),
+        CancelRequest::NotRegistered => {}
+    }
+
+    // Not ours. Say why from the record, read the same way `GET` reads it.
+    let record = match state.jobs.get(&id).await {
+        Some(record) => Some(record),
+        None => {
+            if !state_path.exists() {
+                None
+            } else {
+                let lookup_id = id.clone();
+                store_read(&state, move || {
+                    let store =
+                        rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
+                    store.get_job(&lookup_id)
+                })
+                .await?
+                .map_err(|e| {
+                    map_state_err(anyhow::Error::from(e), state.mutation_permit.running_job())
+                })?
+            }
+        }
+    };
+    match record {
+        None => Err(ApiError::job_not_found(&id)),
+        Some(record) if record.is_in_flight() => Err(ApiError::job_not_cancellable(&id)),
+        Some(_) => Err(ApiError::job_not_running(&id)),
     }
 }
 
@@ -4091,7 +4400,7 @@ mod tests {
 
         // Terminal in a NEWER binary, unrecognized here, and carrying a real
         // result — exactly the downgrade case.
-        let mut newer = persisted_job("from-a-newer-binary", "cancelled");
+        let mut newer = persisted_job("from-a-newer-binary", "paused");
         newer.finished_at = Some("2026-07-07T00:00:10Z".to_string());
         newer.result = Some(serde_json::json!({ "tables_copied": 3 }));
         assert!(
@@ -6340,9 +6649,11 @@ mod tests {
             None,
             None,
             Some(UiConfig {
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            Some(rocky_server::ui::HostGuard {
                 bind_host: "127.0.0.1".to_string(),
                 allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
-                assets: Arc::new(InMemoryAssets(files)),
             }),
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
@@ -6785,7 +7096,8 @@ mod tests {
     /// The host guard: a foreign `Host` is 421 and a foreign or opaque
     /// `Origin` is 403, on UI files and API alike, before routing; the
     /// server's own names, an allowed host and an allowed origin pass; a
-    /// request with no `Origin` passes; without `--ui` the guard is off.
+    /// request with no `Origin` passes; a state with no guard (what a
+    /// non-loopback bind without `--ui` gets) checks no `Host`.
     #[tokio::test]
     async fn ui_mode_refuses_foreign_hosts_and_origins_before_routing() {
         let base = spawn_router(ui_state(&["ui.internal"], &["https://app.example"])).await;
@@ -6881,7 +7193,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "without --ui the guard is off");
+        assert_eq!(resp.status(), 200, "with no host guard, no Host is checked");
     }
 
     /// Raw HTTP requests exercise the parser and the outer Host/Origin guard
@@ -7229,6 +7541,7 @@ mod tests {
             None,
             Vec::new(),
             Some(state_path),
+            None,
             None,
             None,
             rocky_server::state::SettingsSnapshot::default(),
@@ -8081,6 +8394,7 @@ mod tests {
                 rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(10.0),
             }),
             None,
+            None,
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
                 scheduler: true,
@@ -8344,6 +8658,7 @@ mod tests {
                     Some(fifo.clone()),
                     None,
                     Vec::new(),
+                    None,
                     None,
                     None,
                     None,
@@ -8685,8 +9000,9 @@ mod tests {
         }
     }
 
-    /// `--allowed-host` only becomes a guard under `--ui`. Reporting the flag
-    /// list without the UI would name a check that is not running.
+    /// `--allowed-host` only becomes a guard on a loopback or `--ui` bind.
+    /// Reporting the flag list without a guard would name a check that is
+    /// not running.
     #[tokio::test]
     async fn allowed_hosts_report_the_guard_not_the_flags() {
         let (_dir, state) = project_with_three_secrets();
@@ -8696,9 +9012,10 @@ mod tests {
         );
 
         assert!(!output.ui, "this fixture has no UI");
+        assert!(state.host_guard.is_none(), "this fixture has no host guard");
         assert!(
             output.allowed_hosts.is_empty(),
-            "with no UI there is no host guard, so there is no list to report"
+            "with no host guard there is no list to report"
         );
         // The CORS allowlist is a different mechanism and does apply.
         assert_eq!(output.allowed_origins, ["https://example.test"]);
@@ -10007,7 +10324,7 @@ mod tests {
     /// state to be classified deliberately on both predicates.
     ///
     /// It also pins the asymmetry: the two predicates are complements for the
-    /// four known states and deliberately are NOT for anything else — an
+    /// five known states and deliberately are NOT for anything else — an
     /// unrecognized string is neither in flight (so it can never defeat the
     /// cache's capacity bound) nor terminal (so this version never CLAIMS such
     /// a job finished). The gap between them is the set of records this version
@@ -10020,11 +10337,12 @@ mod tests {
             JobState::Running,
             JobState::Succeeded,
             JobState::Failed,
+            JobState::Cancelled,
         ] {
             // Exhaustive on purpose: a new variant breaks compilation here.
             let (in_flight, terminal) = match state {
                 JobState::Queued | JobState::Running => (true, false),
-                JobState::Succeeded | JobState::Failed => (false, true),
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled => (false, true),
             };
             let job = persisted_job("j", job_state_str(state));
             assert_eq!(
@@ -10040,7 +10358,7 @@ mod tests {
         }
 
         // The deliberate asymmetry, which no `JobState` variant can express.
-        let unknown = persisted_job("j", "cancelled");
+        let unknown = persisted_job("j", "paused");
         assert!(
             !unknown.is_in_flight(),
             "an unrecognized state must be evictable, or it could defeat the cache bound"
@@ -10845,6 +11163,7 @@ adapter = "db"
             None,
             Some(ingress),
             None,
+            None,
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
                 scheduler: true,
@@ -11159,9 +11478,11 @@ adapter = "db"
             None,
             ingress,
             Some(UiConfig {
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+            Some(rocky_server::ui::HostGuard {
                 bind_host: "127.0.0.1".to_string(),
                 allowed_hosts: Vec::new(),
-                assets: Arc::new(InMemoryAssets(files)),
             }),
             rocky_server::state::SettingsSnapshot {
                 bind_host: "127.0.0.1".to_string(),
@@ -11762,6 +12083,304 @@ adapter = "db"
             &JobRequest::default(),
         );
         assert_eq!(command.as_std().get_current_dir(), None);
+    }
+
+    // --- Cancel (`POST /api/v1/jobs/{id}/cancel`) ---
+
+    /// The cancel route sits behind the same write gate as every job route:
+    /// no credential is 401, a read-only token 403, a foreign `Host` 421, a
+    /// UI cookie without `X-Rocky-UI` (or without this server's Origin) 403.
+    /// A request that passes the gate reaches the handler: an unknown id is
+    /// a 404 there, not an auth error.
+    #[tokio::test]
+    async fn cancel_route_is_behind_the_write_gate() {
+        let url = |base: &str| format!("{base}/api/v1/jobs/job_unknown/cancel");
+        let client = no_redirect_client();
+
+        let full = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+        let resp = client.post(url(&full)).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "no credential");
+
+        let resp = client
+            .post(url(&full))
+            .bearer_auth(OPERATOR_TOKEN)
+            .header("host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 421, "a foreign Host");
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "host_not_allowed");
+
+        let cookie = login_cookie(&client, &full).await;
+        for (origin, marker, why) in [
+            (Some(full.as_str()), false, "a cookie without X-Rocky-UI"),
+            (None, true, "a cookie without Origin"),
+            (
+                Some("http://127.0.0.1:1"),
+                true,
+                "a cookie from another local page",
+            ),
+        ] {
+            let mut req = client.post(url(&full)).header("cookie", &cookie);
+            if let Some(origin) = origin {
+                req = req.header("origin", origin);
+            }
+            if marker {
+                req = req.header("x-rocky-ui", "1");
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 403, "{why}");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "ui_write_not_from_ui", "{why}");
+        }
+
+        // Through the gate: the handler answers.
+        let resp = client
+            .post(url(&full))
+            .header("cookie", &cookie)
+            .header("origin", &full)
+            .header("x-rocky-ui", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "the page's own cancel");
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "job_not_found");
+        let resp = client
+            .post(url(&full))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "a full-scope Bearer");
+
+        let read_only = spawn_router(ui_state_scoped(TokenScope::ReadOnly, &[], None)).await;
+        let resp = client
+            .post(url(&read_only))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "a read-only token");
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "forbidden_read_only_token");
+    }
+
+    /// The refusals: a finished job and a job whose child has exited are
+    /// `409 job_not_running`; an in-flight job this process holds no child
+    /// for (a scheduled run, another process's record) is
+    /// `409 job_not_cancellable`; an unknown id is `404 job_not_found`.
+    #[tokio::test]
+    async fn cancel_refuses_finished_foreign_and_unknown_jobs() {
+        let state = test_state();
+        let mut done = persisted_job("job_done", "succeeded");
+        done.finished_at = Some("2026-07-07T00:00:05Z".to_string());
+        cache_job(&state, done).await;
+        cache_job(&state, persisted_job("job_scheduled", "running")).await;
+        let (_settling_guard, settling_rx) = state.job_cancels.register("job_settling");
+        drop(settling_rx);
+        cache_job(&state, persisted_job("job_settling", "running")).await;
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        for (id, status, code) in [
+            ("job_done", 409, "job_not_running"),
+            ("job_settling", 409, "job_not_running"),
+            ("job_scheduled", 409, "job_not_cancellable"),
+            ("job_nobody", 404, "job_not_found"),
+        ] {
+            let resp = client
+                .post(format!("{base}/api/v1/jobs/{id}/cancel"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{id}");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, code, "{id}");
+        }
+    }
+
+    /// `cancelled` only when the server signalled AND the child failed. A
+    /// child that exits 0 after the signal finished first: `succeeded`.
+    #[test]
+    fn a_job_is_cancelled_only_when_signalled_and_failed() {
+        assert_eq!(settled_job_state(true, None), JobState::Succeeded);
+        assert_eq!(
+            settled_job_state(true, Some(GroupSignal::Terminate)),
+            JobState::Succeeded
+        );
+        assert_eq!(settled_job_state(false, None), JobState::Failed);
+        assert_eq!(
+            settled_job_state(false, Some(GroupSignal::Terminate)),
+            JobState::Cancelled
+        );
+        assert_eq!(
+            settled_job_state(false, Some(GroupSignal::Kill)),
+            JobState::Cancelled
+        );
+    }
+
+    /// One cancel request and the receiver its reply arrives on.
+    fn cancel_message(
+        signal: GroupSignal,
+    ) -> (CancelMessage, tokio::sync::oneshot::Receiver<bool>) {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        ((signal, reply), answer)
+    }
+
+    /// A cancel actually stops a long-running child: `sleep 30` is gone in
+    /// well under its 30 seconds, the task reports the signal delivered, and
+    /// the outcome records it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_terminates_a_long_running_child() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (message, answer) = cancel_message(GroupSignal::Terminate);
+        tx.send(message).unwrap();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(10), run_job_child(cmd, rx))
+                .await
+                .expect("the cancelled child must exit long before `sleep 30` would")
+                .expect("spawn sleep");
+        assert!(answer.await.unwrap(), "the task reports the delivery");
+        assert!(!output.status.success());
+        assert_eq!(output.signalled, Some(GroupSignal::Terminate));
+        assert_eq!(
+            settled_job_state(output.status.success(), output.signalled),
+            JobState::Cancelled
+        );
+    }
+
+    /// A child that ignores SIGINT still stops on a cancel. A shell starts a
+    /// background command with SIGINT ignored and `exec` keeps the ignore, so
+    /// a `rocky serve` started that way passes it to every job; a cancel that
+    /// sent SIGINT would then never stop a job with no handler of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_stops_a_child_that_ignores_sigint() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("trap '' INT; sleep 30 & wait");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let run = tokio::spawn(run_job_child(cmd, rx));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (message, answer) = cancel_message(GroupSignal::Terminate);
+        tx.send(message).unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("a child that ignores SIGINT must still stop on a cancel")
+            .unwrap()
+            .expect("spawn sh");
+        assert!(answer.await.unwrap());
+        assert!(!output.status.success());
+        assert_eq!(output.signalled, Some(GroupSignal::Terminate));
+    }
+
+    /// A kill reaches the whole process group, not just the child. The shell
+    /// leaves a `sleep 30` in the background holding the stdout pipe; killing
+    /// only the shell would leave that pipe open, and reading it would wait
+    /// the full 30 seconds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_reaches_the_childs_whole_process_group() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 & wait");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let run = tokio::spawn(run_job_child(cmd, rx));
+        // Let the shell start its background sleep before the kill lands.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (message, answer) = cancel_message(GroupSignal::Kill);
+        tx.send(message).unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the whole group must be gone, or the stdout read would wait 30s")
+            .unwrap()
+            .expect("spawn sh");
+        assert!(answer.await.unwrap());
+        assert!(!output.status.success());
+        assert_eq!(output.signalled, Some(GroupSignal::Kill));
+    }
+
+    /// Once the child has exited, its task stops taking cancel requests at
+    /// once, even while a process the child left behind still holds its
+    /// stdout open. A request then cannot be sent at all, which the route
+    /// answers `409 job_not_running`, rather than accepted and never acted
+    /// on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn after_the_child_exits_a_cancel_is_refused_not_swallowed() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 3 & exit 0");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let run = tokio::spawn(run_job_child(cmd, rx));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !run.is_finished(),
+            "PRECONDITION: the leftover sleep still holds the pipe"
+        );
+        let (message, _answer) = cancel_message(GroupSignal::Kill);
+        assert!(
+            tx.send(message).is_err(),
+            "the channel must close when the child exits, not at pipe EOF"
+        );
+        let output = run.await.unwrap().expect("spawn sh");
+        assert!(output.status.success());
+        assert_eq!(output.signalled, None);
+    }
+
+    /// The route answers `202` only for a delivered signal. A request the
+    /// task could not deliver (the child exited first) is
+    /// `409 job_not_running` and does not escalate the next one; after a
+    /// delivered terminate, the next request is a kill.
+    #[tokio::test]
+    async fn cancel_answers_202_only_for_a_delivered_signal() {
+        let state = test_state();
+        let (_guard, mut rx) = state.job_cancels.register("job_live");
+        cache_job(&state, persisted_job("job_live", "running")).await;
+        // The job's task, played by hand: refuse the first request, deliver
+        // the rest.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut first = true;
+                while let Some((signal, reply)) = rx.recv().await {
+                    seen.lock().unwrap().push(signal);
+                    let _ = reply.send(!first);
+                    first = false;
+                }
+            });
+        }
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let cancel = || {
+            client
+                .post(format!("{base}/api/v1/jobs/job_live/cancel"))
+                .send()
+        };
+
+        let resp = cancel().await.unwrap();
+        assert_eq!(resp.status(), 409, "not delivered");
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "job_not_running");
+
+        for expected in ["terminate", "kill"] {
+            let resp = cancel().await.unwrap();
+            assert_eq!(resp.status(), 202);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["job_id"], "job_live");
+            assert_eq!(body["signal"], expected);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                GroupSignal::Terminate,
+                GroupSignal::Terminate,
+                GroupSignal::Kill
+            ]
+        );
     }
 }
 

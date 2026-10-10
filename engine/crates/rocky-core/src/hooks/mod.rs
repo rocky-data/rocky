@@ -18,7 +18,7 @@ use webhook::{AsyncWebhookHandle, WebhookConfig};
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum HookError {
     #[error("hook command failed: {command} (exit code {exit_code})")]
     CommandFailed {
@@ -41,6 +41,27 @@ pub enum HookError {
 
     #[error("webhook error: {0}")]
     Webhook(#[from] webhook::WebhookError),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919). `Display` leaves
+/// out a failed command's stderr, so it is added here, rendered too.
+impl std::fmt::Debug for HookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HookError::CommandFailed { stderr, .. } => {
+                let text = format!("{self}; stderr: {stderr}");
+                crate::secret_registry::fmt_rendered_debug(f, "HookError", &text)
+            }
+            HookError::Timeout { .. }
+            | HookError::Aborted { .. }
+            | HookError::Io(_)
+            | HookError::Serialize(_)
+            | HookError::Webhook(_) => {
+                crate::secret_registry::fmt_rendered_debug(f, "HookError", self)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +971,29 @@ mod tests {
         assert_eq!(cmd.as_std().get_program(), "cmd");
         let args: Vec<_> = cmd.as_std().get_args().collect();
         assert_eq!(args, ["/C", "echo hi"]);
+    }
+
+    /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919),
+    /// in the command and in the stderr that `Display` leaves out.
+    #[test]
+    fn hook_error_debug_prints_a_resolved_value_as_its_name() {
+        const COMMAND_SECRET: &str = "hook-cmd-1919-a1c3";
+        const STDERR_SECRET: &str = "hook-err-1919-b2d4";
+        crate::secret_registry::register_substitution("RV_HOOK_CMD_DBG", COMMAND_SECRET);
+        crate::secret_registry::register_substitution("RV_HOOK_ERR_DBG", STDERR_SECRET);
+        let err = HookError::CommandFailed {
+            command: format!("notify --token {COMMAND_SECRET}"),
+            exit_code: 1,
+            stderr: format!("401 for {STDERR_SECRET}"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(COMMAND_SECRET), "Debug leaks: {debug}");
+        assert!(!debug.contains(STDERR_SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_HOOK_CMD_DBG}"), "{debug}");
+        assert!(
+            debug.contains("stderr: 401 for ${RV_HOOK_ERR_DBG}"),
+            "{debug}"
+        );
     }
 
     // -- Registry tests --
