@@ -5524,6 +5524,7 @@ async fn run_apply_backfill_plan(
     // success).
     crate::commands::run::execute_backfill_set(
         &loaded,
+        config_path,
         session,
         state_path,
         models_dir,

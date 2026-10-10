@@ -3432,10 +3432,14 @@ fn cast_can_fail(
                 scale: ts,
             },
         ) => {
-            // Safe only when no integer digit and no fractional digit is lost.
+            // Safe only when no integer digit and no fractional digit is lost,
+            // and only when the input's digits are read from the SQL: Rocky
+            // types `a * b` over two DECIMALs with the wider operand's digits,
+            // but the product can need more, and a non-ANSI cast of a value
+            // that does not fit returns NULL.
             let source_int_digits = i16::from(*sp) - i16::from(*ss);
             let target_int_digits = i16::from(*tp) - i16::from(*ts);
-            target_int_digits < source_int_digits || ts < ss
+            !source_exact || target_int_digits < source_int_digits || ts < ss
         }
         (a, b) if a == b => false,
         // An integer fits a DECIMAL with as many integer digits as the
@@ -5610,6 +5614,10 @@ mod tests {
             ("CAST(d102 AS DECIMAL(10,2))", false),
             ("CAST(d102 AS DECIMAL(5,2))", true),
             ("CAST(d102 AS DECIMAL(12,0))", true),
+            // A product of DECIMALs is typed with the wider operand's digits,
+            // a guess: the true product can overflow the target.
+            ("CAST(d102 * d102 AS DECIMAL(12,2))", true),
+            ("CAST(d102 * d102 AS DECIMAL(10,2))", true),
             ("CAST(d102 AS DOUBLE)", false),
             ("CAST(d102 AS BIGINT)", true),
             ("CAST(i64 AS DOUBLE)", false),

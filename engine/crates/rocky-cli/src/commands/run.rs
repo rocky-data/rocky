@@ -4379,6 +4379,7 @@ pub async fn run_with_explicit_contracts(
                 Some(&hook_registry),
                 contracts.map(RunContracts::dir),
                 defer_opts.project.as_ref(),
+                defer_opts.target_dialects.as_ref(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -11668,6 +11669,10 @@ pub(crate) async fn execute_backfill_set(
     // `config_hash` describes the executed snapshot too (formerly a separate
     // path re-read — #1120/F10).
     loaded: &rocky_core::config::LoadedConfig,
+    // The path `loaded` was read from: the anchor its pipelines' model globs
+    // resolve against, so each model's casts are typed for its own
+    // warehouse (#2333).
+    config_path: &Path,
     // WP-01 PR-B (2b, R3-4): the ONE backfill session, constructed + acquired
     // + `require_synced` by the caller (`run_apply_backfill_plan`) BEFORE the
     // policy gate. Moved in (not borrowed) so the executor owns the terminal
@@ -11802,7 +11807,15 @@ pub(crate) async fn execute_backfill_set(
             // auto-create, matching the `--model` entry point.
             false,
             None, // backfills always target production
-            &DeferOptions::default(),
+            // Each model's casts are typed for the warehouse its own pipelines
+            // write to, not for this backfill's warehouse (#2333).
+            &DeferOptions {
+                target_dialects: Some(super::compile::target_dialects(
+                    Some(rocky_cfg),
+                    config_path,
+                )),
+                ..DeferOptions::default()
+            },
             skip_gate,
             reuse_enabled,
             column_level_enabled,
@@ -26580,6 +26593,7 @@ adapter = "default"
                 let model_set = std::collections::BTreeSet::from(["m".to_string()]);
                 let backfill = super::execute_backfill_set(
                     &loaded,
+                    &config_path,
                     session,
                     &state_path,
                     &models,
@@ -26829,6 +26843,7 @@ adapter = "default"
         let model_set = std::collections::BTreeSet::from(["m".to_string()]);
         let result = super::execute_backfill_set(
             &loaded,
+            &config_path,
             session,
             &state_path,
             &models,

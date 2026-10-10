@@ -42,7 +42,7 @@ pub fn detect_drift(
         // §P1.9: look up via CiStr borrow — no allocation per column.
         match target_map.get(column_map::CiStr::new(&source_col.name)) {
             Some(target_col) => {
-                if source_col.data_type.to_lowercase() != target_col.data_type.to_lowercase() {
+                if !dialect.types_equivalent(&source_col.data_type, &target_col.data_type) {
                     drifted_columns.push(DriftedColumn {
                         name: source_col.name.clone(),
                         source_type: source_col.data_type.clone(),

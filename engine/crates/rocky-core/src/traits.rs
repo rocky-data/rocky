@@ -1851,6 +1851,16 @@ pub trait SqlDialect: Send + Sync {
         crate::drift::default_is_safe_type_widening(source_type, target_type)
     }
 
+    /// Whether a source column of type `source_type` and a column of this
+    /// warehouse reported as `target_type` are the same type, so drift
+    /// detection sees no change. The default compares the strings, ignoring
+    /// case. A warehouse whose `DESCRIBE` reports several names as one type
+    /// (Snowflake: every float is 64-bit) overrides, so a source that spells
+    /// the type another way does not drift on every run.
+    fn types_equivalent(&self, source_type: &str, target_type: &str) -> bool {
+        source_type.eq_ignore_ascii_case(target_type)
+    }
+
     /// SQL to change a column's data type as part of drift evolution.
     ///
     /// Default emits the ANSI `ALTER TABLE x ALTER COLUMN y TYPE z`
