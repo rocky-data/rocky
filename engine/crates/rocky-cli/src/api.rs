@@ -359,12 +359,16 @@ pub async fn serve(
     ready.signal();
     // Graceful shutdown: on `shutdown` (SIGTERM/ctrl-c, shared with the scheduler
     // loop) axum stops accepting and drains in-flight requests before returning.
-    axum::serve(listener, app)
+    let raise = shutdown.clone();
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.signalled().await })
-        .await?;
-    // Graceful shutdown returns only once `shutdown` is raised, so the
-    // forward has started; wait for it to deliver.
+        .await;
+    // A clean return means `shutdown` was raised. An error return may not
+    // have raised it, and the jobs must still be stopped: their children no
+    // longer share this process's group. Raising it twice is harmless.
+    raise.signal();
     let _ = forward.await;
+    served?;
     Ok(())
 }
 
@@ -12246,6 +12250,30 @@ adapter = "db"
             settled_job_state(output.status.success(), output.signalled),
             JobState::Cancelled
         );
+    }
+
+    /// A child that ignores SIGINT still stops on a cancel. A shell starts a
+    /// background command with SIGINT ignored and `exec` keeps the ignore, so
+    /// a `rocky serve` started that way passes it to every job; a cancel that
+    /// sent SIGINT would then never stop a job with no handler of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_stops_a_child_that_ignores_sigint() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("trap '' INT; sleep 30 & wait");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let run = tokio::spawn(run_job_child(cmd, rx));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (message, answer) = cancel_message(GroupSignal::Terminate);
+        tx.send(message).unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("a child that ignores SIGINT must still stop on a cancel")
+            .unwrap()
+            .expect("spawn sh");
+        assert!(answer.await.unwrap());
+        assert!(!output.status.success());
+        assert_eq!(output.signalled, Some(GroupSignal::Terminate));
     }
 
     /// A kill reaches the whole process group, not just the child. The shell
