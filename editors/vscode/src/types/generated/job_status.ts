@@ -12,7 +12,7 @@ export type JobKind = "run" | "plan" | "apply" | "approve";
 /**
  * Lifecycle state of a job.
  */
-export type JobState = "queued" | "running" | "succeeded" | "failed";
+export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 /**
  * Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).
@@ -21,7 +21,7 @@ export type JobState = "queued" | "running" | "succeeded" | "failed";
  */
 export interface JobStatus {
   /**
-   * Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.
+   * Failure detail when [`state`](Self::state) is [`JobState::Failed`], what stopped the job when it is [`JobState::Cancelled`], else `null`.
    */
   error?: string | null;
   /**

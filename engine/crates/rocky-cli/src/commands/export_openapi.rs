@@ -274,6 +274,9 @@ enum Body {
     Component(&'static str),
     /// The `202 Accepted` job-submission body: `{ "job_id": string }`.
     JobAccepted,
+    /// The `202 Accepted` job-cancel body:
+    /// `{ "job_id": string, "signal": "interrupt" | "kill" }`.
+    JobCancelAccepted,
     /// An ad-hoc object explicitly outside the `/api/v1` value contract.
     OutOfContract,
 }
@@ -830,6 +833,46 @@ fn route_table() -> Vec<Route> {
                 Resp {
                     status: "404",
                     description: "No job with this id (neither in-memory nor persisted).",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/{id}/cancel",
+            operation_id: "cancelJob",
+            tag: "jobs",
+            summary: "Cancel a running job",
+            description: "Stop a job this server process started. The first request sends \
+                 the job's process group an interrupt (SIGINT, as Ctrl-C does); a later one \
+                 kills it (SIGKILL). On Windows every request kills the child. The job keeps \
+                 the single-mutating-job permit until its child has exited. Its final state \
+                 is `cancelled` when the child then failed, or `succeeded` when it finished \
+                 first. Takes no request body.",
+            path_params: &["id"],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "202",
+                    description: "The job's task has the request. Poll \
+                         `GET /api/v1/jobs/{id}` for the final state.",
+                    body: Body::JobCancelAccepted,
+                },
+                Resp {
+                    status: "404",
+                    description: "No job with this id (neither in-memory nor persisted).",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "409",
+                    description: "`job_not_running`: the job has finished. \
+                         `job_not_cancellable`: the job is in flight but this server \
+                         process did not start it (a scheduled run, or a record from \
+                         another process).",
                     body: Body::Component("ErrorEnvelope"),
                 },
                 STATE_NEEDS_MIGRATION,
@@ -1559,6 +1602,19 @@ fn response_object(resp: &Resp) -> Value {
             "type": "object",
             "properties": { "job_id": { "type": "string" } },
             "required": ["job_id"]
+        }),
+        Body::JobCancelAccepted => json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "signal": {
+                    "type": "string",
+                    "enum": ["interrupt", "kill"],
+                    "description": "What this request asked the job's task to send: \
+                         `interrupt` (SIGINT) on the first request, `kill` (SIGKILL) after."
+                }
+            },
+            "required": ["job_id", "signal"]
         }),
         Body::OutOfContract => json!({
             "type": "object",

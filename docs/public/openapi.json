@@ -7494,7 +7494,7 @@
         ]
       },
       "ErrorEnvelope": {
-        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.",
+        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `job_not_running` (`409`: a cancel named a job that has finished), `job_not_cancellable` (`409`: a cancel named a job this server process did not start, such as a scheduled run), `bad_request`, `unauthorized`, `internal_error`.",
         "properties": {
           "code": {
             "description": "Stable machine token, e.g. `\"model_not_found\"`.",
@@ -10619,6 +10619,13 @@
               "failed"
             ],
             "type": "string"
+          },
+          {
+            "description": "`POST /api/v1/jobs/{id}/cancel` signalled the subprocess, and it then exited non-zero. A job that exits 0 after the signal is `succeeded`: it finished before the signal could stop it.",
+            "enum": [
+              "cancelled"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10626,7 +10633,7 @@
         "description": "Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).\n\nThe presentation type over `rocky-core`'s `PersistedJob`: it carries the same lifecycle facts with typed [`JobKind`]/[`JobState`] enums for embedder ergonomics, and — once the job is terminal — the canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying subprocess emitted, embedded **verbatim** in [`result`](Self::result). An embedder switches on [`kind`](Self::kind) to know which schema `result` conforms to (the same `run` / `plan` / `apply` schemas the CLI exports).",
         "properties": {
           "error": {
-            "description": "Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.",
+            "description": "Failure detail when [`state`](Self::state) is [`JobState::Failed`], what stopped the job when it is [`JobState::Cancelled`], else `null`.",
             "type": [
               "string",
               "null"
@@ -26245,6 +26252,76 @@
           }
         },
         "summary": "Job status",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/cancel": {
+      "post": {
+        "description": "Stop a job this server process started. The first request sends the job's process group an interrupt (SIGINT, as Ctrl-C does); a later one kills it (SIGKILL). On Windows every request kills the child. The job keeps the single-mutating-job permit until its child has exited. Its final state is `cancelled` when the child then failed, or `succeeded` when it finished first. Takes no request body.",
+        "operationId": "cancelJob",
+        "parameters": [
+          {
+            "description": "Path parameter `id`.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "signal": {
+                      "description": "What this request asked the job's task to send: `interrupt` (SIGINT) on the first request, `kill` (SIGKILL) after.",
+                      "enum": [
+                        "interrupt",
+                        "kill"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id",
+                    "signal"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The job's task has the request. Poll `GET /api/v1/jobs/{id}` for the final state."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No job with this id (neither in-memory nor persisted)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          }
+        },
+        "summary": "Cancel a running job",
         "tags": [
           "jobs"
         ]

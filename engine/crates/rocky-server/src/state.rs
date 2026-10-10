@@ -118,6 +118,9 @@ pub struct ServerState {
     /// table, serving `GET /api/v1/jobs/{id}` without touching redb on the hot
     /// path. Repopulated lazily from redb after a restart.
     pub jobs: crate::jobs::JobRegistry,
+    /// Cancel channels of the jobs this process launched and has not settled,
+    /// read by `POST /api/v1/jobs/{id}/cancel` and by the shutdown path.
+    pub job_cancels: crate::jobs::JobCancels,
     /// Bearer token required by the HTTP API auth middleware, together with
     /// the [`crate::auth::TokenScope`] it grants. `None` means "no auth"; in
     /// that mode `rocky_cli::api::serve` refuses to bind a non-loopback host.
@@ -449,6 +452,7 @@ impl ServerState {
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
+            job_cancels: crate::jobs::JobCancels::new(),
             auth,
             ui_session_key: crate::ui_session::UiSessionKey::generate(),
             allowed_origins,

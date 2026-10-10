@@ -152,9 +152,73 @@ pub fn stamp_is_this_process(owner_pid: Option<u32>, owner_start_time: Option<u6
     }
 }
 
+/// A signal sent to the whole process group a job child leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSignal {
+    /// `SIGINT`, what Ctrl-C at a terminal sends. `rocky run` handles it in
+    /// its replication fan-out: it stops starting copies, lets in-flight ones
+    /// finish, and settles its state. A process with no handler stops at once.
+    Interrupt,
+    /// `SIGKILL`. Nothing can catch it, so the process stops like a crash.
+    Kill,
+}
+
+/// Send `signal` to every process in the group `pgid`.
+///
+/// `pgid` must be the id of a child spawned as the leader of its own group
+/// (`process_group(0)`), and the caller must still hold that child unreaped:
+/// an unreaped child keeps its id, so the id cannot name another process.
+///
+/// # Errors
+///
+/// A `pgid` of 0 or 1 is refused: `killpg(0, ..)` signals the CALLER's own
+/// group, and 1 is `init`. Otherwise the OS error of `killpg(2)`, such as
+/// `ESRCH` when the group has already exited.
+#[cfg(unix)]
+pub fn signal_process_group(pgid: u32, signal: GroupSignal) -> std::io::Result<()> {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process group id out of range",
+        ));
+    };
+    if pgid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to signal process group 0 or 1",
+        ));
+    }
+    let signal = match signal {
+        GroupSignal::Interrupt => libc::SIGINT,
+        GroupSignal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: `killpg` takes two integers and touches no memory of this
+    // process. `pgid` is above 1 (checked above), so it never names this
+    // process's own group or `init`; a group that no longer exists returns
+    // `ESRCH`, which is reported, not undefined.
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Group 0 is the caller's own group, and 1 is `init`: neither is ever
+    /// signalled, whatever the signal.
+    #[test]
+    fn signal_process_group_refuses_the_callers_group_and_init() {
+        for pgid in [0, 1] {
+            for signal in [GroupSignal::Interrupt, GroupSignal::Kill] {
+                let err = signal_process_group(pgid, signal).unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{pgid}");
+            }
+        }
+    }
 
     #[test]
     fn strip_removes_inherited_pipes_variables_from_child() {
