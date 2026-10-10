@@ -115,7 +115,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
         ▼
   GET /api/v1/jobs/{id} ──► running ───► poll again
                         ├─► succeeded ─┐
-                        └─► failed ────┴─► body embeds the canonical
+                        ├─► failed ────┤
+                        └─► cancelled ─┴─► body embeds the canonical
                                            RunOutput or PlanOutput
 ```
 
@@ -123,9 +124,11 @@ The polled result is the same payload the CLI would have produced.
 
 `POST /api/v1/jobs/approve` takes `{"plan_id": "<64 lowercase hex>"}`. It runs `rocky review <plan_id> --approve` as a subprocess and takes the same single-mutation lock as `run` and `apply`. While one of them runs, it answers `409 mutation_in_progress`. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`. The approval records the approver source `http_api` and the server's git identity. If `git config user.email` cannot be resolved, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`, so run records show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
 
-A submitted job becomes `running` right away. The schema also declares a `queued` state, but this server never uses it, because submissions never sit in a queue. Poll until the state is `succeeded` or `failed` rather than matching on the full set.
+A submitted job becomes `running` right away. The schema also declares a `queued` state, but this server never uses it, because submissions never sit in a queue. Poll until the state is `succeeded`, `failed` or `cancelled` rather than matching on the full set.
 
-There is no cancel route and no timeout route today. A mutating job holds the single mutation lane until its subprocess exits. While that lane is held, the next `run` or `apply` submission returns `409`, so a hung job blocks the next one. Restarting the sidecar is the only way to clear it. On restart the server reconciles its durable job ledger: it marks any job the previous process left `running` or `queued` as `failed`, with the error `interrupted by engine restart`. A client that polls for a terminal state therefore always terminates — a state this version does not recognise is reported as `failed` when the record is read, so polling ends either way. A cancel route is planned.
+`POST /api/v1/jobs/{id}/cancel` stops a job this server process started. It takes no body and answers `202 {"job_id": ..., "signal": "interrupt"}`. The first request sends the job's process group `SIGINT`, as Ctrl-C does: a run of a replication pipeline finishes the copies in flight, saves their state and exits. Other jobs stop at once. A second request sends `SIGKILL` and answers `"signal": "kill"`. On Windows every request kills the job. The job ends `cancelled`, or `succeeded` if it finished before the signal reached it. It keeps the mutation lane until its subprocess has exited. A finished job answers `409 job_not_running`. A job this process did not start, such as a scheduled run, answers `409 job_not_cancellable`. An unknown id answers `404 job_not_found`. The [browser UI guide](/guides/browser-ui/#cancel-a-running-job) lists what a cancelled job leaves behind.
+
+There is no timeout route today. A mutating job holds the single mutation lane until its subprocess exits. While that lane is held, the next `run` or `apply` submission returns `409`, so a hung job blocks the next one until it is cancelled. On restart the server reconciles its durable job ledger: it marks any job the previous process left `running` or `queued` as `failed`, with the error `interrupted by engine restart`. A client that polls for a terminal state therefore always terminates — a state this version does not recognise is reported as `failed` when the record is read, so polling ends either way.
 
 ### Every failure carries an error envelope
 

@@ -170,7 +170,28 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, approve and apply. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+
+### Cancel a running job
+
+While a job runs, operator mode shows a **Cancel** button under it. A read-only page does not show it. The button calls `POST /api/v1/jobs/{id}/cancel`:
+
+```
+Cancel ─▶ SIGINT to the job's process group (as Ctrl-C)  ─▶ the button becomes "Force stop"
+Force stop ─▶ SIGKILL to the job's process group          ─▶ the job stops at once
+```
+
+The job then ends `cancelled`. If it finished before the signal reached it, it ends `succeeded`. A cancelled run, apply or approve keeps the project's single write slot until its process has exited, so a new one waits for it (`409 mutation_in_progress`).
+
+What a cancelled job leaves:
+
+- **A run or apply of a replication pipeline, after Cancel**, stops like Ctrl-C in a terminal. It starts no new table copies and lets the copies in flight finish. It saves their watermarks, marks the other tables `Interrupted`, and records the run as a partial failure. `rocky run --resume-latest` copies the rest.
+- **Any other job, after Cancel** (models, a plan, an approval), stops at once. Rocky has no clean-stop step for these yet ([#1606](https://github.com/rocky-data/rocky/issues/1606)). A warehouse statement in flight is cut, and the warehouse keeps or drops it whole. A state write in flight is all or nothing. Models that finished stay built. Run the job again to finish.
+- **After Force stop**, any job stops like a crash. An incremental replication table can have its rows landed before its watermark was saved. On DuckDB, Databricks, Snowflake and BigQuery, the next run of that table reads the watermark back from the target table first, so it does not copy the same rows twice. On other warehouses, prefer Cancel.
+
+A plan file cut part-way no longer reads as its plan id, so Rocky refuses to apply it.
+
+Cancel reaches only jobs this server process started. A scheduled run (`--scheduler`) answers `409 job_not_cancellable`, and a finished job answers `409 job_not_running`. On Windows there is no interrupt, so Cancel kills the job at once. Stopping `rocky serve` with Ctrl-C or `SIGTERM` sends each of its running jobs the same interrupt as Cancel.
 
 `rocky serve --ui` turns it on by itself when all of these hold:
 
