@@ -12,7 +12,7 @@ Each adapter reads its credentials from its own `[adapter.NAME]` block, except B
 | Databricks | `token` (PAT), else `client_id` + `client_secret` (OAuth M2M) | This page |
 | Snowflake | `pat`, `oauth_token`, key pair, or password | [Snowflake](/reference/adapters/snowflake/#authentication) |
 | BigQuery | `BIGQUERY_TOKEN` or `GOOGLE_APPLICATION_CREDENTIALS` | [BigQuery](/reference/adapters/bigquery/#authentication) |
-| PostgreSQL, Redshift | `username` + `password` | [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/#authentication) |
+| PostgreSQL, Redshift | `username` + `password` | [PostgreSQL](/reference/adapters/postgres/#authentication), [Redshift](/reference/adapters/redshift/#authentication) |
 | SQL Server | SQL login, Entra ID token, or service principal | [SQL Server](/reference/adapters/sqlserver/#authentication) |
 | ClickHouse | `username` + `password` | [ClickHouse](/reference/adapters/clickhouse/#authentication-and-tls) |
 | Spark | optional bearer `token` | [Spark](/reference/adapters/spark/#fields) |

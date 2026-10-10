@@ -161,9 +161,8 @@ zero padding, even though `chrono` would parse it.
 
 > Note: the canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`. The `rocky run` single-step alias fuses plan + apply into one invocation for local iteration and automation. Every partition-selection flag below is accepted on both `rocky plan` and `rocky run`.
 
-`rocky run` accepts seven new flags for selecting and modifying which
-partitions to compute. The selection flags are mutually exclusive (`clap`
-enforces it):
+Seven flags select and modify which partitions to compute. The selection flags
+are mutually exclusive:
 
 | Flag | Behavior |
 |---|---|
@@ -172,7 +171,7 @@ enforces it):
 | `--latest` | Run the partition containing `now()` (UTC). Default for `time_interval` models when no other selection flag is given, except on the first run (see below). |
 | `--missing` | Compute the diff between expected partitions (`first_partition` → `now()`) and what's recorded as `Computed` in the `PARTITIONS` state-store table; run only the gaps. Errors if `first_partition` is unset. |
 | `--lookback N` | Recompute the previous N partitions in addition to the selected ones. CLI override beats the model's TOML `lookback`. |
-| `--parallel N` | Run N partitions concurrently (default 4; pass `--parallel 1` for serial). Driven by `futures::stream::buffer_unordered` so the per-partition futures are polled in the same task — no spawn, no `Send` constraint. Warehouse-query parallelism only: state writes serialize through redb's single-writer lock. **Caveat:** DuckDB's adapter holds a connection mutex and runs `execute_statement` synchronously, so partitions always run serially against DuckDB regardless of `--parallel`. Snowflake and Databricks (REST-based async I/O) parallelize up to N as expected. |
+| `--parallel N` | Run N partitions concurrently (default 4; pass `--parallel 1` for serial). This bounds warehouse queries only: state writes serialize through redb's single-writer lock. **Caveat:** DuckDB's adapter holds a connection mutex, so partitions always run serially against DuckDB, whatever `--parallel` says. Snowflake and Databricks parallelize up to N. |
 
 ### The first run
 
@@ -307,11 +306,10 @@ cross-references the two when you investigate a failure.
 
 ## Timezone
 
-**v1 is UTC-only.** The `time_column` is interpreted as UTC and `--latest`
-resolves to "the partition containing `chrono::Utc::now()`". If your data
-lives in a non-UTC timezone, convert in your model SQL or accept UTC
-partition boundaries. A `timezone` field on the strategy config is a v2
-candidate.
+**Partitions are UTC only.** Rocky reads the `time_column` as UTC, and
+`--latest` resolves to the partition that contains the current UTC time. If
+your data lives in another timezone, convert in your model SQL or accept UTC
+partition boundaries. The strategy has no `timezone` field.
 
 ## JSON output
 
@@ -364,22 +362,21 @@ Both strategies process only part of the data on each run. They differ in what d
 
 Pick `time_interval` when the output is grouped by date and a day must be recomputed as a whole. Pick `incremental` when new or changed rows can be loaded on their own. See [Incremental](/reference/model-format/#incremental).
 
-## Limitations (v1)
+## Limitations
 
-The following are deferred:
+These are not supported yet:
 
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
-  recognized in `.sql` files only. The `.rocky` parser will gain `@var`
-  syntax in v1.1.
+  recognized in `.sql` files only. The `.rocky` parser has no placeholder
+  syntax.
 - **Native partitions on PostgreSQL and Redshift** — both adapters run
   `time_interval` as `DELETE` then `INSERT` in one transaction. A
   declarative-partition (child-table truncate) route is a follow-up.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
-- **Multi-column partitions** — single time column only in v1.
+- **Multi-column partitions** — a single time column only.
 - **Partition column transformations** — `time_column` must be a real
   output column, not an expression.
-- **`--batch-size` CLI flag** — TOML-only in v1; promote to CLI when
-  there's demand.
+- **`--batch-size` CLI flag** — `batch_size` is TOML-only.
 
 ## See also
 
@@ -388,4 +385,4 @@ The following are deferred:
   (`examples/playground/pocs/02-performance/03-partition-checksum/`)
 - [Dagster partitions guide](/dagster/partitions/) — how the dagster-rocky
   integration translates `time_interval` into Dagster `PartitionsDefinition`
-- `rocky run --help` — full CLI reference for the seven new flags
+- `rocky run --help` — full CLI reference for the seven flags

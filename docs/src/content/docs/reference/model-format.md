@@ -59,6 +59,14 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `access` | string | No | `private`, `protected` (default) or `public`. Who may reference the model. See [Model governance](/concepts/model-governance/). |
 | `access_group` | string | No | Ownership group for access checks. Falls back to `group`. Inherits no config. See [Model governance](/concepts/model-governance/#ownership-groups-and-owners). |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+| `adapter` | string | No | An `[adapter.NAME]` key from `rocky.toml`. Runs this model on that adapter instead of the pipeline's. |
+| `intent` | string | No | A plain-language description of what the model does. `rocky ai-sync` reads it. |
+
+More sidecar blocks: `[freshness]` (`max_lag_seconds`, `time_column`, `severity`; see [`[freshness]`](/reference/configuration/#freshness)), `[budget]` (a per-model override of the project [`[budget]`](/reference/configuration/#budget), checked at compile time as `E027`), and the adapter-specific [`[redshift]`](/reference/adapters/redshift/#table-distribution-and-sort-keys) and [`[clickhouse]`](/reference/adapters/clickhouse/#table-engine-partitions-and-sort-key) blocks.
+
+:::caution[Unknown top-level keys are ignored]
+Rocky does not refuse an unknown top-level key in a sidecar. A typo such as `depends_onn = ["x"]` loads without an error, and the setting has no effect. Check each key against this page.
+:::
 
 `drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. Rocky refuses a `full_refresh` or `view` model carrying this key on every other adapter. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
 
@@ -274,7 +282,7 @@ ssn = "confidential"
 Tags are free-form strings (no enum), so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
 
 :::note[Adapter support]
-Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort: failures emit `warn!` and don't abort the run.
+Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Other adapters do not support them yet. Best-effort: a failure logs a warning and does not abort the run.
 :::
 
 ### `[tags]`
@@ -523,7 +531,7 @@ Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG ru
 |---|---|
 | **Databricks (Delta)** | `ALTER TABLE ... SET TBLPROPERTIES ('delta.logRetentionDuration' = '{N} days', 'delta.deletedFileRetentionDuration' = '{N} days')` — both keys written together. |
 | **Snowflake** | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = {N}`. |
-| **BigQuery / DuckDB** | Default-unsupported — those warehouses lack a first-class retention knob at the config level. |
+| **Other adapters** | Not supported. Rocky emits nothing. |
 
 Rocky rejects a malformed value when it parses the sidecar: `"abc"`, `"90"`, `"-3d"`, `"1.5d"`, a leading sign, an exponent. The `ModelError::InvalidRetention` diagnostic names what it saw. Inspect the resolved policies with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
 
@@ -897,7 +905,7 @@ schema = "marts"
 table = "fct_events"
 ```
 
-The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer (shipped in engine v1.30.0 across Phases 1–5: discover, write, sync, partitioned, rowTracking, schema evolution).
+The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer.
 
 ---
 
@@ -1056,7 +1064,7 @@ Per-partition state is tracked in the state store. The `--missing` flag consults
 
 ## DAG Resolution
 
-You never write an execution order. Rocky derives it from the `depends_on` declarations and runs the models in [topological order](/reference/glossary/#topological-order), so every upstream finishes before anything that reads it starts.
+You never write an execution order. Rocky derives it from the `depends_on` declarations and the table references in each model's SQL, and runs the models in [topological order](/reference/glossary/#topological-order), so every upstream finishes before anything that reads it starts.
 
 ```
    stg_orders ─────┐

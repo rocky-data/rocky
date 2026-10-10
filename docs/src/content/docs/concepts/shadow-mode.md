@@ -299,8 +299,7 @@ Rocky compares column names, types, and order:
 ### No value comparison yet
 
 The comparison reads no rows. Two tables can hold the same number of rows and
-different data, and the verdict cannot see that. The JSON field
-`sample_mismatches` is always empty today. For a row-level diff, use
+different data, and the verdict cannot see that. For a row-level diff, use
 [`rocky preview diff --algorithm bisection`](/concepts/preview-internals/#--algorithm-bisection).
 
 ## Thresholds

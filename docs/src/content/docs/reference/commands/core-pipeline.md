@@ -23,50 +23,64 @@ The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `
 
 ## `rocky init`
 
-Create a new Rocky project: a starter `rocky.toml` plus a `models/` directory.
+Create a new Rocky project from a template. The command refuses when the directory already holds a `rocky.toml`.
 
 ```bash
-rocky init [path] [flags]
+rocky init [path] [--template <NAME>]
 ```
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `path` | `string` | `.` | Directory where the project will be created. |
+| `path` | `string` | `.` | Project directory. Rocky creates it when it does not exist. |
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--template <NAME>` | `string` | `duckdb` | Scaffold template. One of `duckdb`, `databricks-fivetran`, `snowflake`, `bigquery`, `trino`. Each template emits a runnable `rocky.toml` with the matching adapter wired up via `${VAR}` env-var placeholders (never inline secrets) plus a `models/welcome.{sql,toml}` that compiles with no source tables. |
+| `--template <NAME>` | `string` | `duckdb` | One of the templates below. Connection values are `${VAR}` placeholders, never inline secrets. |
+
+| Template | What it writes |
+|---|---|
+| `duckdb` | `rocky.toml`, `models/_defaults.toml`, a sample `models/stg_orders` model, and `seeds/seed.sql` sample data. |
+| `databricks-fivetran` | `rocky.toml` for a Fivetran-to-Databricks pipeline, and an empty `models/`. |
+| `snowflake` | `rocky.toml` for Snowflake, and an empty `models/`. |
+| `bigquery` | `rocky.toml`, `models/_defaults.toml`, and a `models/welcome` model. |
+| `trino` | `rocky.toml`, `models/_defaults.toml`, and a `models/welcome` model. |
 
 ### Examples
-
-Create a project in the current directory (default DuckDB template):
 
 ```bash
 rocky init
 ```
 
 ```
-Created rocky.toml
-Created models/
-Rocky project initialized.
+Initialized Rocky project in .
+
+  rocky.toml           — pipeline config (DuckDB)
+  models/_defaults.toml — shared model defaults
+  models/stg_orders.*  — sample transformation model
+  seeds/seed.sql       — sample data
+
+Quick start:
+  duckdb playground.duckdb < seeds/seed.sql
+  rocky validate
+  rocky compile --models models/
 ```
 
-Create a Trino-targeted project in a new directory:
+Create a Trino project in a new directory:
 
 ```bash
 rocky init acme-trino --template trino
 ```
 
-The emitted `rocky.toml` wires the `trino` adapter to `${TRINO_HOST}` / `${TRINO_USER}` / `${TRINO_PASSWORD}` (HTTP Basic) or `${TRINO_JWT}` (JWT bearer), with inline TOML comments documenting both auth modes.
+The Trino `rocky.toml` reads `${TRINO_HOST}`, `${TRINO_USER}` and `${TRINO_PASSWORD}` (HTTP Basic), or `${TRINO_JWT}` (a JWT bearer token). Comments in the file describe both modes.
 
 ### Related Commands
 
 - [`rocky validate`](#rocky-validate) -- check the generated config
-- [`rocky playground`](/reference/commands/development/#rocky-playground) -- create a sample project with DuckDB (no credentials needed)
+- [`rocky playground`](/reference/commands/development/#rocky-playground) -- a sample DuckDB project with no credentials
 
 ---
 
@@ -1068,10 +1082,11 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 
 ### `branch promote` flags
 
-> Note: as of engine v1.33, the canonical form is [`rocky plan promote <name>`](#rocky-plan-promote) followed by `rocky apply <plan-id>` (or `rocky branch promote <name> --plan <plan-id>`). The bare `rocky branch promote <name>` form still works as an alias. It prints a one-line `[deprecated]` notice to stderr, which `ROCKY_SUPPRESS_DEPRECATION=1` silences.
+> The canonical form is [`rocky plan promote <name>`](#rocky-plan-promote) followed by `rocky apply <plan-id>` (or `rocky branch promote <name> --plan <plan-id>`). The bare `rocky branch promote <name>` form still works as an alias. It prints a one-line `[deprecated]` notice to stderr, which `ROCKY_SUPPRESS_DEPRECATION=1` silences.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--plan <plan-id>` | `string` | (none) | Execute a promote plan written by `rocky plan promote`. The gates already ran at plan time. |
 | `--allow-breaking` | flag | off | Bypass the semantic breaking-change gate. Always emits a `breaking_changes_allowed` audit event so the override leaves a paper trail. |
 | `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
 | `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |

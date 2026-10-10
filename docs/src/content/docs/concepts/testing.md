@@ -97,7 +97,7 @@ The `[rules]` section enforces schema-level constraints:
 | `W010` | Warning | Contract defines a column that is not in the model output (but not required) |
 | `W011` | Warning | Contract exists for a model that was not found in the project |
 
-A column can end up with type `Unknown`, which means the compiler could not infer its type. A type check against a contract then passes without error. This avoids false alarms when the type information is incomplete.
+A column can end up with type `Unknown`, which means the compiler could not infer its type. A type check against a contract then does not run. Rocky reports the column as `I003` at info severity, which changes no exit code. To refuse such a column instead, run with `--strict-contracts` or set `[contracts] strict = true`. Each `I003` then becomes the error `E059`. [Who Enforces What](/concepts/capability-matrix/#contracts-columns-types-required-protected) says how to give the compiler the types it needs.
 
 ## rocky test
 
@@ -152,7 +152,7 @@ Testing 12 models...
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "test",
   "total": 12,
   "passed": 10,
@@ -220,7 +220,7 @@ When a project declares any `[[test]]` blocks, `rocky test` reports a unit-test 
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "test",
   "total": 12,
   "passed": 12,
@@ -342,7 +342,7 @@ Warnings do not change the exit code. The JSON `exit_code` is the same number th
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "ci",
   "compile_ok": true,
   "tests_ok": true,

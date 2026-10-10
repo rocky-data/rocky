@@ -361,11 +361,13 @@ Decides how a model's rows land in the target table. One strategy per model.
 - **Incremental**: `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store at SQL-generation time (not carried on the strategy itself, so recipe-hash inputs stay runtime-state-free).
 - **Merge**: `MERGE INTO ... USING (...) ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`. Upserts based on a unique key.
 - **View**: `CREATE OR REPLACE VIEW ... AS SELECT ...`. No physical storage; every read re-executes the `SELECT`. Supported on every warehouse.
-- **MaterializedView**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...`. Databricks-specific.
+- **MaterializedView**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...` on Databricks, Snowflake and BigQuery. PostgreSQL and Redshift drop and re-create the view. Other warehouses refuse it.
 - **DynamicTable**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ...`. Snowflake-specific.
 - **TimeInterval**: partition-keyed materialization. The model SQL uses `@start_date` and `@end_date` placeholders; the runtime substitutes per-partition timestamps. Supports `--partition`, `--from/--to`, `--latest`, `--missing` CLI flags.
 - **DeleteInsert**: delete rows matching the partition key, then insert fresh data. Cheaper alternative to `Merge` when the partition key identifies the rows being rewritten.
 - **Microbatch**: alias for `TimeInterval` with `hour`-granularity defaults; dbt-compatible naming.
+- **Ephemeral**: never materialized. The compiler inlines its SQL as a CTE into each model that reads it.
+- **Snapshot**: an SCD Type 2 history of the model's `SELECT`. Each run closes the changed versions and inserts new ones.
 - **ContentAddressed**: content-addressed Parquet + Delta log commit via the `rocky-iceberg` writer. Designed for cross-engine reads (DuckDB `iceberg_scan`, Trino, Spark). SQL generation does not run for this strategy; the runtime drives `rocky-iceberg::uniform_writer` directly. See [Content-Addressed Materialization](/concepts/content-addressed/).
 
 The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (where applicable) lives in `rocky-core::sql_gen`.

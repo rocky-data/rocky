@@ -30,6 +30,10 @@ A replication pipeline needs no model. Rocky renders its catalog, schema, copy a
                   the SQL below, ready to execute
 ```
 
+The diagram shows five dialects. PostgreSQL, Redshift, SQL Server, ClickHouse
+and Spark have their own dialects too. This page shows the Databricks form
+unless it names another warehouse.
+
 The rest of this page is the catalog of statements Rocky emits. Rocky validates every identifier before it reaches a statement — see [SQL Safety](#sql-safety) at the end.
 
 ## Catalog Lifecycle
@@ -62,7 +66,7 @@ SHOW SCHEMAS IN <catalog>
 
 ## Table Tagging
 
-Rocky tags each replicated table for governance:
+Rocky applies the governance tags you configure to each replicated table:
 
 ```sql
 ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
@@ -70,7 +74,7 @@ ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
 
 ## Incremental Copy
 
-This is the core replication statement. It copies only the rows newer than the last watermark Rocky recorded for the table:
+This is the core replication statement. It copies only the rows newer than the last watermark Rocky recorded for the table. The `_loaded_by` column appears only when the pipeline declares it in `metadata_columns`:
 
 ```sql
 INSERT INTO <target_catalog>.<target_schema>.<table>
@@ -108,7 +112,7 @@ Rocky wraps the SQL you wrote in a statement chosen by the model's materializati
 - **Table**: `CREATE OR REPLACE TABLE ... AS <user_sql>`
 - **Incremental**: `INSERT INTO ... <user_sql>`
 - **Merge**: `MERGE INTO ... USING (<user_sql>) ...`
-- **Materialized View**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS <user_sql>` (Databricks)
+- **Materialized View**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS <user_sql>` (Databricks, Snowflake, BigQuery; PostgreSQL and Redshift drop and re-create the view)
 - **Dynamic Table**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' AS <user_sql>` (Snowflake)
 - **Time Interval**: Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` substitution
 
@@ -153,7 +157,9 @@ The hash expression follows dbt-utils' `generate_surrogate_key`. Rocky casts eac
 
 The hash digest is the same one dbt-utils' `generate_surrogate_key` produces for the same columns, so a key Rocky computes joins against the same key in an upstream dbt model.
 
-## Materialized View (Databricks)
+## Materialized View
+
+Databricks, Snowflake and BigQuery:
 
 ```sql
 CREATE OR REPLACE MATERIALIZED VIEW <catalog>.<schema>.<table> AS
@@ -258,7 +264,8 @@ Rocky uses the Databricks REST API for workspace binding and isolation (not SQL)
 
 ## Catalog Discovery
 
-Rocky finds the catalogs it manages by reading its own tags back:
+Rocky finds the catalogs it manages by reading back a tag you configured, for
+example `managed_by = 'rocky'`:
 
 ```sql
 SELECT catalog_name
@@ -270,7 +277,7 @@ WHERE tag_name = 'managed_by' AND tag_value = 'rocky'
 
 Rocky applies the same rules to every statement it builds:
 
-- **Identifiers** (catalogs, schemas, tables, tenants, regions, sources) must match `^[a-zA-Z0-9_]+$`
+- **Identifiers** (catalogs, schemas, tables, tenants, regions, sources) must match `^[a-zA-Z0-9_]+$`. A BigQuery project ID may also hold hyphens, and has its own rule
 - **Principal names** must match `^[a-zA-Z0-9_ \-\.@]+$`, and Rocky always wraps them in backticks
 - Rocky never uses `format!()` to interpolate untrusted input into SQL
 - Every check runs in `rocky-sql/validation.rs`, before Rocky constructs any SQL

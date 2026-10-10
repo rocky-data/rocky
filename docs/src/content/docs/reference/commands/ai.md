@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-These commands use an AI model to draft, reconcile, explain, and test Rocky models. Each one needs a configured AI provider. None of them materializes anything on its own: a person still runs `rocky apply`.
+These commands use an AI model to draft, reconcile, explain and test Rocky models, and to draft contracts. The generating commands need an AI provider: Rocky reads `ANTHROPIC_API_KEY` from the environment. `rocky mcp` serves the same abilities, and more, to an agent. None of them materializes anything on its own: a person still runs `rocky apply`.
 
 ---
 

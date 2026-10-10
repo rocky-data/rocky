@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-Rocky lives in one repository. It holds the Rust engine, two Python packages, a VS Code extension, a sample pipeline, and this docs site. One pull request can change several of them at once, and one CI run covers them all.
+Rocky lives in one repository. It holds the Rust engine and its browser UI, two Python packages, a VS Code extension, a sample pipeline, and this docs site. One pull request can change several of them at once, and one CI run covers them all.
 
 This page answers three questions. Where does my change belong? How do I build and test that part? What will CI check before it merges?
 
@@ -45,6 +45,7 @@ The right entry point depends on what you want to change.
 | CLI JSON output shape | `engine/crates/rocky-cli/src/output.rs` — then run `just codegen` |
 | A new CLI subcommand | See the `rocky-new-cli-command` skill in `.agents/skills/` (mirrored in `.claude/skills/`) |
 | The Rocky DSL (`.rocky` files) | `engine/crates/rocky-lang/src/` — then update VS Code grammar too |
+| The browser UI (`rocky serve --ui`) | `engine/ui/` (React + Vite). Run `just ui-dev` for the dev loop. |
 | The LSP server | `engine/crates/rocky-server/src/lsp.rs` |
 | The Dagster integration | `integrations/dagster/src/dagster_rocky/` |
 | The Python SDK | `sdk/python/src/rocky_sdk/client.py` |
@@ -66,6 +67,7 @@ Rocky is a monorepo with five subprojects:
 ```
 rocky/
 ├── engine/                     # Rust CLI + engine (Cargo workspace)
+│   └── ui/                     # Browser UI that `rocky serve --ui` embeds
 ├── sdk/python/                 # rocky-sdk Python client
 ├── integrations/dagster/       # dagster-rocky Python package
 ├── editors/vscode/             # VS Code extension (LSP client)
@@ -131,6 +133,24 @@ uv run ruff check
 uv run ruff format --check
 ```
 
+### Browser UI (TypeScript)
+
+```bash
+cd rocky/engine/ui
+
+npm ci
+npm run typecheck
+npm test
+
+# From the monorepo root: `rocky serve` plus the Vite dev server
+just ui-dev
+
+# Build the UI and a release binary that embeds it
+just build-engine-ui
+```
+
+A plain `cargo build` does not need the UI.
+
 ### VS Code extension (TypeScript)
 
 ```bash
@@ -142,7 +162,10 @@ npm install
 # Compile
 npm run compile
 
-# Run tests
+# Run unit tests (vitest)
+npm run test:unit
+
+# Run the integration tests (downloads a full Electron, about 344 MB)
 npm test
 ```
 
@@ -152,7 +175,7 @@ The top-level `justfile` fans one command out across all subprojects:
 
 ```bash
 just build       # cargo build --release + uv build --wheel + npm compile
-just test        # cargo test + pytest + vitest
+just test        # cargo test + pytest + vitest (VS Code and browser UI)
 just lint        # cargo clippy/fmt + ruff + eslint
 just codegen     # Export JSON schemas + regenerate Pydantic/TS bindings
 just --list      # All recipes
@@ -225,8 +248,11 @@ cargo test -- --nocapture
 # Dagster integration
 cd integrations/dagster && uv run pytest -v
 
-# VS Code extension
-cd editors/vscode && npm test
+# Browser UI
+cd engine/ui && npm test
+
+# VS Code extension (unit tests)
+cd editors/vscode && npm run test:unit
 ```
 
 ## What CI runs
