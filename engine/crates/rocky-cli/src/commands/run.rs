@@ -1132,6 +1132,13 @@ pub struct DeferOptions {
     /// graph and already logged each problem, so a sub-run does not log them
     /// again.
     pub consumers_logged_by_caller: bool,
+    /// The warehouse each project model runs on, resolved from the project's
+    /// pipelines the way `rocky compile` does
+    /// ([`super::compile::target_dialects`]). The compile types a `CAST`
+    /// whose width differs between warehouses for it (#2333). `None`
+    /// outside a project run: the compile then uses the warehouse the run
+    /// executes on.
+    pub target_dialects: Option<rocky_compiler::operand_check::TargetDialects>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -3577,13 +3584,17 @@ pub async fn run_with_explicit_contracts(
     // Every compile in this run judges `consumers/` against the whole project,
     // not against the models of one pipeline, glob or selection. A `--dag`
     // sub-run arrives with the context already built, once for the graph.
+    // Likewise each compile types a model's casts for the warehouse that
+    // model's pipelines write to, not for this pipeline's (#2333).
     let defer_with_project;
-    let defer_opts = if defer_opts.project.is_none() {
+    let defer_opts = if defer_opts.project.is_none() || defer_opts.target_dialects.is_none() {
         defer_with_project = DeferOptions {
-            project: Some(rocky_compiler::consumers::project_context(
-                config_path,
-                rocky_cfg,
-            )),
+            project: Some(defer_opts.project.clone().unwrap_or_else(|| {
+                rocky_compiler::consumers::project_context(config_path, rocky_cfg)
+            })),
+            target_dialects: Some(defer_opts.target_dialects.clone().unwrap_or_else(|| {
+                super::compile::target_dialects(Some(rocky_cfg), config_path)
+            })),
             ..defer_opts.clone()
         };
         &defer_with_project
@@ -12557,15 +12568,19 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         source_provenance,
         external_dependencies: defer_opts.external_dependencies.clone(),
         project: defer_opts.project.clone(),
-        // Every model of this run executes on `warehouse`: a `CAST` whose
-        // width differs between warehouses is typed for it, so the contract
-        // gate checks the type the warehouse writes (#2333).
-        target_dialects: rocky_compiler::operand_check::TargetDialects::uniform(
-            rocky_compiler::operand_check::OperandDialect::from_adapter_type(
-                warehouse.dialect().name(),
+        // A `CAST` whose width differs between warehouses is typed for the
+        // warehouse each model's pipelines write to, as `rocky compile`
+        // resolves it (#2333): a model of another pipeline compiled in this
+        // run keeps its own warehouse's widths. Only a run with no project
+        // config falls back to the warehouse it executes on.
+        target_dialects: defer_opts.target_dialects.clone().unwrap_or_else(|| {
+            rocky_compiler::operand_check::TargetDialects::uniform(
+                rocky_compiler::operand_check::OperandDialect::from_adapter_type(
+                    warehouse.dialect().name(),
+                )
+                .into(),
             )
-            .into(),
-        ),
+        }),
         ..Default::default()
     };
 
@@ -33258,6 +33273,83 @@ backend = "local"
         assert!(
             conn.execute_sql("SELECT id FROM main.broken").is_err(),
             "the compile-failed model must not have been materialized"
+        );
+    }
+
+    /// #2333: the run's contract gate types a cast for the warehouse the
+    /// model's own pipelines write to (resolved per model, as `rocky
+    /// compile` does), not for the warehouse this run executes on. A model
+    /// whose pipeline writes to Snowflake keeps `FLOAT` = Float64 even when
+    /// it is compiled during a DuckDB run. With no project context the run
+    /// falls back to its own warehouse (DuckDB: Float32, so E011).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_run_contract_gate_types_casts_for_the_models_own_warehouse() {
+        use rocky_compiler::operand_check::{OperandDialect, TargetDialects};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let run = |defer: DeferOptions| async move {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let models = dir.path().join("models");
+            let contracts = dir.path().join("contracts");
+            std::fs::create_dir(&models).expect("models dir");
+            std::fs::create_dir(&contracts).expect("contracts dir");
+            write_plain_model(&models, "m", "SELECT CAST(1.5 AS FLOAT) AS f");
+            std::fs::write(
+                contracts.join("m.contract.toml"),
+                "[[columns]]\nname = \"f\"\ntype = \"Float64\"\n",
+            )
+            .expect("contract");
+            let adapter =
+                DuckDbWarehouseAdapter::open(&dir.path().join("t.duckdb")).expect("open warehouse");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            super::execute_models_with_explicit_contracts(
+                &models,
+                None,
+                &adapter,
+                None,
+                &PartitionRunOptions::default(),
+                "cast-target-test",
+                Some("m"),
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &defer,
+                super::SkipGateConfig::off(),
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                false,
+                true,
+                None,
+                None,
+                false,
+                Some(super::RunContracts::SelectedModelGuard(&contracts)),
+                false,
+            )
+            .await
+            .expect("a contract rejection is carried in RunOutput");
+            output
+                .errors
+                .iter()
+                .any(|error| error.error.contains("E011"))
+        };
+
+        let mut snowflake = TargetDialects::default();
+        snowflake.set("m", Some(OperandDialect::Snowflake).into());
+        let on_snowflake = DeferOptions {
+            target_dialects: Some(snowflake),
+            ..DeferOptions::default()
+        };
+        assert!(!run(on_snowflake).await, "Snowflake FLOAT is Float64");
+        assert!(
+            run(DeferOptions::default()).await,
+            "no project: the run's DuckDB FLOAT is Float32"
         );
     }
 

@@ -2917,7 +2917,7 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
                     // that does not convert (#2299). Say nullable unless the
                     // cast provably cannot fail.
                     source_nullable
-                        || (cast_can_fail(&source, data_type, &target)
+                        || (cast_can_fail(&source, has_exact_type(expr, scope), data_type, &target)
                             && !integer_literal_fits(expr, data_type, &target))
                 }
                 ast::CastKind::TryCast | ast::CastKind::SafeCast => true,
@@ -3394,8 +3394,14 @@ fn sql_mentions_set_operation(sql: &str) -> bool {
 ///
 /// Only the conversions listed as safe return `false`; everything else,
 /// including an `Unknown` source, is treated as fallible. Inference may wrongly
-/// say nullable, never wrongly non-null (#2299).
-fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyType) -> bool {
+/// say nullable, never wrongly non-null (#2299). `source_exact` says whether
+/// `source` is read from the SQL ([`has_exact_type`]) rather than guessed.
+fn cast_can_fail(
+    source: &RockyType,
+    source_exact: bool,
+    target_sql: &ast::DataType,
+    target: &RockyType,
+) -> bool {
     use RockyType as T;
     // A VARIANT can hold a JSON null, which casts to SQL NULL (Databricks,
     // Snowflake), and an Unknown source may be one. Both stay fallible.
@@ -3434,21 +3440,24 @@ fn cast_can_fail(source: &RockyType, target_sql: &ast::DataType, target: &RockyT
         (a, b) if a == b => false,
         // An integer fits a DECIMAL with as many integer digits as the
         // integer's widest value: 10 for a 32-bit one, 19 for a 64-bit one.
-        // Snowflake's `INTEGER` / `BIGINT` are `NUMBER(38,0)` (#2333).
+        // Snowflake's `INTEGER` / `BIGINT` are `NUMBER(38,0)` (#2333). Only
+        // when the input's integer type is read from the SQL: a guessed
+        // width (`x * 1000000` read as INT) may hold a value that does not
+        // fit, and a non-ANSI cast returns NULL for it.
         (
             T::Int32,
             T::Decimal {
                 precision: tp,
                 scale: ts,
             },
-        ) => i16::from(*tp) - i16::from(*ts) < 10,
+        ) => !source_exact || i16::from(*tp) - i16::from(*ts) < 10,
         (
             T::Int64,
             T::Decimal {
                 precision: tp,
                 scale: ts,
             },
-        ) => i16::from(*tp) - i16::from(*ts) < 19,
+        ) => !source_exact || i16::from(*tp) - i16::from(*ts) < 19,
         (T::Boolean, T::Int32 | T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int32, T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int64, T::Float32 | T::Float64) => false,
@@ -7748,6 +7757,10 @@ mod tests {
         for (expr, ty, nullable) in [
             ("CAST(i64 AS BIGINT)", &n38, false),
             ("CAST(i32 AS INT)", &n38, false),
+            // The input's integer width is a guess: the product may not
+            // fit, and a non-ANSI cast of it returns NULL.
+            ("CAST(i32 * 1000000 AS BIGINT)", &n38, true),
+            ("CAST(i64 * i64 AS DECIMAL(38,0))", &n38, true),
             (
                 "CAST(i32 AS DECIMAL(10,0))",
                 &RockyType::Decimal {

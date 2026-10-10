@@ -481,11 +481,11 @@ fn parse_describe_columns(result: &crate::connector::QueryResult) -> Vec<ColumnI
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            data_type: row
-                .get(type_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("VARCHAR")
-                .to_string(),
+            data_type: crate::types::canonical_type(
+                row.get(type_idx)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("VARCHAR"),
+            ),
             nullable: row
                 .get(null_idx)
                 .and_then(|v| v.as_str())
@@ -555,6 +555,36 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["DisplayName", "Order Total"]);
+    }
+
+    /// #2333: `DESCRIBE` reports every Snowflake float as `FLOAT`, which is
+    /// 64-bit. The stored type must read as `Float64`, the width the
+    /// compiler gives a Snowflake `CAST(x AS FLOAT)`.
+    #[test]
+    fn describe_reads_a_snowflake_float_as_64_bit() {
+        let result = crate::connector::QueryResult {
+            statement_handle: String::new(),
+            columns: ["name", "type", "kind", "null?"]
+                .into_iter()
+                .map(|name| crate::connector::ColumnMetaData {
+                    name: name.into(),
+                    type_name: None,
+                    nullable: None,
+                })
+                .collect(),
+            rows: vec![vec![
+                serde_json::json!("f"),
+                serde_json::json!("FLOAT"),
+                serde_json::json!("COLUMN"),
+                serde_json::json!("Y"),
+            ]],
+            total_row_count: None,
+        };
+        let columns = parse_describe_columns(&result);
+        assert_eq!(
+            rocky_core::contracts::warehouse_type_to_rocky(&columns[0].data_type),
+            rocky_ir::types::RockyType::Float64
+        );
     }
 
     #[test]
