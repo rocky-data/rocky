@@ -5205,6 +5205,19 @@ mod tests {
             format!("[[columns]]\nname = \"f\"\ntype = \"{contract_type}\"\n"),
         )
         .unwrap();
+        // Ten more models, so an edit of one model runs the incremental
+        // compile: `compile_incremental` compiles in full below ten models.
+        for i in 0..10 {
+            std::fs::write(models.join(format!("filler_{i}.sql")), "SELECT 1 AS x").unwrap();
+            std::fs::write(
+                models.join(format!("filler_{i}.toml")),
+                format!(
+                    "name = \"filler_{i}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"filler_{i}\"\n"
+                ),
+            )
+            .unwrap();
+        }
     }
 
     /// The codes of the stored compile result, and the type of `b.f`.
