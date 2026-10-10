@@ -30,39 +30,36 @@ describe("Clip", () => {
 });
 
 describe("StatusCard", () => {
-  // `border-zinc-200`/`dark:border-zinc-700` set the CSS `border-color`
-  // shorthand, which resets `border-left-color` along with it -- and the
-  // built stylesheet compiles `dark:border-zinc-700` after every tone's
-  // `border-l-{colour}-500` rule, so every card showed the same grey left
-  // border in dark mode, whatever its tone (#2123, confirmed by inspecting
-  // `vite build`'s output CSS). jsdom does not resolve the CSS cascade, so
-  // this pins the class list itself: the neutral border must be three
-  // directional utilities that never touch the left side, leaving the tone
-  // class's `border-l-*` the only thing that ever sets it.
-  const TONE_ACCENT: Record<Tone, string> = {
-    ok: "border-l-emerald-500",
-    warn: "border-l-amber-500",
-    risk: "border-l-red-500",
-    muted: "border-l-zinc-400",
-    pending: "border-l-zinc-400",
+  // The tone used to be a left border, and a neutral `border-zinc-*`
+  // shorthand reset it in dark mode (#2123). It is now a dot: one element
+  // per toned card, none on a muted one, and a red edge only on risk.
+  const TONE_DOT_CLASS: Record<Tone, string | null> = {
+    ok: "bg-emerald-500",
+    warn: "bg-amber-500",
+    risk: "bg-red-500",
+    muted: null,
+    pending: "bg-zinc-400",
   };
 
-  it.each(Object.entries(TONE_ACCENT) as [Tone, string][])(
-    "keeps the %s tone's own accent, with no shorthand that can reset it",
-    (tone, accent) => {
-      const { container } = render(<StatusCard label="Status" value="x" tone={tone} />);
+  it.each(Object.entries(TONE_DOT_CLASS) as [Tone, string | null][])(
+    "marks the %s tone with its own dot",
+    (tone, dotClass) => {
+      const { container } = render(<StatusCard label="status" value="x" tone={tone} />);
       const card = container.firstElementChild as HTMLElement;
-      expect(card).toHaveClass(accent);
-      expect(card).not.toHaveClass("border-zinc-200");
-      expect(card).not.toHaveClass("dark:border-zinc-700");
-      expect(card).toHaveClass(
-        "border-t-zinc-200",
-        "border-r-zinc-200",
-        "border-b-zinc-200",
-        "dark:border-t-zinc-700",
-        "dark:border-r-zinc-700",
-        "dark:border-b-zinc-700",
-      );
+      expect(card).toHaveAttribute("data-tone", tone);
+      const dot = card.querySelector("[data-tone-dot]");
+      if (dotClass === null) {
+        expect(dot).toBeNull();
+      } else {
+        expect(dot).toHaveClass(dotClass);
+        expect(dot).toHaveAttribute("aria-hidden", "true");
+      }
+      expect(card.className.includes("border-red-300")).toBe(tone === "risk");
     },
   );
+
+  it("keeps the label's own words for assistive technology", () => {
+    const { getByText } = render(<StatusCard label="models compiled" value="3" />);
+    expect(getByText("models compiled")).toBeInTheDocument();
+  });
 });

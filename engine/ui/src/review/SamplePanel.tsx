@@ -23,12 +23,12 @@ export const defaultSampleLoader: SampleLoader = (model) =>
 function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
   return (
     <div className="space-y-2">
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
         <table className="min-w-full text-left text-xs">
           <thead>
             <tr className="border-b border-zinc-200 dark:border-zinc-700">
               {sample.columns.map((column) => (
-                <th key={column} className="px-2 py-1 font-mono font-semibold whitespace-nowrap">
+                <th key={column} className="bg-zinc-50 px-3 py-2 font-mono font-semibold whitespace-nowrap dark:bg-zinc-950/40">
                   {column}
                 </th>
               ))}
@@ -40,7 +40,7 @@ function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
               // replaced wholesale, never reordered in place.
               <tr key={index} className="border-b border-zinc-100 dark:border-zinc-800">
                 {row.map((cell, cellIndex) => (
-                  <td key={cellIndex} className="px-2 py-1 font-mono whitespace-nowrap">
+                  <td key={cellIndex} className="px-3 py-1.5 font-mono whitespace-nowrap">
                     {cell === null ? (
                       <span className="text-zinc-400 dark:text-zinc-500">null</span>
                     ) : (
@@ -53,7 +53,7 @@ function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
           </tbody>
         </table>
       </div>
-      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
         {sample.row_count} {sample.row_count === 1 ? "row" : "rows"}
         {sample.truncated ? ` (capped at ${sample.limit_applied})` : ""} from{" "}
         {sample.adapter_kind}. A classification-tagged column is masked by the engine before the
@@ -64,7 +64,7 @@ function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
         <span className="font-mono">allow_unmasked</span>. A tag with a masking strategy is masked
         even if it is on that list. A hashed column is pseudonymous, not anonymous.
       </p>
-      <details className="text-[11px] text-zinc-500 dark:text-zinc-400">
+      <details className="text-xs text-zinc-500 dark:text-zinc-400">
         <summary className="cursor-pointer">the SQL that ran</summary>
         <pre className="mt-1 overflow-x-auto rounded bg-zinc-50 p-2 font-mono dark:bg-zinc-800">
           {sample.executed_sql}
@@ -105,10 +105,10 @@ function ConsentedSample({ model, load }: { model: string; load: SampleLoader })
   const loader = useCallback(() => load(model), [load, model]);
   // The hook fetches on mount, so it is mounted only once the viewer asks.
   return (
-    <section aria-label="Sample rows" className="space-y-2">
+    <section aria-label="Sample rows" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
-        <span className="font-mono text-[11px] text-zinc-500 dark:text-zinc-400">{model}</span>
+        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
+        <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400">{model}</span>
       </div>
       {asked ? (
         <AskedSample loader={loader} />

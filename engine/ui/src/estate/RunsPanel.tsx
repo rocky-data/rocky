@@ -1,21 +1,8 @@
 import type { HistoryOutput } from "@rocky-types/history";
-import { EmptyState, type Tone } from "../components";
-import { Clip } from "../components";
+import { Clip, EmptyState, TABLE, ToneDot, runStatusTone, type Tone } from "../components";
 import { formatDuration, formatInstant, orNotRecorded } from "../format";
 
-function statusTone(status: string): Tone {
-  switch (status.toLowerCase()) {
-    case "success":
-      return "ok";
-    case "partialfailure":
-    case "partial_failure":
-      return "warn";
-    case "failure":
-      return "risk";
-    default:
-      return "muted";
-  }
-}
+const statusTone = runStatusTone;
 
 const TONE_TEXT: Record<Tone, string> = {
   ok: "text-emerald-700 dark:text-emerald-400",
@@ -43,43 +30,46 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
         sideways — every panel above and below it included.
       */}
       <div
-        className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
+        className={TABLE.scroller}
         tabIndex={0}
         role="group"
         aria-label="Runs, scrollable"
       >
-      <table className="w-full min-w-max text-left text-xs" aria-label="Runs">
-        <thead className="text-zinc-500 dark:text-zinc-400">
+      <table className={TABLE.table} aria-label="Runs">
+        <thead className={TABLE.head}>
           <tr>
-            <th className="pr-3 font-medium">run</th>
-            <th className="pr-3 font-medium">started</th>
-            <th className="pr-3 font-medium">status</th>
-            <th className="pr-3 font-medium">trigger</th>
-            <th className="pr-3 font-medium">pipeline</th>
-            <th className="pr-3 text-right font-medium">models</th>
-            <th className="text-right font-medium">duration</th>
+            <th className={TABLE.th}>run</th>
+            <th className={TABLE.th}>started</th>
+            <th className={TABLE.th}>status</th>
+            <th className={TABLE.th}>trigger</th>
+            <th className={TABLE.th}>pipeline</th>
+            <th className={`${TABLE.th} text-right`}>models</th>
+            <th className={`${TABLE.th} text-right`}>duration</th>
           </tr>
         </thead>
         <tbody className="text-zinc-900 dark:text-zinc-100">
           {history.runs.map((run) => (
-            <tr key={run.run_id} className="border-t border-zinc-100 dark:border-zinc-800">
-              <td className="pr-3 font-mono" title={run.run_id}>
+            <tr key={run.run_id} className={TABLE.row}>
+              <td className={`${TABLE.td} font-mono`} title={run.run_id}>
                 <Clip value={run.run_id} />
               </td>
-              <td className="pr-3">{formatInstant(run.started_at, now)}</td>
-              <td className={`pr-3 font-medium ${TONE_TEXT[statusTone(run.status)]}`}>
-                {run.status}
+              <td className={TABLE.td}>{formatInstant(run.started_at, now)}</td>
+              <td className={`${TABLE.td} font-medium ${TONE_TEXT[statusTone(run.status)]}`}>
+                <span className="inline-flex items-center gap-2">
+                  <ToneDot tone={statusTone(run.status)} />
+                  {run.status}
+                </span>
               </td>
-              <td className="pr-3">{run.trigger}</td>
-              <td className="pr-3">{orNotRecorded(run.pipeline)}</td>
-              <td className="pr-3 text-right">{run.models_executed}</td>
-              <td className="text-right">{formatDuration(run.duration_ms)}</td>
+              <td className={TABLE.td}>{run.trigger}</td>
+              <td className={TABLE.td}>{orNotRecorded(run.pipeline)}</td>
+              <td className={`${TABLE.td} text-right tabular-nums`}>{run.models_executed}</td>
+              <td className={`${TABLE.td} text-right tabular-nums`}>{formatDuration(run.duration_ms)}</td>
             </tr>
           ))}
         </tbody>
       </table>
       </div>
-      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+      <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
         {history.count} run(s) in the newest 50
       </p>
     </div>

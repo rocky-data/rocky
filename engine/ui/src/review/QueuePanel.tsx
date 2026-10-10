@@ -24,7 +24,7 @@ function waited(seconds: number): string {
 function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
   const href = reviewPath(entry.plan_id);
   return (
-    <li className="rounded-md border border-zinc-200 p-3 dark:border-zinc-700">
+    <li className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <a
           href={href}
@@ -36,14 +36,14 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
         >
           <Clip value={entry.plan_id} />
         </a>
-        <span className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+        <span className="rounded-md bg-zinc-100 px-1.5 py-0.5 font-mono text-xs text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
           {entry.capability} · {entry.principal}
         </span>
       </div>
       <p className="mt-1 text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
-      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-4 dark:text-zinc-300">
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-zinc-700 sm:grid-cols-4 dark:text-zinc-300">
         <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">model</dt>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">model</dt>
           <dd className="font-mono break-all">{entry.model}</dd>
         </div>
         {!(entry.models.length === 1 && entry.models[0] === entry.model) && (
@@ -51,22 +51,22 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           // and the names are in `models`. Shown only when they differ; on an
           // ordinary row the set is the label and the cell would repeat it.
           <div>
-            <dt className="text-zinc-500 dark:text-zinc-400">models</dt>
+            <dt className="text-xs text-zinc-500 dark:text-zinc-400">models</dt>
             <dd className="font-mono break-all">
               {entry.models.length === 0 ? "none the graph can name" : entry.models.join(", ")}
             </dd>
           </div>
         )}
         <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">blast radius</dt>
           <dd>{entry.blast_radius ?? "not computed"}</dd>
         </div>
         <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">waited</dt>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">waited</dt>
           <dd>{waited(entry.staleness_seconds)}</dd>
         </div>
         <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">recorded</dt>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">recorded</dt>
           <dd>{formatInstant(entry.timestamp, now)}</dd>
         </div>
       </dl>
@@ -89,7 +89,7 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
   if (queue.kind !== "ready") {
     return (
       <section aria-label="The review queue" className="space-y-3">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">The review queue</h2>
+        <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">The review queue</h2>
         <ResourceState resource={queue} loadingLine="reading the queue…" />
       </section>
     );
@@ -100,10 +100,10 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
   return (
     <section aria-label="The review queue" className="space-y-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+        <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">
           {total === 0 ? "Nothing is waiting for review" : `${total} waiting for review`}
         </h2>
-        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">ranked by {ranking}</span>
+        <span className="text-xs text-zinc-500 dark:text-zinc-400">ranked by {ranking}</span>
       </div>
       {excluded > 0 && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
@@ -121,7 +121,7 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
           asked for it.
         </p>
       ) : (
-        <ul className="space-y-2">
+        <ul className="space-y-3">
           {pending.map((entry) => (
             <QueueRow key={entry.decision_ref} entry={entry} now={now} />
           ))}

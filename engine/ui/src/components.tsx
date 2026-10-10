@@ -4,16 +4,56 @@ import { clipHead, clipMiddle } from "./format";
 /** Trust-signal tone, the idiom the VS Code Inspector uses. */
 export type Tone = "ok" | "warn" | "risk" | "muted" | "pending";
 
-const TONE_CLASS: Record<Tone, string> = {
-  ok: "border-l-emerald-500",
-  warn: "border-l-amber-500",
-  risk: "border-l-red-500",
-  muted: "border-l-zinc-400",
-  pending: "border-l-zinc-400",
+/**
+ * The tone's dot. A muted card has none: it states a fact and asks nothing.
+ * The tone used to be a 4px left border; that border needed the neutral
+ * edge split into three directional utilities so the dark rule could not
+ * reset it (#2123). A dot has no such interaction with the card's border.
+ */
+export const TONE_DOT: Record<Tone, string | null> = {
+  ok: "bg-emerald-500",
+  warn: "bg-amber-500",
+  risk: "bg-red-500",
+  muted: null,
+  pending: "bg-zinc-400 dark:bg-zinc-500",
+};
+
+/** A risk card also carries a red edge, so a refusal reads before its words do. */
+const TONE_BORDER: Record<Tone, string> = {
+  ok: "border-zinc-200 dark:border-zinc-800",
+  warn: "border-zinc-200 dark:border-zinc-800",
+  risk: "border-red-300 dark:border-red-900",
+  muted: "border-zinc-200 dark:border-zinc-800",
+  pending: "border-zinc-200 dark:border-zinc-800",
 };
 
 /**
- * A status card: a label, a value, an optional sub-line, and a tone accent.
+ * A run's status as a tone. One function for every place a run is drawn,
+ * so the strip and the table never colour the same run differently.
+ */
+export function runStatusTone(status: string): Tone {
+  switch (status.toLowerCase()) {
+    case "success":
+      return "ok";
+    case "partialfailure":
+    case "partial_failure":
+      return "warn";
+    case "failure":
+      return "risk";
+    default:
+      return "muted";
+  }
+}
+
+/** The dot alone, for a line of status outside a card. */
+export function ToneDot({ tone }: { tone: Tone }) {
+  const dot = TONE_DOT[tone];
+  if (dot === null) return null;
+  return <span aria-hidden="true" data-tone-dot="" className={`inline-block size-2 shrink-0 rounded-full ${dot}`} />;
+}
+
+/**
+ * A status card: a label, a value, an optional sub-line, and a tone dot.
  * Every value renders as text: React escapes it, and nothing here uses
  * `dangerouslySetInnerHTML`. That is the whole XSS story for the shell.
  */
@@ -28,27 +68,72 @@ export function StatusCard({
   tone?: Tone;
   sub?: ReactNode;
 }) {
-  // `border-zinc-200`/`dark:border-zinc-700` used to set the CSS
-  // `border-color` shorthand, which applies to all four sides, including
-  // left -- and the built stylesheet compiles the `dark:` rule after every
-  // `TONE_CLASS` entry's `border-l-{colour}-500` rule, so every tone card
-  // showed the same grey left border in dark mode (#2123, same shape as
-  // #1859's `ModelNode` fix in #2110). The neutral border is now three
-  // directional utilities that never touch the left side, so only
-  // `TONE_CLASS` ever sets it.
   return (
     <div
-      className={`rounded-md border border-t-zinc-200 border-r-zinc-200 border-b-zinc-200 border-l-4 bg-white p-3 dark:border-t-zinc-700 dark:border-r-zinc-700 dark:border-b-zinc-700 dark:bg-zinc-900 ${TONE_CLASS[tone]}`}
+      data-tone={tone}
+      className={`rounded-lg border bg-white p-4 dark:bg-zinc-900 ${TONE_BORDER[tone]}`}
     >
-      <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-        {label}
+      <div className="flex items-center gap-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">
+        <ToneDot tone={tone} />
+        {/* Labels are written lower case for the screen reader's sake; the
+            first letter is raised for the eye only. */}
+        <span className="inline-block first-letter:uppercase">{label}</span>
       </div>
       <div className="mt-1 break-words text-sm font-semibold text-zinc-900 dark:text-zinc-100">
         {value}
       </div>
       {sub != null && sub !== "" && (
-        <div className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">{sub}</div>
+        <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{sub}</div>
       )}
+    </div>
+  );
+}
+
+/**
+ * A neutral button: a read, never a write (`WriteButton` draws writes). One
+ * class string, so Refresh and the other reads look alike on every screen.
+ */
+export const READ_BUTTON =
+  "inline-flex h-9 items-center gap-1.5 rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+
+/**
+ * The data table's look, shared by every table on the page: a bordered,
+ * rounded box that scrolls sideways on its own, padded cells, a header row
+ * that reads as a header. One place, so the runs table and the digest's
+ * tables cannot drift apart again.
+ */
+export const TABLE = {
+  scroller:
+    "overflow-x-auto rounded-lg border border-zinc-200 bg-white focus-visible:outline-2 focus-visible:outline-orange-500 dark:border-zinc-800 dark:bg-zinc-900",
+  table: "w-full min-w-max text-left text-sm",
+  head: "border-b border-zinc-200 bg-zinc-50 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950/40 dark:text-zinc-400",
+  th: "px-3 py-2 font-medium",
+  row: "border-t border-zinc-100 first:border-t-0 dark:border-zinc-800",
+  td: "px-3 py-2 align-top",
+} as const;
+
+/**
+ * A screen's title row: the name, an optional line under it, and the
+ * screen's own controls at the end. It wraps on a phone.
+ */
+export function ScreenHeader({
+  title,
+  detail,
+  children,
+}: {
+  title: string;
+  detail?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="min-w-0">
+        <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">{title}</h2>
+        {detail != null && (
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{detail}</p>
+        )}
+      </div>
+      {children != null && <div className="flex flex-wrap items-start gap-2">{children}</div>}
     </div>
   );
 }

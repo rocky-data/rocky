@@ -1,9 +1,12 @@
 import { useCallback, useState } from "react";
-import type { BriefOutput, BriefSinceMode } from "@rocky-types/brief";
+import type { BriefOutput, BriefSinceMode, SectionAvailability } from "@rocky-types/brief";
 import { apiGet } from "../api";
-import { StatusCard } from "../components";
+import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
+import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, type Tone } from "../components";
 import { useResource } from "../estate/useResource";
-import { formatDuration, formatInstant, orNotRecorded } from "../format";
+import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded } from "../format";
+import { reviewPath } from "../review/paths";
+import { navigateTo } from "../router";
 import { CustodyLink } from "./links";
 import { Rows, SectionCard } from "./SectionCard";
 
@@ -48,35 +51,35 @@ export function BriefScreen({ load = defaultBriefLoader, now }: { load?: BriefLo
   const brief = useResource(loader, [loader]);
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="text-xs text-zinc-600 dark:text-zinc-300" htmlFor="brief-since">
-          Window
-        </label>
-        <select
-          id="brief-since"
-          value={since}
-          onChange={(event) => setSince(event.target.value as BriefSinceMode)}
-          className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-        >
-          {WINDOWS.map((window) => (
-            <option key={window.id} value={window.id}>
-              {window.label}
-            </option>
-          ))}
-        </select>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
-          {WINDOWS.find((w) => w.id === since)?.hint}
-        </span>
-        <button
-          type="button"
-          onClick={brief.reload}
-          className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-        >
+    <div className="space-y-6">
+      <ScreenHeader title="Needs you" detail="What waits on a person, then what the estate did.">
+        <div className="flex flex-col items-start gap-1">
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-zinc-600 dark:text-zinc-300" htmlFor="brief-since">
+              Window
+            </label>
+            <select
+              id="brief-since"
+              value={since}
+              onChange={(event) => setSince(event.target.value as BriefSinceMode)}
+              className="h-9 rounded-md border border-zinc-300 bg-white px-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+            >
+              {WINDOWS.map((window) => (
+                <option key={window.id} value={window.id}>
+                  {window.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {WINDOWS.find((w) => w.id === since)?.hint}
+          </span>
+        </div>
+        <button type="button" onClick={brief.reload} className={READ_BUTTON}>
+          <ArrowPathIcon aria-hidden="true" className="size-4" />
           Refresh
         </button>
-        <code className="text-[11px] text-zinc-500 dark:text-zinc-400">GET /api/v1/brief?since={since}</code>
-      </div>
+      </ScreenHeader>
       {brief.kind === "loading" && <p className="text-sm text-zinc-500">Loading the digest…</p>}
       {brief.kind === "refused" && (
         <StatusCard
@@ -107,11 +110,14 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
     scheduler,
   } = brief;
   return (
-    <div className="space-y-3">
+    <div className="space-y-5">
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
         Digest generated {formatInstant(brief.generated_at, now)}, window <code>{brief.since_mode}</code>
-        {brief.since_timestamp ? ` from ${formatInstant(brief.since_timestamp)}` : ", all of recorded history"}.
+        {brief.since_timestamp ? ` from ${formatInstant(brief.since_timestamp)}` : ", all of recorded history"}
+        . Read from <code>GET /api/v1/brief?since={brief.since_mode}</code>.
       </p>
+
+      <Headline brief={brief} />
 
       <SectionCard
         title="Needs you"
@@ -120,19 +126,44 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         emptyLine="no escalation is pending"
         summary={`${escalations.total} pending, ranked by ${escalations.ranking}`}
       >
-        <Rows
-          ariaLabel="Pending escalations"
-          columns={["plan", "model", "capability", "principal", "reason", "decision", "when"]}
-          rows={escalations.pending.map((entry) => [
-            <CustodyLink key={entry.decision_ref} subject={entry.plan_id} />,
-            entry.model,
-            entry.capability,
-            entry.principal,
-            entry.reason,
-            entry.decision_ref,
-            formatInstant(entry.timestamp, now),
-          ])}
-        />
+        <ul aria-label="Pending escalations" className="space-y-3">
+          {escalations.pending.map((entry) => (
+            <li
+              key={entry.decision_ref}
+              className="flex flex-wrap items-start gap-x-4 gap-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"
+            >
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                <ExclamationTriangleIcon aria-hidden="true" className="size-5" />
+              </span>
+              <div className="min-w-0 flex-[1_1_20rem] space-y-1">
+                <p className="flex flex-wrap items-center gap-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                  <span className="font-mono break-all">{entry.model}</span>
+                  <span className="rounded-md bg-zinc-100 px-1.5 py-0.5 font-mono text-xs font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+                    {entry.capability}
+                  </span>
+                </p>
+                <p className="text-sm text-zinc-700 dark:text-zinc-300">{entry.reason}</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {entry.principal} · {formatInstant(entry.timestamp, now)} · plan{" "}
+                  <CustodyLink subject={entry.plan_id} clip /> · <Clip value={entry.decision_ref} keepEnds />
+                </p>
+              </div>
+              <a
+                href={reviewPath(entry.plan_id)}
+                onClick={(event) => {
+                  event.preventDefault();
+                  navigateTo(reviewPath(entry.plan_id));
+                }}
+                // A navigation, so the read look: solid orange is kept for
+                // the writes that change something.
+                className={`${READ_BUTTON} shrink-0`}
+              >
+                Review plan
+                <ArrowRightIcon aria-hidden="true" className="size-4" />
+              </a>
+            </li>
+          ))}
+        </ul>
       </SectionCard>
 
       <SectionCard
@@ -141,7 +172,8 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         note={activity.note}
         summary={`${activity.total} policy evaluations: ${activity.allow} allow, ${activity.require_review} require review, ${activity.deny} deny`}
       >
-        <div className="space-y-2">
+        <div className="space-y-4">
+          <EffectBar allow={activity.allow} review={activity.require_review} deny={activity.deny} />
           <Rows
             ariaLabel="Activity by principal"
             columns={["principal", "total", "allow", "require review", "deny"]}
@@ -181,7 +213,10 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         summary={`${runs.total} runs: ${runs.succeeded} succeeded, ${runs.partial_failure} partial, ${runs.failed} failed`}
       >
         {runs.attention.length === 0 ? (
-          <p className="text-xs text-zinc-500 dark:text-zinc-400">no run needs attention</p>
+          <p className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
+            <ToneDot tone="ok" />
+            no run needs attention
+          </p>
         ) : (
           <Rows
             ariaLabel="Runs needing attention"
@@ -235,8 +270,8 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         note={cost.note}
         summary={`${cost.run_count} run(s), ${formatDuration(cost.total_duration_ms)}`}
       >
-        <div className="space-y-2">
-          <div className="grid gap-2 sm:grid-cols-3">
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-3">
             <StatusCard label="total cost" value={usd(cost.total_cost_usd)} sub={orNotRecorded(cost.adapter_type)} />
             <StatusCard label="bytes scanned" value={bytes(cost.total_bytes_scanned)} />
             <StatusCard
@@ -267,6 +302,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         </div>
       </SectionCard>
 
+      <div className="grid gap-5 lg:grid-cols-2">
       <SectionCard title="Drift" availability={drift.availability} note={drift.note} summary={`${drift.events.length} event(s)`}>
         <Rows
           ariaLabel="Drift events"
@@ -302,6 +338,8 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         />
       </SectionCard>
 
+      </div>
+
       <SectionCard
         title="Scheduler"
         availability={scheduler.availability}
@@ -309,7 +347,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
         emptyLine="nothing is scheduled"
         summary={`${scheduler.scheduled_pipelines} scheduled, ${scheduler.runs_in_window} run(s) in the window, ${scheduler.failed_in_window} failed`}
       >
-        <div className="space-y-2 text-xs text-zinc-900 dark:text-zinc-100">
+        <div className="space-y-2 text-sm text-zinc-900 dark:text-zinc-100">
           <p>Paused: {scheduler.paused.length === 0 ? "none" : scheduler.paused.join(", ")}</p>
           <p>
             Incidents: {scheduler.incident_count}
@@ -322,6 +360,118 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
           />
         </div>
       </SectionCard>
+    </div>
+  );
+}
+
+/**
+ * One line over the whole digest: what waits on a person, how the runs
+ * went, whether autonomy is curtailed. A section that is not available is
+ * said so, never counted as zero.
+ */
+function Headline({ brief }: { brief: BriefOutput }) {
+  const { escalations, runs, autonomy } = brief;
+  const chips: { key: string; tone: Tone; text: string }[] = [];
+  // `no_data` is a real answer ("nothing in the window") and says so in the
+  // section's own words; `unavailable` is no answer and says only that.
+  const quiet = (key: string, availability: SectionAvailability, empty: string, name: string) => {
+    if (availability === "no_data") chips.push({ key, tone: "ok", text: empty });
+    if (availability === "unavailable") chips.push({ key, tone: "muted", text: `${name}: ${NOT_RECORDED}` });
+  };
+  if (escalations.availability === "available") {
+    chips.push({
+      key: "escalations",
+      tone: escalations.total > 0 ? "warn" : "ok",
+      text:
+        escalations.total === 0
+          ? "no escalation is pending"
+          : `${escalations.total} ${escalations.total === 1 ? "decision waits" : "decisions wait"} on you`,
+    });
+  } else {
+    quiet("escalations", escalations.availability, "no escalation is pending", "escalations");
+  }
+  if (runs.availability !== "available") {
+    quiet("runs", runs.availability, "no runs in the window", "runs");
+  } else {
+    const bad = runs.failed + runs.partial_failure;
+    chips.push({
+      key: "runs",
+      tone: runs.failed > 0 ? "risk" : bad > 0 ? "warn" : "ok",
+      text:
+        bad === 0
+          ? `runs healthy: ${runs.succeeded} of ${runs.total} succeeded`
+          : `${[
+              runs.failed > 0 ? `${runs.failed} failed` : null,
+              runs.partial_failure > 0 ? `${runs.partial_failure} partial` : null,
+            ]
+              .filter((part) => part !== null)
+              .join(", ")} of ${runs.total} runs`,
+    });
+  }
+  if (autonomy.availability !== "available") {
+    quiet("autonomy", autonomy.availability, "no rule is degraded and no freeze is in force", "autonomy");
+  } else {
+    const curtailed = autonomy.degraded_rules.length + autonomy.active_freezes.length;
+    chips.push({
+      key: "autonomy",
+      tone: curtailed > 0 ? "warn" : "ok",
+      text:
+        curtailed === 0
+          ? "no freeze, no degraded rule"
+          : `${autonomy.active_freezes.length} freeze(s), ${autonomy.degraded_rules.length} degraded rule(s)`,
+    });
+  }
+  if (chips.length === 0) return null;
+  return (
+    <ul aria-label="Summary" className="flex flex-wrap gap-2">
+      {chips.map((chip) => (
+        <li
+          key={chip.key}
+          className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
+        >
+          <ToneDot tone={chip.tone} />
+          <span className="inline-block first-letter:uppercase">{chip.text}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * Allow, review and deny as one bar, so the share reads at a glance. The
+ * counts are the section's own evaluation counters; the bar is drawn only
+ * when there is something to divide.
+ */
+function EffectBar({ allow, review, deny }: { allow: number; review: number; deny: number }) {
+  const total = allow + review + deny;
+  if (total === 0) return null;
+  const parts = [
+    { label: "allowed", count: allow, color: "bg-emerald-500" },
+    { label: "needed review", count: review, color: "bg-amber-500" },
+    { label: "denied", count: deny, color: "bg-red-500" },
+  ];
+  return (
+    <div>
+      <div
+        role="img"
+        aria-label={parts.map((part) => `${part.count} ${part.label}`).join(", ")}
+        className="flex h-2.5 gap-0.5 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800"
+      >
+        {parts
+          .filter((part) => part.count > 0)
+          .map((part) => (
+            // `min-w-1`: a share of 1 in 1000 stays visible; the label has the exact counts.
+            <span key={part.label} className={`min-w-1 ${part.color}`} style={{ flexGrow: part.count }} />
+          ))}
+      </div>
+      <ul aria-hidden="true" className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-600 dark:text-zinc-300">
+        {parts.map((part) => (
+          <li key={part.label} className="inline-flex items-center gap-1.5">
+            <span className={`size-2 rounded-sm ${part.color}`} />
+            {part.count} {part.label}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

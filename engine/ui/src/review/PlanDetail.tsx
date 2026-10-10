@@ -1,10 +1,11 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
+import { CheckIcon, ClipboardDocumentIcon } from "@heroicons/react/20/solid";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
 import type { BreakingFinding, ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ApproverIdentity, ReviewStatusOutput } from "@rocky-types/review_status";
 import { apiGet } from "../api";
-import { Clip, StatusCard } from "../components";
+import { Clip, StatusCard, ToneDot, type Tone } from "../components";
 import { type Resource, useResource } from "../estate/useResource";
 import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
@@ -17,6 +18,8 @@ import {
   useWriteAccess,
   type JobClient,
 } from "../operator";
+import { navigateTo } from "../router";
+import { reviewPath } from "./paths";
 import { ResourceState } from "./ResourceState";
 import { SamplePanel } from "./SamplePanel";
 
@@ -157,16 +160,16 @@ function BreakingChanges({ diff }: { diff: ReviewOutput }) {
     );
   }
   return (
-    <section aria-label="What it would break" className="space-y-2">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+    <section aria-label="What it would break" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-3">
+      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
         What it would break
       </h3>
-      <ul className="space-y-1">
+      <ul className="divide-y divide-zinc-100 dark:divide-zinc-800">
         {diff.breaking_changes.map((finding, index) => (
           // Findings carry no id; the list is replaced wholesale on each read.
-          <li key={index} className="flex items-baseline gap-2 text-sm">
+          <li key={index} className="flex items-baseline gap-3 py-2 text-sm first:pt-0 last:pb-0">
             <span
-              className={`rounded px-1 text-[10px] uppercase ${
+              className={`shrink-0 rounded-md px-1.5 py-0.5 text-xs font-semibold first-letter:uppercase ${
                 finding.severity === "breaking"
                   ? "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-100"
                   : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-100"
@@ -178,7 +181,7 @@ function BreakingChanges({ diff }: { diff: ReviewOutput }) {
           </li>
         ))}
       </ul>
-      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
         Compared against {diff.base_ref}.
       </p>
     </section>
@@ -188,8 +191,8 @@ function BreakingChanges({ diff }: { diff: ReviewOutput }) {
 function ConditionalDrops({ diff }: { diff: ReviewOutput }) {
   if (diff.conditional_drops.length === 0) return null;
   return (
-    <section aria-label="Conditional DROPs" className="space-y-2">
-      <h3 className="text-sm font-semibold text-red-800 dark:text-red-200">
+    <section aria-label="Conditional DROPs" className="space-y-2 rounded-lg border border-red-300 bg-white p-5 dark:border-red-900 dark:bg-zinc-900">
+      <h3 className="text-base font-semibold text-red-800 dark:text-red-200">
         Conditional DROPs
       </h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
@@ -262,8 +265,8 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
   // refused the request.
   if (lookup.kind === "unknown") {
     return (
-      <section aria-label="Why it needs a human" className="space-y-2">
-        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+      <section aria-label="Why it needs a human" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
           Why it needs a human
         </h3>
         <ResourceState resource={lookup.queue} loadingLine="reading the review queue…" />
@@ -281,8 +284,8 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
   }
   const { entries } = lookup;
   return (
-    <section aria-label="Why it needs a human" className="space-y-3">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+    <section aria-label="Why it needs a human" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-3">
+      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
         Why it needs a human
       </h3>
       {entries.length > 1 && (
@@ -294,21 +297,21 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
       {entries.map((entry) => (
         <div key={entry.decision_ref} className="space-y-2">
           <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-5 dark:text-zinc-300">
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-t border-zinc-100 pt-3 text-sm text-zinc-700 sm:grid-cols-5 dark:border-zinc-800 dark:text-zinc-300 [&_dd]:break-words [&>div]:min-w-0">
             <div>
-              <dt className="text-zinc-500 dark:text-zinc-400">model</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">model</dt>
               <dd className="font-mono break-all">{entry.model}</dd>
             </div>
             <div>
-              <dt className="text-zinc-500 dark:text-zinc-400">capability</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">capability</dt>
               <dd>{entry.capability}</dd>
             </div>
             <div>
-              <dt className="text-zinc-500 dark:text-zinc-400">principal</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">principal</dt>
               <dd>{entry.principal}</dd>
             </div>
             <div>
-              <dt className="text-zinc-500 dark:text-zinc-400">rule</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">rule</dt>
               <dd>
                 {entry.rule_id === undefined || entry.rule_id === null
                   ? "the default effect"
@@ -316,7 +319,7 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
               </dd>
             </div>
             <div>
-              <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">blast radius</dt>
               <dd>{entry.blast_radius ?? "not computed"}</dd>
             </div>
           </dl>
@@ -383,19 +386,54 @@ function Approval({
   // Every row of one plan carries the same command: approval is per plan.
   const command = entries[0]?.approve_command ?? `rocky review ${planId} --approve`;
 
+  const applied = apply.view.kind === "done" && apply.view.job.state === "succeeded";
+
   return (
-    <section aria-label="Approval" className="space-y-2">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Approval</h3>
+    <section
+      aria-label="Approval"
+      // Sticky only as tall as the window, and scrolls inside past that, so
+      // the Apply note and the command never sit stuck below the fold.
+      className="space-y-4 rounded-lg border border-zinc-300 bg-white p-5 lg:sticky lg:top-16 lg:max-h-[calc(100vh-5rem)] lg:overflow-y-auto dark:border-zinc-700 dark:bg-zinc-900"
+    >
+      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Approval</h3>
+      <Steps
+        steps={[
+          { label: "Proposed", state: "done" },
+          { label: "Approved", state: status.reviewed ? "done" : "current" },
+          {
+            label: "Applied",
+            // The status route records approval, not apply. Applied is
+            // known only when this page ran the apply and saw it succeed.
+            // After approval it is unknown, not "next": a plan applied in a
+            // terminal, or before a reload, looks exactly the same here.
+            state: applied ? "done" : status.reviewed ? "unknown" : "later",
+            // A product-bound plan is applied in a terminal, never here.
+            note: productBound
+              ? "Apply this plan in a terminal."
+              : applied || !status.reviewed
+                ? undefined
+                : "The plan status does not record apply.",
+          },
+        ]}
+      />
       {status.reviewed ? (
         <StatusCard
           label="approval"
           value="signed off"
+          tone="ok"
           sub={`${approverLine(status.approver)} on ${formatInstant(
             status.reviewed_at ?? null,
           )}. ${status.breaking_change_count ?? 0} breaking finding(s) were signed off.`}
         />
       ) : (
-        <div className="space-y-1">
+        <div className="space-y-2">
+          <WriteButton
+            label="Approve"
+            primary
+            busy={jobBusy(approve.view)}
+            onClick={() => approve.start({ plan_id: planId })}
+          />
+          <JobLine label="Approve" view={approve.view} />
           {access.kind === "operator" && (
             <p className="text-xs text-zinc-600 dark:text-zinc-300">
               Approving records this server's git identity as the approver, over the HTTP API.
@@ -406,12 +444,6 @@ function Approval({
               Approving clears every one of the {entries.length} escalations above.
             </p>
           )}
-          <WriteButton
-            label="Approve"
-            busy={jobBusy(approve.view)}
-            onClick={() => approve.start({ plan_id: planId })}
-          />
-          <JobLine label="Approve" view={approve.view} />
         </div>
       )}
 
@@ -428,16 +460,17 @@ function Approval({
           }
         />
       ) : (
-        <div className="space-y-1">
+        <div className="space-y-2">
           <WriteButton
             label="Apply"
+            primary={status.reviewed}
             busy={jobBusy(apply.view)}
             disabledReason={status.reviewed ? undefined : "Approve the plan first."}
             onClick={() => apply.start({ plan_id: planId })}
           />
           <JobLine label="Apply" view={apply.view} />
           {status.reviewed && (
-            <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Apply runs the models on disk, and first checks they still match this plan. If
               you edited them after the plan, apply refuses (plan_models_changed): plan and
               approve again.
@@ -447,16 +480,96 @@ function Approval({
       )}
 
       {!status.reviewed && (
-        <div className="space-y-1">
-          <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-            Or approve in a terminal:
-          </p>
-          <pre className="overflow-x-auto rounded bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-800">
-            {command}
-          </pre>
+        <div className="space-y-1 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">Or approve in a terminal:</p>
+          <CommandLine command={command} />
         </div>
       )}
     </section>
+  );
+}
+
+type StepState = "done" | "current" | "later" | "unknown";
+
+/**
+ * Where the plan stands, as three steps. A list, so a screen reader reads
+ * the order; each step says its state in words, not by colour alone.
+ */
+function Steps({ steps }: { steps: { label: string; state: StepState; note?: string }[] }) {
+  const said: Record<StepState, string> = {
+    done: "done",
+    current: "next",
+    later: "not yet",
+    unknown: "not known",
+  };
+  return (
+    <ol aria-label="Steps" className="space-y-3">
+      {steps.map((step, index) => (
+        <li key={step.label} className="flex items-start gap-3 text-sm">
+          <span
+            aria-hidden="true"
+            className={`flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+              step.state === "done"
+                ? "bg-emerald-500 text-white dark:text-zinc-950"
+                : step.state === "current"
+                  ? "border-2 border-orange-500 text-orange-600 dark:text-orange-400"
+                  : step.state === "unknown"
+                    ? "border-2 border-dashed border-zinc-400 text-zinc-500 dark:border-zinc-500 dark:text-zinc-400"
+                    : "border-2 border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-500"
+            }`}
+          >
+            {step.state === "done" ? <CheckIcon className="size-4" /> : index + 1}
+          </span>
+          <span className="pt-0.5">
+            <span
+              className={
+                step.state === "later" || step.state === "unknown"
+                  ? "text-zinc-500 dark:text-zinc-400"
+                  : "font-medium text-zinc-900 dark:text-zinc-100"
+              }
+            >
+              {step.label}
+            </span>
+            <span className="sr-only">: {said[step.state]}</span>
+            {step.note !== undefined && (
+              <span className="block text-xs text-zinc-500 dark:text-zinc-400">{step.note}</span>
+            )}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** A terminal command with a copy button. The command stays on the page as text. */
+function CommandLine({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false);
+  const canCopy = typeof navigator !== "undefined" && navigator.clipboard !== undefined;
+  return (
+    <div className="flex items-start gap-2 rounded-md bg-zinc-50 p-2 dark:bg-zinc-950">
+      <pre className="min-w-0 flex-1 py-1 pl-1 font-mono text-xs break-all whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">
+        {command}
+      </pre>
+      {canCopy && (
+        <button
+          type="button"
+          onClick={() => {
+            navigator.clipboard.writeText(command).then(
+              () => setCopied(true),
+              () => setCopied(false),
+            );
+          }}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 focus-visible:outline-2 focus-visible:outline-orange-500 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+        >
+          {copied ? (
+            <CheckIcon aria-hidden="true" className="size-4" />
+          ) : (
+            <ClipboardDocumentIcon aria-hidden="true" className="size-4" />
+          )}
+          <span className="sr-only">{copied ? "Copied" : "Copy the command"}</span>
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -480,8 +593,8 @@ function SampleFallback({
   product: Resource<ProductStatusOutput>;
 }) {
   const pending = (resource: Resource<unknown>, loadingLine: string) => (
-    <section aria-label="Sample rows" className="space-y-2">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
+    <section aria-label="Sample rows" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         Which model to sample is not known yet.
       </p>
@@ -603,70 +716,99 @@ export function PlanDetail({
   const model = fromQueue ?? fromProduct;
 
   return (
-    <div className="space-y-4">
-      <section aria-label="The plan" className="space-y-2">
-        <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+    <div className="space-y-6">
+      <section aria-label="The plan" className="space-y-3">
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          <a
+            href={reviewPath()}
+            onClick={(event) => {
+              event.preventDefault();
+              navigateTo(reviewPath());
+            }}
+            className="text-sky-700 hover:underline dark:text-sky-400"
+          >
+            Review queue
+          </a>{" "}
+          <span aria-hidden="true">/</span> Plan
+        </p>
+        <h2 className="font-mono text-xl font-semibold text-zinc-900 dark:text-white">
           <Clip value={planId} />
         </h2>
-        <div className="grid gap-2 sm:grid-cols-3">
-          <StatusCard label="kind" value={status.value.kind} />
-          <StatusCard
+        <dl className="flex flex-wrap gap-2 text-sm">
+          <Fact label="kind" value={status.value.kind} />
+          <Fact
             label="review"
+            tone={status.value.reviewed ? "ok" : "warn"}
             value={status.value.reviewed ? "signed off" : "awaiting a human"}
-            tone={status.value.reviewed ? "muted" : "risk"}
           />
-          <StatusCard
-            label="product"
-            value={status.value.product_id ?? "not product-bound"}
-          />
-        </div>
+          <Fact label="product" value={status.value.product_id ?? "not product-bound"} />
+        </dl>
       </section>
 
-      {diff.kind === "ready" ? (
-        <>
-          <BreakingChanges diff={diff.value} />
-          <ConditionalDrops diff={diff.value} />
-        </>
-      ) : (
-        <section aria-label="What it would break" className="space-y-2">
-          <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-            What it would break
-          </h3>
-          <ResourceState resource={diff} loadingLine="compiling both sides…" />
-        </section>
-      )}
+      {/* `minmax(0, 1fr)` below lg too: an unsized track grows to its widest
+          child, and the terminal command then pushed the page sideways. */}
+      <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <div className="min-w-0 space-y-4">
+          {diff.kind === "ready" ? (
+            <>
+              <BreakingChanges diff={diff.value} />
+              <ConditionalDrops diff={diff.value} />
+            </>
+          ) : (
+            <section aria-label="What it would break" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+              <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                What it would break
+              </h3>
+              <ResourceState resource={diff} loadingLine="compiling both sides…" />
+            </section>
+          )}
 
-      <Escalation lookup={lookup} planId={planId} />
+          <Escalation lookup={lookup} planId={planId} />
 
-      {productId !== null &&
-        (product.kind === "ready" ? (
-          <SpecDrift status={status.value} product={product.value} />
-        ) : (
-          <section aria-label="The spec it was planned against" className="space-y-2">
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              The spec it was planned against
-            </h3>
-            <ResourceState resource={product} loadingLine="reading the product…" />
-          </section>
-        ))}
+          {productId !== null &&
+            (product.kind === "ready" ? (
+              <SpecDrift status={status.value} product={product.value} />
+            ) : (
+              <section aria-label="The spec it was planned against" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+                <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                  The spec it was planned against
+                </h3>
+                <ResourceState resource={product} loadingLine="reading the product…" />
+              </section>
+            ))}
 
-      {model !== null ? (
-        <SamplePanel model={model} />
-      ) : (
-        <SampleFallback lookup={lookup} productId={productId} product={product} />
-      )}
+          {model !== null ? (
+            <SamplePanel model={model} />
+          ) : (
+            <SampleFallback lookup={lookup} productId={productId} product={product} />
+          )}
+        </div>
 
-      {(status.value.reviewed || diff.kind === "ready") && (
-        <Approval
-          status={status.value}
-          entries={entries}
-          jobs={jobs}
-          onChanged={() => {
-            status.reload();
-            queue.reload();
-          }}
-        />
-      )}
+        {(status.value.reviewed || diff.kind === "ready") && (
+          <Approval
+            status={status.value}
+            entries={entries}
+            jobs={jobs}
+            onChanged={() => {
+              status.reload();
+              queue.reload();
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** One fact about the plan, as a pill: its name, then its value. */
+function Fact({ label, value, tone }: { label: string; value: string; tone?: Tone }) {
+  return (
+    <div className="inline-flex max-w-full items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-zinc-800 dark:bg-zinc-900">
+      <dt className="text-zinc-500 dark:text-zinc-400">{label}</dt>
+      <dd className="flex min-w-0 items-center gap-1.5 font-medium break-all text-zinc-900 dark:text-zinc-100">
+        {tone !== undefined && <ToneDot tone={tone} />}
+        {value}
+      </dd>
     </div>
   );
 }

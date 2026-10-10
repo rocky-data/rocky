@@ -220,6 +220,13 @@ describe("Approve and Apply on the plan page", () => {
     expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
     // The command stays visible as a secondary hint.
     expect(within(section).getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
+    // The steps say where the plan stands, in words: approval is next.
+    const steps = () =>
+      within(within(section).getByRole("list", { name: "Steps" }))
+        .getAllByRole("listitem")
+        .map((item) => item.textContent);
+    // A done step shows a check, so only the others carry their number.
+    expect(steps()).toEqual(["Proposed: done", "2Approved: next", "3Applied: not yet"]);
 
     fireEvent.click(within(section).getByRole("button", { name: "Approve" }));
     await screen.findByText(/approved over the HTTP API by ops@example.com/);
@@ -227,6 +234,14 @@ describe("Approve and Apply on the plan page", () => {
     const text = document.body.textContent ?? "";
     expect(text).not.toMatch(/from the browser/i);
     expect(text).not.toMatch(/by a human/i);
+    // Approved is done. Applied is not known, never "next" or "done": the
+    // status route records approval, not apply, so an applied plan would
+    // look the same.
+    expect(steps()).toEqual([
+      "Proposed: done",
+      "Approved: done",
+      "3Applied: not knownThe plan status does not record apply.",
+    ]);
     // Now Apply is live, and posts the plan id and nothing else.
     const apply = screen.getByRole("button", { name: "Apply" });
     expect(apply).toBeEnabled();
@@ -234,6 +249,35 @@ describe("Approve and Apply on the plan page", () => {
     await waitFor(() =>
       expect(submitted.at(-1)).toEqual({ kind: "apply", body: { plan_id: PLAN } }),
     );
+    // Only an apply this page saw succeed marks the last step done.
+    await waitFor(() =>
+      expect(steps()).toEqual(["Proposed: done", "Approved: done", "Applied: done"]),
+    );
+  });
+
+  it("never marks Applied done after an apply that failed", async () => {
+    const loaders = planLoaders(async () => ({
+      ...STATUS,
+      reviewed: true,
+      approver: { email: "ops@example.com", host: "box", source: "http_api" },
+    }));
+    const { client } = fakeJobs([job("apply", "failed", { error: "Error: plan_models_changed" })]);
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <PlanDetail planId={PLAN} loaders={loaders} jobs={client} />
+      </WriteAccessProvider>,
+    );
+    const section = await screen.findByRole("region", { name: "Approval" });
+    fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+    await within(section).findByRole("alert");
+    const steps = within(within(section).getByRole("list", { name: "Steps" }))
+      .getAllByRole("listitem")
+      .map((item) => item.textContent);
+    expect(steps).toEqual([
+      "Proposed: done",
+      "Approved: done",
+      "3Applied: not knownThe plan status does not record apply.",
+    ]);
   });
 
   it("has no Apply button for a product-bound plan, and never reads its digest", async () => {
