@@ -501,6 +501,7 @@ impl RockyLsp {
         )
         .await;
 
+        let cast_targets = CastTargets::resolve(&dir_path);
         let config = CompilerConfig {
             models_dir: dir_path.clone(),
             contracts_dir: None,
@@ -518,15 +519,18 @@ impl RockyLsp {
             external_dependencies: Default::default(),
             project: None,
             // A full compile: resolve each model's warehouse afresh, as
-            // `rocky compile` does, and keep it for the edits that follow.
-            target_dialects: self.cast_targets.resolve(&dir_path),
+            // `rocky compile` does. Kept for the edits that follow once
+            // this compile's result is the stored one.
+            target_dialects: cast_targets.targets.clone(),
         };
 
         let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
                 apply_project_gates(&dir_path, &mut result);
-                self.publish_diagnostics(generation, result).await;
+                if self.publish_diagnostics(generation, result).await {
+                    self.cast_targets.keep(generation, cast_targets);
+                }
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
@@ -1527,6 +1531,8 @@ impl LanguageServer for RockyLsp {
                     } else {
                         None
                     };
+                // A full compile also returns the targets it resolved, kept
+                // only once its result is the stored one.
                 let new_result = if let Some(targets) = kept_targets {
                     config.target_dialects = targets;
                     let prev = compile_result.read().await;
@@ -1534,22 +1540,26 @@ impl LanguageServer for RockyLsp {
                     let cf = changed_file
                         .as_ref()
                         .expect("checked use_incremental above");
-                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config).ok()
+                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config)
+                        .ok()
+                        .map(|result| (result, None))
                 } else {
                     let mut config_for_blocking = config.clone();
                     tokio::task::spawn_blocking(move || {
-                        config_for_blocking.target_dialects =
-                            cast_targets.resolve(&config_for_blocking.models_dir);
-                        rocky_compiler::compile::compile(&config_for_blocking).ok()
+                        let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
+                        config_for_blocking.target_dialects = resolved.targets.clone();
+                        rocky_compiler::compile::compile(&config_for_blocking)
+                            .ok()
+                            .map(|result| (result, Some(resolved)))
                     })
                     .await
                     .ok()
                     .flatten()
                 };
 
-                if let Some(mut result) = new_result {
+                if let Some((mut result, resolved)) = new_result {
                     apply_project_gates(&config.models_dir, &mut result);
-                    Self::publish_compile_diagnostics(
+                    let stored = Self::publish_compile_diagnostics(
                         &client,
                         &published_files,
                         &compile_result,
@@ -1557,6 +1567,9 @@ impl LanguageServer for RockyLsp {
                         result,
                     )
                     .await;
+                    if stored && let Some(resolved) = resolved {
+                        cast_targets.keep(generation, resolved);
+                    }
                 } else {
                     // A newer compile that failed still outranks an older
                     // one that may yet succeed.
@@ -4860,14 +4873,20 @@ fn apply_project_gates(
 /// Resolving reads every pipeline's model files, so the result is kept:
 ///
 /// ```text
-///   full compile (startup, save, no previous result) ── resolve, keep
-///   an edit ── rocky.toml unchanged ── incremental compile, kept targets
-///           └─ rocky.toml changed ──── full compile: resolve, keep
+///   full compile (startup, save, no previous result)
+///       resolve ── compile ── result stored ── keep (targets, rocky.toml hash)
+///   an edit ── rocky.toml unchanged since the kept ones ── incremental, kept targets
+///           └─ changed, or nothing kept ──────────────── full compile
 /// ```
 ///
 /// A changed target retypes every cast, so an incremental compile, which
 /// keeps the previous types of the models an edit does not reach, must not
-/// run with targets other than the previous compile's.
+/// run with targets other than those of the stored result. So targets are
+/// kept only when their compile's result is stored: a full compile that
+/// fails, or loses to a newer one, keeps nothing, and the previous kept
+/// targets still match the stored result. A full compile still running when
+/// an edit comes leaves the old kept hash in place, which no longer matches
+/// a changed `rocky.toml`, so that edit compiles in full too.
 ///
 /// Which models a pipeline loads changes only when a file on disk changes,
 /// and a save runs a full compile. An unsaved edit changes neither.
@@ -4880,28 +4899,41 @@ struct CastTargets {
 }
 
 struct KeptCastTargets {
-    /// A hash of the `rocky.toml` bytes the targets were resolved from;
-    /// `None` when there was no readable file.
+    /// The compile generation whose stored result these targets typed.
+    generation: u64,
+    resolved: ResolvedCastTargets,
+}
+
+/// Targets resolved from disk, with the `rocky.toml` they came from.
+struct ResolvedCastTargets {
+    /// A hash of the `rocky.toml` bytes, read before the targets; `None`
+    /// when there was no readable file.
     config: Option<u64>,
     targets: rocky_compiler::operand_check::TargetDialects,
 }
 
 impl CastTargets {
-    /// Resolve the targets from disk and keep them.
-    fn resolve(
-        &self,
-        models_dir: &std::path::Path,
-    ) -> rocky_compiler::operand_check::TargetDialects {
+    /// Resolve the targets from disk. Nothing is kept until
+    /// [`Self::keep`].
+    fn resolve(models_dir: &std::path::Path) -> ResolvedCastTargets {
         let config = config_fingerprint(models_dir);
         let targets = project_target_dialects(models_dir);
-        *self
+        ResolvedCastTargets { config, targets }
+    }
+
+    /// Keep `resolved`: the full compile of `generation` that used it
+    /// stored its result. An older generation never replaces a newer one.
+    fn keep(&self, generation: u64, resolved: ResolvedCastTargets) {
+        let mut kept = self
             .kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(KeptCastTargets {
-            config,
-            targets: targets.clone(),
-        });
-        targets
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.as_ref().is_none_or(|k| k.generation <= generation) {
+            *kept = Some(KeptCastTargets {
+                generation,
+                resolved,
+            });
+        }
     }
 
     /// The kept targets, while `rocky.toml` is unchanged since they were
@@ -4917,8 +4949,8 @@ impl CastTargets {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         kept.as_ref()
-            .filter(|kept| kept.config == config)
-            .map(|kept| kept.targets.clone())
+            .filter(|kept| kept.resolved.config == config)
+            .map(|kept| kept.resolved.targets.clone())
     }
 }
 
@@ -5440,8 +5472,15 @@ mod tests {
         let both = target(&[OperandDialect::DuckDb, OperandDialect::Snowflake]);
 
         let cache = CastTargets::default();
+        // A full compile of generation `g` that stored its result.
+        let full_compile = |g: u64| {
+            let resolved = CastTargets::resolve(&models);
+            let targets = resolved.targets.clone();
+            cache.keep(g, resolved);
+            targets
+        };
         assert_eq!(cache.kept(&models), None, "nothing resolved yet");
-        let resolved = cache.resolve(&models);
+        let resolved = full_compile(1);
         assert_eq!(resolved.for_model("b"), &both);
         assert_eq!(resolved.for_model("c"), &both, "c is not on disk yet");
 
@@ -5463,8 +5502,12 @@ mod tests {
             "kept, not re-read"
         );
 
-        // A full compile (startup, save) resolves again and sees `c`.
-        assert_eq!(cache.resolve(&models).for_model("c"), &duck);
+        // A full compile (startup, save) resolves again and sees `c`. An
+        // older compile that stores after it does not put back its targets.
+        let older = CastTargets::resolve(&models);
+        assert_eq!(full_compile(3).for_model("c"), &duck);
+        cache.keep(2, older);
+        assert_eq!(cache.kept(&models).unwrap().for_model("c"), &duck);
 
         // A changed `rocky.toml` is noticed on an edit: nothing is kept, so
         // the edit runs a full compile, which resolves the new targets.
@@ -5477,10 +5520,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cache.kept(&models), None);
+        // A resolve whose compile failed keeps nothing: the stale kept
+        // targets still do not match the new `rocky.toml`.
+        let failed = CastTargets::resolve(&models);
         assert_eq!(
-            cache.resolve(&models).for_model("c"),
+            failed.targets.for_model("c"),
             &target(&[OperandDialect::Snowflake])
         );
+        assert_eq!(cache.kept(&models), None, "a failed compile keeps nothing");
+        assert_eq!(
+            full_compile(4).for_model("c"),
+            &target(&[OperandDialect::Snowflake])
+        );
+        assert!(cache.kept(&models).is_some());
     }
 
     use super::*;
