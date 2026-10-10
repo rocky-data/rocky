@@ -155,10 +155,16 @@ pub fn stamp_is_this_process(owner_pid: Option<u32>, owner_start_time: Option<u6
 /// A signal sent to the whole process group a job child leads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
-    /// `SIGINT`, what Ctrl-C at a terminal sends. `rocky run` handles it in
-    /// its replication fan-out: it stops starting copies, lets in-flight ones
-    /// finish, and settles its state. A process with no handler stops at once.
-    Interrupt,
+    /// `SIGTERM`, the stop Kubernetes sends a pod. `rocky run` handles it like
+    /// Ctrl-C in its replication fan-out: it stops starting copies, lets
+    /// in-flight ones finish, and settles its state. A process with no handler
+    /// stops at once.
+    ///
+    /// Not `SIGINT`: a shell starts a background command with `SIGINT`
+    /// ignored, and the ignore is inherited across `exec`. A `rocky serve`
+    /// started that way would hand it to every job, and a job with no handler
+    /// of its own would then never stop. Nothing ignores `SIGTERM` that way.
+    Terminate,
     /// `SIGKILL`. Nothing can catch it, so the process stops like a crash.
     Kill,
 }
@@ -189,7 +195,7 @@ pub fn signal_process_group(pgid: u32, signal: GroupSignal) -> std::io::Result<(
         ));
     }
     let signal = match signal {
-        GroupSignal::Interrupt => libc::SIGINT,
+        GroupSignal::Terminate => libc::SIGTERM,
         GroupSignal::Kill => libc::SIGKILL,
     };
     // SAFETY: `killpg` takes two integers and touches no memory of this
@@ -213,7 +219,7 @@ mod tests {
     #[test]
     fn signal_process_group_refuses_the_callers_group_and_init() {
         for pgid in [0, 1] {
-            for signal in [GroupSignal::Interrupt, GroupSignal::Kill] {
+            for signal in [GroupSignal::Terminate, GroupSignal::Kill] {
                 let err = signal_process_group(pgid, signal).unwrap_err();
                 assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{pgid}");
             }

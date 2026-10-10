@@ -275,7 +275,7 @@ enum Body {
     /// The `202 Accepted` job-submission body: `{ "job_id": string }`.
     JobAccepted,
     /// The `202 Accepted` job-cancel body:
-    /// `{ "job_id": string, "signal": "interrupt" | "kill" }`.
+    /// `{ "job_id": string, "signal": "terminate" | "kill" }`.
     JobCancelAccepted,
     /// An ad-hoc object explicitly outside the `/api/v1` value contract.
     OutOfContract,
@@ -846,11 +846,12 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Cancel a running job",
             description: "Stop a job this server process started. The first request sends \
-                 the job's process group an interrupt (SIGINT, as Ctrl-C does); a later one \
-                 kills it (SIGKILL). On Windows every request kills the child. The job keeps \
-                 the single-mutating-job permit until its child has exited. Its final state \
-                 is `cancelled` when the child then failed, or `succeeded` when it finished \
-                 first. Takes no request body.",
+                 the job's process group SIGTERM, which `rocky run` handles like Ctrl-C; \
+                 once that is delivered, a later request sends SIGKILL. On Windows every \
+                 request kills the child. The answer is 202 only after the signal is \
+                 delivered. The job keeps the single-mutating-job permit until its child \
+                 has exited. Its final state is `cancelled` when the child then failed, or \
+                 `succeeded` when it finished first. Takes no request body.",
             path_params: &["id"],
             query_params: &[],
             header_params: &[],
@@ -858,8 +859,8 @@ fn route_table() -> Vec<Route> {
             responses: &[
                 Resp {
                     status: "202",
-                    description: "The job's task has the request. Poll \
-                         `GET /api/v1/jobs/{id}` for the final state.",
+                    description: "The signal was delivered to the job's process group. \
+                         Poll `GET /api/v1/jobs/{id}` for the final state.",
                     body: Body::JobCancelAccepted,
                 },
                 Resp {
@@ -869,7 +870,8 @@ fn route_table() -> Vec<Route> {
                 },
                 Resp {
                     status: "409",
-                    description: "`job_not_running`: the job has finished. \
+                    description: "`job_not_running`: the job has finished, or its child \
+                         exited before the signal could be delivered. \
                          `job_not_cancellable`: the job is in flight but this server \
                          process did not start it (a scheduled run, or a record from \
                          another process).",
@@ -1609,9 +1611,9 @@ fn response_object(resp: &Resp) -> Value {
                 "job_id": { "type": "string" },
                 "signal": {
                     "type": "string",
-                    "enum": ["interrupt", "kill"],
-                    "description": "What this request asked the job's task to send: \
-                         `interrupt` (SIGINT) on the first request, `kill` (SIGKILL) after."
+                    "enum": ["terminate", "kill"],
+                    "description": "The signal delivered: \
+                         `terminate` (SIGTERM) until one is delivered, `kill` (SIGKILL) after."
                 }
             },
             "required": ["job_id", "signal"]

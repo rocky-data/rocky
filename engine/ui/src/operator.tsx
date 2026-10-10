@@ -103,7 +103,7 @@ export type JobView =
   | { kind: "done"; job: JobStatus };
 
 /** What `POST /api/v1/jobs/{id}/cancel` asked the job to do. */
-export type CancelSignal = "interrupt" | "kill";
+export type CancelSignal = "terminate" | "kill";
 
 /** The routes a job is submitted to, read from and cancelled at. Tests hand in fakes. */
 export interface JobClient {
@@ -120,9 +120,9 @@ export const defaultJobClient: JobClient = {
 };
 
 /**
- * Where a cancel of the running job stands. The engine interrupts the job
- * on the first request (as Ctrl-C does) and kills it on the next, so after
- * an interrupt the button offers a forced stop.
+ * Where the latest cancel request of the running job stands. The engine
+ * sends the job SIGTERM on the first request (which `rocky run` handles like
+ * Ctrl-C) and SIGKILL on the next.
  */
 export type CancelView =
   | { kind: "idle" }
@@ -133,6 +133,8 @@ export type CancelView =
 /** The cancel control `useJob` hands to `JobLine`. */
 export interface JobCancel {
   view: CancelView;
+  /** A stop was delivered to this job, so the button now offers a forced stop. */
+  stopping: boolean;
   request: () => void;
 }
 
@@ -152,6 +154,7 @@ export function useJob(
 ): { view: JobView; start: (body?: Record<string, unknown>) => void; cancel: JobCancel } {
   const [view, setView] = useState<JobView>({ kind: "idle" });
   const [cancelView, setCancelView] = useState<CancelView>({ kind: "idle" });
+  const [stopping, setStopping] = useState(false);
   // A second cancel click before the first answers is ignored, like `start`.
   const cancelInFlight = useRef(false);
   const done = useRef(onDone);
@@ -203,6 +206,7 @@ export function useJob(
       if (inFlight.current) return;
       inFlight.current = true;
       setCancelView({ kind: "idle" });
+      setStopping(false);
       setView({ kind: "submitting" });
       client
         .submit(kind, body)
@@ -222,26 +226,39 @@ export function useJob(
   // Cancel the job this hook is following. The job keeps being polled: its
   // final state (`cancelled`, or `succeeded` if it finished first) is what
   // the line shows in the end.
+  //
+  // An answer is applied only while the same job is still the one shown: a
+  // late answer for an earlier job must not mark a newer one as stopping.
   const jobId = view.kind === "running" ? view.jobId : null;
+  const shownJob = useRef<string | null>(null);
+  useEffect(() => {
+    shownJob.current = jobId;
+  }, [jobId]);
   const requestCancel = useCallback(() => {
     if (jobId === null || cancelInFlight.current) return;
     cancelInFlight.current = true;
     setCancelView({ kind: "sending" });
+    const current = () => alive.current && shownJob.current === jobId;
     client
       .cancel(jobId)
       .then(({ signal }) => {
         cancelInFlight.current = false;
-        if (!alive.current) return;
+        if (!current()) return;
+        if (signal === "terminate") setStopping(true);
         setCancelView({ kind: "sent", signal });
       })
       .catch((error: unknown) => {
         cancelInFlight.current = false;
-        if (!alive.current) return;
+        if (!current()) return;
         setCancelView({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
       });
   }, [client, jobId]);
 
-  return { view, start, cancel: { view: cancelView, request: requestCancel } };
+  return {
+    view,
+    start,
+    cancel: { view: cancelView, stopping, request: requestCancel },
+  };
 }
 
 /** Whether a job is in flight, so its button stays pressed. */
@@ -369,27 +386,26 @@ export function failureSummary(job: JobStatus): string {
   return text === "" ? "The job ended without a message." : cap(text);
 }
 
-/** What the Cancel button says once the job was interrupted. */
+/** What the Cancel button says once a stop was delivered to the job. */
 export const FORCE_STOP_LABEL = "Force stop";
 
 /**
  * Cancel for a running job, in operator mode only (a read-only page did not
  * start the job and cannot stop it, so it shows nothing). The first press
- * interrupts the job, as Ctrl-C does: a replication run finishes the copies
- * in flight and saves its state before it stops. If it does not stop, the
- * button then offers a forced stop, which kills it at once.
+ * asks the job to stop, as Ctrl-C does: a replication run finishes the
+ * copies in flight and saves its state before it stops. If it does not stop,
+ * the button then offers a forced stop, which kills it at once.
  */
 function CancelControl({ cancel }: { cancel: JobCancel }) {
   const access = useWriteAccess();
   if (access.kind !== "operator") return null;
   const view = cancel.view;
-  const interrupted = view.kind === "sent";
-  const label = interrupted ? FORCE_STOP_LABEL : "Cancel";
+  const label = cancel.stopping ? FORCE_STOP_LABEL : "Cancel";
   const busy = view.kind === "sending" || (view.kind === "sent" && view.signal === "kill");
   return (
     <div className="space-y-0.5">
       <WriteButton label={label} busy={busy} busyLabel="stopping…" onClick={cancel.request} />
-      {view.kind === "sent" && view.signal === "interrupt" && (
+      {cancel.stopping && !busy && (
         <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
           Asked the job to stop, as Ctrl-C does. A run finishes the copies in flight first.
         </p>

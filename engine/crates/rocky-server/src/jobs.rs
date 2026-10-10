@@ -92,34 +92,50 @@ impl Drop for PermitGuard {
 ///
 /// `POST /api/v1/jobs/{id}/cancel` looks a job up here. Only the job's own
 /// task holds its child process, so the route never signals a process
-/// itself: it sends a [`GroupSignal`](rocky_core::process::GroupSignal) down the job's channel, and the task
+/// itself: it sends a [`CancelMessage`] down the job's channel, and the task
 /// signals the child's group while it still holds the child unreaped. That
-/// is what keeps a recycled pid from being signalled.
+/// is what keeps a recycled pid from being signalled. The task answers on the
+/// message's reply channel whether a signal was delivered, so the route never
+/// claims a stop that did not happen.
 ///
-/// The first request for a job asks for [`Interrupt`](rocky_core::process::GroupSignal::Interrupt); any
-/// later one asks for [`Kill`](rocky_core::process::GroupSignal::Kill). That mirrors a terminal:
-/// Ctrl-C asks `rocky run` to stop cleanly, and a second request is the
-/// "stop now" for a child that does not.
+/// The first delivered request for a job is a
+/// [`Terminate`](rocky_core::process::GroupSignal::Terminate); any later one
+/// is a [`Kill`](rocky_core::process::GroupSignal::Kill). The first asks
+/// `rocky run` to stop cleanly; the second is the "stop now" for a child that
+/// does not.
 ///
 /// A job is registered from submission until its terminal record is
-/// written ([`CancelGuard`] drops then). A job the resident scheduler, or
-/// another process, runs is never here.
+/// written ([`CancelGuard`] drops then). Its task closes the channel as soon
+/// as the child exits, so a request after that is [`CancelRequest::Settling`].
+/// A job the resident scheduler, or another process, runs is never here.
 #[derive(Clone, Default)]
 pub struct JobCancels {
     slots: Arc<Mutex<HashMap<String, CancelSlot>>>,
 }
 
+/// One cancel request: the signal to send, and where the job's task answers
+/// whether it delivered it.
+pub type CancelMessage = (
+    rocky_core::process::GroupSignal,
+    tokio::sync::oneshot::Sender<bool>,
+);
+
 #[derive(Debug)]
 struct CancelSlot {
-    sender: tokio::sync::mpsc::UnboundedSender<rocky_core::process::GroupSignal>,
-    requests: u32,
+    sender: tokio::sync::mpsc::UnboundedSender<CancelMessage>,
+    /// How many signals the job's task has delivered.
+    delivered: u32,
 }
 
 /// What [`JobCancels::request`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum CancelRequest {
-    /// The signal was handed to the job's task.
-    Sent(rocky_core::process::GroupSignal),
+    /// The request was handed to the job's task, which answers on the
+    /// receiver whether it delivered the signal.
+    Sent(
+        rocky_core::process::GroupSignal,
+        tokio::sync::oneshot::Receiver<bool>,
+    ),
     /// The job is registered, but its child has already exited: it is
     /// writing its terminal record.
     Settling,
@@ -140,7 +156,7 @@ impl JobCancels {
         job_id: &str,
     ) -> (
         CancelGuard,
-        tokio::sync::mpsc::UnboundedReceiver<rocky_core::process::GroupSignal>,
+        tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
     ) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         self.slots
@@ -150,7 +166,7 @@ impl JobCancels {
                 job_id.to_string(),
                 CancelSlot {
                     sender,
-                    requests: 0,
+                    delivered: 0,
                 },
             );
         (
@@ -162,41 +178,61 @@ impl JobCancels {
         )
     }
 
-    /// Ask the job's task to signal its child: an interrupt the first time,
-    /// a kill after that.
+    /// Ask the job's task to signal its child: a terminate until one has been
+    /// delivered, a kill after that. Call [`delivered`](Self::delivered) when
+    /// the task answers `true`.
     pub fn request(&self, job_id: &str) -> CancelRequest {
-        let mut slots = self.slots.lock().expect("job cancels mutex poisoned");
-        let Some(slot) = slots.get_mut(job_id) else {
+        let slots = self.slots.lock().expect("job cancels mutex poisoned");
+        let Some(slot) = slots.get(job_id) else {
             return CancelRequest::NotRegistered;
         };
-        let signal = if slot.requests == 0 {
-            rocky_core::process::GroupSignal::Interrupt
+        let signal = if slot.delivered == 0 {
+            rocky_core::process::GroupSignal::Terminate
         } else {
             rocky_core::process::GroupSignal::Kill
         };
-        if slot.sender.send(signal).is_err() {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if slot.sender.send((signal, reply)).is_err() {
             return CancelRequest::Settling;
         }
-        slot.requests += 1;
-        CancelRequest::Sent(signal)
+        CancelRequest::Sent(signal, answer)
     }
 
-    /// Interrupt every registered job, once. `rocky serve` calls this when it
-    /// shuts down: each job child leads its own process group, so the Ctrl-C
-    /// that stops the server no longer reaches the child by itself. A job
-    /// already interrupted is not sent a second (kill) signal here.
-    pub fn interrupt_all(&self) {
+    /// Record that the job's task delivered a signal, so the next request
+    /// escalates to a kill.
+    pub fn delivered(&self, job_id: &str) {
+        if let Some(slot) = self
+            .slots
+            .lock()
+            .expect("job cancels mutex poisoned")
+            .get_mut(job_id)
+        {
+            slot.delivered += 1;
+        }
+    }
+
+    /// Ask every registered job that has not been signalled yet to
+    /// terminate, and return the replies to wait on. `rocky serve` calls this
+    /// when it shuts down: each job child leads its own process group, so the
+    /// Ctrl-C that stops the server no longer reaches the child by itself.
+    pub fn terminate_all(&self) -> Vec<tokio::sync::oneshot::Receiver<bool>> {
         let mut slots = self.slots.lock().expect("job cancels mutex poisoned");
+        let mut answers = Vec::new();
         for slot in slots.values_mut() {
-            if slot.requests == 0
-                && slot
-                    .sender
-                    .send(rocky_core::process::GroupSignal::Interrupt)
-                    .is_ok()
+            if slot.delivered > 0 {
+                continue;
+            }
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            if slot
+                .sender
+                .send((rocky_core::process::GroupSignal::Terminate, reply))
+                .is_ok()
             {
-                slot.requests = 1;
+                slot.delivered = 1;
+                answers.push(answer);
             }
         }
+        answers
     }
 
     /// Whether `job_id` is registered.
@@ -756,49 +792,57 @@ mod tests {
         }
     }
 
-    /// The first request interrupts, every later one kills; a job whose
-    /// receiver is gone is settling; a job whose guard dropped is unknown.
+    fn sent_signal(request: &CancelRequest) -> rocky_core::process::GroupSignal {
+        match request {
+            CancelRequest::Sent(signal, _) => *signal,
+            CancelRequest::Settling | CancelRequest::NotRegistered => {
+                panic!("expected Sent, got {request:?}")
+            }
+        }
+    }
+
+    /// Requests terminate until one is delivered, then kill. A request the
+    /// task did not deliver does not escalate. A job whose receiver is gone
+    /// is settling; a job whose guard dropped is unknown.
     #[test]
-    fn cancel_requests_escalate_and_end_with_the_guard() {
+    fn cancel_requests_escalate_only_after_a_delivery() {
         use rocky_core::process::GroupSignal;
         let cancels = JobCancels::new();
-        assert_eq!(cancels.request("j"), CancelRequest::NotRegistered);
+        assert!(matches!(cancels.request("j"), CancelRequest::NotRegistered));
 
         let (guard, mut rx) = cancels.register("j");
+        assert_eq!(sent_signal(&cancels.request("j")), GroupSignal::Terminate);
         assert_eq!(
-            cancels.request("j"),
-            CancelRequest::Sent(GroupSignal::Interrupt)
+            sent_signal(&cancels.request("j")),
+            GroupSignal::Terminate,
+            "nothing was delivered yet, so no escalation"
         );
-        assert_eq!(cancels.request("j"), CancelRequest::Sent(GroupSignal::Kill));
-        assert_eq!(cancels.request("j"), CancelRequest::Sent(GroupSignal::Kill));
-        assert_eq!(rx.try_recv().unwrap(), GroupSignal::Interrupt);
-        assert_eq!(rx.try_recv().unwrap(), GroupSignal::Kill);
+        cancels.delivered("j");
+        assert_eq!(sent_signal(&cancels.request("j")), GroupSignal::Kill);
+        let (signal, _reply) = rx.try_recv().unwrap();
+        assert_eq!(signal, GroupSignal::Terminate);
 
         drop(rx);
-        assert_eq!(cancels.request("j"), CancelRequest::Settling);
+        assert!(matches!(cancels.request("j"), CancelRequest::Settling));
         drop(guard);
-        assert_eq!(cancels.request("j"), CancelRequest::NotRegistered);
+        assert!(matches!(cancels.request("j"), CancelRequest::NotRegistered));
         assert!(!cancels.contains("j"));
     }
 
-    /// Shutdown interrupts each job once. A job already interrupted gets no
-    /// second (kill) signal from it, and a later cancel still escalates.
+    /// Shutdown terminates each job not yet signalled, once, and hands back
+    /// a reply for each.
     #[test]
-    fn interrupt_all_interrupts_each_job_once() {
+    fn terminate_all_signals_each_unsignalled_job_once() {
         use rocky_core::process::GroupSignal;
         let cancels = JobCancels::new();
         let (_a, mut a) = cancels.register("a");
         let (_b, mut b) = cancels.register("b");
-        assert_eq!(
-            cancels.request("b"),
-            CancelRequest::Sent(GroupSignal::Interrupt)
-        );
-        cancels.interrupt_all();
-        cancels.interrupt_all();
-        assert_eq!(a.try_recv().unwrap(), GroupSignal::Interrupt);
-        assert!(a.try_recv().is_err(), "one interrupt, not two");
-        assert_eq!(b.try_recv().unwrap(), GroupSignal::Interrupt);
-        assert!(b.try_recv().is_err(), "b was already interrupted");
-        assert_eq!(cancels.request("a"), CancelRequest::Sent(GroupSignal::Kill));
+        cancels.delivered("b");
+        assert_eq!(cancels.terminate_all().len(), 1);
+        assert!(cancels.terminate_all().is_empty());
+        assert_eq!(a.try_recv().unwrap().0, GroupSignal::Terminate);
+        assert!(a.try_recv().is_err(), "one terminate, not two");
+        assert!(b.try_recv().is_err(), "b was already signalled");
+        assert_eq!(sent_signal(&cancels.request("a")), GroupSignal::Kill);
     }
 }

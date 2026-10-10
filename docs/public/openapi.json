@@ -26259,7 +26259,7 @@
     },
     "/api/v1/jobs/{id}/cancel": {
       "post": {
-        "description": "Stop a job this server process started. The first request sends the job's process group an interrupt (SIGINT, as Ctrl-C does); a later one kills it (SIGKILL). On Windows every request kills the child. The job keeps the single-mutating-job permit until its child has exited. Its final state is `cancelled` when the child then failed, or `succeeded` when it finished first. Takes no request body.",
+        "description": "Stop a job this server process started. The first request sends the job's process group SIGTERM, which `rocky run` handles like Ctrl-C; once that is delivered, a later request sends SIGKILL. On Windows every request kills the child. The answer is 202 only after the signal is delivered. The job keeps the single-mutating-job permit until its child has exited. Its final state is `cancelled` when the child then failed, or `succeeded` when it finished first. Takes no request body.",
         "operationId": "cancelJob",
         "parameters": [
           {
@@ -26282,9 +26282,9 @@
                       "type": "string"
                     },
                     "signal": {
-                      "description": "What this request asked the job's task to send: `interrupt` (SIGINT) on the first request, `kill` (SIGKILL) after.",
+                      "description": "The signal delivered: `terminate` (SIGTERM) until one is delivered, `kill` (SIGKILL) after.",
                       "enum": [
-                        "interrupt",
+                        "terminate",
                         "kill"
                       ],
                       "type": "string"
@@ -26298,7 +26298,7 @@
                 }
               }
             },
-            "description": "The job's task has the request. Poll `GET /api/v1/jobs/{id}` for the final state."
+            "description": "The signal was delivered to the job's process group. Poll `GET /api/v1/jobs/{id}` for the final state."
           },
           "404": {
             "content": {

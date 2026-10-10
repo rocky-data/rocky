@@ -37,7 +37,7 @@ function fakeJobs(statuses: JobStatus[] = [job("run", "succeeded")]) {
       return { job_id: "job_1" };
     }),
     status: vi.fn(async () => statuses[Math.min(read++, statuses.length - 1)]),
-    cancel: vi.fn(async (jobId: string) => ({ job_id: jobId, signal: "interrupt" as const })),
+    cancel: vi.fn(async (jobId: string) => ({ job_id: jobId, signal: "terminate" as const })),
   };
   return { client, submitted };
 }
@@ -435,20 +435,20 @@ describe("Cancel on a running job", () => {
   /** A job that runs until cancelled, then reads `cancelled`. */
   function cancellableJobs() {
     let cancelled = false;
-    let answerCancel: (value: { job_id: string; signal: "interrupt" | "kill" }) => void = () => {};
+    let answerCancel: (value: { job_id: string; signal: "terminate" | "kill" }) => void = () => {};
     const client: JobClient = {
       submit: vi.fn(async () => ({ job_id: "job_1" })),
       status: vi.fn(async () => job("run", cancelled ? "cancelled" : "running")),
       cancel: vi.fn(
         () =>
-          new Promise<{ job_id: string; signal: "interrupt" | "kill" }>((resolve) => {
+          new Promise<{ job_id: string; signal: "terminate" | "kill" }>((resolve) => {
             answerCancel = resolve;
           }),
       ),
     };
     return {
       client,
-      answer: (signal: "interrupt" | "kill") => answerCancel({ job_id: "job_1", signal }),
+      answer: (signal: "terminate" | "kill") => answerCancel({ job_id: "job_1", signal }),
       settle: () => {
         cancelled = true;
       },
@@ -471,9 +471,13 @@ describe("Cancel on a running job", () => {
     expect(jobs.client.cancel).toHaveBeenCalledWith("job_1");
     expect(screen.getByRole("button", { name: "Cancel: stopping…" })).toBeDisabled();
 
-    jobs.answer("interrupt");
+    jobs.answer("terminate");
     const force = await screen.findByRole("button", { name: FORCE_STOP_LABEL });
     expect(force).toBeEnabled();
+    // While the forced stop is being sent, the button keeps its label.
+    fireEvent.click(force);
+    expect(jobs.client.cancel).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: `${FORCE_STOP_LABEL}: stopping…` })).toBeDisabled();
 
     jobs.settle();
     expect(
@@ -489,7 +493,7 @@ describe("Cancel on a running job", () => {
         <JobLine
           label="Run the project"
           view={{ kind: "running", jobId: "job_1" }}
-          cancel={{ view: { kind: "idle" }, request: () => void jobs.client.cancel("job_1") }}
+          cancel={{ view: { kind: "idle" }, stopping: false, request: () => void jobs.client.cancel("job_1") }}
         />
       </WriteAccessProvider>,
     );
@@ -508,6 +512,7 @@ describe("Cancel on a running job", () => {
               kind: "refused",
               error: new ApiError(409, { code: "job_not_running", message: "job 'job_1' is not running" }),
             },
+            stopping: false,
             request: () => {},
           }}
         />
