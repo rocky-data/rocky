@@ -59,10 +59,9 @@ guide](/concepts/plan-store-v1-to-v2/).
 Dagster then shows it as run metadata in the run viewer, one click from a
 failed materialization back to the plan that produced it.
 
-Engine `v1.35+` content-addresses a plan for every project shape,
-including replication-only projects with no `models/` directory. So
-`run_pipes` always writes a `.rocky/plans/<plan-id>.json` artifact. If the
-engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than
+Every supported engine (1.35.0 and newer) writes a plan for every project
+shape, including replication-only projects with no `models/` directory. If
+the engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than
 falling back to `rocky run`.
 
 ## Drift events as `AssetObservation`
@@ -123,17 +122,16 @@ keeps the verdict from its last completed evaluation, so a check that passed
 before stays green while the source does not change. A pruned table with no
 earlier verdict fails (WARN). Both carry `rocky/pruned_unchanged`.
 
-The last two rows are new. Before, silence was a pass:
+Silence is not a pass. An empty `anomalies` list with no
+`anomaly_evaluated` entry for the table fails at `WARN`:
 
 ```
-before        anomalies: []  ──►  row_count_anomaly: PASS   (green, detector never ran)
-
-now           anomalies: []           ─┐
-              anomaly_evaluated: []   ─┴►  row_count_anomaly: WARN  (no evidence)
+anomalies: []           ─┐
+anomaly_evaluated: []   ─┴►  row_count_anomaly: WARN  (no evidence)
 ```
 
-**On upgrade, a check that was green can turn amber.** That happens on a
-pipeline where the detector was not running, and against an engine too old
+**A check that was green in older releases can turn amber.** That happens on
+a pipeline where the detector was not running, and against an engine too old
 to send the per-table report.
 
 The detector runs for a table only when all of these are true:
@@ -204,6 +202,20 @@ Rocky names a table with a plain string. That string is either
 `catalog.schema.table` or a bare `table`. The `key_resolver` callable maps
 it to a Dagster `AssetKey`. `RockyComponent`'s own resolver handles the
 dotted form for you.
+
+## Compliance and retention
+
+Two more helpers take a `key_resolver` the same way. `RockyComponent` calls
+them when you set `surface_compliance` or `surface_retention_status`.
+
+| Helper | Input | Output |
+|---|---|---|
+| `compliance_check_results(output, *, key_resolver)` | `rocky.compliance()` | One `AssetCheckResult` per asset, named `compliance_exception`, `passed=False`, severity `WARN`. All exceptions for one asset fold into one result. |
+| `retention_observations(output, *, key_resolver)` | `rocky.retention_status()` | One `AssetObservation` per model row, with `rocky/retention_*` metadata. Rows that do not resolve are skipped. |
+
+A compliance exception whose model does not resolve lands on the
+`COMPLIANCE_FALLBACK_ASSET_KEY` (`_compliance`). `RockyComponent` drops that
+result with a warning, because it cannot declare a check on that key.
 
 ## Optimization recommendations
 

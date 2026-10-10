@@ -2,7 +2,7 @@
 title: Contributing
 description: Where each kind of change belongs, how to build and test it, and what CI checks
 sidebar:
-  order: 1
+  order: 6
 ---
 
 Rocky lives in one repository. It holds the Rust engine, two Python packages, a VS Code extension, a sample pipeline, and this docs site. One pull request can change several of them at once, and one CI run covers them all.

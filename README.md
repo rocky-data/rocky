@@ -254,6 +254,7 @@ Rocky **writes** to a warehouse. It **reads** from a source to learn what tables
 | Redshift (Beta) | write | Check, plan, run, merge, dist and sort keys, late-binding views. Password auth only. SQL is unit-tested, not run live. |
 | ClickHouse (Beta) | write | Check, plan, run, views, append, `delete_insert`, `time_interval`, engine and sort keys. No `MERGE`, so `strategy = "merge"` is refused. Tested live. |
 | SQL Server (Beta) | write | Check, plan, run, merge, views, incremental, `delete_insert`, `time_interval`. SQL auth or Entra ID tokens. Tested live on SQL Server 2022. Azure SQL and Fabric Warehouse are not run live. |
+| Apache Spark (Beta) | write | Over Spark Connect, no JVM. Delta Lake or Iceberg tables. Tested live on Spark 4.0.1 with Delta Lake 4.0.0. |
 | DuckDB | write | Local work and tests. No account needed. |
 | Fivetran | read | Your connectors and the tables they land |
 | Airbyte | read | Your connections and the tables they land |

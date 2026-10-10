@@ -45,14 +45,14 @@ consumer keeps compiling.
 ## Run
 
 ```bash
-# Build the engine binary the POC uses (run.sh resolves the worktree's
-# release binary, not a stale PATH install):
-(cd engine && cargo build --release -p rocky)
-
-# Then:
 cd examples/playground/pocs/04-governance/08-cross-team-contracts
 ./run.sh
 ```
+
+`run.sh` picks the binary in this order: `$ROCKY_BIN`, then
+`engine/target/release/rocky`, then `engine/target/debug/rocky`, then `rocky`
+on `PATH`. Build one with `(cd engine && cargo build -p rocky)` if none
+exists.
 
 The two key commands the POC exercises:
 

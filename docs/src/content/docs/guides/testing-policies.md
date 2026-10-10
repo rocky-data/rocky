@@ -2,7 +2,7 @@
 title: Testing Policies
 description: Pin your agent-policy rules with scenario assertions, so a policy edit cannot silently open a hole, and gate them in CI with rocky policy test.
 sidebar:
-  order: 7.5
+  order: 18
 ---
 
 A `[policy]` block is code. It decides whether an agent may apply a schema change, promote a branch, or touch a contracted model. Like any code that guards production, it drifts as you edit it.

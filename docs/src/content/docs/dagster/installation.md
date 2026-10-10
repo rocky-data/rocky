@@ -37,7 +37,7 @@ uv add dagster-rocky
 
 The package requires:
 
-- `rocky-sdk >= 0.16.0` (the typed result models and `RockyClient` live here; `dagster-rocky` is a thin adapter over it)
+- `rocky-sdk >= 0.18.0` (the typed result models and `RockyClient` live here; `dagster-rocky` is a thin adapter over it)
 - `dagster >= 1.13.8`
 - `pydantic >= 2.0`
 - `pygments >= 2.20.0`
@@ -50,6 +50,10 @@ platform.
 
 Put the binary on your `PATH`. If you would rather keep it somewhere else, set
 the `binary_path` config on `RockyResource` to its location.
+
+The binary must be engine 1.35.0 or newer (`MIN_ROCKY_VERSION`). The resource
+checks the version on the first call and raises `dagster.Failure` when it is
+older.
 
 ### Vendor binary for deployment
 

@@ -12,8 +12,10 @@ schema agreement that Rocky enforces before it writes a single row.
 and [`AssetCheckResult`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckResult)
 events.
 
-Every model with a `.contract.toml` file gets one or more contract check specs
-at load time. They show on the asset detail page before any compile or run.
+`RockyComponent` declares the contract check specs at load time. They show on
+the asset detail page before any compile or run, so a fresh deployment already
+shows which assets have contracts. [Which assets get contract
+checks](#which-assets-get-contract-checks) says where they attach.
 
 ## Quickstart
 
@@ -58,8 +60,8 @@ attributes:
   contracts_dir: contracts  # ← enables contract checks
 ```
 
-After you deploy, each model with a contract file shows up to three contract
-checks on its asset detail page. Which of the three appear depends on the rule
+After you deploy, each matching asset shows up to three contract checks on its
+asset detail page. Which of the three appear depends on the rule
 kinds the contract declares:
 
 - `contract_required_columns`: passes when there are no E010 diagnostics
@@ -133,24 +135,17 @@ results = list(
 )
 ```
 
-## Why the specs exist before the first run
-
-The specs are declared at load time, so the Dagster UI shows the contract slots
-**before any compile or run**. On a fresh deployment you can still see which
-models have contracts, and which contract kinds each one declares.
-
 ## Which assets get contract checks
 
 `RockyComponent` matches contracts to assets by **table name**. A contract file
-`orders.contract.toml` attaches to any asset whose key ends with `orders`. Two
-kinds of asset qualify:
+`orders.contract.toml` attaches to a source-replication asset whose key ends
+with `orders`.
 
-- **Derived-model assets** — set `surface_derived_models: true` (or
-  `dag_mode: true`) and every silver-layer model is surfaced as its own
-  asset, so each model with a contract file gets the contract checks
-  automatically. See [Derived models](/dagster/derived-models/).
-- **Source-replication tables** whose table name happens to match a
-  contract file — the fallback when derived models are not surfaced.
+Derived-model assets do not get contract check specs. That holds for both
+`surface_derived_models: true` and `dag_mode: true`. `build_model_specs`
+accepts `contract_rules_by_model` but ignores it. To check a derived model's
+contract in Dagster, build the specs yourself with the
+[standalone helpers](#standalone-helpers).
 
 ## How `discover_contract_rules` handles bad input
 

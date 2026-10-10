@@ -7,7 +7,7 @@ sidebar:
 
 `RockyResource` is a `dagster.ConfigurableResource`. It runs the Rocky CLI in a subprocess and parses the JSON output into typed Pydantic models. There is roughly one Python method per Rocky CLI command.
 
-This page documents the main methods. The resource carries more than these, including `apply()`, `run_model()`, `catalog()`, `dag()`, `cost()`, `compliance()`, and the branch and plan promotion helpers. Every one follows the same shape: run a subprocess, return a typed result.
+This page documents the main methods in detail. [Other methods](#other-methods) lists the rest. Every one follows the same shape: run a subprocess, return a typed result.
 
 ## Configuration
 
@@ -32,17 +32,22 @@ The resource also accepts four optional **resolver** fields: `shadow_suffix_fn`,
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
 - **Partial success**: Rocky can exit non-zero and still print valid JSON. That happens when some tables succeed and others fail, and when every table copies and then an error-severity check fails (exit 2, `check_gate_failed: true`). `run()`, `compile()`, `test()`, and `ci()` handle it for you. They return the parsed result, so you can tell the successes from the failures. Read `check_gate_failed` as well as `tables_failed`: a run stopped by a check has no failed table to look at.
-- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run`, which is the engine's own plan+apply path. Neither persists a separate plan artifact. Only `run_pipes()` keeps the two-step shape. It runs `rocky plan`, then `rocky apply <plan-id>`. It persists an auditable plan artifact to `.rocky/plans/<plan-id>.json` and surfaces the `plan_id` as Pipes `extras`. A materialization therefore traces back to the exact plan it applied. `run_pipes()` requires engine `v1.35+` for a replication-only project. That is the first version that content-addresses a plan for every project shape. If `rocky plan` emits no `plan_id`, `run_pipes()` raises `dagster.Failure` with an upgrade hint rather than falling back.
+- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run` and write no plan file. Only `run_pipes()` runs `rocky plan`, then `rocky apply <plan-id>`, and keeps the plan in `.rocky/plans/<plan-id>.json`. See [Plan artifact per materialization](/dagster/observability/#plan-artifact-per-materialization).
 
 ---
 
 ## Core Pipeline
 
-### `discover() -> DiscoverResult`
+### `discover(*, pipeline=None, emit_fivetran_state_to=None) -> DiscoverResult`
 
 Runs `rocky discover` and returns all discovered sources and their tables.
 
 **Wraps**: `rocky discover --output json`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `pipeline` | `str \| None` | `None` | Pipeline name (required when multiple pipelines are defined) |
+| `emit_fivetran_state_to` | `str \| Path \| None` | `None` | Also write the Fivetran state envelope to this file. The envelope goes only to the file, not into the return value. |
 
 ```python
 result = rocky.discover()
@@ -62,7 +67,7 @@ Runs `rocky plan` and returns the planned SQL statements without executing them.
 | `pipeline` | `str \| None` | `None` | Pipeline name (required when multiple pipelines are defined) |
 | `env` | `str \| None` | `None` | Optional environment name |
 
-### `run(filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
+### `run(filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, shadow_suffix=None, idempotency_key=None, defer=False, defer_to=None, timeout_seconds=None) -> RunResult`
 
 Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
 
@@ -80,9 +85,15 @@ Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution re
 | `latest` | `bool` | `False` | Run the partition containing `now()` (UTC) |
 | `missing` | `bool` | `False` | Run partitions missing from the state store |
 | `lookback` | `int \| None` | `None` | Recompute the previous N partitions in addition to the selected ones |
-| `parallel` | `int \| None` | `None` | Run N partitions concurrently. Left as `None`, the `--parallel` flag is omitted and the engine applies its own default of 4 concurrent partitions (earlier engine versions defaulted to serial). Pass `1` to run one partition at a time — note this does not bound a replication pipeline's table fan-out, which comes from its `[execution] concurrency`. DuckDB runs serially regardless. |
+| `parallel` | `int \| None` | `None` | Run N partitions concurrently. Left as `None`, the `--parallel` flag is omitted and the engine applies its own default of 4 concurrent partitions. Pass `1` to run one partition at a time. This does not bound a replication pipeline's table fan-out, which comes from its `[execution] concurrency`. DuckDB runs serially regardless. |
+| `shadow_suffix` | `str \| None` | `None` | Run in shadow mode and write to targets with this table-name suffix. See [Branch deployments](/dagster/branch-deployments/). |
+| `idempotency_key` | `str \| None` | `None` | Caller-supplied dedup token. Rocky stores it verbatim, so never put a secret in it. |
+| `defer` / `defer_to` | `bool` / `str \| None` | `False` / `None` | Resolve unbuilt `ref()` upstreams against an existing schema instead of rebuilding them |
+| `timeout_seconds` | `int \| None` | `None` | Watchdog budget for this one call. Overrides the resource's `timeout_seconds` and any `timeout_fn` resolver. |
 
-### `run_streaming(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
+A resolver (`shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`, `timeout_fn`) fires only when its argument is absent from the call. An explicit `None` counts as absent.
+
+### `run_streaming(context, filter, governance_override=None, *, ...) -> RunResult`
 
 Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()`, but it spawns the binary via `subprocess.Popen`. It forwards Rocky's stderr, the engine's tracing output, to `context.log.info` line by line as the run progresses. Use it inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
 
@@ -101,18 +112,25 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
     return result.tables_copied
 ```
 
-### `run_pipes(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, pipes_client=None) -> PipesClientCompletedInvocation`
+### `run_pipes(context, filter, governance_override=None, *, ..., pipes_client=None, asset_key_fn=None, include_keys=None, declared_checks=None) -> PipesClientCompletedInvocation`
 
-Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line. The run viewer therefore gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster shows it as run metadata.
+Full Dagster Pipes execution with structured events. Runs `rocky plan`, then runs `rocky apply <plan-id>` through `PipesSubprocessClient`. The engine emits Pipes messages for materializations, asset checks, and log lines. The plan id is attached as `extras={"plan_id": plan_id}`. If `rocky plan` emits no `plan_id`, the call raises `dagster.Failure`; it does not fall back to `rocky run`.
 
-**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol. This is the only execution mode that keeps the two-step shape. Replication-only projects route through plan+apply too, because engine `v1.35+` content-addresses every plan. A missing `plan_id` therefore raises `dagster.Failure` with an upgrade hint rather than falling back to `rocky run`.
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `context` | `AssetExecutionContext \| OpExecutionContext` | Dagster execution context |
 | `filter` | `str` | Component filter |
-| `pipes_client` | `PipesSubprocessClient \| None` | Optional pre-configured Pipes client |
-| All other parameters | | Same as `run()` |
+| `pipes_client` | `PipesSubprocessClient \| None` | Optional pre-configured Pipes client. When set, `asset_key_fn` and `include_keys` are ignored. |
+| `asset_key_fn` | `Callable[[list[str]], AssetKey \| None] \| None` | Maps each event's asset key. Return `None` to drop the event. |
+| `include_keys` | `set[AssetKey] \| None` | Allowlist. Events for other keys are dropped. |
+| `declared_checks` | `Mapping[str, Sequence[str]] \| None` | Asset key (slash-joined) to declared check names. The engine answers every declared check it did not produce with an explicit not-evaluated failure. |
+| All other parameters | | Same as `run()`, except `defer` and `defer_to`: `rocky plan` does not accept them, so passing them raises `ValueError` |
+
+:::caution[No watchdog on the apply step]
+`timeout_seconds` and `timeout_fn` bound only the `rocky plan` step. `PipesSubprocessClient` owns the apply subprocess and exposes no kill hook. A warehouse hang during apply holds the Dagster step until it ends. Set a Dagster run timeout, or use `run_streaming()` when you need the watchdog.
+:::
 
 ```python
 @dg.asset
@@ -284,11 +302,11 @@ against the configured layout. Without it, a custom `models_dir` yields
 
 ## Diagnostics
 
-### `doctor() -> DoctorResult`
+### `doctor(*, check=None) -> DoctorResult`
 
-Run health checks on the Rocky installation and configuration.
+Run health checks on the Rocky installation and configuration. Pass `check` to run one named check, for example `"state_rw"`.
 
-**Wraps**: `rocky doctor --output json`
+**Wraps**: `rocky doctor --output json [--check <check>]`
 
 ### `compliance(*, env=None) -> ComplianceOutput`
 
@@ -351,15 +369,30 @@ Fire a test hook event. Returns raw stdout (not parsed JSON).
 
 ---
 
-## Execution modes for `rocky run`
+## Other methods
 
-The resource provides three execution modes, all sharing the same partition and governance flag plumbing:
+These methods follow the same pattern. Each one wraps the CLI command of the same name and returns its typed output.
 
-| Mode | Method | Use case |
-|---|---|---|
-| **Buffered** | `run()` | Scripts, tests, notebooks. No Dagster context needed. |
-| **Streaming** | `run_streaming()` | Long Dagster runs. Live stderr forwarding to `context.log`. |
-| **Pipes** | `run_pipes()` | Full Dagster Pipes. Structured `MaterializationEvent` and `AssetCheckEvaluation` per table. |
+| Method | Wraps |
+|---|---|
+| `apply(plan_id, *, expect_spec_digest=None)` | `rocky apply <plan-id>` |
+| `review_status(plan_id)` | `rocky review <plan-id> --status` |
+| `run_model(model_name, *, pipeline=None, filter=None, partition=None, ...)` | `rocky run --model <name>` |
+| `reconcile_watermark(pipeline, *, tables=None, dry_run=False)` | `rocky state reconcile-watermark --pipeline <pipeline>` |
+| `branch_approve(name, *, message=None, out=None)` | `rocky branch approve <name>` |
+| `branch_promote(name, *, filter=None, skip_approval=False)` | `rocky branch promote <name>` |
+| `plan_promote(name, *, base="main", allow_breaking=False, filter=None)` | `rocky plan promote <name> --base <base>` |
+| `catalog(*, out=None)` | `rocky catalog` (writes files to disk) |
+| `dag(*, column_lineage=False, models_dir=None)` | `rocky dag` |
+| `cost(run_id="latest")` | `rocky cost <run-id>` |
+| `ai_contract(model, *, save=False)` | `rocky ai-contract` |
+| `freshness(*, pipeline=None)` | `rocky freshness`. Map the result with [`freshness_check_results`](/dagster/freshness/#freshness_check_resultsoutput) |
+| `state_health(*, probe_write=False)` | state-store snapshot. See [Health checks](/dagster/health/#state-backend-health) |
+| `schedule_spool()` | `rocky state schedule spool` |
+| `product_verify(product)`, `product_compile(product)`, `product_approve(product)`, `product_status(product)`, `product_list()`, `product_journal(product)` | `rocky product <verb>` |
+| `package_list()` | `rocky package list` |
+
+The three ways to run `rocky run` (`run()`, `run_streaming()`, `run_pipes()`) are compared in [Live log streaming](/dagster/pipes/#three-execution-modes).
 
 ## HTTP fallback
 

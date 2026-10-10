@@ -38,8 +38,8 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 |---|---|
 | **Typed compiler** | Reports resolvable type mismatches and missing columns before the compile succeeds |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
-| **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
-| **Incremental loads** | A replication pipeline copies only the rows newer than a stored watermark. A transformation model cannot use `incremental` (`E037`); use `merge` or `time_interval` |
+| **Multiple materialization strategies** | `full_refresh`, `incremental`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed` |
+| **Incremental loads** | Process only the rows newer than a watermark. A replication pipeline keeps the watermark in the state store. A transformation model declares `timestamp_column` and `@incremental_filter`; without a watermark it is `E037` |
 | **Schema drift detection** | Notices when a source column changed type and handles it automatically |
 | **Data contracts** | Declare what columns must exist and what types they must be; enforced at compile time |
 | **Deterministic surrogate keys** | Declare `[[surrogate_key]]` and Rocky injects a dialect-correct hash column into the SELECT; the value matches `dbt_utils.generate_surrogate_key` over the same columns, so keys stay stable when migrating a dbt Core project to Rocky |
@@ -52,8 +52,11 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 | **Hooks & webhooks** | Fire shell commands or HTTP calls on 18 lifecycle events. `rocky run` fires them on a replication pipeline only |
 | **Column lineage** | Trace an output column back through casts and function calls to the source column it came from |
 | **Cost model** | Reads run history and recommends `table` or `view` per model |
-| **Dagster integration** | Orchestration via RockyResource and Dagster Pipes |
+| **Browser UI** | `rocky serve --ui`: read the project, review and approve plans, run pipelines (section 19) |
 | **VS Code extension** | LSP client: hover types, go-to-definition, inline diagnostics, completion |
+| **Dagster integration** | Orchestration via RockyResource and Dagster Pipes |
+| **MCP server** | `rocky mcp` gives an agent tools to read, draft, and propose. It never applies a change (section 34) |
+| **Policy and data products** | `[policy]` grades what a human or an agent may do; `rocky fulfill` drives a product spec to a reviewed apply (experimental) |
 | **AI intent layer** | Generate models from a plain-English description (`rocky ai "..."`) |
 
 ---
@@ -70,7 +73,7 @@ Rocky's engine is a Cargo workspace of small Rust crates. Each crate has one job
                             │                       │
         ┌───────────────────▼────────────────────┐  │
         │                rocky-cli               │  │
-        │   72 commands, JSON output, /api/v1    │  │
+        │   the commands, JSON output, /api/v1   │  │
         │          Dagster Pipes emitter         │  │
         └───┬─────────────────┬──────────────────┘  │
             │                 │      ┌──────────────▼─────────┐
@@ -111,7 +114,13 @@ Rocky's engine is a Cargo workspace of small Rust crates. Each crate has one job
  │ rocky-duckdb              │  │ rocky-iceberg           │
  │ rocky-bigquery            │  │ rocky-duckdb            │
  │ rocky-trino               │  │ rocky-bigquery          │
- │                           │  │ manual (built-in)       │
+ │ rocky-postgres            │  │ manual (built-in)       │
+ │   (PostgreSQL, Redshift*) │  │                         │
+ │ rocky-sqlserver*          │  │                         │
+ │ rocky-clickhouse*         │  │                         │
+ │ rocky-spark*              │  │                         │
+ │ (* = Beta)                │  │                         │
+ │                           │  │                         │
  │ run the generated SQL     │  │ list what tables exist  │
  └───────────────────────────┘  └─────────────────────────┘
 
@@ -128,12 +137,13 @@ Rocky's engine is a Cargo workspace of small Rust crates. Each crate has one job
  │ rocky-verify        offline verifier for rocky-manifest v0.1  │
  │ rocky-catalog-core  Iceberg REST / Unity / Polaris / Nessie   │
  │ rocky-wasm          WASM bindings for the compiler pipeline   │
+ │ rocky-secret-registry  prints a resolved ${VAR} as ${NAME}    │
  └───────────────────────────────────────────────────────────────┘
 ```
 
 **The chain:** CLI command → compile config + models → produce IR → topological sort → generate SQL per adapter → execute against warehouse → update state store.
 
-Two binaries ship from this workspace: `rocky` (the CLI, which also hosts `rocky lsp`, `rocky serve`, and `rocky mcp`) and `rocky-lsp` (the language server on its own). `rocky-server` holds the shared server state, the auth and CORS middleware, the file watcher, and the LSP; the HTTP router and the `/api/v1` handlers live in `rocky-cli`, so the API returns the same typed payloads as `rocky <verb> --output json`. `engine/ui/` is a React app. Build it first (`cd engine/ui && npm ci && npm run build`), then `cargo build --features ui` embeds `engine/ui/dist` and `rocky serve --ui` serves it. Skip the npm step and the feature embeds an empty directory: the build prints a warning, and `serve --ui` refuses to start.
+Two binaries ship from this workspace: `rocky` (the CLI, which also hosts `rocky lsp`, `rocky serve`, and `rocky mcp`) and `rocky-lsp` (the language server on its own). `rocky-server` holds the shared server state, the auth and CORS middleware, the file watcher, and the LSP; the HTTP router and the `/api/v1` handlers live in `rocky-cli`, so the API returns the same typed payloads as `rocky <verb> --output json`. The browser UI is a React app in `engine/ui/`, embedded in the binary and served by `rocky serve --ui` (section 19).
 
 ---
 
@@ -264,14 +274,14 @@ The second error is the E012 for the same column, left out here: the contract al
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col, and `null` when the emitter has no span), `model`, and `suggestion`.
 
-The full set spans E001–E037, W001–W031, D011–D012, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either. The `rocky compile` command itself adds the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001). So `rocky test`, `rocky ci`, the LSP and `rocky serve` never report them. The codes you meet most often:
+The full set spans E001–E060, W001–W057, D011–D013, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either. The `rocky compile` command itself adds some, such as the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001). The language server and `rocky serve` never report those. `rocky ci` and `rocky test` run some of the per-warehouse checks too, such as the function check (E057, W057). The codes you meet most often:
 - `E001` — join key with no common type between two upstream models
 - `E010`–`E014` — contract violations (missing / retyped / nullability / protected-column removed / a new nullable column under `no_new_nullable`)
 - `E020`–`E028` — time-interval placeholders, the budget ceiling, and an unsupplied `@var(name)`
 - `E030`–`E034` — cross-team import-contract violations
 - `E035` — Managed-Iceberg `format_options` the warehouse would reject
 - `E036` — two models that write the same target table
-- `E037` — a transformation model declares `type = "incremental"`, which would append every row again on each run
+- `E037` — a transformation model declares `type = "incremental"` with no watermark (`timestamp_column`), so each run would append every row again
 - `W001` — implicit type coercion on a join key
 - `W002` — `SELECT *` over an upstream whose schema is unknown
 - `W004` / `W005` — classification and freshness gaps
@@ -306,9 +316,13 @@ rocky-core (SQL gen) ──▶ rocky-databricks ──▶ Databricks SQL API
                      ──▶ rocky-duckdb     ──▶ DuckDB in-process
                      ──▶ rocky-bigquery   ──▶ BigQuery REST API
                      ──▶ rocky-trino      ──▶ Trino /v1/statement
+                     ──▶ rocky-postgres   ──▶ PostgreSQL, Redshift (Beta)
+                     ──▶ rocky-sqlserver  ──▶ SQL Server over TDS (Beta)
+                     ──▶ rocky-clickhouse ──▶ ClickHouse HTTP (Beta)
+                     ──▶ rocky-spark      ──▶ Spark Connect (Beta)
 ```
 
-What the `manual` source type discovers, and when Rocky uses it, is under review: see [issue #1994](https://github.com/rocky-data/rocky/issues/1994).
+A `manual` source lists its tables in `rocky.toml`, under `[[adapter.NAME.schemas]]`. `rocky validate` refuses a `manual` adapter with no `schemas` (`V057`).
 
 Both families implement traits that `rocky-core` defines: `WarehouseAdapter`, `SqlDialect`, `DiscoveryAdapter`, `GovernanceAdapter`, `BatchCheckAdapter`, and `TypeMapper`. The `rocky-adapter-sdk` crate mirrors those traits for adapters built outside this repo. One crate can implement several traits. `rocky-duckdb` is both a source adapter and a warehouse adapter.
 
@@ -345,7 +359,7 @@ strategy                 SQL generation           DYNAMIC TABLE
                          returns an error         TARGET_LAG = '1 hour'
 ```
 
-`materialized_view` and `dynamic_table` are two separate strategies. Databricks, Snowflake, and BigQuery support `materialized_view`, and all three emit `CREATE OR REPLACE MATERIALIZED VIEW`. DuckDB and Trino return a "not supported" error when Rocky generates the SQL. Only Snowflake supports `dynamic_table`. It needs a `target_lag` value, such as `"1 minute"` or `"downstream"`.
+`materialized_view` and `dynamic_table` are two separate strategies. Databricks, Snowflake, and BigQuery emit `CREATE OR REPLACE MATERIALIZED VIEW` for `materialized_view`. PostgreSQL and Redshift drop the view and create it again. The other adapters return a "not supported" error when Rocky generates the SQL. Only Snowflake supports `dynamic_table`. It needs a `target_lag` value, such as `"1 minute"` or `"downstream"`.
 
 ---
 
@@ -466,7 +480,7 @@ Step 7: Commit the queued watermarks (one batch)
 
 Step 8: Fire post-run hooks
   Shell commands or webhooks under [hook.on_pipeline_complete]
-  and [hook.on_pipeline_error] — replication only (section 25)
+  and [hook.on_pipeline_error] — replication only (section 26)
 
 Step 9: Emit JSON output
   { tables_copied, materializations, check_results, drift, anomalies }
@@ -475,7 +489,7 @@ Step 9: Emit JSON output
   1 (failure), or 130 (Ctrl-C)
 ```
 
-**Not every step runs for every pipeline type.** The diagram above is the replication path, which is where drift detection (6a), the watermark steps (6c, 6g, 7) and the hooks (8) live. A transformation pipeline runs the compile, the layering and the model loop, and the skip gate (6b) is its step: the gate is evaluated for the models in a layer before that layer executes. Which pipeline types get the watermark filter is under review: see [issue #1990](https://github.com/rocky-data/rocky/issues/1990).
+**Not every step runs for every pipeline type.** The diagram above is the replication path, which is where drift detection (6a), the watermark steps (6c, 6g, 7) and the hooks (8) live. A transformation pipeline runs the compile, the layering and the model loop, and the skip gate (6b) is its step: the gate is evaluated for the models in a layer before that layer executes. Its `incremental` models filter through `@incremental_filter` instead of a state-store watermark (section 11).
 
 The rule in step 6g is per table, not per layer. Rocky commits a watermark only for a table that succeeded. A failed table never queues one, so it keeps its old watermark and re-reads the same rows next time. A sibling's failure does not hold back a successful table's watermark. Holding it back would be the unsafe choice: the next run would load that table's rows a second time.
 
@@ -505,7 +519,7 @@ State store: watermarks["orders_summary"] = "2024-01-15 08:22:11"
 
 Rocky does a full refresh when the target table is missing, or when an incremental model has no prior watermark. It does not compare a timestamp against NULL. In SQL, `updated_at > NULL` evaluates to UNKNOWN, so such a filter would return no rows, not every row.
 
-Which pipeline types get the watermark filter described above is under review: see [issue #1990](https://github.com/rocky-data/rocky/issues/1990).
+A transformation model filters differently. It declares `timestamp_column` and puts `@incremental_filter` where the filter belongs. On an incremental run that resolves to `<col> > (SELECT MAX(<col>) FROM <target>)`. On the first run and on `rocky run --full-refresh` it resolves to `TRUE`. No state-store watermark is involved.
 
 **Why compute the new watermark from the target, not the source?**
 
@@ -560,7 +574,7 @@ CLI flags for time-interval models:
 
 ## 13. SCD-2 Snapshots (Slowly Changing Dimensions)
 
-Sometimes you want to track *history*: not just the current state, but every change over time. A snapshot pipeline (`type = "snapshot"`, run with `rocky snapshot`) does this. It implements SCD Type 2 with a history-preserving MERGE. A snapshot is a pipeline type, not a materialization strategy.
+Sometimes you want to track *history*: not just the current state, but every change over time. A snapshot pipeline (`type = "snapshot"`, run with `rocky snapshot`) does this. It implements SCD Type 2 with a history-preserving MERGE. A transformation model can do the same with `[strategy] type = "snapshot"`. That model runs in the model DAG under `rocky run`, so downstream models can read it.
 
 ```
 SOURCE TABLE — current state only
@@ -592,7 +606,7 @@ When a row changes (Alice went from Silver → Gold), Rocky:
 
 New rows (no prior history) just get inserted with `valid_from = now()`.
 
-Change detection is NULL-safe, and it is not the key columns that it compares. Rocky matches a source row to its current target row on the `unique_key` columns with plain `=`. It then compares the *change* column with `IS DISTINCT FROM`, and that column is the pipeline's `updated_at`. `IS DISTINCT FROM` is what makes a NULL-to-value transition count as a change. The SQL generator also has a "check" strategy that compares a list of columns the same way, but `rocky.toml` has no key for it: a snapshot pipeline always builds the `updated_at` form. If nothing changed, Rocky does nothing — no spurious new history rows.
+Change detection is NULL-safe, and it is not the key columns that it compares. Rocky matches a source row to its current target row on the `unique_key` columns with plain `=`. It then compares the *change* column with `IS DISTINCT FROM`, and that column is the pipeline's `updated_at`. `IS DISTINCT FROM` is what makes a NULL-to-value transition count as a change. A snapshot pipeline always builds this `updated_at` form. A snapshot model can also take `strategy = "check"` with `check_cols`, which compares a list of columns the same way. If nothing changed, Rocky does nothing — no spurious new history rows.
 
 ---
 
@@ -834,7 +848,32 @@ A pipeline's `[pipeline.<name>.target.governance] grants` and `schema_grants` ar
 
 ---
 
-## 19. The VS Code Extension and LSP
+## 19. Serving the Project: `rocky serve` and the Browser UI
+
+`rocky serve` starts an HTTP API. Most routes answer with the typed payloads the CLI prints; a handful (health, project metadata, the DAG views, settings, job status) exist only on the API. It binds `127.0.0.1:8080` by default. A non-loopback bind needs `--token`, so model SQL and run history do not leak on the LAN.
+
+`rocky serve --ui` also serves a browser UI at `/ui/`. The bind and the flags decide what the UI may do:
+
+| How the server starts | What the UI may do |
+|---|---|
+| Loopback bind, with no `--token`, `--allowed-host` or `--allowed-origin` | Operator mode. `--ui` generates a full-scope token for the process. The UI can run, plan, approve and apply as the user who started the server. |
+| `--read-only` | View only |
+| `--allowed-host` or `--allowed-origin` | View only (a read-only UI token) |
+| Any other bind | Requires `--token --read-only` |
+
+The command prints a `/login?t=<token>` link; opening it sets a session cookie, so the page never holds the token. A read-only scope answers `403` to any request whose method is not `GET`, `HEAD`, or `OPTIONS`. Two routes sit outside the check: `/api/v1/health`, and the HMAC-verified webhook-ingress route. Release binaries carry the UI. From source, build `engine/ui` with npm first, then `cargo build --features ui`; a `--features ui` build with no `engine/ui/dist/index.html` embeds nothing and refuses `--ui` at startup. Combining `--ui` with `--scheduler` also requires `ROCKY_WEBHOOK_SECRET`. The command prints the address to open, token included.
+
+```
+browser ──▶ /ui/  (React app, embedded in the binary)
+                │
+                └─▶ /api/v1/…  (handlers in rocky-cli, same JSON as the CLI)
+```
+
+Reference: [`rocky serve`](https://rocky-data.dev/reference/commands/development/#rocky-serve).
+
+---
+
+## 20. The VS Code Extension and LSP
 
 Rocky ships a Language Server Protocol (LSP) server. LSP is the protocol an editor uses to ask a language tool for types, errors, and completions. VS Code's Rocky extension spawns the server as a child process and talks to it over stdio.
 
@@ -908,11 +947,11 @@ Tooltip appears ←
 - Document formatting: `.rocky` files only, through the same formatter as `rocky fmt`
 - Inline diagnostics: red/yellow squiggles for the codes the compiler emits (not the ones the `rocky compile` command adds on top, listed in section 6)
 
-The extension adds 60 commands of its own. Among them: "Open Compiled SQL", which runs `rocky compile --model <name> --expand-macros --output json` and opens the macro-expanded SQL beside the source; "Preview Model Rows", which runs `rocky preview rows`; "Show Model Lineage"; and "Run Pipeline". There is no "Preview SQL" command.
+The extension adds 61 commands of its own. Among them: "Open Compiled SQL", which runs `rocky compile --model <name> --expand-macros --output json` and opens the macro-expanded SQL beside the source; "Preview Model Rows", which runs `rocky preview rows`; "Show Model Lineage"; and "Run Pipeline". There is no "Preview SQL" command.
 
 ---
 
-## 20. The Rocky DSL
+## 21. The Rocky DSL
 
 Rocky supports a higher-level DSL for people who prefer it over raw SQL. It is a pipeline-oriented syntax that compiles down to SQL. It is an option, not a replacement. A `.rocky` model and a `.sql` model live in the same models directory and feed the same compiler.
 
@@ -965,7 +1004,7 @@ Read the two side by side and you can see what lowering does. `derive` names an 
 
 ---
 
-## 21. The Dagster Integration
+## 22. The Dagster Integration
 
 Rocky plugs into Dagster as a `ConfigurableResource`. You configure it once, then use it to run Rocky commands from Dagster ops or assets.
 
@@ -1027,7 +1066,7 @@ The two-step shape is deliberate. A fused `rocky run` has no plan file to cite, 
 
 ---
 
-## 22. The Python SDK
+## 23. The Python SDK
 
 `rocky-sdk` is a pure Python client that wraps the Rocky CLI via subprocess. No Rust dependency needed at runtime.
 
@@ -1076,7 +1115,7 @@ The SDK carries two naming conventions, and it helps to know which you are holdi
 
 ---
 
-## 23. Cost Model and Optimization
+## 24. Cost Model and Optimization
 
 `rocky optimize` reads the run history in the state store and recommends a materialization strategy per model. It sees no query logs, so it does not know how often anyone reads a model. What it knows is what the runs recorded.
 
@@ -1126,11 +1165,11 @@ Total estimated monthly savings: $0.01
 Models analyzed: 5
 ```
 
-`CURRENT` is the strategy in each model's own configuration. A `full_refresh` model reads `table`, and every model in this run uses `full_refresh`. Other strategies read as their own name, such as `view`, `merge`, or `incremental`. A model that appears in run history but not in the models directory reads `unknown` and gets no recommendation. The command used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
+`CURRENT` is the strategy in each model's own configuration. A `full_refresh` model reads `table`, and every model in this run uses `full_refresh`. Other strategies read as their own name, such as `view`, `merge`, or `incremental`. A model that appears in run history but not in the models directory reads `unknown` and gets no recommendation. The command never recommends `ephemeral`: run history cannot show whether inlining a model into each consumer repeats expensive work.
 
 ---
 
-## 24. Column Lineage
+## 25. Column Lineage
 
 Rocky traces an output column back through the DAG to the source column it came from, when the SQL makes that traceable. Real output from the playground project:
 
@@ -1165,7 +1204,7 @@ This is extracted from the SQL AST by `rocky-sql::lineage` — no runtime execut
 
 ---
 
-## 25. Hooks and Webhooks
+## 26. Hooks and Webhooks
 
 Rocky can fire shell commands or HTTP calls on 18 lifecycle events. An event is a TOML table key, not a value: you write `[hook.on_pipeline_error]`, not `event = "pipeline_error"`. There is no `[[hooks]]` array; a config that uses one fails to parse.
 
@@ -1240,7 +1279,7 @@ The Slack preset posts Slack's Block Kit JSON. Its text is built from the event,
 
 ---
 
-## 26. The Complete Picture
+## 27. The Complete Picture
 
 Everything Rocky does, in one ASCII map:
 
@@ -1283,7 +1322,8 @@ Everything Rocky does, in one ASCII map:
                            ┌──────▼──────┐
               Databricks ◀─┤ Warehouse   ├─▶ Snowflake
               DuckDB     ◀─┤ Adapter     ├─▶ BigQuery
-                           │             ├─▶ Trino
+              PostgreSQL ◀─┤             ├─▶ Trino
+              SQL Server ◀─┤             ├─▶ ClickHouse, Spark
                            └──────┬──────┘
                                   │
                            ┌──────▼──────┐
@@ -1312,7 +1352,6 @@ Everything Rocky does, in one ASCII map:
  Unit tests     ──▶ rocky test --models models/
                     ↳ runs [[test]] fixtures on DuckDB
  Run forensics  ──▶ rocky replay <run-id|latest>, rocky trace, rocky cost
- Browser UI     ──▶ rocky serve --ui --token <t> --token-scope read-only
  Estate digest  ──▶ rocky brief --since 24h
  Decisions      ──▶ rocky audit [--for <table|run|plan>]
 
@@ -1326,14 +1365,20 @@ Everything Rocky does, in one ASCII map:
 
  INTEGRATIONS:
  ─────────────
+ Browser ──▶ rocky serve --ui  (React app embedded in the binary)
+             ↳ read the project; in operator mode, run, approve, apply
+
+ VS Code ──▶ rocky-lsp, else rocky lsp (child process over stdio)
+             ↳ hover types, diagnostics, completion, go-to-def, rename
+
+ Agents  ──▶ rocky mcp  (MCP server over stdio)
+             ↳ read, draft, propose; never applies
+
  Dagster ──▶ RockyResource (3 modes: run / run_streaming / run_pipes)
              ↳ Pipes: real-time asset events back to Dagster UI
 
  Python  ──▶ RockyClient (3-thread subprocess: stdout + stderr + watchdog)
              ↳ Typed Pydantic results auto-generated from Rust schemas
-
- VS Code ──▶ rocky-lsp, else rocky lsp (child process over stdio)
-             ↳ hover types, diagnostics, completion, go-to-def, rename
 
 
  SAFETY GATES:
@@ -1351,7 +1396,7 @@ Everything Rocky does, in one ASCII map:
 
 ---
 
-## 27. Config Groups: Governed Fan-Out
+## 28. Config Groups: Governed Fan-Out
 
 When many models share the same routing and materialization (a fleet of regional marts, say), you don't want to repeat that config in every sidecar. A **config group** declares it once. Each model opts in by name.
 
@@ -1382,7 +1427,7 @@ This is a compile-time governance check, not a runtime convention. A model in an
 
 ---
 
-## 28. Declarative Tests and Unit Tests
+## 29. Declarative Tests and Unit Tests
 
 Rocky has two test mechanisms, distinguished by a singular-vs-plural key. They do different jobs.
 
@@ -1431,7 +1476,7 @@ Rows compare as a multiset by default (order doesn't matter, duplicate counts do
 
 ---
 
-## 29. Model Tags and Per-Column Docs
+## 30. Model Tags and Per-Column Docs
 
 A model's `[tags]` block is free-form governance metadata about the model as a whole: `domain`, `tier`, `owner`, whatever your governance model needs. This is distinct from `[classification]`, which is keyed by *column* and drives masking.
 
@@ -1450,22 +1495,6 @@ Tags compose with config groups. A model inherits its group's `[tags]` as a shar
 Resolved tags land on `rocky compile --output json` as `models_detail[].tags`, and the `dagster-rocky` integration projects them onto each derived asset's Dagster tags. The same attribute drives both Rocky's view of the model and the orchestrator's, so a governed fan-out is visible end-to-end.
 
 **Per-column docs.** A `[columns.<name>]` table attaches a one-line description to an output column. Those descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`, and in the `rocky docs` HTML catalog, which renders them beside the column names an offline compile inferred. A description whose column that compile cannot see has nowhere to render; `rocky docs` then warns and names the column instead of dropping it in silence.
-
----
-
-## 30. Serving the Project: `rocky serve` and the Browser UI
-
-`rocky serve` starts an HTTP API. Most routes answer with the typed payloads the CLI prints; a handful (health, project metadata, the DAG views, settings, job status) exist only on the API. It binds `127.0.0.1:8080` by default. A non-loopback bind needs `--token`, so model SQL and run history do not leak on the LAN.
-
-`rocky serve --ui` also serves a browser UI at `/ui/`. On a loopback bind with no token, no `--allowed-host` and no `--allowed-origin`, `--ui` generates a full-scope token for the process: operator mode, where the UI can run, plan, approve and apply as the user who started the server. `--read-only` gives a view-only UI. A server with `--allowed-host` or `--allowed-origin` keeps a read-only UI token, and any other bind requires `--token --read-only`. The command prints a `/login?t=<token>` link; opening it sets a session cookie, so the page never holds the token. A read-only scope answers `403` to any request whose method is not `GET`, `HEAD`, or `OPTIONS`. Two routes sit outside the check: `/api/v1/health`, and the HMAC-verified webhook-ingress route. Release binaries carry the UI. From source, build `engine/ui` with npm first, then `cargo build --features ui`; a `--features ui` build with no `engine/ui/dist/index.html` embeds nothing and refuses `--ui` at startup. Combining `--ui` with `--scheduler` also requires `ROCKY_WEBHOOK_SECRET`. The command prints the address to open, token included.
-
-```
-browser ──▶ /ui/  (React app, embedded in the binary)
-                │
-                └─▶ /api/v1/…  (handlers in rocky-cli, same JSON as the CLI)
-```
-
-Reference: [`rocky serve`](https://rocky-data.dev/reference/commands/development/#rocky-serve).
 
 ---
 
@@ -1518,7 +1547,29 @@ Reference: [`rocky policy`](https://rocky-data.dev/reference/commands/governance
 
 ---
 
-## 34. Data Products and the Fulfillment Loop (experimental)
+## 34. Agents and the MCP Server
+
+`rocky mcp` runs a Model Context Protocol (MCP) server over stdio. MCP is the protocol an agent harness uses to call tools. The server runs on your machine. There is no Rocky-hosted service.
+
+The tools let an agent compile, read lineage and schemas, sample rows, draft models, contracts and checks, and record a plan with `propose`. Some tools read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview`. No tool runs SQL that changes the warehouse, and no tool runs `rocky apply`.
+
+```
+agent ──▶ rocky mcp
+            ├─▶ draft_* tools ──▶ files under models/
+            └─▶ propose ───────▶ .rocky/plans/<plan_id>.json
+                                         │
+person ──▶ rocky review <plan_id> --approve    (writes the approval marker)
+                                         │
+person ──▶ rocky apply <plan_id> ──▶ warehouse  (no MCP tool runs this step)
+```
+
+The `review_queue` tool can write an approval marker only on `rocky mcp --profile approver`. The default profile refuses that call. `--profile worker` serves a minimal drafting set of tools. The profile is fixed when the server starts.
+
+Reference: [`rocky mcp`](https://rocky-data.dev/reference/commands/ai/#rocky-mcp).
+
+---
+
+## 35. Data Products and the Fulfillment Loop (experimental)
 
 A product spec at `products/<name>.toml` declares what a data product must be: its grain, columns, checks, freshness, and classifications. It adds no runtime semantics. `rocky product compile` verifies the spec and lowers it onto primitives the engine already enforces: contracts, declarative tests, sidecar metadata, policy posture. A field that cannot lower is refused at parse time rather than shimmed.
 
@@ -1530,7 +1581,7 @@ Reference: [product commands](https://rocky-data.dev/reference/commands/products
 
 ---
 
-## 35. Branches, Previews, and Run Forensics
+## 36. Branches, Previews, and Run Forensics
 
 **Branches.** A branch is the named, persistent form of shadow mode. `rocky branch create <name>` records a `schema_prefix` in the state store; `rocky run --branch <name>` then applies that prefix to every model target. A branch name is 1 to 64 characters from `[A-Za-z0-9_]`, because the schema is `branch__<name>`. `branch list` and `branch show` report what exists, and `branch compare` diffs the branch's tables against production. A table that `branch compare` cannot read reports `verdict: "error"` and a `null` count, never `0`.
 
@@ -1546,7 +1597,7 @@ References: [`rocky branch`](https://rocky-data.dev/reference/commands/core-pipe
 
 ---
 
-## 36. The Container Image
+## 37. The Container Image
 
 Every engine release publishes one image, `ghcr.io/rocky-data/rocky`. It adds that release's Linux binary to `gcr.io/distroless/cc-debian12:nonroot` and nothing else of its own. The base carries glibc, libstdc++ and the CA certificates the connectors need; there is no shell and no package manager. It runs as user `65532`, works in `/data`, exposes port `8080`, and its default command is `serve --host 0.0.0.0`.
 

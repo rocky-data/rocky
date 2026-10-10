@@ -215,7 +215,7 @@ command.
 1. Run `rocky ai-explain --all --save` to write an intent for every model.
 2. Read the generated intents and edit them. They are plain English, so change anything that reads wrong.
 3. Run `rocky ai-test --all --save` to write a baseline set of assertions.
-4. From here, `rocky ai-sync` proposes updates when upstream schemas change. The first sync of each model only records a baseline.
+4. From here, `rocky ai-sync` proposes updates from each model's intent and its upstream schema changes. The first sync of a model only records the baseline.
 
 Intent is optional. A model without intent still compiles, tests, and runs.
 Intent turns on the maintenance commands. It is never required.

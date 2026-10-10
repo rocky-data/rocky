@@ -25,13 +25,19 @@ prod", and the soundness property that ties an approval to your code:
 Because the hash covers `models/`, editing a transformation model **after**
 sign-off drifts `branch_state_hash`, so the earlier approval no longer
 matches and `promote` rejects it with `state_hash_mismatch` (step 8 below).
-You can't sneak a SQL change past a green approval.
+An honest edit after sign-off cannot ride on the old approval.
+
+**Limit:** the artifact's "signature" is an unkeyed blake3 digest over its own
+JSON. It is an integrity checksum, not a cryptographic signature. Anything that
+can write `.rocky/approvals/` can mint a valid artifact, and the recorded git
+email authenticates nobody. See
+[Architecture of trust](../../../../../docs/src/content/docs/concepts/architecture-of-trust.md).
 
 ## Why it's distinctive
 
-- **Cryptographic gate, not a process gate.** The approval artifact is
-  signed against a state hash; if the branch changes after approval, the
-  hash drifts and `promote` rejects the now-stale signature.
+- **The approval is bound to the state hash.** If the branch changes after
+  approval, the hash drifts and `promote` rejects the stale approval. (This
+  catches drift. It is not a tamper boundary; see the limit above.)
 - **No external service.** Approvals are files on disk, easy to commit,
   easy to mirror to another store, easy to inspect.
 - **Audit trail in the same JSON output as the operation itself.** No
@@ -53,12 +59,11 @@ You can't sneak a SQL change past a green approval.
 
 ## Prerequisites
 
-- `rocky` on PATH — needs the `models_fingerprint` state-file fix (post-1.43.0);
-  on 1.43.0 the approval self-invalidates because the state DB under `models/`
-  pollutes the hash
+- `rocky` ≥ 1.44.0 on PATH (on 1.43.0 the state DB under `models/` drifts
+  the hash, so a fresh approval fails its own check)
 - `duckdb` CLI for seeding (`brew install duckdb`)
-- A configured git identity (`git config user.email`) — the approver's
-  email is bound into the signed artifact
+- A configured git identity (`git config user.email`). Rocky records the
+  approver's email in the artifact.
 
 ## Run
 
@@ -76,7 +81,7 @@ You can't sneak a SQL change past a green approval.
    `poc.branch__fix_orders.orders`, leaving prod untouched.
 5. **First promote attempt fails** — `[branch.approval]` requires one
    approver and the gate finds zero artifacts on disk. Exit 1.
-6. **Approve** — Rocky signs an artifact bound to the current
+6. **Approve** — Rocky writes an artifact bound to the current
    `branch_state_hash` (which folds in `models/orders_clean.sql`'s bytes)
    and the local git identity; the file lands at
    `.rocky/approvals/fix_orders/<approval_id>.json`.

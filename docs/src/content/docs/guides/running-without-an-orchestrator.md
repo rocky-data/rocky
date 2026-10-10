@@ -2,7 +2,7 @@
 title: Running Rocky Without an Orchestrator
 description: "Run Rocky on a schedule from cron, a systemd timer, GitHub Actions, or your warehouse's own scheduler. Covers the exit codes, failure alerts, and health checks."
 sidebar:
-  order: 5.5
+  order: 10
 ---
 
 You do not need Dagster, Airflow, or any other orchestration platform to run Rocky on a schedule. The engine already handles the hard parts. A plain timer supplies the one part it does not: deciding when to start.

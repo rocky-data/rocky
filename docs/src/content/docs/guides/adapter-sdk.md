@@ -2,12 +2,12 @@
 title: Building a Custom Adapter
 description: Build a Rust warehouse adapter with the Rocky adapter SDK. The traits you implement, a worked skeleton, auth, testing, and how to ship it.
 sidebar:
-  order: 9
+  order: 20
 ---
 
 An [adapter](/reference/glossary/#adapter) is the plugin that connects Rocky to one system. Rocky talks to every warehouse through a small set of traits in the `rocky-adapter-sdk` crate. Implement those traits and you have a working warehouse adapter, wired the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, and `rocky-duckdb` are today.
 
-This guide takes a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton). It is shaped after ClickHouse, but the same shape fits Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky does not ship in-tree. (Trino is in-tree as of engine v1.28.0; see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino). ClickHouse now ships in-tree too, as a Beta adapter: see the [ClickHouse adapter](/reference/adapters/clickhouse/). The skeleton below stays a teaching example.)
+This guide takes a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton). It is shaped after ClickHouse, but the same shape fits StarRocks, MotherDuck, or any SQL warehouse Rocky does not ship in-tree. (Trino and ClickHouse already ship in-tree: see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino) and the [ClickHouse adapter](/reference/adapters/clickhouse/), which is Beta. The skeleton below stays a teaching example.)
 
 Your crate sits at the bottom of this chain. It supplies the two boxes marked "yours":
 
@@ -40,7 +40,7 @@ Your crate sits at the bottom of this chain. It supplies the two boxes marked "y
 
 Use the adapter SDK when one of these is true:
 
-- The warehouse you need is not in [the in-tree adapter list](/concepts/adapters/) (Databricks, Snowflake, BigQuery, DuckDB, Trino).
+- The warehouse you need is not in [the in-tree adapter list](/concepts/adapters/) (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, Redshift, Trino, ClickHouse, SQL Server, Spark).
 - You need a forked variant of an existing adapter, such as Databricks Serverless on top of `rocky-databricks`.
 - You embed Rocky in a tool that owns its own warehouse client, and you would rather wrap that client than spawn `rocky` as a subprocess.
 

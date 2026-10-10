@@ -52,7 +52,7 @@ At a terminal, the compare prints its table view — one pair, matching:
 ```
   Rocky Compare
 
-  Tables: 1 compared, 1 passed, 0 warned, 0 failed
+  Tables: 1 compared, 1 passed, 0 warned, 0 no baseline, 0 failed
   Overall: PASS
 
   [  OK] warehouse.staging__shopify.orders (prod=6, shadow=6, diff=0.00%)
@@ -67,12 +67,13 @@ rocky --output json compare --shadow-suffix _shadow
 
 ```json
 {
-  "version": "1.71.0",
+  "version": "1.80.0",
   "command": "compare",
   "filter": "",
   "tables_compared": 1,
   "tables_passed": 1,
   "tables_warned": 0,
+  "tables_no_baseline": 0,
   "tables_failed": 0,
   "results": [
     {
@@ -84,7 +85,8 @@ rocky --output json compare --shadow-suffix _shadow
       "row_count_diff_pct": 0.0,
       "schema_match": true,
       "schema_diffs": [],
-      "verdict": "pass"
+      "verdict": "pass",
+      "reasons": []
     }
   ],
   "overall_verdict": "pass"
@@ -111,10 +113,11 @@ The command exits 1 and the pair fails:
 ```
   Rocky Compare
 
-  Tables: 1 compared, 0 passed, 0 warned, 1 failed
+  Tables: 1 compared, 0 passed, 0 warned, 0 no baseline, 1 failed
   Overall: FAIL
 
   [FAIL] warehouse.staging__shopify.orders (prod=6, shadow=7, diff=16.67%)
+         - row count diff 16.67% exceeds failure threshold 5.00% (shadow=7, production=6, diff=1)
 ```
 
 That is the promotion gate: the shadow run saw data the production run has
@@ -126,6 +129,9 @@ added CSV line to restore the example.)
 
 - `--shadow-suffix <s>` must match the suffix the shadow run used.
 - `--filter key=value` narrows the comparison to matching sources.
+- `--thresholds '<json>'` overrides the limits. A row-count difference of 1%
+  warns and 5% fails by default (`row_count_diff_pct_warn`,
+  `row_count_diff_pct_fail`).
 - `--output` is a global flag and goes before the subcommand. At a
   terminal the default is the table view; piped output defaults to JSON.
   Force either with `rocky --output json|table compare …`.

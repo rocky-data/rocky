@@ -67,6 +67,7 @@ modes Rocky does not model. Integrate them, do not replace them.
 | PostgreSQL | Beta | Yes | No | No |
 | ClickHouse | Beta | Yes | No | No |
 | SQL Server / Azure SQL / Fabric | Beta | Yes | No | No |
+| Apache Spark | Beta | Yes | No | No |
 
 ## Materialization Strategies
 
@@ -98,7 +99,7 @@ Dynamic Tables (Snowflake) refresh on a declared lag.
 |---|:---:|:---:|
 | Static type inference | **Yes** | Yes |
 | Column type tracking | **Yes** | Yes |
-| Compile-time diagnostics | **35+** | Partial |
+| Compile-time diagnostics | **70+** | Partial |
 | Safe type widening | **Yes** | No |
 | NULL-safe equality | **Yes** | No |
 | Data contracts | **Yes** | Yes |
@@ -157,7 +158,7 @@ can compare before you commit. SQLMesh ships none of these four.
 | Dagster | **Native** | Community (dagster-sqlmesh) |
 | Airflow | Via CLI | Yes |
 | Dagster Pipes protocol | **Yes** | No |
-| Typed output models | **Yes** (87 schemas) | No |
+| Typed output models | **Yes** (a JSON schema per command) | No |
 
 ## Data Quality
 
@@ -251,7 +252,7 @@ compose rather than compete.
 | Benchmarks | **Yes** | No |
 | HTTP API / LSP | **Yes** | Yes |
 | Hook management | **Yes** | No |
-| **Total** | **65+** | ~20 |
+| **Total** | **70+** | ~20 |
 
 ## Performance
 

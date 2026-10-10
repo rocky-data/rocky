@@ -19,38 +19,19 @@ rules below.
 
 ## Default mappings
 
-### Asset key
+The default [translator](/dagster/translator/) fills each `AssetSpec`:
 
-The default asset key is constructed from the source type, component values, and table name:
+| Field | Default |
+|---|---|
+| Asset key | `[source_type, *component_values, table_name]`. A list-valued component joins with `__`. |
+| Group | The first string-valued component. Falls back to `source_type`. |
+| Tags | `rocky/source_type`, plus `rocky/<component_name>` per string component |
+| Metadata | `source_id`, `source_type`, `last_sync_at`, `row_count`, plus adapter metadata such as `fivetran.service` |
+| Freshness policy | Set on every spec when the pipeline configures `[checks.freshness]`. See [Freshness policies](/dagster/freshness/). |
 
-```
-[source_type, *component_values, table_name]
-```
-
-For example, a table `orders` from a Fivetran source with components `tenant=acme`, `regions=us_west`, `connector=shopify` produces:
-
-```
-["fivetran", "acme", "us_west", "shopify", "orders"]
-```
-
-### Group
-
-The default group name is the first component whose value is a string.
-Components whose value is a list are skipped. If every component is
-list-valued, the group falls back to the source type. In the example above, the
-group is `"acme"`.
-
-### Tags
-
-- `rocky/source_type` -- the source type (e.g., `"fivetran"`)
-- `rocky/<component_name>` -- one tag per string component (e.g., `rocky/tenant: "acme"`)
-
-### Metadata
-
-- `source_id` -- the source identifier
-- `source_type` -- the source type
-- `last_sync_at` -- timestamp of the last sync
-- `row_count` -- number of rows in the table
+For example, a table `orders` from a Fivetran source with components
+`tenant=acme`, `regions=us_west`, `connector=shopify` gets the key
+`["fivetran", "acme", "us_west", "shopify", "orders"]` and the group `"acme"`.
 
 ## Example
 

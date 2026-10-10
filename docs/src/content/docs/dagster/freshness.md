@@ -122,6 +122,28 @@ policies = per_model_freshness_policies(compile_result)
 # {"fct_daily_orders": <FreshnessPolicy>, ...}
 ```
 
+### `freshness_check_results(output)`
+
+The helpers above set a policy. This one reports a measurement. It maps a
+`rocky freshness` report, from `RockyResource.freshness()`, to Dagster asset
+check results.
+
+```python
+from dagster_rocky import RockyResource, freshness_check_results
+
+rocky = RockyResource(config_path="rocky.toml")
+results = freshness_check_results(rocky.freshness())
+```
+
+It returns one `AssetCheckResult` per source (`source_freshness`) and one per
+model (`model_freshness`). `pass` passes. `warn` fails at `WARN`. `error` and
+`runtime_error` fail at `ERROR`. The default asset key splits the entry's
+`catalog.schema.table` on dots. Pass `asset_key_for=` to map it yourself;
+return `None` to skip an entry.
+
+`rocky freshness` exits 1 when any check is `error` or `runtime_error`. The
+resource still returns the report.
+
 ## API choice: `FreshnessPolicy.time_window`
 
 `dagster-rocky` uses the Dagster 1.12+ constructor

@@ -2,7 +2,7 @@
 title: Migrating from dbt
 description: How rocky import-dbt converts a dbt Core project into a Rocky project, what it translates, what it refuses, and what you fix by hand.
 sidebar:
-  order: 2
+  order: 7
 ---
 
 `rocky import-dbt` converts a dbt Core project into a Rocky project. Point it at a dbt project directory and it writes a Rocky repo to disk. You get a body file and a `.toml` sidecar per model, a `rocky.toml`, and a `MIGRATION-NOTES.md` listing everything it could not translate.
@@ -29,7 +29,7 @@ You need three things before you start:
 
 1. **Rocky installed** -- see [Installation](/getting-started/installation/)
 2. **An existing dbt project** with models in a `models/` directory
-3. **Your warehouse credentials** (Databricks host, HTTP path, token)
+3. **Credentials for your warehouse**, for example a Databricks host, HTTP path and token. See [Connect to a warehouse](/guides/connect-a-warehouse/).
 
 You do not need dbt installed. The importer reads `.sql` files directly and parses Jinja expressions with its own regex-based extractor.
 
@@ -652,7 +652,7 @@ The compiler does three things:
   Compiled: 4 models, 0 errors, 0 warnings
 ```
 
-A bare table reference the importer left unresolved, one whose name matches no model in the project, is **not** a compile error. Rocky treats it as an external reference: it appears in lineage and creates no DAG dependency. See [Using Rocky with dbt Packages](/guides/using-dbt-packages/). The diagnostics you *will* see after an import come from the type checker and from contracts:
+A bare table reference the importer left unresolved, one whose name matches no model in the project, is **not** a compile error. Rocky treats it as an external reference: it appears in lineage and creates no DAG dependency. See [Read dbt Package Tables](/guides/using-dbt-packages/). The diagnostics you *will* see after an import come from the type checker and from contracts:
 
 - **Missing depends_on**: the importer can miss a dependency that was implicit in dbt, such as a `{{ ref() }}` inside a macro. Add it to the model's TOML, and the reference then resolves to a project model instead of an external one.
 - **Type mismatches** (`E011`): Rocky infers types from upstream models. It reports a column used in a context its type does not fit.
@@ -1008,7 +1008,7 @@ Remove the dbt steps once Rocky covers every model.
 
 You do not have to convert everything. A dbt package such as `fivetran/facebook_ads` or `fivetran/stripe` produces tables in your warehouse, and Rocky can reference those tables directly as external sources. Rocky's resolver classifies a schema-qualified table reference such as `dbt_fivetran.stg_facebook_ads__ad_history` as external on its own: it appears in lineage and creates no DAG dependency.
 
-So you can leave a vendor-maintained staging package in dbt and write your own analytics in Rocky. See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for the full walkthrough.
+So you can leave a vendor-maintained staging package in dbt and write your own analytics in Rocky. See [Read dbt Package Tables](/guides/using-dbt-packages/) for the full walkthrough.
 
 ## Troubleshooting
 

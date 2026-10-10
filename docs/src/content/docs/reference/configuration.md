@@ -426,12 +426,21 @@ One name clash to know about. This `schema_template` routes replication targets 
 
 Have Rocky create and label the catalogs and schemas it writes to, instead of provisioning them by hand. The block covers four things: catalog and schema creation, tags, grants, and workspace isolation.
 
-Tagging, grants, and isolation run against Databricks Unity Catalog APIs, so they apply only when the target adapter is Databricks. The two `auto_create_*` flags work on every adapter that emits `CREATE SCHEMA` SQL.
+Support depends on the target adapter. The two `auto_create_*` flags work on every adapter that emits `CREATE SCHEMA` SQL.
+
+| Target | `tags` | `grants` / `schema_grants` | `isolation` |
+|---|---|---|---|
+| Databricks | Yes (Unity Catalog) | Yes | Yes |
+| Snowflake | Yes | Yes | No |
+| BigQuery | Schema and table labels only. A catalog (project) label logs a warning. | No: logs a warning. Use Google Cloud IAM. | No |
+| Other adapters | No | No | No |
+
+Where a row says No, the call does nothing and the run continues.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `auto_create_catalogs` | bool | `false` | Create target catalogs if they do not exist. |
-| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. Honored on **both** replication and transformation pipeline targets (transformation parity landed in engine v1.29.0; prior versions silently no-op'd on transformation pipelines, surfacing as a "Schema with name X does not exist" execute-time error). |
+| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. Honored on **both** replication and transformation pipeline targets. |
 | `tags` | table | `{}` | Tags applied to managed catalogs, schemas, and tables. |
 | `grants` | list | `[]` | Catalog-level grants. Each entry has `principal` (string) and `permissions` (list of strings). |
 | `schema_grants` | list | `[]` | Schema-level grants. Same format as `grants`. |
@@ -844,11 +853,11 @@ Two limits are worth knowing:
 
 #### Upgrading to the `cas` default
 
-This release changes the default on `s3`, `gcs`, and `tiered` from `off` to `cas`. Older binaries do not know the marker exists and keep uploading unconditionally. So upgrade every writer that shares a `[state]` prefix together, or keep the interim rule of one writer per prefix until the whole fleet runs this release. To keep the old behaviour, set `concurrency_control = "off"` explicitly before you upgrade. Run `rocky doctor` on each writer afterwards to confirm the resolved mode.
+Engine 1.77.0 changed the default on `s3`, `gcs`, and `tiered` from `off` to `cas`. Older binaries do not know the marker exists and keep uploading unconditionally. So upgrade every writer that shares a `[state]` prefix together. Or keep one writer per prefix until the whole fleet runs 1.77.0 or later. To keep the old behaviour, set `concurrency_control = "off"` explicitly before you upgrade. Run `rocky doctor` on each writer afterwards to confirm the resolved mode.
 
 **What `cas` covers.** Every write of the shared state object goes through it. The end-of-run upload fails closed when it loses a race. The ledger seams retry instead: `rocky policy freeze` / `unfreeze`, `rocky gc`, `rocky restore` (and a restore-shaped `rocky apply <plan-id>`), and the policy rows a run-shaped `rocky apply` writes when a `[policy]` rule sets `verify_after`. A seam that loses a race downloads the winner and replays its change on top. Where the change rests on a policy decision (a restore, or the rule decision a governed `rocky apply` records before it runs), the decision is re-made against the winner first. It gives up after three attempts with a conflict error and leaves the winner in place. It never falls back to an unconditional upload. A restore re-proves each artifact on every attempt. With a `[policy]` block it also re-checks freezes right before each object write, because a written object cannot be taken back. This applies equally to `s3`, `gcs`, and `tiered`.
 
-**The guarantee holds only between writers that all run with `cas`.** Once the `cas-required` marker exists, a writer on `off` refuses to upload rather than overwrite. Before the first CAS upload, and for binaries older than this release, nothing stops it. Until every writer that shares a `[state]` prefix runs `cas` on this release, keep one writer per `[state]` prefix.
+**The guarantee holds only between writers that all run with `cas`.** Once the `cas-required` marker exists, a writer on `off` refuses to upload rather than overwrite. Before the first CAS upload, and for binaries older than 1.77.0, nothing stops it. Until every writer that shares a `[state]` prefix runs `cas` on 1.77.0 or later, keep one writer per `[state]` prefix.
 
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 
@@ -1008,7 +1017,7 @@ Namespacing is **opt-in and default-off**.
 
 | Mode | Behavior |
 |---|---|
-| `"none"` (default) | One global `<models>/.rocky-state.redb` for the whole project. Identical to today's behavior. |
+| `"none"` (default) | One global `<models>/.rocky-state.redb` for the whole project. |
 | `"pipeline"` | One state file per pipeline, under `<models>/.rocky-state/<pipeline>.redb`. |
 
 ```toml
@@ -1107,7 +1116,7 @@ Cap what an AI generation can spend. The block applies to `rocky ai`, `rocky ai-
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. The default preserves Rocky's pre-1.x hard-coded behaviour. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
+| `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
 
 ```toml
 [ai]
@@ -1291,7 +1300,7 @@ confidential = "redact"
 An unknown strategy — a typo like `"mask"` — fails at config load. Rocky never accepts a spelling it cannot emit SQL for.
 
 :::note[Adapter support]
-Masking works today against **Databricks** Unity Catalog, using column tags plus `CREATE MASK` / `SET MASKING POLICY`. Rocky emits one statement per column, because Unity Catalog rejects multi-column masking DDL. Snowflake, BigQuery, and DuckDB do not support it until there is demand. Rocky applies masks after a successful DAG run, best-effort: a failure logs a warning and does not abort the pipeline, the same as grants.
+Masking works today against **Databricks** Unity Catalog, using column tags plus `CREATE MASK` / `SET MASKING POLICY`. Rocky emits one statement per column, because Unity Catalog rejects multi-column masking DDL. Other adapters do not support it yet. Rocky applies masks after a successful DAG run, best-effort: a failure logs a warning and does not abort the pipeline, the same as grants.
 :::
 
 ### `[mask.<env>]`
@@ -1360,8 +1369,8 @@ permissions = ["MANAGE"]
 
 Rocky flattens the graph into `admin → {SELECT, USE CATALOG, USE SCHEMA, MODIFY, MANAGE}` and forwards the resolved set to `GovernanceAdapter::reconcile_role_graph` after a successful DAG.
 
-:::caution[v1 is log-only]
-The v1 Databricks implementation validates each `rocky_role_<name>` principal against the identifier grammar and emits a `debug!` trace. SCIM group creation and per-catalog GRANT emission are deferred as a follow-up. The resolver still catches cycles and unknown parents at config-load regardless of adapter capability, so invalid graphs fail fast even before reconcile runs.
+:::caution[Databricks only, best-effort]
+On Databricks, Rocky creates a SCIM group named `rocky_role_<name>` for each role. It then grants each resolved permission on each managed catalog. A failed group create or `GRANT` logs a warning and the run continues. Without workspace auth, Rocky only checks the group names and logs the graph. Other adapters do nothing. The resolver catches cycles and unknown parents at config load on every adapter.
 :::
 
 ---
@@ -1618,6 +1627,12 @@ scope = { classifications = ["pii"] }
 ```
 
 Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `rocky policy test` in CI. A later policy edit then cannot open a hole unnoticed. See [Testing policies](/guides/testing-policies/) for the scenario fields, and [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) for where the gates sit.
+
+---
+
+## `[fulfill]`
+
+Configure the agent driver for the experimental `rocky fulfill` loop. The deterministic commands never read this block. Rocky refuses an unknown field here. See [`rocky fulfill` configuration](/reference/commands/fulfill/#configuration) for the fields and the sandbox caveats.
 
 ---
 

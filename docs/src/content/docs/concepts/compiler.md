@@ -570,9 +570,11 @@ span, and sometimes a suggested fix.
 | `E011` | Column type mismatch against contract |
 | `E012` | Nullability violation against contract |
 | `E013` | Protected column removed |
+| `E014` | The output holds a nullable column the contract does not declare, while the contract sets `[rules] no_new_nullable = true` |
 | `E020`--`E026` | `time_interval` validation (`@start_date`/`@end_date` placeholders, `time_column` presence/type/nullability/granularity) |
 | `E027` | Budget exceeded -- projected spend over the model's `[budget]` ceiling |
 | `E028` | Required run variable (`@var(name)`) referenced but no `--var` supplied and no inline default |
+| `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
 | `E030` | Imported producer dropped a column this project reads (cross-team contract) |
 | `E031` | Imported producer narrowed the type of a column this project reads (cross-team contract) |
 | `E032` | Imported producer tightened a column this project reads from nullable to NOT NULL (cross-team contract) |
@@ -580,36 +582,35 @@ span, and sometimes a suggested fix.
 | `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
+| `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E038` | An `ephemeral` model is used in a way inlining cannot serve: it declares `[[tests]]`, another model reads its nominal target by a qualified name, a consumer's SQL cannot be rewritten, or `rocky run --model` selects it directly |
 | `E039` | A model reads a column absent from a complete in-project upstream model. See [The type system](#the-type-system) |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
-| `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
-| `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
-| `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
-| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB; the other warehouses with a list get `W057`). See [Unknown functions](#unknown-functions) |
-| `E060` | A downstream-consumer file in `consumers/` is invalid: it does not parse, two consumers share a name, or `depends_on` names something that is not a model. See [Downstream consumers](/concepts/downstream-consumers/) |
-| `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
+| `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery or `DATE > 5` on DuckDB |
-| `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
-| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server) |
-| `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
-| `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
+| `E045` | A two-part read names a table absent from a known schema whose table list Rocky holds as complete (or strict sources are on). See [Missing tables in external sources](#missing-tables-in-external-sources-e045--w045) |
 | `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |
-| `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, a key or change column that is an expression, an `updated_at` or `check_cols` entry the model's explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
 | `E047` | A model reads a `private` model outside its ownership group, or a producer model that is not `public` (see [Model governance](/concepts/model-governance/)) |
 | `E048` | A model-version problem: undeclared latest version, missing version file, or a reference to an undeclared version |
+| `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, a key or change column that is an expression, an `updated_at` or `check_cols` entry the model's explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
+| `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
+| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server) |
 | `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
 | `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and a warehouse the model runs on is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
 | `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when a warehouse the model runs on is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
 | `E055` | `rocky package` refused to vendor a dbt package: a bad spec, `dbt` not on `PATH`, an adapter with no dbt profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong without `--build-empty` (all-NULL columns or a placeholder `*`), a package model name or `[target]` table the project already uses (ignoring case), a package model that reads a seed or a model that was not vendored, vendored SQL that does not parse, Jinja or a credential-like name in a var, a dbt step past `--dbt-timeout`, or a `remove` that would delete edited files without `--force`. See [Use dbt packages](/guides/dbt-packages/) |
 | `E056` | A bare read (`FROM orders`, no schema) is ambiguous: several models write a table called `orders`, none is also named `orders`, and the reader's `depends_on` does not pick one. Rocky binds a bare read by the table a model writes, not by its name, and does not guess between candidates. Qualify the read with its schema or list the intended model in `depends_on` |
+| `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB; the other warehouses with a list get `W057`). See [Unknown functions](#unknown-functions) |
+| `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
+| `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
+| `E060` | A downstream-consumer file in `consumers/` is invalid: it does not parse, two consumers share a name, or `depends_on` names something that is not a model. See [Downstream consumers](/concepts/downstream-consumers/) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |
-| `W050` | A freshness `loaded_at_field` / `time_column` is not a date or time type, or a source `loaded_at_field` is missing from the known source schema |
 | `W010` | Contract defines a column not in model output (not required) |
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
@@ -617,25 +618,25 @@ span, and sometimes a suggested fix.
 | `W014` | `rocky serve` could not load the transformation pipelines' models (a model name shared across pipelines, a malformed sidecar, a dangling models directory), so `/api/v1/models` shows only `models/` and `/api/v1/dag` answers the load error until it is fixed. If `models/` has no model either, the server reports `engine_not_ready` with the load error instead |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
+| `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W042` | Aggregate argument is cast implicitly at run time and fails on values that do not convert (escalate with `--deny-warnings W042`) |
 | `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
 | `W044` | `E044`'s finding on a model that runs only on PostgreSQL, which accepts a column that depends on a grouped primary key (escalate with `--deny-warnings W044`) |
-| `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W045` | A two-part read names a table absent from a known schema whose table list came from a seed or the schema cache (escalate with `--strict-sources`) |
-| `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
-| `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
-| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
-| `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
+| `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
+| `W050` | A freshness `loaded_at_field` / `time_column` is not a date or time type, or a source `loaded_at_field` is missing from the known source schema |
+| `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
 | `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
+| `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
+| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
-| `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
-| `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
+| `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect` or `[portability] target_dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |
 
 ### Format

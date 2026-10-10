@@ -12,7 +12,7 @@
 transformation model and shared defaults, and a `seeds/seed.sql`: a project
 that validates and compiles immediately, with no credentials. The `--template`
 flag selects a different starting point (`duckdb`, `databricks-fivetran`,
-`snowflake`).
+`snowflake`, `bigquery`, `trino`).
 
 This POC scaffolds a DuckDB project into `./scaffolded/`, prints the tree, runs
 the exact quickstart the scaffolder recommends (`validate` + `compile`) to prove

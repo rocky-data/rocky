@@ -2,7 +2,7 @@
 title: No lock-in
 description: Reduce any Rocky project to plain runnable SQL with rocky emit-sql, so adopting Rocky is never a one-way door.
 sidebar:
-  order: 8
+  order: 19
 ---
 
 Rocky compiles your models to ordinary SQL. `rocky emit-sql` hands you that SQL directly. If you ever step away from the engine, you keep runnable files rather than a proprietary format.
@@ -22,7 +22,7 @@ rocky emit-sql --models models/ --out-dir build/sql/
 rocky emit-sql --models models/ --model fct_orders
 ```
 
-Rocky generates that output through the same code path `rocky run` uses, including any declared [surrogate-key columns](/reference/model-format/#surrogate_key). The SQL dialect comes from the target adapter configured in your `rocky.toml`: Databricks, Snowflake, BigQuery, Trino, or DuckDB. With no resolvable config, it defaults to DuckDB.
+Rocky generates that output through the same code path `rocky run` uses, including any declared [surrogate-key columns](/reference/model-format/#surrogate_key). The SQL dialect comes from the target adapter configured in your `rocky.toml`, for any built-in warehouse adapter. With no resolvable config, it defaults to DuckDB.
 
 A full-refresh model emits a complete `CREATE OR REPLACE TABLE … AS …`. That statement runs as-is, and it matches what a run executes.
 

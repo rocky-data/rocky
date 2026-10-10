@@ -2,7 +2,7 @@
 title: Run Rocky on Kubernetes
 description: "A Helm chart for self-hosting Rocky: one replica, replaced in place, on a persistent volume. What the chart refuses, and why each refusal exists."
 sidebar:
-  order: 5.7
+  order: 12
 ---
 
 The repository ships a Helm chart at [`deploy/helm/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/helm/rocky). It is community-supported: an example to start from, not a supported deployment. It encodes the [deployment contract](/advanced/deployment-contract/) and refuses the settings that break it.
@@ -129,7 +129,7 @@ It does **not** prove the sweep succeeded, that the project compiled, that the s
 
 ## The browser UI
 
-`serve.ui.enabled` defaults to `true`. `rocky serve --ui` and `--allowed-host` shipped in `engine-v1.74.0`, the chart's `appVersion`, so the default image serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
+`serve.ui.enabled` defaults to `true`. `rocky serve --ui` and `--allowed-host` shipped in `engine-v1.74.0`. The chart's default image is its `appVersion` (`1.76.0` today), so it serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
 
 With the UI on, the Ingress host is passed as `--allowed-host` and a request carrying any other `Host` is refused `421`. Note that a foreign host usually never reaches Rocky at all: it matches no Ingress rule, so the controller's own default backend answers `404` first.
 

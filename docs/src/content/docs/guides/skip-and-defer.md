@@ -2,7 +2,7 @@
 title: Skip Unchanged Models and Defer to Prod
 description: When to use --skip-unchanged, when to use --defer, and when to use a full refresh. The safety contract and the limits come first.
 sidebar:
-  order: 6.5
+  order: 13
 ---
 
 `rocky run` has two opt-in flags that change *which* models build, for two different reasons:

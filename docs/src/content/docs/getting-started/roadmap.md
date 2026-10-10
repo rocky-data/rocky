@@ -18,7 +18,8 @@ on it. It is a maturity grade for the code. It is not a claim about who uses Roc
 
 - **Databricks** is the production target for 2026: SQL Statement API, Unity
   Catalog, OAuth M2M, adaptive concurrency, and schema-prefix branches.
-  Warehouse-native `SHALLOW CLONE` is a follow-up.
+  `rocky preview create` copies tables into the preview schema with a
+  metadata-only `SHALLOW CLONE`.
 - **The compiler.** Typed column-level inference, the diagnostic codes, and the
   language server all behave the same in CI and in your editor.
 - **Branches and run records.** A named branch is an isolated schema. Each run
@@ -100,10 +101,11 @@ on it. It is a maturity grade for the code. It is not a claim about who uses Roc
   rates per principal or rule, and `rocky review --queue` ranks pending
   escalations. A signal the ledger does not hold renders as *not recorded*,
   never as a fabricated number.
-- **A browser UI.** `rocky serve --ui` serves a view of the same
-  data (read-only, or with changes in operator mode): the estate and its DAG, the review queue with one plan in full, and the
-  governor's brief, scorecard, custody, audit and product journal. See the
-  [browser UI guide](/guides/browser-ui/).
+- **A browser UI.** `rocky serve --ui` shows the same recorded data in your
+  browser: the estate and its DAG, the review queue with one plan in full, and
+  the governor's brief, scorecard, custody, audit, and product journal. It is
+  read-only, or it can make changes in operator mode on your own machine. See
+  the [browser UI guide](/guides/browser-ui/).
 - **An embeddable engine.** `rocky serve` exposes `/api/v1` with outputs
   byte-identical to the CLI's `--output json`, an async job model, and a
   generated OpenAPI 3.1 document. The [Embedding guide](/guides/embedding/)
@@ -120,6 +122,11 @@ on it. It is a maturity grade for the code. It is not a claim about who uses Roc
   warehouse is Snowflake or BigQuery and you need it at GA today,
   [open a discussion](https://github.com/rocky-data/rocky/discussions). We want
   the failure reports.
+- **PostgreSQL, Redshift, ClickHouse, SQL Server, and Apache Spark.**
+  PostgreSQL, ClickHouse, SQL Server 2022, and Spark are tested against a live
+  server. Redshift, Azure SQL, and Fabric are tested by generated SQL only.
+  Not every strategy runs on every warehouse. See
+  [Connect a warehouse](/guides/connect-a-warehouse/).
 - **Iceberg.** REST-catalog source discovery works. Content-addressed writes
   round-trip as Iceberg through Delta UniForm, end to end.
 

@@ -2,7 +2,7 @@
 title: Data Governance
 description: Configure schema patterns, data contracts, permissions, tagging, quality checks, and audit trails.
 sidebar:
-  order: 7
+  order: 17
 ---
 
 Rocky enforces data quality, schema stability, access control, masking, retention, and auditability. Most of it is declarative: write the rules in `rocky.toml` or in a model sidecar, and `rocky apply` carries them out. Two features run as standalone commands instead, so you can gate a PR on them. `rocky compliance` rolls up classification against masking, and `rocky retention-status` reports retention per model.
@@ -277,7 +277,7 @@ A classification tag marks a column as sensitive. A masking strategy decides how
                                    └────────────────────┘
 ```
 
-Shipped in engine-v1.16.0. Implemented on Databricks today. Other adapters do nothing.
+Implemented on Databricks today. Other adapters do nothing.
 
 ### Tag columns in the model sidecar
 
@@ -346,7 +346,7 @@ See the [configuration reference](/reference/configuration/) for the full schema
 
 `rocky compliance` answers one question: **is every classified column masked wherever policy says it should be?**
 
-It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip. Shipped in engine-v1.16.0.
+It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip.
 
 ### Basic usage
 
@@ -401,7 +401,7 @@ The payload follows the `ComplianceOutput` schema: a `summary` block of counters
 
 You declare roles that inherit from other roles. Rocky flattens that hierarchy into one resolved permission set per role. It rejects cycles and unknown parents at config-load time.
 
-Shipped in engine-v1.16.0. What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
+What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
 
 ### Declare roles in `rocky.toml`
 
@@ -448,8 +448,6 @@ Both passes only add. Rocky revokes no grant and deletes no group. Removing a ro
 ## 7. Data Retention (Pillar 5 of 5)
 
 A retention policy tells the warehouse how long to keep a table's historical data. You write one sidecar key. Each adapter translates it into the warehouse's own TBLPROPERTIES or session parameter.
-
-Shipped in engine-v1.16.0.
 
 ### Declare retention on a model
 
@@ -800,7 +798,7 @@ The check passes when the query result is less than or equal to the threshold.
 
 ## 13. Audit Trail
 
-Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`, shipped in engine-v1.16.0. `rocky history --audit` shows them.
+Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`. `rocky history --audit` shows them.
 
 ### `rocky history --audit` and the 8 audit fields
 

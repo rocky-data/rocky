@@ -2,7 +2,7 @@
 title: The Browser UI
 description: "What rocky serve --ui shows: eleven areas in a sidebar, five of which open a screen today. How to open it, operator mode, and what it can and cannot do."
 sidebar:
-  order: 5.8
+  order: 3
 ---
 
 `rocky serve --ui` serves a browser UI for one project. It shows the project's models and runs, the plans waiting for a human, and the policy decisions and product history the engine recorded. On your own machine, the UI can also make changes (see [Operator mode](#operator-mode)). Every value on the page comes from a typed `/api/v1` payload. Most of those payloads are the same ones the CLI prints with `--output json`.

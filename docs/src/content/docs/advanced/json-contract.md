@@ -2,7 +2,7 @@
 title: JSON Contract
 description: The rules that keep Rocky's --output json payloads stable across releases
 sidebar:
-  order: 2
+  order: 5
 ---
 
 Rocky commands that support `--output json` print a JSON payload. That payload is the interface contract between Rocky and whatever reads it: Dagster, the Python SDK, a shell script, or your own service.
@@ -55,16 +55,16 @@ dagster-rocky consumes this array to build a Dagster `AssetKey`. Its translator 
 
 ## Parsing a payload in Python
 
-Call `parse_rocky_output()`. It reads the payload's `"command"` field and returns the matching typed model:
+Call `parse_rocky_output()` from `rocky-sdk`. It reads the payload's `"command"` field and returns the matching typed model:
 
 ```python
-from dagster_rocky import parse_rocky_output
+from rocky_sdk import parse_rocky_output
 
 result = parse_rocky_output(json_str)
 # Returns: DiscoverResult | RunResult | PlanResult | StateResult | ...
 ```
 
-`dagster_rocky` re-exports these names from `dagster_rocky.types`. That shim re-exports `rocky_sdk.types`, which includes the generated models from the cascade below.
+`dagster_rocky` re-exports the same names through `dagster_rocky.types`, so `from dagster_rocky import parse_rocky_output` also works.
 
 A few commands print more than one shape under the same command name. For those, the function discriminates on the fields that are present, such as column lineage versus model lineage.
 
@@ -98,7 +98,9 @@ Run `just install-hooks` once to get the same check locally. The `.git-hooks/pre
 
 1. Add the field to the relevant Rust `*Output` struct as optional (nullable).
 2. Run `just codegen` to regenerate the Pydantic models and the TypeScript interfaces.
-3. Commit the Rust change, the schema, and both bindings together.
-4. Document the field in the [JSON output reference](/reference/json-output/).
+3. Add the field by hand to the matching model in `sdk/python/src/rocky_sdk/types.py`. Those are the models `parse_rocky_output()` returns, and codegen does not write them.
+4. Run `just regen-fixtures` when the change alters a shape the Dagster test fixtures capture. `just codegen-all` runs both steps.
+5. Commit the Rust change, the schema, both bindings and the fixtures together.
+6. Document the field in the [JSON output reference](/reference/json-output/).
 
 The field ships with the next minor engine release. It needs no separate schema version bump, because a new optional field is allowed inside a minor series.

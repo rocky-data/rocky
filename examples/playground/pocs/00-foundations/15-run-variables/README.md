@@ -49,7 +49,8 @@ cd examples/playground/pocs/00-foundations/15-run-variables
 ./run.sh
 ```
 
-No credentials required — DuckDB only.
+No credentials required — DuckDB only. `run.sh` needs `rocky`, the `duckdb`
+CLI and `jq` on `PATH`. `rocky emit-sql` writes the rendered SQL to `build/`.
 
 ## Expected output
 

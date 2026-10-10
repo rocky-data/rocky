@@ -19,10 +19,11 @@ after its file stem.
 - Format-agnostic ingest. Drop heterogeneous files into `data/`; Rocky picks
   them up and routes each through the warehouse's native scanner. No `pip
   install pandas`, no staging buckets, no per-format pipelines.
-- The same `[pipeline.<name>]` shape works against Snowflake / Databricks /
-  BigQuery: swap the `[adapter]` block and re-run. The `LoaderAdapter` trait
-  guarantees each warehouse handles all three formats via its own bulk-load
-  primitive (`COPY INTO`, `LOAD DATA`, etc.).
+- The same `[pipeline.<name>]` shape works against Snowflake, Databricks and
+  BigQuery: swap the `[adapter]` block and re-run. Each implements the
+  `LoaderAdapter` trait with its own bulk-load primitive (`COPY INTO`, load
+  jobs, etc.). **Limit:** BigQuery loads local files as CSV only. Parquet and
+  JSONL need a `gs://` path.
 
 ## Layout
 
@@ -67,7 +68,7 @@ values vary per run; the Parquet size depends on DuckDB's writer):
 ```text
 === load (Parquet + CSV + JSONL → DuckDB, format auto-detected) ===
 {
-  "version": "1.63.0",
+  "version": "<rocky version>",
   "command": "load",
   "source_dir": "data/",
   "format": "auto",

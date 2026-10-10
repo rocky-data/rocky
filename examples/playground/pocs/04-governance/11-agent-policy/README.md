@@ -131,8 +131,8 @@ changed, and what sits downstream in its blast radius. `rocky audit --scorecard
 
 The contract still lists `email`, so dropping it warns (`W010` — a contract
 column left the output) but does **not** hard-error: the plan builds. The proof
-that the agent's refusal came from the *policy plane* and nothing else is step 4:
-a human applies the exact same plan, with the exact same `W010` warning present,
+that the agent's refusal came from the *policy plane* and nothing else is step 4b
+of `run.sh`: a human applies the exact same plan, with the exact same `W010` warning present,
 and it succeeds. Same plan, same compile, different principal, different outcome.
 
 ## Why the deny cannot be worked around

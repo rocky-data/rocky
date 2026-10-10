@@ -49,14 +49,14 @@ update_columns = ["name", "email", "tier"]
 
 ## Prerequisites
 
-- `rocky` on PATH
-- `duckdb` CLI (`brew install duckdb`), which seeds the source table, applies
-  the delta, and verifies post-MERGE row counts
 - `rocky` ≥ 1.29.0 on PATH. The two enabling fixes shipped in 1.29.0, in PRs
   [#448](https://github.com/rocky-data/rocky/pull/448)
   (`auto_create_schemas` for transformation pipelines) and
   [#449](https://github.com/rocky-data/rocky/pull/449) (DuckDB MERGE
   unqualified-LHS).
+- `duckdb` CLI (`brew install duckdb`), which seeds the source table, applies
+  the delta, and verifies post-MERGE row counts
+- `python3` (prints the materializations from the run JSON)
 
 ## Run
 

@@ -2,7 +2,7 @@
 title: Deployment Contract
 description: "What happens to a running Rocky when a pod dies, when two overlap, and when a rollout replaces one with another, per state backend. The one rule the self-host surface rests on, and the loss windows the engine does not hide."
 sidebar:
-  order: 6
+  order: 4
 ---
 
 This page is the contract between Rocky and the machine that runs it. It states what the engine does when the process dies, when two processes overlap, and when a rollout replaces one with another. Each statement names the mechanism behind it. Where the engine cannot promise something, the page says so.
@@ -86,7 +86,7 @@ A child that is still running when the drain runs out is not killed at once. The
 
 **The pod's `terminationGracePeriodSeconds`, or the container's stop grace, must exceed `--drain-timeout-seconds` plus 60.** With the defaults that is more than 120 seconds. A grace inside that window lets the supervisor `SIGKILL` the pod while the child is still writing, and the occurrence is recorded as a failure.
 
-Closing the tiered-backend seams tracked as issue 1242 does not make a rolling update safe. The double fire lives in the scheduler tables that never sync, not in the sync.
+Compare-and-swap on the state backend does not make a rolling update safe. The double fire lives in the scheduler tables that never sync, not in the sync.
 
 ## Mixed versions during an upgrade
 

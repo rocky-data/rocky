@@ -117,4 +117,3 @@ the group. A model that belongs to no group simply carries its own `[tags]`.
   (`RockyDagsterTranslator.get_model_tags`).
 - The group loader + tag merge live at
   `engine/crates/rocky-core/src/models.rs` (`resolve_model_config`).
-```

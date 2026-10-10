@@ -10,7 +10,7 @@ and TOML. Rocky compiles them and reports supported static problems across the
 project graph. A later run sends generated SQL to the warehouse.
 
 Rocky owns the graph. Your warehouse keeps storage and compute: Databricks,
-Snowflake, BigQuery, or DuckDB. Everything between the two is Rocky's job:
+Snowflake, BigQuery, DuckDB, or another [supported adapter](#supported-adapters). Everything between the two is Rocky's job:
 branches, run records, column-level lineage, compile-time contracts, a
 dialect-portability lint, and per-model cost.
 
@@ -123,7 +123,7 @@ check it rather than take it on faith.
    instead.
 4. **Per-model cost attribution.** Cost is a column on every run record, not a
    dashboard you check afterwards. `[budget]` blocks fail the run on overspend,
-   `budget_breach` fires the hook, and `rocky preview cost` projects spend at
+   the `on_budget_breach` hook fires, and `rocky preview cost` projects spend at
    pull-request time.
 5. **AI-assisted drafting.** `rocky ai` generates a model and validates it
    against available project context. Treat the result as a draft. Review the
@@ -141,8 +141,8 @@ check it rather than take it on faith.
 ## Where Rocky is today
 
 The trust primitives (compiler, branches, replay, lineage, contracts, cost) are
-GA (live-tested) on Databricks. Snowflake, BigQuery, and Trino are Beta: the
-core run loop works, and conformance coverage is still growing. The wider AI
+GA (live-tested) on Databricks. Every other warehouse adapter except DuckDB is
+Beta: the core run loop works, and conformance coverage is still growing. The wider AI
 workflow, Iceberg-native writes, and a semantic layer are on the roadmap.
 
 See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
@@ -154,12 +154,16 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
   [benchmarks](/getting-started/benchmarks/).
 - **Typed checks.** Column-level inference can report resolvable schema errors
   at compile time. Unknown types and runtime behavior need separate checks.
+- **A browser UI, then the editor.** `rocky serve --ui` shows the project's
+  models, runs, and plans that need review in your browser. The
+  [VS Code extension](/guides/ide-setup/) adds compile errors and column types
+  as you type. See the [browser UI guide](/guides/browser-ui/).
 - **SQL-first.** No Jinja. Business logic stays in SQL. An optional Rocky DSL
   exists for the cases plain SQL handles badly; it never replaces SQL.
 - **Config-first bronze.** Source replication is driven by `rocky.toml`, with
   zero SQL files for a 1:1 copy.
 - **Embedded state.** Watermarks live in a local `redb` database, with optional
-  S3 or Valkey sync. There is no manifest file. A watermark is the timestamp of
+  S3, GCS, or Valkey sync. There is no manifest file. A watermark is the timestamp of
   the newest row Rocky has already loaded; see the
   [glossary](/reference/glossary/).
 
@@ -176,26 +180,14 @@ packages, so a hybrid setup works while you migrate.
 
 ## How Rocky compares to SQLMesh
 
-SQLMesh is the tool Rocky most resembles. It also analyzes SQL statically, using
-SQLGlot rather than templating. Its virtual environments, plan/apply, and
-column-level lineage are mature primitives that Rocky shares rather than beats.
-
-Rocky differs in two ways. It keeps SQL as the default surface, where SQLMesh
-leans Python-first. And it enforces more. Declarative open-source governance and
-`[budget]` blocks that fail the build are not in SQLMesh OSS. Rocky also adds
-source-schema-drift detection and a dialect-portability lint at pull-request
-time. SQLMesh instead transpiles between dialects with SQLGlot.
-
-SQLMesh is more mature in years, funding, and adoption. It ships native Python
-models and an open-source CI/CD bot.
-
-Full side-by-side table: [Feature comparison](/getting-started/comparison/).
+SQLMesh is the tool Rocky most resembles. The
+[Feature comparison](/getting-started/comparison/) sets them side by side.
 
 ## Design principles
 
 1. **Adapter-based.** Source adapters (Fivetran, Airbyte, DuckDB, Iceberg,
-   manual) handle discovery. Warehouse adapters (Databricks, Snowflake,
-   BigQuery, Trino, DuckDB) handle execution. The core engine stays
+   manual) handle discovery. Warehouse adapters (Databricks, DuckDB, and the
+   Beta adapters in the table below) handle execution. The core engine stays
    warehouse-agnostic.
 2. **Inline quality checks.** Data checks run during replication, not as a
    separate step afterwards.
@@ -215,6 +207,11 @@ Full side-by-side table: [Feature comparison](/getting-started/comparison/).
 | Warehouse | Snowflake | REST API; OAuth / JWT / password (Beta) |
 | Warehouse | BigQuery | REST API; service account / ADC (Beta) |
 | Warehouse | Trino | `/v1/statement` REST polling; HTTP Basic / JWT (Beta) |
+| Warehouse | PostgreSQL | Native protocol, rustls TLS (Beta) |
+| Warehouse | Redshift | Shares the PostgreSQL adapter crate; tested by generated SQL only (Beta) |
+| Warehouse | ClickHouse | HTTP interface; no `MERGE` (Beta) |
+| Warehouse | SQL Server / Azure SQL / Fabric | Native TDS; Azure SQL and Fabric tested by generated SQL only (Beta) |
+| Warehouse | Apache Spark | Spark Connect over gRPC; Delta or Iceberg tables (Beta) |
 | Warehouse | DuckDB | In-process; powers the playground and `rocky test` |
 
 Source adapters are metadata-only. They identify what exists. The data itself

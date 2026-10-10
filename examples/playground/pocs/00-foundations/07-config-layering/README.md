@@ -23,8 +23,7 @@ the precedence rules are visible side-by-side.
 ## Why it's distinctive
 
 - Env-var substitution works at **every** config layer, including per-model
-  sidecars, which closes a dbt-migration ergonomics gap (FR-001 Option A).
-  A Dagster asset factory can now point each asset at its own
+  sidecars. A Dagster asset factory can point each asset at its own
   catalog/schema/table by setting env vars on the rocky subprocess.
 - The same source files materialize to different physical tables based on
   the orchestrator's environment, with no codegen or templating step.

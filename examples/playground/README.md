@@ -69,7 +69,7 @@ Start here. These POCs cover the language, the config layers, and the deploy loo
 | [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Full generic adapter surface against DuckDB — validate, list, doctor, seed, discover, plan, compile, test in one credential-free flow |
 | [06-branches-replay-lineage](pocs/00-foundations/06-branches-replay-lineage) | **Trust arc 1** — `rocky branch create/list/show`, `rocky run --branch`, `rocky replay`, `rocky lineage --downstream` |
 | [07-config-layering](pocs/00-foundations/07-config-layering) | Three-layer config: `rocky.toml` + `_defaults.toml` + per-model sidecar, with env-var substitution at every layer |
-| [08-branch-approve-promote](pocs/00-foundations/08-branch-approve-promote) | **Trust arc 1** — `[branch.approval] required = true` gates `rocky branch promote`; `rocky branch approve` writes a content-addressed signed artifact bound to the branch state hash |
+| [08-branch-approve-promote](pocs/00-foundations/08-branch-approve-promote) | **Trust arc 1** — `[branch.approval] required = true` gates `rocky branch promote`; `rocky branch approve` writes a content-addressed approval bound to the branch state hash (an unkeyed digest, not a signature) |
 | [09-files-to-duckdb](pocs/00-foundations/09-files-to-duckdb) | `rocky load` ingests Parquet + CSV + JSONL from one `data/` directory into DuckDB — format auto-detected by extension |
 | [10-route-by-tenant](pocs/00-foundations/10-route-by-tenant) | One Parquet file with mixed-account rows is loaded then fanned out to per-tenant schemas (`account_acme.events`, `account_beta.events`, …) via per-model `target.schema` overrides |
 | [11-plan-apply-workflow](pocs/00-foundations/11-plan-apply-workflow) | `rocky plan` persists a content-addressed plan to `.rocky/plans/<id>.json`; `rocky apply <id>` executes it. Re-planning the same intent yields the same `plan_id` |
@@ -84,17 +84,17 @@ How Rocky catches bad data. These POCs cover contracts, inline checks, named and
 
 | POC | Feature |
 |---|---|
-| [01-data-contracts-strict](pocs/01-quality/01-data-contracts-strict) | Every contract rule (`required`, `protected`, columns) + a deliberately broken sibling that exercises every diagnostic code |
+| [01-data-contracts-strict](pocs/01-quality/01-data-contracts-strict) | Contract rules (`required`, `protected`, typed `[[columns]]`) + a deliberately broken sibling that raises E010, E012 and E013 |
 | [02-inline-checks](pocs/01-quality/02-inline-checks) | Built-in `[checks]` (row_count, column_match) running inline during `rocky run`; freshness and null_rate stay commented out in `rocky.toml` |
-| [03-anomaly-detection](pocs/01-quality/03-anomaly-detection) | `rocky history` + `rocky metrics --alerts` driven by row count anomalies across runs |
-| [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` with both passing and intentionally failing assertions |
+| [03-anomaly-detection](pocs/01-quality/03-anomaly-detection) | `rocky run` flags a row-count anomaly against the baseline of earlier runs; `rocky history` lists the runs |
+| [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` runs the models in an in-memory DuckDB (auto-loads `data/seed.sql`); full set and `--model` targeting |
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 | [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
 | [08-cross-source-overlap](pocs/01-quality/08-cross-source-overlap) | The same data arriving via two sibling sources — `cross_source_overlap` flags a business key shared across siblings (which per-table `unique` can't see) + `unique_expr` catches a derived-key duplicate, both at replication time |
 | [09-named-tests](pocs/01-quality/09-named-tests) | Define a check once in `test_definitions.toml`, apply it across models via `[[use_test]]` (column/severity overrides) alongside inline `[[tests]]` |
 | [10-unit-tests](pocs/01-quality/10-unit-tests) | Fixture-driven `[[test]]` blocks (`given` rows → `expect` rows) run by `rocky test` — multiset by default, positional with `ordered` |
-| [11-fail-loud-on-compile-error](pocs/01-quality/11-fail-loud-on-compile-error) | A model that fails to compile (E020) makes `rocky run` exit non-zero with status `partial_failure` and a `compile-error`; the broken table is never built while the clean model's data still lands |
+| [11-fail-loud-on-compile-error](pocs/01-quality/11-fail-loud-on-compile-error) | A model that fails to compile (E020) makes `rocky run` exit non-zero with status `PartialFailure` and a `compile-error`; the broken table is never built while the clean model's data still lands |
 
 ### 02 — Performance (14 POCs · DuckDB)
 
@@ -104,8 +104,8 @@ How Rocky avoids rebuilding what has not changed. These POCs cover the increment
 |---|---|
 | [01-incremental-watermark](pocs/02-performance/01-incremental-watermark) | `strategy = "incremental"` — full load on run #1, watermark-filtered INSERT on run #2 |
 | [02-merge-upsert](pocs/02-performance/02-merge-upsert) | `strategy.type = "merge"` with `unique_key` + `update_columns` for SCD-1 upserts |
-| [03-partition-checksum](pocs/02-performance/03-partition-checksum) | Partition checksum incremental that catches late-arriving corrections to historical data |
-| [04-column-propagation](pocs/02-performance/04-column-propagation) | Column-level lineage pruning — `rocky plan` skips downstream models whose consumed columns didn't change |
+| [03-partition-checksum](pocs/02-performance/03-partition-checksum) | `time_interval` strategy — re-running a partition (DELETE + INSERT) picks up late-arriving rows; `--partition`, `--from`/`--to` |
+| [04-column-propagation](pocs/02-performance/04-column-propagation) | `rocky lineage --column` on a 3-model chain — `status` reaches the downstream model, `amount` dead-ends |
 | [05-optimize-recommendations](pocs/02-performance/05-optimize-recommendations) | `rocky optimize` + `profile-storage` + `compact --dry-run` after building run history |
 | [06-schema-drift-recover](pocs/02-performance/06-schema-drift-recover) | Drift detection auto-widening `STRING→INT`, unsafe changes via `DROP+RECREATE` |
 | [07-view-intermediate](pocs/02-performance/07-view-intermediate) | `strategy = "view"` — a shared intermediate that copies no data |

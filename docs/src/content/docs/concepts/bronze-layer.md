@@ -83,16 +83,26 @@ For a multi-tenant setup where each tenant gets its own catalog, see
 
 ## Auto-creation
 
-Set `auto_create_catalogs = true` and `auto_create_schemas = true`, and Rocky
-creates the target catalog and schema before it copies anything:
+Set `auto_create_catalogs` and `auto_create_schemas` under the target's
+`governance` block. Rocky then creates the target catalog and schema before it
+copies anything:
+
+```toml
+[pipeline.bronze.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+
+[pipeline.bronze.target.governance.tags]
+managed_by = "rocky"
+```
 
 ```sql
 CREATE CATALOG IF NOT EXISTS warehouse;
 CREATE SCHEMA IF NOT EXISTS warehouse.stage__shopify;
 ```
 
-Rocky tags the catalogs it creates (for example `managed_by = "rocky"`) so it can
-find which catalogs it manages later.
+Rocky applies the tags you declare in `governance.tags` to the catalogs it
+manages. A tag such as `managed_by` lets you find those catalogs later.
 
 ## Incremental strategy
 

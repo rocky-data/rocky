@@ -2,7 +2,7 @@
 title: Troubleshooting
 description: Look up the error message you got, then follow the numbered fix
 sidebar:
-  order: 3
+  order: 1
 ---
 
 This page is symptom-first. Search it for the error message you got, then follow the numbered steps under it.
@@ -11,44 +11,36 @@ For the opposite view, categories of failure with a recovery playbook for each, 
 
 ## Compile errors
 
-### "Model 'X' not found"
+### "unknown dependency 'X' referenced by 'Y'"
 
-A model references another model that the project does not contain.
+Model `Y` lists `X` in its `depends_on`, but the project has no model named `X`.
 
 **Likely causes**
 
-- The referenced model file is missing or misnamed.
+- A typo in `depends_on`. The message adds "did you mean 'Z'?" when a model name is close.
+- The model file for `X` is missing or misnamed.
 - The `name` field in the `.toml` sidecar does not match the file name.
-- The model sits in a subdirectory that Rocky does not scan.
+- `X` is a source table, not a model.
 
 **Fix**
 
-1. Check that the referenced model exists under `models/`.
-2. Check that its `name` field matches the file name.
-3. Check the SQL reference itself. Rocky discovers dependencies from SQL table references, and a bare name becomes a DAG edge to the model whose `[target]` table has that name. If the model's target table is spelled differently from its name, read the target, or see warning `D012`.
+1. Check the spelling against the suggestion in the message.
+2. Check that the model file exists under `models/` and that its `name` field matches.
+3. Remove the entry when `X` is a source table. Rocky reads a source table from the SQL; it needs no `depends_on`.
 
-### "Type mismatch on column 'X'"
+### "join key type mismatch on column 'X'"
 
-A column's type differs between the upstream model and the downstream model.
-
-**Fix**
-
-1. Run `rocky compile` to see which two types disagree and where.
-2. Add an explicit `CAST()` to convert one side, or change the upstream model to produce the expected type.
-3. If the change is intentional schema evolution, run `rocky ai-sync` to propagate it downstream.
-
-### "Join key type mismatch"
-
-Two models in a join share a column name but not its type.
+Two upstream models in a join share a column name but not its type, and the types have no common type (`E001`).
 
 **Fix**
 
 1. Read the diagnostic. It names both models and both types.
-2. Add an explicit `CAST()` on one side of the join so the types match.
+2. Add an explicit `CAST()` on one side of the join, or change the upstream model to produce the expected type.
+3. If the change is intentional schema evolution, run `rocky ai-sync` to propagate it downstream.
 
 ### "Contract violation"
 
-A model's output does not satisfy its data contract.
+A model's output does not satisfy its data contract (`E010`–`E014`). For example: `column 'X' type mismatch: contract expects …`.
 
 **Fix**
 
@@ -142,7 +134,7 @@ The AI could not produce valid code inside the retry budget.
 **Fix**
 
 1. Regenerate the token in your Databricks workspace settings.
-2. For OAuth M2M, check `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`.
+2. For OAuth M2M, check the `client_id` and `client_secret` values in the adapter block, and the environment variables they read.
 
 ### Databricks: "Statement execution timeout"
 
@@ -164,7 +156,7 @@ A query ran longer than the configured timeout.
 
 **Fix**
 
-1. Check `FIVETRAN_API_KEY` and `FIVETRAN_API_SECRET`.
+1. Check the `api_key` and `api_secret` values in the Fivetran adapter block, and the environment variables they read.
 2. Confirm the API key has access to the `destination_id` you configured.
 
 ## State store problems

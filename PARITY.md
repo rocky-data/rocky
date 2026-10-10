@@ -1,5 +1,7 @@
 # PARITY — Python answer key to Rust port
 
+**Status:** Record. The port is complete: 199 Python nodes, 152 mapped, 47 dissolved, 0 deferred.
+
 The frozen Python implementation on branch `feat/ff-wp2-spec-compiler` is the
 specification for this port. Every collected pytest node id maps to a Rust test,
 a `DEFERRED-PART2` entry, or a `DISSOLVED` justification. Nothing is dropped
@@ -182,7 +184,7 @@ authority, not the name similarity.
 | `test_uncovered_aggregate_row_breaks_totality` | MAPPED | `product::manifest::tests::an_uncovered_aggregate_row_breaks_totality` |
 | `test_verify_artifact_hashes_detects_drift_and_absence` | MAPPED | `product::manifest::tests::verify_artifact_hashes_detects_drift_and_absence` |
 
-## Rust tests with no Python counterpart (added coverage)
+## Rust tests with no Python counterpart (lowering, commit, manifest)
 
 Beyond the parser's own added tests, listed further up.
 
@@ -198,11 +200,10 @@ Beyond the parser's own added tests, listed further up.
 | `product::lowering::tests::a_preserved_scalar_survives_and_stays_above_the_tables` | A preserved scalar other than name/intent, which no Python test carried. |
 | `product::lowering::tests::a_nullable_column_gets_no_not_null_test` | Every column in the fixture is non-nullable, so the guard was invisible to the goldens. |
 | `product::lowering::tests::a_freshness_budget_too_wide_for_toml_is_refused` | The added refusal below. |
-| `product::commit::tests::fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched` (+ `_prev_`, `_journal_temp_`, `a_symlinked_final_is_refused_on_the_fresh_path`) | Hardening beyond the answer key — see divergence 6: the prototype left the fresh commit path unguarded against symlinked write targets. |
-| `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files`, `half_canonical_path_aliases_are_refused_as_unsafe` | Two guards the answer key's tests never reached (mutation-check findings). |
+| `product::commit::tests::fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched` (+ `_prev_`, `_journal_temp_`, `a_symlinked_final_is_refused_on_the_fresh_path`) | Hardening beyond the answer key — see divergence 5: the prototype left the fresh commit path unguarded against symlinked write targets. |
 | `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files` | A mutation pass showed rollback's brand-new-file removal branch was live but unreached: every Phase-B drill replaces files that exist. A cold Phase-A crash is the shape that needs it. |
 | `product::commit::tests::half_canonical_path_aliases_are_refused_as_unsafe` | A mutation pass showed the canonical-spelling gate was unpinned: `a//b`-style aliases normalize inside `Path::components` and would fall through to a different refusal. |
-| `product::manifest::tests::the_instance_walk_covers_every_row_the_schema_declares` | The mechanization the answer key lacks — see divergence 6. |
+| `product::manifest::tests::the_instance_walk_covers_every_row_the_schema_declares` | The mechanization the answer key lacks. |
 | `product::manifest::tests::json_escapes_everything_outside_printable_ascii` | The hand-written JSON writer's escaping, including surrogate pairs. |
 | `product::manifest::tests::leaf_derivation_recurses_through_a_nested_unit_model` | Unreachable in today's schema, and a hole waiting for the first model that nests another. |
 | `product::manifest::tests::a_ref_to_a_property_less_definition_is_a_leaf_not_a_model` | `FreshnessSpec.severity` is exactly this shape; misreading it would drop the leaf silently. |
@@ -361,7 +362,7 @@ or dissolves into the engine surface it was probing.
    is not a drift from the answer key — it is two producers with two spellings,
    and both are pinned by tests.
 
-6. **Fresh-path symlink refusal — hardening BEYOND the answer key.** The
+5. **Fresh-path symlink refusal — hardening BEYOND the answer key.** The
    frozen prototype's `commit_generation` calls `recover_generation` first,
    whose symlinked-residue refusal sits past its no-journal early return —
    so on the FRESH commit path (no prior crash) the prototype's own
@@ -380,14 +381,14 @@ or dissolves into the engine surface it was probing.
    and `O_NOFOLLOW` on the `.ff-prev` backup's source read (unix only, so
    Windows keeps the pre-check-only guarantee and stays untested).
 
-5. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
+6. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
    casefolding.** Python's `str.casefold` also folds shapes like `ß` → `ss`;
    Rust's standard library has no casefold. Artifact paths in this protocol
    are ASCII (`models/<identifier>.toml` and the state dir), where the two
    are identical, and the check exists for case-insensitive filesystems,
    whose own folding is closer to `to_lowercase` than to full casefolding.
 
-6. **The renderer is new code with no Python counterpart, and that is the
+7. **The renderer is new code with no Python counterpart, and that is the
    largest residual risk in this port.** The answer key delegated its output to
    a library; the port reimplements that library's layout rules (four-space
    indent, the 100-character inline budget counted in characters rather than

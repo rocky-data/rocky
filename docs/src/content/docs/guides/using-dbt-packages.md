@@ -1,8 +1,8 @@
 ---
-title: Using Rocky with dbt Packages
+title: Read dbt Package Tables
 description: Run Rocky alongside dbt packages such as Fivetran and build on package-managed tables, or vendor the package with rocky package.
 sidebar:
-  order: 3
+  order: 9
 ---
 
 There are two ways to use a dbt package such as a Fivetran connector package with Rocky:

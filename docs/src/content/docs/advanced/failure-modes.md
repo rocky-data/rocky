@@ -71,19 +71,19 @@ Every finding is a [diagnostic](/reference/glossary/#diagnostic-code): a stable 
 
 | Code | Failure |
 |---|---|
-| `E001` | Type mismatch on a column reference |
+| `E001` | Join key type mismatch between two upstream models, with no common type |
 | `E020`–`E026` | `time_interval` model misconfiguration (placeholders, granularity, nullability) |
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-This table is not exhaustive. The compiler also emits `E010`–`E014` and `E030`–`E035`.
+This table is not exhaustive. The compiler also emits `E010`–`E014` and `E029`–`E060`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
 
 Codes `E010`–`E014` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
 
 **Recovery playbook.**
 
 1. Run `rocky compile --output table`. It underlines the source span that triggered the diagnostic.
-2. Read the same diagnostic in VS Code if you use the [Rocky extension](../../guides/ide-setup). The LSP adds hover detail and a `Quick Fix` action where one exists. `E010` / `E013` and the type-mismatch codes `E001`–`E003` ship deterministic fixes. Other codes may offer an AI-generated fix when `ANTHROPIC_API_KEY` is set.
+2. Read the same diagnostic in VS Code if you use the [Rocky extension](/guides/ide-setup/). The LSP adds hover detail and a `Quick Fix` action where one exists. `E010` / `E013` and `E001` (a `CAST` wrap) ship deterministic fixes. Other codes may offer an AI-generated fix when `ANTHROPIC_API_KEY` is set.
 3. Fix the model SQL, or fix the upstream contract that triggered the diagnostic.
 4. Re-run `rocky compile` until it is clean.
 
@@ -91,7 +91,7 @@ Codes `E010`–`E014` are formally compile-time failures. They get their own sec
 
 **Per-model compile failure during a run.** The whole-project abort above is the common case. A model can also compile in isolation and then fail when its turn comes during the run. An upstream change that shifts a type does exactly this.
 
-Rocky contains that failure at the table boundary instead of passing over the model. The model counts towards `tables_failed` and gets an `errors[*]` entry with [`failure_kind: "compile-error"`](/advanced/per-table-error-containment/#failure_kind-taxonomy) carrying the diagnostic. The run exits non-zero, with status `Failure`, or `PartialFailure` when other models succeeded. Earlier engine versions skipped the model and still called the run a success.
+Rocky contains that failure at the table boundary instead of passing over the model. The model counts towards `tables_failed` and gets an `errors[*]` entry with [`failure_kind: "compile-error"`](/advanced/per-table-error-containment/#failure_kind-taxonomy) carrying the diagnostic. The run exits non-zero, with status `Failure`, or `PartialFailure` when other models succeeded.
 
 ---
 
@@ -122,7 +122,7 @@ A passing contract is what lets you refactor a model's internals without breakin
 
 ## 3. Schema drift
 
-**Definition.** [Drift](/reference/glossary/#drift) is a mismatch between the source schema and the target table's current schema. Rocky's [graduated drift handling](../../concepts/schema-drift) tries to fix the divergence in place. It runs `ALTER COLUMN TYPE` for a safe widening and `ALTER TABLE ADD COLUMN` for a new column. It drops and recreates the table only when it cannot do either.
+**Definition.** [Drift](/reference/glossary/#drift) is a mismatch between the source schema and the target table's current schema. Rocky's [graduated drift handling](/concepts/schema-drift/) tries to fix the divergence in place. It runs `ALTER COLUMN TYPE` for a safe widening and `ALTER TABLE ADD COLUMN` for a new column. It drops and recreates the table only when it cannot do either.
 
 **Detection signal.** The `drift` block (a `DriftSummary`) on `rocky run` / `rocky apply --output json`. It reports `tables_checked`, `tables_drifted`, and one `actions_taken[]` entry per drifted table. Each entry carries `table`, `action`, and a human-readable `reason`. Rocky adds an entry only when it changed the target, so a table with no drift produces no entry. Three actions reach the wire:
 
@@ -153,7 +153,7 @@ Rocky corrects drift inside the run rather than waiting for you. Your job is to 
 
 ## 4. Quality check failures
 
-**Definition.** An [inline data quality check](../../concepts/data-quality-checks) declared under `[pipeline.<name>.checks]` in `rocky.toml` failed against the data Rocky just materialised. Checks run after each model materialises.
+**Definition.** An [inline data quality check](/concepts/data-quality-checks/) declared under `[pipeline.<name>.checks]` in `rocky.toml` failed against the data Rocky just materialised. Checks run after each model materialises.
 
 An error-severity check failure fails the run by default, because `fail_on_error = true`. A warning-severity check is advisory. It appears in the run output and in Dagster Pipes events, and it does not fail the run.
 
@@ -182,14 +182,14 @@ The dispatched adapter classifies its own failures:
 | Adapter | Common failure modes |
 |---|---|
 | Databricks | `401 Unauthorized` (PAT expired / OAuth M2M misconfigured), statement timeout, rate-limit on `information_schema` queries |
-| Snowflake | Auth chain rejection (OAuth → JWT → password), warehouse suspended, query result-size cap |
+| Snowflake | Auth rejection (PAT → OAuth → key-pair JWT → password), warehouse suspended, query result-size cap |
 | BigQuery | Quota exceeded, auth scope mismatch, BIGNUMERIC type drift |
 | DuckDB | File lock contention, out-of-memory on large CTAS |
 | Fivetran / Airbyte | `403 Forbidden` (missing API scope), connector currently syncing |
 
 ### Classified retry
 
-Since engine 1.58.0 the run loop retries proven-transient failures itself. This is on by default.
+The run loop retries proven-transient failures itself. This is on by default.
 
 When a model's materialization fails, the adapter's own retryable judgement classifies it as `Transient`, `Permanent`, or `Unknown`. Rocky re-runs only a proven transient failure, with capped exponential backoff. A 429, a connection reset, a warehouse warming up, and a lock conflict all qualify.
 
@@ -210,8 +210,8 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 1. Run `rocky doctor --output json` first. Its `checks[]` entry named `"adapters"` reports `status: "healthy" | "warning" | "critical"`. It tells you which adapter Rocky expects to work and which one it cannot currently reach. Treat doctor as a credentials and connectivity smoke test.
 2. For a **transient** failure, entries with `failure_kind: "transient"` or `"connection-failed"` on `errors[*]`, note that the engine already retried it in-run (see [Classified retry](#classified-retry)). A failure that still surfaced has exhausted its retry budget. Once the underlying condition clears, run `rocky plan --resume-latest && rocky apply <plan-id>` to pick up where the run stopped. The single-step `rocky run --resume-latest` alias does the same thing.
-3. For an **auth** failure, walk the adapter's auth chain, for example Snowflake's OAuth → JWT → password order. Check the env vars and the `rocky.toml` config against the [authentication guide](../../reference/authentication), which has a per-adapter checklist.
-4. For a **quota** failure, check the warehouse's own quota dashboard. Rocky's adaptive concurrency (the Databricks AIMD throttle) backs off automatically, but a hard quota reset happens warehouse-side.
+3. For an **auth** failure, walk the adapter's auth order, for example Snowflake's PAT → OAuth → key-pair JWT → password. Check the env vars and the `rocky.toml` config against [Authentication](/reference/authentication/).
+4. For a **quota** failure, check the warehouse's own quota dashboard. Rocky's adaptive concurrency (an AIMD throttle: it adds one slot at a time and halves on a rate limit) backs off automatically, but a hard quota reset happens warehouse-side.
 5. For a **statement timeout**, raise `timeout_secs` on the adapter. Better, ask whether the model's [materialization strategy](/reference/glossary/#materialization-strategy) is right. A multi-hour `FullRefresh` is often a missed `Merge` or `Incremental`; `rocky optimize` surfaces the recommendation.
 
 ---
@@ -321,19 +321,19 @@ Hook failures look like runtime failures. The fix is in your hook script or webh
 
 ## 8. Cost / budget violations
 
-**Definition.** A model cost more to run than the `[budget]` block in its sidecar `.toml` allows. Or the project-level cost projection flagged a pull request as over budget against the base ref.
+**Definition.** A run cost more, ran longer, or scanned more than the project [`[budget]`](/reference/configuration/#budget) block in `rocky.toml` allows. Or a model's projected cost is over its sidecar `[budget]` (`E027` at compile time). Or the cost projection flagged a pull request as over budget against the base ref.
 
-**Detection signal.** Two signals, one after the run and one before it. After a run, `RunOutput.budget_breaches[]` holds a `BudgetBreachOutput` per breach, with `actual`, `limit`, and `limit_type`. Before a run, the `rocky preview cost` output's `summary.delta_usd` compares the branch with the base. Setting `on_breach = "error"` in the `[budget]` block turns a per-model breach from a warning into a non-zero `rocky apply` exit.
+**Detection signal.** Two signals, one after the run and one before it. After a run, `RunOutput.budget_breaches[]` holds a `BudgetBreachOutput` per breach, with `actual`, `limit`, and `limit_type`. Before a run, the `rocky preview cost` output's `summary.delta_usd` compares the branch with the base. Setting `on_breach = "error"` in the project `[budget]` block turns a breach from a warning into a non-zero `rocky apply` exit.
 
 **Recovery playbook.**
 
 1. Run `rocky cost --output json` for the current projection, broken down per model.
-2. For an **expected** violation, where the model deliberately got more expensive or you are backfilling a wider date range, raise `[budget].max_usd` in the model's sidecar.
+2. For an **expected** violation, where the model deliberately got more expensive or you are backfilling a wider date range, raise `max_usd` in the project `[budget]` block. For `E027`, raise it in the model's sidecar `[budget]`.
 3. For an **unexpected** violation, where the cost spiked without a known cause, check three things:
    - Did the `MaterializationStrategy` change recently, for example `Merge` → `FullRefresh`? `rocky optimize --output json` recommends a cheaper strategy when one fits.
    - Did the upstream row count grow? `rocky history --model <name>` shows the row-count history.
    - Is the SQL doing a cross-join or another antipattern? Run `rocky lineage <model> --column <name>`. It traces that column back through the upstream columns feeding it, and labels each edge with the transform. It reports no cost of its own, so you read the path and judge which join is doing the work.
-4. For PR-time violations, the [`rocky-preview` GitHub Action](../../guides/preview-a-pr) renders the cost delta in the PR comment, so reviewers see it before merge.
+4. For PR-time violations, the [`rocky-preview` GitHub Action](/guides/preview-a-pr/) renders the cost delta in the PR comment, so reviewers see it before merge.
 
 **Why budgets warn by default.** Cost is a signal, not a gate, until you have calibrated budgets against real usage. Switch to `on_breach = "error"` once your `[budget]` blocks reflect reality. Until then, the `rocky cost` warning on every PR is the calibration loop.
 
@@ -341,7 +341,7 @@ Hook failures look like runtime failures. The fix is in your hook script or webh
 
 ## 9. Governance failures
 
-**Definition.** Something in Rocky's [governance layer](../../guides/governance) did not apply cleanly. That layer covers permissions, classification, masking, and retention. Three cases are typical. The warehouse rejected a permission diff. A mask classification did not resolve to a strategy. A retention sweep could not acquire its target.
+**Definition.** Something in Rocky's [governance layer](/guides/governance/) did not apply cleanly. That layer covers permissions, classification, masking, and retention. Three cases are typical. The warehouse rejected a permission diff. A mask classification did not resolve to a strategy. A retention sweep could not acquire its target.
 
 **Detection signal.**
 
@@ -355,8 +355,8 @@ Hook failures look like runtime failures. The fix is in your hook script or webh
 **Recovery playbook.**
 
 1. **Permission rejected.** The cause is usually a missing principal: a group or user the warehouse does not know. It can also be a missing parent grant, such as `USE CATALOG` before `USE SCHEMA`. The warehouse's own error text sits verbatim in the diff entry. Act on it directly.
-2. **Unresolved classification (`W004`).** Add the tag to a `[mask]` or `[mask.<env>]` block in `rocky.toml`. Or list it under `[classifications.allow_unmasked]` to opt out on the record. Rocky denies the implicit-allow path by design, so it surfaces the unresolved tag rather than leaking the column.
-3. **Mask mismatch.** Re-run `rocky plan --env <env>` to preview what Rocky would apply. The active env's `[mask.<env>]` block overrides the workspace `[mask]` defaults. If the override does not take effect, check the env name spelling and the inheritance order in the [governance guide](../../guides/governance).
+2. **Unresolved classification (`W004`).** Add the tag to a `[mask]` or `[mask.<env>]` block in `rocky.toml`. Or list it in `[classifications] allow_unmasked` to opt out on the record. Rocky denies the implicit-allow path by design, so it surfaces the unresolved tag rather than leaking the column.
+3. **Mask mismatch.** Re-run `rocky plan --env <env>` to preview what Rocky would apply. The active env's `[mask.<env>]` block overrides the workspace `[mask]` defaults. If the override does not take effect, check the env name spelling and the inheritance order in the [governance guide](/guides/governance/).
 4. **Retention sweep failure.** The cause is usually a missing partition column or a permissions problem on the target. Run `rocky doctor --output json` to confirm the adapter holds the right grants on the target schema.
 
 Permissions and masking apply *after* a successful materialisation. So a governance failure means the data landed but is not fully wired into your access model. Recovery is rarely urgent, but it must close before your next compliance audit.
@@ -367,8 +367,8 @@ Permissions and masking apply *after* a successful materialisation. So a governa
 
 - [Per-table error containment](/advanced/per-table-error-containment/): how the run path isolates failures at the table boundary and how to consume the `failure_kind` discriminator
 - [Troubleshooting](/advanced/troubleshooting/): symptom-first lookup ("I got error X")
-- [`rocky doctor`](../../reference/cli#doctor): aggregate health check across config, state, adapters, pipelines
-- [`rocky plan --resume-latest`](../../reference/cli#run): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
-- [Schema drift](../../concepts/schema-drift): graduated drift handling deep dive
-- [Data quality checks](../../concepts/data-quality-checks): inline check authoring + result shape
-- [Governance guide](../../guides/governance): permissions, classification, masking, retention
+- [`rocky doctor`](/reference/commands/development/#rocky-doctor): aggregate health check across config, state, adapters, pipelines
+- [`rocky plan --resume-latest`](/reference/commands/core-pipeline/#rocky-plan): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
+- [Schema drift](/concepts/schema-drift/): graduated drift handling deep dive
+- [Data quality checks](/concepts/data-quality-checks/): inline check authoring + result shape
+- [Governance guide](/guides/governance/): permissions, classification, masking, retention

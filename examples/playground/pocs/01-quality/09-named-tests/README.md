@@ -77,6 +77,8 @@ generates the assertion SQL for the active dialect.
 ./run.sh
 ```
 
+`run.sh` needs `rocky`, the `duckdb` CLI and `jq` on `PATH`.
+
 The script materializes both marts on DuckDB, runs `rocky test --models models`
 (every model compiles + executes), then runs `rocky test --declarative` to
 execute and **name** each resolved assertion. It asserts all four applications

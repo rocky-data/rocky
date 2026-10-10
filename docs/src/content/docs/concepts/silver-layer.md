@@ -66,10 +66,10 @@ Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | Yes | Model identifier, used in `depends_on` references |
+| `name` | No | Model identifier, used in `depends_on` references; defaults to the file name |
 | `depends_on` | No | List of upstream model names (execution order) |
 | `[strategy]` | No | Materialization config (see below); defaults to `full_refresh` |
-| `[target]` | Yes | Output table: `{ catalog, schema, table }` |
+| `[target]` | Yes | Output table: `{ catalog, schema, table }`. A config group or `_defaults.toml` can supply `catalog` and `schema`; `table` defaults to the model name |
 | `[[sources]]` | No | Input tables (for documentation and lineage) |
 
 ### `[strategy]`
@@ -167,13 +167,24 @@ WHEN NOT MATCHED THEN INSERT *
 
 ## Materialization strategies
 
-| Strategy | When to use | Adapters |
+A model takes one of these `[strategy] type` values. The
+[strategy examples](/reference/model-format/#strategy-examples) in the model
+format reference show each one in full.
+
+| Strategy | When to use | Known warehouse limits |
 |---|---|---|
-| [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | All |
-| [`merge`](#merge) | SCDs, upserts by key | All |
-| [`time_interval`](/concepts/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | All |
-| `materialized_view` | Warehouse-managed view refresh | Databricks, Snowflake, BigQuery |
+| [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | — |
+| [`incremental`](#incremental) | Append only the rows newer than the watermark | — |
+| [`merge`](#merge) | SCDs, upserts by key | Not on Trino or ClickHouse |
+| `delete_insert` | Rewrite the rows that match a partition key | — |
+| [`time_interval`](/concepts/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | — |
+| `microbatch` | `time_interval` with hourly defaults | — |
+| `view` | A view, no stored rows | — |
+| `ephemeral` | Never built; inlined into the models that read it | — |
+| `materialized_view` | Warehouse-managed view refresh | Databricks, Snowflake, BigQuery, PostgreSQL, Redshift |
 | `dynamic_table` | Target-lag managed tables | Snowflake |
+| [`content_addressed`](/concepts/content-addressed/) | Hash-named Parquet files with a Delta log commit | See its page |
+| `snapshot` | Keep row history (SCD Type 2) | See the model format reference |
 
 ### full_refresh (default)
 
