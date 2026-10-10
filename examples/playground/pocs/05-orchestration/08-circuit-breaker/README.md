@@ -1,4 +1,4 @@
-# 08-circuit-breaker — Trust arc 3: retry policy + three-state circuit breaker
+# 08-circuit-breaker — retry policy + three-state circuit breaker
 
 > **Category:** 05-orchestration
 > **Credentials:** none to validate the config; Databricks/Snowflake to observe the breaker fire
@@ -7,8 +7,9 @@
 
 ## What it shows
 
-The deploy-safety side of Arc 3: adapter operations run behind an
-exponential-backoff retry policy and a three-state circuit breaker.
+Adapter operations run behind an exponential-backoff retry policy and a
+three-state circuit breaker. A circuit breaker stops calling a failing
+warehouse after N failures in a row, then tries again after a timeout.
 
 **TOML surface:**
 
@@ -35,9 +36,9 @@ event bus: `circuit_breaker_tripped` (Closed/HalfOpen → Open) and
 - **Trust-grade resilience is a warehouse-adapter concern, not a user
   concern.** The breaker lives in the Rust crates; you configure it
   declaratively in `rocky.toml`.
-- **The retry policy and breaker are observable.** Transitions emit
-  events and can feed a hook (future `event_hooks` bridge, Arc 3
-  wave 2). You get back pressure, not silent failure.
+- **The retry policy and breaker are observable.** Each state change
+  emits an event on the run's event bus. You get back pressure, not silent
+  failure.
 
 ## Layout
 
@@ -75,10 +76,10 @@ event bus: `circuit_breaker_tripped` (Closed/HalfOpen → Open) and
   `engine/crates/rocky-core/src/config.rs` (`RetryConfig`)
 - Adapters wired: `rocky-databricks/src/connector.rs`,
   `rocky-snowflake/src/connector.rs`
-- **State backend wired (v1.13.0+):** `[state.retry]` shares the exact
+- **State backend wired:** `[state.retry]` shares the exact
   shape and semantics of `[adapter.NAME.retry]`: same `RetryConfig`,
   same breaker, same events. See [`03-remote-state-s3/`](../03-remote-state-s3/)
   for a live MinIO demo that includes the retry block and a
   `rocky doctor --check state_rw` cold-start probe.
 - Sibling POC: [`04-checkpoint-resume/`](../04-checkpoint-resume/)
-  covers the other half of Arc 3: state-store-backed resume.
+  covers state-store-backed resume after a partial failure.

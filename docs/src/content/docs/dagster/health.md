@@ -118,9 +118,3 @@ put, get, and delete round-trip against the backend.
 
 Either path tolerates a missing binary or an unreadable store. Fields degrade to
 `None` instead of raising, so it is safe to call on every sensor tick.
-
-## Why the healthcheck is a function, not a resource method
-
-`rocky_healthcheck` lives outside `RockyResource` because the resource is a
-frozen Pydantic model. Adding a method for each new idea churns the resource
-module. The function can become a method later, once it settles.

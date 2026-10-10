@@ -28,10 +28,9 @@ attributes:
 
 When loaded, the code location now exposes:
 
-- **Source-replication assets** (one per discovered table): the
-  existing behavior.
-- **Derived-model assets** (one per compiled model in `models_detail`),
-  new in 0.4.
+- **Source-replication assets**, one per discovered table.
+- **Derived-model assets**, one per compiled model in `models_detail`.
+  Ephemeral models are skipped, because nothing materializes them.
 
 Each derived-model asset gets:
 
@@ -47,11 +46,13 @@ Each derived-model asset gets:
   block merged over any config-group baseline. A governance tag then works
   in asset selection: `dagster asset materialize --select tag:domain=finance`.
 - **Kinds:** `{"rocky", "model"}` for UI badges.
-- **Freshness policy:** from `model.freshness` (`[freshness]
-  max_lag_seconds` in the model's TOML frontmatter).
+- **Freshness policy:** from the model's `[freshness]` block
+  (`expected_lag_seconds`, or the legacy `max_lag_seconds`). See
+  [Freshness policies](/dagster/freshness/#per-model-freshness).
 - **Partitions definition:** from the model's `time_interval` strategy
-  via `partitions_def_for_model_detail`. `None` for `full_refresh` /
-  `merge`.
+  via `partitions_def_for_model_detail`. `None` for every other strategy.
+- **Contract checks:** none. See
+  [Which assets get contract checks](/dagster/contracts/#which-assets-get-contract-checks).
 - **Optimize metadata:** when `surface_optimize_metadata=True`, the
   `rocky optimize` recommendations for matching models are merged into
   `AssetSpec.metadata`.
@@ -95,7 +96,7 @@ The engine requires `--filter`, so `<sentinel>` targets the first discovered
 source and the command is accepted. That filter pass does run its
 source-replication materializations on the warehouse. **Dagster only sees the
 derived-model events**, because the multi-asset declares only derived-model
-`AssetSpec` instances. `_emit_results` drops the source-replication events.
+`AssetSpec` instances. The component drops the source-replication events.
 
 For partitioned multi-assets, the partition flags are threaded from
 Dagster's execution context:

@@ -10,8 +10,7 @@ model, such as a single day. Rocky's `time_interval` materialization
 strategy says a model is partitioned by a time column at a fixed
 granularity: `hour`, `day`, `month`, or `year`.
 
-`dagster-rocky` ships `partitions.py`. It converts those strategies into
-Dagster's
+`dagster-rocky` converts those strategies into Dagster's
 [`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
 variants. The translation happens twice, once when Dagster loads your
 definitions and once on every run:
@@ -79,10 +78,9 @@ The higher-level builder. It takes a `ModelDetail` from
 `CompileResult.models_detail`. When the strategy discriminator says
 `time_interval`, it calls the pure builder above.
 
-It returns `None` for every other strategy: `full_refresh`,
-`merge`, `delete_insert`, and `view`. It also
-returns `None` for `microbatch` today, even though that strategy is
-time-based.
+It returns `None` for every other strategy, for example `full_refresh`,
+`incremental`, `merge`, `delete_insert`, and `view`. It also returns `None`
+for `microbatch`, even though that strategy is time-based.
 
 ```python
 from dagster_rocky import partitions_def_for_model_detail, RockyResource

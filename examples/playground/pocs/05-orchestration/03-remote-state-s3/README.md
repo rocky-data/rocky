@@ -13,7 +13,7 @@ flow without an account.
 
 The demo runs:
 
-0. **`state_rw` probe** (v1.13.0+) — `rocky doctor --check state_rw` round-trips a marker object against MinIO *before* any pipeline work so IAM / reachability problems surface at cold start instead of end-of-run upload.
+0. **`state_rw` probe** — `rocky doctor --check state_rw` round-trips a marker object against MinIO *before* any pipeline work so IAM / reachability problems surface at cold start instead of end-of-run upload.
 1. **Initial load** — 100 rows replicated, state uploaded to MinIO (under the retry + circuit-breaker policy configured in `[state.retry]`).
 2. **Incremental run** — 25 delta rows appended, only new rows replicated (watermark persisted via S3).
 3. **Round-trip restore** — local state file deleted, re-downloaded from S3 on next run, proving zero duplicate rows.
@@ -37,6 +37,12 @@ data/seed_delta.sql     # 25 delta rows for incremental run
 run.sh                  # End-to-end demo: state_rw probe + 3 runs + S3 round-trip
 expected/               # Captured JSON output (gitignored)
 ```
+
+## Prerequisites
+
+- `rocky` and the `duckdb` CLI on `PATH`
+- `docker` + `docker compose` for MinIO
+- The `aws` CLI, only to list the bucket contents in the output (optional)
 
 ## Run
 
@@ -70,7 +76,7 @@ Without Docker, the script shows config validation only.
     orders  2026-04-01 00:01:00  ...
 
 === S3 state after run 1 (MinIO bucket) ===
-    [DATE]  8.0K playground/state.redb
+    [DATE]  8.0K playground/v32/state.redb
 
 === Append delta (25 new rows, later timestamps) ===
     source rows: 125
@@ -81,7 +87,7 @@ Without Docker, the script shows config validation only.
     orders  2026-05-01 00:25:00  ...
 
 === S3 state after run 2 ===
-    [DATE]  8.0K playground/state.redb
+    [DATE]  8.0K playground/v32/state.redb
 
 === Round-trip test: delete local state, re-download from S3 ===
     local state deleted: ls: .rocky-state.redb: No such file or directory
@@ -94,6 +100,8 @@ Without Docker, the script shows config validation only.
 
 POC complete: S3 state sync (upload + download) via MinIO.
 ```
+
+The object key includes the state schema version (`v32` in engine 1.80.0).
 
 Key observation: after deleting the local state and re-running, the target
 still has exactly 125 rows (not 225). The watermark was restored from S3,

@@ -540,34 +540,17 @@ rocky serve --models src/models --contracts src/contracts --port 9090 --watch
 
 ## `rocky lsp`
 
-Start a Language Server Protocol server for IDE integration. Provides diagnostics, completions, hover information, and go-to-definition for Rocky SQL models.
+Start the language server for editors. It gives diagnostics, completions, hover information and go-to-definition for Rocky models. It talks over stdin and stdout. An editor starts it; you rarely run it by hand.
 
 ```bash
 rocky lsp
 ```
 
-### Flags
+No command-specific flags. A hidden `--stdio` flag is accepted for editors that pass it. Stdio is always the transport.
 
-No command-specific flags. The LSP server communicates over stdin/stdout per the LSP specification.
+In VS Code, the Rocky extension starts `rocky lsp` for you. `rocky.server.path` sets the binary (default `rocky`), and `rocky.server.extraArgs` adds arguments.
 
-### Examples
-
-Start the LSP server (typically called by an editor, not directly):
-
-```bash
-rocky lsp
-```
-
-Configure in VS Code (`settings.json`):
-
-```json
-{
-  "rocky.lsp.path": "rocky",
-  "rocky.lsp.args": ["lsp"]
-}
-```
-
-Configure in Neovim (with lspconfig):
+In Neovim, with `lspconfig`:
 
 ```lua
 require('lspconfig').rocky.setup({
@@ -581,97 +564,75 @@ require('lspconfig').rocky.setup({
 
 ### Related Commands
 
-- [`rocky serve`](#rocky-serve) -- HTTP API server (alternative integration method)
-- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- the LSP uses the same compilation engine
+- [`rocky serve`](#rocky-serve) -- the HTTP API and browser UI
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- the LSP uses the same compiler
 
 ---
 
 ## `rocky init-adapter`
 
-Scaffold a new warehouse adapter crate. Creates the directory structure, Cargo.toml, and trait implementation stubs for building a custom adapter (e.g., BigQuery, Redshift, Snowflake).
+Scaffold a new warehouse adapter crate under `crates/rocky-<name>/`. Run it from the engine workspace root. It refuses when the directory already exists.
 
 ```bash
 rocky init-adapter <name>
 ```
 
-### Arguments
-
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `name` | `string` | **(required)** | Adapter name (e.g., `bigquery`, `redshift`, `snowflake`). |
-
-### Examples
-
-Scaffold a BigQuery adapter:
+| `name` | `string` | **(required)** | Adapter name, for example `redshift`. The crate is `rocky-<name>`. |
 
 ```bash
-rocky init-adapter bigquery
+rocky init-adapter redshift
 ```
 
 ```
-Created crates/rocky-bigquery/Cargo.toml
-Created crates/rocky-bigquery/src/lib.rs
-Created crates/rocky-bigquery/src/connector.rs
-Created crates/rocky-bigquery/src/auth.rs
+Created adapter scaffold at crates/rocky-redshift/
 
-Adapter scaffold ready at crates/rocky-bigquery/
-Implement the WarehouseAdapter trait in src/connector.rs to get started.
+  crates/rocky-redshift/
+  ├── Cargo.toml
+  ├── src/
+  │   ├── lib.rs
+  │   ├── dialect.rs     ← SqlDialect trait (TODO: implement methods)
+  │   ├── adapter.rs     ← WarehouseAdapter trait (TODO: implement)
+  │   └── types.rs       ← TypeMapper trait
+  └── tests/
+      └── integration.rs ← Live tests (#[ignore])
 ```
 
-Scaffold a Snowflake adapter:
-
-```bash
-rocky init-adapter snowflake
-```
-
-```
-Created crates/rocky-snowflake/Cargo.toml
-Created crates/rocky-snowflake/src/lib.rs
-Created crates/rocky-snowflake/src/connector.rs
-Created crates/rocky-snowflake/src/auth.rs
-
-Adapter scaffold ready at crates/rocky-snowflake/
-Implement the WarehouseAdapter trait in src/connector.rs to get started.
-```
+The command then prints the next steps: add the crate to the workspace, choose `literal_escape` in `dialect.rs` (the crate does not compile until you do), implement the traits, and register the adapter in `registry.rs`.
 
 ### Related Commands
 
-- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- compile models using the new adapter
-- [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- validate config after registering the adapter
+- [`rocky test-adapter`](#rocky-test-adapter) -- run the conformance suite against the adapter
+- [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- check a config that uses it
 
 ---
 
 ## `rocky hooks`
 
-Manage lifecycle hooks configured in rocky.toml.
-
-### `rocky hooks list`
-
-List all configured hooks.
+List the lifecycle hooks configured in `rocky.toml`, or fire a test event at them.
 
 ```bash
 rocky hooks list
-```
-
-### `rocky hooks test`
-
-Fire a synthetic test event to validate hook scripts.
-
-```bash
-rocky hooks test <EVENT>
+rocky hooks test <event>
 ```
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `EVENT` | string | Event name (e.g., `on_pipeline_start`, `on_materialize_error`) |
+| `event` | `string` | Event name for `hooks test`, for example `on_pipeline_start` or `on_materialize_error`. |
 
-### Examples
+`hooks test` builds a synthetic context for the event, prints it, and runs every hook configured for that event.
 
 ```bash
 $ rocky hooks test on_pipeline_start
 Firing test event: on_pipeline_start
-Hook 'bash scripts/notify.sh': OK (exit 0, 120ms)
+Context JSON:
+{ ... }
+
+All hooks passed.
 ```
+
+See [Hooks](/concepts/hooks/) for the events and the config.
 
 ---
 
@@ -781,53 +742,107 @@ is zero (the status keys on failures).
 
 ## `rocky doctor`
 
-Health checks for your Rocky project: config validation, local state store integrity, adapter connectivity, pipeline consistency, state backend configuration, live state read/write, and auth verification.
+Run health checks on the project and report each result. It exits `3` when any check is `critical`, and `0` otherwise.
 
 ```bash
-rocky doctor                     # Run all checks
-rocky doctor --check config      # Run only the config check
-rocky doctor --check auth        # Verify credentials + connectivity for all adapters
-rocky doctor --check state_rw    # Round-trip a marker object against the state backend
-rocky doctor --verbose           # Add per-check context to human-readable output
+rocky doctor [--check <NAME>] [--verbose]
 ```
 
-The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an adapter-specific cheaper query) and each discovery adapter. Reports per-adapter pass/fail with latency.
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--check <NAME>` | `string` | (all) | Run only the check with this name, from the table below. A name that matches no check runs nothing. |
+| `--verbose` | `bool` | `false` | Add context under each check. In JSON, each check gains a `details` array of `[key, value]` pairs. Without the flag, `details` is left out. |
 
-The `state_rw` check (v1.13.0+) runs a put → get → delete probe against the configured state backend so IAM and reachability problems surface at cold start rather than at end-of-run upload. Local backend is a no-op; tiered probes both legs.
+| Check | What it checks |
+|-------|----------------|
+| `config` | `rocky.toml` parses, and its adapters and pipelines are valid. |
+| `state` | The local state store is readable and not corrupted. |
+| `state_schema` | The state store's schema version. `critical` when the store was written by a newer engine than this binary. |
+| `adapters` | Each adapter's configuration, without connecting. |
+| `pipelines` | Schema patterns, templates and governance config. |
+| `state_sync` | The configured remote state backend (type only). |
+| `state_rw` | A put, get and delete of a marker object on the state backend, so access and reachability problems show at start-up. No-op for `local`; `tiered` probes both legs. |
+| `state_concurrency` | Lost-update exposure of a remote `[state]` backend. See below. Silent for `local`. |
+| `auth`, `auth/<adapter>` | Pings each warehouse and discovery adapter to check credentials and connectivity. |
+| `scheduler` | `critical` when the scheduler's `.rocky/tick.lock` is held with a stale heartbeat. A warning when no tick ran for twice the shortest cron interval. Silent when no pipeline has a `[schedule]`. |
+| `spool` | Webhook demands that a tick quarantined as unreadable. Silent when the spool does not exist. A spool that exists but cannot be read is a warning. |
 
-The `--verbose` flag (v1.20.0+) prints extra context under each check:
+**`state_concurrency`.** Rocky resolves the concurrency mode as a writer does at start-up. An unset `concurrency_control` takes the backend default, and `"cas"` (compare-and-swap) runs a conditional-write probe.
 
-- the config path and the state file's size;
-- each adapter's type and its credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`);
-- each pipeline's kind (`replication`, `transformation`, `quality`, or `snapshot`);
-- the state backend.
+- Healthy: the mode resolves to `"cas"` and the store supports it. The end-of-run upload and every ledger write (`rocky policy`, `rocky gc`, `rocky restore`, `rocky apply`) commit by compare-and-swap.
+- Critical: `"cas"` is explicit, and the probe shows the store ignores conditional writes.
+- Warning, each with its own message: the mode is `"off"` but the `cas-required` marker exists, so uploads will be refused; an unset mode fell back to `"off"`; the probe was inconclusive; `"off"` is explicit; or `"cas"` is set on a backend with no compare-and-swap write.
+- `--verbose` adds `resolved`, `cas_probe` and `cas_required_marker`.
 
-Without `--verbose`, JSON output is unchanged. The `details` array on each `HealthCheck` only serializes when it has content, so an existing consumer sees a byte-stable envelope.
+With `--verbose`, the other checks add the config path, the state file size, each adapter's type and credential signal, each pipeline's kind, and the state backend. The credential signal is one of `token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env` or `none`.
 
-See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
+```bash
+rocky doctor --check auth
+```
+
+```json
+{
+  "command": "doctor",
+  "overall": "warning",
+  "checks": [
+    { "name": "config", "status": "healthy", "message": "rocky.toml valid", "duration_ms": 4 },
+    { "name": "state", "status": "healthy", "message": "state store readable", "duration_ms": 2 },
+    { "name": "adapters", "status": "warning", "message": "adapter.fivetran: API key not set", "duration_ms": 120 }
+  ],
+  "suggestions": [
+    "Set FIVETRAN_API_KEY to enable the Fivetran discovery adapter."
+  ]
+}
+```
+
+`overall` is `critical` when any check is critical, `warning` when any check warns, and `healthy` otherwise.
 
 ---
 
 ## `rocky list`
 
-Inspect project contents without running a pipeline.
+List what the project holds, without running anything.
 
 ```bash
-rocky list pipelines         # Pipeline definitions (type, adapters, depends_on)
-rocky list adapters          # Adapter configurations (type, host)
-rocky list models            # Transformation models (target, strategy, contract, deps)
-rocky list sources           # Replication source configurations
-rocky list deps <model>      # What this model depends on
-rocky list consumers <model> # What depends on this model
+rocky list pipelines           # pipeline definitions
+rocky list adapters            # adapter configurations
+rocky list models              # transformation models
+rocky list sources             # replication source configurations
+rocky list deps <model>        # what a model depends on
+rocky list consumers <model>   # what depends on a model
 ```
 
-Every subcommand supports `--output json` via `-o json`. Rocky finds models in the `models/` directory and in its immediate subdirectories, which covers the common `models/{layer}/` layout.
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Accepted by bare `rocky list`, `models`, `deps` and `consumers`. |
+| `--select`, `--exclude`, `--state-ref`, `--state-working-tree` | `string` | (all) | [Node selection](/reference/node-selection/). Accepted by bare `rocky list` and `rocky list models`. |
 
-`rocky list models` takes `--select`, `--exclude`, and `--state-ref` and lists only the selected models. Bare `rocky list` lists models too, so `rocky list --select +fct_orders` works like `dbt ls`. The JSON shape is the same as `rocky list models`. See [Node selection](/reference/node-selection/).
+Bare `rocky list` lists models, so `rocky list --select +fct_orders` works like `dbt ls`. Its JSON is the same as `rocky list models`. Rocky finds models in the models directory and its direct subdirectories, which covers the common `models/{layer}/` layout.
 
-See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
+```
+$ rocky -o table list pipelines
+NAME                      TYPE             TARGET               SOURCE               DEPENDS ON
+playground                replication      default              default              -
+```
+
+```json
+{
+  "version": "1.80.0",
+  "command": "list_pipelines",
+  "pipelines": [
+    {
+      "name": "playground",
+      "pipeline_type": "replication",
+      "target_adapter": "default",
+      "source_adapter": "default",
+      "depends_on": [],
+      "concurrency": "16"
+    }
+  ]
+}
+```
 
 ### Related Commands
 
-- [`rocky dag`](/reference/commands/modeling/#rocky-dag) -- the same dependencies as a graph rather than a list
+- [`rocky dag`](/reference/commands/modeling/#rocky-dag) -- the same dependencies as a graph
 - [`rocky catalog`](/reference/commands/modeling/#rocky-catalog) -- export the compiled graph as a lineage snapshot

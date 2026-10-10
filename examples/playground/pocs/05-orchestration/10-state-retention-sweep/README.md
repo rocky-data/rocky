@@ -19,9 +19,11 @@ delivery paths exercised by this POC:
    `sweep_interval_seconds` so a project that runs every minute doesn't
    pay the sweep cost on every invocation.
 
-Operational tables (schema cache, watermarks, partition records,
-branches, idempotency keys, grace periods, run progress, check history)
-are **never** swept regardless of configuration.
+Operational tables (schema cache, watermarks, partition records, loaded
+files, branches, idempotency keys, grace periods, check history) are
+**never** swept, whatever the configuration says. A swept run record takes
+its resume checkpoint with it, unless that checkpoint still needs watermark
+recovery or still owes post-copy checks.
 
 ## Why it's distinctive
 
@@ -47,8 +49,7 @@ are **never** swept regardless of configuration.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.23.0 on PATH (`rocky state retention sweep` landed in 1.22.0,
-  end-of-run auto-sweep followed in 1.23.0)
+- `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
 - `python3` for the small JSON probes in `run.sh`
 
@@ -98,8 +99,8 @@ are **never** swept regardless of configuration.
 ```toml
 [state.retention]
 max_age_days = 365            # default
-min_runs_kept = 100           # default — the N most recent successful runs
-                              # are preserved unconditionally
+min_runs_kept = 100           # default — the N most recent rows in each
+                              # domain are preserved unconditionally
 applies_to = ["history", "lineage", "audit"]  # domains to sweep
 sweep_interval_seconds = 3600 # default — minimum gap between end-of-run
                               # auto-sweeps; 0 means "every run"
@@ -107,8 +108,8 @@ sweep_budget_ms = 5000        # soft budget; exceeding flips the per-run
                               # log line from debug to warn
 ```
 
-Set `applies_to = []` to disable auto-sweep without removing the manual
-subcommand.
+Set `applies_to = []` to turn the sweep off (manual and automatic) without
+removing the block.
 
 ## Related
 

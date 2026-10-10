@@ -18,17 +18,22 @@ The project ships two models:
 - `customer_revenue` — an intent-annotated downstream rollup that groups
   orders by `customer_id`. Its `intent` is the contract ai-sync syncs against.
 
-## Current behavior (important)
+## How the upstream baseline works
 
-Upstream schema-change *detection* is **not yet wired** in the engine: the
-state store does not snapshot prior compilations, so `ai-sync` cannot diff a
-"before" schema against an "after" one. Proposals are therefore driven by the
-model's **declared intent alone**, with no upstream column-added / removed /
-renamed diff. The CLI prints this same caveat at the top of its output
-(`proposals are based on declared model intent only …`).
+`ai-sync` stores each model's upstream column types in a snapshot next to the
+state store (`<state>.ai-sync.json`). A later sync diffs the current upstream
+types against that baseline and feeds the changes into the prompt.
 
-Once compile-snapshot persistence lands, the same command will additionally
-feed detected upstream changes into the prompt.
+```
+first sync ──▶ no baseline: proposal uses intent only, baseline saved
+later sync ──▶ diff upstream types vs baseline ──▶ changes go into the prompt
+--apply    ──▶ writes the proposal and advances that model's baseline
+```
+
+`run.sh` runs one sync without `--apply`, so on a clean checkout every model
+is a first sync. The CLI prints `Note: no upstream schema snapshot existed …
+Their proposals follow declared intent only.` To see a diff, change an upstream
+column and run `rocky ai-sync --models models` again.
 
 ## Why it's distinctive
 
@@ -56,5 +61,5 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ./run.sh
 ```
 
-`run.sh` compiles the models and runs `rocky ai-sync`, writing the proposals
-to `expected/sync.log`.
+`run.sh` runs `rocky ai-sync --models models` (a dry run) and writes the
+proposals to `expected/sync.log`.

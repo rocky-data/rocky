@@ -107,9 +107,9 @@ How Rocky avoids rebuilding what has not changed. These POCs cover the increment
 | [03-partition-checksum](pocs/02-performance/03-partition-checksum) | `time_interval` strategy — re-running a partition (DELETE + INSERT) picks up late-arriving rows; `--partition`, `--from`/`--to` |
 | [04-column-propagation](pocs/02-performance/04-column-propagation) | `rocky lineage --column` on a 3-model chain — `status` reaches the downstream model, `amount` dead-ends |
 | [05-optimize-recommendations](pocs/02-performance/05-optimize-recommendations) | `rocky optimize` + `profile-storage` + `compact --dry-run` after building run history |
-| [06-schema-drift-recover](pocs/02-performance/06-schema-drift-recover) | Drift detection auto-widening `STRING→INT`, unsafe changes via `DROP+RECREATE` |
+| [06-schema-drift-recover](pocs/02-performance/06-schema-drift-recover) | Source type drift (`DECIMAL→VARCHAR`) detected on the next incremental run; an unsafe change triggers `DROP+RECREATE` |
 | [07-view-intermediate](pocs/02-performance/07-view-intermediate) | `strategy = "view"` — a shared intermediate that copies no data |
-| [08-delete-insert-partitioned](pocs/02-performance/08-delete-insert-partitioned) | `strategy = "delete_insert"` with `partition_by` — atomic partition replacement without MERGE |
+| [08-delete-insert-partitioned](pocs/02-performance/08-delete-insert-partitioned) | `strategy = "delete_insert"` with `partition_by` — partition replacement without MERGE (compile only; DELETE and INSERT are not one transaction on DuckDB) |
 | [09-adaptive-concurrency](pocs/02-performance/09-adaptive-concurrency) | AIMD throttling — dynamic parallelism with `concurrency`, `error_rate_abort_pct`, `table_retries` |
 | [10-cost-budgets](pocs/02-performance/10-cost-budgets) | **Trust arc 2** — per-run `cost_summary` + `[budget]` block + `budget_breach` record |
 | [11-strategy-showcase](pocs/02-performance/11-strategy-showcase) | Three strategies side-by-side on one source: `full_refresh` + `incremental` + `merge`, with a cheat-sheet README |

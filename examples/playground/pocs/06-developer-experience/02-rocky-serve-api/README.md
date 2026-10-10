@@ -13,8 +13,9 @@ It listens on port 8080 by default. `run.sh` starts it with
 9876. Embed the API into custom dashboards or IDE plugins.
 
 `rocky serve` also takes `--watch`, which recompiles when a model file
-changes. This POC does not pass it: the script starts the server, reads
-four endpoints, and stops.
+changes, and `--ui`, which serves the Rocky browser UI at `/ui/`. This POC
+passes neither: the script starts the server, reads four endpoints, and
+stops.
 
 ## Endpoints
 
@@ -25,6 +26,9 @@ All routes are served under the `/api/v1` prefix:
 - `GET /api/v1/models/:model/lineage` — lineage for one model
 - `GET /api/v1/dag` — full DAG
 - `GET /api/v1/meta` — list every route this build serves
+
+The server serves more routes than these (runs, jobs, review, products and
+others). Read `/api/v1/meta` for the full list.
 
 ## Run
 

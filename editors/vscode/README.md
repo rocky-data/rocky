@@ -26,6 +26,8 @@ The extension is a language client. It starts `rocky lsp` and asks it the langua
 
 Rocky reads plain SQL as well as the `.rocky` DSL. The language server attaches to both.
 
+Rocky also has a browser UI. Run `rocky serve --ui` to browse the project and review plans in a browser. See the [browser UI guide](https://rocky-data.dev/guides/browser-ui/).
+
 ## In action
 
 **See the SQL behind the DSL.** Open a model and run `Rocky: Open Compiled SQL`. The compiled SQL appears beside it and refreshes every time you save. Here `!=` becomes a null-safe `IS DISTINCT FROM`, and the post-aggregate filter becomes `HAVING`.
@@ -46,7 +48,7 @@ In the recording below, a PII-classified model flags a column left unmasked. Col
 
 **Editor intelligence**: diagnostics, hover, completion, go-to-definition, find references, rename, quick-fix code actions, signature help, document symbols, and inlay hints for inferred column types. Formatting applies to `.rocky` files only. Folding also works on the `.sql` files under `models/`.
 
-**Syntax**: a TextMate grammar and semantic tokens for `.rocky` files. Snippets cover the DSL operators (`from`, `where`, `derive`, `group`, `join`, `select`, `sort`, `take`, `match`) and the sidecar blocks (`model`, `source`, `target`, `strategy-incremental`).
+**Syntax**: a TextMate grammar and semantic tokens for `.rocky` files. Snippets cover the DSL operators (`from`, `where`, `derive`, `group`, `join`, `select`, `sort`, `take`, `match`) and the sidecar blocks (`model`, `source`, `target`, `strategy-merge`, `strategy-full`).
 
 **Activity bar sidebar**: Get Started, Extension Info, Models, Runs, Sources, Schema, Previews, Branches, and Help. A workspace with no `rocky.toml` shows orientation instead of CLI errors, with buttons for Initialize Rocky Project, Try the Playground, and Open Documentation.
 

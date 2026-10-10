@@ -131,8 +131,8 @@ changed, and what sits downstream in its blast radius. `rocky audit --scorecard
 
 The contract still lists `email`, so dropping it warns (`W010` — a contract
 column left the output) but does **not** hard-error: the plan builds. The proof
-that the agent's refusal came from the *policy plane* and nothing else is step 4b
-of `run.sh`: a human applies the exact same plan, with the exact same `W010` warning present,
+that the agent's refusal came from the *policy plane* and nothing else is step
+4b of `run.sh`: a human applies the exact same plan, with the same `W010` warning,
 and it succeeds. Same plan, same compile, different principal, different outcome.
 
 ## Why the deny cannot be worked around
@@ -153,7 +153,7 @@ costs a human round-trip; a false permit costs correctness.
 
 ## Default posture
 
-Absent a `[policy]` block the plane is never constructed and behaviour is
-identical to today (AI-authored plans require review; everything else is
-ungated). Adopting `[policy]` with only `default_agent_effect = "require_review"`
-reproduces today's gate, then you turn the dial up rule by rule.
+Without a `[policy]` block, Rocky never builds the policy plane. AI-authored
+plans then require review, and everything else is ungated. A `[policy]` block
+with only `default_agent_effect = "require_review"` gives the same gate. You then
+turn the dial up rule by rule.

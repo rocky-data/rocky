@@ -25,7 +25,7 @@ The right entry point depends on what you want to change.
 
 | You want to change | Start here |
 |---|---|
-| How a warehouse executes SQL | `engine/crates/rocky-<name>/` — the adapter crate. Implement `WarehouseAdapter` / `SqlDialect` from `rocky-adapter-sdk`. |
+| How a warehouse executes SQL | `engine/crates/rocky-<name>/` — the adapter crate. Implement `WarehouseAdapter` / `SqlDialect` from `rocky-core::traits`. An out-of-tree process adapter uses `rocky-adapter-sdk` instead. |
 | How SQL is generated from the IR | `engine/crates/rocky-core/src/sql_gen.rs` |
 | What the IR looks like (model shape) | `engine/crates/rocky-ir/src/ir.rs` |
 | The type checker or semantic graph | `engine/crates/rocky-compiler/src/` |
@@ -43,7 +43,7 @@ The right entry point depends on what you want to change.
 | Column lineage extraction | `engine/crates/rocky-sql/src/lineage.rs` |
 | Skip-unchanged gate / hashing | `engine/crates/rocky-sql/src/determinism.rs` + `rocky-ir/src/ir.rs::skip_hash()` |
 | CLI JSON output shape | `engine/crates/rocky-cli/src/output.rs` — then run `just codegen` |
-| A new CLI subcommand | See the `rocky-new-cli-command` skill in `.claude/skills/` |
+| A new CLI subcommand | See the `rocky-new-cli-command` skill in `.agents/skills/` (mirrored in `.claude/skills/`) |
 | The Rocky DSL (`.rocky` files) | `engine/crates/rocky-lang/src/` — then update VS Code grammar too |
 | The LSP server | `engine/crates/rocky-server/src/lsp.rs` |
 | The Dagster integration | `integrations/dagster/src/dagster_rocky/` |
@@ -64,7 +64,7 @@ The IR named above is the [intermediate representation](/reference/glossary/#ir-
 Rocky is a monorepo with five subprojects:
 
 ```
-rocky-data/
+rocky/
 ├── engine/                     # Rust CLI + engine (Cargo workspace)
 ├── sdk/python/                 # rocky-sdk Python client
 ├── integrations/dagster/       # dagster-rocky Python package
@@ -72,7 +72,7 @@ rocky-data/
 ├── examples/playground/        # POC catalog + benchmarks
 ├── docs/                       # Documentation site (Astro + Starlight)
 ├── justfile                    # Cross-project build orchestration
-└── CLAUDE.md                   # Monorepo conventions
+└── AGENTS.md                   # Monorepo conventions
 ```
 
 For the crate-level breakdown of `engine/`, see [Architecture](/concepts/architecture/).
@@ -102,7 +102,7 @@ cargo fmt -- --check
 ### rocky-sdk (Python)
 
 ```bash
-cd rocky-data/sdk/python
+cd rocky/sdk/python
 
 # Install with dev dependencies
 uv sync --dev
@@ -118,7 +118,7 @@ uv run ruff format --check
 ### dagster-rocky (Python)
 
 ```bash
-cd rocky-data/integrations/dagster
+cd rocky/integrations/dagster
 
 # Install with dev dependencies
 uv sync --dev
@@ -134,7 +134,7 @@ uv run ruff format --check
 ### VS Code extension (TypeScript)
 
 ```bash
-cd rocky-data/editors/vscode
+cd rocky/editors/vscode
 
 # Install dependencies
 npm install
@@ -191,7 +191,9 @@ Two kinds of change must land in several subprojects at once. Do each as a singl
 
 1. Edit the relevant `*Output` struct in `engine/crates/rocky-cli/src/output.rs`
 2. Run `just codegen` from the monorepo root to regenerate bindings
-3. Commit the schema and regenerated bindings together with the Rust change
+3. Add a new field by hand to the matching model in `sdk/python/src/rocky_sdk/types.py`
+4. Run `just regen-fixtures` when the output shape changes
+5. Commit the schema, the regenerated bindings and the fixtures together with the Rust change
 
 The `codegen-drift` CI workflow fails any PR whose committed bindings differ from what `just codegen` produces locally. The full cascade is documented in the [JSON contract](/advanced/json-contract/).
 
@@ -201,6 +203,7 @@ The `codegen-drift` CI workflow fails any PR whose committed bindings differ fro
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
 4. `editors/vscode/snippets/rocky.json` (snippets)
+5. `docs/src/content/docs/concepts/rocky-dsl.md` and `docs/rocky-lang-spec.md` (DSL page and full spec)
 
 ## Run the tests
 
@@ -242,7 +245,7 @@ The workflows in `.github/workflows/` are path-filtered. A PR that touches only 
 | `dagster-release.yml` | `dagster-v*` tag | PyPI publish via OIDC |
 | `vscode-ci.yml` | `editors/vscode/**` changes | npm test + eslint |
 | `vscode-release.yml` | `vscode-v*` tag | VS Code Marketplace publish |
-| `codegen-drift.yml` | Any subproject | Validates committed bindings match `just codegen` output |
+| `codegen-drift.yml` | `engine/**`, `schemas/**`, generated bindings, fixtures, POCs | Validates committed bindings and fixtures match `just codegen` / `just regen-fixtures` output |
 
 ## How a release ships
 

@@ -90,6 +90,7 @@ A discovered source (e.g., a Fivetran connector).
 | `source_type` | `str` | Source type (e.g., `"fivetran"`) |
 | `last_sync_at` | `datetime \| None` | Timestamp of last sync |
 | `tables` | `list[TableInfo]` | Tables in this source |
+| `metadata` | `dict` | Adapter-namespaced metadata, such as `fivetran.service` |
 
 ### `TableInfo`
 
@@ -114,10 +115,13 @@ Top-level result from `rocky run`.
 |---|---|---|
 | `version` | `str` | Output schema version |
 | `command` | `str` | Command that produced this output |
+| `status` | `str \| None` | Whole-run status: `"Success"`, `"PartialFailure"`, `"Failure"`, `"SkippedIdempotent"`, or `"SkippedInFlight"` |
 | `filter` | `str` | Filter that was applied |
 | `duration_ms` | `int` | Total execution time in milliseconds |
 | `tables_copied` | `int` | Number of tables copied |
 | `tables_failed` | `int` | Number of tables that failed |
+| `check_gate_failed` | `bool` | `True` when error-severity checks failed and the `fail_on_error` gate failed the run. A run can fail this way with `tables_failed == 0` |
+| `tables_skipped` | `int` | Tables skipped through the idempotency key |
 | `materializations` | `list[MaterializationInfo]` | Materialization details per table |
 | `check_results` | `list[TableCheckResult]` | Check results per table |
 | `errors` | `list[TableError]` | Per-table execution errors |
@@ -236,6 +240,8 @@ A single check result.
 |---|---|---|
 | `name` | `str` | Check name (e.g., `"row_count"`, `"freshness"`) |
 | `passed` | `bool` | Whether the check passed |
+| `severity` | `str \| None` | `"error"` (default) or `"warning"` |
+| `not_evaluated` | `str \| None` | Why the check did not run. When set, the numeric fields are placeholders |
 | `source_count` | `int \| None` | Source row count (for row_count checks) |
 | `target_count` | `int \| None` | Target row count (for row_count checks) |
 | `missing` | `list[str] \| None` | Missing columns (for column_match checks) |
@@ -377,6 +383,7 @@ Per-model summary from compilation.
 | `strategy` | `dict` | Strategy configuration (tagged union) |
 | `target` | `dict[str, str]` | Target catalog/schema/table |
 | `freshness` | `ModelFreshnessConfig \| None` | Per-model freshness config |
+| `depends_on` | `list[str]` | Upstream models |
 | `tags` | `dict[str, str] \| None` | Model governance tags (own + group-inherited), projected onto Dagster asset tags |
 
 ---
@@ -507,7 +514,7 @@ Reads the JSON `command` field, then returns the matching Pydantic model. Suppor
 Two outputs are not on that list. There is no `test-adapter` dispatch entry, so reach that output through `RockyClient.test_adapter()` instead. There is no `drift` command either, because schema drift is reported on `RunResult.drift`.
 
 ```python
-from dagster_rocky import parse_rocky_output
+from dagster_rocky import CompileResult, DoctorResult, RunResult, parse_rocky_output
 
 with open("rocky-output.json") as f:
     result = parse_rocky_output(f.read())

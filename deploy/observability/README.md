@@ -176,6 +176,7 @@ prometheus/prometheus.yml             # metric store
 grafana/provisioning/datasources.yaml # Tempo + Loki + Prometheus (fixed UIDs)
 grafana/provisioning/dashboards.yaml  # dashboard provider
 grafana/dashboards/rocky-runs.json    # the Rocky Runs dashboard
+grafana/dashboards/rocky-scheduler.json # the Rocky Scheduler dashboard
 grafana/alerting/rocky-alerts.yaml    # provisioned alert rules
 ```
 

@@ -60,7 +60,7 @@ cd examples/playground/pocs/05-orchestration/09-idempotency-key
 You should see three JSON outputs showing `status = "Success"` →
 `status = "SkippedIdempotent"` → `status = "Success"` (with a new key).
 
-## Key decisions (matching the plan)
+## Key decisions
 
 - **Verbatim key storage.** Keys stored as-is in the state store;
   **do NOT put secrets in idempotency keys**.

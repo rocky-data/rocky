@@ -11,11 +11,9 @@ A staging model that other models read, carried by a view: no copied data, and
 every read sees the source as it is now. Use it for the intermediate steps that
 do not deserve a table — filters, renames, type casts.
 
-This POC used to demonstrate `strategy = "ephemeral"` before Rocky could
-inline such a model (#1996). Rocky now inlines an ephemeral model as a CTE into
-each consumer, so `type = "ephemeral"` is the other choice for this staging
-step: no warehouse object at all, at the cost of running the staging SQL once
-per consumer.
+`type = "ephemeral"` is the other choice for this staging step. Rocky inlines
+an ephemeral model as a CTE into each consumer: no warehouse object at all, at
+the cost of running the staging SQL once per consumer.
 
 ## Why it's distinctive
 
@@ -54,10 +52,6 @@ per consumer.
 ```
 
 `run.sh` compiles the models, **runs** them, and then reads the warehouse back.
-The old version of this POC never ran a model — it called `validate`, `compile`
-and `rocky test ... || true` — which is how it stayed green for months while
-the strategy it advertised did not work. A POC that never runs its models
-cannot tell you they work.
 
 ## Expected output
 

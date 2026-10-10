@@ -70,39 +70,24 @@ empty ([#2162](https://github.com/rocky-data/rocky/issues/2162)).
 
 ## Why it's distinctive
 
-Built on Rocky primitives that Fivetran's Smart Run technique
-(`COPY` + git-diff + re-run-changed) reaches for but cannot match
-without rewriting dbt's compiler:
+The pattern is "copy what didn't change, re-run what did, diff the result".
+Rocky builds it from its own parts:
 
-- **Column-level pruning > model-level.** Compiler IR knows column-level
-  dependencies. A column added to an unused tail of a wide table prunes
-  to zero downstream; Smart Run has to re-run the whole subtree.
-- **Branches are the substrate.** Schema-prefix branches everywhere;
-  warehouse-native clones slot into the same API via the
-  `WarehouseAdapter::clone_table_for_branch` trait method: Databricks
-  `SHALLOW CLONE` and BigQuery `CREATE TABLE … COPY` (both metadata-only)
-  are live as of `engine-v1.19.1`. DuckDB and Snowflake use the portable
-  CTAS default; Snowflake's native `CLONE` lands when a Snowflake
-  consumer drives the integration test.
-- **Compile-time change detection > git-diff alone.** `rocky ci-diff`
-  already does git-diff between refs and produces a structural diff;
-  the next step (*"this textual change is type-equivalent and produces
-  no output diff"*) is something only a compiled engine can do.
-- **Cost delta as a state-store query, not a fresh measurement.**
-  `rocky cost latest` already rolls per-run cost from adapter telemetry;
-  `preview cost` is the diff layer over that machinery.
+- **Branches are the copy target.** Every copy lands in a schema-prefix
+  branch (`branch__<name>`). Each adapter picks its cheapest copy through
+  `WarehouseAdapter::clone_table_for_branch`: Databricks `SHALLOW CLONE`,
+  Snowflake `CREATE TABLE … CLONE` and BigQuery `CREATE TABLE … COPY` are
+  metadata-only; DuckDB and the other adapters use a portable CTAS. The
+  output reports `copy_strategy: "ctas"` whichever primitive ran.
+- **Pruning is model-level today.** The prune set is the changed models plus
+  everything downstream of them. Column-level pruning is not implemented
+  (`changed_columns` is always empty). For column-level blast radius on a PR,
+  see [`11-lineage-diff`](../11-lineage-diff/).
+- **Cost delta is a state-store query, not a fresh measurement.**
+  `rocky cost latest` already rolls up per-run cost from adapter telemetry;
+  `preview cost` is the diff layer over it.
 - **Single PR comment.** The composite GitHub Action stitches all three
-  outputs into one comment: row counts, columns, and cost delta in one place.
-
-Compare:
-
-| Property | Fivetran Smart Run | `rocky preview` |
-|---|---|---|
-| Pruning granularity | Model-level | Column-level (compiler IR) |
-| Copy substrate | `COPY` | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` (metadata-only); DuckDB / Snowflake CTAS |
-| Cost delta | Not surfaced | First-class output |
-| Data diff | Not surfaced | First-class output |
-| PR comment | Not described | First-class output |
+  outputs into one comment: row counts, columns, and cost delta.
 
 ## Layout
 
@@ -145,19 +130,14 @@ run` for both DSL and SQL surfaces.
 
 ## Status
 
-Production path as of **engine-v1.18.0**. Earlier revisions of `run.sh`
-wrapped each preview call in a stub-tolerating helper while the engine
-handlers were still scaffolding; that scaffolding is gone, and the script
-now treats `preview create / diff / cost` like any other production CLI
-command (`set -e` enforces failure).
-
-The live `expected/preview_*.json` outputs are captured on each run for
-inspection; they are gitignored and vary in their non-deterministic
-fields (timestamps, branch schema, run ids) run to run.
+`run.sh` treats `preview create / diff / cost` like any other CLI command:
+`set -e` fails the script on any error. The `expected/preview_*.json`
+outputs are gitignored. Their timestamps, branch schema and run ids change
+from run to run.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.18.0 on PATH
+- `rocky` on PATH (or `ROCKY_BIN`; `run.sh` prefers `engine/target/release/rocky`, then `engine/target/debug/rocky`)
 - `duckdb` CLI for seeding (`brew install duckdb`)
 - `jq`, to check that `preview diff` and `preview cost` paired with the branch run
 - `git`, and the POC inside a git checkout (`rocky preview create` runs
@@ -202,8 +182,8 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 ## Related
 
 - Sibling POC: [`00-foundations/06-branches-replay-lineage/`](../../00-foundations/06-branches-replay-lineage/),
-  covering the four trust-arc primitives (branches, replay, column lineage,
-  state store) that `preview` composes.
+  covering the primitives (branches, replay, column lineage, state store)
+  that `preview` composes.
 - Sibling POC: [`06-developer-experience/04-shadow-mode-compare/`](../04-shadow-mode-compare/),
   the precursor `rocky compare` kernel that `preview diff` extends.
 - Engine source: `engine/crates/rocky-cli/src/commands/preview.rs`,

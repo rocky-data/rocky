@@ -35,8 +35,8 @@ The POC runs `rocky ai` twice to cover both flag paths:
 - **No copy-paste step** — body + sidecar land on disk, ready to `rocky run`.
 - **Materializations on one flag surface** — `full_refresh` and `merge`
   (+ `--unique-key`). `incremental` is refused: on a transformation model it
-  re-inserts every row on each run (E037). `ephemeral` is refused too: it is
-  never inlined into its consumers (E038).
+  re-inserts every row on each run (E037). `ephemeral` is refused too: a
+  generated model has no consumer yet to inline it into.
 - Different from `engine/examples/ai-intent` (which ships pre-generated tests).
   This POC generates fresh models live.
 

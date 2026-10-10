@@ -61,15 +61,9 @@ No data moves in this step. The result is the list of schemas and tables that mo
 
 ## Step 4: Compile
 
-Rocky runs the full compiler pipeline:
-
-1. Load `.sql` + `.toml` model files
-2. Resolve dependencies → build the DAG
-3. Build the semantic graph (column lineage map)
-4. Type-check columns (propagate types through the DAG)
-5. Validate contracts (required columns, type constraints, protected columns)
-6. Run lints (blast radius, freshness coverage, breaking-change classification)
-7. Merge diagnostics
+Rocky runs the full [compiler pipeline](/concepts/compiler/#compile-pipeline):
+load, resolve dependencies, build the semantic graph, type-check, validate
+contracts, then lint and merge the diagnostics.
 
 One `Error`-severity diagnostic is enough to stop the run. Rocky prints every diagnostic as JSON and exits with code 1. No SQL has run yet.
 
@@ -151,24 +145,22 @@ A model that fails to compile when its turn comes (`CompileError`) never reaches
 
 ### 6f. Quality checks
 
-After the SQL executes, Rocky runs the model's declared quality checks: the `[[tests]]` blocks in the model's `.toml` sidecar.
+After the SQL executes, Rocky runs the pipeline's checks against the target
+table: the `[pipeline.<name>.checks]` settings and their `[[assertions]]`
+blocks. [Data Quality Checks](/concepts/data-quality-checks/) lists them.
 
 ```toml
-[[tests]]
+[[pipeline.silver.checks.assertions]]
 type = "not_null"
 column = "order_id"
-
-[[tests]]
-type = "row_count_range"
-min = 1
-
-[[tests]]
-type = "accepted_values"
-column = "status"
-values = ["completed", "cancelled", "pending"]
 ```
 
-Each check runs a `SELECT` against the freshly written target table. Rocky collects failed checks into `check_results` in the JSON output, where they may trigger `check_failed` hooks.
+Each check runs a `SELECT` against the freshly written target table. Rocky
+collects the results into `check_results` in the JSON output. A
+`check_result` hook can react to each one.
+
+The `[[tests]]` blocks in a model sidecar do not run here. Run them with
+`rocky test --declarative`.
 
 ### 6g. Defer the watermark write
 
@@ -211,7 +203,7 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. The shape below is il
 
 ```json
 {
-  "version": "1.28.0",
+  "version": "1.80.0",
   "command": "run",
   "status": "PartialFailure",
   "tables_copied": 3,

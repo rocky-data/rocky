@@ -1,11 +1,25 @@
 ---
 title: Authentication
-description: How Rocky picks between a PAT and OAuth M2M when connecting to Databricks
+description: Where each adapter reads its credentials, and how Rocky picks between a PAT and OAuth M2M on Databricks
 sidebar:
   order: 9
 ---
 
-Rocky connects to **Databricks** warehouses two ways. You do not choose between them explicitly: Rocky looks at which credentials you supplied and picks. The choice applies to every Databricks API call — SQL statement execution, Unity Catalog operations, and workspace bindings.
+Each adapter reads its credentials from its own `[adapter.NAME]` block, except BigQuery, which reads them from the environment. Put `${VAR}` references in the block, never the secret itself.
+
+| Adapter | Credentials | Details |
+|---|---|---|
+| Databricks | `token` (PAT), else `client_id` + `client_secret` (OAuth M2M) | This page |
+| Snowflake | `pat`, `oauth_token`, key pair, or password | [Snowflake](/reference/adapters/snowflake/#authentication) |
+| BigQuery | `BIGQUERY_TOKEN` or `GOOGLE_APPLICATION_CREDENTIALS` | [BigQuery](/reference/adapters/bigquery/#authentication) |
+| PostgreSQL, Redshift | `username` + `password` | [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/#authentication) |
+| SQL Server | SQL login, Entra ID token, or service principal | [SQL Server](/reference/adapters/sqlserver/#authentication) |
+| ClickHouse | `username` + `password` | [ClickHouse](/reference/adapters/clickhouse/#authentication-and-tls) |
+| Spark | optional bearer `token` | [Spark](/reference/adapters/spark/#fields) |
+| Fivetran | `api_key` + `api_secret` | [Fivetran](/reference/adapters/fivetran/#authentication) |
+| DuckDB, `manual` | none | — |
+
+The rest of this page covers Databricks. Rocky connects to it two ways. You do not choose between them explicitly: Rocky looks at which credentials you supplied and picks. The choice applies to every Databricks API call — SQL statement execution, Unity Catalog operations, and workspace bindings.
 
 ## Detection Order
 
@@ -34,15 +48,14 @@ Rocky checks the personal access token first, and falls back to the service prin
 
 A single long-lived token. Rocky tries this first. Good for development.
 
-- Supply it in the environment as `DATABRICKS_TOKEN`.
-- Or in the config as `token = "${DATABRICKS_TOKEN}"`.
+- Set `token` in the adapter block, for example `token = "${DATABRICKS_TOKEN}"`.
 - Rocky sends it as `Authorization: Bearer <token>`.
 
 ## OAuth M2M (Service Principal)
 
 A client ID and secret that Rocky exchanges for a short-lived token. Rocky uses this when the PAT is empty. Prefer it in production.
 
-- Supply `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` in the environment.
+- Set `client_id` and `client_secret` in the adapter block, for example from `${DATABRICKS_CLIENT_ID}` and `${DATABRICKS_CLIENT_SECRET}`.
 - Rocky calls the token endpoint `https://<host>/oidc/v1/token`.
 - Grant type: `client_credentials`. Scope: `all-apis`.
 - The endpoint returns a short-lived access token, and Rocky refreshes it for you.
@@ -71,7 +84,7 @@ Rocky replaces every `${VAR_NAME}` reference in `rocky.toml` when it parses the 
 
 ## Validation
 
-Run `rocky validate` before a pipeline to confirm at least one method is configured correctly.
+Run `rocky validate` before a pipeline. It warns when a Databricks block sets neither `token` nor `client_id` (`V013`).
 
 ## Source Adapter Authentication
 

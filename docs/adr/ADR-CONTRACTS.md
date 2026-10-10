@@ -4,7 +4,7 @@
 
 **Work package:** WP-03 (compiler and contract soundness) and WP-04 (governance semantics)
 **Closes (once ratified and implemented):** audit findings **RD-011** (contract compatibility ignores nested and parameterized structure), **RD-012** (breaking-change classification defaults to safe), **RD-013** (promotion fails open when the semantic comparison cannot run). Sets the contract semantics that **WP-04** builds on.
-**Sibling:** ADR-TYPES (not yet written) owns decimal arithmetic, numeric literal parsing, backend precision caps, and the call on the unmerged WP-03 decimal-inference work. This ADR does not decide any of those. It only consumes the `RockyType` that inference produces.
+**Sibling:** [ADR-TYPES](ADR-TYPES.md) owns decimal arithmetic, numeric literal parsing, backend precision caps, and the call on the unmerged WP-03 decimal-inference work. This ADR does not decide any of those. It only consumes the `RockyType` that inference produces.
 
 > Scope boundary. This ADR owns the *contract* question: what a declared contract promises, which gate checks it, how `Unknown` and nullability are treated at that gate, and how a type or contract change is classified. It does not change how types are inferred. A wrong concrete inferred type is an ADR-TYPES / `typecheck.rs` defect, not a contract defect.
 
@@ -253,7 +253,7 @@ Who may approve a promote the gate refused, and how, depends on a trust ADR (ADR
   - **RD-010 and decimal inference.** Wrong decimal precision or scale from inference is ADR-TYPES. A contract can only be as right as the type it is handed.
   - **The unmerged WP-03 decimal-inference work.** ADR-TYPES decides whether to open or archive it. Part of its load-gate `Unknown` work may already be covered on `main` by #1721; that needs checking when ADR-TYPES is written.
   - **The rest of WP-04.** Per-model check identity, missing verification evidence, durable policy audit writes, and the hostile-agent boundary are not contract semantics. This ADR gives them a stable contract and classifier to build on.
-  - **Who may approve a break-glass promote.** Open question E, which depends on ADR-TRUST (not yet written).
+  - **Who may approve a break-glass promote.** Open question E, which depends on ADR-TRUST. [ADR-TRUST](ADR-TRUST.md) now answers it.
 
 ### What it unblocks
 

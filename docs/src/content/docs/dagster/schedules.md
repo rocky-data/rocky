@@ -67,22 +67,12 @@ Some users want their own schedule-tag values for grouping.
 
 ## Pairing with sensors
 
-Schedules and sensors complement each other:
+Schedules fire at fixed times, whatever the upstream state. Sensors fire when
+upstream state changes. Both can target the same asset selection. If they do,
+expect two runs: `build_rocky_schedule` sets no `run_key`, and Dagster does not
+dedupe across a schedule and a sensor. Rocky's incremental,
+[idempotent](/reference/glossary/#idempotent) execution keeps the second run
+cheap, but both runs execute.
 
-- **Schedules** fire at fixed times regardless of upstream state, useful for
-  reports that should run every morning.
-- **Sensors** fire when upstream state changes, useful for pipelines that
-  should kick off as soon as Fivetran completes a sync.
-
-Both can target the same asset selection. If they do, expect two runs.
-
-Dagster deduplicates on `run_key` per instigator. A sensor's `run_key`
-only stops that same sensor from re-emitting the same `(source, sync)`
-pair on a later tick. `build_rocky_schedule` sets no `run_key` at all. So
-a schedule that fires at the same time as a sensor, on the same
-selection, launches two runs. Dagster does not dedupe across a schedule
-and a sensor.
-
-Rocky's execution is incremental and
-[idempotent](/reference/glossary/#idempotent), which keeps the redundant
-run cheap. Both runs still execute.
+[Automation conditions](/dagster/automation/#sensor--schedule--automationcondition-which-to-use)
+compares the four ways to trigger a Rocky asset.
