@@ -2,7 +2,7 @@
 title: Apache Spark adapter
 description: Connect Rocky to Apache Spark over Spark Connect (Beta) — fields, table formats, which strategies run, and what Rocky refuses
 sidebar:
-  order: 8
+  order: 9
 ---
 
 The Spark adapter is **Beta**. It talks to a Spark Connect server over gRPC, so Rocky needs no JVM. It is tested live against Spark 4.0.1 with Delta Lake 4.0.0. Rocky logs a warning when you register it.

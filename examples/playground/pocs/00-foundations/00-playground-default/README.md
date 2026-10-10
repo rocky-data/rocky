@@ -7,10 +7,13 @@
 
 ## What it shows
 
-This is the **exact output** of `rocky playground my-project`, a small, runnable
-transformation DAG you can materialize locally and inspect end-to-end. It doubles as
-the known-good baseline for the catalog: if `rocky run` or `rocky test` ever fails here
+This POC holds the same models, contract and config as `rocky playground my-project`.
+Only comments differ. It is a small transformation DAG that you materialize and inspect locally.
+It is also the baseline for the catalog. If `rocky run` or `rocky test` fails here
 after a binary upgrade, the playground generator regressed.
+
+`rocky playground` seeds `playground.duckdb` for you when it scaffolds. This POC
+seeds it with the `duckdb` CLI in `run.sh`.
 
 The pipeline (all models materialize into the default schema `playground.main`):
 
@@ -27,7 +30,7 @@ the execution order.
 ## Why it's distinctive
 
 - **The only POC that intentionally mirrors the binary's stock output.** Every other POC covers a feature the generator doesn't show.
-- Materializes a real multi-model DAG with `rocky run`, then `rocky preview rows` / `rocky profile` (and the VS Code Inspector) read the materialized tables, the simplest end-to-end "see your data" loop.
+- Materializes a real multi-model DAG with `rocky run`. Then `rocky preview rows` and `rocky profile` read the materialized tables. The browser UI (`rocky serve --ui`) and the VS Code Inspector show the same rows.
 
 ## Layout
 
@@ -60,10 +63,13 @@ the execution order.
 # or, by hand:
 duckdb playground.duckdb < data/seed.sql   # seed the source
 rocky run                                  # materialize raw_orders → customer_orders → revenue_summary
-rocky preview rows --model customer_orders # peek at real rows
+rocky preview rows --model customer_orders # peek at real rows (not in run.sh)
 rocky profile customer_orders              # observed per-column stats
 rocky test --models models --contracts contracts
 ```
+
+`run.sh` also runs `rocky validate`, `rocky compile` and `rocky lineage revenue_summary`.
+It writes each JSON result to `expected/`.
 
 ## Expected output
 
@@ -78,9 +84,11 @@ customer_orders, raw_orders, revenue_summary
 ## What happened
 
 1. `duckdb … < data/seed.sql` seeds the `raw__orders.orders` source.
-2. `rocky run` materializes the three models in DAG order into `playground.main`.
-3. `rocky preview rows` / `rocky profile` read those materialized tables (the same data the VS Code Inspector surfaces).
-4. `rocky test` re-executes the models against an in-memory DuckDB and verifies the `revenue_summary` contract.
+2. `rocky validate` and `rocky compile` check the config and type-check the models.
+3. `rocky run` materializes the three models in DAG order into `playground.main`.
+4. `rocky test` runs the models again against an in-memory DuckDB. It verifies the `revenue_summary` contract.
+5. `rocky profile` reads the materialized `customer_orders` table.
+6. `rocky lineage revenue_summary` traces the column edges back to the source.
 
 ## Related
 

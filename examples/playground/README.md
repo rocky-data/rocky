@@ -62,7 +62,7 @@ Start here. These POCs cover the language, the config layers, and the deploy loo
 |---|---|
 | [00-playground-default](pocs/00-foundations/00-playground-default) | Stock 3-model scaffold from `rocky playground` — baseline smoke test |
 | [01-replication-basics](pocs/00-foundations/01-replication-basics) | Minimal replication-shape pipeline — backs the Dagster integration test fixtures |
-| [01-dsl-pipeline-syntax](pocs/00-foundations/01-dsl-pipeline-syntax) | Every Rocky DSL operator in one file (`from→where→derive→group→join→select→sort→take→distinct`) |
+| [01-dsl-pipeline-syntax](pocs/00-foundations/01-dsl-pipeline-syntax) | The core DSL pipeline operators in one model (`from→where→group→where→sort→take`) |
 | [02-null-safe-operators](pocs/00-foundations/02-null-safe-operators) | `!=` lowering to `IS DISTINCT FROM` — side-by-side `.rocky` vs `.sql` |
 | [03-date-literals-and-match](pocs/00-foundations/03-date-literals-and-match) | `@2025-01-01` date literals and `match { ... }` pattern matching |
 | [04-window-functions](pocs/00-foundations/04-window-functions) | DSL window syntax with partition + sort + frame |

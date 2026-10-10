@@ -14,13 +14,13 @@ The Snowflake warehouse adapter accepts four kinds of credential: a Programmatic
 | `account` | string | Yes | Snowflake account identifier (e.g., `"org-account"`). |
 | `warehouse` | string | Yes | Warehouse name for query execution. |
 | `database` | string | No | Default database. |
-| `schema` | string | No | Default schema. |
 | `role` | string | No | Role to assume. |
 | `username` | string | No | Username for key-pair or password auth. |
 | `password` | string | No | Password for password auth. |
 | `private_key_path` | string | No | Path to PKCS#8 PEM private key for key-pair JWT auth. |
 | `oauth_token` | string | No | Pre-supplied OAuth token from an IdP. |
 | `pat` | string | No | Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header, distinct from `oauth_token`. |
+| `timeout_secs` | integer | No | Statement timeout in seconds. Default `120`. |
 
 ## Authentication
 

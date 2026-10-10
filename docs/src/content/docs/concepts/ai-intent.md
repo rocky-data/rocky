@@ -34,10 +34,8 @@ the wrong thing. The compiler catches it before Rocky reports success.
 
 ### Level 2: Compile-verify loop
 
-The loop is not only for generation. It runs whenever AI writes or edits code.
-Rocky compiles each result and feeds any diagnostics back until the code passes
-or hits the attempt limit. See
-[The compile-verify safety net](#the-compile-verify-safety-net) for the full flow.
+The same loop runs whenever AI writes or edits code, not only on generation.
+See [The compile-verify safety net](#the-compile-verify-safety-net) for the flow.
 
 ### Level 3: Intent as metadata
 
@@ -78,6 +76,11 @@ rocky ai "Top 10 customers by lifetime revenue" --format sql
 rocky ai "Top 10 customers by lifetime revenue" --output json
 ```
 
+Rocky writes the model file and its `.toml` sidecar into `--models` (default
+`models`). An existing file at that path fails the command unless you pass
+`--overwrite`. `--materialization` accepts `full_refresh` (default) or `merge`.
+A `merge` model needs `--unique-key`.
+
 The output carries the generated source, the suggested model name, the format,
 and how many compile attempts it took.
 
@@ -115,18 +118,18 @@ rocky ai-sync --models models/ --apply
 rocky ai-sync --models models/ --model orders_summary
 ```
 
-The sync runs in four steps:
+The sync runs in five steps:
 
 1. Compiles the project to build the current semantic graph and typed schemas
-2. Asks the LLM to propose an update for each model that carries intent, keeping that intent
-3. Puts the proposal through the compile-verify loop
-4. Prints the change as a diff; `--apply` writes it to disk
+2. Diffs each model's upstream column types against a stored baseline
+3. Asks the LLM to propose an update that keeps the intent and absorbs those changes
+4. Puts the proposal through the compile-verify loop
+5. Prints the change as a diff; `--apply` writes it to disk
 
-Proposals today read the model's declared intent and nothing else. Detecting
-upstream schema changes (diffing added, removed, renamed, and type-changed
-columns against a stored previous compilation) is designed but not wired up. The
-state store does not yet snapshot prior compilation results, so `rocky ai-sync`
-prints a note saying the proposals come from declared intent alone.
+The baseline lives next to the state store, in `<state>.ai-sync.json`. On a
+model's first sync no baseline exists. Rocky says so, proposes from intent
+alone, and saves the current upstream schemas as the baseline. A model's
+baseline advances only when `--apply` writes its proposal.
 
 ### rocky ai-test
 
@@ -147,6 +150,20 @@ The LLM reads the intent, the column schema with types and nullability, and the
 target table. It produces SQL assertions. Each assertion is a query that returns
 0 rows when the assertion holds. The [Testing and Contracts](/concepts/testing)
 page has the test format.
+
+### rocky ai-contract
+
+Drafts a `.contract.toml` for a model from its observed data. It works on
+DuckDB only.
+
+```bash
+rocky ai-contract orders_summary          # print the draft
+rocky ai-contract orders_summary --save   # write <model>.contract.toml
+```
+
+Rocky profiles the target table per column and compile-verifies the draft.
+By default only the schema and aggregate counts leave the machine.
+`--with-data` also sends min/max values and samples of low-cardinality columns.
 
 ## The compile-verify safety net
 
@@ -181,15 +198,24 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Rocky sets the provider, the model, and the attempt limit internally. It uses
-Claude by default. No AI feature runs on its own. You always call it through a
-`rocky ai` subcommand.
+Claude by default. One setting is yours, `[ai] max_tokens` in `rocky.toml`
+(default `4096`). It caps each request and the total output tokens across the
+retry loop.
+
+```toml
+[ai]
+max_tokens = 8192
+```
+
+No AI feature runs on its own. You always call it through a `rocky ai*`
+command.
 
 ## Adopting intent on an existing project
 
 1. Run `rocky ai-explain --all --save` to write an intent for every model.
 2. Read the generated intents and edit them. They are plain English, so change anything that reads wrong.
 3. Run `rocky ai-test --all --save` to write a baseline set of assertions.
-4. From here, `rocky ai-sync` proposes updates from each model's declared intent. It does not detect upstream schema changes yet.
+4. From here, `rocky ai-sync` proposes updates when upstream schemas change. The first sync of each model only records a baseline.
 
 Intent is optional. A model without intent still compiles, tests, and runs.
 Intent turns on the maintenance commands. It is never required.

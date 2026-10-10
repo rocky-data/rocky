@@ -14,8 +14,8 @@ manifest file, and no separate parse step.
               └───────────┬────────────┘
                           ▼
                    rocky compile ───────► diagnostics
-                          │               E001-E036  errors
-                          ▼               W001-W031  warnings
+                          │               E001-E060  errors
+                          ▼               W001-W057  warnings
                       typed IR            P001-P002  lints
               (every column's type)       I001-I003  information
                           │
@@ -217,10 +217,12 @@ stable code, so you can grep for it and gate on it.
 
 | Prefix | Codes | What it means |
 |---|---|---|
-| `E` | E001-E036 | Error. `rocky compile` exits non-zero. |
-| `W` | W001-W031 | Warning. Compilation still succeeds. |
+| `E` | E001-E060 | Error. `rocky compile` exits non-zero. |
+| `W` | W001-W057 | Warning. Compilation still succeeds. |
 | `P` | P001-P002 | Lint. P001 flags SQL that does not port to your target dialect. P002 warns on a `SELECT *` whose downstream consumers name specific columns. |
 | `I` | I001-I003 | Information. I003 flags a contract column whose type Rocky could not infer, so its declared type went unchecked. |
+
+The ranges have gaps, so not every number is in use.
 
 Two examples. A column whose type no longer matches its contract is `E011`. A
 Snowflake-only construct in a Databricks project is `P001`.
@@ -245,6 +247,7 @@ per model with a `-- rocky-allow: <construct>` comment.
 | **Portability** | Opt-in dialect-divergence lint targeting Databricks, Snowflake, BigQuery, or DuckDB |
 | **DSL** | Pipeline-oriented `.rocky` syntax. It is optional, and models stay plain SQL by default |
 | **AI** | Intent metadata, schema-sync, intent extraction, test generation |
+| **Browser UI** | `rocky serve --ui` serves a browser UI over the HTTP API at `/ui/`. See [`ui/`](ui/) |
 | **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |
 | **Quality** | Pipeline-level checks plus 13 declarative assertions with severity, filters, and row quarantine |
 | **Execution** | DuckDB (local), Databricks (production), Snowflake + BigQuery + Trino + PostgreSQL + Redshift + ClickHouse + SQL Server (beta) |

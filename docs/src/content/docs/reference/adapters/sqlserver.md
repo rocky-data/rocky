@@ -2,7 +2,7 @@
 title: SQL Server adapter
 description: Connect Rocky to Microsoft SQL Server, Azure SQL or Fabric Warehouse — fields, auth, TLS, and how each materialization runs in T-SQL
 sidebar:
-  order: 7
+  order: 6
 ---
 
 The SQL Server warehouse adapter (`type = "sqlserver"`) runs your SQL over a native TDS connection. It needs no ODBC driver and no OpenSSL. TLS uses rustls.
@@ -11,7 +11,7 @@ The SQL Server warehouse adapter (`type = "sqlserver"`) runs your SQL over a nat
 |--------|--------|
 | SQL Server 2016 SP1 and later | Supported. Tested live against SQL Server 2022. |
 | Azure SQL Database, Azure SQL Managed Instance | Beta. Same T-SQL; not run in CI. |
-| Microsoft Fabric Warehouse | Beta. Set `flavor = "fabric"`. Not run in CI. |
+| Microsoft Fabric Warehouse | Beta. Set `flavor = "fabric"`. Not run in CI. Rocky logs a warning when you register it. |
 
 `CREATE OR ALTER VIEW` and `DROP TABLE IF EXISTS` need SQL Server 2016 SP1 or later.
 

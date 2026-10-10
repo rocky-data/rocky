@@ -206,13 +206,9 @@ DropAndRecreate.
 - **True `INSERT OVERWRITE`.** Iceberg-backed catalogs support it
   natively; v0 falls back to `DELETE` + `INSERT`, which is not atomic.
 - **`information_schema`-backed nullability** in `describe_table`.
-- **Arrow record batches** from the connector: `fetch_arrow_batch` is
-  implemented via the spooled-protocol Arrow path (see [Wire protocol](#wire-protocol)
-  above), but the path is version-gated on upstream Trino merging
-  Arrow IPC as a supported spooling encoding (PR
-  [`trinodb/trino#26365`](https://github.com/trinodb/trino/pull/26365)).
-  Today the call surfaces `ArrowEncodingUnavailable` against any
-  shipping coordinator.
+- **Arrow record batches** from the connector. `fetch_arrow_batch` exists,
+  but every shipping coordinator returns `ArrowEncodingUnavailable`. See
+  [Arrow result fetch](#arrow-result-fetch-fetch_arrow_batch).
 
 ## Testing
 
@@ -315,13 +311,17 @@ For the end-to-end pipeline-shape walkthrough (full `docker compose up`
 engine/crates/rocky-trino/
 ├── Cargo.toml
 ├── README.md          ← this file
-└── src/
-    ├── lib.rs         ← module root + re-exports + crate-level docs
-    ├── adapter.rs     ← `TrinoAdapter`: WarehouseAdapter impl
-    ├── auth.rs        ← `TrinoAuth`: Basic + JWT, RedactedString-wrapped
-    ├── connector.rs   ← `TrinoClient`: /v1/statement state machine
-    ├── dialect.rs     ← `TrinoDialect`: SqlDialect impl
-    └── test_helpers.rs ← centralised basic-auth fixtures (cfg(test))
+├── src/
+│   ├── lib.rs         ← module root + re-exports + crate-level docs
+│   ├── adapter.rs     ← `TrinoAdapter`: WarehouseAdapter impl
+│   ├── arrow_stream.rs ← spooled-protocol Arrow fetch (`fetch_arrow_batch`)
+│   ├── auth.rs        ← `TrinoAuth`: Basic + JWT, RedactedString-wrapped
+│   ├── connector.rs   ← `TrinoClient`: /v1/statement state machine
+│   ├── dialect.rs     ← `TrinoDialect`: SqlDialect impl
+│   └── test_helpers.rs ← centralised basic-auth fixtures (cfg(test))
+└── tests/
+    ├── conformance.rs ← live-coordinator harness (`trino-conformance` feature)
+    └── iceberg/       ← docker-compose stack for the Iceberg drift test
 ```
 
 Public types are re-exported at the crate root: `TrinoAdapter`,

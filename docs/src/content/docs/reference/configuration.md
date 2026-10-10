@@ -184,13 +184,19 @@ The connection fields, authentication, and examples for each adapter type live o
 - [Snowflake](/reference/adapters/snowflake/) — PAT, OAuth, key-pair, and password auth
 - [BigQuery](/reference/adapters/bigquery/) — project/location plus environment-supplied credentials
 - [PostgreSQL](/reference/adapters/postgres/) — host, database and role, with libpq-style `sslmode`
+- [SQL Server](/reference/adapters/sqlserver/) — SQL Server; Azure SQL and Fabric Warehouse are Beta. SQL auth or Entra ID
 - [Redshift](/reference/adapters/redshift/) (Beta) — the PostgreSQL adapter's fields plus dist/sort keys and late-binding views
 - [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
-- [SQL Server](/reference/adapters/sqlserver/) (Beta) — SQL Server, Azure SQL and Fabric Warehouse; SQL auth or Entra ID
 - [Spark](/reference/adapters/spark/) (Beta) — Spark Connect with an optional bearer token, on Delta Lake or Iceberg tables
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
 
-`type = "trino"`, `type = "airbyte"`, and `type = "iceberg"` are accepted by the config parser but have no dedicated page yet; configure adapter-specific keys through [`[adapter.NAME.extra]`](#adaptername).
+Three types have no page yet. They read these top-level fields:
+
+| `type` | Role | Fields |
+|--------|------|--------|
+| `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`. |
+| `"airbyte"` | Discovery | `host` (Airbyte API URL, required). `token` (optional bearer token). |
+| `"iceberg"` | Discovery | `host` (REST catalog URL, required). `token` (optional bearer token). |
 
 
 ### `type = "manual"`

@@ -19,6 +19,8 @@ The Rocky VS Code extension gives you compile errors, column types, lineage, and
 
 So the extension needs a Rocky binary it can reach. Section 1 installs the extension; section 2 points it at that binary.
 
+To look at a project without an editor, use the [browser UI](/guides/browser-ui/) (`rocky serve --ui`).
+
 ![A Rocky DSL model on the left and its compiled SQL on the right, updating live as you type](/demo-vscode-compiled-sql.gif)
 
 The extension source is in the monorepo at [`editors/vscode/`](https://github.com/rocky-data/rocky/tree/main/editors/vscode).
@@ -117,13 +119,7 @@ Or in `settings.json`:
 
 ### Extra arguments
 
-Pass additional flags to the language server:
-
-```json
-{
-  "rocky.server.extraArgs": ["--verbose"]
-}
-```
+`rocky.server.extraArgs` adds arguments after `rocky lsp`. The standalone `rocky-lsp` binary ignores its arguments, so this setting has effect only when the extension falls back to `rocky lsp`.
 
 ### All extension settings
 
@@ -302,7 +298,9 @@ Three more AI commands work on models you already have. Each writes its result b
 
 You can also reach these actions by right-clicking a node in the Inspector's lineage canvas.
 
-### All commands
+### Main commands
+
+The extension adds more commands than this table lists. Type `Rocky:` in the Command Palette to see them all.
 
 | Command | Description |
 |---|---|

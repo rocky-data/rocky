@@ -1,6 +1,6 @@
 ---
 title: BigQuery adapter
-description: The BigQuery adapter's two config fields, and the order Rocky checks for credentials
+description: The BigQuery adapter's config fields, and the order Rocky checks for credentials
 sidebar:
   order: 4
 ---
@@ -11,8 +11,9 @@ The BigQuery warehouse adapter runs your SQL through the BigQuery REST API.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `project_id` | string | No | Google Cloud project ID that owns the datasets and is billed for query execution. |
-| `location` | string | No | BigQuery processing location (e.g., `"US"`, `"EU"`, `"us-central1"`). |
+| `project_id` | string | Yes | Google Cloud project ID that owns the datasets and is billed for query execution. |
+| `location` | string | No | BigQuery processing location (e.g., `"US"`, `"EU"`, `"us-central1"`). Default `"US"`. |
+| `timeout_secs` | integer | No | Statement timeout in seconds. Default `300`. |
 
 ```toml
 [adapter.bq]

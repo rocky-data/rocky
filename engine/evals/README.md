@@ -181,6 +181,7 @@ engine/evals/
 │   ├── error_contract.py        creds-free structured-error contract check (rocky binary only)
 │   └── version.py               HARNESS_VERSION
 ├── fixtures/orders_trap/        the pinned DuckDB fixture (the reconcile trap)
+├── fixtures/orders_trap_governed/  the same fixture plus a [policy] deny on *_pii
 ├── scorecards/                  committed scorecards (one so far, at 1.57.0)
 └── testdata/                    recorded transcript for --selftest
 ```

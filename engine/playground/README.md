@@ -62,8 +62,8 @@ its tab and loads it into the editor.
 
 Single self-contained `index.html` -- no build step, no npm, no bundler.
 Loads WASM via ES module import from `./pkg/rocky_wasm.js` (the output of
-`wasm-pack build --target web`). If the module is not found, the UI
-gracefully displays a "WASM not built yet" message with build instructions.
+`wasm-pack build --target web`). If the module is not found, the page shows
+a "WASM not built yet" message with build instructions.
 
 ## Troubleshooting
 

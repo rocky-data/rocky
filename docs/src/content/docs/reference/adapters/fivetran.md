@@ -2,7 +2,7 @@
 title: Fivetran adapter
 description: The Fivetran source adapter, which reads connector and table metadata and nothing else
 sidebar:
-  order: 5
+  order: 10
 ---
 
 The Fivetran source adapter calls the Fivetran REST API to list connectors and their tables. It reads **metadata only**. Rocky never moves data through this adapter.

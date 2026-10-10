@@ -2,7 +2,7 @@
 title: ClickHouse adapter
 description: Connect Rocky to ClickHouse (Beta) — fields, TLS, table engines and sort keys, which strategies run, and what Rocky refuses
 sidebar:
-  order: 7
+  order: 8
 ---
 
 The ClickHouse adapter is **Beta**. It talks to the server's HTTP interface. It is tested live against ClickHouse 26.10, and it needs ClickHouse 23.6 or later. Rocky logs a warning when you register it.

@@ -2,7 +2,7 @@
 title: Redshift adapter
 description: Connect Rocky to Amazon Redshift (Beta) — fields, table distribution and sort keys, late-binding views, and what differs from PostgreSQL
 sidebar:
-  order: 6
+  order: 7
 ---
 
 The Redshift adapter is **Beta**. Rocky tests its SQL in unit tests only. There is no local Redshift to run it against, so no Redshift SQL runs in CI. Rocky logs a warning when you register it.

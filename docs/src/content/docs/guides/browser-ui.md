@@ -73,7 +73,7 @@ A reverse proxy in front of the server may log the query string of `/login`. Con
 
 A cookie session can also write, but only from the page. A write must carry an `Origin` header that names this server exactly (the same host and port), or an `--allowed-origin` entry, and the header `X-Rocky-UI: 1`. Another page on the same machine shares the cookie, because cookies do not separate ports, so it is refused. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
 
-If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **session expired**. Open the newest `Rocky UI:` link from the console.
+If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **Session expired**. Open the newest `Rocky UI:` link from the console.
 
 To run the UI somewhere other than your own machine, use the [container image](/guides/run-the-image/) or the [Helm chart](/guides/kubernetes/). The chart serves the UI by default.
 
