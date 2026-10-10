@@ -115,7 +115,7 @@ engine/
 ├── crates/
 │   ├── rocky-ir/            # Typed Intermediate Representation (ModelIr, MaterializationStrategy)
 │   ├── rocky-core/          # Generic SQL transformation engine (depends on rocky-ir)
-│   ├── rocky-secret-registry/  # Resolved ${VAR} values, printed back as ${NAME}
+│   ├── rocky-secret-registry/  # Prints resolved ${VAR} values as ${NAME}
 │   ├── rocky-core-compiletest/  # Compile-fail (trybuild) guards for rocky-core
 │   ├── rocky-cli-compiletest/   # Compile-fail guard: rocky-cli's plan writers stay crate-private
 │   ├── rocky-catalog-core/  # Catalog client abstraction (Iceberg REST, Unity Catalog, Polaris, Nessie)
@@ -128,7 +128,7 @@ engine/
 │   ├── rocky-bigquery/      # BigQuery warehouse adapter (Beta)
 │   ├── rocky-trino/         # Trino warehouse adapter (Beta)
 │   ├── rocky-postgres/      # PostgreSQL + Redshift warehouse adapters
-│   ├── rocky-sqlserver/     # SQL Server, Azure SQL, Fabric Warehouse adapter
+│   ├── rocky-sqlserver/     # SQL Server, Azure SQL, Fabric adapter
 │   ├── rocky-clickhouse/    # ClickHouse warehouse adapter (Beta)
 │   ├── rocky-spark/         # Spark Connect warehouse adapter (Beta)
 │   ├── rocky-fivetran/      # Fivetran source adapter
