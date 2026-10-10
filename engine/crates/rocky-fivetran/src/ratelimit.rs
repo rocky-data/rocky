@@ -431,12 +431,16 @@ pub fn build_ratelimit_budget(
         FivetranRatelimitBackend::File => Ok(std::sync::Arc::new(FileBudget::default_dir())),
         #[cfg(feature = "valkey")]
         FivetranRatelimitBackend::Valkey => {
-            let url = cfg.valkey_url.as_ref().ok_or_else(|| {
-                BudgetError::Config(
-                    "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.ratelimit]"
-                        .into(),
-                )
-            })?;
+            let url = cfg
+                .valkey_url
+                .as_ref()
+                .map(rocky_core::credential_url::CredentialUrl::expose)
+                .ok_or_else(|| {
+                    BudgetError::Config(
+                        "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.ratelimit]"
+                            .into(),
+                    )
+                })?;
             let max_wake =
                 Duration::from_secs(cfg.max_wake_seconds.unwrap_or(DEFAULT_MAX_WAKE_SECONDS));
             let budget = crate::ratelimit_valkey::ValkeyBudget::from_url(url, max_wake)?;

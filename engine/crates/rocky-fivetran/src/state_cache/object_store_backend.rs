@@ -86,11 +86,14 @@ impl ObjectStoreCache {
     /// - `az://container/prefix` — Azure Blob Storage
     /// - `file:///path/prefix` — local filesystem (for tests and dev)
     pub fn from_url(url: &str) -> Result<Self, CacheError> {
+        // The error names the URL without its userinfo or query, which can
+        // hold a credential (#2339).
+        let shown = rocky_core::credential_url::CredentialUrl::from(url);
         let parsed =
-            Url::parse(url).map_err(|e| CacheError::ObjectStoreUrl(format!("{url}: {e}")))?;
+            Url::parse(url).map_err(|e| CacheError::ObjectStoreUrl(format!("{shown}: {e}")))?;
         let scheme = parsed.scheme().to_string();
         let (store, prefix) = object_store::parse_url(&parsed)
-            .map_err(|e| CacheError::ObjectStoreUrl(format!("{url}: {e}")))?;
+            .map_err(|e| CacheError::ObjectStoreUrl(format!("{shown}: {e}")))?;
         Ok(ObjectStoreCache {
             store: Arc::from(store),
             prefix,

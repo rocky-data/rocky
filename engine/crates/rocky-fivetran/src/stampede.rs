@@ -220,12 +220,16 @@ pub fn build_stampede_lock(
         FivetranStampedeBackend::None => Ok((std::sync::Arc::new(NoLock), resolved)),
         #[cfg(feature = "valkey")]
         FivetranStampedeBackend::Valkey => {
-            let url = cfg.valkey_url.as_ref().ok_or_else(|| {
-                LockError::Config(
-                    "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.stampede]"
-                        .into(),
-                )
-            })?;
+            let url = cfg
+                .valkey_url
+                .as_ref()
+                .map(rocky_core::credential_url::CredentialUrl::expose)
+                .ok_or_else(|| {
+                    LockError::Config(
+                        "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.stampede]"
+                            .into(),
+                    )
+                })?;
             let lock = crate::stampede::valkey::ValkeyLock::from_url(url)?;
             Ok((std::sync::Arc::new(lock), resolved))
         }

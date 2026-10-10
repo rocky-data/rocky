@@ -10197,6 +10197,32 @@ auto_create_schemas = true
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
     }
 
+    /// #2339: a Fivetran `valkey_url` can embed a password. Rotating that
+    /// password must not refuse a plan, like every other credential. Pointing
+    /// the URL at another server still must.
+    #[test]
+    fn config_identity_ignores_a_valkey_password_but_not_its_host() {
+        fn identity(url: &str) -> String {
+            let body = format!(
+                "[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\napi_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\n\n[adapter.ft.circuit_breaker]\nbackend = \"valkey\"\nvalkey_url = \"{url}\"\n\n[adapter.default]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("rocky.toml");
+            std::fs::write(&p, body).unwrap();
+            super::config_policy_identity(&rocky_core::config::load_rocky_config(&p).unwrap())
+        }
+        assert_eq!(
+            identity("rediss://default:PASSWORD_A@valkey-a:6379/0"),
+            identity("rediss://default:PASSWORD_B@valkey-a:6379/0"),
+            "a rotated Valkey password must not change the config identity"
+        );
+        assert_ne!(
+            identity("rediss://default:PASSWORD_A@valkey-a:6379/0"),
+            identity("rediss://default:PASSWORD_A@valkey-b:6379/0"),
+            "another Valkey host must change the config identity"
+        );
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {

@@ -199,7 +199,7 @@ pub fn build_state_cache(
             Ok(Arc::new(FileCache::new(root.into())?))
         }
         FivetranCacheBackend::ObjectStore => {
-            let url = config.object_store_url.as_ref().ok_or_else(|| {
+            let url = config.object_store_url.as_ref().map(rocky_core::credential_url::CredentialUrl::expose).ok_or_else(|| {
                 CacheError::Config(
                     "backend = \"object_store\" requires `object_store_url` in [adapter.<name>.cache]"
                         .into(),
@@ -209,11 +209,16 @@ pub fn build_state_cache(
         }
         #[cfg(feature = "valkey")]
         FivetranCacheBackend::Valkey => {
-            let url = config.valkey_url.as_ref().ok_or_else(|| {
-                CacheError::Config(
-                    "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.cache]".into(),
-                )
-            })?;
+            let url = config
+                .valkey_url
+                .as_ref()
+                .map(rocky_core::credential_url::CredentialUrl::expose)
+                .ok_or_else(|| {
+                    CacheError::Config(
+                        "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.cache]"
+                            .into(),
+                    )
+                })?;
             let ttl = std::time::Duration::from_secs(
                 config
                     .valkey_ttl_seconds
@@ -229,18 +234,26 @@ pub fn build_state_cache(
         FivetranCacheBackend::Tiered => {
             #[cfg(feature = "valkey")]
             {
-                let valkey_url = config.valkey_url.as_ref().ok_or_else(|| {
-                    CacheError::Config(
-                        "backend = \"tiered\" requires `valkey_url` in [adapter.<name>.cache]"
-                            .into(),
-                    )
-                })?;
-                let object_store_url = config.object_store_url.as_ref().ok_or_else(|| {
-                    CacheError::Config(
+                let valkey_url = config
+                    .valkey_url
+                    .as_ref()
+                    .map(rocky_core::credential_url::CredentialUrl::expose)
+                    .ok_or_else(|| {
+                        CacheError::Config(
+                            "backend = \"tiered\" requires `valkey_url` in [adapter.<name>.cache]"
+                                .into(),
+                        )
+                    })?;
+                let object_store_url = config
+                    .object_store_url
+                    .as_ref()
+                    .map(rocky_core::credential_url::CredentialUrl::expose)
+                    .ok_or_else(|| {
+                        CacheError::Config(
                         "backend = \"tiered\" requires `object_store_url` in [adapter.<name>.cache]"
                             .into(),
                     )
-                })?;
+                    })?;
                 let ttl = std::time::Duration::from_secs(
                     config
                         .valkey_ttl_seconds
