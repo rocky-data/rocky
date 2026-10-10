@@ -583,7 +583,7 @@ impl ServerState {
             None => (Default::default(), Vec::new(), Default::default()),
         };
 
-        let config = CompilerConfig {
+        let mut config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: self.contracts_dir.clone(),
             required_explicit_contract_model: None,
@@ -597,8 +597,8 @@ impl ServerState {
             preserve_authored_sql: false,
             external_dependencies: Default::default(),
             project: None,
-            // The language server and `rocky serve` do not resolve each model's
-            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            // Set in the compile task below: resolving reads every
+            // pipeline's models from disk.
             target_dialects: Default::default(),
         };
 
@@ -635,6 +635,13 @@ impl ServerState {
             // route down: fall back to compiling `models_dir` alone, as
             // before the union, and carry the refusal out as a diagnostic.
             let mut load_error: Option<String> = None;
+            // Each model's warehouse, from the resolver `rocky compile`
+            // uses, so a `CAST` whose width differs between warehouses is
+            // typed as the CLI types it (#2342).
+            config.target_dialects = rocky_compiler::model_targets::target_dialects(
+                gate_config.as_ref(),
+                &gate_config_path,
+            );
             let mut result = match gate_config
                 .as_ref()
                 .filter(|project| union_of_pipelines && has_transformation_pipeline(project))

@@ -4955,6 +4955,44 @@ mod tests {
         );
     }
 
+    /// #2342: `rocky serve` types a `CAST` for the warehouse the model runs
+    /// on, as `rocky compile` does. Its pipeline writes to Snowflake, where
+    /// `FLOAT` is 64-bit; the served type used to be `Unknown`.
+    #[tokio::test]
+    async fn model_detail_types_a_cast_for_the_models_warehouse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\nwarehouse = \"wh\"\n\
+             username = \"u\"\npassword = \"p\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("b.sql"), "SELECT CAST(1.5 AS FLOAT) AS f").unwrap();
+        std::fs::write(
+            models.join("b.toml"),
+            "name = \"b\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"b\"\n",
+        )
+        .unwrap();
+
+        let state = ServerState::new(models, None, Some(config));
+        state.recompile().await;
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/models/b"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: ModelDetailOutput = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let typed = body.typed_columns.expect("b has typed columns");
+        let f = typed.iter().find(|c| c.name == "f").expect("column f");
+        assert_eq!(f.data_type, rocky_ir::types::RockyType::Float64);
+    }
+
     /// The one estate route whose size is not bounded by the model count
     /// carries an explicit cap, and a cut is reported, never silent.
     #[tokio::test]

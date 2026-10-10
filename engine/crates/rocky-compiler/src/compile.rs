@@ -669,9 +669,8 @@ pub fn compile_incremental(
     // changes affect every downstream model, so if they shift the caller
     // must invoke `compile` directly rather than this path. The same holds
     // for `config.target_dialects`: a changed target retypes every cast.
-    // The LSP constructs `CompilerConfig` once per workspace-init
-    // (see `RockyLsp::config_for_compile`), so this invariant holds in
-    // practice.
+    // The LSP keeps the targets of its last full compile and compiles in
+    // full when `rocky.toml` changes (`CastTargets` in rocky-server).
 
     // 1. Load the new project + rebuild the semantic graph. Both are cheap
     //    relative to typecheck — the whole point of the optimization.

@@ -5111,7 +5111,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             contracts,
             out,
             with_seed,
-        } => rocky_cli::commands::run_publish_ir(&models, contracts.as_deref(), &out, with_seed),
+        } => rocky_cli::commands::run_publish_ir(
+            &cli.config,
+            &models,
+            contracts.as_deref(),
+            &out,
+            with_seed,
+        ),
         Command::Imports { action } => match action {
             ImportsAction::Update { check } => {
                 rocky_cli::commands::run_imports_update(&cli.config, check)

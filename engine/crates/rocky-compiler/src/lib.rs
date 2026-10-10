@@ -32,6 +32,7 @@ pub mod governance;
 pub mod group_by;
 pub mod import;
 pub mod limits;
+pub mod model_targets;
 pub mod models_loader;
 pub mod operand_check;
 pub mod partial;
