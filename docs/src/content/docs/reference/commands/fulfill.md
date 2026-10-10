@@ -28,8 +28,19 @@ Every stop prints the state, why the loop stopped, and the next command. Exit co
 Advance the product's state machine.
 
 ```bash
-rocky fulfill revenue_daily
+rocky fulfill <product> [--retry]
 ```
+
+| Argument or flag | Type | Default | Description |
+|---|---|---|---|
+| `product` | `string` | **(required)** | Product name, read from `products/<name>.toml`. |
+| `--retry` | `bool` | `false` | Re-enter a `blocked` product after you fix the printed remedy. |
+
+```bash
+rocky --state-path .rocky/state.redb fulfill revenue_daily
+```
+
+Pass `--state-path` with a store the worker cannot write. The loop refuses the default store. See [What v0 does not defend](#what-v0-does-not-defend).
 
 The loop trusts nothing it did not verify itself:
 
@@ -39,7 +50,6 @@ The loop trusts nothing it did not verify itself:
 - The apply recomputes the spec digest from the approved snapshot and passes `--expect-spec-digest`. The engine refuses a mismatch even if the loop did not.
 - Only a `Succeeded` outcome is ever journaled as applied. An apply deflected as already-running keeps waiting. A resumed crash asks the idempotency store for an authoritative receipt; a backend that cannot answer leaves the state for a human, never a blind retry.
 
-`--retry` re-enters a `blocked` product after you fix the printed remedy.
 
 ### When the applied output is wrong
 
@@ -98,7 +108,13 @@ Two invocations never fight: every state write is a compare-and-swap, and a loop
 
 ## `rocky fulfill approve-spec <product>`
 
-Approve the current candidate spec. This is the same authority transition as [`rocky product approve`](/reference/commands/products/#rocky-product-approve) — one implementation, two spellings. The snapshot file is written first, immutable and digest-addressed; then one state-store transaction records the approval, moves the loop state, and appends the journal row. A second approver racing you fails cleanly and is shown the winning digest.
+Approve the current candidate spec. Pass the same `--state-path` as the loop, or the command refuses.
+
+```bash
+rocky --state-path .rocky/state.redb fulfill approve-spec revenue_daily
+```
+
+This is the same authority transition as [`rocky product approve`](/reference/commands/products/#rocky-product-approve) — one implementation, two spellings. The snapshot file is written first, immutable and digest-addressed; then one state-store transaction records the approval, moves the loop state, and appends the journal row. A second approver racing you fails cleanly and is shown the winning digest.
 
 ## Configuration
 
