@@ -86,8 +86,10 @@ pub async fn run_backfill(
     )
 }
 
-/// Inner implementation — takes an explicit `root` for the plans directory so
-/// tests can pass a temp dir without touching the process-global cwd.
+/// Inner implementation — takes an explicit project `root` so tests can pass a
+/// temp dir without touching the process-global cwd. The plans directory, the
+/// config and the models directory are all read under `root`, as apply reads
+/// them (#2340).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_backfill_in(
     root: &Path,
@@ -109,6 +111,15 @@ pub(crate) fn run_backfill_in(
         );
     }
 
+    // Read the config and the models under `root`, as `rocky apply` and
+    // `rocky review` do (#2340): the plan binds what it read here, and apply
+    // re-reads `root.join(...)`. A relative `root` that is not the cwd would
+    // otherwise plan one directory and apply another. `models_dir` itself is
+    // persisted as given, because apply joins it to `root` once more. The CLI
+    // passes the absolute cwd as `root`, so its behaviour does not change.
+    let config_path = &root.join(config_path);
+    let models_dir_at_root = crate::commands::apply::plan_models_dir(root, Some(models_dir));
+
     // Open the state store best-effort: it is required for --from-last-run and
     // for the historical cost estimate, but a manual backfill can still compose
     // (with an unavailable cost estimate) without one.
@@ -116,7 +127,7 @@ pub(crate) fn run_backfill_in(
 
     // 1. Compile first so lineage + strategy are available, and so the seed
     //    resolution can validate names against the real model graph.
-    let compiled = compile_project(config_path, state_path, models_dir)
+    let compiled = compile_project(config_path, state_path, &models_dir_at_root)
         .context("failed to compile the project for backfill composition")?;
 
     // 2. Resolve the affected seed models + the trigger label.
@@ -309,7 +320,10 @@ pub(crate) fn run_backfill_in(
     // apply-time TOCTOU gate rejects a post-plan swap of any, built from the SAME
     // `models_dir` the apply choke-point re-reads.
     let extras = crate::commands::apply::ExecutionExtras::build(
-        &crate::commands::apply::resolved_surrogate_keys(models_dir, &compiled.project.models)?,
+        &crate::commands::apply::resolved_surrogate_keys(
+            &models_dir_at_root,
+            &compiled.project.models,
+        )?,
         &compiled.project.models,
         &compiled.contract_files,
         &resolved_mask,
