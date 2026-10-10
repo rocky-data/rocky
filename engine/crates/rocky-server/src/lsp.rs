@@ -5483,6 +5483,8 @@ mod tests {
         let resolved = full_compile(1);
         assert_eq!(resolved.for_model("b"), &both);
         assert_eq!(resolved.for_model("c"), &both, "c is not on disk yet");
+        // A slow full compile that resolved now but stores last.
+        let older = CastTargets::resolve(&models);
 
         // `c` appears on disk. An edit keeps the resolved targets, so `c`
         // is still read as a model no pipeline lists.
@@ -5504,7 +5506,6 @@ mod tests {
 
         // A full compile (startup, save) resolves again and sees `c`. An
         // older compile that stores after it does not put back its targets.
-        let older = CastTargets::resolve(&models);
         assert_eq!(full_compile(3).for_model("c"), &duck);
         cache.keep(2, older);
         assert_eq!(cache.kept(&models).unwrap().for_model("c"), &duck);
