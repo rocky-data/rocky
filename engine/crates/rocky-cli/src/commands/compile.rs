@@ -955,6 +955,18 @@ pub(crate) fn target_dialects(
     rocky_compiler::model_targets::target_dialects(config, config_path)
 }
 
+/// [`target_dialects`] of the project config at `config_path`, for a caller
+/// that has already refused an unreadable `rocky.toml` (the source-schema
+/// loader does). A missing file gives no target for any model.
+pub(crate) fn target_dialects_at(
+    config_path: &Path,
+) -> rocky_compiler::operand_check::TargetDialects {
+    let config = rocky_config::load_optional_project_config(Some(config_path))
+        .ok()
+        .flatten();
+    target_dialects(config.as_ref(), config_path)
+}
+
 /// [`operand_target_for`] given the warehouses the model runs on.
 fn operand_target_of(
     target_dialect: Option<Dialect>,

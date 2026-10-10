@@ -246,6 +246,9 @@ fn compile_for_propose(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
+        // Each model's warehouse, so the plan is refused on the cast errors
+        // `rocky compile` refuses on (#2342).
+        target_dialects: super::compile::target_dialects_at(config_path),
         ..Default::default()
     };
     compile::compile(&config).map_err(|e| anyhow::anyhow!("compile failed: {e}"))

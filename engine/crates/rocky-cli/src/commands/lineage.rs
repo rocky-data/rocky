@@ -136,6 +136,9 @@ pub fn run_lineage(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
+        // Each model's warehouse, so a cast's column type matches
+        // `rocky compile` (#2342).
+        target_dialects: super::compile::target_dialects_at(config_path),
         ..Default::default()
     };
 

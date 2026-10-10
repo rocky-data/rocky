@@ -136,3 +136,23 @@ fn docs_type_a_cast_for_the_models_warehouse() {
     let html = fs::read_to_string(tmp.path().join("catalog.html")).unwrap();
     assert!(html.contains("FLOAT64"), "{html}");
 }
+
+/// `rocky catalog` and `rocky lineage` report the cast column with the
+/// warehouse's type (DuckDB `FLOAT` is 32-bit).
+#[test]
+fn catalog_and_lineage_type_a_cast_for_the_models_warehouse() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path(), DUCKDB, None);
+    for args in [
+        &["--output", "json", "catalog"][..],
+        &["--output", "json", "lineage", "b"][..],
+    ] {
+        let out = rocky(tmp.path(), args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\"FLOAT32\""),
+            "{args:?}: {}",
+            text(&out)
+        );
+    }
+}
