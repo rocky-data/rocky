@@ -25,9 +25,7 @@ change` notices.
 ## Why it's distinctive
 
 - **The compile-verify loop becomes interactive** — pair this with
-  `rocky lsp` for type-aware authoring + auto-materialise. dbt's
-  `--no-version-check --select <model>` story doesn't survive contact
-  with watching.
+  `rocky lsp` for type-aware authoring + auto-materialise.
 - **Debounce window coalesces editor save bursts** — a quick burst
   triggers exactly one re-run, not one per `notify` event.
 - **FSEvents-safe on macOS** — the watcher monitors the parent directory
@@ -47,7 +45,7 @@ change` notices.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.27.0 (the next release after the merge of [#423](https://github.com/rocky-data/rocky/pull/423)) on PATH
+- `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
 
 ## Run

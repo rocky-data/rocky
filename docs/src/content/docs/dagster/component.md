@@ -44,18 +44,36 @@ attributes:
   state_path: .rocky-state.redb
 ```
 
-## Opt-in surfaces
+The component passes `binary_path`, `config_path`, `state_path`,
+`state_namespace`, `models_dir`, `contracts_dir`, `server_url`,
+`timeout_seconds`, `strict_doctor`, and `strict_doctor_checks` to the
+[`RockyResource`](/dagster/resource/#configuration) it builds. They mean the
+same thing there.
 
-Five fields add behaviour on top of the discover and compile cache. All five
-default to off. An existing component behaves the same until you turn one on.
+## Opt-in fields
 
-| Field | Since | YAML | What it does |
-|---|---|---|---|
-| `surface_compliance` | 1.13.0 | yes | Calls `rocky compliance` once per materialization batch and emits an aggregated `AssetCheckResult` per asset for any model with classification exceptions. |
-| `surface_retention_status` | 1.13.0 | yes | Calls `rocky retention-status` once per materialization batch and emits one `AssetObservation` per model row, keyed by model. |
-| `discover_on_missing_state` | 1.14.0 | yes | If the local state file is absent at code-server load, `build_defs` runs `write_state_to_path()` synchronously instead of returning an empty `Definitions`. Skipped under `dg dev` (which relies on the CLI workflow) and only applies when state management is local-filesystem. |
-| `surface_column_lineage` | 1.14.0 | yes | At code-server load, walks `models_dir/*.toml` (skipping `_*.toml` and `*.contract.toml`), calls `rocky lineage` per model, and merges the resulting `dagster.TableColumnLineage` into each matching `AssetSpec`'s `metadata["dagster/column_lineage"]`. |
-| `post_state_write_hook` | 1.14.0 | **no, Python only** | Callable invoked with the state-file path immediately after every successful `write_state_to_path()`. Typical use: push the freshly-written state to a durable store (S3, Valkey) so the next ephemeral pod boots with the cache pre-warmed. |
+These fields change what the component builds or emits. All default to off,
+except `surface_optimize_metadata`.
+
+| Field | YAML | What it does |
+|---|---|---|
+| `translator_class` | yes | Dotted path to a [`RockyDagsterTranslator`](/dagster/translator/) subclass, for example `my_module.MyTranslator`. Not an opt-in; listed here because it is set in YAML. |
+| `surface_optimize_metadata` | yes | On by default. The state refresh also runs `rocky optimize`, and the recommendations land in `AssetSpec.metadata`. |
+| `surface_derived_models` | yes | Each compiled model becomes its own asset. See [Derived models](/dagster/derived-models/). |
+| `dag_mode` | yes | Builds one connected graph from `rocky dag`. See [DAG mode](#dag-mode). |
+| `execution_mode` | yes | `"streaming"` (default) or `"pipes"`. See [Live log streaming](/dagster/pipes/#rockycomponent-default). |
+| `enable_sensor` | yes | Adds a [`rocky_source_sensor`](/dagster/sensors/). Tune it with `sensor_granularity` and `sensor_interval_seconds`. |
+| `surface_compliance` | yes | Calls `rocky compliance` once per materialization batch. Emits one aggregated `AssetCheckResult` per asset with classification exceptions. |
+| `surface_configured_checks` | yes | Declares a check spec for every configured non-default check name the engine reports, so those checks show before any run. |
+| `surface_retention_status` | yes | Calls `rocky retention-status` once per materialization batch. Emits one `AssetObservation` per model row. |
+| `surface_column_lineage` | yes | At code-server load, calls `rocky lineage` per model and merges the `TableColumnLineage` into `metadata["dagster/column_lineage"]`. One CLI call per model on every load. |
+| `discover_on_missing_state` | yes | If the local state file is absent at code-server load, runs `write_state_to_path()` first. Skipped under `dg dev`. Applies only to local-filesystem state. |
+| `strict_build` | yes | Fails the code-server load when discover fails or finds zero sources, instead of loading an empty graph. Compile and optimize stay best-effort. |
+| `satisfy_empty_outputs` | yes | Emits a zero-row `MaterializeResult` (marked `rocky/empty_for_partition`) for each selected asset a run did not copy, so same-run downstream steps still run. Failed tables are excluded. Streaming mode without `dag_mode` only; other combinations raise. |
+| `op_tags` | yes | Dagster op tags for every Rocky op. Use a pool, for example `{"dagster/pool": "rocky"}` capped at 1, so two ops do not contend for the state-store lock. |
+| `tenant` | yes | Collapses tenants into one partitioned asset. See [Scoping a tenant partition run](#scoping-a-tenant-partition-run). |
+| `post_state_write_hook` | **no, Python only** | Called with the state-file path after every successful `write_state_to_path()`. Typical use: push the state to S3 or Valkey so the next pod boots warm. |
+| `shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn` | **no, Python only** | Forwarded to the resource's resolvers. See [Branch deployments](/dagster/branch-deployments/#resource-level-auto-shadow). |
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -103,6 +121,14 @@ Narrowing applies only to a strict subset of the tenant's connectors. A full or
 empty selection still runs the whole tenant. Each `id=` targets that partition's
 own source, so tenants stay isolated from each other.
 
+## Refreshing state
+
+Trigger a state refresh to pick up the latest discovery results. The
+`dg defs state refresh` workflow calls `write_state_to_path(state_path)` for
+you. A scheduled job that resolves the state path from the `defs_state` config
+does the same. A refresh runs on its own, separate from the code location reload
+cycle.
+
 ## State storage
 
 By default the component stores its state on the local filesystem. Dagster's
@@ -113,7 +139,10 @@ By default the component stores its state on the local filesystem. Dagster's
 - **No API calls on reload** -- Assets appear in the Dagster UI as soon as the code location loads.
 - **Resilience** -- Assets stay visible when a source API is temporarily unavailable.
 - **Large source counts** -- Discovery cost does not land on code location startup, however many sources and tables you have.
-- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_pipes()` keep the two-step `rocky plan` + `rocky apply <plan-id>` chain, persisting `.rocky/plans/<plan-id>.json` per materialization. A [plan](/reference/glossary/#plan) is a reviewable record of what a run will do. The default `run()` / `run_streaming()` path is a fused `rocky run` and does not write a plan file. See [observability](/dagster/observability/#plan-artifact-per-materialization).
+
+With `execution_mode: pipes`, each materialization also keeps a
+[plan](/reference/glossary/#plan) file. See [Plan artifact per
+materialization](/dagster/observability/#plan-artifact-per-materialization).
 
 ## DAG mode
 
@@ -149,11 +178,3 @@ Materialization dispatches to the right Rocky command per node kind:
 
 To change how keys are derived, subclass `RockyDagsterTranslator` and implement
 `get_dag_node_asset_key()` and `get_dag_group_name()`.
-
-## Refreshing state
-
-Trigger a state refresh to pick up the latest discovery results. The
-`dg defs state refresh` workflow calls `write_state_to_path(state_path)` for
-you. A scheduled job that resolves the state path from the `defs_state` config
-does the same. A refresh runs on its own, separate from the code location reload
-cycle.

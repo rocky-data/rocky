@@ -2,7 +2,7 @@
 title: Run the Container Image
 description: "Run Rocky from the container image that ships with every engine release: docker run, the volume, the token, the health probe, the drain, upgrades, and a Compose example."
 sidebar:
-  order: 5.6
+  order: 11
 ---
 
 Every engine release publishes one container image, `ghcr.io/rocky-data/rocky`. The image holds the release's own `rocky` binary and nothing else. This guide shows you how to run it with `docker run`, what to mount, how to probe it, how to stop it, and how to upgrade it. A Compose example and a build recipe close the page.

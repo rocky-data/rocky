@@ -49,7 +49,7 @@ defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
 
 | Symbol | Purpose |
 |---|---|
-| [`RockyResource`](/dagster/resource/) | `ConfigurableResource` wrapping the CLI; 25+ methods; three run modes (buffered, streaming, Pipes) |
+| [`RockyResource`](/dagster/resource/) | `ConfigurableResource` wrapping the CLI. One method per CLI command, three run modes (buffered, streaming, Pipes) |
 | [`RockyComponent`](/dagster/component/) | State-backed component that caches discovery; `dag_mode=True` builds connected asset graphs |
 | [`RockyDagsterTranslator`](/dagster/translator/) | Customize asset keys, groups, tags, and metadata per Rocky table |
 | [`load_rocky_assets()`](/dagster/assets/) | Returns one `AssetSpec` per enabled Rocky table |
@@ -95,10 +95,4 @@ Results travel back up the same chain. The CLI prints typed JSON on stdout. `Roc
 
 ## Requirements
 
-- `dagster >= 1.13.8`
-- `rocky-sdk >= 0.16.0`
-- `pydantic >= 2.0`
-- `pygments >= 2.20.0`
-- The `rocky` binary must be available on `PATH` (or configured via `binary_path`). To pin one Rocky version in a container or cloud deployment, ship the binary next to your Dagster code and point `binary_path` at it — see [Installation](/dagster/installation/#vendor-binary-for-deployment).
-
-`RockyResource` exposes one Python method per Rocky CLI command. See the [RockyResource](/dagster/resource/) page for the full method list and signatures.
+`dagster-rocky` needs `dagster >= 1.13.8`, `rocky-sdk >= 0.18.0`, and the `rocky` binary. See [Installation](/dagster/installation/) for the full list and for how to pin one binary version in a deployment.

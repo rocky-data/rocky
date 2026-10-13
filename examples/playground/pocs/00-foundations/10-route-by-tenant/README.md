@@ -90,9 +90,9 @@ know or care how many tenants exist; it just runs every model under
 1. `duckdb :memory:` mints `data/events.parquet` from the seed CSV.
 2. `rocky load --pipeline ingest` writes all 20 rows into `main.events` via the
    DuckDB adapter's native `read_parquet()` + `CREATE TABLE`.
-3. `run.sh` pre-creates `account_acme`, `account_beta`, `account_ceres`
-   schemas; transformation pipelines don't auto-create schemas at run time
-   today.
+3. `run.sh` pre-creates the `account_acme`, `account_beta` and `account_ceres`
+   schemas. This POC does not set `auto_create_schemas = true` (see
+   [`04-governance/07-auto-create-schemas`](../../04-governance/07-auto-create-schemas)).
 4. `rocky run --pipeline route` compiles the three models, resolves their
    `[target]` from the sidecar `.toml`, and executes a per-model
    `CREATE OR REPLACE TABLE poc.account_<id>.events AS SELECT ... WHERE

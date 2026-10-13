@@ -191,7 +191,7 @@ At the start of each table's replication, Rocky reads the watermark from the sta
    FROM fivetran_catalog.src__acme__us_west__shopify.orders
    WHERE _fivetran_synced > TIMESTAMP '2025-03-15T14:30:00Z'
    ```
-3. **Update.** After a successful copy, Rocky advances the watermark to the current timestamp, and the next run picks up from there.
+3. **Update.** After a successful copy, Rocky reads `MAX(<timestamp_column>)` from the target and stores it as the new watermark. The next run picks up from there.
 
 ## Inspecting state
 
@@ -229,14 +229,16 @@ This catches problems like:
 - A bad sync duplicated data, so the count spikes
 - A connector stopped syncing, so the count stays flat when it should grow
 
-Set the threshold per pipeline in `rocky.toml`:
+Set the threshold per pipeline in `rocky.toml`. It needs the `row_count` check, and defaults to `50`:
 
 ```toml
 [pipeline.bronze.checks]
 enabled = true
 row_count = true
-freshness = { threshold_seconds = 86400 }
+anomaly_threshold_pct = 50
 ```
+
+[Data Quality Checks](/concepts/data-quality-checks/#anomaly-detection) lists every condition the detector needs.
 
 ## Remote State Persistence
 
@@ -250,6 +252,7 @@ A remote backend carries the watermarks and the history, never the scheduler's o
 |---------|--------|----------|
 | `local` | Default | Development, persistent VMs |
 | `s3` | `s3_bucket` | Durable storage, multi-region |
+| `gcs` | `gcs_bucket` | Durable storage on Google Cloud |
 | `valkey` | `valkey_url` | Low-latency, shared state |
 | `tiered` | Both | Valkey for speed, S3 for durability |
 
@@ -295,7 +298,8 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
 
 ```
    ┌────────────────────────┐
-   │ remote: S3 or Valkey   │
+   │ remote: S3, GCS,       │
+   │ or Valkey              │
    └───────────┬────────────┘
                │ 1. download, before the run starts
                ▼
@@ -306,7 +310,8 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
                │ 3. upload, after the run finishes
                ▼
    ┌────────────────────────┐
-   │ remote: S3 or Valkey   │
+   │ remote: S3, GCS,       │
+   │ or Valkey              │
    └────────────────────────┘
 ```
 
@@ -365,7 +370,7 @@ circuit_breaker_threshold = 5
 
 | Mode | Behaviour | When to use |
 |---|---|---|
-| `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
+| `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers. Trades state durability for run liveness. |
 | `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
 
 **A lost run record follows the same rule.** A run can succeed and still fail to write its run record, for example on a full disk. Rocky still uploads the run's other state, such as watermarks, because discarding them would make the next run re-copy data. Under `"skip"` the run warns and exits 0. Under `"fail"`, or on a governed run (`rocky apply`), it exits non-zero after the upload. Either way the uploaded ledger keeps evidence of the run, and [`rocky history`](/reference/commands/administration/#rocky-history) lists it under `unrecorded_runs`.

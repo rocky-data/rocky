@@ -20,16 +20,49 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
+## What Rocky is
+
+Rocky is a typed SQL compiler and run engine. You write SQL and TOML. Rocky
+compiles the project, reports supported static problems before execution, and
+sends generated SQL to your warehouse. Storage and compute stay in the warehouse.
+
+A clean compile does not prove general SQL validity or correct result values.
+See [what Rocky checks, and how](/getting-started/introduction/).
+
+## Get Started in 60 Seconds
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+rocky playground my-first-project
+cd my-first-project
+rocky compile            # type-check
+rocky test               # run the models on an in-memory DuckDB
+rocky run                # materialize the DAG against local DuckDB
+```
+
+You need no credentials. `rocky playground` creates a DuckDB project and seeds
+it, so `rocky run` works on the first try. Other platforms:
+[Installation](/getting-started/installation/).
+
+`rocky run` is the one-step path for local iteration and automation. For a
+PR-gated replication deploy, split it in two: `rocky plan` writes an auditable
+plan to `.rocky/plans/<id>.json`, and `rocky apply <plan-id>` executes it. See
+the [Quickstart](/getting-started/quickstart/).
+
+## See the project
+
+Open the browser UI first. It needs no editor. Add the editor extension when
+you write models.
+
+<CardGrid>
+  <LinkCard title="Browser UI: rocky serve --ui" href="/guides/browser-ui/" description="Models and the DAG, runs, plans waiting for review, and the recorded policy decisions, in your browser. The release binaries include it." />
+  <LinkCard title="VS Code extension" href="/guides/ide-setup/" description="Compile errors, column types, and lineage as you type, through the rocky lsp language server." />
+</CardGrid>
+
 ## Checks Rocky reports at compile time
 
 The expensive failures on a data platform are trust failures, not slow queries.
-A column type changes upstream and a revenue dashboard quietly diverges for
-three days. Warehouse spend doubles and nobody can say which model caused it.
-
-**Rocky reports supported static problems before execution.** The available SQL,
-schemas, and configuration determine which checks can run. A clean compile does
-not prove general SQL validity or correct result values. See
-[the full list, and how Rocky catches each one](/getting-started/introduction/).
+The available SQL, schemas, and configuration determine which checks can run.
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
@@ -48,7 +81,7 @@ not prove general SQL validity or correct result values. See
     `rocky ai` generates a draft and validates it against available project context. Review the generated files and run relevant checks. Replication pipelines can use the saved plan and approval path before execution.
   </Card>
   <Card title="Dialect-divergence lint" icon="puzzle">
-    `P001` catches a Snowflake-only construct in a Databricks project, and the reverse. Cross-warehouse teams stop finding portability bugs in prod.
+    `P001` catches a Snowflake-only construct in a Databricks project, and the reverse.
   </Card>
   <Card title="Declarative tests, not templated SQL" icon="list-format">
     Tests are declarative TOML. Rocky generates the assertion SQL for your target dialect, and `rocky test` runs fixture-driven tests locally on DuckDB.
@@ -60,25 +93,6 @@ not prove general SQL validity or correct result values. See
     `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL, so adopting Rocky never locks you in.
   </Card>
 </CardGrid>
-
-## Get Started in 60 Seconds
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-rocky playground my-first-project
-cd my-first-project
-rocky compile            # type-check
-rocky test               # run assertions locally
-rocky run                # materialize the DAG against local DuckDB
-```
-
-You need no credentials. The playground runs on DuckDB and seeds itself on the
-first run.
-
-`rocky run` is the one-step path for local iteration and automation. For
-production or a PR-gated deploy, split it in two: `rocky plan` writes an
-auditable plan to `.rocky/plans/<id>.json`, and `rocky apply <plan-id>` executes
-it.
 
 ## One trace, one cost graph, one replay handle
 

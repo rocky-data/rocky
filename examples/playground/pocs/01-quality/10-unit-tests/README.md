@@ -40,7 +40,8 @@ distinction is load-bearing — read the `s`.
 | **Command** | `rocky test` (this POC, **default path**) | `rocky test --declarative` |
 | **Warehouse** | None — in-memory DuckDB | Runs against the configured adapter |
 
-Plural `[[tests]]` and the `--declarative` path are covered in a separate POC.
+Plural `[[tests]]` and the `--declarative` path are covered in
+[`09-named-tests`](../09-named-tests/).
 This one is purely the singular `[[test]]` unit-test surface.
 
 This mirrors dbt 1.8's `unit_tests:` (`given` / `expect`) for SQL-logic tests
@@ -66,6 +67,8 @@ seed-CSV scaffolding.
 ```bash
 ./run.sh
 ```
+
+`run.sh` needs `rocky` and `jq` on `PATH`.
 
 Expected: `2/2 fixture-driven unit tests passed` and the captured
 `expected/test.json` carries `unit_tests.total = 2`, `passed = 2`, `failed = 0`.

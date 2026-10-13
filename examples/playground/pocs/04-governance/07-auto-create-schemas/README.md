@@ -11,7 +11,7 @@ A transformation pipeline materialises two models into a target schema (`poc.mar
 
 ## Why it's distinctive
 
-- **Engine v1.29.0 fix.** Pre-v1.29.0 the setting was silently a no-op on transformation pipelines; only the replication path honoured it. Runs failed at execute time with `Catalog Error: Schema with name mart does not exist`. This POC is the regression guard: the pre-condition asserts the target schema is absent, and the run succeeds end-to-end.
+- **Regression guard.** Before engine 1.29.0, transformation pipelines ignored this setting, and the run failed with `Catalog Error: Schema with name mart does not exist`. The precondition asserts the schema is absent; the run must still succeed.
 - **One config knob, zero `CREATE SCHEMA` boilerplate.** Without `auto_create_schemas`, users hand-author the schema before every fresh deploy.
 
 ## Layout

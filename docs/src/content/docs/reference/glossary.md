@@ -9,7 +9,7 @@ Short definitions of the terms that show up across Rocky's docs, CLI output, and
 
 ### Adapter
 
-A plugin that connects Rocky to a system. Source adapters (Fivetran, Airbyte, DuckDB, Iceberg, BigQuery, manual) discover what tables exist. Warehouse adapters (Databricks, Snowflake, BigQuery, Trino, DuckDB) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/concepts/adapters/).
+A plugin that connects Rocky to a system. Discovery adapters (Fivetran, Airbyte, Iceberg, `manual`, and DuckDB and BigQuery) list what tables exist. Warehouse adapters (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, SQL Server, Redshift, ClickHouse, Spark, Trino) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/concepts/adapters/).
 
 ### Apply
 
@@ -25,7 +25,7 @@ The set of downstream models a change can reach. Rocky computes it from [lineage
 
 ### Branch
 
-A named, isolated copy of your pipeline's output, written to its own schema. You develop and run against a branch, inspect the result, then promote it or drop it. Nothing touches production until you promote. See [Branches and replay](/getting-started/roadmap/) and the `06-branches-replay-lineage` POC.
+A named, isolated copy of your pipeline's output, written to its own schema. You develop and run against a branch, inspect the result, then promote it or drop it. Nothing touches production until you promote. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) and the `06-branches-replay-lineage` POC.
 
 ### Bronze layer
 
@@ -65,7 +65,7 @@ The SQL that changes structure rather than rows: `CREATE`, `ALTER`, `DROP`. Rock
 
 ### Declarative
 
-You state the result you want; Rocky works out the statements that get there. A `[[grants]]` block names who should have access, and Rocky derives the `GRANT` and `REVOKE` to match. The opposite is imperative, where you write each step yourself. See [Reconcile](#reconcile).
+You state the result you want; Rocky works out the statements that get there. A `[[grants]]` block names who should have access, and Rocky issues the `GRANT` statements. The opposite is imperative, where you write each step yourself. See [Reconcile](#reconcile).
 
 ### Deterministic
 
@@ -81,7 +81,7 @@ A short fixed-length value computed from a much larger input, so two large thing
 
 ### Drift
 
-A mismatch between what your code expects and what the warehouse actually has, usually because a source column changed type or was added or dropped. Rocky detects it on every run and either recreates the target or blocks the PR. See [Schema drift](/concepts/schema-drift/).
+A mismatch between a source table's schema and its target table's schema, usually because a source column was added or changed type. Rocky detects it on every run. It adds the column, widens the type in place, or rebuilds the target. It does not detect a column the source dropped. See [Schema drift](/concepts/schema-drift/).
 
 ### Dry run
 
@@ -125,7 +125,7 @@ A rule that hides a sensitive column's value. Tag the column with a `[classifica
 
 ### Materialization strategy
 
-How a model's output lands in the warehouse: `view`, `table`, `merge`, `time_interval`, and others. A replication pipeline also takes `incremental`, which a transformation model cannot use (`E037`). Set per model. See [Model format](/reference/model-format/).
+How a model's output lands in the warehouse: `view`, `full_refresh`, `incremental`, `merge`, `time_interval`, and others. A transformation model with `incremental` needs a watermark column, or compile fails with `E037`. Set per model. See [Model format](/reference/model-format/).
 
 ### MCP (Model Context Protocol)
 
@@ -145,7 +145,7 @@ A column that is allowed to hold `NULL`. Rocky carries nullability alongside the
 
 ### OTLP (OpenTelemetry Protocol)
 
-The wire format OpenTelemetry uses to ship traces and metrics. Rocky exports over it, so a run is visible in Grafana, Tempo, or any other OTLP backend without Rocky hosting a UI. See [Observability](/guides/observability/).
+The wire format OpenTelemetry uses to ship traces and metrics. Rocky exports over it, so a run is visible in Grafana, Tempo, or any other OTLP backend. See [Observability](/guides/observability/).
 
 ### Partition
 
@@ -153,7 +153,7 @@ A slice of a table identified by a column value, usually a date or an hour. A pa
 
 ### Pipeline
 
-A unit of work declared in `rocky.toml`. Rocky has four types: `replication` (bronze copy), `transformation` (SQL models), `quality` (standalone checks), and `snapshot` (SCD2 history). See [Configuration](/reference/configuration/).
+A unit of work declared in `rocky.toml`. Rocky has five types: `replication` (bronze copy), `transformation` (SQL models), `quality` (standalone checks), `snapshot` (SCD2 history), and `load` (files into a table). See [Configuration](/reference/configuration/).
 
 ### Plan
 
@@ -173,11 +173,11 @@ Separating a model's failing rows from its passing ones, so a downstream reader 
 
 ### Reconcile
 
-Reading what the warehouse actually has, comparing it against what you declared, and issuing only the statements that close the gap. Rocky reconciles permissions this way: it reads the current grants, diffs them against your config, and emits just the `GRANT` and `REVOKE` it needs. See [Permissions](/reference/permissions/).
+Reading what the warehouse actually has, comparing it against what you declared, and issuing only the statements that close the gap. Rocky reconciles Databricks workspace bindings this way: it adds the missing ones and removes the ones you did not declare. Grants are not reconciled: Rocky adds them and never revokes one. See [Permissions](/reference/permissions/).
 
 ### Replay
 
-Inspecting, auditing, and re-executing a past run against its [content-addressed](#content-addressed) record. `rocky replay <run_id>` surfaces per-model SQL hashes, row counts, and bytes; `rocky replay <run_id> --execute --verify` reconstructs each recipe from its provenance and re-runs it to reproduce the recorded output bit-for-bit, on a local DuckDB engine or, with `--warehouse`, on the live warehouse in an isolated replay schema. Re-execution covers deterministic content-addressed models; mutable-source models are classified `non_replayable` and non-deterministic recipes are flagged. See [Roadmap](/getting-started/roadmap/).
+Inspecting, auditing, and re-executing a past run against its [content-addressed](#content-addressed) record. `rocky replay <run_id>` surfaces per-model SQL hashes, row counts, and bytes; `rocky replay <run_id> --execute --verify` reconstructs each recipe from its provenance and re-runs it to reproduce the recorded output bit-for-bit, on a local DuckDB engine or, with `--warehouse`, on the live warehouse in an isolated replay schema. Re-execution covers deterministic content-addressed models; mutable-source models are classified `non_replayable` and non-deterministic recipes are flagged. See [Verify a run](/guides/verify-a-run/).
 
 ### SCD (slowly changing dimension)
 
@@ -189,7 +189,7 @@ Changing a table's columns over time without breaking the models that read it. R
 
 ### Seam
 
-A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, and the MCP write tools — those are exactly the points the `[policy]` plane gates. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
+A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when `auto_apply_additive_drift` is on. Those are exactly the points the `[policy]` plane gates. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 
 ### Shadow mode
 

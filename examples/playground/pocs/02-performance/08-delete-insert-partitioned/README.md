@@ -3,7 +3,7 @@
 > **Category:** 02-performance
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s
-> **Rocky features:** `strategy = "delete_insert"`, `partition_by`, atomic partition replacement
+> **Rocky features:** `strategy = "delete_insert"`, `partition_by`, partition replacement
 
 ## What it shows
 
@@ -13,6 +13,13 @@ The `delete_insert` materialization strategy is an alternative to MERGE for part
 2. Inserts fresh data for those partitions
 
 This is ideal for late-arriving data, daily/regional aggregates, and scenarios where MERGE's row-matching overhead isn't needed.
+
+**Limit:** on DuckDB the DELETE and the INSERT run as two separate
+statements, not one transaction. The DELETE commits first, so a failed INSERT
+leaves the partition empty until the next run. Some adapters (PostgreSQL,
+Redshift) join them into one transaction.
+
+`run.sh` only validates and compiles the model. It does not execute it.
 
 ## Why it's distinctive
 
@@ -68,14 +75,15 @@ POC complete: delete_insert strategy parsed and compiled.
 ## What happened
 
 1. `rocky compile` parsed the model and recognized `delete_insert` strategy with `partition_by = ["region"]`
-2. At execution time, Rocky would generate:
+2. At execution time, Rocky generates two statements (shape from
+   `SqlDialect::delete_partitions_sql` in `engine/crates/rocky-core/src/traits.rs`):
    ```sql
-   DELETE FROM poc.analytics.regional_sales WHERE region IN ('us_east', 'us_west', 'eu_west');
-   INSERT INTO poc.analytics.regional_sales
-   SELECT sale_date, region, COUNT(*), SUM(amount), AVG(amount)
-   FROM seeds.daily_sales GROUP BY sale_date, region;
+   DELETE FROM poc.analytics.regional_sales WHERE (region) IN (
+     SELECT DISTINCT region FROM (<model SQL>) AS _rocky_incoming);
+   INSERT INTO poc.analytics.regional_sales <model SQL>;
    ```
-3. Only affected partitions are touched; unmodified regions remain untouched
+3. Only the regions present in the new output are deleted and re-inserted.
+   Other regions in the target stay as they are.
 
 ## Related
 

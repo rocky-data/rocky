@@ -62,7 +62,7 @@ Live demo + tour (when credentials are set):
 - GCP project with BigQuery API enabled
 - One of:
   - `GOOGLE_APPLICATION_CREDENTIALS` — path to Service Account JSON key
-  - `BIGQUERY_TOKEN` — pre-supplied Bearer token (e.g., `gcloud auth print-access-token`)
+  - `BIGQUERY_TOKEN` — pre-supplied Bearer token (e.g., `gcloud auth print-access-token`); top-level `./run.sh` only
 
 ## Run
 
@@ -100,17 +100,16 @@ Full BigQuery surface tour, one scenario at a time:
 
 Each driver creates its own `poc_step*_*` dataset, runs end-to-end, and cleans up on exit.
 
+The drivers under `live/` read only `GCP_PROJECT_ID` and
+`GOOGLE_APPLICATION_CREDENTIALS`: they refuse to start without both. The
+`BIGQUERY_TEST_PROJECT` and `BIGQUERY_TOKEN` fallbacks work only for the
+top-level `./run.sh`.
+
 ## Recording
 
 The live tour is a recorded demo. [`RECORDING.md`](./RECORDING.md) is the standalone shooting script: a seven-shot order (compile smoke → full-refresh → discover → merge → time-interval → drift → cost cross-check), each with the command, what it proves, and a caption, plus the pre-flight env vars and binary setup.
 
-The recording is recorder-agnostic on purpose: the repo's `cli-recording/` vhs tapes are local-DuckDB and no-creds, and vhs's fixed `Sleep` pacing can't track multi-minute live BigQuery jobs, so capture with asciinema, a screen recorder, or whatever you prefer. The env vars are the same as the live run:
-
-```bash
-export GCP_PROJECT_ID="<your-gcp-project-id>"          # BIGQUERY_TEST_PROJECT also accepted
-export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"   # or BIGQUERY_TOKEN
-export BQ_LOCATION="EU"                                # optional; default EU
-```
+The recording is recorder-agnostic on purpose: the repo's `cli-recording/` vhs tapes are local-DuckDB and no-creds, and vhs's fixed `Sleep` pacing can't track multi-minute live BigQuery jobs. Capture with asciinema, a screen recorder, or whatever you prefer. The env vars are the same as the live run above.
 
 ## Expected output
 

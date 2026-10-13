@@ -1,11 +1,11 @@
 ---
 title: Modeling Commands
-description: Commands for compiling, tracing lineage, testing, and running CI on Rocky SQL models
+description: Compile, test, lint and diff Rocky models, trace their lineage, and preview a change before it merges
 sidebar:
   order: 2
 ---
 
-Commands for working with Rocky's SQL models: compile, lineage, local tests, and CI.
+These commands work on Rocky models. They compile and test the models, trace lineage, render SQL, and compare a change against a base git ref. The last two publish and check schemas across teams.
 
 ---
 
@@ -24,7 +24,8 @@ rocky compile [flags]
 | `--models <PATH>` | `PathBuf` | every pipeline | Compile only the `.sql`, `.rocky` and `.toml` model files in this directory. Without it, Rocky compiles the models of every transformation pipeline together. See [The whole project by default](#the-whole-project-by-default). |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
 | `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` / `--state-working-tree` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
+| `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, so `rocky compile` checks the same SQL `rocky run --var` executes. A required `@var(name)` with no value and no inline default is a compile error. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). The flag also selects the warehouse for the `E042`/`E043` operand checks, ahead of the adapter type. See [Aggregate and comparison operands](/concepts/compiler/#aggregate-and-comparison-operands). |
 | `--deny-warnings <CODES>` | `string` (comma-separated, repeatable) | | Report the listed warning codes as errors and exit non-zero, such as `--deny-warnings W042,W043`. Other warnings stay warnings. A code that is not a warning code (`W999`, `W42`, `E042`) is refused before the compile, with the list of valid codes. |
@@ -756,10 +757,12 @@ rocky emit-sql [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
-| `--model <NAME>` | `string` | | Render a single model by name instead of the whole project. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Render only the [selected models](/reference/node-selection/). |
+| `--models <PATH>` | `PathBuf` | `models`, or the `--pipeline`'s own models location | Directory containing `.sql` and `.toml` model files. |
+| `--model <NAME>` | `string` | | Render one model by exact name. Cannot be combined with `--select`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` / `--state-working-tree` | `string` | | Render only the [selected models](/reference/node-selection/). |
 | `--out-dir <PATH>` | `PathBuf` | | Write one `<model>.sql` file per model into this directory, in dependency order. When omitted, the concatenated SQL is printed to stdout (also in dependency order). |
+| `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, so the emitted SQL shows the resolved `@var(name)` text. |
+| `--pipeline <NAME>` | `string` | the only transformation pipeline | Transformation pipeline whose target adapter sets the SQL dialect. Required when the project has more than one transformation pipeline. A name that matches no transformation pipeline is an error. |
 
 ### Dialect and the runnable guarantee
 
@@ -773,7 +776,7 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 | Present, with `${VAR}` placeholders in an adapter's connection fields you have not exported | Renders in the configured dialect. A credential is never sent anywhere, so it does not have to resolve. An unset placeholder anywhere else — an adapter `type`, an `[imports]` path — still refuses, because it changes what the config means. |
 | Present but malformed, or it breaks a config rule | Refuses, and names the file. Rendering a broken Snowflake project in DuckDB would answer a question you did not ask. |
 
-With a config present, `emit-sql` also runs the per-model-target checks of [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile) (E042/E043, E044, E049, E051, E053, E054). It refuses to emit SQL that the pipeline's warehouse cannot run, such as a `merge` model on ClickHouse (E053).
+With a config present, `emit-sql` also runs the per-model-target checks of [`rocky compile`](#rocky-compile) (E042/E043, E044, E049, E051, E053, E054). It refuses to emit SQL that the pipeline's warehouse cannot run, such as a `merge` model on ClickHouse (E053).
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
@@ -853,7 +856,7 @@ rocky lint --fix                    # Rewrite the fixable findings in place
 rocky lint --output json            # Machine-readable findings
 ```
 
-`rocky lint` reads `.sql` files. It does not read `.rocky` files. Use [`rocky fmt`](/reference/cli/) for those.
+`rocky lint` reads `.sql` files. It does not read `.rocky` files. Use [`rocky fmt`](/reference/cli/#rocky-fmt) for those.
 
 **Arguments and flags:**
 
@@ -957,7 +960,8 @@ rocky test [flags]
 | `--models <PATH>` | `PathBuf` | `models/` beside the config file | Directory containing model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory. |
 | `--model <NAME>` | `string` | | Run tests for a single model only. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` / `--state-working-tree` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
+| `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, as in `rocky compile --var`. |
 | `--declarative` | `bool` | `false` | Run the `[[tests]]` of model sidecars against the warehouse instead of DuckDB. |
 | `--pipeline <NAME>` | `string` | | With `--declarative`: run the tests of the models in `--models` against this pipeline's warehouse. Without it and without `--models`, every transformation pipeline runs its own models' tests against its own warehouse. |
 
@@ -1078,6 +1082,7 @@ rocky ci [flags]
 | `--models <PATH>` | `PathBuf` | every pipeline | Run only the models in this directory. Without it, `rocky ci` runs the models of every transformation pipeline. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
 | `--strict-contracts` | `bool` | `false` | Refuse a contract column whose declared type Rocky cannot check: the `I003` note becomes the `E059` error. Same as `[contracts] strict = true`. |
+| `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, as in `rocky compile --var`. |
 
 With no `--models`, `rocky ci` compiles every transformation pipeline's models as one project graph, as [`rocky compile`](#the-whole-project-by-default) does. Then it runs them all in one in-memory DuckDB, in dependency order. So a model in a downstream pipeline reads the tables its upstream pipelines made.
 
@@ -1087,7 +1092,7 @@ data/seed.sql ─► in-memory DuckDB ─► compile (typed from the seed) ─�
 
 The seed is `data/seed.sql` beside `rocky.toml`. The compile is typed from the tables it made, so `rocky ci` finds a contract type mismatch (`E011`) from the seed alone.
 
-The compile runs the same per-model-target checks as [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`. `E054` is judged on the SQL each model runs, with its ephemeral upstreams inlined, as `rocky run` sends it.
+The compile runs the same per-model-target checks as [`rocky compile`](#rocky-compile). These are `E042`/`E043` (operand types), `E057` (unknown function), `E044` (`GROUP BY`), `E049`, `E051`, `E053` and `E054`. Each model is judged against the warehouse of the pipeline that loads it, as read from `rocky.toml`. An error from these checks fails `rocky ci` before any model runs, and its code is in `diagnostics`. `E054` is judged on the SQL each model runs, with its ephemeral upstreams inlined, as `rocky run` sends it.
 
 The project files are found beside the config file, not the working directory. So `rocky --config sub/rocky.toml ci` run from the directory above reads `sub/contracts/` and `sub/functions/`. `rocky compile` and `rocky test` do the same when you pass no `--models`.
 
@@ -1354,6 +1359,7 @@ Pass `--algorithm bisection` to compare row content. It needs a `Merge` model wh
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. Rocky matches it against the `rocky_branch` recorded on each run. |
 | `--base <REF>` | `string` | `main` | Git branch name or commit that the base run was recorded on. A commit can be a full sha or a prefix of at least 7 characters. It must differ from `--name`. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
+| `--algorithm <ALGO>` | `sampled` \| `bisection` | `sampled` | Comparison method. Hidden from `--help`. See the `bisection` limits above. |
 
 The old `--sample-size` flag is gone. Nothing read it, so Rocky removed it. A script that still passes it now fails to parse.
 
@@ -1421,6 +1427,38 @@ These back the autogenerated Pydantic and TypeScript bindings. See [JSON Output]
 - [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) -- the schema-prefix branches `preview create` registers
 - [`rocky cost`](/reference/commands/administration/#rocky-cost) -- the per-run cost rollup `preview cost` diffs across base and branch
 - [`rocky compare`](/reference/cli/#rocky-compare) -- ad-hoc shadow comparison; `preview diff` extends the same kernel with sampled row-level diffing
+
+---
+
+## `rocky publish-ir`
+
+Publish this project's compiled schema so another team can check their models against it. Rocky compiles the project and writes its typed `ProjectIr` as JSON. The consumer vendors that file and points an [`[imports.<name>]`](/reference/configuration/#importsname) block at it. Their `rocky compile` then fails (`E030`) when you drop a column they still read.
+
+```bash
+rocky publish-ir [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. |
+| `--contracts <PATH>` | `PathBuf` | | Contracts directory. |
+| `--out <PATH>` | `PathBuf` | `project-ir.json` | Where to write the snapshot. |
+| `--with-seed` | `bool` | `false` | Run `data/seed.sql` against an in-memory DuckDB before compiling, so leaf models get concrete column types. |
+
+### Examples
+
+```bash
+rocky publish-ir --with-seed --out project-ir.json
+```
+
+Pass `--with-seed` for a self-contained DuckDB producer. Without concrete types, the snapshot gives the consumer's contract nothing to check against.
+
+### Related Commands
+
+- [`rocky imports`](#rocky-imports) -- the consumer side: advance the vendored baseline
+- [Cross-team contracts](/concepts/cross-team-contracts/) -- the full producer and consumer workflow
 
 ---
 

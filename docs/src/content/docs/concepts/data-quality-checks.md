@@ -8,7 +8,7 @@ sidebar:
 Rocky has two quality surfaces. Both run inline against the warehouse during a run.
 
 1. **Pipeline-level checks** — configured per pipeline in `rocky.toml` under `[pipeline.<name>.checks]`. They run after each table is replicated: row count, column match, freshness, null rate, anomaly detection, custom SQL.
-2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML, or directly under `[pipeline.<name>.checks]`, as repeated `[[assertions]]` blocks. They cover `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, and `composite`, plus the time-window shorthands `not_in_future` and `older_than_n_days`.
+2. **Declarative assertions** — repeated `[[assertions]]` blocks under `[pipeline.<name>.checks]`. The same kinds in a model sidecar, written as `[[tests]]`, run separately with `rocky test --declarative` (see the [table below](#model-level-declarative-assertions)). They cover `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, and `composite`, plus the time-window shorthands `not_in_future` and `older_than_n_days`.
 
 A third check runs before either of them. The compiler validates each model against its contract, so a model that breaks its contract never reaches the warehouse:
 
@@ -22,8 +22,8 @@ A third check runs before either of them. The compiler validates each model agai
    └─────────┬──────────┘               │ each table lands │
              │ an error                 └────────┬─────────┘
              ▼                                   │
-   the run stops. Nothing      ┌──────────────┐  │
-   reaches the warehouse.      │ model-level  │  │
+   the model and its           ┌──────────────┐  │
+   downstream are withheld.    │ model-level  │  │
                                │ assertions,  │  │
                                │ on any       │  │
                                │ pipeline type│  │
@@ -362,8 +362,6 @@ Six names on the allowlist are refused in one particular shape, because that sha
 | `to_date`, `to_timestamp`, `to_char` | called with one argument, e.g. `to_date(order_date)`, reads a session default format | called with an explicit format, e.g. `to_date(order_date, 'YYYY-MM-DD')` |
 | `date_trunc`, `datediff` (and its `date_diff` spelling) | a `week` date part, or a synonym (`w`, `wk`, `weekofyear`, `woy`, `wy`), reads `WEEK_START` | any other date part, e.g. `day`, `month`, `year`, or the fixed, Monday-start `week_iso` |
 | `date_part` | a `week` (`w`, `wk`, `weekofyear`, `woy`, `wy`) part reads `WEEK_START`; a `dayofweek` (`weekday`, `dow`, `dw`) or `yearofweek` part reads `WEEK_OF_YEAR_POLICY` and `WEEK_START` | any other date part, including `dayofyear`, the `epoch_*` and `timezone_*` parts `date_trunc`/`datediff` don't take, and every ISO-fixed variant (`week_iso`, `dayofweekiso`, `yearofweekiso`) |
-
-`to_char` was off the allowlist entirely until this rule shipped; it is back on now that its risky shape is refused rather than its name.
 
 `EXTRACT(<part> FROM <expr>)` — Snowflake's own documented alternative spelling of `date_part`, and also accepted as `EXTRACT(<part>, <expr>)` on Snowflake — is refused on the identical three part families, even though it parses as its own SQL construct rather than a function call.
 

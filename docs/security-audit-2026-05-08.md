@@ -1,5 +1,7 @@
 # Rocky monorepo — security audit
 
+**Status:** Record. It describes the code as it was on 2026-05-08. It is not updated when a finding is fixed.
+
 **Date:** 2026-05-08
 **Scope:** `engine/` (20 Rust crates), `integrations/dagster/` (Python), `editors/vscode/` (TypeScript), `examples/playground/`, `scripts/`, `.git-hooks/`
 **Method:** parallel static review across 7 concern areas (secrets, SQL, subprocess, fs/deserialization, network/TLS, LSP/IPC, AI), plus `npm audit`. `cargo audit` and `pip-audit` were not installed in this environment (see Limitations).

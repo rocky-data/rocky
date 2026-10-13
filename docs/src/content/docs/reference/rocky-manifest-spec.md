@@ -2,7 +2,7 @@
 title: "rocky-manifest v0.1"
 description: An open, offline-verifiable format for attesting which program, over which inputs, in which environment produced a table version
 sidebar:
-  order: 11
+  order: 12
 ---
 
 :::caution[Draft / experimental]

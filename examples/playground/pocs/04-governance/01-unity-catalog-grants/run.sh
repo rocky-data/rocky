@@ -12,4 +12,4 @@ rocky validate
 rocky -c rocky.toml -o json plan --filter source=orders > expected/plan.json
 rocky -c rocky.toml -o json run  --filter source=orders > expected/run.json
 
-echo "POC complete: grants reconciled. See expected/run.json -> permissions block."
+echo "POC complete: grants applied. See expected/run.json -> permissions block."

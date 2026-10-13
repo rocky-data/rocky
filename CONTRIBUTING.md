@@ -5,6 +5,7 @@ Rocky is a monorepo. Every subproject shares one repository, one issue tracker, 
 | Subproject | Path | Language | Build |
 |---|---|---|---|
 | Rocky CLI engine | `engine/` | Rust (multi-crate Cargo workspace) | `cargo` |
+| Browser UI (`rocky serve --ui`) | `engine/ui/` | TypeScript (React, Vite) | `npm` |
 | Python SDK | `sdk/python/` | Python | `uv` |
 | Dagster integration | `integrations/dagster/` | Python | `uv` |
 | VS Code extension | `editors/vscode/` | TypeScript | `npm` |
@@ -30,16 +31,16 @@ git clone https://github.com/rocky-data/rocky.git
 cd rocky
 ```
 
-The top-level `justfile` runs one task across the four code subprojects: the engine, the SDK, the Dagster integration, and the VS Code extension. It does not cover `docs/` or the playground. Install [`just`](https://github.com/casey/just), then:
+The top-level `justfile` runs one task across the code subprojects: the engine, the browser UI, the SDK, the Dagster integration, and the VS Code extension. It does not cover `docs/` or the playground. Install [`just`](https://github.com/casey/just), then:
 
 ```bash
 just build       # engine, sdk wheel, dagster wheel, vscode extension
-just test        # cargo test, both pytest suites, vscode unit tests
-just lint        # cargo clippy/fmt + ruff + eslint
+just test        # cargo test, both pytest suites, vscode unit tests, UI typecheck + tests
+just lint        # cargo clippy/fmt + ruff + eslint (vscode and UI)
 just --list      # every recipe
 ```
 
-Two gaps to know about. `just test` runs the VS Code unit tests only; the electron suite has its own recipe, `just test-vscode-electron`. `just build` compiles the extension but does not bundle it, so it does not produce the `dist/extension.js` that debugging needs.
+Three gaps to know about. `just build` does not build the browser UI; `just build-engine-ui` builds it and embeds it in a release binary. `just test` runs the VS Code unit tests only; the electron suite has its own recipe, `just test-vscode-electron`. `just build` compiles the extension but does not bundle it, so it does not produce the `dist/extension.js` that debugging needs.
 
 You can also build one subproject directly. The sections below give the commands.
 
@@ -53,7 +54,7 @@ To start a branch, `scripts/new-branch.sh <name> [base]` refuses on a dirty tree
 - **pre-commit, codegen drift:** runs only when you stage `output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` under `engine/crates/rocky-cli/src/`.
 - **pre-push:** `cargo clippy` for `engine/`, `ruff check` for `integrations/dagster/`.
 
-Neither hook checks `sdk/python/`. A check also skips silently when its tool is not installed, so a missing `uv` turns the ruff check into a pass. The drift check compares fewer paths than `codegen-drift.yml` does, so a commit can pass the hook and still fail CI. Treat the hooks as a fast first pass, not as the gate. Set `ROCKY_SKIP_HOOKS=1` to skip every hook, or `ROCKY_SKIP_CODEGEN_HOOK=1` to skip the drift check alone.
+Neither hook checks `sdk/python/`, and neither lints `engine/ui/`. A check also skips silently when its tool is not installed, so a missing `uv` turns the ruff check into a pass. The drift check compares fewer paths than `codegen-drift.yml` does, so a commit can pass the hook and still fail CI. Treat the hooks as a fast first pass, not as the gate. Set `ROCKY_SKIP_HOOKS=1` to skip every hook, or `ROCKY_SKIP_CODEGEN_HOOK=1` to skip the drift check alone.
 
 ### Engine (`engine/`)
 
@@ -90,6 +91,19 @@ uv run ruff check && uv run ruff format --check
 ```
 
 Every test runs without the `rocky` binary and without credentials. Hand-written scenario data lives in `tests/scenarios.py` as Python dicts. Captures from a real binary live in `tests/fixtures_generated/`, and `just regen-fixtures` refreshes them.
+
+### Browser UI (`engine/ui/`)
+
+```bash
+cd engine/ui
+npm ci
+npm run build      # writes dist/, then refuses any external load
+npm test           # vitest
+npm run typecheck
+npm run lint
+```
+
+`cargo build --features ui` (from `engine/`) embeds `engine/ui/dist/` in the binary. Plain `cargo build` needs no Node toolchain. For local development, run `just ui-dev` from the repository root. It starts `rocky serve` on port 8080 and Vite on 5173; open `http://localhost:5173/ui/`. [`engine/ui/README.md`](engine/ui/README.md) has the details.
 
 ### VS Code extension (`editors/vscode/`)
 
@@ -220,10 +234,10 @@ CI is path-filtered. The paths your PR touches decide which workflows run. Every
 
 | What you touch | Workflow | What it runs |
 |---|---|---|
-| `engine/**` | `engine-ci.yml` | nextest, clippy, `cargo fmt --check`, an adapter-boundary lint, a release-build smoke test |
+| `engine/**` | `engine-ci.yml` | nextest, clippy, `cargo fmt --check`, an adapter-boundary lint, the browser UI's lint, typecheck, tests and build, a release-build smoke test with the UI embedded |
 | `sdk/python/**` | `sdk-ci.yml` | pytest, ruff, and a smoke job driving the SDK against a real `rocky` |
 | `integrations/dagster/**` | `dagster-ci.yml` | pytest and ruff |
-| `editors/vscode/**` | `vscode-ci.yml` | compile, the electron integration tests, eslint |
+| `editors/vscode/**` | `vscode-ci.yml` | compile, vitest unit tests, the electron integration tests, eslint |
 | `docs/**` | `docs-build.yml` | an Astro build of the docs site |
 | `scripts/**` | `scripts-ci.yml` | shellcheck, and a self-test of the soak-verdict script |
 | `.agents/skills/**` or `.claude/skills/**` | `skills-mirror-drift.yml` | diffs the two skill trees and fails unless they are byte-identical |

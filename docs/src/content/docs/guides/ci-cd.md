@@ -408,7 +408,7 @@ jobs:
         run: uv run dg check defs
 ```
 
-The two checks cover different layers. `rocky ci` validates the models on their own. Dagster's `definitions validate` confirms that the orchestration layer can load those models and wire them into assets.
+The two checks cover different layers. `rocky ci` validates the models on their own. `dg check defs` confirms that the orchestration layer can load those models and wire them into assets.
 
 ## 7. JSON Output Schema
 
@@ -418,7 +418,7 @@ Every CI command emits structured JSON.
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "ci",
   "compile_ok": true,
   "tests_ok": true,
@@ -435,7 +435,7 @@ Every CI command emits structured JSON.
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "compile",
   "models": 12,
   "execution_layers": 4,
@@ -458,7 +458,7 @@ Every CI command emits structured JSON.
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.80.0",
   "command": "test",
   "total": 12,
   "passed": 11,

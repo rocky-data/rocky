@@ -178,7 +178,7 @@ so a second run replaces the function in place.
 | PostgreSQL | `CREATE OR REPLACE FUNCTION name(cents BIGINT) RETURNS NUMERIC LANGUAGE sql [IMMUTABLE \| VOLATILE] AS $rocky$ SELECT … $rocky$` |
 | Redshift | `CREATE OR REPLACE FUNCTION name(BIGINT) RETURNS FLOAT8 { IMMUTABLE \| VOLATILE } AS $$ SELECT … $$ LANGUAGE sql` |
 | Trino | Refused with `E051` |
-| ClickHouse, SQL Server | Refused with `E051` |
+| ClickHouse, SQL Server, Spark | Refused with `E051` |
 
 The table shows each statement on one line. In the real statement, the
 parenthesis that closes the body starts a new line, so a trailing
@@ -224,7 +224,8 @@ transformation pipeline that loads it.
 Rocky's Trino adapter cannot create persistent functions. `rocky compile`
 reports `E051` when a calling model runs on a Trino target.
 `rocky run` and the plan preview refuse with `E051` on a Trino target.
-ClickHouse and SQL Server are refused the same way. On SQL Server a
+ClickHouse, SQL Server and Spark are refused the same way, because Rocky has
+no function DDL for them. On SQL Server a
 scalar function takes `@`-prefixed parameters and must be called with its
 schema (`dbo.f(x)`), so a model's bare `f(x)` call would not reach it.
 

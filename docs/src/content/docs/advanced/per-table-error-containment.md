@@ -2,7 +2,7 @@
 title: Per-table error containment
 description: How rocky run keeps one failed table from killing the whole run, and how to branch on failure_kind
 sidebar:
-  order: 4
+  order: 3
 ---
 
 `rocky run` treats each table as its own unit of work. The canonical `rocky plan` plus `rocky apply` flow behind it does the same. One table failing does not crash the run.
@@ -46,11 +46,11 @@ Classifying the adapter error into a [`FailureKind`](#failure_kind-taxonomy) *be
 Two config keys abort the run early. Both live under `[execution]`, and neither is a CLI flag.
 
 - `fail_fast = true` (default `false`) aborts on the first error.
-- `error_rate_abort_pct` (default `50`, `0` disables it) aborts once more than that percentage of completed tables have failed. Rocky checks the rate only after at least 4 tables complete.
+- `error_rate_abort_pct` (default `50`, `0` disables it) aborts once the share of failed tables is at or above that percentage. Rocky checks the rate only after at least 4 tables complete.
 
 Without an abort, the run finishes and exits non-zero. That lets a caller tell partial success from clean success, while the JSON output stays well-formed.
 
-The loop is agnostic to the [adapter](/reference/glossary/#adapter), the plugin that runs Rocky's SQL on one particular warehouse. So this holds for Databricks, Snowflake, BigQuery, and DuckDB alike. The loop catches `anyhow::Error` from any source: connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
+The loop is agnostic to the [adapter](/reference/glossary/#adapter), the plugin that runs Rocky's SQL on one particular warehouse. So this holds for every warehouse adapter. The loop catches `anyhow::Error` from any source: connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
 
 ### What `errors[*]` looks like
 
@@ -95,8 +95,6 @@ The classifier walks the `anyhow::Error` chain on each per-table failure. It dow
 
 How the error was built decides whether that works. An error built with `anyhow::anyhow!("...{e}")` stringifies its source and drops the type, so it falls through to `unknown`. An error propagated with `?` or `.context(...)` keeps the typed source and classifies correctly.
 
-Engine `v1.34` converted the 23 sites in `run.rs` that used to stringify adapter errors into type-preserving wraps. Since then, `failure_kind` returns a non-`unknown` value for every real production adapter error.
-
 ### Recommended consumer policy
 
 Map each variant to one of four actions:
@@ -108,7 +106,7 @@ Map each variant to one of four actions:
 | **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found`, `compile-error` |
 | **Surface raw `error` for triage** | `unknown` |
 
-"Retry with backoff" needs one qualification. Since engine 1.58.0 the run loop already retries proven-transient failures itself, on by default. See [Classified retry](/advanced/failure-modes/#classified-retry) and `[resilience] transient_max_retries`, which defaults to 2.
+"Retry with backoff" needs one qualification. The run loop already retries proven-transient failures itself, on by default. See [Classified retry](/advanced/failure-modes/#classified-retry) and `[resilience] transient_max_retries`, which defaults to 2.
 
 So a `transient` entry that reaches your `errors[*]` has already exhausted its in-run retry budget. At the orchestrator level, retry means a *delayed* re-run or `--resume-latest`. It does not mean a tight-loop retry, which only doubles the engine's own attempts.
 
@@ -176,7 +174,7 @@ defs = dg.Definitions(
 )
 ```
 
-This needs two versions. Engine `v1.34+` emits the discriminator on the wire, and `dagster-rocky` `v1.35+` surfaces `failure_kind` directly on `RunResult.errors[*]`. Older bindings default the field to `"unknown"` when they parse a newer engine's output.
+`dagster-rocky` surfaces `failure_kind` directly on `RunResult.errors[*]`.
 
 For a non-Dagster consumer, `rocky run --output json | jq` gives the same shape:
 
@@ -199,5 +197,5 @@ Treat `unknown` as a surface-and-triage signal, never as silently retry-safe.
 ## See also
 
 - [Failure modes](/advanced/failure-modes/) -- the nine-category taxonomy and recovery playbook for every kind of Rocky failure.
-- [JSON output](../../reference/json-output) -- the full versioned schema for `rocky run` and every other command.
-- [`rocky plan --resume-latest`](../../reference/cli) -- resume a failed run from its last checkpoint; per-table progress is recorded for every success and every classified failure.
+- [JSON output](/reference/json-output/) -- the full versioned schema for `rocky run` and every other command.
+- [`rocky plan --resume-latest`](/reference/commands/core-pipeline/#rocky-plan) -- resume a failed run from its last checkpoint; per-table progress is recorded for every success and every classified failure.

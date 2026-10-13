@@ -24,7 +24,6 @@ Rocky instances through a Valkey-backed remote state store:
 - **Replicated schema cache** — `[cache.schemas] replicate = true` ships the DESCRIBE-result cache off-machine
 - **Valkey state** — `backend = "valkey"` uses local redb as the working store and Valkey as the shared remote
 - **Graceful degradation** — if Valkey is unreachable, state sync warns and the run continues on local state
-- **Zero-config Valkey** — set `valkey_url` and Rocky handles serialization + TTL
 
 > **Note on `tiered`:** a `backend = "tiered"` state store means **Valkey (fast) + S3
 > (durable)** and additionally requires `s3_bucket`. This POC stays Valkey-only to
@@ -79,7 +78,7 @@ docker compose down   # cleanup
 === Run pipeline (cache-enabled) ===
 
 === Check Valkey state ===
-  rocky:state:poc:v19:state.redb        # only when Valkey (Docker) is running
+  rocky:state:poc:v32:state.redb        # only when Valkey (Docker) is running
 
 POC complete: replicated schema cache + Valkey state backend configured.
 ```

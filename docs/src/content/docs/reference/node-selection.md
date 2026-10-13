@@ -2,7 +2,7 @@
 title: Node selection
 description: Syntax and semantics of --select, --exclude, and --state-ref for choosing which models a command works on
 sidebar:
-  order: 6
+  order: 5
 ---
 
 Choose a subset of transformation models with `--select` and `--exclude`. The syntax follows dbt's [node selection syntax](https://docs.getdbt.com/reference/node-selection/syntax), so a dbt selector usually works unchanged.

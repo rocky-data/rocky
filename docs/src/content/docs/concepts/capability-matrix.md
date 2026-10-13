@@ -39,7 +39,7 @@ Four more words appear across the rows, always with the same meaning:
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E013) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E014) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
@@ -53,12 +53,14 @@ Four more words appear across the rows, always with the same meaning:
 
 **Rocky-guaranteed: enforced at compile.** A `.contract.toml` declares what a model must produce.
 `rocky compile` checks the model's inferred schema against it, before anything
-runs, and fails on any of these four errors:
+runs, and fails on any of these errors:
 
 - `E010`: a required column is missing.
 - `E011`: a column's type does not match.
 - `E012`: the contract says non-nullable, the model output is nullable.
 - `E013`: a protected column was removed.
+- `E014`: the output holds a nullable column the contract does not declare.
+  This check runs only when the contract sets `[rules] no_new_nullable = true`.
 
 Every `rocky run` reads the project `contracts/` directory and checks each contract in the compile that supplies the model SQL. A contract error keeps that model's existing table and withholds its downstream models. `rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` also requires the selected model to have a contract. A failed run can still record state and history.
 
@@ -76,18 +78,18 @@ Two limits, stated plainly:
   fills the schema cache that `rocky compile` reads. `discover` refuses a
   transformation-only pipeline, so for those use a seed. One limit on that:
   an expression whose result type depends on the warehouse — `AVG` over a
-  `DECIMAL` column — stays `Unknown` either way. A `CAST` (also `::`,
-  `TRY_CAST` and `SAFE_CAST`) over an input Rocky cannot type takes its
-  target type, and so clears an `I003`, only for these targets: `BOOLEAN`, `DOUBLE` (`DOUBLE PRECISION`, `FLOAT64`), `DATE`, text types (`VARCHAR`, `CHAR`, `TEXT`, `STRING`), binary types (`BINARY`, `VARBINARY`, `BLOB`), and `DECIMAL` or `NUMERIC` with digits (`DECIMAL(p)` or `DECIMAL(p, s)`, `1 <= p <= 38`, `0 <= s <= p`). The contract is
-  compared with that target. `INT`, `INTEGER`, `SMALLINT`, `TINYINT`, `BIGINT`, `FLOAT`, `REAL`, `TIMESTAMP`, a bare `DECIMAL` or `NUMERIC`, and `DECIMAL` digits out of that range stay `Unknown`, because their width differs by warehouse (Snowflake `BIGINT` and `INTEGER` are `NUMBER(38,0)`, `FLOAT` is 64-bit, `TIMESTAMP` is `TIMESTAMP_NTZ`). A `TRY_CAST` or `SAFE_CAST` column is
-  nullable.
+  `DECIMAL` column — stays `Unknown` either way. A `CAST` over an input
+  Rocky cannot type clears an `I003` only for some target types, such as
+  `DATE` or `DECIMAL(18, 2)`. `INT`, `BIGINT` and `TIMESTAMP` stay `Unknown`,
+  because their width differs by warehouse. The full list is in
+  [The Rocky Compiler](/concepts/compiler/#4-type-check).
 - To refuse a declared type Rocky cannot check, run `rocky compile
   --strict-contracts` or `rocky ci --strict-contracts`, or set
   `[contracts] strict = true` in `rocky.toml` (which `rocky run` and
   `rocky test` also read). Each `I003` is then the `E059` error. It names the
   model and the column, says why the type is unknown, and says how to fix it:
-  give the compiler source schemas, or cast the column to one of the targets
-  above in the SELECT. `rocky run` first describes the sources in the
+  give the compiler source schemas, or cast the column to one of those targets
+  in the SELECT. `rocky run` first describes the sources in the
   warehouse, so it refuses only what stays unknown after that.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision

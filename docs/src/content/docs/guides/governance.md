@@ -2,14 +2,14 @@
 title: Data Governance
 description: Configure schema patterns, data contracts, permissions, tagging, quality checks, and audit trails.
 sidebar:
-  order: 7
+  order: 17
 ---
 
 Rocky enforces data quality, schema stability, access control, masking, retention, and auditability. Most of it is declarative: write the rules in `rocky.toml` or in a model sidecar, and `rocky apply` carries them out. Two features run as standalone commands instead, so you can gate a PR on them. `rocky compliance` rolls up classification against masking, and `rocky retention-status` reports retention per model.
 
 Five governance features do the enforcement. Each one names what Rocky does:
 
-1. **Grants** -- Rocky reconciles catalog and schema ACLs against Unity Catalog on every apply.
+1. **Grants** -- Rocky issues a `GRANT` for each declared catalog and schema permission on every apply. It never revokes.
 2. **Column classification and masking** -- you tag columns in the model sidecar; project-level `[mask]` and `[mask.<env>]` blocks decide how Rocky obscures them.
 3. **Compliance rollup** -- `rocky compliance` resolves tags against strategies and reports the gaps, without touching the warehouse.
 4. **Role-graph reconciliation** -- Rocky flattens your `[role.<name>]` hierarchy and reconciles the result.
@@ -22,7 +22,7 @@ Each one runs at a different moment. This is where they fire:
   ───────────        ───────           ───────────────────────────────
   role graph         data contracts    during the run:
   validated          checked             catalogs + schemas created
-  (cycles, unknown                       grants reconciled
+  (cycles, unknown                       grants applied
    parents)                              tags applied
   mask strategy                          quality checks, per copied
   names checked                          table (replication)
@@ -177,7 +177,7 @@ The PR then fails on a contract violation, before the code reaches production.
 
 ## 3. Grants (Pillar 1 of 5)
 
-You declare the permissions you want in `rocky.toml`. Rocky reconciles Databricks Unity Catalog against that declaration on every `rocky apply`.
+You declare the permissions you want in `rocky.toml`. Rocky issues a `GRANT` for each declared permission on every `rocky apply`. Rocky does not read the current grants and never revokes one.
 
 ### Catalog-level grants
 
@@ -211,7 +211,7 @@ principal = "analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 ```
 
-### Reconciliation flow
+### How Rocky applies grants
 
 `rocky apply` runs this loop for each catalog and schema it manages:
 
@@ -220,27 +220,21 @@ permissions = ["USE SCHEMA", "SELECT"]
                      [pipeline.<name>.target.governance.schema_grants]
                                    │
                                    ▼
-  2. query actual    SHOW GRANTS ON CATALOG / ON SCHEMA
-                                   │
-                                   ▼
-  3. diff            which grants to add, which to revoke
-                                   │
-                    ┌──────────────┴──────────────┐
-                    ▼                             ▼
-  4. apply     Databricks:                  no REST permissions API:
-               one batched request          GRANT / REVOKE SQL
-               to the Unity Catalog
-               permissions API
+  2. apply           one GRANT per declared permission
 ```
 
-The privilege effect is identical on both branches. Only the transport differs, so a Databricks audit log shows PATCH requests rather than `GRANT` statements. Rocky batches one request per securable, grouped by principal.
+Rocky does not read the grants that already exist. A grant that `rocky.toml` does not declare stays in place.
 
 ```sql
--- Equivalent SQL (the form emitted on SQL-only warehouses)
 GRANT SELECT ON CATALOG `acme_warehouse` TO `analysts`;
 GRANT USE SCHEMA ON SCHEMA `acme_warehouse`.`staging__us_west__shopify` TO `analysts`;
-REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `temp_access`;
 ```
+
+:::caution[Rocky never revokes]
+Removing a grant from `rocky.toml` leaves it on the warehouse. A person must revoke an unwanted grant by hand. `grants_revoked` in the run output is always `0`.
+:::
+
+Catalog grants run only with `auto_create_catalogs = true`. Schema grants run only with `auto_create_schemas = true`. See [Permissions](/reference/permissions/).
 
 ### Managed vs skipped permissions
 
@@ -253,7 +247,7 @@ REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `temp_access`;
 | `MODIFY` | |
 | `MANAGE` | |
 
-Rocky never grants or revokes a skipped permission. It therefore cannot disturb ownership or admin-level grants.
+Rocky never grants a skipped permission. It therefore cannot disturb ownership or admin-level grants.
 
 ### Principal validation
 
@@ -277,7 +271,7 @@ A classification tag marks a column as sensitive. A masking strategy decides how
                                    └────────────────────┘
 ```
 
-Shipped in engine-v1.16.0. Implemented on Databricks today. Other adapters do nothing.
+Implemented on Databricks today. Other adapters do nothing.
 
 ### Tag columns in the model sidecar
 
@@ -346,7 +340,7 @@ See the [configuration reference](/reference/configuration/) for the full schema
 
 `rocky compliance` answers one question: **is every classified column masked wherever policy says it should be?**
 
-It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip. Shipped in engine-v1.16.0.
+It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip.
 
 ### Basic usage
 
@@ -401,7 +395,7 @@ The payload follows the `ComplianceOutput` schema: a `summary` block of counters
 
 You declare roles that inherit from other roles. Rocky flattens that hierarchy into one resolved permission set per role. It rejects cycles and unknown parents at config-load time.
 
-Shipped in engine-v1.16.0. What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
+What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
 
 ### Declare roles in `rocky.toml`
 
@@ -448,8 +442,6 @@ Both passes only add. Rocky revokes no grant and deletes no group. Removing a ro
 ## 7. Data Retention (Pillar 5 of 5)
 
 A retention policy tells the warehouse how long to keep a table's historical data. You write one sidecar key. Each adapter translates it into the warehouse's own TBLPROPERTIES or session parameter.
-
-Shipped in engine-v1.16.0.
 
 ### Declare retention on a model
 
@@ -800,7 +792,7 @@ The check passes when the query result is less than or equal to the threshold.
 
 ## 13. Audit Trail
 
-Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`, shipped in engine-v1.16.0. `rocky history --audit` shows them.
+Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`. `rocky history --audit` shows them.
 
 ### `rocky history --audit` and the 8 audit fields
 
@@ -1044,7 +1036,7 @@ phone = "pii"
 ssn = "confidential"
 ```
 
-That one configuration exercises every feature in this guide: schema routing, declarative grants with reconciliation, workspace isolation, per-environment classification and masking, role-graph validation at config load, retention, inline quality checks, and the audit trail.
+That one configuration exercises every feature in this guide: schema routing, declarative grants, workspace isolation, per-environment classification and masking, role-graph validation at config load, retention, inline quality checks, and the audit trail.
 
 ## 15. CI Gate Example
 

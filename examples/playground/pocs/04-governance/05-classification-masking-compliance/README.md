@@ -11,17 +11,16 @@
 
 ## What it shows
 
-The Wave A + Wave B governance surface shipped in `engine-v1.16.0`:
+The POC covers four parts of column governance:
 
 1. **Model sidecars** declare per-column classification tags
    (`email = "pii"`, `ssn = "pii_high"`, `region = "internal"`).
 2. **Project `rocky.toml`** binds each tag to a masking strategy in
    `[mask]` (workspace default) and tightens it in `[mask.<env>]` for
    specific environments.
-3. **`rocky compliance`** is a static resolver that answers
-   _"are all classified columns masked wherever policy says they
-   should be?"_ with no warehouse I/O, as a pure resolver over the config +
-   sidecars.
+3. **`rocky compliance`** answers _"are all classified columns masked
+   wherever policy says they should be?"_ It reads only the config and the
+   sidecars. It makes no warehouse calls.
 4. **`--fail-on exception`** turns the rollup into a CI gate: exit 1
    when any classified column has no resolved strategy and isn't on the
    `[classifications.allow_unmasked]` advisory list.
@@ -178,4 +177,4 @@ answers "is the config right?" not "is the warehouse in sync?"
 - Governance adapter trait:
   `engine/crates/rocky-core/src/traits.rs` (`GovernanceAdapter::apply_column_tags`,
   `apply_masking_policy`)
-- CHANGELOG: `engine/CHANGELOG.md`, the `[1.16.0]` Wave A + Wave B entries.
+- CHANGELOG: `engine/CHANGELOG.md`, the `[1.16.0]` entries.

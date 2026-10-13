@@ -1,4 +1,4 @@
-# 08-portability-lint — Trust arc 6: compile-time portability gate
+# 08-portability-lint — compile-time portability gate
 
 > **Category:** 06-developer-experience
 > **Credentials:** none (no warehouse needed, lint is AST-based)
@@ -25,11 +25,10 @@ Three escape hatches:
 
 ## Why it's distinctive
 
-- **AST-based, not regex.** `NVL(x, y)` inside a string literal doesn't
-  trip the lint; a real function-call does. The same AST walker is what
-  a future editor integration would hook for squiggles. (Today the
-  diagnostic reports a file-level span — `line: 1` — since per-construct
-  byte offsets aren't tracked yet.)
+- **AST-based, not regex.** The lint walks the parsed SQL tree (the AST).
+  `NVL(x, y)` inside a string literal doesn't trip the lint; a real
+  function call does. The diagnostic reports a file-level span
+  (`line: 1`), because per-construct byte offsets aren't tracked yet.
 - **Polyglot correctness at compile time.** dbt packages you hope
   travel; Rocky rejects the non-portable construct at compile-time
   with a targeted suggestion, before the warehouse sees it.
@@ -60,9 +59,9 @@ Three escape hatches:
    as Snowflake SQL (`[portability] target_dialect = "snowflake"`), where
    NVL is native, so there is no portability diagnostic and every model
    type-checks. Without that line, `rocky compile` refuses NVL with
-   `E057`: the project's adapter is DuckDB, and DuckDB has no NVL (engine
-   1.79.0, #2329). Declaring the dialect tells Rocky not to judge the
-   SQL's function names against the DuckDB adapter.
+   `E057`: the project's adapter is DuckDB, and DuckDB has no NVL.
+   Declaring the dialect tells Rocky not to judge the SQL's function
+   names against the DuckDB adapter.
 2. **`rocky compile --target-dialect bq`** — the flag overrides the
    configured dialect for P001 and fires exactly one P001 on
    `non_portable_nvl.sql`. `portable.sql` is clean (COALESCE works
@@ -76,5 +75,5 @@ Three escape hatches:
 - Engine source: `engine/crates/rocky-sql/src/portability.rs`,
   `engine/crates/rocky-sql/src/pragma.rs`
 - CLI surface: `rocky compile --target-dialect {dbx,sf,bq,duckdb}`
-- Companion arc: Arc 7 blast-radius lint (P002 `SELECT *`); see
+- Companion POC: the P002 `SELECT *` blast-radius lint; see
   [`09-sql-types-blast-radius/`](../09-sql-types-blast-radius/)

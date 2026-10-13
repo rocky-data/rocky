@@ -62,8 +62,8 @@ of finding them later.
 ### Compile-time types and diagnostics
 
 Rocky infers column-level types across the whole DAG. It reports problems as
-diagnostic codes you can grep in a CI log. The error codes run from `E001` to
-`E037`, with `W` warnings and `P` lints alongside.
+diagnostic codes you can grep in a CI log. Errors carry an `E` code, warnings a
+`W` code, and lints a `P` code.
 
 Compilation fails on any error-level diagnostic. That is the whole point: the
 failure becomes a non-zero exit code at PR time, not a wrong number in
@@ -206,20 +206,21 @@ workflow.
 ### Declarative governance
 
 Rocky models governance as code through a `GovernanceAdapter`. The surface covers
-tag management, grant and revoke, workspace bindings, column tags, masking
-policies bound to classification tags, and role-graph reconciliation.
+tag management, grants, workspace bindings, column tags, masking
+policies bound to classification tags, and role-graph reconciliation. The adapter trait has a
+revoke method (`revoke_grants`), but `rocky run` does not call it. Rocky grants and never revokes.
 
 How much of that is real depends entirely on the warehouse:
 
 - **Databricks** implements the full surface through Unity Catalog.
-- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT`/`REVOKE` role grants, plus retention policy. Workspace binding and masking are not driven.
+- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT` role grants, plus retention policy. Workspace binding and masking are not driven.
 - **BigQuery** reconciles tags as labels (`ALTER … SET OPTIONS(labels=…)`). Grants map to IAM, so `apply_grants` and `revoke_grants` currently log and do nothing. Real IAM integration is a follow-up.
 - **DuckDB** does nothing, because it has no governance model to drive.
 
 So governance at depth is a Databricks capability today. The skeleton is
 warehouse-neutral. The depth is not yet portable.
 
-**Partial.** Full on Databricks; tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB.
+**Partial.** Full on Databricks; tags + `GRANT` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB.
 
 ### Schema drift handling
 
@@ -305,15 +306,19 @@ rewriting the Parquet.
 
 ### VS Code trust overlays
 
-The VS Code extension draws the lineage graph and paints four trust signals onto
-it. Each one is backed by CLI output.
+The VS Code extension draws the lineage graph and paints five trust signals onto
+it. Each one is backed by Rocky output.
 
-1. **Drift**: schema drift against the warehouse. This overlay expects a dedicated drift command. There is no standalone `rocky drift` subcommand yet, because drift is detected inside `rocky run` and `rocky plan`. The overlay degrades to unavailable until that surface lands.
-2. **Breaking**: breaking changes from the semantic CI diff.
-3. **Replay**: the last recorded run for each model.
-4. **Governance**: compliance and masking status.
+1. **Cost**: the compile-time cost estimate for each model.
+2. **Freshness**: the declared freshness policy.
+3. **Breaking**: breaking changes from the semantic CI diff.
+4. **Last run**: the last recorded run for each model.
+5. **Governance**: classified columns and unmasked exceptions.
 
-**Shipped (four overlays).**
+There is no drift overlay. Rocky has no standalone `rocky drift` command. It
+detects drift inside `rocky run` and `rocky plan`.
+
+**Shipped (five overlays).**
 
 ## The honesty grade
 
@@ -324,15 +329,15 @@ surprised.
 |---|---|---|
 | Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
-| Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
+| Compile-time contracts (`E010`–`E014`) | Shipped | Intra-project contract validation against inferred schema. |
 | Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it by default; with `auto_apply_additive_drift`, only a nullable addition that policy resolves to `allow`. No grace period before a drop. A column removed from the source is not detected. The `drift` output can omit a drop whose first rebuild failed. |
-| Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
-| VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
+| Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect` or `[portability] target_dialect`; error severity. |
+| VS Code trust overlays | Shipped | Five: Cost, Freshness, Breaking, Last run, Governance. No drift overlay. |
 | Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Databricks surfaces scanned bytes for observability; Snowflake's warehouse-reported-bytes plumbing is the follow-up. |
-| Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB. |
+| Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB. |
 | Cross-team / cross-project contract enforcement | Shipped | Producer `rocky publish-ir` → consumer `[imports.<name>]` vendored snapshot → `E030`–`E034` enforced at the consumer's `rocky compile`. |
 
 ## What to lead with

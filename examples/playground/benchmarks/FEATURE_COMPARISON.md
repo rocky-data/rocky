@@ -4,6 +4,8 @@
 **Rocky version:** 0.3.0 (post-optimization)
 
 > **Partial refresh, 2026-06-01:** This is an April 2026 snapshot. Only a handful of cells have been refreshed against current sources — e.g. the open-source license, the Fusion runtime rename, column-level lineage, manifest/artifacts, and the orchestration row (including a current `dagster-sqlmesh` correction); the remaining cells still reflect the April snapshot and have not been re-verified. This file is kept as a dated benchmark artifact. The published comparison at [docs: Feature Comparison](../../../docs/src/content/docs/getting-started/comparison.md) no longer covers dbt, so it is not a refreshed version of this table. In these tables, **dbt-core** is the dbt Core 1.x Python line; **dbt-fusion** tracks the Rust dbt Core v2.0 runtime plus Fusion's SQL-comprehension layer.
+>
+> **Rocky's own column is stale too.** It describes Rocky 0.3.0. For example, §2 lists PostgreSQL and Redshift as "Planned" and Spark, Trino and ClickHouse as "No". The current engine ships adapters for all five (most in Beta), plus SQL Server. For current Rocky capabilities, read the docs ([Connect a warehouse](../../../docs/src/content/docs/guides/connect-a-warehouse.mdx)), not this file.
 
 This document provides a factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features are verified against official documentation and source code as of April 2026.
 
@@ -284,13 +286,13 @@ take 100
 | **Catalog lifecycle** | Yes (auto-create, tags) | No | No | No | No | No |
 | **Schema lifecycle** | Yes (auto-create, tags) | Yes (auto-create) | Yes | Partial | Yes | No |
 | **RBAC / GRANT management** | Yes (6 permission types) | No | No | No | No | No |
-| **Permission reconciliation** | Yes (drift detection + REVOKE) | No | No | No | No | No |
+| **Permission grants** | Yes (GRANT only; never revokes) | No | No | No | No | No |
 | **Workspace isolation** | Yes (Databricks binding) | No | No | No | No | No |
 | **Resource tagging** | Yes (configurable per-resource) | No | No | No | No | No |
 | **Multi-tenant patterns** | Yes (schema_pattern components) | No | No | No | No | No |
 | **Shadow mode** | Yes (_rocky_shadow tables) | No | No | No | No | No |
 
-**Rocky-unique governance:** Full Unity Catalog lifecycle management — auto-create catalogs/schemas, tag-based governance, workspace binding for tenant isolation, permission reconciliation with SHOW GRANTS + GRANT/REVOKE drift detection. Schema patterns support multi-tenant deployments (e.g., `src__client__regions__source`).
+**Rocky-unique governance:** Full Unity Catalog lifecycle management — auto-create catalogs/schemas, tag-based governance, workspace binding for tenant isolation, declared permissions applied as GRANT statements (Rocky never revokes). Schema patterns support multi-tenant deployments (e.g., `src__client__regions__source`).
 
 ---
 

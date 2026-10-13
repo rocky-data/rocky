@@ -41,7 +41,7 @@ The Rocky DSL supports two ergonomic features that make business logic more read
 
 ## What happened
 
-`tiered_orders.rocky` filters orders to those after `@2025-06-01` and tags
+`tiered_orders.rocky` keeps orders on or after `@2025-06-01` with a non-NULL amount and tags
 each one with a tier using `match`. The compiled SQL contains a
 `DATE '2025-06-01'` literal for the date and a `CASE WHEN` cascade for the
 match expression.

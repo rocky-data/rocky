@@ -26,11 +26,8 @@ from dagster_rocky import (
 rocky = RockyResource(config_path="rocky.toml")
 rocky_assets = load_rocky_assets(rocky)
 
-# Build a sensor that targets every Rocky asset.
-# `rocky_resource` defaults to the resource key "rocky" — the sensor
-# resolves it through Dagster's required-resource injection at evaluation
-# time, so per-deployment overrides applied via `Definitions` reach the
-# sensor without needing to rebuild it.
+# Target every Rocky asset. The sensor resolves the resource key
+# "rocky" at evaluation time (see Resource injection below).
 fivetran_sync_sensor = rocky_source_sensor(
     target=dg.AssetSelection.assets(*[s.key for s in rocky_assets]),
     minimum_interval_seconds=300,  # poll every 5 minutes
@@ -77,15 +74,13 @@ branches under it are covered in [Backlog cap](#backlog-cap) below.
 
 ## Transient discover failures
 
-Source adapters can fail one at a time. A Fivetran 5xx or rate-limit window hits a single connector. An Iceberg `list_tables` error hits one namespace. From engine `1.17.4` onward, `rocky discover` reports these in `failed_sources` instead of dropping the connector from the output.
+Source adapters can fail one at a time. A Fivetran 5xx or rate-limit window hits a single connector. An Iceberg `list_tables` error hits one namespace. `rocky discover` reports these in `failed_sources` instead of dropping the connector from the output.
 
 That signal matters. Without it, a transient adapter error looks the same as a source that was removed upstream, and a diff-based reconciler would shrink the asset graph.
 
 So the sensor skips the cursor advance for failed ids. A flapping connector keeps coming back for evaluation until one of two things happens. It succeeds, and the cursor advances normally. Or it is genuinely removed upstream, and it drops out of both `sources` and `failed_sources`.
 
 Healthy sources in the same tick still produce `RunRequest`s. A partial failure does not block the run.
-
-Requires engine `≥ 1.17.4`. Older engines omit the field, and the sensor reads an absent field as "no failures reported".
 
 ## Granularity
 
@@ -99,7 +94,6 @@ keeps each materialization scoped to a single Fivetran connector.
 
 ```python
 sensor = rocky_source_sensor(
-    rocky_resource=rocky,
     target=...,
     granularity="per_source",
 )
@@ -113,7 +107,6 @@ want them to materialize as a single Dagster run.
 
 ```python
 sensor = rocky_source_sensor(
-    rocky_resource=rocky,
     target=...,
     granularity="per_group",
 )
@@ -235,8 +228,16 @@ class MyTranslator(RockyDagsterTranslator):
         return dg.AssetKey(["my_prefix", source.id, table.name])
 
 sensor = rocky_source_sensor(
-    rocky_resource=rocky,
     target=...,
     translator=MyTranslator(),
 )
 ```
+
+## Tenant partitions
+
+When `RockyComponent` collapses tenants into partitions (`tenant:`), the sensor
+must emit partitioned `RunRequest`s. Pass `tenant_component` and
+`tenant_partitions_name` together; passing only one raises at definition time.
+`sync_partitions_from_discover` (default `True`) adds new tenant values to the
+dynamic partition set. Set `enable_sensor: true` on the component and it wires
+this for you.

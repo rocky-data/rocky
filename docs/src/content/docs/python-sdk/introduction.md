@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-`rocky-sdk` is a typed Python client for the Rocky engine. Its `RockyClient` class gives you one method per Rocky CLI command.
+`rocky-sdk` is a typed Python client for the Rocky engine. Its `RockyClient` class gives you one method for each Rocky CLI command it supports.
 
 Each method runs the `rocky` binary as a subprocess with `--output json`, parses the output into a [Pydantic](https://docs.pydantic.dev/) model, and raises a typed error on failure. Use it from a notebook, a script, or any orchestrator.
 
@@ -117,11 +117,13 @@ except RockyCommandError as exc:
 
 ## Methods
 
-`RockyClient` exposes one method per Rocky CLI command:
+`RockyClient` has these methods. For a command not listed, call `run_cli(args)`. It adds `--config` and `--output json`, and returns stdout as a string.
 
-- **Pipeline:** `discover`, `plan`, `apply`, `run`, `run_model`, `resume_run`, `state`
-- **Modeling:** `compile`, `lineage`, `catalog`, `dag`, `test`, `ci`
-- **Observability:** `history`, `metrics`, `optimize`, `cost`
+- **Pipeline:** `discover`, `plan`, `apply`, `run`, `run_model`, `resume_run`, `state`, `reconcile_watermark`, `schedule_spool`
+- **Review and data products:** `review_status`, `product_verify`, `product_compile`, `product_approve`, `product_status`, `product_list`, `product_journal`
+- **Modeling:** `compile`, `lineage`, `catalog`, `dag`, `test`, `ci`, `profile`
+- **Packages:** `package_add`, `package_update`, `package_list`, `package_remove`
+- **Observability:** `history`, `metrics`, `optimize`, `cost`, `freshness`
 - **AI:** `ai`, `ai_sync`, `ai_explain`, `ai_test`, `ai_contract`
 - **Governance and branches:** `compliance`, `retention_status`, `branch_approve`, `branch_promote`, `plan_promote`
 - **Diagnostics:** `doctor`, `validate_migration`, `test_adapter`, `hooks_list`, `hooks_test`
@@ -130,7 +132,7 @@ except RockyCommandError as exc:
 
 `run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress anywhere. See [Stream live progress](/python-sdk/recipes/#stream-live-progress).
 
-Each method's full signature, parameters, and return type are in the [`RockyResource` reference](/dagster/resource/). `RockyClient` exposes the same methods and configuration, because the Dagster resource delegates to it. The output model shapes are in the [JSON output reference](/reference/json-output/).
+The [`RockyResource` reference](/dagster/resource/) documents the signatures, parameters, and return types. The Dagster resource delegates to `RockyClient`, so the shared methods match. `profile` and the package write methods (`package_add`, `package_update`, `package_remove`) are on `RockyClient` only. The output model shapes are in the [JSON output reference](/reference/json-output/).
 
 ## Requirements
 

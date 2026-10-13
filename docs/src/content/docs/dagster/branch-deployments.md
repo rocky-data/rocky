@@ -148,16 +148,3 @@ The suffix reaches every `run()` call, whatever the pipeline kind. Rocky
 refuses a shadow run of a quality, snapshot or load pipeline, so that call fails
 in a branch deployment instead of reading or writing production. To run such a
 pipeline anyway, call it through a resource that has no `shadow_suffix_fn`.
-
-## Future work
-
-A config-string `shadow_mode="branch_deploy"` shortcut over the
-`shadow_suffix_fn` wiring above is still aspirational. It is not shipped:
-
-```python
-# Future API (not yet shipped) — config-string sugar over shadow_suffix_fn
-rocky = RockyResource(
-    config_path="rocky.toml",
-    shadow_mode="branch_deploy",  # auto-shadow when in branch deploy
-)
-```
