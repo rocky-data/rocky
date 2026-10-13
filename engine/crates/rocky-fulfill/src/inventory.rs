@@ -180,6 +180,12 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::product::spec::ParsedSpec",
     "rocky_core::product::spec::parse_spec_bytes",
     "rocky_core::product::spec::spec_digest",
+    // DELIBERATE (#1919): `DriverError`'s `Debug` prints a resolved `${VAR}`
+    // value as `${NAME}`, as every other engine error does. The test
+    // registers a substitution to prove it. Neither call reaches the runner
+    // or the worker; both only format text.
+    "rocky_core::secret_registry::fmt_rendered_debug",
+    "rocky_core::secret_registry::register_substitution",
 ];
 
 /// Read every `.rs` file under `src/`.
