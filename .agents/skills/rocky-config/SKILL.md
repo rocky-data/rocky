@@ -545,12 +545,14 @@ min_history_runs          = 5
 [hook.on_pipeline_start]
 command    = "scripts/notify.sh"
 timeout_ms = 5000
-on_failure = "warn"                  # default; or "abort" (stop the pipeline) / "ignore" (silent)
+on_failure = "warn"                  # default; or "abort" / "ignore" (silent)
 
 [hook.on_pipeline_fail]
 url        = "${SLACK_WEBHOOK_URL}"   # webhook instead of command
 template   = "default"                # built-in preset
 ```
+
+`rocky run` ignores every hook outcome, so a failing hook is logged and the run continues. Only `rocky hooks test` acts on `abort`. A hook cannot gate a run today.
 
 Events: `on_pipeline_start`, `on_pipeline_complete`, `on_pipeline_fail`, `on_model_start`, `on_model_complete`, `on_model_fail`, `on_check_fail`, `on_drift_detected`.
 
