@@ -2707,10 +2707,11 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             // SUM preserves numeric type, nullable (empty group → NULL).
             // A DECIMAL widens by a dialect-dependent amount (DuckDB
             // DECIMAL(38, s), Databricks DECIMAL(p + 10, s)), so its result
-            // is `Unknown`: the same rule inference applies to `SUM` over a
-            // DECIMAL expression (see `SelectInference::push_expression`).
-            // Without it a downstream model read the input's precision as
-            // the sum's type (#2320).
+            // is `Unknown`. `has_exact_type` applies the same rule to a
+            // `SUM` or `AVG` over a DECIMAL expression, and
+            // `infer_function_type` routes both through here. Without it a
+            // downstream model read the input's precision as the sum's type
+            // (#2320).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
             } else if matches!(input_type, RockyType::Decimal { .. }) {
@@ -3237,18 +3238,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
     match name.as_str() {
         // Aggregate functions (work with or without OVER)
         "COUNT" => (RockyType::Int64, false),
-        "SUM" => {
+        "SUM" | "AVG" => {
             let arg_type = first_arg_type(func, scope);
-            let result = if arg_type.is_integer() {
-                RockyType::Int64
-            } else {
-                arg_type
-            };
-            (result, true)
-        }
-        "AVG" => {
-            let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("AVG", &arg_type)
+            infer_aggregation_type(name.as_str(), &arg_type)
         }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
