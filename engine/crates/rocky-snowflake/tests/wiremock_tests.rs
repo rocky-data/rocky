@@ -1420,10 +1420,11 @@ async fn rate_limit_below_threshold_does_not_trip_breaker() {
 
 /// One batched `INFORMATION_SCHEMA.COLUMNS` query replaces N per-table
 /// `DESCRIBE TABLE` round trips. Mounts a mock that only matches the batched
-/// query (scoped to `<db>.information_schema.columns`), returns a 4-column
-/// rowset covering two tables, and asserts: the query fires exactly once, the
-/// result groups by lowercase table name, column names are lowercased, and
-/// `is_nullable` (YES/NO) parses into the right `nullable` flag.
+/// query (scoped to `<db>.information_schema.columns`), returns a rowset
+/// covering two tables, and asserts: the query fires exactly once, the
+/// result groups by lowercase table name, column names are lowercased,
+/// `is_nullable` (YES/NO) parses into the right `nullable` flag, and each
+/// type is spelled as `DESCRIBE TABLE` spells it (#2344).
 #[tokio::test]
 async fn test_batch_describe_single_query_groups_by_table() {
     use rocky_core::traits::BatchCheckAdapter;
@@ -1446,15 +1447,19 @@ async fn test_batch_describe_single_query_groups_by_table() {
                     {"name": "LOWER(TABLE_NAME)", "type": "TEXT", "nullable": false},
                     {"name": "LOWER(COLUMN_NAME)", "type": "TEXT", "nullable": false},
                     {"name": "DATA_TYPE", "type": "TEXT", "nullable": false},
-                    {"name": "IS_NULLABLE", "type": "TEXT", "nullable": false}
+                    {"name": "IS_NULLABLE", "type": "TEXT", "nullable": false},
+                    {"name": "CHARACTER_MAXIMUM_LENGTH", "type": "FIXED", "nullable": true},
+                    {"name": "NUMERIC_PRECISION", "type": "FIXED", "nullable": true},
+                    {"name": "NUMERIC_SCALE", "type": "FIXED", "nullable": true},
+                    {"name": "DATETIME_PRECISION", "type": "FIXED", "nullable": true}
                 ]
             },
             // Snowflake returns INFORMATION_SCHEMA values as JSON strings.
             "data": [
-                ["orders", "id", "NUMBER", "NO"],
-                ["orders", "customer", "TEXT", "YES"],
-                ["events", "event_id", "NUMBER", "YES"],
-                ["events", "created_at", "TIMESTAMP_NTZ", "NO"]
+                ["orders", "id", "NUMBER", "NO", null, "38", "0", null],
+                ["orders", "customer", "TEXT", "YES", "16777216", null, null, null],
+                ["events", "event_id", "NUMBER", "YES", null, "10", "0", null],
+                ["events", "created_at", "TIMESTAMP_NTZ", "NO", null, "0", "9", null]
             ]
         })))
         // Exactly one batched query — not one DESCRIBE per table.
@@ -1476,15 +1481,24 @@ async fn test_batch_describe_single_query_groups_by_table() {
     let orders = map.get("orders").expect("orders table present");
     assert_eq!(orders.len(), 2);
     assert_eq!(orders[0].name, "id");
-    assert_eq!(orders[0].data_type, "NUMBER");
+    assert_eq!(orders[0].data_type, "NUMBER(38,0)");
     assert!(!orders[0].nullable, "id is_nullable=NO -> not nullable");
     assert_eq!(orders[1].name, "customer");
+    assert_eq!(orders[1].data_type, "VARCHAR(16777216)");
     assert!(orders[1].nullable, "customer is_nullable=YES -> nullable");
 
     let events = map.get("events").expect("events table present");
     assert_eq!(events.len(), 2);
-    assert!(events.iter().any(|c| c.name == "event_id" && c.nullable));
-    assert!(events.iter().any(|c| c.name == "created_at" && !c.nullable));
+    assert!(
+        events
+            .iter()
+            .any(|c| c.name == "event_id" && c.nullable && c.data_type == "NUMBER(10,0)")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|c| c.name == "created_at" && !c.nullable && c.data_type == "TIMESTAMP_NTZ(9)")
+    );
 }
 
 /// An empty `INFORMATION_SCHEMA.COLUMNS` result (schema with no tables, or a

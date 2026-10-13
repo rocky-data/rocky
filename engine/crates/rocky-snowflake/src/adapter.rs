@@ -462,7 +462,7 @@ fn parse_snowflake_chunk_checksums(
     Ok(out)
 }
 
-fn parse_describe_columns(result: &crate::connector::QueryResult) -> Vec<ColumnInfo> {
+pub(crate) fn parse_describe_columns(result: &crate::connector::QueryResult) -> Vec<ColumnInfo> {
     // Snowflake DESCRIBE TABLE returns name, type, kind, null?, and other fields.
     let headers: Vec<_> = result
         .columns

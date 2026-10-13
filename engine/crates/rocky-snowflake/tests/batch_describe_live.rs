@@ -20,11 +20,11 @@
 //!    keyed by its lowercase table name.
 //! 2. The batched column set matches the per-table `DESCRIBE TABLE` path
 //!    (`WarehouseAdapter::describe_table`) for the same table — same column
-//!    names (lowercased), same nullability. Snowflake's `INFORMATION_SCHEMA`
-//!    reports `data_type` families (`NUMBER`, `TEXT`) where `DESCRIBE` reports
-//!    precise types (`NUMBER(38,0)`, `VARCHAR(...)`), so the type *string* is
-//!    deliberately not asserted equal — only that both paths see the same
-//!    columns.
+//!    names (lowercased), same nullability, same type string. The batch
+//!    path rebuilds the `DESCRIBE` type (`NUMBER(38,0)`, `VARCHAR(255)`,
+//!    `TIMESTAMP_NTZ(9)`) from the length, precision and scale columns
+//!    (#2344). The `TIME` / `TIMESTAMP_*` precision source is not in
+//!    Snowflake's `COLUMNS` documentation, so this test is what settles it.
 //!
 //! Without this test, the inline SQL-shape unit tests in `batch.rs` would
 //! pass while a casing or result-shape regression against the real
@@ -127,7 +127,18 @@ async fn live_batch_describe_matches_per_table_describe() {
             "CREATE TABLE \"{database}\".\"{schema}\".\"events\" (\
                 \"event_id\" NUMBER(38,0), \
                 \"payload\" VARIANT, \
-                \"created_at\" TIMESTAMP_NTZ NOT NULL\
+                \"created_at\" TIMESTAMP_NTZ NOT NULL, \
+                \"price\" NUMBER(10,2), \
+                \"code\" CHAR, \
+                \"digest\" BINARY(16), \
+                \"flag\" BOOLEAN, \
+                \"day\" DATE, \
+                \"at_time\" TIME(3), \
+                \"seen_ltz\" TIMESTAMP_LTZ(6), \
+                \"seen_tz\" TIMESTAMP_TZ, \
+                \"attrs\" OBJECT, \
+                \"tags\" ARRAY, \
+                \"place\" GEOGRAPHY\
             )"
         ),
     )
@@ -195,6 +206,14 @@ async fn live_batch_describe_matches_per_table_describe() {
                 mismatch = Some(format!(
                     "{table}.{}: nullability mismatch — batch={} per-table={}",
                     col.name, b.nullable, col.nullable
+                ));
+                break;
+            }
+            // The type string must agree too (#2344): drift compares it.
+            if b.data_type != col.data_type {
+                mismatch = Some(format!(
+                    "{table}.{}: type mismatch — batch={} per-table={}",
+                    col.name, b.data_type, col.data_type
                 ));
                 break;
             }
