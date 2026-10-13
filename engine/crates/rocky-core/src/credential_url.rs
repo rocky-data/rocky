@@ -14,27 +14,29 @@
 //!
 //! ```text
 //!   identity   redis://default:***@valkey:6379/0?db=1&pass=***#insecure
-//!              the password and the values of secret query keys masked
+//!              only what a client reads, and no secret
 //!   shown      redis://default:***@valkey:6379/0?***#***
 //!              the whole query and fragment hidden as well
 //! ```
 //!
 //! The **identity** is what the plan config identity (`config_policy_identity`
 //! in `rocky-cli`) hashes and what a plan's config snapshot stores. It keeps
-//! the scheme, user name, host, port, path, the query (`?db=`, a unix-socket
-//! setting) and the fragment (`#insecure` turns TLS verification off),
-//! because each of them can change which server is used or how. It masks:
+//! the scheme, user name, host, port and path, because each of them can
+//! change which server is used. The query and fragment are masked by an
+//! allow-list of what the clients read:
 //!
-//! - the password, so a rotated password does not refuse a plan, as for
-//!   every other credential;
-//! - the value of each query key in an exact list of secret names
-//!   (`password`, `pass`, `token`, `sig`, the Azure SAS and AWS presign
-//!   keys). Matching is exact, so `?keyspace=` or `?passive=` stay;
-//! - a user name with no password, except for the Azure schemes, where it
-//!   names the container. Without a password the Redis client never sends a
-//!   user name, so it can only be a misplaced token.
+//! - query: on a Redis scheme the values of `db`, `user` and `protocol` stay.
+//!   Every other value is `***` (the key name stays). The Redis client reads
+//!   only those keys and `pass`; `object_store` reads no query.
+//! - fragment: kept only when it is `insecure`, which turns TLS verification
+//!   off. The Redis client reads no other fragment.
 //!
-//! Every other value is kept as written, like an
+//! It also masks the password, so a rotated password does not refuse a plan,
+//! and a user name with no password, except for the Azure schemes, where it
+//! names the container. Without a password the Redis client never sends a
+//! user name, so it can only be a misplaced token.
+//!
+//! The kept values are stored as written, like an
 //! [`crate::env_string::EnvString`] field: a resolved `${VAR}` value prints
 //! as `${NAME}` in the stored snapshot.
 //!
@@ -141,7 +143,7 @@ impl CredentialUrl {
         match parse(&self.0) {
             Some(url) => {
                 out = out.replace(url.as_str(), &shown);
-                if let Some(password) = url.password() {
+                if let Some(password) = password(&url) {
                     secrets.push(password.to_string());
                     secrets.push(percent_decode(password));
                 }
@@ -193,37 +195,71 @@ fn parse(raw: &str) -> Option<Url> {
 /// container (`az://container@account.dfs.core.windows.net/path`).
 const AZURE_SCHEMES: &[&str] = &["az", "adl", "azure", "abfs", "abfss"];
 
+/// The schemes the Redis client accepts (redis-1.7.1 `parse_redis_url`).
+const REDIS_SCHEMES: &[&str] = &[
+    "redis",
+    "rediss",
+    "valkey",
+    "valkeys",
+    "redis+unix",
+    "valkey+unix",
+    "unix",
+];
+
+/// The query keys whose values the identity keeps: the non-secret ones the
+/// Redis client reads (`db`, `user` and `protocol`; it also reads `pass`).
+/// `object_store` reads no query at all.
+const KEPT_REDIS_QUERY_KEYS: &[&str] = &["db", "user", "protocol"];
+
+/// The password, or `None` when it is absent or empty (`redis://TOKEN:@h`).
+fn password(url: &Url) -> Option<&str> {
+    url.password().filter(|p| !p.is_empty())
+}
+
 /// Whether the user name is masked: it is set, there is no password, and the
 /// scheme is not an Azure one. Without a password the Redis client never
 /// sends a user name (`AUTH` and `HELLO ... AUTH` need the password), so a
 /// lone user name selects nothing and can only be a misplaced token.
 fn masks_user_name(url: &Url) -> bool {
-    !url.username().is_empty() && url.password().is_none() && !AZURE_SCHEMES.contains(&url.scheme())
+    !url.username().is_empty() && password(url).is_none() && !AZURE_SCHEMES.contains(&url.scheme())
 }
 
 /// The password and a lone user name become `***`.
 fn mask_userinfo(url: &mut Url) {
     // Neither setter can fail: a URL with a userinfo has a host.
-    if url.password().is_some() {
+    if password(url).is_some() {
         let _ = url.set_password(Some("***"));
     } else if masks_user_name(url) {
+        let _ = url.set_password(None);
         let _ = url.set_username("***");
     }
 }
 
 /// [`CredentialUrl::identity`] for a URL that parses.
+///
+/// The query and fragment are masked by an allow-list of what the clients
+/// read, so a value no client reads, secret or not, never reaches a plan:
+///
+/// - query: the values of `db`, `user` and `protocol` on a Redis scheme are
+///   kept. Every other value is `***`; its key name stays.
+/// - fragment: kept only when it is `insecure`, the one fragment the Redis
+///   client reads (it turns TLS verification off). Any other is `***`.
 fn identity_form(mut url: Url) -> String {
     mask_userinfo(&mut url);
+    let redis = REDIS_SCHEMES.contains(&url.scheme());
     if let Some(query) = url.query().map(str::to_string) {
         let mut masked = url::form_urlencoded::Serializer::new(String::new());
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if is_secret_query_key(&key) {
-                masked.append_pair(&key, "***");
-            } else {
+            if redis && KEPT_REDIS_QUERY_KEYS.contains(&key.as_ref()) {
                 masked.append_pair(&key, &value);
+            } else {
+                masked.append_pair(&key, "***");
             }
         }
         url.set_query(Some(&masked.finish()));
+    }
+    if url.fragment().is_some_and(|f| f != "insecure") {
+        url.set_fragment(Some("***"));
     }
     url.to_string()
 }
@@ -260,54 +296,6 @@ fn shown_textual(raw: &str) -> String {
         _ => "",
     };
     format!("{scheme}{userinfo}{location}{extra}")
-}
-
-/// Whether a query key holds a secret: an exact, case-insensitive match on a
-/// known secret name. Exact, because a masked key means a change to it does
-/// not refuse a plan, so `?keyspace=` or `?bypass=` must stay.
-///
-/// Covers passwords, tokens and API keys, signatures, every Azure SAS field
-/// (a SAS token is one credential spread over several keys) and the AWS
-/// presigned-URL credential keys.
-fn is_secret_query_key(key: &str) -> bool {
-    const SECRET_KEYS: &[&str] = &[
-        "password",
-        "pass",
-        "pwd",
-        "passwd",
-        "token",
-        "access_token",
-        "auth_token",
-        "api_key",
-        "apikey",
-        "secret",
-        "client_secret",
-        "sig",
-        "signature",
-        // Azure SAS.
-        "sv",
-        "ss",
-        "srt",
-        "sp",
-        "se",
-        "st",
-        "spr",
-        "sr",
-        "skoid",
-        "sktid",
-        "skt",
-        "ske",
-        "sks",
-        "skv",
-        "sdd",
-        "sip",
-        "si",
-        // AWS presigned URL.
-        "x-amz-signature",
-        "x-amz-credential",
-        "x-amz-security-token",
-    ];
-    SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str())
 }
 
 fn percent_decode(text: &str) -> String {
@@ -437,6 +425,10 @@ mod tests {
             "https://h/p?X-Amz-Signature=SIG-SECRET&X-Amz-Credential=CRED-SECRET",
             "redis://u:p@ss-SECRET@h:6379",
             "user:pw-SECRET@host:6379",
+            // A fragment other than `insecure`, and query keys no client reads.
+            "redis://h:6379/0#TOKEN-SECRET",
+            "redis://h/?auth=A-SECRET&key=K-SECRET&x-api-key=X-SECRET&sas_token=S-SECRET",
+            "redis://TOKEN-SECRET:@h:6379",
         ] {
             let identity = id(raw);
             assert!(!identity.contains("SECRET"), "{raw} -> {identity}");
@@ -462,15 +454,14 @@ mod tests {
             ("redis://:pw@valkey-a:6379/0", "redis://:pw@valkey-b:6379/0"),
             ("redis://:pw@h:6379/0", "redis://:pw@h:6379/1"),
             ("redis://user-a:pw@h:6379", "redis://user-b:pw@h:6379"),
-            // Keys whose names merely contain a secret word.
+            // The query keys the Redis client reads.
+            ("redis://h:6379/?protocol=2", "redis://h:6379/?protocol=3"),
             (
-                "redis://h/?ssl_keyfile=/a.key",
-                "redis://h/?ssl_keyfile=/b.key",
+                "redis+unix:///s.sock?user=a&pass=p",
+                "redis+unix:///s.sock?user=b&pass=p",
             ),
-            ("redis://h/?keyspace=a", "redis://h/?keyspace=b"),
-            ("redis://h/?sessionid=1", "redis://h/?sessionid=2"),
-            ("redis://h/?bypass=on", "redis://h/?bypass=off"),
-            ("redis://h/?passive=0", "redis://h/?passive=1"),
+            // A key that exists, against none.
+            ("redis://h/", "redis://h/?keyspace=a"),
         ];
         for (a, b) in pairs {
             assert_ne!(id(a), id(b), "{a} and {b} must differ");
@@ -498,6 +489,14 @@ mod tests {
             // the password too.
             ("redis://u:p@ss-A@h:6379", "redis://u:p@ss-B@h:6379"),
             ("redis://TOKEN-A@h:6379", "redis://TOKEN-B@h:6379"),
+            ("redis://TOKEN-A:@h:6379", "redis://TOKEN-B:@h:6379"),
+            // Values no client reads: a change selects nothing.
+            ("redis://h/?keyspace=a", "redis://h/?keyspace=b"),
+            (
+                "redis://h/?ssl_keyfile=/a.key",
+                "redis://h/?ssl_keyfile=/b.key",
+            ),
+            ("redis://h:6379/0#TOKEN-A", "redis://h:6379/0#TOKEN-B"),
         ];
         for (a, b) in pairs {
             assert_eq!(id(a), id(b), "{a} and {b} must agree");

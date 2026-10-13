@@ -10233,7 +10233,7 @@ auto_create_schemas = true
                 "az://container-a@account.dfs.core.windows.net/p",
                 "az://container-b@account.dfs.core.windows.net/p",
             ),
-            ("redis://h/?keyspace=a", "redis://h/?keyspace=b"),
+            ("redis://h:6379/?protocol=2", "redis://h:6379/?protocol=3"),
         ] {
             assert_ne!(identity(a), identity(b), "{a} and {b} must differ");
         }
