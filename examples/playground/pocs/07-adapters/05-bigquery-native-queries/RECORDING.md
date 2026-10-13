@@ -45,10 +45,14 @@ to force it into a `.tape`.
 3. **Credentials and project.**
 
    ```bash
-   export GCP_PROJECT_ID="<your-gcp-project-id>"          # BIGQUERY_TEST_PROJECT also accepted
-   export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"   # or BIGQUERY_TOKEN
+   export GCP_PROJECT_ID="<your-gcp-project-id>"
+   export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"
    export BQ_LOCATION="EU"                                # optional; default EU
    ```
+
+   Shots 2-7 run the `live/` drivers, which require both `GCP_PROJECT_ID`
+   and `GOOGLE_APPLICATION_CREDENTIALS`. The `BIGQUERY_TEST_PROJECT` and
+   `BIGQUERY_TOKEN` fallbacks work only for the top-level `./run.sh`.
 
 4. **Terminal.** Size the window so a full driver's `==>` output fits
    without wrapping (~100 cols is comfortable). A dark theme reads best on

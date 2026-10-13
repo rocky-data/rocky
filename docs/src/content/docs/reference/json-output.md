@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Rocky's JSON output is the contract between Rocky and whatever calls it — Dagster, a CI job, your own script. Every command that accepts `--output json` is backed by one typed Rust struct, and the Python and TypeScript bindings are generated from that same struct. Nothing here is hand-written, so the JSON and the bindings cannot drift apart.
+Rocky's JSON output is the contract between Rocky and whatever calls it — Dagster, a CI job, your own script. Every command that accepts `--output json` is backed by one typed Rust struct. The generated Python and TypeScript bindings come from that same struct, and the `codegen-drift` CI check fails a pull request where they drift apart. See [JSON contract](/advanced/json-contract/) for the stability rules.
 
 ## Schema Version
 
@@ -112,7 +112,7 @@ Returns all discovered sources and their tables.
 |-------|------|-------------|
 | `sources[].id` | string | Connector identifier from the source system. |
 | `sources[].components` | object | Parsed schema pattern components. |
-| `sources[].source_type` | string | Source type (`"fivetran"` or `"manual"`). |
+| `sources[].source_type` | string | Source adapter type, such as `"fivetran"` or `"manual"`. |
 | `sources[].last_sync_at` | string or null | ISO 8601 timestamp of the last successful sync. Null if unknown. |
 | `sources[].tables` | array | List of tables in this source. |
 | `sources[].tables[].name` | string | Table name. |
@@ -123,6 +123,8 @@ Returns all discovered sources and their tables.
 | `failed_sources[].source_type` | string | Source type (`"fivetran"`, `"iceberg"`, etc.). |
 | `failed_sources[].error_class` | string | One of `"transient"`, `"timeout"`, `"rate_limit"`, `"auth"`, `"unknown"`. Lets consumers branch on operating-mode without parsing `message`. |
 | `failed_sources[].message` | string | Free-form error detail for human inspection. |
+| `excluded_tables` | array | Tables the discovery adapter reported but that do not exist in the source warehouse. Same shape as on `rocky run`. Empty when nothing was filtered. |
+| `schemas_cached` | integer or absent | Schema-cache entries written by `rocky discover --with-schemas`. Omitted without that flag. |
 | `checks` | object or absent | Pipeline-level check configuration, when `[checks]` is declared in `rocky.toml`. |
 | `checks.freshness.threshold_seconds` | integer | Freshness threshold in seconds. |
 | `new_sources` | array or absent | Source schemas seen for the first time since the prior snapshot. Present only when `[…source.discovery] report_new_sources = true`; absent (omitted) otherwise. The first discover of a pipeline establishes the baseline and reports none. |
@@ -130,7 +132,7 @@ Returns all discovered sources and their tables.
 | `collision_candidates[].external_object_id` | string | The shared external object id (e.g. an ad-account id) found under more than one schema. |
 | `collision_candidates[].sources` | array | The distinct source schemas that resolve to this object id. |
 
-Consumers diffing successive discover snapshots **must** treat ids that appear in `failed_sources` but not in `sources` as "unknown state, do not delete"; that's the contract that distinguishes a fetch failure from a deletion. Available since engine `1.17.4`.
+Consumers diffing successive discover snapshots **must** treat ids that appear in `failed_sources` but not in `sources` as "unknown state, do not delete"; that's the contract that distinguishes a fetch failure from a deletion.
 
 `new_sources` and `collision_candidates` are the discover-time signals for [cross-source duplicate detection](/concepts/data-quality-checks/#cross-source-overlap); both are opt-in and omitted from the payload when their feature is off.
 
@@ -146,6 +148,8 @@ Returns a complete summary of the pipeline execution.
 {
   "version": "1.6.0",
   "command": "run",
+  "status": "Success",
+  "interrupted": false,
   "pipeline_type": "replication",
   "filter": "tenant=acme",
   "duration_ms": 45200,
@@ -247,6 +251,10 @@ Returns a complete summary of the pipeline execution.
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `status` | string | Terminal status: `"Success"`, `"PartialFailure"`, `"Failure"`, or, for `--idempotency-key`, `"SkippedIdempotent"` / `"SkippedInFlight"`. Always present. |
+| `interrupted` | boolean | `true` when Ctrl-C cancelled the run. Always present. |
+| `check_gate_failed` | boolean | `true` when an error-severity check failed and `fail_on_error` is on. It is not counted in `tables_failed`. |
+| `contained` | array | Models withheld after an upstream failure. Omitted when empty. See [Failure containment](/advanced/failure-modes/#failure-containment-across-the-model-graph). |
 | `pipeline_type` | string or absent | Pipeline type executed (e.g., `"replication"`). |
 | `filter` | string | The filter applied to this run. Empty string when no filter was set. |
 | `duration_ms` | integer | Total pipeline execution time in milliseconds. |
@@ -265,7 +273,9 @@ Returns a complete summary of the pipeline execution.
 | `cost_summary` | object or absent | Per-run cost rollup: `total_cost_usd` (float or null), `adapter_type` (string), `total_bytes_scanned` (integer or null), `total_duration_ms` (integer), and `per_model` (array of `{asset_key, duration_ms, cost_usd}`). Absent only for unbilled source adapters (`fivetran`/`airbyte`); present otherwise — including DuckDB, which reports `total_cost_usd` `0`, and billed adapters that computed no cost, where `total_cost_usd` is null. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
 | `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
 
-A transformation model that fails to compile during a run counts as a failure, not a silent skip. It lands on `tables_failed`, gets an `errors[]` entry with `failure_kind: "compile-error"` carrying the diagnostic, and the run reports `Failure` — or `PartialFailure` when other models succeeded — with exit code `1` or `2`. Earlier engine versions skipped the model and still reported success.
+The table above is not every field. `run.schema.json` also defines `verify_after_failed`, `quarantine`, `model_decisions`, `idempotency_key`, `skipped_by_run_id`, `scheduling_warnings`, `override_warnings`, `consumer_diagnostics` and `excluded_tables`.
+
+A transformation model that fails to compile during a run counts as a failure, not a silent skip. It lands on `tables_failed`, gets an `errors[]` entry with `failure_kind: "compile-error"` carrying the diagnostic, and the run reports `Failure` — or `PartialFailure` when other models succeeded — with exit code `1` or `2`.
 
 **`materializations[]`:**
 
@@ -282,8 +292,10 @@ A transformation model that fails to compile during a run counts as a failure, n
 | `metadata.column_count` | integer or absent | Number of columns in the materialized table. |
 | `metadata.compile_time_ms` | integer or absent | Compile time in milliseconds for derived models. |
 | `cost_usd` | float or absent | Observed cost of this materialization in USD, computed post-hoc from the adapter's cost formula. Rolls up into `cost_summary.total_cost_usd` at the run level. |
-| `job_ids` | array of strings | Warehouse-side job IDs for the statements this materialization issued, accumulated alongside `bytes_scanned` / `bytes_written`. Lets orchestrators cross-check rocky-reported figures against the warehouse console (`bq show -j`, Snowflake query history, Databricks SQL warehouse history). Empty `[]` for adapters that don't surface a job id. Available since engine `1.21.0`. |
+| `job_ids` | array of strings | Warehouse-side job IDs for the statements this materialization issued, accumulated alongside `bytes_scanned` / `bytes_written`. Lets orchestrators cross-check rocky-reported figures against the warehouse console (`bq show -j`, Snowflake query history, Databricks SQL warehouse history). Empty `[]` for adapters that don't surface a job id. |
 | `partition` | object or absent | Partition window info for `time_interval` materializations. |
+
+The schema also carries `attempts`, `bytes_scanned`, `bytes_written`, `started_at` and `tenant` on each entry. See `run.schema.json`.
 
 #### Cross-checking BigQuery cost against `bq show -j`
 
@@ -343,8 +355,8 @@ When `not_evaluated` is set, these numbers are placeholders, not measurements.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `grants_added` | integer | Number of GRANT statements executed. |
-| `grants_revoked` | integer | Number of REVOKE statements executed. |
+| `grants_added` | integer | Number of declared catalog permissions Rocky sent this run. It counts what was sent, not what changed. |
+| `grants_revoked` | integer | Always `0`. Rocky does not revoke grants. |
 | `catalogs_created` | integer | Number of catalogs created during this run. |
 | `schemas_created` | integer | Number of schemas created during this run. |
 

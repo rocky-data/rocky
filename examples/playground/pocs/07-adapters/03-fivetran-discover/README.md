@@ -38,5 +38,5 @@ POC complete: discovered <N> Fivetran connectors.
 
 `<N>` is the number of connectors reported for your `FIVETRAN_DESTINATION_ID`,
 so the exact count depends on your Fivetran account. `discover.json` follows the
-`rocky discover` JSON schema — a `sources` array, each entry a discovered
-connector table — and no warehouse is written.
+`rocky discover` JSON schema: a `sources` array with one entry per discovered
+connector, each listing its `tables`. No warehouse is written.

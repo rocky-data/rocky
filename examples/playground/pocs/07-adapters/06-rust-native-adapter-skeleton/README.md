@@ -20,7 +20,7 @@ For an out-of-process adapter shape (any language, JSON-RPC over stdio), see the
 ## Status — what works, what doesn't
 
 - **Works:** SDK trait impls, dialect SQL generation, identifier validation, in-process testing pattern, `AdapterManifest` shape, capability declaration.
-- **Not wired yet:** out-of-tree adapter registration. To make a real ClickHouse adapter ship today, you fork `rocky-data/rocky` and add the crate to `engine/Cargo.toml` plus the CLI's adapter dispatch; the SDK pins the trait shape so the fork stays small and upstreamable. The forward-looking `[adapter.skeleton]` block in `rocky.toml` shows what dynamic registration will look like once it lands.
+- **Not wired yet:** out-of-tree registration of a Rust-native adapter. (An out-of-process adapter is discovered from `$PATH` today; see `04-custom-process-adapter/`.) To ship a Rust-native adapter today, you fork `rocky-data/rocky` and add the crate to `engine/Cargo.toml` plus the CLI's adapter dispatch; the SDK pins the trait shape so the fork stays small and upstreamable. The forward-looking `[adapter.skeleton]` block in `rocky.toml` shows what dynamic registration will look like once it lands.
 
 See `docs/src/content/docs/guides/adapter-sdk.md` for the full walkthrough.
 
@@ -56,7 +56,7 @@ test result: ok. 11 passed; 0 failed; ...
 manifest:
   name           = skeleton
   dialect        = skeleton
-  sdk_version    = 1.18.0
+  sdk_version    = 1.80.0
   warehouse      = true
   merge          = false
   create_schema  = true
@@ -70,6 +70,9 @@ statements executed:
   [1] ALTER TABLE `raw`.`events_copy` DELETE WHERE `day` = '2026-01-01'
   [2] INSERT INTO `raw`.`events_copy` SELECT `id`, `ts` FROM `default`.`events` ...
 ```
+
+`sdk_version` is the `rocky-adapter-sdk` crate version, so it matches the
+engine checkout you build against.
 
 ## What to change to make this real
 

@@ -2,7 +2,7 @@
 title: The Browser UI
 description: "What rocky serve --ui shows: eleven areas in a sidebar, five of which open a screen today. How to open it, operator mode, and what it can and cannot do."
 sidebar:
-  order: 5.8
+  order: 3
 ---
 
 `rocky serve --ui` serves a browser UI for one project. It shows the project's models and runs, the plans waiting for a human, and the policy decisions and product history the engine recorded. On your own machine, the UI can also make changes (see [Operator mode](#operator-mode)). Every value on the page comes from a typed `/api/v1` payload. Most of those payloads are the same ones the CLI prints with `--output json`.
@@ -73,17 +73,19 @@ A reverse proxy in front of the server may log the query string of `/login`. Con
 
 A cookie session can also write, but only from the page. A write must carry an `Origin` header that names this server exactly (the same host and port), or an `--allowed-origin` entry, and the header `X-Rocky-UI: 1`. Another page on the same machine shares the cookie, because cookies do not separate ports, so it is refused. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
 
-If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **session expired**. Open the newest `Rocky UI:` link from the console.
+If the link is stale or wrong, `/login` answers `401` with a page that says so. It has a field for the token. Without a session, `/ui/` shows **Session expired**. Open the newest `Rocky UI:` link from the console.
 
 To run the UI somewhere other than your own machine, use the [container image](/guides/run-the-image/) or the [Helm chart](/guides/kubernetes/). The chart serves the UI by default.
 
 ## Needs you
 
+The sidebar shows a badge on Needs you and on Review when decisions wait on you. The number is the count Needs you lists. The page reads it again on each navigation, and every 30 seconds while the tab is visible. No badge means nothing waits, or the count could not be read, for example while a run holds the state store.
+
 The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: how many decisions wait on you, how the runs went, and whether a freeze or a degraded rule is in force. Then there is a card for each part of the digest.
 
 The first card, which gives the area its name, is what needs you. Each pending plan is its own row, with a **Review plan** button that opens it in Review. The rest are the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler. A bar over the policy decisions shows how many were allowed, needed review, or were denied.
 
-![The brief: one pending plan under Needs you, ten agent decisions with their capability, effect and rule, two successful runs, no degraded autonomy, and a cost card](/ui-governor-brief.png)
+![The Needs you screen: a badge of 1 on Needs you and on Review, a summary line saying one decision waits and two runs succeeded, one pending plan for revenue_daily with a Review plan button, and a bar over ten agent decisions, five allowed and five needing review](/ui-governor-brief.png)
 
 A card says so when its data was not available. A signal the ledger does not hold shows as **not recorded**, never as a zero. In the summary line, a part with nothing in the window says so in its own words, such as "no runs in the window". A part the engine could not read says **not recorded**, never zero.
 
@@ -101,7 +103,7 @@ The Review screen lists the plans that the policy plane sent to a human, by a ru
 
 Open a plan to see why it waits:
 
-![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, an Approve button, and the rocky review --approve command to copy](/ui-review.png)
+![One plan in the Review screen: an agent's run plan awaiting a human, a breaking finding that the email column of dim_customer is dropped, the default policy effect that required review, a sample-rows button, and an Approval panel with the Proposed, Approved and Applied steps, an Approve button and the rocky review --approve command to copy](/ui-review.png)
 
 The plan screen shows:
 

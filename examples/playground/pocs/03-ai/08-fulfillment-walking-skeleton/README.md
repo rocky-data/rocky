@@ -89,14 +89,14 @@ failing plan already had.
   dispatched as a plain draft. The **banked live evidence predates the fix** —
   its first draft was green, so it exercised no repair round; the live lane
   simply gains this recovery path now.
-- **The repair window is a real residual.** Between the repair dispatch and the
-  merge that closes it, the sidecar is not covered by any hash, and the merge
-  preserves keys and `[[tests]]` entries the lowering does not own — so content
-  added to that file during the window is carried into the committed artifact.
-  Using it needs a process that can write the models directory while the loop
-  runs, which is the same access that can forge an approval marker. This POC
-  makes no claim to defend against that. Tracked in
-  [#1515](https://github.com/rocky-data/rocky/issues/1515).
+- **The repair window is a narrowed residual, not a closed one.** Since 1.74.0
+  (#1821), `draft_model` also writes both files to the task outbox
+  (`.rocky/fulfillment/<product>/outbox/`). The runner refuses the round if the
+  files in `models/` differ from that copy. This gives no protection from a
+  process that runs as the same user: it can write the outbox as easily as
+  `models/`. That is the same access that can forge an approval marker. This
+  POC makes no claim to defend against it. See
+  [#1515](https://github.com/rocky-data/rocky/issues/1515) (closed).
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
   loop's journal; it never blocks an apply, and it never routes into a repair
@@ -232,7 +232,7 @@ ANTHROPIC_API_KEY=... ./run-live.sh   # live lane: a real worker drafts the SQL
     OK  state=needs_input, products/revenue_daily.toml written by the runner
 ...
 [2] approve + drive: red draft -> repair round -> converged; manifest total
-    OK  red draft repaired (3 transcripts; repaired SQL survived); manifest merged, ...
+    OK  red draft repaired (rounds by kind: drafting elicitation repair ; repaired SQL survived); manifest merged, ...
 ...
 [10] staleness: fresh observe (lag<budget), then stale after backdating (lag>budget)
     OK  fresh lag 5s < 86400s; stale lag 209383917s > 86400s; journal=44 rows

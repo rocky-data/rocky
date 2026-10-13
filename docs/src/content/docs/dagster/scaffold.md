@@ -48,7 +48,7 @@ After running, `my_pipeline/` contains:
 ```
 my_pipeline/
 ├── defs.yaml          # type: dagster_rocky.RockyComponent + attributes
-├── rocky.toml         # DuckDB-backed starter, freshness preconfigured
+├── rocky.toml         # DuckDB-backed full-refresh starter
 ├── .gitignore         # the DuckDB files and state the engine creates
 ├── models/            # empty, with .gitkeep
 │   └── .gitkeep
@@ -56,10 +56,14 @@ my_pipeline/
 ```
 
 The default `rocky.toml` uses the **DuckDB local-execution adapter**. The
-scaffold therefore runs end to end with no warehouse credentials. It also
-preconfigures a [freshness policy](./freshness.md), which declares how far
-behind the newest row a table may fall. You see that policy on your
-Dagster assets right away.
+scaffold therefore runs end to end with no warehouse credentials. It copies
+every table in each `src__<source>` schema of `warehouse.duckdb` into
+`raw__<source>`, with `row_count` and `column_match` checks.
+
+The file also carries a commented-out incremental strategy and a
+`[pipeline.main.checks.freshness]` block. Turn them on once every source table
+has a load timestamp column. The freshness block then gives your Dagster assets
+a [freshness policy](/dagster/freshness/).
 
 ## Overwrite protection
 
@@ -79,9 +83,12 @@ After scaffolding, the README guides users through:
 
 ```bash
 # Install the rocky binary (once)
-curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
 
-# Validate the pipeline locally (DuckDB, no credentials required)
+# Check the pipeline config (DuckDB, no credentials required)
+rocky --config rocky.toml validate
+
+# Run the pipeline locally
 rocky --config rocky.toml run
 
 # Launch the Dagster UI

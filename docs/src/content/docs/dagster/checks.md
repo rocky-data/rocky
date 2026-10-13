@@ -57,10 +57,10 @@ It handles every Rocky check type, both pipeline-level and model-level:
 - **cross_source_overlap** -- detects the same business key across sibling sources feeding a shared target
 - **custom** -- any user-defined SQL check
 
-Anomalies are not part of `check_results` -- they live on `RunResult.anomalies` and are converted by the separate `anomaly_check_results()` helper (see the observability page).
+Anomalies are not part of `check_results`. They live on `RunResult.anomalies`. The separate `anomaly_check_results()` helper converts them. See [Observability](/dagster/observability/#anomalies-as-assetcheckresult-severity-warn).
 
 **Model-level assertions (DQX parity):**
-`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`).
+`not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`).
 
 Severity maps to Dagster's `AssetCheckSeverity`, either `ERROR` or `WARN`. A
 failing warning-severity check still reports `passed = false`. At `WARN` it does
@@ -74,7 +74,14 @@ Each event carries whatever metadata the check populated:
 - `lag_seconds` / `threshold_seconds`
 - `column` / `null_rate` / `threshold`
 - `query` / `result_value`
+- `overlap_count` / `contributing_tables` / `overlap_sample` (cross-source overlap)
+- `not_evaluated`, the reason the check did not run. When it is set, the numbers above are placeholders, not readings.
 - `severity`, a marker present when the check is advisory
+
+Engine check names such as `null_rate:<col>` contain `:` and `.`, which Dagster
+refuses in a check name. `emit_check_results` sanitizes each name. Declare your
+own `AssetCheckSpec` with the sanitized name too. The function is
+`dagster_rocky.contracts.sanitize_check_name`.
 
 ## Example
 

@@ -21,10 +21,8 @@ or are refused:
 - A model with `{% if target.name == 'prod' %}` (`stg_orders`) —
   **refused**. The raw importer cannot evaluate Jinja control flow, and
   stripping the tags would apply the conditional body unconditionally.
-  Since engine 1.76.0 (#2059) it lands under "Failed models" with the fix
-  named: run `dbt compile --full-refresh` and import with the manifest.
-  Before, it was emitted verbatim with a
-  `-- TODO: dbt-jinja-not-translated` marker.
+  It lands under "Failed models" with the fix named: run
+  `dbt compile --full-refresh` and import with the manifest.
 - A model with `{% for %}` loops (`stg_loop`) — **refused** for the same
   reason, rather than half-rendered into broken SQL.
 - A model with `{{ var('cutoff') }}` (`stg_variables`) — **mapped** to
@@ -35,9 +33,9 @@ or are refused:
   **mapped** to a native `[[tests]]` block of type `in_range` on the
   model sidecar; no longer surfaced as an `UnsupportedTest` warning.
 - `snapshots/orders_snapshot.sql` — **imported** as a
-  `type = "snapshot"` model that keeps dbt's metadata column names
-  (since engine 1.77.0, #2244). Two `MappedConstruct` warnings say what
-  to check before the first `rocky run`.
+  `type = "snapshot"` model that keeps dbt's metadata column names. Two
+  `MappedConstruct` warnings say what to check before the first
+  `rocky run`.
 - `dbt_packages/` and `tests/` (singular tests) trees — silently ignored.
 
 The POC's `run.sh` asserts each of these end-to-end. The happy-path

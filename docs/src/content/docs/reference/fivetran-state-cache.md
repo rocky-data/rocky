@@ -32,7 +32,7 @@ The cache removes the repetition. A steady-state tenant pays one discover cycle 
    process 3 ──► cache HIT  ──► envelope
 ```
 
-Together with the per-host rate-limit budget (engine-v1.37.0), this is the cold-start equivalent of an asset cache.
+Together with the rate-limit budget (see [Cross-process coordination](#cross-process-coordination)), this is the cold-start equivalent of an asset cache.
 
 ## Configuration
 
@@ -54,7 +54,7 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-Omit the `[adapter.<name>.cache]` block and the backend defaults to `"none"`. The adapter then behaves exactly as it did before the cache existed: every fetch goes straight to the Fivetran API.
+Omit the `[adapter.<name>.cache]` block and the backend defaults to `"none"`: every fetch goes straight to the Fivetran API.
 
 ## Backends
 
@@ -95,11 +95,11 @@ Supported URL schemes:
 
 **Credentials** come from each SDK's own default provider chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, an IAM role, or `~/.aws/credentials` for S3; `GOOGLE_APPLICATION_CREDENTIALS` for GCS; and so on. Rocky adds no credential surface of its own for cloud storage.
 
-The backend writes single-part PUTs. It compares the response ETag, an MD5 for a single part, against the new bytes. No PUT crosses the wire when the envelope has not changed. It caps the serialized envelope at 5 MB to keep that comparison safe. Real envelopes for a 57-connector tenant land between 60 and 120 KB.
+The backend writes single-part PUTs. It compares the response ETag, an MD5 for a single part, against the new bytes. No PUT crosses the wire when the envelope has not changed. It caps the serialized envelope at 5 MB to keep that comparison safe.
 
 ### `valkey`
 
-Redis or Valkey. Sub-millisecond reads, so this is the hot path for sensors and sync detection that need fresh-ish data fast. The `valkey` Cargo feature gates it.
+Redis or Valkey. Reads are fast, so this is the hot path for sensors and sync detection that need recent data. The released `rocky` binary includes it.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -159,6 +159,20 @@ Every cache decision emits a span event over [OTLP](/reference/glossary/#otlp-op
 
 The cache fails open. When a backend is unreachable Rocky still fetches over HTTP, so a broken cache slows a run down but never stops it. Each failure emits a `cache_write_failed` event and a warning log line, so you can alert on a backend that fails consistently.
 
-## Volume reduction
+## Cross-process coordination
 
-Take a 57-connector tenant running 5 processes with 2 to 8 sensor triggers an hour. The cache plus the rate-limit budget cut steady-state Fivetran calls from roughly 600–2400 an hour to roughly 80.
+Three more optional blocks on the same Fivetran adapter coordinate processes through Valkey. Each one fails open: when its backend is unreachable, Rocky calls the API directly.
+
+| Block | Default | What it does |
+|---|---|---|
+| `[adapter.<name>.ratelimit]` | `backend = "file"`: a per-host budget under `${TMPDIR}/rocky-fivetran-ratelimit/` | After one process gets a 429, the others on the same budget wait for the same `wake_at`. `backend = "valkey"` shares the budget across hosts. Keys: `valkey_url`, `max_wake_seconds` (default `600`). |
+| `[adapter.<name>.stampede]` | `backend = "none"`: every process is the leader | On a cold cache, one leader calls the API and the others poll the cache. Keys: `valkey_url`, `lock_ttl_seconds` (default `60`), `poll_timeout_seconds` (default `30`). |
+| `[adapter.<name>.circuit_breaker]` | `backend = "none"`: no breaker | Stops API calls for the whole org after repeated failures, then probes again after a cooldown. Keys: `valkey_url`, `failure_threshold` (default `5`), `window_seconds` (default `60`), `cooldown_seconds` (default `300`), `cooldown_max_seconds` (default `3600`). |
+
+A `valkey` backend without `valkey_url` fails the config load. Rocky ignores these blocks on every adapter type except `fivetran`.
+
+```toml
+[adapter.fivetran_main.stampede]
+backend = "valkey"
+valkey_url = "rediss://valkey.internal:6379/"
+```

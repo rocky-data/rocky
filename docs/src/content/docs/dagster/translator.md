@@ -26,7 +26,7 @@ One method fills each part of the `AssetSpec`:
 
 Returns the Dagster `AssetKey` for a given source and table combination.
 
-**Default:** `[source_type, *component_values, table_name]`
+**Default:** `[source_type, *component_values, table_name]`. A list-valued component joins its items with `__`.
 
 ### `get_group_name(source) -> str`
 
@@ -80,6 +80,18 @@ Returns metadata to attach to the asset.
 
 **Default:** `source_id`, `source_type`, plus `last_sync_at` / `row_count` when present, plus every adapter-namespaced `source.metadata` entry (e.g. `fivetran.service`) forwarded verbatim (non-string values JSON-encoded)
 
+### Other methods
+
+| Method | Default |
+|---|---|
+| `get_asset_deps(source, table)` | `[]`. Override to declare upstream assets, for example a Fivetran asset. |
+| `get_partition_key(source)` | `None`, which uses the raw tenant component value. Used only with the component's `tenant` collapse. |
+| `get_model_asset_key(model)` | `[catalog, schema, table]` from the model's `[target]` |
+| `get_model_group_name(model)` | The target schema |
+| `get_model_metadata(model)` | `rocky/target_table` and `rocky/strategy` |
+| `get_dag_node_asset_key(node)` | `dag_mode` only. A transformation uses `[catalog, schema, table]`. A seed uses `["seed", label]`. Source and load use `[pipeline, "source"]` and `[pipeline, "load"]`. Quality and snapshot use `["quality", pipeline]` and `["snapshot", pipeline]`. |
+| `get_dag_group_name(node)` | `dag_mode` only. The target schema for a transformation, else the pipeline name, else `"default"` |
+
 ## Custom translator example
 
 ```python
@@ -97,16 +109,11 @@ class MyTranslator(RockyDagsterTranslator):
 
 ## Using a custom translator
 
-Pass your translator instance to `load_rocky_assets()`:
+Use the same translator everywhere you build or target Rocky assets. Otherwise the asset keys do not line up.
 
-```python
-from dagster_rocky import RockyResource, load_rocky_assets
-
-rocky = RockyResource(config_path="rocky.toml")
-assets = load_rocky_assets(rocky, translator=MyTranslator())
-
-defs = dg.Definitions(
-    assets=assets,
-    resources={"rocky": rocky},
-)
-```
+| Where | How |
+|---|---|
+| `load_rocky_assets()` | `load_rocky_assets(rocky, translator=MyTranslator())` |
+| `RockyComponent` | `translator_class: my_module.MyTranslator` in `defs.yaml` |
+| `rocky_source_sensor()` | `rocky_source_sensor(target=..., translator=MyTranslator())` |
+| `build_model_specs()` | `build_model_specs(compile_result, translator=MyTranslator())` |

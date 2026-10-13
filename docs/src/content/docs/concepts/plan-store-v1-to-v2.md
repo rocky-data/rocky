@@ -5,7 +5,7 @@ sidebar:
   order: 17
 ---
 
-`rocky plan` writes each plan to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. For `rocky compact` and `rocky archive` plans, the typed-IR **v2** envelope is now the only shape that loads. The legacy **v1** inline-SQL envelope is retired, and the `[plan_store]` config block that chose between them has been removed.
+`rocky plan` writes each plan to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. For `rocky compact` and `rocky archive` plans, the typed-IR **v2** envelope is the only shape that loads, since engine-v1.37.0. The legacy **v1** inline-SQL envelope is retired, and the `[plan_store]` config block that chose between them has been removed.
 
 ## What's changed
 
@@ -35,8 +35,8 @@ There is no in-place upgrade. A stale v1 envelope is simply not parseable. Re-pl
 ## Timeline
 
 ```
-  engine-v1.33.0        engine-v1.35.0        this release
-  ──────────────        ──────────────        ────────────
+  engine-v1.33.0        engine-v1.35.0        engine-v1.37.0
+  ──────────────        ──────────────        ──────────────
   writer: v1            writer: v2            writer: v2
   reader: v1 and v2     reader: v1 and v2     reader: v2 only
   v2 opt-in through     v1 pinnable through   [plan_store] block
@@ -48,7 +48,7 @@ There is no in-place upgrade. A stale v1 envelope is simply not parseable. Re-pl
   the default flip      on request            re-plan to move on
 ```
 
-The release notes that ship this change name the version it lands in.
+The v1 reader and the `[plan_store]` block were removed in engine-v1.37.0.
 
 ## Related
 

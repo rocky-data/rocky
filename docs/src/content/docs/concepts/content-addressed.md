@@ -5,7 +5,7 @@ sidebar:
   order: 16
 ---
 
-`materialization = "content_addressed"` writes a model's SELECT result to an
+A model with `[strategy] type = "content_addressed"` writes its SELECT result to an
 object-store prefix you control. It writes **Parquet files named by the hash of
 their own bytes, plus a Delta log commit**. That naming is what
 [content-addressed](/reference/glossary/#content-addressed) means: the file's name
@@ -14,9 +14,8 @@ comes from its contents, not from a timestamp or a counter.
 Any engine that reads Iceberg or Delta reads those files directly. DuckDB
 `iceberg_scan`, Trino, and Spark do not go through Rocky.
 
-Shipped end to end in engine v1.30.0. That includes partitioned tables,
-post-`ALTER` schema evolution, and rowTracking, a Delta feature that gives every
-row a stable ID.
+The writer supports partitioned tables, post-`ALTER` schema evolution, and
+rowTracking, a Delta feature that gives every row a stable ID.
 
 ## When to use it
 

@@ -1,15 +1,15 @@
 ---
-title: Use dbt Packages
+title: Vendor dbt Packages
 description: Vendor a dbt Hub package, such as a Fivetran connector package, as Rocky models with rocky package, then extend or override it.
 sidebar:
-  order: 2
+  order: 8
 ---
 
 `rocky package` brings a dbt Hub package into your Rocky project as plain Rocky models. dbt runs once, when you add or update the package, to compile it. After that, Rocky owns the models. It type-checks them, tracks their lineage, selects them, runs them and tests them. You do not need dbt to compile, run or test the project.
 
 This page walks through the [`fivetran/stripe`](https://hub.getdbt.com/fivetran/stripe/latest/) package on DuckDB. The same steps work for other Fivetran packages, such as `fivetran/hubspot` and `fivetran/salesforce`.
 
-If you prefer to keep a package in dbt and only read its tables, see [Using Rocky with dbt Packages](/guides/using-dbt-packages/).
+If you prefer to keep a package in dbt and only read its tables, see [Read dbt Package Tables](/guides/using-dbt-packages/).
 
 ## How it works
 

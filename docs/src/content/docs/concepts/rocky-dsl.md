@@ -44,6 +44,8 @@ ORDER BY revenue DESC
 LIMIT 100
 ```
 
+Function names are uppercased and their arguments pass through unchanged. So `count()` lowers to `COUNT()`. Check that your warehouse accepts that form, or write `count(1)`.
+
 ## Constructs
 
 ### from
@@ -136,6 +138,8 @@ FROM orders o
 JOIN customers AS c ON o.customer_id = c.customer_id
 ```
 
+For an outer or cross join, put `left`, `right`, `full` or `cross` before `join`, or write one word such as `left_join`. A cross join takes no `on` clause.
+
 ### sort
 
 Orders results. Use `desc` for descending:
@@ -197,6 +201,18 @@ from source.fivetran.orders
 replicate
 ```
 
+### let
+
+A `let` binding names a sub-pipeline. It lowers to a common table expression (a `WITH` clause). Bindings come before the main pipeline:
+
+```
+let active = from users
+where is_active == true
+
+from active
+select { id, name }
+```
+
 ## String literals
 
 Use single or double quotes for a string. A string ends at the matching quote,
@@ -218,7 +234,7 @@ where order_date >= @2025-01-01
 
 Lowers to `WHERE order_date >= DATE '2025-01-01'`.
 
-Timestamps are also supported: `@2025-01-01T00:00:00Z`.
+A time part is allowed: `@2025-01-01T00:00:00Z`. It still lowers to a `DATE` literal (`DATE '2025-01-01T00:00:00Z'`), never a `TIMESTAMP`. Check that your warehouse reads that value the way you expect.
 
 ## NULL-safe operators
 

@@ -2,7 +2,7 @@
 title: Observability
 description: Send Rocky's traces and metrics to a collector over OTLP, read its structured logs, and run a local Grafana stack that watches runs.
 sidebar:
-  order: 8.5
+  order: 15
 ---
 
 Rocky is instrumented from the inside. A run emits OpenTelemetry traces and metrics, writes structured logs to stderr, and keeps a local record of every log event on disk. Point the exporter at a collector, or read the local files. Either way you see what a run did, without adding a line of code to your models.
@@ -52,7 +52,7 @@ How the run spans nest:
 
 A few honest limits are worth knowing.
 
-- **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The embedded DuckDB engine runs statements in-process and does not, so a local DuckDB run shows model-level spans but no per-statement spans. The `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` attributes ride on the Databricks, Snowflake, and BigQuery spans. Trino emits a simpler `statement.execute` span, plus a separate `statement.execute_arrow` span on its Arrow path.
+- **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The PostgreSQL, Redshift, ClickHouse, SQL Server and Spark adapters do not yet. The embedded DuckDB engine runs statements in-process and does not, so a local DuckDB run shows model-level spans but no per-statement spans. The `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` attributes ride on the Databricks, Snowflake, and BigQuery spans. Trino emits a simpler `statement.execute` span, plus a separate `statement.execute_arrow` span on its Arrow path.
 - **`scheduler.tick` comes from the resident scheduler, not from a run.** `rocky serve --scheduler` (experimental) emits one per poll interval. Each pass records its outcome and its counts even when nothing ran, so an idle loop and a wedged one stay distinguishable in the trace.
 - **`rocky.query_duration_ms` is populated by the Databricks adapter today.** Other adapters record their statement spans without feeding that metric yet.
 - **`governance_setup` and `batched_checks` are marker spans.** They are declared to delimit the governance and quality-check phases, but they do not parent the events emitted during those phases. Those events stay at the root of the trace. Treat the two as phase markers, not as subtrees.

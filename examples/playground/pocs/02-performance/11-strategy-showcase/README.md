@@ -18,10 +18,10 @@ raw__orders.orders ──────┼── pipeline.inc (incremental)   → 
 ```
 
 Two of the strategies (`full_refresh`, `incremental`) live on **replication
-pipelines**; `merge` is declared at the **model level** inside a
-**transformation pipeline**, because Rocky's replication strategy enum is
-limited to full_refresh + incremental. The user-facing TOML is shown in
-each pipeline's section of `rocky.toml`.
+pipelines**. `merge` is declared at the **model level** inside a
+**transformation pipeline**. (A replication pipeline also accepts
+`strategy = "merge"` with `merge_keys`; this POC shows the model form.) The
+user-facing TOML is shown in each pipeline's section of `rocky.toml`.
 
 ## Why it's distinctive
 
@@ -66,12 +66,11 @@ each pipeline's section of `rocky.toml`.
 
 ## Prerequisites
 
-- `rocky` on PATH
-- `duckdb` CLI (`brew install duckdb`), which seeds the source, applies the
-  delta, and runs the side-by-side verification queries
 - `rocky` ≥ 1.29.0 on PATH. `auto_create_schemas` for transformation pipelines
   landed in 1.29.0, in PR #448. On an older binary, pre-create `poc.merge` with
   duckdb.
+- `duckdb` CLI (`brew install duckdb`), which seeds the source, applies the
+  delta, and runs the side-by-side verification queries
 
 ## Run
 

@@ -1,4 +1,4 @@
-# 04-column-propagation — Column-level lineage pruning
+# 04-column-propagation — Column-level lineage across a model chain
 
 > **Category:** 02-performance
 > **Credentials:** none (DuckDB)
@@ -16,12 +16,12 @@ without reading every model's SQL.
 
 ## Why it's distinctive
 
-- **Column-level**, not table-level. dbt's lineage graph stops at table
+- **Column-level**, not table-level. dbt-core's lineage graph stops at table
   edges; Rocky traces every column transformation.
 - Tracing `status` from `stg_orders` reports a `downstream_consumers`
   entry for `fct_status_summary`; tracing `amount` reports none — the
   column dead-ends there.
-- Outputs Graphviz `dot` format for rendering.
+- `--format dot` outputs Graphviz `dot` for rendering.
 
 ## Layout
 

@@ -53,6 +53,8 @@ transformation workflow, use the [Playground](/guides/playground/).
 
    This writes a runnable DuckDB starter project. You get a `rocky.toml`, a `models/` directory holding `_defaults.toml` and a sample `stg_orders` model, and a `seeds/seed.sql`. Step 2 replaces the generated `rocky.toml` with the Fivetran to Databricks config below.
 
+   To start from a similar Fivetran to Databricks config instead, run `rocky init my-pipeline --template databricks-fivetran`. Its pipeline and adapter names differ from step 2.
+
 2. **Configure a source, a target, and the pipeline that wires them together.**
 
    ```toml
@@ -125,10 +127,10 @@ transformation workflow, use the [Playground](/guides/playground/).
 5. **Build a plan.**
 
    ```bash
-   plan_id=$(rocky plan --filter tenant=acme --output json | jq -r .plan_id)
+   plan_id=$(rocky plan --filter source=orders --output json | jq -r .plan_id)
    ```
 
-   Rocky compiles the pipeline, detects drift, and records a plan keyed by `plan_id`. A plan is the exact work Rocky will do, written down before it does any of it. The same inputs always produce the same plan. Read the SQL, the drift actions, and the checks before you commit to a run. See the [glossary](/reference/glossary/).
+   `--filter` selects sources by a schema-pattern component. Here `source=orders` selects the `src__orders` schema. Rocky compiles the pipeline, detects drift, and records a plan keyed by `plan_id`. A plan is the exact work Rocky will do, written down before it does any of it. The same inputs always produce the same plan. Read the SQL, the drift actions, and the checks before you commit to a run. See the [glossary](/reference/glossary/).
 
 6. **Apply the plan.**
 
@@ -153,18 +155,19 @@ transformation workflow, use the [Playground](/guides/playground/).
 `rocky run` does the work of steps 5 and 6 in one command. Use it for replication iteration and for automation.
 
 ```bash
-rocky run --filter tenant=acme
+rocky run --filter source=orders
 ```
 
 Either path resumes from the last checkpoint after a failure. Add `--resume-latest`:
 
 ```bash
-rocky run --filter tenant=acme --resume-latest
+rocky run --filter source=orders --resume-latest
 ```
 
 ## Next steps
 
 - [Playground](/guides/playground/): the credential-free DuckDB version of this flow.
+- [Browser UI](/guides/browser-ui/): open the project in your browser with `rocky serve --ui`.
 - [Schema patterns](/concepts/schema-patterns/): customize source-to-target mapping.
 - [Silver layer](/concepts/silver-layer/): add transformation models on top of the bronze copy.
 - [Data quality checks](/concepts/data-quality-checks/): assertions that run inline with the load.

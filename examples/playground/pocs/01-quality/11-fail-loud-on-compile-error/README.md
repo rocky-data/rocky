@@ -3,7 +3,7 @@
 ## Feature
 
 `rocky run` over a project that contains a model with a real compile error
-fails the run loudly: it exits non-zero, reports `partial_failure`, and records
+fails the run loudly: it exits non-zero, reports status `PartialFailure`, and records
 the broken model as a `compile-error` instead of quietly reporting a green run
 over a half-built warehouse.
 
@@ -46,7 +46,8 @@ cd examples/playground/pocs/01-quality/11-fail-loud-on-compile-error
 ./run.sh
 ```
 
-No credentials required — DuckDB only.
+No credentials required — DuckDB only. `run.sh` needs `rocky`, the `duckdb`
+CLI and `jq` on `PATH`.
 
 ## Expected output
 

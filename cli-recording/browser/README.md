@@ -39,7 +39,7 @@ Each scene writes `out/<scene>.webm`. `out/` is generated; it is gitignored.
 | `samples` | The sample panel as a button first, then real rows | 9 |
 | `journal` | One product's whole life in append order | 11 |
 
-## Three things it does on purpose
+## Four things it does on purpose
 
 **It waits for a landmark, never for a timer.** A `waitForSelector` that fails
 is a loud failure. A `waitForTimeout` that is too short is a blank frame in the

@@ -88,6 +88,13 @@ cargo build --release
 # binary at target/release/rocky
 ```
 
+A plain source build has no browser UI, so `rocky serve --ui` refuses to start. The release binaries and the container image include it. To embed it in a source build, build the page first. This needs Node.js:
+
+```bash
+cd ui && npm ci && npm run build && cd ..
+cargo build --release --features ui
+```
+
 ## Verify
 
 Confirm the binary is on your `PATH` and prints a version:

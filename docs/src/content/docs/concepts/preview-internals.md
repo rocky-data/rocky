@@ -145,7 +145,7 @@ Two properties set this apart from sampling:
 
 Rows with a NULL key belong to no chunk. Bisection compares them as a separate group: the row count, then the sorted list of row hashes. When the groups differ, it diffs the NULL-key rows by value. It reports each surplus row as added or removed, with the sample key `NULL`. A NULL-key row cannot be "changed", because it has no key to match on.
 
-Bisection is a checksum, not a proof. It can miss a change in two cases:
+Bisection is a checksum, not a proof. It can miss a change in three cases:
 
 - **Hash collision.** The row hashes are 64-bit and non-cryptographic. A change can, rarely, produce the same chunk checksum.
 - **Duplicate keys.** Two rows with the same key and the same values have the same hash, and `BIT_XOR` cancels them in pairs. Bisection runs only on Merge models with a single-column `unique_key`, where keys are expected to be unique.
@@ -196,5 +196,5 @@ The [codegen pipeline](/reference/json-output/) generates the Pydantic (Dagster)
 ## Related concepts
 
 - [The Rocky Compiler](/concepts/compiler/) — type checks models; preview builds its prune set from sidecar dependencies.
-- [Shadow Mode](/concepts/shadow-mode/) — the comparison kernel `preview diff` extends with sampled row-level diffing.
+- [Shadow Mode](/concepts/shadow-mode/) — the comparison kernel `preview diff` builds on.
 - [State Management](/concepts/state-management/) — the `RunRecord` store `preview cost` reads to compute base-vs-branch deltas.

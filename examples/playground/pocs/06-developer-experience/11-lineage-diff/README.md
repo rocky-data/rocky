@@ -23,7 +23,7 @@ A single `rocky lineage-diff main` lists all six column changes (three per modif
 
 - **Column-level, not file-level.** `git diff` shows that `stg_orders.sql` changed; `rocky lineage-diff` shows *which columns* moved and *which downstream consumers* sit on each. CODEOWNERS-style review tooling can't reach this granularity without a compiled engine.
 - **One command per PR.** The Markdown output is pre-rendered for direct paste into a GitHub PR comment, with no JSON-to-comment glue code in CI. Pair with the GitHub Action wired into [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/) for a complete PR review surface.
-- **v1 trace direction is HEAD-only.** Removed columns can't be walked downstream (the column doesn't exist on HEAD), so the table renders `_(removed; not traceable on HEAD)_`; the structural diff still surfaces the removal. A base-vs-HEAD trace delta is the natural v2.
+- **The trace runs on HEAD only.** A removed column can't be walked downstream (it doesn't exist on HEAD), so the table renders `_(removed; not traceable on HEAD)_`. The structural diff still reports the removal.
 
 ## Layout
 

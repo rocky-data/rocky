@@ -11,7 +11,7 @@ A custom warehouse adapter implemented in **Python** that Rocky talks to over
 stdin/stdout using a JSON-RPC line protocol. Adapters can be written in any
 language as long as they implement the required methods (`initialize`,
 `execute_statement`, `execute_query`, `describe_table`, `table_exists`,
-`shutdown`). This POC ships an ~120-line Python adapter wrapping SQLite (stdlib
+`shutdown`). This POC ships an ~130-line Python adapter wrapping SQLite (stdlib
 `sqlite3`, zero deps), then **discovers it through the engine**: dropped on
 `$PATH` as an executable named `rocky-sqlite`, Rocky registers it as the adapter
 `sqlite`, following the same cargo-subcommand convention `cargo-foo` uses.
@@ -30,7 +30,7 @@ language as long as they implement the required methods (`initialize`,
 .
 ├── README.md
 ├── rocky.toml          DuckDB config so `rocky validate` is happy (the adapter is PATH-discovered, not configured here)
-├── adapter.py          ~120-line stdio JSON-RPC adapter wrapping SQLite
+├── adapter.py          ~130-line stdio JSON-RPC adapter wrapping SQLite
 └── run.sh              (1) exercises the adapter raw, (2) installs it as rocky-sqlite and discovers it
 ```
 

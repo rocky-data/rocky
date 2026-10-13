@@ -41,7 +41,7 @@ with real variance, then queries the rolling-stats block.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.22.0 on PATH (the `--rolling-stats` flag landed in 1.22.0)
+- `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
 - `python3` for the JSON assertion
 

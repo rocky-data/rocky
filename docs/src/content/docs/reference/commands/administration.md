@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-These commands read what already happened and maintain what Rocky keeps. They cover run history, quality metrics, and cost; storage optimization, compaction, profiling, and archival; the embedded state store; and the governance rollups.
+These commands read what already happened and maintain what Rocky keeps. They cover run history, quality metrics and cost; storage compaction, profiling and archival; the state store and the scheduler; and the governance rollups.
 
 ---
 
@@ -21,8 +21,11 @@ rocky history [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--model <NAME>` | `string` | | Filter history to a specific model. |
+| `--model <NAME>` | `string` | | Show one model's executions as a flat list. |
+| `--recipe <HASH>` | `string` | | Show every recorded execution of one exact program, by its recipe hash. Read the hash from any model record's `recipe_identity` in `history`, `trace` or `catalog` JSON. Conflicts with `--model`. |
 | `--since <DATE>` | `string` | | Only show runs since this date (ISO 8601 or `YYYY-MM-DD`). |
+| `--rolling-stats` | `bool` | `false` | Add the mean, standard deviation, z-score and health score over the most recent successful executions. Requires `--model`. |
+| `--window <N>` | `integer` | `20` | Number of successful executions for `--rolling-stats`. |
 | `--audit` | `bool` | `false` | Include the governance audit trail for each run in JSON output, and print a second governance table after the default summary in text output. See [Audit trail](#audit-trail) below. |
 | `--run <RUN_ID>` | `string` | | Show exactly one run by its id. The output has the same shape as the list, with `count` set to `1`, so a consumer reads one shape either way. A run the store does not hold is an error naming the id, not an empty list. Conflicts with `--model`, `--recipe` and `--since`; composes with `--audit`. |
 
@@ -67,7 +70,7 @@ rocky history
 
 A run made with `rocky run --branch <name>` also carries `rocky_branch`, the literal `<name>`. Rocky leaves the field out of any other run. It is not an audit field, so it appears with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the git branch you had checked out, which appears only with `--audit`.
 
-A run can start without leaving a record. It may still be running, it may have crashed, or its record write may have failed. When the ledger holds evidence of such a run, the document adds `unrecorded_runs`. A replication run leaves a `checkpoint` header. Every other kind of run leaves a `run_started` marker. These runs are not counted in `count`. When the list is present, `runs` is not the complete history. Rocky leaves the field out when it is empty, and when you filter by `--trigger`.
+A run can start without leaving a record. It may still be running, it may have crashed, or its record write may have failed. When the ledger holds evidence of such a run, the document adds `unrecorded_runs`. A replication run leaves a `checkpoint` header. Every other kind of run leaves a `run_started` marker. These runs are not counted in `count`. When the list is present, `runs` is not the complete history. Rocky leaves the field out when it is empty, and when the MCP `history` tool filters by trigger.
 
 ```json
 "unrecorded_runs": [
@@ -138,7 +141,7 @@ The `RUN ID` column is truncated to 11 characters and the timestamp is rendered 
 
 ### Audit trail
 
-`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky apply` (and the `rocky run` alias) against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
+`--audit` adds an eight-field governance trail to each run record. Every `rocky apply` and `rocky run` records it. The default output leaves these fields out.
 
 | Field | Description |
 |-------|-------------|
@@ -148,8 +151,8 @@ The `RUN ID` column is truncated to 11 characters and the timestamp is rendered 
 | `git_branch` | Branch name at the project root (`None` when not a git repo). |
 | `idempotency_key` | Echoed value of `--idempotency-key` (`None` when the flag wasn't used). |
 | `target_catalog` | Resolved target catalog for the executed pipeline. |
-| `hostname` | Hostname where the run executed. Always populated (defaults to `"unknown"` on pre-v6 rows). |
-| `rocky_version` | `CARGO_PKG_VERSION` at run time. Always populated (`"<pre-audit>"` on pre-v6 rows). |
+| `hostname` | Hostname where the run executed. `"unknown"` on rows written before the audit trail existed. |
+| `rocky_version` | The engine version at run time. `"<pre-audit>"` on rows written before the audit trail existed. |
 
 ```bash
 rocky history --audit
@@ -1074,8 +1077,8 @@ When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::s
 
 Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
 
-:::note[Upgrading to v1.16.0 state paths]
-If you have an existing CWD `.rocky-state.redb`, move it into `models/` to silence the one-time deprecation warning, or keep it where it is (it still works).
+:::note[A legacy state file in the working directory]
+To silence the deprecation warning, move a `.rocky-state.redb` from the working directory into `models/`. Left where it is, it still works.
 :::
 
 ### Related Commands
@@ -1285,6 +1288,47 @@ Webhook spool: /srv/analytics/.rocky/pending-demands
 
 ---
 
+## `rocky tick`
+
+**Experimental.** Evaluate the schedule demand once and run what is due. Rocky reads each [`[pipeline.<name>.schedule]`](/reference/configuration/#pipelinenameschedule) block (`cron`, `after`, `freshness`), works out what is due now, and runs it, one `rocky run` child process at a time. There is no daemon. Drive it from an external timer such as a systemd timer, cron or CI.
+
+```bash
+rocky tick [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dry-run` | `bool` | `false` | Report what would run. Execute nothing and write no state. |
+| `--pipeline <NAME>` | `string` | (every scheduled pipeline) | Evaluate one pipeline only. |
+| `--now <RFC3339>` | `string` | the wall clock | Evaluate demand as of this instant, for tests and catch-up previews. It moves scheduling decisions only. It does not age files on disk, so it cannot expire the webhook dedup window. |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Nothing was due, or every run succeeded. Also when another `rocky` process holds the state store: the tick skips with a `state_busy` entry in `skipped[]`, and the next tick retries. |
+| `2` | At least one run failed or was partial. |
+| `1` | The tick could not proceed, for example an invalid config or a state store that does not open. |
+
+Exit `0` does not mean the estate is healthy. A pipeline in `failure_backoff` produces quiet exit-`0` ticks. Alert on the `skipped` reasons and on `consecutive_failures` in the JSON, not on the exit code alone.
+
+`rocky serve --scheduler` runs the same loop in process. Run one scheduler per project directory. [`rocky doctor --check scheduler`](/reference/commands/development/#rocky-doctor) reports a stuck or silent scheduler.
+
+### Examples
+
+```bash
+rocky tick --dry-run --output json
+```
+
+### Related Commands
+
+- [`rocky state schedule`](#rocky-state-schedule) -- pause or resume a pipeline's schedule
+- [`rocky serve`](/reference/commands/development/#rocky-serve) -- the resident scheduler (`--scheduler`)
+
+---
+
 ## `rocky compliance`
 
 Governance rollup over classification sidecars plus the project `[mask]` policy. Static resolver: answers *"are all classified columns masked wherever policy says they should be?"* without issuing a single warehouse call.
@@ -1299,7 +1343,7 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 |------|------|---------|-------------|
 | `--env <NAME>` | `string` | | Scope the report to a single environment. When unset, the report expands across the defaults plus every `[mask.<env>]` override block declared in `rocky.toml`. A named env that has no matching `[mask.<env>]` block still reports under that label; the resolver falls back to the `[mask]` defaults. |
 | `--exceptions-only` | `bool` | `false` | Filter `per_column` to rows that produced at least one exception. The `exceptions` list is unaffected; allow-listed tags are suppressed from `per_column` under this flag. |
-| `--fail-on <CONDITION>` | `exception` | | Gate condition. Only `exception` is supported in v1. When set, exits `1` when one or more exceptions are emitted. Useful as a CI gate that blocks merges that leave classified columns unmasked. |
+| `--fail-on <CONDITION>` | `exception` | | Gate condition. The only value is `exception`: exit `1` when any exception is emitted. Use it as a CI gate that blocks a merge that leaves a classified column unmasked. |
 | `--models <PATH>` | `string` | `models` | Models directory to scan for `[classification]` sidecars. |
 
 ### Behavior

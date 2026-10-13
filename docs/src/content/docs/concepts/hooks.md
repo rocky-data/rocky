@@ -124,7 +124,7 @@ The script receives JSON like:
 ```json
 {
   "event": "pipeline_complete",
-  "run_id": "run_20260402",
+  "run_id": "run-20260402-143000-000",
   "pipeline": "raw",
   "timestamp": "2026-04-02T14:30:00Z",
   "duration_ms": 45200,

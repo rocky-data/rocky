@@ -35,7 +35,7 @@ that have shown up since.
 ```
 .
 ├── README.md
-├── rocky.toml                 # Trivial replication pipeline (POCs require one)
+├── rocky.toml                 # Trivial replication pipeline (run.sh passes --models)
 ├── run.sh                     # Three-step demo: single partition → backfill → late correction
 ├── models/
 │   ├── fct_daily_orders.toml  # [strategy] type = "time_interval"
@@ -93,9 +93,9 @@ computed.
 
 ## How `time_interval` differs from `incremental`
 
-`incremental` here means a replication pipeline's watermarked copy. On a
-transformation model, `type = "incremental"` is refused at compile time
-(E037), because it has no watermark to apply.
+The table compares against a replication pipeline's watermarked copy. A
+transformation model can also use `type = "incremental"`, but it needs a
+`timestamp_column`. Without one, compile refuses it with E037.
 
 | Aspect | replication `strategy = "incremental"` | `[strategy] type = "time_interval"` |
 |---|---|---|

@@ -10,9 +10,9 @@
 
 ## What it shows
 
-Wave C-2 of the governance waveplan (engine-v1.16.0) gave every model
-sidecar a declarative `retention = "<N>[dy]"` key. The value is parsed
-once at project-load time into a typed `RetentionPolicy { duration_days: u32 }`.
+Every model sidecar can declare `retention = "<N>[dy]"`. Rocky parses the
+value once, at project-load time, into a typed
+`RetentionPolicy { duration_days: u32 }`.
 Grammar is strict (`30d`, `1y`; `-3d`, `90`, `abc` all reject with
 actionable diagnostics). Years are flat 365 days (`1y` → 365, no
 leap-year semantics, confirmed in `rocky-core::retention`).
@@ -45,8 +45,8 @@ compiled model set (no warehouse probe).
 
 `rocky run` on DuckDB resolves the governance adapter to
 `NoopGovernanceAdapter`. Its `apply_retention_policy` impl returns
-`Ok(())` unconditionally (see `rocky-core/src/traits.rs:1660-1670`): **no
-warning, no error, silently skipped.** The POC still exercises the
+`Ok(())` unconditionally (see `NoopGovernanceAdapter` in
+`rocky-core/src/traits.rs`): **no warning, no error, silently skipped.** The POC still exercises the
 full parse-and-wire path:
 
 1. `rocky validate` — confirms all three sidecars parse (a malformed
@@ -83,13 +83,14 @@ sidecar:
   Snowflake's edition-specific cap (Standard 90, Enterprise 365)
   enforces server-side, and Rocky surfaces any rejection.
 - **BigQuery / DuckDB.** No first-class time-travel retention knob at
-  the config level; the apply is a no-op (silent on DuckDB via
-  `NoopGovernanceAdapter`; the trait default would `warn!` but the
-  Databricks/Snowflake impls override it).
+  the config level. On DuckDB the apply is a silent no-op
+  (`NoopGovernanceAdapter`). An adapter that keeps the trait default
+  returns a "not supported" error, which the best-effort loop logs as a
+  warning. Databricks and Snowflake override it.
 
 Apply is **best-effort**: failures emit `warn!` and the pipeline
 continues, matching the semantics of `apply_grants` and the rest of
-the Wave C governance reconcile loop.
+the governance reconcile loop.
 
 ## Layout
 
@@ -137,7 +138,7 @@ JSON output (default `-o json`):
 
 ```json
 {
-  "version": "1.63.0",
+  "version": "1.80.0",
   "command": "retention-status",
   "models": [
     { "model": "ephemeral_summary", "in_sync": true },
@@ -151,9 +152,9 @@ Note: `configured_days` and `warehouse_days` use `skip_serializing_if`,
 so unset fields are omitted rather than emitted as explicit `null`.
 Consumers should treat missing keys as `null`.
 
-`in_sync` in v1 is a declaration check (`configured_days == warehouse_days`)
-where `warehouse_days` is always `None` (hence `true` only for
-unconfigured models, where both sides are `None`). The v2 `--drift`
-probe will populate `warehouse_days` from `SHOW TBLPROPERTIES`
-(Databricks) / `SHOW PARAMETERS` (Snowflake) and make `in_sync` a real
-drift signal.
+`in_sync` compares `configured_days` with `warehouse_days`. Without
+`--drift`, `warehouse_days` is always absent, so `in_sync` is `true` only
+for unconfigured models. With `--drift`, the Databricks and Snowflake
+governance adapters read the real value from the warehouse, and `in_sync`
+becomes a real drift signal. On DuckDB and BigQuery the probe returns
+nothing, so the result is the same as without `--drift`.

@@ -34,8 +34,8 @@ stitched together in a UI.
   after the fact.
 - **Replay handle on the same run.** `rocky replay latest` reads the
   same `RunRecord` (same SQL hashes, same timings, same model graph).
-  Re-execution with pinned inputs follows in the content-addressed
-  write path (in flight); the inspection surface is live today.
+  This POC uses the inspection view only. `rocky replay` also has a
+  read-only audit (`--check`) and re-execution (`--execute [--verify]`).
 
 ## Layout
 
@@ -49,7 +49,7 @@ stitched together in a UI.
 
 ## Prerequisites
 
-- `rocky` on PATH (≥ 1.31.0 for `rocky cost`)
+- `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
 
 ## Run
@@ -95,7 +95,8 @@ regardless of adapter.
 
 1. `data/seed.sql` materializes three `raw__<source>.<table>` tables.
 2. `rocky run` discovers all three via the `schema_pattern`, runs them
-   concurrently under AIMD throttle, and writes one `RunRecord` to
+   concurrently under adaptive concurrency (the default: it halves the
+   parallelism on a warehouse rate-limit signal), and writes one `RunRecord` to
    `.rocky-state.redb` with per-model SQL hashes, row counts, and
    timings.
 3. `rocky trace latest` reads that `RunRecord` and emits the timeline

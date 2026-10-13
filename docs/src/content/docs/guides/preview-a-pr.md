@@ -2,7 +2,7 @@
 title: Preview a PR Before Merging
 description: Use rocky preview to run only the models a PR changed, diff them against base, and see the cost difference. Locally today, in CI as a follow-up.
 sidebar:
-  order: 8
+  order: 6
 ---
 
 `rocky preview` runs only the models a PR's diff actually changes. It runs them against a per-PR branch schema and copies every other model from the base ref, rather than rebuilding it. It then reports a structural and row-level diff, plus the cost difference against base. This guide walks you through running it locally on a feature branch.
@@ -291,6 +291,7 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 | Output | Description |
 |---|---|
 | `comment_url` | HTML URL of the upserted PR comment. |
+| `body_path` | Path to the rendered Markdown body, for a trusted caller to stage. |
 | `prune_set_size` | Number of models in the prune set (changed + downstream-of-changed). |
 | `delta_usd` | Total branch-vs-base USD cost delta. Empty when no paired runs exist yet (e.g. first preview against an unpopulated base). |
 
