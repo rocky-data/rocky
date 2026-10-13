@@ -449,8 +449,10 @@ Rocky supports lifecycle hooks configured in `rocky.toml`. Hooks fire shell comm
 [hook.on_pipeline_start]
 command = "scripts/notify.sh"
 timeout_ms = 5000
-on_failure = "warn"  # or "abort" (stop the pipeline) or "ignore" (silent); "warn" is the default
+on_failure = "warn"  # or "abort" or "ignore" (silent); "warn" is the default
 ```
+
+`rocky run` ignores every hook outcome: each call site discards the result of `fire`, so a failing hook is logged and the run continues whatever `on_failure` says. Only `rocky hooks test` acts on `abort`. A hook cannot gate a run today.
 
 Implementation in `crates/rocky-core/src/hooks/` (mod.rs, webhook.rs, template.rs, presets.rs).
 

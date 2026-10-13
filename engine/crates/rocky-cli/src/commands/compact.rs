@@ -1517,7 +1517,7 @@ async fn prepare_compact_apply(
             "compact plan '{}' is in format v1, which is no longer supported \
              (this plan was written by Rocky < engine-v1.35.0). \
              Re-run `rocky compact` to write a fresh v2 plan. \
-             See https://docs.rocky-data.com/concepts/plan-store-v1-to-v2 \
+             See https://rocky-data.dev/advanced/upgrade-notes/#plan-store-v1-to-v2-engine-v1370 \
              for the migration guide.",
             plan_id,
         ),
