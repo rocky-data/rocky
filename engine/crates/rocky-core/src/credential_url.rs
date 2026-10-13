@@ -240,8 +240,9 @@ fn mask_userinfo(url: &mut Url) {
 /// The query and fragment are masked by an allow-list of what the clients
 /// read, so a value no client reads, secret or not, never reaches a plan:
 ///
-/// - query: the values of `db`, `user` and `protocol` on a Redis scheme are
-///   kept. Every other value is `***`; its key name stays.
+/// - query: `db`, `user` and `protocol` on a Redis scheme are kept. Every
+///   other pair is `***=***`, its key name too: a bare `?TOKEN` is a key with
+///   no value, and the key is the secret.
 /// - fragment: kept only when it is `insecure`, the one fragment the Redis
 ///   client reads (it turns TLS verification off). Any other is `***`.
 fn identity_form(mut url: Url) -> String {
@@ -253,7 +254,7 @@ fn identity_form(mut url: Url) -> String {
             if redis && KEPT_REDIS_QUERY_KEYS.contains(&key.as_ref()) {
                 masked.append_pair(&key, &value);
             } else {
-                masked.append_pair(&key, "***");
+                masked.append_pair("***", "***");
             }
         }
         url.set_query(Some(&masked.finish()));
@@ -429,6 +430,9 @@ mod tests {
             "redis://h:6379/0#TOKEN-SECRET",
             "redis://h/?auth=A-SECRET&key=K-SECRET&x-api-key=X-SECRET&sas_token=S-SECRET",
             "redis://TOKEN-SECRET:@h:6379",
+            // A bare key: the key itself is the secret.
+            "redis://h:6379/0?TOKEN-SECRET",
+            "az://c/p/?TOKEN-SECRET",
         ] {
             let identity = id(raw);
             assert!(!identity.contains("SECRET"), "{raw} -> {identity}");
