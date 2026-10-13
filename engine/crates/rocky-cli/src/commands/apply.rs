@@ -10258,7 +10258,7 @@ auto_create_schemas = true
         assert!(!text.contains("SECRET"), "{text}");
         assert!(!text.contains("blake3"), "{text}");
         assert!(
-            text.contains("rediss://default:***@valkey:6379/0?db=1&pass=***"),
+            text.contains("rediss://default:***@valkey:6379/0?db=1&***=***"),
             "{text}"
         );
     }

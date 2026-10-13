@@ -15885,21 +15885,19 @@ valkey_url = "rediss://:BREAKER_PW_SECRET@breaker.example:6379"
         let json = serde_json::to_string(adapter).unwrap();
         let digest_json =
             crate::env_string::with_env_values_scope(|| serde_json::to_string(adapter).unwrap());
-        for secret in [
+        // Test markers, not credentials: each must be absent from every form.
+        for marker in [
             "SAS_SECRET_TOKEN",
             "CACHE_PW_SECRET",
             "RATELIMIT_PW_SECRET",
             "STAMPEDE_PW_SECRET",
             "BREAKER_PW_SECRET",
         ] {
+            assert!(!debug.contains(marker), "{marker} leaked into Debug");
+            assert!(!json.contains(marker), "{marker} leaked into JSON");
             assert!(
-                !debug.contains(secret),
-                "{secret} leaked into Debug: {debug}"
-            );
-            assert!(!json.contains(secret), "{secret} leaked into JSON: {json}");
-            assert!(
-                !digest_json.contains(secret),
-                "{secret} leaked into the digested JSON: {digest_json}"
+                !digest_json.contains(marker),
+                "{marker} leaked into the digested JSON"
             );
         }
         for host in [
