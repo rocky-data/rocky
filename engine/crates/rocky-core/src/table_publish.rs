@@ -152,7 +152,7 @@ pub trait TablePointerBackend: Send + Sync {
 }
 
 /// Why a [`TablePointerBackend::move_table`] call did not report a move.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum TableMoveError {
     /// No commit was written. The table did not move.
     #[error("{0}")]
@@ -161,6 +161,14 @@ pub enum TableMoveError {
     /// example a timeout after the request was sent).
     #[error("{0}")]
     Unknown(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for TableMoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "TableMoveError", self)
+    }
 }
 
 impl From<TableMoveError> for TableMoveOutcome {
@@ -201,7 +209,7 @@ impl TablePublishReport {
 }
 
 /// Why a table publish did not record an outcome.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum TablePublishError {
     /// The begin step failed. No table was touched.
     #[error("table publish refused before any table moved: {0}")]
@@ -238,6 +246,14 @@ pub enum TablePublishError {
         /// What happened to each table.
         moves: Vec<TableMove>,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for TablePublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "TablePublishError", self)
+    }
 }
 
 /// A suggested fence spacing for a large publish on a remote state store,
@@ -1166,5 +1182,35 @@ mod tests {
         );
         let head = store.get_environment(&env()).unwrap().unwrap();
         assert_eq!(head.pointers["a"], winner.finished.to["a"]);
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn table_move_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "table-move-1919-bb02";
+        rocky_core::secret_registry::register_substitution("RV_TABLE_MOVE_DBG", SECRET);
+        let err = TableMoveError::NotMoved(format!("PUT https://{SECRET}/commit failed"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_TABLE_MOVE_DBG}"), "{debug}");
+    }
+
+    #[test]
+    fn table_publish_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "table-pub-1919-cc03";
+        rocky_core::secret_registry::register_substitution("RV_TABLE_PUB_DBG", SECRET);
+        let err = TablePublishError::Fenced {
+            started: "p1".into(),
+            head: Some(SECRET.into()),
+            moves: Vec::new(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_TABLE_PUB_DBG}"), "{debug}");
     }
 }

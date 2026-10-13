@@ -146,7 +146,7 @@ pub struct ActiveMarkerFreeze {
 }
 
 /// Errors from the marker write path.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum FreezeMarkerError {
     /// Transport / backend failure.
     #[error("object store error: {0}")]
@@ -164,6 +164,14 @@ pub enum FreezeMarkerError {
          re-run the command to mint a fresh id"
     )]
     IdCollision { key: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for FreezeMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "FreezeMarkerError", self)
+    }
 }
 
 /// Project the active freeze set: `{all freeze ids} − {ids referenced by any
@@ -627,5 +635,23 @@ mod tests {
         assert_eq!(active_ids(&active), vec!["key-stem"]);
         assert_eq!(active[0].principal, None, "None = matches BOTH principals");
         assert_eq!(active[0].scope, "any");
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn freeze_marker_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "marker-key-1919-6a0d";
+        rocky_core::secret_registry::register_substitution("RV_FREEZE_MARKER_DBG", SECRET);
+        let err = FreezeMarkerError::IdCollision {
+            key: format!("{SECRET}/freeze/1.json"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_FREEZE_MARKER_DBG}"), "{debug}");
     }
 }

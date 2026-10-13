@@ -171,7 +171,7 @@ pub enum ProposeOutcome {
 /// already distinguishes; the mcp layer maps them back onto its existing
 /// envelopes with the exact same wording, so extracting the helper is
 /// wire-neutral. No MCP error types enter this crate.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ProposeError {
     /// The project did not compile; carries the compile error chain.
     #[error("compile failed: {0}")]
@@ -204,6 +204,14 @@ pub enum ProposeError {
     /// Persisting the gated plan failed.
     #[error("failed to write AI-authored plan: {0}")]
     PlanWrite(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ProposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ProposeError", self)
+    }
 }
 
 /// Everything a governed propose needs, resolved by the caller.
@@ -1951,5 +1959,21 @@ mod tests {
             "an unloadable config is a warehouse failure — reporting it as custody would \
              print a remedy that cannot fix it: {broken}"
         );
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn propose_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "propose-cfg-1919-bf12";
+        rocky_core::secret_registry::register_substitution("RV_PROPOSE_ERR_DBG", SECRET);
+        let err = ProposeError::PolicyUnreadable(format!("bad host {SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_PROPOSE_ERR_DBG}"), "{debug}");
     }
 }

@@ -392,7 +392,7 @@ pub struct TickReport {
 }
 
 /// A fault that fails the whole tick closed — it runs nothing.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum TickError {
     /// A state-store read or write failed.
     #[error("state store error during tick: {0}")]
@@ -413,6 +413,14 @@ pub enum TickError {
     /// The per-demand loop exceeded its defensive bound — a state-machine bug.
     #[error("reconciler loop bound exceeded for demand {0}")]
     LoopBound(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for TickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "TickError", self)
+    }
 }
 
 /// Evaluate all standing demand once and execute what is due.
@@ -4357,5 +4365,21 @@ adapter = "db"
                 .is_empty(),
             "the affix-shaped demand was consumed"
         );
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn tick_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "tick-cycle-1919-7b0e";
+        rocky_core::secret_registry::register_substitution("RV_TICK_ERR_DBG", SECRET);
+        let err = TickError::Cycle(format!("a -> {SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_TICK_ERR_DBG}"), "{debug}");
     }
 }

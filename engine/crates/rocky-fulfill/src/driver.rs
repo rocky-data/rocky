@@ -170,7 +170,7 @@ pub enum DriverOutcome {
 }
 
 /// A typed driver failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum DriverError {
     /// No supervised driver exists for this platform (Windows in v0).
     #[error("unsupported driver platform: no process-group supervision exists here in v0")]
@@ -214,6 +214,14 @@ pub enum DriverError {
         /// Detail for the operator.
         detail: String,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for DriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "DriverError", self)
+    }
 }
 
 /// A live process group's identity, for the store's takeover stamp.
@@ -2186,5 +2194,21 @@ mod worker_state_path_tests {
             let expected: Vec<OsString> = recorded.into_iter().map(Into::into).collect();
             assert_eq!(out, expected);
         }
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn driver_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "driver-cmd-1919-0417";
+        rocky_core::secret_registry::register_substitution("RV_DRIVER_ERR_DBG", SECRET);
+        let err = DriverError::Spawn(format!("no such file {SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DRIVER_ERR_DBG}"), "{debug}");
     }
 }

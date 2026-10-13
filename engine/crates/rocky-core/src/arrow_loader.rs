@@ -43,7 +43,7 @@ use crate::traits::SqlDialect;
 // ---------------------------------------------------------------------------
 
 /// Errors from batch CSV reading and SQL generation.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BatchLoaderError {
     #[error("failed to open CSV file {path}: {source}")]
     OpenFile { path: String, source: csv::Error },
@@ -59,6 +59,14 @@ pub enum BatchLoaderError {
 
     #[error("invalid column name in CSV header: {0}")]
     InvalidColumnName(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for BatchLoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "BatchLoaderError", self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -975,5 +983,21 @@ mod tests {
         assert!(sql.contains("(1, 'Alice', 95.5)"));
         assert!(sql.contains("(2, 'Bob', 87.0)"));
         assert!(sql.contains("(3, 'Carol', NULL)"));
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn batch_loader_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "csv-path-1919-1b08";
+        rocky_core::secret_registry::register_substitution("RV_BATCH_LOADER_DBG", SECRET);
+        let err = BatchLoaderError::NoHeader(format!("/data/{SECRET}.csv"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_BATCH_LOADER_DBG}"), "{debug}");
     }
 }

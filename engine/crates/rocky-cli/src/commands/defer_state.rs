@@ -35,7 +35,7 @@ pub struct DeferStateSource {
 }
 
 /// Why `--defer-to-state` refused to resolve a deferred upstream.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum DeferStateError {
     /// No state store exists at the path.
     #[error("--defer-to-state: no state store at {path}")]
@@ -98,6 +98,14 @@ pub enum DeferStateError {
         upstream: String,
         scope: String,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for DeferStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "DeferStateError", self)
+    }
 }
 
 /// One resolved deferred upstream.
@@ -560,5 +568,23 @@ pub(crate) mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn defer_state_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "defer-path-1919-8c0f";
+        rocky_core::secret_registry::register_substitution("RV_DEFER_STATE_DBG", SECRET);
+        let err = DeferStateError::StateNotFound {
+            path: format!("/s/{SECRET}.redb"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DEFER_STATE_DBG}"), "{debug}");
     }
 }
