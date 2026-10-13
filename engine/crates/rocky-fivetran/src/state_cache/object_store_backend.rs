@@ -65,6 +65,9 @@ pub struct ObjectStoreCache {
     /// URL scheme tag for `Debug` output and log messages — keeps the
     /// raw bucket / credentials out of any log line.
     scheme: String,
+    /// The URL the store was built from, kept only to scrub its secrets out
+    /// of a runtime error (#2339). `None` for [`Self::from_parts`].
+    credential: Option<rocky_core::credential_url::CredentialUrl>,
 }
 
 impl std::fmt::Debug for ObjectStoreCache {
@@ -104,6 +107,7 @@ impl ObjectStoreCache {
             store: Arc::from(store),
             prefix,
             scheme,
+            credential: Some(credential),
         })
     }
 
@@ -120,6 +124,17 @@ impl ObjectStoreCache {
             store,
             prefix,
             scheme: scheme.to_string(),
+            credential: None,
+        }
+    }
+
+    /// A runtime `object_store` error, with the store URL's secrets
+    /// scrubbed out of its text: a client error can echo the request URL,
+    /// which starts with the configured one (#2339).
+    fn store_error(&self, e: object_store::Error) -> CacheError {
+        match &self.credential {
+            Some(credential) => CacheError::ObjectStoreRemote(credential.scrub(&e.to_string())),
+            None => CacheError::ObjectStore(e),
         }
     }
 
@@ -167,9 +182,9 @@ impl FivetranStateCache for ObjectStoreCache {
         let result = match self.store.get(&path).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(CacheError::ObjectStore(e)),
+            Err(e) => return Err(self.store_error(e)),
         };
-        let bytes = result.bytes().await?;
+        let bytes = result.bytes().await.map_err(|e| self.store_error(e))?;
         let envelope: FivetranStateEnvelope = serde_json::from_slice(&bytes)?;
         Ok(Some(envelope))
     }
@@ -212,10 +227,13 @@ impl FivetranStateCache for ObjectStoreCache {
             Err(object_store::Error::NotFound { .. }) => {
                 // No prior object — fall through to unconditional PUT.
             }
-            Err(e) => return Err(CacheError::ObjectStore(e)),
+            Err(e) => return Err(self.store_error(e)),
         }
 
-        self.store.put(&path, Bytes::from(bytes).into()).await?;
+        self.store
+            .put(&path, Bytes::from(bytes).into())
+            .await
+            .map_err(|e| self.store_error(e))?;
         Ok(WriteOutcome::Written)
     }
 
@@ -227,6 +245,20 @@ impl FivetranStateCache for ObjectStoreCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2339: a runtime error that echoes the store URL must not carry its
+    /// secrets out.
+    #[test]
+    fn a_runtime_store_error_holds_no_secret() {
+        let cache = ObjectStoreCache::from_url("memory:///p/?sig=SIG-SECRET").unwrap();
+        let echo = object_store::Error::Generic {
+            store: "test",
+            source: "request to memory:///p/?sig=SIG-SECRET failed (SIG-SECRET)".into(),
+        };
+        let text = cache.store_error(echo).to_string();
+        assert!(text.contains("failed"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
 
     /// #2339: `object_store` echoes the URL it cannot recognise, so the
     /// error must not carry the URL's secrets back out.

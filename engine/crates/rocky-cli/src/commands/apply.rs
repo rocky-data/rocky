@@ -10233,9 +10233,34 @@ auto_create_schemas = true
                 "az://container-a@account.dfs.core.windows.net/p",
                 "az://container-b@account.dfs.core.windows.net/p",
             ),
+            ("redis://h/?keyspace=a", "redis://h/?keyspace=b"),
         ] {
             assert_ne!(identity(a), identity(b), "{a} and {b} must differ");
         }
+    }
+
+    /// #2339: the plan's config snapshot is written to disk in plaintext, so
+    /// a Fivetran URL's password, secret query values and a token put where
+    /// the user name goes must not be in it, not even as a digest.
+    #[test]
+    fn plan_config_snapshot_holds_no_url_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\napi_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\n\n[adapter.ft.cache]\nbackend = \"tiered\"\nvalkey_url = \"rediss://default:PW_SECRET@valkey:6379/0?db=1&pass=PASS_SECRET\"\nobject_store_url = \"az://c/p/?sv=2024&sig=SIG_SECRET\"\n\n[adapter.ft.circuit_breaker]\nbackend = \"valkey\"\nvalkey_url = \"redis://TOKEN_SECRET@breaker:6379\"\n\n[adapter.default]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+        let (snapshot, _) =
+            crate::commands::plan::config_snapshot_forms(dir.path(), &cfg, true).unwrap();
+        let text = snapshot.to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("blake3"), "{text}");
+        assert!(
+            text.contains("rediss://default:***@valkey:6379/0?db=1&pass=***"),
+            "{text}"
+        );
     }
 
     #[test]

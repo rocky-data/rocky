@@ -105,6 +105,11 @@ pub enum CacheError {
     #[error("cache object-store: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ObjectStore(#[from] object_store::Error),
 
+    /// Object-store backend failure, its text scrubbed of the store URL's
+    /// secrets (#2339).
+    #[error("cache object-store: {}", rocky_core::secret_registry::render_placeholders(.0))]
+    ObjectStoreRemote(String),
+
     /// Object-store URL parsing failure (e.g. unsupported scheme).
     #[error("cache object-store URL: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ObjectStoreUrl(String),

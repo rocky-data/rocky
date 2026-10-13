@@ -13,35 +13,43 @@
 //! builds two forms without the secret:
 //!
 //! ```text
-//!   identity   redis://default:***@valkey:6379/0?db=1#insecure
-//!              secret query values masked, every other part kept
+//!   identity   redis://default:***@valkey:6379/0?db=1&pass=***#insecure
+//!              the password and the values of secret query keys masked
 //!   shown      redis://default:***@valkey:6379/0?***#***
 //!              the whole query and fragment hidden as well
 //! ```
 //!
 //! The **identity** is what the plan config identity (`config_policy_identity`
-//! in `rocky-cli`) hashes. It keeps the scheme, user name, host, port, path,
-//! the non-secret query (`?db=`, a unix-socket setting) and the fragment
-//! (`#insecure` turns TLS verification off), because each of them changes
-//! which server is used or how. Only the password and the values of secret
-//! query keys are `***`, so a rotated password does not refuse a plan, as
-//! for every other credential.
+//! in `rocky-cli`) hashes and what a plan's config snapshot stores. It keeps
+//! the scheme, user name, host, port, path, the query (`?db=`, a unix-socket
+//! setting) and the fragment (`#insecure` turns TLS verification off),
+//! because each of them can change which server is used or how. It masks:
 //!
-//! ## Fail closed
+//! - the password, so a rotated password does not refuse a plan, as for
+//!   every other credential;
+//! - the value of each query key in an exact list of secret names
+//!   (`password`, `pass`, `token`, `sig`, the Azure SAS and AWS presign
+//!   keys). Matching is exact, so `?keyspace=` or `?passive=` stay;
+//! - a user name with no password, except for the Azure schemes, where it
+//!   names the container. Without a password the Redis client never sends a
+//!   user name, so it can only be a misplaced token.
 //!
-//! The URL is parsed with the `url` crate, so a userinfo is read from the
-//! authority only. When the URL does not parse, or an `@` is not the one
-//! userinfo delimiter (two of them, or one in a path or query), the split is
-//! a guess. The identity is then a digest of the whole URL: a password change
-//! refuses the plan, which is the safe direction. The shown form then hides
-//! everything before the last `@` as well.
+//! Every other value is kept as written, like an
+//! [`crate::env_string::EnvString`] field: a resolved `${VAR}` value prints
+//! as `${NAME}` in the stored snapshot.
+//!
+//! The URL is parsed with the `url` crate, the parser the Redis client and
+//! `object_store` use, so the userinfo split is the one the client sees. A
+//! URL it cannot parse is one no client can connect with. Its identity is
+//! the shown form, marked `unparseable-url`, and holds no secret.
 //!
 //! ## Serialization
 //!
 //! - Default: the shown form, with each resolved `${VAR}` value in it written
 //!   as `${NAME}`, as [`crate::env_string::EnvString`] does.
 //! - Inside [`crate::env_string::with_env_values_scope`]: the identity form,
-//!   with the resolved values. Only ever hashed, never printed.
+//!   with the resolved values. Hashed, and stored in a plan's config snapshot
+//!   after `${NAME}` rendering, so it must never hold a password.
 //! - Inside [`crate::redacted::with_unredacted_scope`]: the full URL.
 //!
 //! `Deserialize` reads a plain string, so `rocky.toml` and `${VAR}` work as
@@ -93,17 +101,14 @@ impl CredentialUrl {
         self.0.is_empty()
     }
 
-    /// The form the config identity hashes. Holds no secret, but holds every
-    /// part that selects the server or how to reach it. Never print it: it may
-    /// hold a resolved `${VAR}` value, and for a URL that does not parse it is
-    /// a digest of the whole URL.
+    /// The form the config identity hashes and a plan stores. Holds no
+    /// password and no value of a secret query key, but every other part
+    /// that can select the server. Print [`Self::rendered`] instead: it may
+    /// hold a resolved `${VAR}` value.
     pub fn identity(&self) -> String {
-        match parse_unambiguous(&self.0) {
+        match parse(&self.0) {
             Some(url) => identity_form(url),
-            None => format!(
-                "unparsed-url:blake3:{}",
-                blake3::hash(format!("rocky.credential_url.v1\0{}", self.0).as_bytes()).to_hex()
-            ),
+            None => format!("unparseable-url {}", shown_textual(&self.0)),
         }
     }
 
@@ -111,7 +116,7 @@ impl CredentialUrl {
     /// query and the fragment. May hold a resolved `${VAR}` value, so print
     /// [`Self::rendered`].
     fn shown(&self) -> String {
-        match parse_unambiguous(&self.0) {
+        match parse(&self.0) {
             Some(url) => shown_form(url),
             None => shown_textual(&self.0),
         }
@@ -133,22 +138,29 @@ impl CredentialUrl {
         let shown = self.rendered();
         let mut out = text.replace(&self.0, &shown);
         let mut secrets: Vec<String> = Vec::new();
-        match Url::parse(&self.0) {
-            Ok(url) => {
+        match parse(&self.0) {
+            Some(url) => {
                 out = out.replace(url.as_str(), &shown);
                 if let Some(password) = url.password() {
                     secrets.push(password.to_string());
                     secrets.push(percent_decode(password));
                 }
+                if masks_user_name(&url) {
+                    secrets.push(url.username().to_string());
+                    secrets.push(percent_decode(url.username()));
+                }
                 for part in [url.query(), url.fragment()].into_iter().flatten() {
                     secrets.push(part.to_string());
                     secrets.push(percent_decode(part));
-                    for (_, value) in url::form_urlencoded::parse(part.as_bytes()) {
-                        secrets.push(value.into_owned());
+                    for pair in part.split('&') {
+                        // The value as written (`abc%2Bxyz`) and decoded.
+                        let raw_value = pair.split_once('=').map_or(pair, |(_, v)| v);
+                        secrets.push(raw_value.to_string());
+                        secrets.push(percent_decode(raw_value));
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 // No reliable split: hide everything before the last `@` and
                 // after the first `?` or `#`.
                 if let Some(index) = self.0.rfind('@') {
@@ -169,29 +181,39 @@ impl CredentialUrl {
     }
 }
 
-/// The URL parsed, when its userinfo split is certain.
-///
-/// Certain means: it parses, and every `@` in it is the one userinfo
-/// delimiter. With no `@` there is no userinfo. With one `@`, the parse must
-/// have read a user name or a password before it; if not, the `@` sits in a
-/// path, query or fragment, where another reader could split it differently.
-/// Two or more `@` are never certain (an unencoded `@` in a password, or one
-/// in a query such as `?client_name=a@b`).
-fn parse_unambiguous(raw: &str) -> Option<Url> {
-    let url = Url::parse(raw).ok()?;
-    match raw.matches('@').count() {
-        0 => Some(url),
-        1 if !url.username().is_empty() || url.password().is_some() => Some(url),
-        _ => None,
+/// The URL as the Redis client and `object_store` parse it, or `None` when
+/// it has no authority (`user:pw@host:6379` parses as the scheme `user`
+/// and an opaque path). Neither client connects with such a URL, and its
+/// userinfo split is a guess, so it takes the textual fallback.
+fn parse(raw: &str) -> Option<Url> {
+    Url::parse(raw).ok().filter(|url| !url.cannot_be_a_base())
+}
+
+/// The Azure schemes `object_store` accepts. Their user name is the
+/// container (`az://container@account.dfs.core.windows.net/path`).
+const AZURE_SCHEMES: &[&str] = &["az", "adl", "azure", "abfs", "abfss"];
+
+/// Whether the user name is masked: it is set, there is no password, and the
+/// scheme is not an Azure one. Without a password the Redis client never
+/// sends a user name (`AUTH` and `HELLO ... AUTH` need the password), so a
+/// lone user name selects nothing and can only be a misplaced token.
+fn masks_user_name(url: &Url) -> bool {
+    !url.username().is_empty() && url.password().is_none() && !AZURE_SCHEMES.contains(&url.scheme())
+}
+
+/// The password and a lone user name become `***`.
+fn mask_userinfo(url: &mut Url) {
+    // Neither setter can fail: a URL with a userinfo has a host.
+    if url.password().is_some() {
+        let _ = url.set_password(Some("***"));
+    } else if masks_user_name(url) {
+        let _ = url.set_username("***");
     }
 }
 
-/// [`CredentialUrl::identity`] for a URL whose split is certain.
+/// [`CredentialUrl::identity`] for a URL that parses.
 fn identity_form(mut url: Url) -> String {
-    if url.password().is_some() {
-        // Cannot fail: a URL with a password has a host.
-        let _ = url.set_password(Some("***"));
-    }
+    mask_userinfo(&mut url);
     if let Some(query) = url.query().map(str::to_string) {
         let mut masked = url::form_urlencoded::Serializer::new(String::new());
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
@@ -206,11 +228,9 @@ fn identity_form(mut url: Url) -> String {
     url.to_string()
 }
 
-/// [`CredentialUrl::shown`] for a URL whose split is certain.
+/// [`CredentialUrl::shown`] for a URL that parses.
 fn shown_form(mut url: Url) -> String {
-    if url.password().is_some() {
-        let _ = url.set_password(Some("***"));
-    }
+    mask_userinfo(&mut url);
     if url.query().is_some() {
         url.set_query(Some("***"));
     }
@@ -220,9 +240,9 @@ fn shown_form(mut url: Url) -> String {
     url.to_string()
 }
 
-/// [`CredentialUrl::shown`] for a URL whose split is a guess. Hides
-/// everything that could be a userinfo (up to the LAST `@`) and everything
-/// from the first `?` or `#`. It hides more than it must, never less.
+/// [`CredentialUrl::shown`] for a URL that does not parse. Hides everything
+/// that could be a userinfo (up to the LAST `@`) and everything from the
+/// first `?` or `#`. It hides more than it must, never less.
 fn shown_textual(raw: &str) -> String {
     let route_start = raw.find(['/', '?', '#']);
     let (scheme, rest) = match raw.find("://") {
@@ -242,23 +262,52 @@ fn shown_textual(raw: &str) -> String {
     format!("{scheme}{userinfo}{location}{extra}")
 }
 
-/// Whether a query key can hold a secret. Errs toward yes: a masked
-/// non-secret only means two values of it hash the same.
+/// Whether a query key holds a secret: an exact, case-insensitive match on a
+/// known secret name. Exact, because a masked key means a change to it does
+/// not refuse a plan, so `?keyspace=` or `?bypass=` must stay.
 ///
-/// Covers passwords (`password`, `pass`, `pwd`), tokens and keys (`auth`,
-/// `token`, `secret`, `key`, `credential`, `session`), signatures (`sig`) and
-/// every Azure SAS field, since a SAS token is one credential spread over
-/// several keys.
+/// Covers passwords, tokens and API keys, signatures, every Azure SAS field
+/// (a SAS token is one credential spread over several keys) and the AWS
+/// presigned-URL credential keys.
 fn is_secret_query_key(key: &str) -> bool {
-    const FRAGMENTS: &[&str] = &[
-        "pass", "pwd", "auth", "token", "secret", "sig", "key", "cred", "session",
+    const SECRET_KEYS: &[&str] = &[
+        "password",
+        "pass",
+        "pwd",
+        "passwd",
+        "token",
+        "access_token",
+        "auth_token",
+        "api_key",
+        "apikey",
+        "secret",
+        "client_secret",
+        "sig",
+        "signature",
+        // Azure SAS.
+        "sv",
+        "ss",
+        "srt",
+        "sp",
+        "se",
+        "st",
+        "spr",
+        "sr",
+        "skoid",
+        "sktid",
+        "skt",
+        "ske",
+        "sks",
+        "skv",
+        "sdd",
+        "sip",
+        "si",
+        // AWS presigned URL.
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
     ];
-    const SAS_KEYS: &[&str] = &[
-        "sv", "ss", "srt", "sp", "se", "st", "spr", "sr", "si", "sdd", "skoid", "sktid", "skt",
-        "ske", "sks", "skv", "saoid", "suoid", "scid",
-    ];
-    let key = key.to_ascii_lowercase();
-    FRAGMENTS.iter().any(|f| key.contains(f)) || SAS_KEYS.contains(&key.as_str())
+    SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str())
 }
 
 fn percent_decode(text: &str) -> String {
@@ -346,10 +395,10 @@ mod tests {
                 "rediss://default:pw-SECRET@host:6379/2",
                 "rediss://default:***@host:6379/2",
             ),
-            // Ambiguous: an unencoded `@` and `/` in the password.
+            // The split the client sees: the authority ends at the first `/`.
             (
                 "redis://u:p@s/s?w-SECRET@host:6379",
-                "redis://***@host:6379",
+                "redis://u:***@s/s?***",
             ),
             (
                 "redis+unix:///run/v.sock?pass=pw-SECRET",
@@ -361,7 +410,9 @@ mod tests {
                 "az://container@account.dfs.core.windows.net/path",
                 "az://container@account.dfs.core.windows.net/path",
             ),
-            // Not a URL the parser accepts as one: the textual fallback.
+            // A token put where the user name goes.
+            ("redis://TOKEN-SECRET@host:6379", "redis://***@host:6379"),
+            // Not a URL the parser accepts: the textual fallback.
             ("user:pw-SECRET@host:6379", "***@host:6379"),
             ("", ""),
         ];
@@ -369,18 +420,32 @@ mod tests {
             let url = CredentialUrl::from(raw);
             assert_eq!(url.to_string(), shown, "for {raw}");
             assert!(!format!("{url:?}").contains("SECRET"), "for {raw}");
-            // The identity keeps the fragment whole (`#insecure` changes the
-            // TLS mode). A secret put there is hashed by value, so rotating it
-            // refuses a plan: the safe direction. It is never printed.
-            if !raw.contains('#') {
-                assert!(!url.identity().contains("SECRET"), "for {raw}");
-            }
             assert_eq!(url.expose(), raw);
         }
     }
 
-    /// Each pair names a different server, database or TLS mode, so the two
-    /// identities must differ.
+    /// What a plan stores: never a password, a secret query value or a lone
+    /// user name, and never a digest of one.
+    #[test]
+    fn the_identity_holds_no_secret() {
+        for raw in [
+            "redis://:pw-SECRET@host:6379",
+            "rediss://default:pw-SECRET@host:6379/2",
+            "redis://TOKEN-SECRET@host:6379",
+            "redis+unix:///run/v.sock?db=1&pass=pw-SECRET",
+            "az://c/p/?sv=2024&sig=SIG-SECRET",
+            "https://h/p?X-Amz-Signature=SIG-SECRET&X-Amz-Credential=CRED-SECRET",
+            "redis://u:p@ss-SECRET@h:6379",
+            "user:pw-SECRET@host:6379",
+        ] {
+            let identity = id(raw);
+            assert!(!identity.contains("SECRET"), "{raw} -> {identity}");
+            assert!(!identity.contains("blake3"), "{raw} -> {identity}");
+        }
+    }
+
+    /// Each pair names a different server, database, TLS mode, container or
+    /// client setting, so the two identities must differ.
     #[test]
     fn the_identity_keeps_every_part_that_selects_the_server() {
         let pairs = [
@@ -396,6 +461,16 @@ mod tests {
             ),
             ("redis://:pw@valkey-a:6379/0", "redis://:pw@valkey-b:6379/0"),
             ("redis://:pw@h:6379/0", "redis://:pw@h:6379/1"),
+            ("redis://user-a:pw@h:6379", "redis://user-b:pw@h:6379"),
+            // Keys whose names merely contain a secret word.
+            (
+                "redis://h/?ssl_keyfile=/a.key",
+                "redis://h/?ssl_keyfile=/b.key",
+            ),
+            ("redis://h/?keyspace=a", "redis://h/?keyspace=b"),
+            ("redis://h/?sessionid=1", "redis://h/?sessionid=2"),
+            ("redis://h/?bypass=on", "redis://h/?bypass=off"),
+            ("redis://h/?passive=0", "redis://h/?passive=1"),
         ];
         for (a, b) in pairs {
             assert_ne!(id(a), id(b), "{a} and {b} must differ");
@@ -403,7 +478,7 @@ mod tests {
     }
 
     /// A password change, wherever the password sits, must not move the
-    /// identity when the split is certain.
+    /// identity.
     #[test]
     fn the_identity_ignores_a_rotated_secret() {
         let pairs = [
@@ -419,21 +494,14 @@ mod tests {
                 "az://c/p/?sv=2024&se=2026-01-01&sig=SIG-A",
                 "az://c/p/?sv=2025&se=2027-01-01&sig=SIG-B",
             ),
+            // An unencoded `@` in the password: the client reads it as part of
+            // the password too.
+            ("redis://u:p@ss-A@h:6379", "redis://u:p@ss-B@h:6379"),
+            ("redis://TOKEN-A@h:6379", "redis://TOKEN-B@h:6379"),
         ];
         for (a, b) in pairs {
             assert_eq!(id(a), id(b), "{a} and {b} must agree");
         }
-    }
-
-    /// When the split is a guess, a password change refuses (the identity
-    /// is a digest of the whole URL), and nothing of the URL is readable.
-    #[test]
-    fn an_ambiguous_url_fails_closed() {
-        let a = id("redis://u:p@ss-A@h:6379");
-        let b = id("redis://u:p@ss-B@h:6379");
-        assert_ne!(a, b);
-        assert!(a.starts_with("unparsed-url:blake3:"), "{a}");
-        assert!(!a.contains("ss-A"));
     }
 
     #[test]
@@ -467,11 +535,12 @@ mod tests {
 
     #[test]
     fn scrub_removes_every_secret_an_error_can_echo() {
-        let raw = "foo://user:PW%2FSECRET@h/p?sig=SIG-SECRET#FRAG-SECRET";
+        let raw = "foo://user:PW%2FSECRET@h/p?sig=SIG%2BSECRET#FRAG-SECRET";
         let url = CredentialUrl::from(raw);
         let parsed = Url::parse(raw).unwrap();
         let text = format!(
-            "raw {raw} | parsed \"{parsed}\" | prefix {} | decoded PW/SECRET | value SIG-SECRET",
+            "raw {raw} | parsed \"{parsed}\" | prefix {} | decoded PW/SECRET \
+             | value SIG+SECRET | encoded SIG%2BSECRET",
             &parsed[..url::Position::BeforePath]
         );
         let scrubbed = url.scrub(&text);
@@ -480,6 +549,13 @@ mod tests {
             scrubbed.contains("foo://user:***@h/p?***#***"),
             "{scrubbed}"
         );
+    }
+
+    #[test]
+    fn scrub_removes_a_token_used_as_the_user_name() {
+        let url = CredentialUrl::from("redis://TOKEN-SECRET@h:6379");
+        let scrubbed = url.scrub("auth failed for TOKEN-SECRET at redis://TOKEN-SECRET@h:6379");
+        assert!(!scrubbed.contains("SECRET"), "{scrubbed}");
     }
 
     #[test]
