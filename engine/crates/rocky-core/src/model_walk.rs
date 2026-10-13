@@ -24,7 +24,7 @@ pub const MAX_MODELS_TREE_DEPTH: usize = 64;
 /// Never silently dropped: a caller that ignores these reintroduces the
 /// silent-drop family one seam over. Strict callers fail on the first one;
 /// tolerant callers surface them beside the partial result.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ModelWalkError {
     #[error("failed to read models directory {dir}: {source}")]
     ReadDir {
@@ -55,6 +55,14 @@ pub enum ModelWalkError {
          say what it pointed at; repair or remove it"
     )]
     UnresolvedEntry { path: PathBuf, detail: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ModelWalkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ModelWalkError", self)
+    }
 }
 
 /// Every directory of the models tree under `root`, pre-order.
@@ -383,5 +391,24 @@ mod tests {
         );
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(matches!(errors[0], ModelWalkError::DepthCeiling { .. }));
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn model_walk_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "walk-dir-1919-5f0c";
+        rocky_core::secret_registry::register_substitution("RV_MODEL_WALK_DBG", SECRET);
+        let err = ModelWalkError::DepthCeiling {
+            dir: std::path::PathBuf::from(format!("/models/{SECRET}")),
+            limit: 3,
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_MODEL_WALK_DBG}"), "{debug}");
     }
 }

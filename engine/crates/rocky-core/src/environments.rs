@@ -381,7 +381,7 @@ pub struct PublishRequest {
 }
 
 /// Why a model cannot be published.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum PublishRefusal {
     /// The named run is not in run history (never recorded, or swept).
     #[error("run {run_id:?} is not in run history")]
@@ -452,8 +452,16 @@ pub enum PublishRefusal {
     },
 }
 
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "PublishRefusal", self)
+    }
+}
+
 /// A publish or environment request that is wrong in itself.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Clone, PartialEq, Eq, Error)]
 pub enum EnvironmentError {
     /// The environment name breaks the grammar.
     #[error(
@@ -494,6 +502,14 @@ pub enum EnvironmentError {
     /// The outcome does not match the publish it closes.
     #[error("table publish {publish_id:?} cannot be finished: {reason}")]
     FinishMismatch { publish_id: String, reason: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for EnvironmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "EnvironmentError", self)
+    }
 }
 
 /// Resolve one source against the run's recorded executions. Pure, so the
@@ -837,5 +853,36 @@ mod tests {
             r#"{"outcome":"sync_failed","table":"c.s.orders","table_version":4,"committed":false,"error":"x"}"#
         );
         assert!(sync_failed.serves_version() && !sync_failed.is_fully_served());
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn publish_refusal_debug_renders_a_resolved_value() {
+        const SECRET: &str = "pub-refusal-1919-dd04";
+        rocky_core::secret_registry::register_substitution("RV_PUB_REFUSAL_DBG", SECRET);
+        let err = PublishRefusal::BackendRefused {
+            reason: format!("catalog {SECRET} refused"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_PUB_REFUSAL_DBG}"), "{debug}");
+    }
+
+    #[test]
+    fn environment_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "env-error-1919-ee05";
+        rocky_core::secret_registry::register_substitution("RV_ENV_ERR_DBG", SECRET);
+        let err = EnvironmentError::FinishMismatch {
+            publish_id: "p1".into(),
+            reason: format!("table {SECRET} differs"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_ENV_ERR_DBG}"), "{debug}");
     }
 }

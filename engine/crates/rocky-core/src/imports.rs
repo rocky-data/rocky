@@ -18,7 +18,7 @@ use rocky_ir::ProjectIr;
 use thiserror::Error;
 
 /// Errors that can occur loading or verifying an imported snapshot.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ImportsError {
     /// The snapshot file could not be read.
     #[error("failed to read import snapshot '{path}': {source}")]
@@ -53,6 +53,14 @@ pub enum ImportsError {
         found: u64,
         max_supported: u32,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ImportsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ImportsError", self)
+    }
 }
 
 /// Current on-disk format version for published snapshots. A snapshot with no
@@ -470,5 +478,25 @@ mod tests {
             }
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn imports_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "import-path-1919-2c09";
+        rocky_core::secret_registry::register_substitution("RV_IMPORTS_ERR_DBG", SECRET);
+        let err = ImportsError::UnsupportedVersion {
+            path: format!("/snap/{SECRET}.json"),
+            found: 9,
+            max_supported: 1,
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_IMPORTS_ERR_DBG}"), "{debug}");
     }
 }

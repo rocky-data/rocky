@@ -29,7 +29,7 @@ use crate::output::{
 };
 
 /// Why a schedule-status read failed.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ScheduleStatusError {
     /// `rocky.toml` could not be read or parsed. Reported distinctly from a
     /// state-store failure so the caller can answer with the right status: a
@@ -43,6 +43,14 @@ pub enum ScheduleStatusError {
     /// `ConfigInvalid` because a locked store is retryable.
     #[error(transparent)]
     State(#[from] anyhow::Error),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ScheduleStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ScheduleStatusError", self)
+    }
 }
 
 /// Build the scheduler status snapshot.
@@ -407,5 +415,21 @@ mod side_effect_free_tests {
             "the read-only status must not materialize the state file"
         );
         drop(out);
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn schedule_status_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "sched-stat-1919-9d10";
+        rocky_core::secret_registry::register_substitution("RV_SCHED_STATUS_DBG", SECRET);
+        let err = ScheduleStatusError::State(anyhow::anyhow!("open {SECRET} failed"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SCHED_STATUS_DBG}"), "{debug}");
     }
 }

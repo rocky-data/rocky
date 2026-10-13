@@ -2704,9 +2704,18 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
     match func {
         "COUNT" => (RockyType::Int64, false), // COUNT is never null
         "SUM" => {
-            // SUM preserves numeric type, nullable (empty group → NULL)
+            // SUM preserves numeric type, nullable (empty group → NULL).
+            // A DECIMAL widens by a dialect-dependent amount (DuckDB
+            // DECIMAL(38, s), Databricks DECIMAL(p + 10, s)), so its result
+            // is `Unknown`. `has_exact_type` applies the same rule to a
+            // `SUM` or `AVG` over a DECIMAL expression, and
+            // `infer_function_type` routes both through here. Without it a
+            // downstream model read the input's precision as the sum's type
+            // (#2320).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
+            } else if matches!(input_type, RockyType::Decimal { .. }) {
+                RockyType::Unknown
             } else {
                 input_type.clone()
             };
@@ -3229,18 +3238,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
     match name.as_str() {
         // Aggregate functions (work with or without OVER)
         "COUNT" => (RockyType::Int64, false),
-        "SUM" => {
+        "SUM" | "AVG" => {
             let arg_type = first_arg_type(func, scope);
-            let result = if arg_type.is_integer() {
-                RockyType::Int64
-            } else {
-                arg_type
-            };
-            (result, true)
-        }
-        "AVG" => {
-            let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("AVG", &arg_type)
+            infer_aggregation_type(name.as_str(), &arg_type)
         }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
@@ -3811,12 +3811,8 @@ impl SelectInference {
     fn push_expression(&mut self, name: String, expr: &Expr, scope: &TypeScope) {
         let (data_type, nullable) = infer_expr_type(expr, scope);
         let function = function_name(expr);
-        // `SUM` / `AVG` of a DECIMAL widens the precision by a
-        // dialect-dependent amount (DuckDB DECIMAL(38, s), Databricks
-        // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
-        let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
-            && matches!(data_type, RockyType::Decimal { .. });
-        if has_exact_type(expr, scope) && !widened_decimal {
+        // `SUM` / `AVG` of a DECIMAL is not exact: see [`has_exact_type`].
+        if has_exact_type(expr, scope) {
             self.exact_type_outputs.insert(self.columns.len());
         } else {
             self.relation_inexact.insert(self.columns.len());
@@ -3917,11 +3913,22 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
         Expr::Nested(inner) => has_exact_type(inner, scope),
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
-            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
+            // `SUM` / `AVG` of a DECIMAL widens the precision by a
+            // dialect-dependent amount (DuckDB DECIMAL(38, s), Databricks
+            // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the
+            // result. Checked here, not only at the projection, so a
+            // `COALESCE` / `NULLIF` / `CASE` around the sum is not exact
+            // either (#2320).
+            name @ ("SUM" | "MIN" | "MAX" | "AVG") => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
                         if has_exact_type(arg, scope)
+                            && !(matches!(name, "SUM" | "AVG")
+                                && matches!(
+                                    infer_expr_type(arg, scope).0,
+                                    RockyType::Decimal { .. }
+                                ))
                 ),
                 _ => false,
             },
@@ -6424,6 +6431,144 @@ mod tests {
             assert_eq!(full.typed_models[name][0].data_type, RockyType::Int64);
             assert!(full.typed_models[name][0].nullable, "{name}");
         }
+    }
+
+    /// The typed columns of `model`, as `(name, type, nullable)`.
+    fn typed_columns_of(result: &TypeCheckResult, model: &str) -> Vec<(String, RockyType, bool)> {
+        result.typed_models[model]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2320 across models. An upstream model stores a column whose type is
+    /// a guess (`LENGTH`'s width, `x * 1.5`) as `Unknown`, so a downstream
+    /// aggregate over it is `Unknown` too, as it is inline or through a CTE.
+    /// This holds by a bare, a qualified and a target-table read, and in an
+    /// incremental typecheck. A bare source column and a cast stay exact.
+    #[test]
+    fn a_downstream_aggregate_over_an_upstream_guess_is_not_typed() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let mut by_target = make_model(
+            "by_target",
+            "SELECT MAX(l) AS m, SUM(amt) AS s, MAX(d) AS md FROM warehouse.silver.up",
+        );
+        by_target.config.depends_on = vec!["up".to_string()];
+        let models = vec![
+            make_model(
+                "up",
+                "SELECT LENGTH(n) AS l, x * 1.5 AS amt, CAST(x AS DOUBLE) AS d, x FROM t",
+            ),
+            make_model(
+                "down",
+                "SELECT MAX(l) AS m, SUM(amt) AS s, MAX(d) AS md, MAX(x) AS mx, \
+                 MAX(up.l) AS q FROM up",
+            ),
+            by_target,
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let full = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let expected = |names: &[&str]| -> Vec<(String, RockyType, bool)> {
+            names
+                .iter()
+                .map(|name| match *name {
+                    "md" => ("md".to_string(), RockyType::Float64, true),
+                    "mx" => ("mx".to_string(), RockyType::Int32, true),
+                    other => (other.to_string(), RockyType::Unknown, true),
+                })
+                .collect()
+        };
+        assert_eq!(
+            typed_columns_of(&full, "down"),
+            expected(&["m", "s", "md", "mx", "q"])
+        );
+        assert_eq!(
+            typed_columns_of(&full, "by_target"),
+            expected(&["m", "s", "md"])
+        );
+        assert_eq!(
+            typed_columns_of(&full, "up"),
+            vec![
+                ("l".to_string(), RockyType::Unknown, true),
+                ("amt".to_string(), RockyType::Unknown, true),
+                ("d".to_string(), RockyType::Float64, false),
+                ("x".to_string(), RockyType::Int32, false),
+            ]
+        );
+
+        // Only `down` is re-typechecked; `up` comes from the previous result.
+        let incremental = typecheck_project_incremental(
+            &graph,
+            &sources,
+            &project.models,
+            &HashSet::from(["down".to_string()]),
+            &full,
+            None,
+            &TargetDialects::default(),
+        );
+        assert_eq!(incremental.typed_models, full.typed_models);
+    }
+
+    /// `SUM` over a DECIMAL column widens it by a dialect-dependent amount,
+    /// so the sum is `Unknown`, in the model and in a model that reads it.
+    /// Before, the model stored the input's DECIMAL(10, 2) as the sum's type
+    /// and a downstream `MAX` / `SUM` / bare read took it (#2320).
+    #[test]
+    fn a_sum_over_a_decimal_column_is_unknown_downstream_too() {
+        let decimal = RockyType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("p", decimal.clone(), true)]),
+        )]);
+        let models = vec![
+            make_model(
+                "up",
+                "SELECT SUM(p) AS c, MAX(p) AS mp, \
+                 COALESCE(SUM(p), CAST(0 AS DECIMAL(10,2))) AS a, NULLIF(SUM(p), 0) AS b, \
+                 CASE WHEN COUNT(*) > 0 THEN SUM(p) ELSE CAST(0 AS DECIMAL(10,2)) END AS k, \
+                 COALESCE(CAST(SUM(p) AS DECIMAL(10,2)), CAST(0 AS DECIMAL(10,2))) AS r \
+                 FROM t",
+            ),
+            make_model(
+                "down",
+                "SELECT MAX(c) AS m, SUM(c) AS s, MAX(mp) AS mmp FROM up",
+            ),
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let full = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        assert_eq!(
+            typed_columns_of(&full, "down"),
+            vec![
+                ("m".to_string(), RockyType::Unknown, true),
+                ("s".to_string(), RockyType::Unknown, true),
+                ("mmp".to_string(), decimal.clone(), true),
+            ]
+        );
+        // A `COALESCE`, `NULLIF` or `CASE` around the sum is `Unknown` too.
+        let decimal_for_r = decimal.clone();
+        assert_eq!(
+            typed_columns_of(&full, "up"),
+            vec![
+                ("c".to_string(), RockyType::Unknown, true),
+                ("mp".to_string(), decimal, true),
+                ("a".to_string(), RockyType::Unknown, true),
+                ("b".to_string(), RockyType::Unknown, true),
+                ("k".to_string(), RockyType::Unknown, true),
+                // Cast the sum, then default it: typed and NOT NULL.
+                ("r".to_string(), decimal_for_r, false),
+            ]
+        );
     }
 
     fn make_time_interval_select_star_model(name: &str, time_column: &str, sql: &str) -> Model {
