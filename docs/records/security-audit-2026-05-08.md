@@ -70,7 +70,7 @@ If the configured coordinator/API host is compromised, on-path (TLS MITM with a 
 Pre/post-hook strings are passed to `sh -c <command>`. This is the documented design, and the runtime context (`{run_id}`, `{event}`, etc.) is delivered via stdin as JSON, **not** interpolated into the command string. The hazard is when users build hook commands by string-formatting untrusted values (e.g., a webhook payload, a Fivetran response) into the `command` field of `rocky.toml`.
 
 **Remediation:**
-- Add a doc note in [`rocky-config`](../.claude/skills/rocky-config/SKILL.md) and `hooks` section explicitly forbidding interpolation of untrusted values into `command`.
+- Add a doc note in [`rocky-config`](../../.claude/skills/rocky-config/SKILL.md) and `hooks` section explicitly forbidding interpolation of untrusted values into `command`.
 - Optional: add a `--strict-hooks` lint that flags `command` strings containing `$(...)`, backticks, or unquoted `$VAR` substitutions.
 
 ### M-4 — Path traversal via `models = "..."` in `rocky.toml`
@@ -159,7 +159,7 @@ Setting `ANTHROPIC_API_KEY` is the only gate. The prompt sends model SQL, table 
 | Files | `engine/crates/rocky-cli/src/pipes.rs:188-193`, `commands/run_audit.rs`, `rocky-core/src/models.rs` |
 | Severity | Low (test-only, no runtime impact) |
 
-Aligns with the [`rust-unsafe`](../engine/.claude/skills/rust-unsafe/SKILL.md) skill: the two legitimate unsafe sites today are mmap + test env-var mutation. Consider centralizing the env-mutation `unsafe` into a single `ScopedEnvGuard` helper to make future audits cheaper.
+Aligns with the [`rust-unsafe`](../../engine/.claude/skills/rust-unsafe/SKILL.md) skill: the two legitimate unsafe sites today are mmap + test env-var mutation. Consider centralizing the env-mutation `unsafe` into a single `ScopedEnvGuard` helper to make future audits cheaper.
 
 ### L-8 — BigQuery `describe_table_sql` interpolation bug (functional, not security)
 

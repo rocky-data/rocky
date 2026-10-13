@@ -97,7 +97,7 @@ Two limits, stated plainly:
 
 Checked in `validate_contract` and `type_name_matches`,
 `engine/crates/rocky-compiler/src/contracts.rs`. Workflow:
-[Testing](/concepts/testing/) and
+[Checks and Tests](/concepts/data-quality-checks/) and
 [Cross-team contracts](/concepts/cross-team-contracts/).
 
 ## Classification tag completeness
@@ -307,7 +307,7 @@ is caught after the data exists, not before. Rocky does not prevent a
 duplicate from landing between test runs.
 
 Test kinds: `engine/crates/rocky-core/src/tests.rs`. Workflow:
-[Testing](/concepts/testing/).
+[Checks and Tests](/concepts/data-quality-checks/).
 
 ## How to read a gap
 

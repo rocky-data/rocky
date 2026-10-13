@@ -2,7 +2,7 @@
 title: Project Scaffold
 description: Bootstrap a new Rocky + Dagster project
 sidebar:
-  order: 16
+  order: 15
 ---
 
 There are two ways to bootstrap a new project. Take the first for a bare

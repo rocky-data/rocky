@@ -175,7 +175,7 @@ can compare before you commit. SQLMesh ships none of these four.
 | Reusable named / generic tests | **Yes** | Yes (audits) |
 
 **Rocky:** two kinds of test ship, and neither is bolted on.
-[Unit tests](/concepts/testing/) put mock input rows under a `[[test]]` block,
+[Unit tests](/concepts/data-quality-checks/#unit-tests-test) put mock input rows under a `[[test]]` block,
 assert on the output rows, and run locally on DuckDB with plain `rocky test`.
 [Reusable named tests](/concepts/data-quality-checks/#reusable-named-tests) let
 you define an assertion once in `models/test_definitions.toml` and apply it by

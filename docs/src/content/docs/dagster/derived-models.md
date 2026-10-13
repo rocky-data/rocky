@@ -2,7 +2,7 @@
 title: Derived Models
 description: Surface Rocky compiled models as their own Dagster assets
 sidebar:
-  order: 18
+  order: 12
 ---
 
 By default, `dagster-rocky` surfaces only source-replication tables: one

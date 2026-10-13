@@ -2,7 +2,7 @@
 title: Partitions
 description: Map Rocky time_interval models to Dagster partitioned assets
 sidebar:
-  order: 13
+  order: 11
 ---
 
 A [partition](/reference/glossary/#partition) is one time slice of a

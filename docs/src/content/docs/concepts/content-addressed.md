@@ -162,5 +162,5 @@ writer handles it for you. You declare the logical names only.
 
 - [Model Format](/reference/model-format/#content-addressed) — the sidecar field reference, including the full Strategy Examples block.
 - [Silver Layer](/concepts/silver-layer/) — where content-addressed models sit in the lakehouse mental model.
-- [Adapters](/concepts/adapters/) — the adapter contracts on the writer side.
+- [Adapters](/guides/adapter-sdk/) — the adapter contracts on the writer side.
 - [The Architecture of Trust](/concepts/architecture-of-trust/) — the recipe-identity hashes stamped on every materialization, and what replay can and cannot verify.

@@ -2,7 +2,7 @@
 title: Contract Checks
 description: Surface Rocky .contract.toml validation as native Dagster asset checks
 sidebar:
-  order: 17
+  order: 9
 ---
 
 A [compile-time contract](/reference/glossary/#compile-time-contract) is a

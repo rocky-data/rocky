@@ -15,6 +15,13 @@ export default defineConfig({
     "/features/comparison/": "/getting-started/comparison/",
     "/features/benchmarks/": "/getting-started/benchmarks/",
     "/features/all-features/": "/getting-started/introduction/",
+    "/concepts/testing/": "/concepts/data-quality-checks/",
+    "/concepts/adapters/": "/guides/adapter-sdk/",
+    "/concepts/plan-store-v1-to-v2/": "/advanced/upgrade-notes/",
+    "/dagster/schedules/": "/dagster/scheduling/",
+    "/dagster/automation/": "/dagster/scheduling/",
+    "/dagster/sensors/": "/dagster/scheduling/",
+    "/dagster/translator/": "/dagster/assets/",
   },
   integrations: [
     starlight({
@@ -47,8 +54,59 @@ export default defineConfig({
           items: [{ autogenerate: { directory: "guides" } }],
         },
         {
+          // Concepts is listed by hand, in groups. Add a new concepts page here,
+          // or it will not appear in the sidebar.
           label: "Concepts",
-          items: [{ autogenerate: { directory: "concepts" } }],
+          items: [
+            {
+              label: "Build models",
+              items: [
+                "concepts/silver-layer",
+                "concepts/bronze-layer",
+                "concepts/rocky-dsl",
+                "concepts/compiler",
+                "concepts/dag-dependencies",
+                "concepts/schema-patterns",
+                "concepts/user-defined-functions",
+                "concepts/linters",
+                "concepts/data-quality-checks",
+              ],
+            },
+            {
+              label: "Run pipelines",
+              items: [
+                "concepts/execution-flow",
+                "concepts/incremental",
+                "concepts/time-interval",
+                "concepts/content-addressed",
+                "concepts/schema-drift",
+                "concepts/state-management",
+                "concepts/shadow-mode",
+                "concepts/hooks",
+              ],
+            },
+            {
+              label: "Govern and agents",
+              items: [
+                "concepts/capability-matrix",
+                "concepts/model-governance",
+                "concepts/cross-team-contracts",
+                "concepts/downstream-consumers",
+                "concepts/operating-rocky-with-agents",
+                "concepts/mcp-authoring",
+                "concepts/ai-intent",
+                "concepts/architecture-of-trust",
+              ],
+            },
+            {
+              label: "Internals",
+              items: [
+                "concepts/architecture",
+                "concepts/sql-generation",
+                "concepts/preview-internals",
+              ],
+            },
+          ],
         },
         {
           label: "Reference",

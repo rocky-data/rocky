@@ -7,47 +7,55 @@ sidebar:
 
 Rocky reads one `rocky.toml` file for everything. You name your adapters (`[adapter.NAME]`) and your pipelines (`[pipeline.NAME]`), so one file can hold several sources, several warehouses, and several pipelines side by side.
 
+<span id="at-a-glance"></span>
+## Config at a glance
+
 :::caution[A key that does not exist is usually an error, not a no-op]
-Rocky rejects an unrecognized key in most blocks. A typo (`tooken` for `token`, `retires` for `retries`) fails the config load with a message naming the key. This is deliberate: a silently ignored setting looks like it is working. The pipeline section is where this is weakest. `[hook.*]` ignores an unknown event key silently, and `[adapter.NAME.extra]` passes every key through untouched. A key written **directly under `[pipeline.NAME]`** is accepted and ignored, on every pipeline type: `strategyy = "x"` there loads and `rocky validate` reports the config valid. Two nested blocks are lenient as well: a check toggle such as `[pipeline.NAME.checks.row_count]` ignores an unknown key (`severty = "warning"` is dropped), and so does an `[[pipeline.NAME.checks.assertions]]` entry. `[pipeline.NAME.source]`, `[pipeline.NAME.target]` and `[pipeline.NAME.checks.quarantine]` do refuse one, naming the key. Check a key against this page before you add it. In the lenient blocks a clean `rocky validate` is not evidence that Rocky read your key.
+A typo (`tooken` for `token`, `retires` for `retries`) fails the config load in most blocks, and the message names the key. In the lenient blocks a clean `rocky validate` is not evidence that Rocky read your key. Check every key against this page.
 :::
 
-## Config Inference and Defaults
+| Block | What happens to an unknown key |
+|---|---|
+| `[pipeline.NAME.source]`, `[pipeline.NAME.target]`, `[pipeline.NAME.checks.quarantine]` | Refused. The error names the key. |
+| Directly under `[pipeline.NAME]` | Accepted and ignored, on every pipeline type. `strategyy = "x"` loads and `rocky validate` reports the config valid. |
+| A check toggle such as `[pipeline.NAME.checks.row_count]`, and an `[[pipeline.NAME.checks.assertions]]` entry | Ignored. `severty = "warning"` is dropped. |
+| `[hook.*]` | An unknown event key is ignored silently. |
+| `[adapter.NAME.extra]` | Every key passes through untouched. |
 
-Write less by leaning on the defaults. Rocky fills in most fields, so a small project needs only a handful of lines.
+One row per top-level block:
 
-| What | Default | When to omit |
-|---|---|---|
-| `pipeline.type` | `"replication"` | Always (unless using a different type) |
-| Unnamed `[adapter]` with a `type` key | Auto-wraps as `adapter.default` | Single-adapter projects |
-| Pipeline `adapter` refs | `"default"` | When only one adapter is defined |
-| `[state]\nbackend = "local"` | `"local"` | Local development (always the default) |
-| `auto_create_catalogs` / `auto_create_schemas` | `false` | When you don't need auto-creation |
-| Model sidecar `name` | Filename stem | When file is `fct_orders.toml` and name is `fct_orders` |
-| Model sidecar `target.table` | Same as `name` | When table name matches model name |
-| `models/_defaults.toml` | N/A | Provides directory-level `[target]` defaults for `catalog` and `schema` |
+| Block | What it does |
+|---|---|
+| [`[adapter.NAME]`](#adaptername) | One named connection to a warehouse or a source. |
+| [`[pipeline.NAME]`](#pipelinename) | One unit of work: source, target, checks, execution, schedule. |
+| [`[state]`](#state) | Where watermarks and run history live between runs. |
+| [`[run]`](#run) | Skip models that did not change. Off by default. |
+| [`[reuse]`](#reuse) | Reuse work for content-addressed models. |
+| [`[resilience]`](#resilience) | Retry a model that failed for a transient reason. On by default. |
+| [`[retry]`](#retry) | One shared connector retry budget for the run. |
+| [`[budget]`](#budget) | Limits on cost, time and bytes scanned per run. |
+| [`[cost]`](#cost) | Warehouse prices for `rocky optimize`. |
+| [`[cache]`](#cache) | The schema cache for typechecking. |
+| [`[freshness]`](#freshness) | Project-wide staleness budget. |
+| [`[schedule]`](#pipelinenameschedule) | Project defaults for `[pipeline.NAME.schedule]`. |
+| [`[contracts]`](#contracts) | Strict handling of contract columns. |
+| [`[imports.NAME]`](#importsname) | Check models against another team's published schema. |
+| [`[lint]`](#lint), [`[portability]`](#portability) | Style rules and cross-warehouse SQL lint. |
+| [`[mask]`](#mask), [`[classifications]`](#classifications), [`[role.NAME]`](#rolename) | Masking, classification tags and role inheritance. |
+| [`[policy]`](#policy) | Who may change what, enforced at mutating steps. |
+| [`[branch]`](#branch), [`[gc]`](#gc) | Branch promotion approval and `rocky gc` limits. |
+| [`[selectors]`](#selectors) | Saved `--select` expressions. |
+| [`[ai]`](#ai), [`[fulfill]`](#fulfill) | Token cap for `rocky ai*`; agent driver for `rocky fulfill` (experimental). |
+| [`[hook.*]`](#hooks) | Shell commands and webhooks on pipeline events. |
+| `[schema_evolution]` | Removed. A config that declares it fails to load. See [below](#schema_evolution-removed). |
 
-### Directory-level defaults
-
-Create a `models/_defaults.toml` so you do not repeat `[target]` in every model:
+A minimal full config. It runs a DuckDB replication with no credentials:
 
 ```toml
-# models/_defaults.toml
-[target]
-catalog = "analytics"
-schema = "warehouse"
-```
-
-Each model inherits these values and overrides only what differs.
-
-## At a glance
-
-```toml
-# Define one or more adapter instances by name
 [adapter.local]
 type = "duckdb"
 path = "warehouse.duckdb"
 
-# Define one or more pipelines and reference adapters by name
 [pipeline.replication]
 type = "replication"
 strategy = "full_refresh"
@@ -69,7 +77,35 @@ schema_template = "analytics"
 backend = "local"
 ```
 
-The same config can declare additional adapters (`[adapter.prod_databricks]`, `[adapter.prod_fivetran]`) and additional pipelines, and pipelines select which adapters to use via the `adapter = "..."` field on `source`/`target`.
+A config can declare more adapters and pipelines. A pipeline picks its adapters with `adapter = "..."` on `source` and `target`.
+
+## Config Inference and Defaults
+
+Write less by leaning on the defaults. Rocky fills in most fields, so a small project needs only a handful of lines.
+
+| What | Default | When to omit |
+|---|---|---|
+| `pipeline.type` | `"replication"` | Always (unless using a different type) |
+| Unnamed `[adapter]` with a `type` key | Auto-wraps as `adapter.default`. Then `source.adapter` and `target.adapter` can be left out. | Single-adapter projects |
+| Pipeline `adapter` refs | `"default"` | When only one adapter is defined |
+| `[state]\nbackend = "local"` | `"local"` | Local development (always the default) |
+| `auto_create_catalogs` / `auto_create_schemas` | `false` | When you don't need auto-creation |
+| Model sidecar `name` | Filename stem | When file is `fct_orders.toml` and name is `fct_orders` |
+| Model sidecar `target.table` | Same as `name` | When table name matches model name |
+| `models/_defaults.toml` | N/A | Provides directory-level `[target]` defaults for `catalog` and `schema` |
+
+### Directory-level defaults
+
+Create a `models/_defaults.toml` so you do not repeat `[target]` in every model:
+
+```toml
+# models/_defaults.toml
+[target]
+catalog = "analytics"
+schema = "warehouse"
+```
+
+Each model inherits these values and overrides only what differs.
 
 ## Environment Variables
 
@@ -144,9 +180,7 @@ Do not put a secret in a field these outputs carry. In particular, never put a s
 Use `${VAR_NAME:-default}` to provide a fallback when a variable is unset or empty:
 
 ```toml
-[state]
 backend = "${ROCKY_STATE_BACKEND:-local}"
-s3_bucket = "${ROCKY_STATE_BUCKET:-}"
 ```
 
 ---
@@ -253,14 +287,6 @@ Decide how hard this adapter tries again after a transient error: an HTTP 429 or
 | `circuit_breaker_recovery_timeout_secs` | integer | `null` | When set, the breaker auto-recovers after this many seconds: it enters half-open, admits a single trial request, and either closes on success or re-opens on failure. When unset, a tripped breaker stays tripped for the rest of the run (manual-reset behaviour). |
 | `max_retries_per_run` | integer | `null` | Per-adapter cross-statement retry budget for a single run. Use the top-level [`[retry]`](#retry) block when you want one shared budget across every adapter instead. |
 
-```toml
-[adapter.prod.retry]
-max_retries = 5
-initial_backoff_ms = 500
-max_backoff_ms = 60000
-circuit_breaker_recovery_timeout_secs = 30
-```
-
 When the breaker trips, Rocky emits a `circuit_breaker_tripped` pipeline event; on auto-recovery it emits `circuit_breaker_recovered`. Hook subscribers can observe both without polling the adapter. See [Hooks](/concepts/hooks/).
 
 ---
@@ -287,34 +313,20 @@ metadata_columns = [
 ]
 ```
 
-Rocky inserts the `value` field into the copy statement as a SQL expression, so write `"NULL"` for a null and a function call like `"CURRENT_TIMESTAMP()"` for a computed value.
+Rocky inserts `value` into the copy statement as a SQL expression. Write `"NULL"` for a null and `"CURRENT_TIMESTAMP()"` for a computed value. Rocky checks the text when the config loads:
 
-Because that text goes into generated SQL, Rocky checks it when the config loads. A `value` must be **one** expression, and any function it calls must be on Rocky's scalar-function allowlist. These all pass:
-
-```toml
-value = "NULL"
-value = "'rocky'"
-value = "1"
-value = "CURRENT_TIMESTAMP"
-value = "current_timestamp()"
-value = "CAST('x' AS VARCHAR)"
-value = "'{source}'"                 # a placeholder, quoted
-value = "CONCAT('{tenant}', '_', '{source}')"
-```
-
-A function that is not on the list is refused, and the message names the list so you can see what is allowed:
+- A `value` must be **one** expression.
+- Any function it calls must be on Rocky's scalar-function allowlist. A function not on the list is refused, and the message names the list.
+- A **placeholder in a `value` must be quoted**. `value = "'{tenant}'"` is a string literal and parses. `value = "{tenant}"` is not valid SQL, so the config is refused at load with a parse error.
+- This applies to `value` only, because `value` is SQL. A placeholder in a **name** template stays unquoted: `schema_template = "stage__{source}"`.
 
 ```toml
+value = "CAST('x' AS VARCHAR)"       # passes
+value = "CONCAT('{tenant}', '_', '{source}')"   # passes
 value = "my_udf(1)"                  # refused: not on the allowlist
 ```
 
-A **placeholder in a `value` must be quoted**. `value = "'{tenant}'"` is a string literal, which parses. `value = "{tenant}"` is not valid SQL at all, so the config is refused at load with a parse error.
-
-This applies to `value` only, because `value` is SQL. A placeholder in a **name** template is not SQL and stays unquoted: `schema_template = "stage__{source}"` is correct as written.
-
-The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse the expression is sent to.
-
-DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can still be rejected by Trino itself. The allowlist applies either way.
+The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse that receives the expression. DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can still be rejected by Trino itself. The allowlist applies either way.
 
 ### `[pipeline.NAME.source]`
 
@@ -325,15 +337,7 @@ Point the pipeline at the system it reads from.
 | `adapter` | string | Yes | Name of the adapter that reads the source rows. Must match a `[adapter.NAME]` key, and that adapter must move data. A discovery-only adapter such as Fivetran goes in [`source.discovery`](#pipelinenamesourcediscovery) instead. |
 | `catalog` | string | No | Source catalog name (used by warehouse-resident sources like Databricks). |
 
-Fivetran lands its tables in your warehouse. So the warehouse adapter reads the rows, and the Fivetran adapter only lists what exists:
-
-```toml
-[pipeline.bronze.source]
-adapter = "prod"            # the warehouse adapter
-
-[pipeline.bronze.source.discovery]
-adapter = "fivetran"        # an adapter with kind = "discovery"
-```
+Fivetran lands its tables in your warehouse. The warehouse adapter reads the rows, and the Fivetran adapter (`kind = "discovery"`) only lists what exists. Set it in `source.discovery`.
 
 ### `[pipeline.NAME.source.discovery]`
 
@@ -344,13 +348,6 @@ Use a different adapter to list schemas and tables than the one that reads the r
 | `adapter` | string | Yes | — | Adapter name to use for discovery. |
 | `report_new_sources` | bool | No | `false` | Diff the discovered source inventory against the prior persisted snapshot and report first-seen schemas in the discover output's `new_sources`. The first discover of a pipeline records the baseline and reports nothing. Off by default — the diff and its state write only happen when opted in. |
 | `on_collision` | `"off"` \| `"warn"` \| `"error"` | No | `"off"` | Cross-source collision detection. When the same external object (e.g. an ad account) is onboarded under two schemas, its data lands in two target tables and silently doubles any downstream `UNION ALL`. `warn` reports the pairs in the discover output's `collision_candidates` and emits a `source_collision_detected` event; `error` additionally fails the discover so a colliding onboard can't silently create a catalog. `off` (default) skips detection entirely. Only adapters that resolve external object ids (e.g. Fivetran) participate; others contribute nothing. |
-
-```toml
-[pipeline.bronze.source.discovery]
-adapter = "fivetran"
-report_new_sources = true   # surface freshly-onboarded sources in `new_sources`
-on_collision = "warn"       # surface same-object-twice onboards in `collision_candidates`
-```
 
 See [Cross-source duplicate detection](#cross-source-duplicate-detection) for the counterpart that runs during replication rather than at discovery.
 
@@ -389,21 +386,7 @@ Say where the pipeline writes. The two templates build the catalog and schema na
 | `catalog_template` | string | Yes | Template for the target catalog name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
 | `schema_template` | string | Yes | Template for the target schema name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
 
-```toml
-[pipeline.bronze.target]
-adapter = "prod"
-catalog_template = "warehouse"
-schema_template = "stage__{source}"
-```
-
-Given `source=shopify`:
-
-| Template | Result |
-|----------|--------|
-| `warehouse` | `warehouse` (static, no substitution) |
-| `stage__{source}` | `stage__shopify` |
-
-The two blocks work as one path. `schema_pattern` takes a source schema apart, and the target templates put a destination name back together from the pieces:
+A template without a placeholder (`warehouse`) is static. The two blocks work as one path. `schema_pattern` takes a source schema apart, and the target templates put a destination name back together from the pieces:
 
 ```
   source schema                  parsed components        target name
@@ -446,23 +429,7 @@ Where a row says No, the call does nothing and the run continues. Catalog tags, 
 | `schema_grants` | list | `[]` | Schema-level grants. Same format as `grants`. |
 | `isolation` | table | | Workspace isolation settings (see below). |
 
-```toml
-[pipeline.bronze.target.governance]
-auto_create_catalogs = true
-auto_create_schemas = true
-
-[pipeline.bronze.target.governance.tags]
-managed_by = "rocky"
-environment = "production"
-
-[[pipeline.bronze.target.governance.grants]]
-principal = "group:data_engineers"
-permissions = ["USE CATALOG", "MANAGE"]
-
-[[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:data_engineers"
-permissions = ["USE SCHEMA", "SELECT", "MODIFY"]
-```
+The [Full Example](#full-example) shows a complete governance block.
 
 ### `[pipeline.NAME.target.governance.isolation]`
 
@@ -479,19 +446,6 @@ Each entry in `workspace_ids` is a table with two fields:
 |-------|------|---------|-------------|
 | `id` | integer | required | Databricks workspace ID. |
 | `binding_type` | string | `"READ_WRITE"` | Access level: `"READ_WRITE"` or `"READ_ONLY"`. |
-
-```toml
-[pipeline.bronze.target.governance.isolation]
-enabled = true
-
-[[pipeline.bronze.target.governance.isolation.workspace_ids]]
-id = 7474656540609532
-binding_type = "READ_WRITE"
-
-[[pipeline.bronze.target.governance.isolation.workspace_ids]]
-id = 7474647537929812
-binding_type = "READ_ONLY"
-```
 
 `binding_type` maps to the Databricks API values `BINDING_TYPE_READ_WRITE` and `BINDING_TYPE_READ_ONLY`.
 
@@ -517,15 +471,6 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `quarantine` | table | | `{ enabled = true, mode = "split" \| "tag" \| "drop" }`. Off unless `enabled = true`. See below. |
 | `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
 | `cross_source_overlap` | table | | Flags the same business key appearing across sibling sources that feed one consolidation target. See [Cross-source duplicate detection](#cross-source-duplicate-detection). |
-
-```toml
-[pipeline.bronze.checks]
-enabled = true
-row_count = true
-column_match = true
-freshness = { threshold_seconds = 86400 }
-anomaly_threshold_pct = 50.0
-```
 
 #### `[[pipeline.NAME.checks.assertions]]`
 
@@ -563,36 +508,16 @@ column = "order_id"
 
 [[pipeline.silver.checks.assertions]]
 table = "orders"
-type = "accepted_values"
-column = "status"
-values = ["pending", "shipped", "delivered"]
-severity = "warning"
-
-[[pipeline.silver.checks.assertions]]
-table = "orders"
 type = "in_range"
 column = "amount_cents"
 min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 
 [[pipeline.silver.checks.assertions]]
-table = "orders"
-type = "aggregate"
-op = "sum"
-cmp = "gt"
-value = "0"
-column = "amount_cents"
-
-[[pipeline.silver.checks.assertions]]
 table = "order_lines"
 type = "composite"
 kind = "unique"
 columns = ["order_id", "line_item_id"]
-
-[[pipeline.silver.checks.assertions]]
-table = "orders"
-type = "unique_expr"
-key_expr = "md5(tenant_id || '-' || order_id)"
 ```
 
 Use `unique_expr` when the meaningful identity is a *computed* value rather than any stored column, for example a surrogate key built to be stable across a multi-tenant union, which neither `unique` (single column) nor `composite` (column tuple) can express.
@@ -607,12 +532,6 @@ Keep the bad rows out of the clean table instead of only counting them. Rocky ta
 | `mode` | `"split"` \| `"tag"` \| `"drop"` | `"split"` | What Rocky does with the failing rows. See the table below. |
 | `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. `split` and `drop` refuse a suffix that makes this name match the source table, so an empty suffix is refused. Names are compared exactly. |
 | `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. `split` refuses a suffix that makes this name match the source table or the valid table. `drop` writes no quarantine table, so it does not check this one. Names are compared exactly, so suffixes that differ only in case are not refused. On a warehouse that ignores case in a table name, such as DuckDB or Databricks, the two name one table, and the valid write replaces the quarantine rows there. |
-
-```toml
-[pipeline.dq.checks.quarantine]
-enabled = true
-mode = "split"
-```
 
 | Mode | Behavior |
 |---|---|
@@ -638,13 +557,6 @@ For the cross-*table* case (the same business key arriving through two **sibling
 
 Exactly one of `keys` or `key_expr` is required. Sibling tables whose key can't be evaluated (missing column / keyless) are skipped with a logged reason rather than erroring.
 
-```toml
-[pipeline.bronze.checks.cross_source_overlap]
-keys = ["order_id"]
-severity = "warning"
-max_overlap_rows = 0
-```
-
 This is the **detective** counterpart to discover-time `on_collision` (the **preventive** catch). See [Data Quality Checks](/concepts/data-quality-checks/#cross-source-overlap) for the full semantics.
 
 ### `[pipeline.NAME.execution]`
@@ -657,14 +569,6 @@ Tune how many tables this pipeline processes at once, and when it gives up. The 
 | `fail_fast` | bool | `false` | Abort all remaining tables on first error. |
 | `error_rate_abort_pct` | integer | `50` | Abort if error rate exceeds this percentage (0–100). Set to 0 to disable. |
 | `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. |
-
-```toml
-[pipeline.bronze.execution]
-concurrency = 8
-fail_fast = false
-error_rate_abort_pct = 50
-table_retries = 1
-```
 
 ---
 
@@ -737,11 +641,10 @@ retry = { max = 2 }
 
 Project-level defaults live in a top-level `[schedule]` block:
 
-```toml
-[schedule]
-timezone = "UTC"          # default timezone for every pipeline's cron
-poll_interval_seconds = 15 # `rocky serve --scheduler` cadence; `--poll-interval-seconds` overrides it, and the one-shot `rocky tick` does not read it
-```
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `timezone` | string | `"UTC"` | Default timezone for every pipeline's `cron`. |
+| `poll_interval_seconds` | integer | `15` | Cadence of `rocky serve --scheduler`. `--poll-interval-seconds` overrides it. The one-shot `rocky tick` does not read it. |
 
 ---
 
@@ -765,31 +668,7 @@ Choose where Rocky keeps what it remembers between runs: watermarks, run history
 | `on_schema_mismatch` | string | `"recreate"` | What to do when the binary opens a state store written by a **newer** binary, which happens mid-way through a rolling upgrade. `"recreate"` logs one warning, starts from fresh local state, does one full-refresh run, and never writes the downgraded state back to the shared tier. `"fail"` aborts the open instead. Only the run path honours this; inspection and branch commands always hard-fail on a forward-incompatible store. |
 | `freeze_marker_writes` | bool | `false` | Write durable freeze and unfreeze marker objects beside the remote state file (under `<prefix>/freeze/` and `<prefix>/unfreeze/`) when `rocky policy freeze` / `unfreeze` run. Reading and enforcing markers is always on wherever a durable object tier exists. You can therefore upgrade a whole fleet to marker readers before any marker is written. Requires `backend = "s3"`, `"gcs"`, or `"tiered"`; setting it on `"local"` or `"valkey"` is a hard error rather than a silent no-op. |
 
-**Local (default):**
-
-```toml
-[state]
-backend = "local"
-```
-
-**S3 (durable, for ephemeral environments):**
-
-```toml
-[state]
-backend = "s3"
-s3_bucket = "${ROCKY_STATE_BUCKET}"
-s3_prefix = "rocky/state/"
-```
-
-**Valkey (low-latency, shared):**
-
-```toml
-[state]
-backend = "valkey"
-valkey_url = "${VALKEY_URL}"
-```
-
-**Tiered (Valkey + S3 fallback):**
+Set the fields each backend requires, as the table shows. `"tiered"` downloads from Valkey first (fast) and falls back to S3 (durable). It uploads to both.
 
 ```toml
 [state]
@@ -798,21 +677,11 @@ valkey_url = "${VALKEY_URL}"
 s3_bucket = "${ROCKY_STATE_BUCKET}"
 ```
 
-Tiered downloads from Valkey first (fast), falls back to S3 (durable). Uploads to both.
-
 ### Concurrent writers
 
 Stop a second run from erasing a first when both share one `[state]` prefix. Without protection, two concurrent runs both download the ledger, both change it, and the second upload wipes the first. The first run's watermarks, run records, and policy rows are lost, and Rocky raises no error.
 
-Compare-and-swap (CAS: a write that succeeds only if the object has not changed since you read it) closes that. It is the default on `s3`, `gcs`, and `tiered`, so this config is protected with no extra setting:
-
-```toml
-[state]
-backend = "s3"
-s3_bucket = "${ROCKY_STATE_BUCKET}"
-```
-
-Each upload then commits only if the remote object still carries the generation this run downloaded. A run that lost the race exits non-zero with a compare-and-swap conflict rather than overwriting the winner.
+Compare-and-swap (CAS: a write that succeeds only if the object has not changed since you read it) closes that. It is the default on `s3`, `gcs`, and `tiered`, so an `s3` config with only `s3_bucket` is protected with no extra setting. Each upload commits only if the remote object still carries the generation this run downloaded. A run that lost the race exits non-zero with a compare-and-swap conflict rather than overwriting the winner.
 
 What it does not do is reconcile the two runs. You re-run the loser yourself. Rocky does not roll back the warehouse writes it already made, so a non-merge strategy can duplicate rows on that re-run. Prefer merge-style strategies for pipelines you expect to contend.
 
@@ -863,14 +732,9 @@ Engine 1.77.0 changed the default on `s3`, `gcs`, and `tiered` from `off` to `ca
 
 With `concurrency_control = "off"` the tiered backend keeps its historical behaviour, including the stale-cache window: an `off` write carries no generation, so there is nothing for a read to validate a cached copy against.
 
-Replication publishes recovery intent before copying on supported atomic
-adapters. A failed pre-copy upload with `"fail"` stops before INSERT. With
-`"skip"`, it warns and continues; a fresh pod cannot recover unpublished intent
-after the local ledger disappears. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication).
+**Upload failures and recovery.** Replication publishes recovery intent before copying on supported atomic adapters. A failed pre-copy upload with `"fail"` stops before INSERT. With `"skip"`, it warns and continues. A fresh pod cannot recover unpublished intent after the local ledger disappears. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication).
 
-A failed watermark flush keeps available progress and attempts its upload.
-Ordinary `"skip"` runs warn and retain their normal exit policy. Explicit
-`"fail"` and governed runs return nonzero after preserving available state.
+A failed watermark flush keeps available progress and attempts its upload. Ordinary `"skip"` runs warn and retain their normal exit policy. Explicit `"fail"` and governed runs return nonzero after preserving available state.
 
 ### `[state.retry]`
 
@@ -887,18 +751,6 @@ Decide how hard Rocky retries a state upload or download that failed for a trans
 | `circuit_breaker_recovery_timeout_secs` | int \| null | `null` | Seconds in `Open` before a half-open trial is allowed. `null` = manual reset only. |
 | `max_retries_per_run` | int \| null | `null` | Cross-transfer retry budget for a single run. `null` = unbounded (per-transfer `max_retries` is the only cap). |
 
-```toml
-[state]
-backend = "s3"
-s3_bucket = "${ROCKY_STATE_BUCKET}"
-on_upload_failure = "fail"    # strict: treat state durability as required
-
-[state.retry]
-max_retries = 5
-circuit_breaker_threshold = 3
-circuit_breaker_recovery_timeout_secs = 30
-```
-
 Every transfer ends with a structured `outcome` field on its `state.upload` or `state.download` event: `ok`, `absent`, `carried_forward`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, or `budget_exhausted`. Build alerts on those values, not on the free-form log message.
 
 ### `[state.idempotency]`
@@ -910,13 +762,6 @@ Tune how `rocky plan --idempotency-key <KEY>` deduplicates a retried run (the `r
 | `retention_days` | integer | `30` | Lifetime of a terminal idempotency stamp before garbage collection. GC runs during the state upload sweep; no separate cron. |
 | `dedup_on` | string | `"success"` | Which terminal statuses count as "already processed". `"success"` only stamps successful runs (failures stay claimable for retries); `"any"` stamps every terminal status. |
 | `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Informational on Valkey/tiered backends, which set the TTL server-side via `SET NX EX`. |
-
-```toml
-[state.idempotency]
-retention_days = 30
-dedup_on = "success"
-in_flight_ttl_hours = 24
-```
 
 Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky plan --idempotency-key`](/reference/cli/#rocky-run) for the three possible outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`).
 
@@ -972,37 +817,6 @@ gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" \
   --lifecycle-file=rocky-lifecycle.json
 ```
 
-**Terraform equivalents:**
-
-```hcl
-# S3
-resource "aws_s3_bucket_lifecycle_configuration" "rocky_state" {
-  bucket = aws_s3_bucket.rocky_state.id
-
-  rule {
-    id     = "rocky-idempotency-stamps-30d"
-    status = "Enabled"
-
-    filter { prefix = "rocky/state/" }
-    expiration { days = 30 }
-  }
-}
-
-# GCS
-resource "google_storage_bucket" "rocky_state" {
-  name     = "rocky-state"
-  location = "US"
-
-  lifecycle_rule {
-    action    { type = "Delete" }
-    condition {
-      age            = 30
-      matches_prefix = ["rocky/state/"]
-    }
-  }
-}
-```
-
 **Operational notes:**
 
 - **Bucket lifecycle does not replace `[state.idempotency] retention_days`.** The local redb mirror on each pod still has its own copy of the stamp; Rocky's sweep is what evicts that. Bucket lifecycle handles the durable copy.
@@ -1051,40 +865,18 @@ Skipping is a best-effort optimization. It is **not** a promise that a fresh reb
 | `lag_tolerance_seconds` | integer | `0` | Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged — the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild. |
 | `strict_scheduling` | bool | `false` | Turn physical-read scheduling warnings into a run refusal. Rocky derives ordering edges from the physical `schema.table` names a model reads. It reports what it could not safely resolve. That covers contradicting bare-read pairs, models whose reference extraction failed, and colliding targets. It also covers a `catalog.schema.table` read of a model with no catalog in its `[target]`, when Rocky cannot name that model's catalog. And it covers a by-name edge that `rocky run --dag` dropped because an exact read contradicted it. `false` reports these as warnings and the run still exits `0`, so a consumer that ignores them can read a stale target and see success. `true` refuses the run instead. It lives on `[run]` rather than `[pipeline.NAME.execution]` because `rocky run --dag` derives ordering across pipelines, where a per-pipeline switch would have no single answer. |
 
-```toml
-[run]
-skip_unchanged = true
-skip_rowcount_fallback = false   # default; only flip on if you accept the weaker signal
-lag_tolerance_seconds = 0        # default; any MAX(ts) movement rebuilds
-strict_scheduling = false        # default; flip on for fail-closed ordering
-```
-
 ### What is and is not skip-eligible
 
 Rocky skips a model only when **both** of these hold. Anything else rebuilds.
 
-- **(B) Eligible.** The model uses a plain materialization strategy (**not** `content_addressed` or `time_interval`). Its `[skip] eligible` is not `false`, and Rocky can prove its SQL deterministic. It always rebuilds SQL containing `CURRENT_TIMESTAMP` / `NOW()`, `RANDOM()`, `UUID()`, `CURRENT_USER`, `CURRENT_CATALOG`, `ANY_VALUE`, `ARRAY_AGG`, an unordered `LIMIT`, or any function it cannot resolve. `full_refresh` **is** eligible: a deterministic full refresh whose logic and inputs have not moved is safe to skip.
+- **(B) Eligible.** The model uses a plain materialization strategy (**not** `content_addressed` or `time_interval`). Its `[skip] eligible` is not `false`, and Rocky can prove its SQL deterministic. It always rebuilds SQL containing `CURRENT_TIMESTAMP` / `NOW()`, `RANDOM()`, `UUID()`, `CURRENT_USER`, `CURRENT_CATALOG`, `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, `MODE`, an unordered `LIMIT` / `TOP` / `FETCH`, or any function not on Rocky's pure-function allowlist. `full_refresh` **is** eligible: a deterministic full refresh whose logic and inputs have not moved is safe to skip.
 - **(G) Upstreams provably unchanged.** Rocky must be able to prove every upstream stable, and that needs the model's lineage to be provably complete. Only a single plain `SELECT` over bare tables qualifies. A model that uses a CTE, a subquery in `FROM`, or an `IN (SELECT …)` / `EXISTS` / scalar sub-select is **never skipped**. Nor is one that uses a `PIVOT` / `UNNEST` / nested-join table factor, or a set operation (`UNION` / `INTERSECT` / `EXCEPT`). Rocky cannot prove it saw every upstream of those shapes.
 
 `--force-rebuild` plus `full_refresh` always builds.
 
 ### Per-model `[skip]` overrides
 
-Override the automatic decision for one model with a `[skip]` block in its sidecar. See [Model format](/reference/model-format/) for the sidecar structure.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `eligible` | bool | (auto) | `false` ⇒ this model always builds, even when the gate is on and everything else looks unchanged (use for known-volatile models the static scan might miss). `true` ⇒ the model is eligible, subject to the other gate clauses. Unset ⇒ fall back to the automatic eligibility rules. |
-| `deterministic` | bool | (auto) | Owner assertion about the SQL. `true` is the only way a model the static non-determinism scan flagged (timestamps, randomness, unresolved UDFs, …) becomes skip-eligible — an explicit, auditable, per-model opt-in. `false` forces the model to be treated as non-deterministic (never auto-skipped). Unset ⇒ trust the static scan. |
-
-```toml
-# models/fct_orders.toml
-name = "fct_orders"
-
-[skip]
-eligible = true        # opt this model in/out of the gate explicitly
-deterministic = true   # owner asserts the SQL is pure → re-eligible
-```
+Override the automatic decision for one model with a `[skip]` block in its sidecar. It has two keys, `eligible` and `deterministic`, both unset by default. See [`[skip]` in Model format](/reference/model-format/#skip) for the fields.
 
 ---
 
@@ -1099,14 +891,7 @@ Let a content-addressed model reuse work it already did, with a record an audito
 
 Both decisions fail closed. Any unproven input forces a build: a non-deterministic model, a changed recipe or environment, a consumed-column set Rocky cannot enumerate, a missing or moved column hash. Doubt always resolves to running the SQL.
 
-The kill switch for the default-on knob:
-
-```toml
-[reuse]
-column_level = false   # restore the always-build behavior
-```
-
-The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`). The provenance record this path writes is what an auditor reads in [Verify a run](/guides/verify-a-run/).
+The kill switch for the default-on knob is `column_level = false`, which restores the always-build behavior. The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`). The provenance record this path writes is what an auditor reads in [Verify a run](/guides/verify-a-run/).
 
 ---
 
@@ -1117,11 +902,6 @@ Cap what an AI generation can spend. The block applies to `rocky ai`, `rocky ai-
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
-
-```toml
-[ai]
-max_tokens = 8192
-```
 
 Every `rocky ai*` command reads this block. Rocky never reads the API key from `rocky.toml`. It comes from the `ANTHROPIC_API_KEY` environment variable instead, so the key never lands on disk in a project file.
 
@@ -1143,18 +923,7 @@ Control how long a cached table shape stays trusted, and whether other machines 
 | `trusted_max_age_seconds` | integer | unset | Cache entries younger than this are trusted as current. A reference to a column a trusted entry lacks is the `E041` error. Older entries, and every entry when the key is unset, give the `W041` warning. |
 | `strict_sources` | bool | `false` | Trust every known source schema, including seeds and old cache entries. Every `W041` becomes `E041`. `rocky compile --strict-sources` does the same for one invocation. |
 
-```toml
-[cache.schemas]
-ttl_seconds = 3600   # 1h TTL for teams with high-DDL churn
-replicate = true     # opt in to share cache via the remote state backend
-```
-
 `trusted_max_age_seconds` and `strict_sources` control the missing-source-column check. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041).
-
-```toml
-[cache.schemas]
-trusted_max_age_seconds = 3600   # entries cached in the last hour refuse with E041
-```
 
 A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not reach it yet. A future `[cache.valkey]` key is reserved for it.
 
@@ -1171,13 +940,6 @@ Tell `rocky optimize` what your warehouse costs, so its materialization recommen
 | `warehouse_size` | string | `"Medium"` | Warehouse size for cost estimation (e.g., `"Small"`, `"Medium"`, `"Large"`). |
 | `min_history_runs` | integer | `5` | Runs Rocky needs in history before it makes a cost recommendation. |
 
-```toml
-[cost]
-storage_cost_per_gb_month = 0.023
-compute_cost_per_dbu = 0.40
-warehouse_size = "Medium"
-```
-
 ---
 
 ## `[budget]`
@@ -1190,14 +952,6 @@ Put a ceiling on what one run may cost, how long it may take, and how much it ma
 | `max_duration_ms` | integer | | Maximum allowed run wall time in milliseconds. |
 | `max_bytes_scanned` | integer | | Maximum allowed total bytes scanned across every materialization in the run. Useful for CI gates on scan volume even when the dollar cost stays inside `max_usd` (e.g. a BigQuery query that stops pruning partitions). Aggregated from the per-model `bytes_scanned` figures the adapter reports. Today that's BigQuery's `totalBytesBilled`; Databricks / Snowflake / DuckDB still inherit `None` and skip the dimension rather than treating "no data" as zero. |
 | `on_breach` | string | `"warn"` | Either `"warn"` (fire the event, keep the run successful) or `"error"` (also fail the run). |
-
-```toml
-[budget]
-max_usd = 25.0
-max_duration_ms = 900000          # 15 minutes
-max_bytes_scanned = 1099511627776 # 1 TiB
-on_breach = "error"
-```
 
 The three limits are independent, and any one of them breaching trips the event. Rocky evaluates them once per run against the observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route a breach into a notification system.
 
@@ -1220,11 +974,7 @@ target_dialect = "bigquery"
 allow = ["QUALIFY"]
 ```
 
-Precedence for the effective target dialect:
-
-1. `rocky compile --target-dialect <DIALECT>` flag (wins if set).
-2. `[portability] target_dialect`.
-3. Unset: no lint.
+The effective target dialect is the `--target-dialect` flag if set, else `target_dialect`, else none (no lint).
 
 See [Linters](/concepts/linters/) for the full list of covered constructs and the per-model pragma syntax.
 
@@ -1259,21 +1009,11 @@ Share one retry budget across every adapter in a run, instead of giving each its
 |-------|------|---------|-------------|
 | `max_retries_per_run` | integer | | Total retries allowed across every adapter for this run. Omit the block to keep per-adapter budgets (each `[adapter.NAME.retry]` remains in isolation). |
 
-```toml
-[retry]
-max_retries_per_run = 50
-```
-
 ---
 
 ## `[contracts]`
 
 Project-level contract settings.
-
-```toml
-[contracts]
-strict = true
-```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -1336,11 +1076,6 @@ Silence the `W004` warning for a classification tag you never intend to mask. Th
 |-------|------|---------|-------------|
 | `allow_unmasked` | list of strings | `[]` | Classification tags allowed to appear in a model sidecar without a matching `[mask]` strategy. Suppresses the W004 compiler warning. |
 
-```toml
-[classifications]
-allow_unmasked = ["internal", "lineage_only"]
-```
-
 Use it for tags that exist only for discovery or lineage tracking. [`rocky compliance`](/reference/cli/#rocky-compliance) still lists those columns and still suppresses their exceptions, so the report never pretends they are enforced.
 
 ---
@@ -1395,11 +1130,6 @@ Set a project-wide staleness budget, so you do not repeat the same threshold in 
 | `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) reads `MAX(time_column)` from the model's target table. |
 | `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. Under `"error"`, a stale model makes `rocky freshness` exit 1. |
 
-```toml
-[freshness]
-expected_lag_seconds = 3600   # every model should be under an hour behind
-```
-
 A model that declares no `[freshness]` block of its own inherits this one, whole. Precedence, first match wins:
 
 ```
@@ -1453,18 +1183,7 @@ Rocky classifies each failure before deciding. Only a failure it can prove is tr
 | `contain_failures` | bool | `false` | `false` stops the run at a model that fails **while it runs**: no later layer starts, though models already running beside it finish. Every error-severity compile failure withholds its declared DAG descendants by default; unrelated branches can build. A project that does not compile at all builds nothing. See [Failure containment](/advanced/failure-modes/#failure-containment-across-the-model-graph). `true` also withholds the failed model and downstream closure after a runtime failure, then lets unrelated subtrees finish. It reports `PartialFailure` with the failure and its blast radius. |
 | `auto_apply_additive_drift` | bool | `false` | `false` evolves the target for a new nullable upstream column with no policy gate, as Rocky has always done. `true` routes the mutation through the [`[policy]`](#policy) plane first. Rocky applies only a provably additive change with an `allow` verdict on the `schema_change.additive` capability, and leaves anything else for review. The verdict starts from a matching rule, or from `default_agent_effect` when no rule matches, so `default_agent_effect = "allow"` can grant it without one. A freeze, an exhausted autonomy budget, an unreadable or untrusted decision ledger, or a decision row that fails to persist still refuses. With no `[policy]` block, nothing is granted. |
 
-```toml
-[resilience]
-transient_max_retries = 2    # default
-contain_failures = true      # let unrelated models finish when one fails
-```
-
-To restore single-attempt behaviour, for example in CI where a fast failure is what you want:
-
-```toml
-[resilience]
-enabled = false
-```
+To restore single-attempt behaviour, for example in CI where a fast failure is what you want, set `enabled = false`.
 
 ---
 
@@ -1515,14 +1234,6 @@ An approval counts as valid only when all of these hold:
 - It was signed inside `max_age_seconds`.
 - Its signer is on the list, when `allowed_signers` is set.
 
-```toml
-[branch.approval]
-required = true
-min_approvers = 2
-allowed_signers = ["lead@example.com", "governance@example.com"]
-max_age_seconds = 43200   # 12 hours
-```
-
 ---
 
 ## `[gc]`
@@ -1531,12 +1242,7 @@ Control what `rocky gc` is allowed to delete. Eviction is recorded, not destruct
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `physical_delete` | bool | `false` | Reserved for a future protocol-aware `VACUUM`. `false` tombstones and retires the ledger row only. `true` is a **hard error** at apply time today, so the flag fails loudly rather than deleting bytes or silently doing nothing. |
-
-```toml
-[gc]
-physical_delete = false   # the only supported value today
-```
+| `physical_delete` | bool | `false` | Reserved for a future protocol-aware `VACUUM`. `false` (the only supported value today) tombstones and retires the ledger row only. `true` is a **hard error** at apply time today, so the flag fails loudly rather than deleting bytes or silently doing nothing. |
 
 `rocky restore` can rebuild an evicted artifact only when the recorded recipe is non-partitioned, content-addressed, and reads no recorded upstreams. Even then it can refuse — a missing tombstone, a re-derivation whose hash differs, or a lost race on ledger reinstatement all stop it. A recipe with any recorded upstream cannot be restored yet. What is durably retained is the eviction record and the provenance it points at, not a promise that the exact bytes come back. See the [governance and reclamation commands](/reference/commands/governance-reclamation/).
 
@@ -1638,7 +1344,7 @@ Configure the agent driver for the experimental `rocky fulfill` loop. The determ
 
 ## Full Example
 
-A complete Fivetran → Databricks pipeline with governance:
+A complete Fivetran → Databricks pipeline with governance. The [minimal config](#config-at-a-glance) at the top of this page is the credential-free DuckDB version.
 
 ```toml
 # ──────────────────────────────────────────────────
@@ -1727,58 +1433,6 @@ backend = "${ROCKY_STATE_BACKEND:-local}"
 # valkey_url = "${VALKEY_URL}"
 ```
 
-A credential-free DuckDB pipeline (good for examples and tests). Using config inference, many defaults can be omitted:
-
-```toml
-[adapter.local]
-type = "duckdb"
-path = "warehouse.duckdb"
-
-[pipeline.demo]
-strategy = "full_refresh"
-
-[pipeline.demo.source]
-adapter = "local"
-
-[pipeline.demo.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.demo.target]
-adapter = "local"
-catalog_template = "warehouse"
-schema_template = "analytics"
-
-[pipeline.demo.checks]
-row_count = true
-
-[pipeline.demo.execution]
-concurrency = 4
-```
-
-Note: `pipeline.type = "replication"` (default), `auto_create_catalogs = false` (default), `auto_create_schemas = false` (default), and `[state]\nbackend = "local"` (default) are all omitted.
-
-With a single adapter, this can be even more minimal using the unnamed adapter shorthand:
-
-```toml
-[adapter]
-type = "duckdb"
-path = "warehouse.duckdb"
-
-[pipeline.demo]
-strategy = "full_refresh"
-
-[pipeline.demo.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.demo.target]
-catalog_template = "warehouse"
-schema_template = "analytics"
-```
-
 ---
 
 ## Hooks
@@ -1787,8 +1441,6 @@ Run a shell command or post to an HTTP endpoint when something happens in a pipe
 
 ```toml
 # Shell hooks — run a command, pipe JSON context to stdin.
-# Event keys are always the `on_<event>` form; a key without the
-# `on_` prefix is treated as unknown and silently ignored.
 [[hook.on_pipeline_start]]
 command = "bash scripts/notify.sh"
 timeout_ms = 5000

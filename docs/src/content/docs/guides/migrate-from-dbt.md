@@ -19,9 +19,23 @@ sidebar:
    └─────────────────┘                                └──────────────────┘
 ```
 
-Read this guide if you have a dbt project and want Rocky to run those models. It covers the import itself, what the importer translates, what it refuses, and how to check the result. `rocky validate-migration` (section 7) cross-checks that every dbt model came across.
+You get:
 
-Rocky has no Jinja runtime, so some dbt constructs have no automatic translation. The importer reports each one instead of guessing. ["What translates cleanly today, and what doesn't"](#what-translates-cleanly-today-and-what-doesnt) is the full list.
+- a Rocky repo from one command, with models, sidecars, tests and contracts converted;
+- a `MIGRATION-NOTES.md` that lists every construct the importer could not translate;
+- a checked result: the repo compiles, validates, and matches the dbt project before cutover.
+
+Rocky has no Jinja runtime, so some dbt constructs have no automatic translation. The importer reports or refuses each one instead of guessing. ["What translates cleanly today, and what doesn't"](#what-translates-cleanly-today-and-what-doesnt) is the full list.
+
+| Step | Command | Section |
+|---|---|---|
+| Import | `rocky import-dbt` | [1](#1-import-the-dbt-project) |
+| Review and fix Jinja | read the sidecars | [2](#2-review-the-imported-models), [3](#3-handle-unsupported-jinja) |
+| Configure the warehouse | `rocky.toml` | [4](#4-configure-rockytoml) |
+| Compile and test | `rocky compile`, `rocky test` | [5](#5-compile-the-imported-models), [6](#6-run-tests-locally) |
+| Validate and compare | `rocky validate-migration`, `rocky plan` | [7](#7-validate-the-migration), [8](#8-verify-the-output-before-cutover) |
+| Tests and contracts | `[[tests]]`, `.contract.toml` | [9](#9-convert-dbt-tests-to-rocky-tests-and-contracts) |
+| Cut over in stages | leaf models first | [11](#11-move-a-large-project-in-stages) |
 
 ## Prerequisites
 
@@ -210,39 +224,7 @@ values = ["pending", "completed", "shipped"]
 column = "status"
 ```
 
-`imported/models/fct_revenue.toml`:
-
-```toml
-name = "fct_revenue"
-intent = "Per-customer revenue rollup."
-
-[strategy]
-type = "full_refresh"
-
-[target]
-catalog = "warehouse"
-schema = "main"
-table = "fct_revenue"
-
-[[tests]]
-type = "unique"
-column = "customer_id"
-
-[[tests]]
-type = "not_null"
-column = "customer_id"
-
-[[tests]]
-type = "relationships"
-to_table = "warehouse.main.stg_orders"
-to_column = "customer_id"
-column = "customer_id"
-
-[[tests]]
-type = "in_range"
-min = "0"
-column = "total_revenue"
-```
+`imported/models/fct_revenue.toml` follows the same shape. It carries `full_refresh`, plus `relationships` and `in_range` tests (see [Generic test mapping](#generic-test-mapping)).
 
 `imported/MIGRATION-NOTES.md` records everything that did not translate: counts of skipped tests and macros, the environment variables each adapter needs, and a "Known limitations" list. Read it first.
 
@@ -330,6 +312,8 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 Run `dbt compile --full-refresh` before import, including any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs and `args.full_refresh = true`. It also needs `compiled_code`, and a successful result for its `unique_id`. dbt 2 writes no per-model results for `compile` (`results` is empty). Rocky then accepts the `compiled_code` of the same invocation as the evidence. `dbt run --full-refresh` writes per-model results on dbt 1 and dbt 2, but it rebuilds the tables.
 
 A selective compile leaves unselected models without that evidence. Compile without `--select` or include each model you want to import. This rule applies without a key or a direct `is_incremental()` call. Remove any effective `full_refresh=false` config and compile again. That config overrides the command flag.
+
+A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
 :::
 
 ## 1. Import the dbt Project
@@ -354,17 +338,7 @@ rocky-models/
 └── dim_customers.toml
 ```
 
-### What the importer converts
-
-These are the main patterns, in short form:
-
-| dbt Pattern | Rocky Conversion |
-|---|---|
-| `{{ ref('model_name') }}` | Bare table reference (`model_name`) + `depends_on` in TOML |
-| `{{ source('source_name', 'table') }}` | Fully qualified table reference (`source_name.table`) |
-| `{{ config(materialized='incremental', unique_key='id') }}` | `[strategy]` section in TOML |
-| `{{ this }}` | Target table reference from `[target]` in TOML |
-| `schema.yml` column tests (`unique`, `not_null`, `accepted_values`, `relationships`) | `[[tests]]` blocks in the model sidecar TOML (see [Section 9](#9-convert-dbt-tests-to-rocky-tests-and-contracts) below) |
+Every conversion is listed in [What translates cleanly today](#what-translates-cleanly-today-and-what-doesnt). Tests land as `[[tests]]` blocks (see [Section 9](#9-convert-dbt-tests-to-rocky-tests-and-contracts)).
 
 ### JSON output
 
@@ -409,58 +383,11 @@ Two flags override that choice:
 
 ## 2. Review the Imported Models
 
-Read each generated pair of files after the import. A typical conversion looks like this.
+Read each generated pair of files after the import. The walkthrough above shows one in full. Three points to check:
 
-### Before (dbt)
-
-```sql
--- models/stg_orders.sql
-{{ config(materialized='incremental', unique_key='order_id') }}
-
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM {{ source('shopify', 'orders') }}
-```
-
-### After (Rocky)
-
-**stg_orders.sql:**
-
-```sql
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM shopify.orders
-```
-
-**stg_orders.toml:**
-
-```toml
-name = "stg_orders"
-
-[strategy]
-type = "merge"
-unique_key = ["order_id"]
-
-[target]
-catalog = "warehouse"
-schema = "main"
-table = "stg_orders"
-
-[[sources]]
-catalog = "warehouse"
-schema = "shopify"
-table = "orders"
-```
-
-Two things moved. The `{{ config() }}` block became `[strategy]`, and `{{ source() }}` became a fully qualified reference. A `config(unique_key=...)` with no explicit `incremental_strategy` maps to Rocky's `merge` strategy keyed on `unique_key`, not to a bare `incremental` block. The `[[sources]]` block and its qualified coordinates come from the `sources.yml` definition for `shopify.orders`. Without a matching `sources.yml` entry, the importer emits a warning and no `[[sources]]` block.
+- `{{ config(materialized='incremental', unique_key='id') }}` with no explicit `incremental_strategy` becomes a `merge` strategy keyed on `unique_key`, not a bare `incremental` block.
+- The `[[sources]]` block comes from the `sources.yml` entry. Without a matching entry, the importer emits a warning and no `[[sources]]` block.
+- `{{ ref() }}` and `{{ source() }}` become bare and fully qualified references.
 
 ## 3. Handle Unsupported Jinja
 
@@ -472,23 +399,7 @@ The manifest path uses SQL compiled by dbt. The raw path converts a limited set 
 Per-model `catalog`, `schema`, and `table` routing driven by an orchestrator is a different case, usually written with `{{ target.* }}` in dbt. Rocky's config has three layers: the pipeline `rocky.toml`, `models/_defaults.toml`, and the per-model sidecar `.toml`. Every layer accepts `${VAR}` and `${VAR:-default}` substitution, resolved at config-load time. See the worked example at [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering). This suits a Dagster asset factory that injects a target per asset through the subprocess environment.
 :::
 
-### Common warnings
-
-| Pattern | Importer Behavior | Manual Fix |
-|---|---|---|
-| `{{ var('some_var') }}` | Converted to an `@var(some_var)` run-variable marker in the emitted SQL (not a warning) | Pass the value at run time with `rocky run --var some_var=value`, or give the marker an inline default: `@var(some_var, fallback)`. A marker with neither a `--var` binding nor a default fails to compile. |
-
-### Common failures
-
-| Pattern | Reason | Manual Fix |
-|---|---|---|
-| Custom Jinja macros (`{{ generate_schema_name() }}`) | Rocky cannot interpret custom macros | Rewrite the SQL without the macro |
-| `{% if ... %}` and `{% set ... %}` | Raw import cannot evaluate the statement and refuses the model | Compile with `dbt compile --full-refresh` and import the manifest, or rewrite the SQL |
-| `{% for ... %}` loops generating SQL | Dynamic SQL generation not supported | Write out the SQL explicitly or use a CTE |
-| `{% macro ... %}` definitions | Rocky uses pure SQL, not macros | Convert shared logic to CTEs or separate models |
-| Python dbt models (`.py` files) | Not SQL | Rewrite in SQL |
-
-For each failed model, read the error message and rewrite the SQL yourself. Many of these macros exist to do something Rocky expresses in config instead: incremental logic, schema naming, environment branching.
+A custom macro, `{% if %}`, `{% for %}`, `{% macro %}` or a Python model makes the importer refuse that model. [The list above](#what-translates-cleanly-today-and-what-doesnt) names each case. For each failed model, read the error and rewrite the SQL. Many macros do something Rocky expresses in config: incremental logic, schema naming, environment branching. Move shared macro logic into CTEs or separate models. A `@var(name)` marker with neither a `--var` binding nor an inline default (`@var(name, fallback)`) fails to compile.
 
 ### `generate_surrogate_key`
 
@@ -702,23 +613,13 @@ This prints the SQL Rocky will generate for each model. Compare it against the `
 
 ### Run on a test catalog
 
-Add a test pipeline to your `rocky.toml`. Point it at a sandbox catalog, and reuse the adapters you already defined: the `prod` data adapter and the `fivetran` discovery adapter.
+Add a second pipeline to `rocky.toml`. Copy `[pipeline.bronze]`, reuse the `prod` and `fivetran` adapters, and change only these keys:
 
 ```toml
 [pipeline.bronze_test]
 type = "replication"
 strategy = "full_refresh"
-
-[pipeline.bronze_test.source]
-adapter = "prod"
-
-[pipeline.bronze_test.source.discovery]
-adapter = "fivetran"
-
-[pipeline.bronze_test.source.schema_pattern]
-prefix = ""
-separator = "__"
-components = ["source"]
+# source, source.discovery and source.schema_pattern: same as [pipeline.bronze]
 
 [pipeline.bronze_test.target]
 adapter = "prod"
@@ -766,51 +667,7 @@ Everything else needs a manual step: column-level type and nullability contracts
 
 ### Generic test mapping
 
-Take these dbt tests in `schema.yml`. dbt 1.7 and later also accept `data_tests:`, and the importer reads that as a synonym for `tests:`.
-
-```yaml
-models:
-  - name: fct_orders
-    columns:
-      - name: order_id
-        tests:
-          - unique
-          - not_null
-      - name: status
-        tests:
-          - accepted_values:
-              values: ['completed', 'pending', 'cancelled']
-      - name: customer_id
-        tests:
-          - relationships:
-              to: ref('dim_customers')
-              field: customer_id
-```
-
-The importer emits `[[tests]]` blocks directly into `models/fct_orders.toml`:
-
-```toml
-[[tests]]
-type = "unique"
-column = "order_id"
-
-[[tests]]
-type = "not_null"
-column = "order_id"
-
-[[tests]]
-type = "accepted_values"
-values = ["completed", "pending", "cancelled"]
-column = "status"
-
-[[tests]]
-type = "relationships"
-to_table = "warehouse.main.dim_customers"
-to_column = "customer_id"
-column = "customer_id"
-```
-
-The importer resolves `relationships.to: ref('m')` to a fully-qualified Rocky table. It looks the name up in its own name → (catalog, schema) map over the imported models. A cross-project ref falls back to the importer defaults. `rocky test` runs these tests against the materialised tables.
+The importer reads `tests:` in `schema.yml`, and `data_tests:` (dbt 1.7 and later) as a synonym. It emits `[[tests]]` blocks into `models/<model>.toml`. The walkthrough above shows real output. It resolves `relationships.to: ref('m')` to a fully-qualified Rocky table, using its own name to (catalog, schema) map over the imported models. A cross-project ref falls back to the importer defaults. `rocky test` runs these tests against the materialised tables.
 
 | dbt Test | Rocky `[[tests]]` |
 |---|---|
@@ -1006,9 +863,7 @@ Remove the dbt steps once Rocky covers every model.
 
 ### Keeping dbt packages without converting them
 
-You do not have to convert everything. A dbt package such as `fivetran/facebook_ads` or `fivetran/stripe` produces tables in your warehouse, and Rocky can reference those tables directly as external sources. Rocky's resolver classifies a schema-qualified table reference such as `dbt_fivetran.stg_facebook_ads__ad_history` as external on its own: it appears in lineage and creates no DAG dependency.
-
-So you can leave a vendor-maintained staging package in dbt and write your own analytics in Rocky. See [Read dbt Package Tables](/guides/using-dbt-packages/) for the full walkthrough.
+You do not have to convert everything. A vendor package such as `fivetran/stripe` builds tables in your warehouse. Rocky reads a schema-qualified table such as `dbt_fivetran.stg_facebook_ads__ad_history` as an external source: it appears in lineage and creates no DAG dependency. See [Read dbt Package Tables](/guides/using-dbt-packages/).
 
 ## Troubleshooting
 
@@ -1031,9 +886,7 @@ Each one appears as a warning. To keep incremental behaviour, give the model a `
 Any of these is refused when its dbt SQL uses `is_incremental()` in a form other than the standard watermark filter. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
 
 :::caution[Incremental models need a full-refresh compile]
-Every manifest incremental model needs successful per-model evidence in a matching full-refresh artifact pair and `compiled_code`. Plain or selective compiles can leave unsafe or missing SQL. A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
-
-Run `dbt compile --full-refresh` without `--select`, or include the model. Keep `manifest.json` and `run_results.json` side by side. Remove any effective `full_refresh=false` model config and compile again. That config overrides the command flag.
+Follow the caution "Run `dbt compile --full-refresh` first" in the walkthrough above. A selective or plain compile leaves a manifest incremental model without evidence, and its first Rocky run fails or omits old rows.
 :::
 
 The raw and no-manifest importer refuses every effectively incremental model it resolves from inline, project, or model properties config. It has no compiled SQL or per-model run result.
@@ -1050,17 +903,4 @@ rocky --config pipeline.dev.toml compile --models ./rocky-models
 
 ### Macros that generate SQL dynamically
 
-If your dbt project relies on a macro that generates SQL, such as a `union_all` macro that combines tables, write the SQL out instead. A CTE with `UNION ALL` usually reads better anyway:
-
-```sql
-WITH all_orders AS (
-    SELECT * FROM raw_catalog.us_west_shopify.orders
-    UNION ALL
-    SELECT * FROM raw_catalog.eu_central_shopify.orders
-)
-SELECT
-    order_id,
-    customer_id,
-    total_amount
-FROM all_orders
-```
+Write the SQL out instead. A CTE with `UNION ALL` usually reads better than a `union_all` macro. See [Handle unsupported Jinja](#3-handle-unsupported-jinja).

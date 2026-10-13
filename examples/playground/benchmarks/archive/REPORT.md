@@ -3,7 +3,7 @@
 > **Status: historical record. Not the current report.** This file keeps
 > Rounds 1, 2 and 3 (2026-04-07 to 2026-04-10). They measured Rocky 0.1.0
 > to 0.3.0, not the current engine. The latest run on record is
-> [`REPORT_CURRENT.md`](REPORT_CURRENT.md). The numbers below are unchanged
+> [`REPORT_CURRENT.md`](../REPORT_CURRENT.md). The numbers below are unchanged
 > from the original runs.
 
 **Date:** 2026-04-07
@@ -488,4 +488,4 @@ Rocky 0.3.0 is **10-17% faster** than 0.1.0 at every scale despite significant f
 
 4. **Rocky 0.3.0 is faster than 0.1.0** despite adding multi-type pipeline config, Dagster Pipes, config UX overhaul. New features don't regress the hot path.
 
-See [`REPORT_CURRENT.md`](REPORT_CURRENT.md) for the full Round 3 report with methodology and analysis.
+See [`REPORT_CURRENT.md`](../REPORT_CURRENT.md) for the full Round 3 report with methodology and analysis.

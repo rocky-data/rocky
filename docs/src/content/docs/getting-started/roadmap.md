@@ -52,7 +52,7 @@ on it. It is a maturity grade for the code. It is not a claim about who uses Roc
   (`given`) and an expected output (`expect`). `rocky test` seeds a fresh
   in-memory DuckDB, materializes the model against the fixtures, and compares
   the result. No warehouse connection is needed. See
-  [testing](/concepts/testing/).
+  [testing](/concepts/data-quality-checks/).
 - **Config groups.** A [config group](/reference/model-format/#config-groups) in
   `models/groups/<name>.toml` fans shared routing and strategy out to every
   model that opts in with `group = "<name>"`, so a one-line change reaches the

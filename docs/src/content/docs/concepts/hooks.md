@@ -5,7 +5,7 @@ sidebar:
   order: 12
 ---
 
-Rocky fires a lifecycle event at each notable point in a run. Attach a shell script or an HTTP webhook to any event. Use it to send a notification, gate the run, write an audit record, or drive your own integration.
+Rocky fires a lifecycle event at each notable point in a run. Attach a shell script or an HTTP webhook to any event. Use it to send a notification, write an audit record, or drive your own integration.
 
 :::note[Not the same as seed hooks]
 The lifecycle hooks on this page fire **shell commands and webhooks** on pipeline events. They are separate from the `pre_hook` / `post_hook` fields on a seed sidecar, which run **SQL statements** on the warehouse around a single [`rocky seed`](/reference/cli/#rocky-seed) load.
@@ -35,9 +35,9 @@ Every event follows the same path, whichever kind of hook you attach to it.
            │ the hook fails            │ `secret` is set
            ▼                           ▼
    on_failure decides:          Rocky signs the body:
-     abort  → stop the run        X-Rocky-Signature:
-     warn   → log, continue         sha256=<hex digest>
-     ignore → continue quietly
+     warn   → log, continue       X-Rocky-Signature:
+     ignore → continue quietly      sha256=<hex digest>
+     abort  → `rocky hooks test` only
 ```
 
 ## Lifecycle events
@@ -48,7 +48,7 @@ Rocky fires 18 events, grouped into six phases:
 
 | Event | When | Use case |
 |-------|------|----------|
-| `pipeline_start` | Pipeline begins | Slack notification, deploy freeze gate |
+| `pipeline_start` | Pipeline begins | Slack notification |
 | `discover_complete` | Source discovery finishes | Log connector/table counts |
 | `compile_complete` | Compilation finishes | Validate types before execution |
 | `pipeline_complete` | Pipeline succeeds | Success notification, metrics push |
@@ -76,7 +76,7 @@ Rocky fires 18 events, grouped into six phases:
 |-------|------|----------|
 | `before_checks` | Quality checks begin | Mute downstream alerts during expected check windows |
 | `check_result` | A quality check completes | Per-check threshold alerting |
-| `after_checks` | All checks finish | Aggregate summary to dashboards, gating on total pass rate |
+| `after_checks` | All checks finish | Aggregate summary to dashboards, pass-rate summary |
 | `drift_detected` | Schema drift found | Schema change notification |
 | `anomaly_detected` | Row count anomaly | Data quality alert |
 
@@ -90,7 +90,7 @@ Rocky fires 18 events, grouped into six phases:
 
 | Event | When | Use case |
 |-------|------|----------|
-| `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend; gate downstream runs on `on_breach = "error"` |
+| `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend |
 
 :::note[Event names carry an `on_` prefix in config]
 The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky writes into the `event` field of the JSON context. When you **reference** an event — as a `[hook.*]` config key or as the `rocky hooks test` argument — prefix it with `on_`: `on_pipeline_start`, `on_budget_breach`, and so on. An unknown/unprefixed key is ignored with a warning rather than firing.
@@ -138,11 +138,13 @@ The script receives JSON like:
 
 | Mode | Behavior |
 |------|----------|
-| `abort` | Stop the pipeline if the hook fails |
+| `abort` | Mark the hook result as abort |
 | `warn` | Log a warning and continue (default) |
 | `ignore` | Silently continue |
 
-Use `abort` for a gating hook, such as a deploy freeze or an approval gate. Use `warn` or `ignore` for a notification.
+Today `rocky run` ignores every hook outcome. A failing hook is logged and the run continues. Only `rocky hooks test` acts on `abort`.
+
+A hook cannot gate a run today. Do not use a hook for a deploy freeze or an approval gate. Use hooks for notifications and audit records.
 
 ### Security: trust the `command` source
 

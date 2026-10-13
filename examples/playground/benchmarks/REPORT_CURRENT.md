@@ -4,7 +4,7 @@
 > measured Rocky 0.3.0. The engine has shipped many releases since, so treat
 > these numbers as a dated snapshot, not as the current engine's speed. The
 > cost model in §5 uses April 2026 list prices. Earlier rounds are in
-> [`REPORT.md`](REPORT.md). The public summary is the docs page
+> [`REPORT.md`](archive/REPORT.md). The public summary is the docs page
 > [Performance Benchmarks](../../../docs/src/content/docs/getting-started/benchmarks.md).
 
 **Date:** 2026-04-10
@@ -560,5 +560,5 @@ Generate charts:
 ```
 
 See also:
-- [`REPORT.md`](REPORT.md) — Historical Round 1 → Round 2 → Round 3 progression
-- [`FEATURE_COMPARISON.md`](FEATURE_COMPARISON.md) — dated (April 2026) 17-category feature comparison: Rocky vs dbt-core vs dbt-fusion vs SQLMesh vs Coalesce vs Dataform
+- [`REPORT.md`](archive/REPORT.md) — Historical Round 1 → Round 2 → Round 3 progression
+- [`FEATURE_COMPARISON.md`](archive/FEATURE_COMPARISON.md) — dated (April 2026) 17-category feature comparison: Rocky vs dbt-core vs dbt-fusion vs SQLMesh vs Coalesce vs Dataform

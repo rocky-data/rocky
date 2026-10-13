@@ -5,49 +5,38 @@ sidebar:
   order: 10
 ---
 
-You do not need Dagster, Airflow, or any other orchestration platform to run Rocky on a schedule. The engine already handles the hard parts. A plain timer supplies the one part it does not: deciding when to start.
+You do not need Dagster, Airflow, or any other orchestration platform to run Rocky on a schedule. A plain timer decides when to start. The engine does the rest.
 
-This guide shows you how to:
+You get:
 
-- drive `rocky run` from cron, a systemd timer, GitHub Actions, or a warehouse-native scheduler;
-- read the exit codes, so your alerting stays honest;
-- get failure notifications and health checks with no control plane.
+- `rocky run` driven from cron, a systemd timer, GitHub Actions, or a warehouse-native scheduler;
+- exit codes that let your alerting tell a partial success from a hard failure;
+- failure notifications and health checks with no control plane;
+- optional native scheduling with `rocky tick` (experimental).
 
-If you already run Dagster or Airflow, keep them. The [`dagster-rocky`](/dagster/resource/) integration is fully supported. This page is for the estates where a timer is enough.
+| You want | Use | Section |
+|---|---|---|
+| A timer on a Linux host | cron or a systemd timer | [cron](#cron), [systemd](#systemd-timer-and-service) |
+| No host at all | GitHub Actions or a warehouse scheduler | [GitHub Actions](#github-actions-on-a-schedule), [Databricks](#databricks-workflows-and-warehouse-native-schedulers) |
+| An alert on failure | A webhook hook or `rocky brief` | [Failure notification](#failure-notification-without-a-platform) |
+| Pre-flight and history | `rocky doctor`, `rocky history` | [Health checks](#health-checks) |
+| Schedules declared in `rocky.toml` | `rocky tick` | [Native scheduling](#native-scheduling-with-rocky-tick-experimental) |
 
-## Words this page uses
-
-The second half of this page describes Rocky's own scheduler. These are the terms it uses.
-
-| Term | What it means |
-|---|---|
-| Demand | A recorded request to run one pipeline. A `cron` slot, an `after` dependency, a `freshness` budget, or a webhook each create one. |
-| Tick | One pass that looks at all standing demand and runs what is due. |
-| Reconciler | The code that performs a tick. `rocky tick` runs it once. `rocky serve --scheduler` runs it in a loop. |
-| Claim | The marker the reconciler writes when it takes a demand to run. It stops a second tick taking the same one. |
-| Stuck-claim resolver | Recovery on the demand path. When a due demand finds its claim still `submitted` from an earlier tick, Rocky resolves it from the child's run record. |
-| Orphan sweep | A pass at the end of a tick over the `submitted` claims an earlier tick left behind. It finishes each one whose run record already shows a terminal outcome, whether or not the demand is due again. |
-| Spool file | The file on disk that holds an accepted webhook demand. Rocky writes and `fsync`s it before it answers the caller. |
-| Fail-closed | Rocky refuses to act when it cannot confirm the conditions. It never guesses in the permissive direction. |
-| At-most-once | Rocky attempts the work one time and never retries it. The work can be lost, never duplicated. |
-| `failure_backoff` | The state a pipeline enters after a scheduled run fails. Later ticks skip it until its `resume_at`. |
-| Incident bundle | One JSON file under `.rocky/incidents/` holding the facts of one failed scheduled run. |
-
-Terms used across the rest of the docs are in the [glossary](/reference/glossary/).
+If you already run Dagster or Airflow, keep them. The [`dagster-rocky`](/dagster/resource/) integration is fully supported.
 
 ## What one `rocky run` already does
 
-A single `rocky run` is not a bare SQL script. Inside one invocation the engine does the following.
+A single `rocky run` is not a bare SQL script. A timer adds only the trigger, and log retention if you want it. The run's behavior stays in `rocky.toml` and the engine.
 
-- **It executes the model DAG in dependency order.** Independent branches run concurrently, at a concurrency you configure.
-- **It retries and self-heals within the run.** A failed statement is retried up to `max_retries`. On the Databricks and Snowflake adapters a circuit breaker trips after a run of consecutive failures, so one broken warehouse connection does not hammer the rest of the run. See the [retry and circuit-breaker settings](/reference/configuration/#retry).
-- **It keeps the work that succeeded.** When some models materialize and others fail, Rocky does not discard the good ones. The run ends with a partial-success exit code and lists the failures. You keep the current data and know exactly what broke. See [per-table error containment](/advanced/per-table-error-containment/).
-- **It records runs locally.** Runs go into the embedded [state store](/reference/glossary/#state-store), a local redb database file, so `rocky history` and the audit trail need no external database. Run-record persistence is best-effort. It is most complete for replication and transformation runs today.
-- **It resumes a failed replication run.** Use `rocky run --resume-latest`, or `--resume <run_id>`. The run picks up from recorded progress for that pipeline. A complete checkpoint without a terminal run record refuses resume. Follow its recovery guidance to execute checks safely. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication).
-- **It deduplicates with an idempotency key.** Pass `rocky run --idempotency-key <key>`. Rocky skips a run whose key is already in flight or already *successful*, rather than applying it twice. A *failed* run leaves the key claimable by default, so a retry can proceed. Set `dedup_on = "any"` to skip after a failure too, which forgoes retry under that key. An idempotency key cannot be combined with resume.
-- **It fires lifecycle [hooks](/concepts/hooks/)** on pipeline events. Notifications can then live in the pipeline definition rather than in the scheduler. Hook coverage is still filling in: the failure hooks fire most reliably on the replication path today. Pair them with the exit-code routing below rather than relying on them alone.
-
-A timer adds the trigger, and log retention if you want it. Everything about *how the run behaves* already lives in `rocky.toml` and the engine. That is the whole idea. The run's behavior stays with the pipeline definition, not in a separate system you have to keep in sync.
+| Behavior | What it does |
+|---|---|
+| DAG order | Runs models in dependency order. Independent branches run concurrently, at a concurrency you configure. |
+| Retry | Retries a failed statement up to `max_retries`. On Databricks and Snowflake a circuit breaker trips after consecutive failures. See the [retry settings](/reference/configuration/#retry). |
+| Keep good work | Keeps models that materialized when others fail. The run exits with the partial-success code and lists the failures. See [per-table error containment](/advanced/per-table-error-containment/). |
+| Local records | Writes runs to the embedded [state store](/reference/glossary/#state-store) (a local redb file). `rocky history` and the audit trail need no external database. Persistence is best-effort, and most complete for replication and transformation runs today. |
+| Resume | `rocky run --resume-latest` or `--resume <run_id>` resumes a failed replication run from recorded progress. A complete checkpoint without a terminal run record refuses resume. Follow its recovery guidance. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication). |
+| Idempotency key | `rocky run --idempotency-key <key>` skips a run whose key is in flight or already *successful*. A *failed* run leaves the key claimable by default. Set `dedup_on = "any"` to skip after a failure too, which forgoes retry under that key. You cannot combine a key with resume. |
+| Hooks | Fires lifecycle [hooks](/concepts/hooks/) on pipeline events. Coverage is still filling in: failure hooks fire most reliably on the replication path today. Pair them with the exit-code routing below. |
 
 ## The exit-code contract
 
@@ -337,6 +326,24 @@ This is **experimental** while the reconciler soaks. External orchestrators stay
 
 Scheduling works on `replication`, `transformation`, `quality`, and `snapshot` pipelines. `load` pipelines cannot take part yet. A load re-ingests every discovered file on each run rather than incrementally, so scheduling one would duplicate data, and it records no run the scheduler can observe. `rocky validate` rejects a scheduled load, and rejects an `after` that references a load. Native load scheduling is a planned follow-up.
 
+### Words this section uses
+
+| Term | What it means |
+|---|---|
+| Demand | A recorded request to run one pipeline. A `cron` slot, an `after` dependency, a `freshness` budget, or a webhook each create one. |
+| Tick | One pass that looks at all standing demand and runs what is due. |
+| Reconciler | The code that performs a tick. `rocky tick` runs it once. `rocky serve --scheduler` runs it in a loop. |
+| Claim | The marker the reconciler writes when it takes a demand to run. It stops a second tick taking the same one. |
+| Stuck-claim resolver | Recovery on the demand path. When a due demand finds its claim still `submitted` from an earlier tick, Rocky resolves it from the child's run record. |
+| Orphan sweep | A pass at the end of a tick over the `submitted` claims an earlier tick left behind. It finishes each one whose run record already shows a terminal outcome, whether or not the demand is due again. |
+| Spool file | The file on disk that holds an accepted webhook demand. Rocky writes and `fsync`s it before it answers the caller. |
+| Fail-closed | Rocky refuses to act when it cannot confirm the conditions. It never guesses in the permissive direction. |
+| At-most-once | Rocky attempts the work one time and never retries it. The work can be lost, never duplicated. |
+| `failure_backoff` | The state a pipeline enters after a scheduled run fails. Later ticks skip it until its `resume_at`. |
+| Incident bundle | One JSON file under `.rocky/incidents/` holding the facts of one failed scheduled run. |
+
+Terms used across the rest of the docs are in the [glossary](/reference/glossary/).
+
 ### The demand lifecycle
 
 Every demand travels the same path, whatever created it.
@@ -407,33 +414,19 @@ after = ["raw"]             # run once raw has a newer success than staging's la
 * * * * *  analytics  cd /srv/analytics && flock -n /var/lock/rocky-tick.lock rocky tick --output json >> /var/log/rocky/tick.log 2>&1
 ```
 
-Or a systemd timer:
+Or a systemd timer. It follows the units in the earlier systemd section: a `oneshot` service with `SuccessExitStatus=2`, because the wrapper routes exit `2`.
 
 ```ini
 # /etc/systemd/system/rocky-tick.timer
-[Unit]
-Description=Evaluate Rocky schedule demand every minute
-
 [Timer]
 OnCalendar=*:0/1
-# Do not stack ticks if one runs long.
 AccuracySec=1s
 
-[Install]
-WantedBy=timers.target
-```
-
-```ini
 # /etc/systemd/system/rocky-tick.service
-[Unit]
-Description=Rocky demand reconciler tick
-
 [Service]
 Type=oneshot
 WorkingDirectory=/srv/analytics
 ExecStart=/usr/local/bin/rocky tick --output json
-# Exit 2 (a due run failed or was partial) is not a unit failure — the wrapper
-# below routes it. Total failures (exit 1) still trip OnFailure.
 SuccessExitStatus=2
 ```
 
@@ -555,7 +548,7 @@ If you need timers on several hosts, give each host its own project and state fi
 
 ### Preview before you wire the timer
 
-`rocky tick --dry-run` evaluates demand and reports exactly what *would* run. It executes nothing and writes no state. Use it to confirm a new schedule does what you expect:
+`rocky tick --dry-run` evaluates demand and reports exactly what *would* run. It starts no pipeline and advances no scheduler cursor. It still opens the state store read-write. On a fresh project it can create the state file. On an older store it can stamp the current schema version. Use it to confirm a new schedule does what you expect:
 
 ```bash
 rocky tick --dry-run --now 2026-05-02T03:00:00Z --output json
@@ -565,13 +558,11 @@ rocky tick --dry-run --now 2026-05-02T03:00:00Z --output json
 
 ### Exit codes and honest alerting
 
-`rocky tick` reuses the exit-code contract above. Scoped to a tick, the three codes mean this:
+`rocky tick` reuses the exit-code contract above:
 
-| Code | What it means for `rocky tick` |
-|------|--------------------------------|
-| `0` | Nothing was due, or every run the tick launched succeeded |
-| `1` | The tick could not proceed at all (invalid config, unopenable state). It ran nothing and failed closed |
-| `2` | At least one launched run failed or came back partial |
+- `0`: nothing was due, or every run the tick launched succeeded.
+- `1`: the tick could not proceed at all (invalid config, unopenable state). It ran nothing and failed closed.
+- `2`: at least one launched run failed or came back partial.
 
 The same `rocky-run.sh` routing works unchanged.
 

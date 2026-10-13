@@ -9,7 +9,7 @@ Short definitions of the terms that show up across Rocky's docs, CLI output, and
 
 ### Adapter
 
-A plugin that connects Rocky to a system. Discovery adapters (Fivetran, Airbyte, Iceberg, `manual`, and DuckDB and BigQuery) list what tables exist. Warehouse adapters (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, SQL Server, Redshift, ClickHouse, Spark, Trino) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/concepts/adapters/).
+A plugin that connects Rocky to a system. Discovery adapters (Fivetran, Airbyte, Iceberg, `manual`, and DuckDB and BigQuery) list what tables exist. Warehouse adapters (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, SQL Server, Redshift, ClickHouse, Spark, Trino) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/guides/adapter-sdk/).
 
 ### Apply
 
@@ -41,7 +41,7 @@ A data-quality assertion that runs inline during a run (row counts, column match
 
 ### Compile-time contract
 
-A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E011`) that blocks the PR. See [Testing and contracts](/concepts/testing/).
+A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E011`) that blocks the PR. See [Checks and Tests](/concepts/data-quality-checks/).
 
 ### Config group
 
@@ -161,7 +161,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Plan store
 
-Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. The directory is a trusted input: anyone who can write it can author a plan that `rocky apply` runs. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Plan store v1 to v2](/concepts/plan-store-v1-to-v2/).
+Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. The directory is a trusted input: anyone who can write it can author a plan that `rocky apply` runs. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Upgrade Notes](/advanced/upgrade-notes/).
 
 ### Provenance
 

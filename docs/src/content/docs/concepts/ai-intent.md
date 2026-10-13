@@ -148,7 +148,7 @@ rocky ai-test --models models/ --all --save
 
 The LLM reads the intent, the column schema with types and nullability, and the
 target table. It produces SQL assertions. Each assertion is a query that returns
-0 rows when the assertion holds. The [Testing and Contracts](/concepts/testing)
+0 rows when the assertion holds. The [Checks and Tests](/concepts/data-quality-checks/)
 page has the test format.
 
 ### rocky ai-contract

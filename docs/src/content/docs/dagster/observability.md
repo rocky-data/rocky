@@ -2,7 +2,7 @@
 title: "Observability: Drift, Anomalies, Optimize"
 description: Surface Rocky's drift, anomaly, and optimization signals as native Dagster events
 sidebar:
-  order: 12
+  order: 13
 ---
 
 Rocky notices things while it runs. A source column changed type. A table
@@ -52,8 +52,7 @@ The plan file records exactly what Rocky tried to apply: the
 materialization list, the governance plan, and the drift actions. Compact
 and archive plans also carry the typed
 [IR](/reference/glossary/#ir-intermediate-representation), the graph the
-apply path regenerates SQL from. See the [Plan store v1 to v2 migration
-guide](/concepts/plan-store-v1-to-v2/).
+apply path regenerates SQL from. See the [Upgrade Notes](/advanced/upgrade-notes/).
 
 `run_pipes` also attaches the plan id as `extras={"plan_id": plan_id}`.
 Dagster then shows it as run metadata in the run viewer, one click from a

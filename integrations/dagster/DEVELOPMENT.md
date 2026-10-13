@@ -75,7 +75,7 @@ The configuration fields and every method are listed in the [RockyResource docs]
 
 ### 3. Translator (`translator.py`)
 
-`RockyDagsterTranslator` maps Rocky sources, tables, models, and DAG nodes to Dagster asset keys, groups, tags, and metadata. Subclass it to change naming without touching execution code. The methods and defaults are in the [Translator docs](https://rocky-data.dev/dagster/translator/).
+`RockyDagsterTranslator` maps Rocky sources, tables, models, and DAG nodes to Dagster asset keys, groups, tags, and metadata. Subclass it to change naming without touching execution code. The methods and defaults are in the [Translator docs](https://rocky-data.dev/dagster/assets/#customize-with-a-translator).
 
 ### 4. Component (`component.py`)
 
