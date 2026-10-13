@@ -53,7 +53,7 @@ Entries on `contained[*]` are not failures of their own. They name models Rocky 
 | [Quality check failures](#4-quality-check-failures) | `check_results[].checks[].passed == false` | `rocky run` / `rocky apply --output json` |
 | [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky apply` exit + entry on `errors[*]` with typed `failure_kind` | `rocky apply`, `rocky doctor` |
 | [State store failures](#6-state-store-failures) | `state` / `state_sync` doctor checks report `critical`, lockfile errors, missing watermarks | `rocky doctor`, `rocky state` |
-| [Hook failures](#7-hook-failures) | Hook failure in run stderr / logs; `on_failure: abort` aborts the run | `rocky hooks test`, run stderr |
+| [Hook failures](#7-hook-failures) | Hook failure in run stderr / logs; `rocky run` does not stop on a hook failure | `rocky hooks test`, run stderr |
 | [Cost / budget violations](#8-cost--budget-violations) | `RunOutput.budget_breaches[]`; `on_breach = "error"` flips to non-zero exit | `rocky cost`, `rocky apply` |
 | [Governance failures](#9-governance-failures) | warehouse-rejected grants in `errors[]`, `mask_actions` lists unresolved tags (`W004`) | `rocky apply`, `rocky plan --env` |
 
@@ -306,14 +306,14 @@ A failure here does one of two things. It stops the run from starting, through l
 
 **Definition.** A pipeline lifecycle hook failed. Hooks fire on events such as `on_pipeline_start`, `on_pipeline_complete`, `on_after_model_run`, and `on_model_error`. A hook can be a shell command, a webhook, or a templated payload.
 
-**Detection signal.** Hook failures have no dedicated field on the run output. They appear in the run's stderr and logs. Reproduce one in isolation with `rocky hooks test <event> --output json`, whose `status` is `no_hooks`, `continue`, or `abort`. The hook's `on_failure` setting decides whether a failure aborts the run (`abort`) or continues with a warning (`warn`).
+**Detection signal.** Hook failures have no dedicated field on the run output. They appear in the run's stderr and logs. Reproduce one in isolation with `rocky hooks test <event> --output json`, whose `status` is `no_hooks`, `continue`, or `abort`. Only `rocky hooks test` acts on `on_failure = "abort"`. `rocky run` ignores every hook outcome, so the run continues after a failed hook.
 
 **Recovery playbook.**
 
 1. Reproduce the hook with `rocky hooks test <event> --output json`. This fires it in isolation against a dummy event payload.
 2. If the hook is a **shell command** that exits non-zero, fix the script. Check its env-var assumptions too: hooks inherit the run's environment, not your shell's.
 3. If the hook is a **webhook**, read the receiver's logs for the real rejection. Rocky surfaces only the HTTP status, and the receiver's body usually holds the actionable message.
-4. If the hook is **flaky**, from a network blip or a third-party rate limit, set `on_failure = "warn"`. The transient failure then stops gating the run, and the run's stderr and logs still flag it in your observability stack.
+4. If the hook is **flaky**, from a network blip or a third-party rate limit, set `on_failure = "warn"`. The run's stderr and logs still flag the failure in your observability stack.
 
 Hook failures look like runtime failures. The fix is in your hook script or webhook receiver, not in the pipeline.
 

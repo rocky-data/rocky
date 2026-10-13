@@ -195,7 +195,7 @@ The commit is atomic across the successful models. Failed models keep their prio
 
 Rocky fires `pipeline_complete` on success and `pipeline_error` on failure. The `HookEvent` enum serializes as snake_case. The full set of 18 events runs from `pipeline_start` through `after_model_run`, `check_result`, `drift_detected`, and `budget_breach`. See [Hooks and webhooks](/concepts/hooks/).
 
-Command hooks run as shell subprocesses. Webhook hooks fire as HTTP POSTs, asynchronously if configured. The `on_failure` setting (`abort`, `warn`, or `ignore`) decides what a hook failure does to the run.
+Command hooks run as shell subprocesses. Webhook hooks fire as HTTP POSTs, asynchronously if configured. The `on_failure` setting (`abort`, `warn`, or `ignore`) decides how `rocky hooks test` treats a failure. `rocky run` ignores every hook outcome today: it logs a failing hook and continues.
 
 ## Step 9: Emit JSON output
 

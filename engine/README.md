@@ -310,8 +310,7 @@ For how Rocky compares to other SQL transformation tools, see the
 Build a custom adapter in Rust, or in any language, with the
 [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/). It walks
 through a ClickHouse-shaped skeleton, the trait surface, auth, testing, and
-distribution. For the concepts, see
-[Adapter SDK](https://rocky-data.dev/concepts/adapters/).
+distribution.
 
 ## Replaying a recorded run
 

@@ -2,7 +2,7 @@
 title: Check Results
 description: Convert Rocky check results into Dagster events
 sidebar:
-  order: 6
+  order: 7
 ---
 
 Two functions turn the result of a Rocky run into Dagster events. The events

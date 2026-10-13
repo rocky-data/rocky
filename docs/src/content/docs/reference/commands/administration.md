@@ -1300,7 +1300,7 @@ rocky tick [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--dry-run` | `bool` | `false` | Report what would run. Execute nothing and write no state. |
+| `--dry-run` | `bool` | `false` | Report what would run. Start no pipeline and advance no scheduler cursor. It still opens the state store read-write. See [Preview before you wire the timer](/guides/running-without-an-orchestrator/#preview-before-you-wire-the-timer). |
 | `--pipeline <NAME>` | `string` | (every scheduled pipeline) | Evaluate one pipeline only. |
 | `--now <RFC3339>` | `string` | the wall clock | Evaluate demand as of this instant, for tests and catch-up previews. It moves scheduling decisions only. It does not age files on disk, so it cannot expire the webhook dedup window. |
 

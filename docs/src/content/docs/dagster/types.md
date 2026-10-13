@@ -2,7 +2,7 @@
 title: Type Reference
 description: Pydantic models for Rocky's JSON output
 sidebar:
-  order: 8
+  order: 10
 ---
 
 Most `RockyResource` methods return a Pydantic v2 model, not a dictionary. The model validates the JSON while it parses it, and your editor completes the field names. This page is the field-by-field reference for the models you read most often.

@@ -2,7 +2,7 @@
 title: Freshness Policies
 description: Attach Dagster freshness expectations to Rocky-managed assets
 sidebar:
-  order: 9
+  order: 8
 ---
 
 `dagster-rocky` maps Rocky's freshness configuration onto Dagster's

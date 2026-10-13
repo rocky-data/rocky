@@ -117,9 +117,7 @@ Rocky walks the models in topological order. For each one it pulls column-level
 lineage out of the SQL AST. It resolves table aliases to real model or source
 names. It expands `SELECT *` against the upstream schemas.
 
-The result is a `SemanticGraph`: per-model schemas, upstream and downstream
-relationships, and cross-model lineage edges. The [Semantic graph](#semantic-graph)
-section below covers it in detail.
+The result is a `SemanticGraph`. The [Semantic graph](#semantic-graph) section below covers it.
 
 ### 4. Type check
 
@@ -266,7 +264,7 @@ compile is an error.
 A `rocky plan` fingerprints the contract file of each model it covers, from
 either place. If that file changes or is deleted before `rocky apply`, the
 apply refuses with `plan_models_changed`. The
-[Testing and Contracts](/concepts/testing) page has the contract format.
+[Checks and Tests](/concepts/data-quality-checks/) page has the contract format.
 
 ### 6. Lint passes and merge
 
@@ -566,18 +564,12 @@ span, and sometimes a suggested fix.
 | Code | Meaning |
 |------|---------|
 | `E001` | Type-checking error (unresolved reference, type mismatch) |
-| `E010` | Required column missing from model output |
-| `E011` | Column type mismatch against contract |
-| `E012` | Nullability violation against contract |
-| `E013` | Protected column removed |
-| `E014` | The output holds a nullable column the contract does not declare, while the contract sets `[rules] no_new_nullable = true` |
+| `E010`--`E014` | Contract violations: a missing required column, a type mismatch, a nullability violation, a removed protected column, an undeclared nullable column. See [Checks and Tests](/concepts/data-quality-checks/#data-contracts) |
 | `E020`--`E026` | `time_interval` validation (`@start_date`/`@end_date` placeholders, `time_column` presence/type/nullability/granularity) |
 | `E027` | Budget exceeded -- projected spend over the model's `[budget]` ceiling |
 | `E028` | Required run variable (`@var(name)`) referenced but no `--var` supplied and no inline default |
 | `E029` | A bare column name is ambiguous: two joined relations both have it. See [Ambiguous column names](#ambiguous-column-names-e029) |
-| `E030` | Imported producer dropped a column this project reads (cross-team contract) |
-| `E031` | Imported producer narrowed the type of a column this project reads (cross-team contract) |
-| `E032` | Imported producer tightened a column this project reads from nullable to NOT NULL (cross-team contract) |
+| `E030`--`E032` | Imported producer dropped a column, narrowed its type, or tightened it to NOT NULL, and this project reads it (cross-team contract). See [Cross-Team Contracts](/concepts/cross-team-contracts/) |
 | `E033` | Imported snapshot's recipe hash does not match the configured `pin` |
 | `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
@@ -611,8 +603,7 @@ span, and sometimes a suggested fix.
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |
-| `W010` | Contract defines a column not in model output (not required) |
-| `W011` | Contract exists for a model not found in the project |
+| `W010`, `W011` | A contract column is not in the model output, or a contract exists for a model not in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
 | `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
 | `W014` | `rocky serve` could not load the transformation pipelines' models (a model name shared across pipelines, a malformed sidecar, a dangling models directory), so `/api/v1/models` shows only `models/` and `/api/v1/dag` answers the load error until it is fixed. If `models/` has no model either, the server reports `engine_not_ready` with the load error instead |

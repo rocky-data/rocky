@@ -51,7 +51,7 @@ defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
 |---|---|
 | [`RockyResource`](/dagster/resource/) | `ConfigurableResource` wrapping the CLI. One method per CLI command, three run modes (buffered, streaming, Pipes) |
 | [`RockyComponent`](/dagster/component/) | State-backed component that caches discovery; `dag_mode=True` builds connected asset graphs |
-| [`RockyDagsterTranslator`](/dagster/translator/) | Customize asset keys, groups, tags, and metadata per Rocky table |
+| [`RockyDagsterTranslator`](/dagster/assets/#customize-with-a-translator) | Customize asset keys, groups, tags, and metadata per Rocky table |
 | [`load_rocky_assets()`](/dagster/assets/) | Returns one `AssetSpec` per enabled Rocky table |
 | `emit_check_results()` / `emit_materializations()` | Convert Rocky results into Dagster events |
 

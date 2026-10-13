@@ -2,7 +2,7 @@
 title: RockyComponent
 description: A Dagster component that caches rocky discover output in a state file
 sidebar:
-  order: 7
+  order: 5
 ---
 
 `RockyComponent` caches the output of `rocky discover` in a state file. Dagster
@@ -57,12 +57,12 @@ except `surface_optimize_metadata`.
 
 | Field | YAML | What it does |
 |---|---|---|
-| `translator_class` | yes | Dotted path to a [`RockyDagsterTranslator`](/dagster/translator/) subclass, for example `my_module.MyTranslator`. Not an opt-in; listed here because it is set in YAML. |
+| `translator_class` | yes | Dotted path to a [`RockyDagsterTranslator`](/dagster/assets/#customize-with-a-translator) subclass, for example `my_module.MyTranslator`. Not an opt-in; listed here because it is set in YAML. |
 | `surface_optimize_metadata` | yes | On by default. The state refresh also runs `rocky optimize`, and the recommendations land in `AssetSpec.metadata`. |
 | `surface_derived_models` | yes | Each compiled model becomes its own asset. See [Derived models](/dagster/derived-models/). |
 | `dag_mode` | yes | Builds one connected graph from `rocky dag`. See [DAG mode](#dag-mode). |
 | `execution_mode` | yes | `"streaming"` (default) or `"pipes"`. See [Live log streaming](/dagster/pipes/#rockycomponent-default). |
-| `enable_sensor` | yes | Adds a [`rocky_source_sensor`](/dagster/sensors/). Tune it with `sensor_granularity` and `sensor_interval_seconds`. |
+| `enable_sensor` | yes | Adds a [`rocky_source_sensor`](/dagster/scheduling/#sensors). Tune it with `sensor_granularity` and `sensor_interval_seconds`. |
 | `surface_compliance` | yes | Calls `rocky compliance` once per materialization batch. Emits one aggregated `AssetCheckResult` per asset with classification exceptions. |
 | `surface_configured_checks` | yes | Declares a check spec for every configured non-default check name the engine reports, so those checks show before any run. |
 | `surface_retention_status` | yes | Calls `rocky retention-status` once per materialization batch. Emits one `AssetObservation` per model row. |

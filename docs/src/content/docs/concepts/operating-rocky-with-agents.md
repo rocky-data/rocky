@@ -67,28 +67,9 @@ fixes the SQL, and re-drafts until the compile is clean.
 
 ## Generators and write tools
 
-The write surface splits in two, and the prefix tells you which half you are in.
+The write surface splits in two, and the prefix tells you which half you are in. The **`ai_*` generators** call a language model under your own `ANTHROPIC_API_KEY` and hand back a draft. They change nothing on disk. The **`draft_*` write tools** write content into the project and compile it, whether it is the agent's own work or a generator's output.
 
-The **`ai_*` generators** call a language model under your own
-`ANTHROPIC_API_KEY` and hand back a draft. They change nothing on disk. Each one
-matches a `rocky ai-*` CLI verb.
-
-The **`draft_*` write tools** write content into the project and compile it.
-The content can be the agent's own work or a generator's output. The write tool
-does not care where it came from, only that it compiles and clears your policy
-rules.
-
-Keeping them apart is what makes a rule like *this agent may not author
-contracts in the `pii` schema* enforceable. Generating is cheap and speculative.
-Writing is a governed act, so it has one place to be checked.
-
-The write tools do not give an agent new power. An agent in a coding harness can
-already write files. What the tools add is compile feedback with the write and a
-visible policy verdict. They also work in a harness with no filesystem access at
-all. Rocky supplies the tools, the rules, and the verification. The loop itself
-stays in whatever client you connect.
-
-See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
+Keeping them apart makes a rule like *this agent may not author contracts in the `pii` schema* enforceable. Generating is cheap and speculative. Writing is a governed act, so it has one place to be checked. The write tools give an agent no new power. They add compile feedback with the write, a visible policy verdict, and they work in a harness with no filesystem access. The loop itself stays in whatever client you connect. [MCP Authoring](/concepts/mcp-authoring/) lists every tool in both families.
 
 ## The three gates
 
@@ -172,11 +153,7 @@ set by the caller, and Rocky still does not check that a person set it. So
 `--profile approver` gives you a server where an agent's `confirm` is
 sufficient. Start one only where that is what you want.
 
-Be exact about what this check verifies. It reads a file, parses it, and compares
-the plan id. It does not authenticate who approved, or that a person approved at
-all. That check is a floor: it runs on every AI-authored apply whatever your
-`[policy]` rules say, so an `allow` rule cannot waive it, and a policy rule can
-only add restrictions on top. What the marker cannot tell you is covered below.
+The check reads a file, parses it, and compares the plan id. It does not authenticate who approved, or that a person approved at all. It is a floor: it runs on every AI-authored apply whatever your `[policy]` rules say. An `allow` rule cannot waive it, and a policy rule can only add restrictions on top. The next section says what the marker cannot tell you.
 
 ## What the three gates do not defend against
 

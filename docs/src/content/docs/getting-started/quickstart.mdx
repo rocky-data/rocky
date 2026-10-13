@@ -1,46 +1,17 @@
 ---
 title: Quickstart
-description: Get a Rocky pipeline running in 5 minutes
+description: Copy Fivetran tables into Databricks with a Rocky plan and apply, in 5 minutes
 sidebar:
   order: 3
 ---
 
 import { Steps } from '@astrojs/starlight/components';
 
-This page builds a Rocky pipeline that copies Fivetran-landed source tables into Databricks. It takes about five minutes.
+This page copies Fivetran-landed source tables into Databricks. It takes about five minutes.
 
 :::tip[No warehouse credentials?]
-The [Playground](/guides/playground/) runs a local DuckDB transformation project with nothing to configure. It can compile, review emitted SQL, run models, and preview rows. `rocky plan` currently supports replication pipelines only. Use the Playground's guarded local run instead.
+Use the [Playground](/guides/playground/). It runs on local DuckDB and needs no setup. `rocky plan` supports replication pipelines only, so the Playground uses `rocky run`.
 :::
-
-There are two ways to reach the warehouse. Both start the same way.
-
-```
-  Shared setup
-  ────────────
-  rocky init        scaffold the project
-  rocky validate    check config + adapter wiring, no network
-  rocky discover    ask the source which tables exist
-        │
-        ├───────────────────────────┐
-        │ PR-gated deploy           │ Local iteration
-        ▼                           ▼
-  rocky plan                    rocky run
-        │ writes                    │ plans and applies
-        ▼ .rocky/plans/<id>.json    │ in one step
-  you review the SQL and drift      │
-        │                           │
-        ▼                           │
-  rocky apply <id>                  │
-        │                           │
-        └────────────┬──────────────┘
-                     ▼
-                 warehouse
-```
-
-Steps 1 to 4 below are the shared setup. Steps 5 and 6 are the PR-gated
-replication path. Step 7 inspects what the run stored. For a local
-transformation workflow, use the [Playground](/guides/playground/).
 
 <Steps>
 
@@ -51,9 +22,7 @@ transformation workflow, use the [Playground](/guides/playground/).
    cd my-pipeline
    ```
 
-   This writes a runnable DuckDB starter project. You get a `rocky.toml`, a `models/` directory holding `_defaults.toml` and a sample `stg_orders` model, and a `seeds/seed.sql`. Step 2 replaces the generated `rocky.toml` with the Fivetran to Databricks config below.
-
-   To start from a similar Fivetran to Databricks config instead, run `rocky init my-pipeline --template databricks-fivetran`. Its pipeline and adapter names differ from step 2.
+   This writes a DuckDB starter project. Step 2 replaces its `rocky.toml`.
 
 2. **Configure a source, a target, and the pipeline that wires them together.**
 
@@ -106,7 +75,7 @@ transformation workflow, use the [Playground](/guides/playground/).
    backend = "local"
    ```
 
-   An `[adapter.*]` block defines one connection. A `[pipeline.*]` block ties adapters together into a unit of work. Select between pipelines with `--pipeline NAME`. Export the environment variables this config references (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, and the rest) before you run Rocky.
+   Export the environment variables this config references (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, and the rest) before you run Rocky. Other warehouses: [Connect to a warehouse](/guides/connect-a-warehouse/).
 
 3. **Validate the config.**
 
@@ -130,7 +99,7 @@ transformation workflow, use the [Playground](/guides/playground/).
    plan_id=$(rocky plan --filter source=orders --output json | jq -r .plan_id)
    ```
 
-   `--filter` selects sources by a schema-pattern component. Here `source=orders` selects the `src__orders` schema. Rocky compiles the pipeline, detects drift, and records a plan keyed by `plan_id`. A plan is the exact work Rocky will do, written down before it does any of it. The same inputs always produce the same plan. Read the SQL, the drift actions, and the checks before you commit to a run. See the [glossary](/reference/glossary/).
+   `--filter source=orders` selects the `src__orders` schema. Rocky compiles the pipeline, detects drift, and writes a plan to `.rocky/plans/<plan_id>.json`. A plan is the exact work Rocky will do, written down first. Read it before you apply it. See the [glossary](/reference/glossary/).
 
 6. **Apply the plan.**
 
@@ -138,37 +107,18 @@ transformation workflow, use the [Playground](/guides/playground/).
    rocky apply "$plan_id"
    ```
 
-   Rocky executes the plan in order: discover, create catalogs and schemas, apply drift, copy data, run checks. It prints a versioned JSON result holding the materializations, check results, drift actions, and permissions.
-
-7. **Inspect the state.**
-
-   ```bash
-   rocky state
-   ```
-
-   Shows the stored watermark for every table. A watermark is the timestamp of the newest row Rocky has already loaded. See the [glossary](/reference/glossary/).
+   Rocky runs the plan in order: create catalogs and schemas, apply drift, copy data, run checks. It prints a JSON result. Checks run after the copy, so a failed check cannot undo it.
 
 </Steps>
 
 ## The one-command path
 
-`rocky run` does the work of steps 5 and 6 in one command. Use it for replication iteration and for automation.
-
-```bash
-rocky run --filter source=orders
-```
-
-Either path resumes from the last checkpoint after a failure. Add `--resume-latest`:
-
-```bash
-rocky run --filter source=orders --resume-latest
-```
+`rocky run --filter source=orders` plans and applies in one step. Use it for local iteration and automation. Add `--resume-latest` to resume from the last checkpoint after a failure.
 
 ## Next steps
 
-- [Playground](/guides/playground/): the credential-free DuckDB version of this flow.
-- [Browser UI](/guides/browser-ui/): open the project in your browser with `rocky serve --ui`.
-- [Schema patterns](/concepts/schema-patterns/): customize source-to-target mapping.
-- [Silver layer](/concepts/silver-layer/): add transformation models on top of the bronze copy.
-- [Data quality checks](/concepts/data-quality-checks/): assertions that run inline with the load.
+- [Browser UI](/guides/browser-ui/): open the project with `rocky serve --ui`.
+- [VS Code extension](/guides/ide-setup/): compile errors and types as you type.
+- [Bronze layer](/concepts/bronze-layer/): how replication and schema patterns work.
+- [Silver layer](/concepts/silver-layer/): add transformation models on top.
 - [Dagster integration](/dagster/introduction/): run Rocky as Dagster assets.

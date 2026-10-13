@@ -11,7 +11,7 @@ Each method runs the `rocky` binary as a subprocess with `--output json`, parses
 
 Rocky ships one orchestrator integration, [`dagster-rocky`](/dagster/introduction/). `RockyResource` there is a thin adapter over this same `RockyClient`. Every other orchestrator, whether Airflow, Prefect, Flyte, or a cron script, wraps this client in a task.
 
-[Recipes](/python-sdk/recipes/) covers the patterns that go past this page: streaming, error handling, `rocky serve` mode, and Airflow and Prefect examples.
+[Recipes](/python-sdk/recipes/) covers streaming, partial success, `rocky serve` mode, and Airflow and Prefect examples.
 
 ## What one call does
 
@@ -130,7 +130,7 @@ except RockyCommandError as exc:
 
 `discover()` returns a `DiscoverResult`. Read the discovered sources from `.sources`, and check `.failed_sources` before you treat a missing source as deleted upstream.
 
-`run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress anywhere. See [Stream live progress](/python-sdk/recipes/#stream-live-progress).
+`run()` accepts a `log_callback` for live progress. See [Stream live progress](/python-sdk/recipes/#stream-live-progress).
 
 The [`RockyResource` reference](/dagster/resource/) documents the signatures, parameters, and return types. The Dagster resource delegates to `RockyClient`, so the shared methods match. `profile` and the package write methods (`package_add`, `package_update`, `package_remove`) are on `RockyClient` only. The output model shapes are in the [JSON output reference](/reference/json-output/).
 

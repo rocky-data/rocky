@@ -2,7 +2,7 @@
 title: Dagster+ Branch Deployments
 description: Detect Dagster+ branch deployments and derive Rocky shadow-mode suffixes
 sidebar:
-  order: 19
+  order: 16
 ---
 
 Dagster+ creates a *branch deployment* when a pull request opens: an isolated

@@ -9,7 +9,7 @@
 
 Lifecycle hooks declared in `rocky.toml` that fire shell commands on
 pipeline events. Each hook receives a JSON event payload on stdin and can
-abort, warn, or ignore on failure.
+set `on_failure` to abort, warn, or ignore. `rocky run` only logs a failing hook; only `rocky hooks test` acts on abort.
 
 ## Why it's distinctive
 

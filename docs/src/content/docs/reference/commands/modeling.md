@@ -1040,7 +1040,7 @@ The default `rocky test` path also runs fixture-driven `[[test]]` unit tests dec
 
 Each `results` entry carries the model name, the `[[test]]` block's `test` name, a `passed` flag, an `error` message (`null` when the test passed), and the `mismatches` array of row-level diffs. Each mismatch renders its row as `col=val, col=val`. A mismatch `kind` is `missing` (expected but not produced), `extra` (produced but not expected), or `value_diff` (same positional row, differing values, from an `ordered` expectation).
 
-`--declarative` is a separate surface: it adds a `declarative` block summarising `[[tests]]` (plural) declared in model sidecars, run against the configured warehouse adapter rather than DuckDB. See [Testing and Contracts](/concepts/testing/) for both surfaces.
+`--declarative` is a separate surface: it adds a `declarative` block summarising `[[tests]]` (plural) declared in model sidecars, run against the configured warehouse adapter rather than DuckDB. See [Checks and Tests](/concepts/data-quality-checks/) for both surfaces.
 
 ### A selector that matches nothing fails
 
@@ -1403,6 +1403,8 @@ Sample the result rows of one transformation model, or of one CTE inside it. Cla
 | `--sql-file <PATH>` | `PathBuf` | | Preview an ad-hoc SQL snippet read from this file instead of the model's compiled SQL. This backs the editor's "Preview Selection". Mutually exclusive with `--cte`. |
 
 `--sql-file` still needs `--model`, which names the enclosing model. If that model has any masked column, Rocky refuses the ad-hoc preview rather than risk leaking a pre-mask value.
+
+**Masking by adapter.** The `hash` and `partial` masks work on Databricks, Snowflake and DuckDB. The code also accepts the `spark` adapter type for both. On every other adapter, such as BigQuery, Rocky has no inline expression for them. `rocky preview rows` then returns the `unmaskable_column` error and no rows. The error names the columns. The `redact` mask works on every adapter.
 
 **Example.** Peek at a model's rows during local development:
 

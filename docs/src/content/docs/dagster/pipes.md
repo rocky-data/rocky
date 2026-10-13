@@ -2,7 +2,7 @@
 title: Live Log Streaming (Pipes)
 description: Stream rocky run progress to the Dagster run viewer in real time
 sidebar:
-  order: 20
+  order: 17
 ---
 
 **`RockyResource.run_streaming()`** is a Pipes-style alternative to

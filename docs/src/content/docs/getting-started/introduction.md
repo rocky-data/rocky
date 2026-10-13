@@ -5,242 +5,103 @@ sidebar:
   order: 1
 ---
 
-**Rocky is the typed graph between your code and your warehouse.** You write SQL
-and TOML. Rocky compiles them and reports supported static problems across the
-project graph. A later run sends generated SQL to the warehouse.
+**Rocky is the typed graph between your code and your warehouse.** You write SQL and TOML. Rocky compiles them and reports supported static problems across the project graph. A later run sends generated SQL to the warehouse.
 
-Rocky owns the graph. Your warehouse keeps storage and compute: Databricks,
-Snowflake, BigQuery, DuckDB, or another [supported adapter](#supported-adapters). Everything between the two is Rocky's job:
-branches, run records, column-level lineage, compile-time contracts, a
-dialect-portability lint, and per-model cost.
+Your warehouse keeps storage and compute: Databricks, Snowflake, BigQuery, DuckDB, or another [supported adapter](/guides/adapter-sdk/). Rocky owns the graph between the two.
 
 ```
    your SQL + rocky.toml
             │
             ▼
-   ┌──────────────────┐   compile errors, E### ──► fix the project
-   │      Rocky       │───────────────────────────────────┐
-   │  compile · plan  │                                   │
-   └────────┬─────────┘                                   ▼
-            │ dialect SQL                            you fix it
+   ┌──────────────────┐   compile errors, E### ──► you fix the project
+   │      Rocky       │
+   │  compile · plan  │
+   └────────┬─────────┘
+            │ dialect SQL
             ▼
    ┌──────────────────┐
    │    warehouse     │  storage + compute stay here
    └──────────────────┘
 ```
 
+Rocky is not a warehouse, not a table format, and not a query engine.
+
+## Start here
+
+| Step | Page |
+|---|---|
+| Install | [Installation](/getting-started/installation/) |
+| Run a first project, no credentials | [Playground](/guides/playground/) |
+| Copy real tables into a warehouse | [Quickstart](/getting-started/quickstart/) |
+| See the project in a browser | [Browser UI](/guides/browser-ui/): `rocky serve --ui` |
+| Get types and errors in the editor | [VS Code extension](/guides/ide-setup/) |
+| Move over a dbt Core project | [Migrate from dbt](/guides/migrate-from-dbt/) |
+
 ## Why Rocky exists
 
-The expensive failures on a data platform are not slow queries. They are trust
-failures. Nothing breaks loudly, and the damage surfaces days later, inside a
-number somebody already acted on.
+The expensive failures on a data platform are not slow queries. They are trust failures. Nothing breaks loudly, and the damage surfaces days later.
 
-- A source column type changes upstream. A revenue dashboard quietly diverges
-  for three days.
-- An engineer renames a column on `stg_orders`. 47 downstream models break in
-  production.
-- A `SELECT *` pulls in a new column nobody designed for. A downstream join
-  silently double-counts.
-- A Snowflake-only function lands in a Databricks-targeted project. It fails
-  only in prod.
-- Warehouse spend doubles in a month. Nobody can say which model caused it.
-- An auditor asks who changed `fct_revenue.amount`, when, and why. The honest
-  answer is `git blame` and screenshots.
+- A source column type changes upstream. A revenue dashboard quietly diverges.
+- An engineer renames a column on `stg_orders`. 47 downstream models break in production.
+- A Snowflake-only function lands in a Databricks project. It fails only in prod.
+- Warehouse spend doubles. Nobody can say which model caused it.
 
-**Rocky can report or gate selected failures.** A known column-type mismatch can
-raise `E011` at compile time against a declared contract. A rename's represented blast radius is a
-`rocky lineage-diff` comment on the pull request. An unbudgeted cost spike is a
-`[budget]` block that fails the run. Classified data with no mask strategy fails
-`rocky compliance`.
+Rocky can report or gate selected failures of this kind. It checks only what it can resolve from your SQL, schemas, and configuration.
 
-None of these are visible to the warehouse. It sees one statement at a time and
-has no idea what the previous shape was. Rocky is the layer that does know.
+## The trust primitives
 
-## Who Rocky is for
+Each item names the CLI surface or code it ships as.
 
-Rocky is built first for the **lead data platform engineer running
-production-critical, multi-tenant pipelines on Databricks**. On those pipelines
-a silent failure costs real money. Dagster is already the orchestrator. That is
-the wedge, and that is where Rocky has the most production mileage.
+| Primitive | Surface |
+|---|---|
+| **Typed SQL.** Types are inferred where source and expression information exists. Problems are `E###` errors, `W###` warnings, and `P###` lints, each with a suggested fix. | `rocky compile` |
+| **Column-level lineage.** Rocky traces represented columns through supported transformations. | `rocky lineage-diff main` |
+| **Branches and run records.** A branch is an isolated schema. Each run records per-model SQL hashes, row counts, and bytes. | `rocky branch create`, `rocky replay <run_id>` |
+| **Per-model cost.** Cost is recorded on every run. `[budget]` blocks can fail a run. An allocation is not a warehouse bill. | `rocky cost` |
+| **AI-assisted drafting.** The result is a draft. Review the files, run checks, then plan and approve. | `rocky ai` |
+| **Dialect lint.** `P001` catches a Snowflake-only construct in a Databricks project, and the reverse. | `rocky compile` |
+| **Declarative governance.** Roles, tags, and mask strategies as code. | `rocky compliance --fail-on exception` |
 
-The next ring out is **Snowflake and BigQuery teams evaluating SQLMesh**. They
-want correctness moved into the compiler rather than the planner. They prefer
-SQL over Python-first ergonomics. Those adapters work today, but they are Beta.
-See the [Roadmap](/getting-started/roadmap/).
-
-Rocky is **not** a fit for three groups:
-
-- Greenfield analytics shops with no scale pain.
-- Single-analyst setups.
-- Teams on a warehouse-native pipeline product, such as Databricks LakeFlow or
-  Snowflake Dynamic Tables. They will not give up its features for portability
-  and compile-time safety.
-
-## What Rocky is, and what it is not
-
-Rocky owns the graph: dependencies, compile-time types, drift handling,
-incremental logic, lineage, cost, contracts, and governance.
-
-**Rocky is not a warehouse, not a table format, and not a query engine.**
-
-## Scope on the ELT spectrum
-
-| Stage | Rocky | Notes |
-|---|---|---|
-| Extract (SaaS sources) | — | Use Fivetran, Airbyte, Stitch, or warehouse-native CDC |
-| Extract (files) | ✅ | `rocky load`: CSV, Parquet, JSONL from a directory into the warehouse |
-| Load (bronze replication) | ✅ | Config-driven replication pipelines. Discovery via Fivetran metadata, DuckDB `information_schema`, or manual declaration |
-| Transform | ✅ | Compiled SQL models; no Jinja, no manifest, no parse step |
-| Quality | ✅ | Inline assertions during `rocky apply`; no separate test step |
-| Orchestration | Partial | Native Dagster integration; `rocky serve` for small standalone teams |
-
-Quality is more than the inline gate at run time. A model can also declare
-fixture-driven unit tests, which `rocky test` runs locally on DuckDB. It can
-declare data tests such as not-null and uniqueness, which
-`rocky test --declarative` runs against warehouse rows. See
-[Testing and Contracts](/concepts/testing/).
-
-## The seven trust primitives
-
-Each item below names the CLI surface or diagnostic code it ships as, so you can
-check it rather than take it on faith.
-
-1. **SQL as a typed, compiled language.** Rocky infers column types where it
-   has enough source and expression information. It reports problems as `E###`
-   errors, `W###` warnings, and `P###` portability lints, each with a suggested
-   fix. This is a compiler with a language server, not a text-macro engine.
-2. **Column-level lineage at compile time.** Rocky traces represented columns
-   through supported transformations. `rocky lineage-diff main` lists
-   the per-column downstream blast radius for a pull request. That CI gate needs
-   a compiler; there is no way to do it from templated strings.
-3. **Branches and a content-addressed run record.** A named branch is an
-   isolated schema: `rocky branch create`, then `rocky run --branch`. Each run
-   records the per-model SQL hash, row count, and bytes, and keys the written
-   artifacts by the hash of their content. `rocky replay <run_id>` inspects that
-   record. For a deterministic model, `rocky replay --execute --verify` re-runs
-   the recipe locally on DuckDB and reproduces the output bit for bit. Add
-   `--warehouse` to re-run it in an isolated replay schema on the live warehouse
-   instead.
-4. **Per-model cost attribution.** Cost is a column on every run record, not a
-   dashboard you check afterwards. `[budget]` blocks fail the run on overspend,
-   the `on_budget_breach` hook fires, and `rocky preview cost` projects spend at
-   pull-request time.
-5. **AI-assisted drafting.** `rocky ai` generates a model and validates it
-   against available project context. Treat the result as a draft. Review the
-   files, run relevant checks, then plan and approve execution. The wider AI
-   surface, such as a mass refactor after a column-type change, is on the
-   [Roadmap](/getting-started/roadmap/).
-6. **Dialect-divergence lint.** `P001` catches a Snowflake-only construct in a
-   Databricks project, and the reverse. It is useful the day you start a
-   migration and essential the day you finish one.
-7. **Declarative governance.** Roles as code with declared `GRANT` statements, Unity
-   Catalog tags, workspace isolation, and mask strategies bound to
-   classification tags. `rocky compliance --fail-on exception` gates CI on
-   unmasked sensitive columns.
+A clean compile does not prove that every warehouse query is valid. It does not prove the result values are correct. Add [tests and contracts](/concepts/data-quality-checks/) for that.
 
 ## Where Rocky is today
 
-The trust primitives (compiler, branches, replay, lineage, contracts, cost) are
-GA (live-tested) on Databricks. Every other warehouse adapter except DuckDB is
-Beta: the core run loop works, and conformance coverage is still growing. The wider AI
-workflow, Iceberg-native writes, and a semantic layer are on the roadmap.
+| Area | Status |
+|---|---|
+| Compiler, branches, replay, lineage, contracts, cost on Databricks | GA (live-tested) |
+| DuckDB | Supported. Powers the playground and `rocky test`. |
+| Every other warehouse adapter | Beta. The core run loop works. Conformance coverage is still growing. |
+| Wider AI workflow, Iceberg-native writes, semantic layer | [Roadmap](/getting-started/roadmap/) |
 
-See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
+Adapter list and capabilities: [Capability matrix](/concepts/capability-matrix/).
 
-## What Rocky is like to use
+## Who Rocky is for
 
-- **Fast.** A single binary that starts in under 100 ms. It compiles 10k models
-  in about 1 s with about 150 MB of peak memory. See
-  [benchmarks](/getting-started/benchmarks/).
-- **Typed checks.** Column-level inference can report resolvable schema errors
-  at compile time. Unknown types and runtime behavior need separate checks.
-- **A browser UI, then the editor.** `rocky serve --ui` shows the project's
-  models, runs, and plans that need review in your browser. The
-  [VS Code extension](/guides/ide-setup/) adds compile errors and column types
-  as you type. See the [browser UI guide](/guides/browser-ui/).
-- **SQL-first.** No Jinja. Business logic stays in SQL. An optional Rocky DSL
-  exists for the cases plain SQL handles badly; it never replaces SQL.
-- **Config-first bronze.** Source replication is driven by `rocky.toml`, with
-  zero SQL files for a 1:1 copy.
-- **Embedded state.** Watermarks live in a local `redb` database, with optional
-  S3, GCS, or Valkey sync. There is no manifest file. A watermark is the timestamp of
-  the newest row Rocky has already loaded; see the
-  [glossary](/reference/glossary/).
+Rocky is built first for the lead data platform engineer who runs production-critical, multi-tenant pipelines on Databricks. A silent failure costs real money there, and Rocky has the most production mileage there.
 
-## Importing an existing dbt project
+The next ring out is Snowflake and BigQuery teams evaluating SQLMesh. See the [comparison](/getting-started/comparison/).
 
-`rocky import-dbt` reads a dbt Core project and writes a runnable Rocky repo to
-disk. You move over one piece at a time rather than all at once.
-`rocky validate-migration` compares the dbt project against the Rocky project
-side by side, so you can confirm what changed before you cut over. See the
-[migration guide](/guides/migrate-from-dbt/).
+Rocky is **not** a fit for these groups:
 
-Rocky models can also read tables that other tools produce, including dbt
-packages, so a hybrid setup works while you migrate.
+- Greenfield analytics shops with no scale pain.
+- Single-analyst setups.
+- Teams on a warehouse-native pipeline product, such as Databricks LakeFlow or Snowflake Dynamic Tables.
 
-## How Rocky compares to SQLMesh
+## What Rocky does not do
 
-SQLMesh is the tool Rocky most resembles. The
-[Feature comparison](/getting-started/comparison/) sets them side by side.
+| Stage | Rocky |
+|---|---|
+| Extract from SaaS sources | No. Use Fivetran, Airbyte, Stitch, or warehouse-native CDC. |
+| Extract from files | Yes. `rocky load` reads CSV, Parquet, and JSONL. |
+| Load (bronze replication) | Yes. Config-driven replication pipelines. |
+| Transform | Yes. Compiled SQL models. No Jinja, no manifest. |
+| Quality | Yes. Inline checks during `rocky apply`, plus [declarative tests](/concepts/data-quality-checks/). |
+| Orchestration | Partial. Native Dagster integration, and `rocky serve` for small standalone teams. |
 
-## Design principles
+## Next
 
-1. **Adapter-based.** Source adapters (Fivetran, Airbyte, DuckDB, Iceberg,
-   manual) handle discovery. Warehouse adapters (Databricks, DuckDB, and the
-   Beta adapters in the table below) handle execution. The core engine stays
-   warehouse-agnostic.
-2. **Inline quality checks.** Data checks run during replication, not as a
-   separate step afterwards.
-3. **Structured output.** Every command emits versioned JSON for an
-   orchestrator to read.
-
-## Supported adapters
-
-| Role | Adapter | Notes |
-|---|---|---|
-| Source | Fivetran | REST API discovery; metadata only |
-| Source | Airbyte | REST API discovery; metadata only |
-| Source | DuckDB | `information_schema` discovery |
-| Source | Iceberg | Catalog/manifest discovery for content-addressed reads |
-| Source | Manual | Tables declared in `rocky.toml` |
-| Warehouse | Databricks | SQL Statement API, Unity Catalog, adaptive concurrency |
-| Warehouse | Snowflake | REST API; OAuth / JWT / password (Beta) |
-| Warehouse | BigQuery | REST API; service account / ADC (Beta) |
-| Warehouse | Trino | `/v1/statement` REST polling; HTTP Basic / JWT (Beta) |
-| Warehouse | PostgreSQL | Native protocol, rustls TLS (Beta) |
-| Warehouse | Redshift | Shares the PostgreSQL adapter crate; tested by generated SQL only (Beta) |
-| Warehouse | ClickHouse | HTTP interface; no `MERGE` (Beta) |
-| Warehouse | SQL Server / Azure SQL / Fabric | Native TDS; Azure SQL and Fabric tested by generated SQL only (Beta) |
-| Warehouse | Apache Spark | Spark Connect over gRPC; Delta or Iceberg tables (Beta) |
-| Warehouse | DuckDB | In-process; powers the playground and `rocky test` |
-
-Source adapters are metadata-only. They identify what exists. The data itself
-already lives in the warehouse, or arrives from files through `rocky load`. One
-DuckDB instance can act as both source and warehouse, which is how the
-credential-free playground runs end to end.
-
-A new adapter plugs in through the [Adapter SDK](/concepts/adapters/) without
-changes to the core engine.
-
-## Monorepo layout
-
-| Path | Artifact | Language |
-|---|---|---|
-| `engine/` | `rocky` CLI | Rust (Cargo workspace) |
-| `sdk/python/` | `rocky-sdk` wheel | Python |
-| `integrations/dagster/` | `dagster-rocky` wheel | Python |
-| `editors/vscode/` | Rocky VSIX | TypeScript |
-| `examples/playground/` | POC catalog | TOML / SQL |
-
-Crate-level breakdown: [Architecture](/concepts/architecture/).
-
-## Community
-
-- **Discussions:** [github.com/rocky-data/rocky/discussions](https://github.com/rocky-data/rocky/discussions)
-- **Issues:** [github.com/rocky-data/rocky/issues](https://github.com/rocky-data/rocky/issues)
-- **Email:** [hello@rocky-data.dev](mailto:hello@rocky-data.dev)
-- **Security:** [security@rocky-data.dev](mailto:security@rocky-data.dev) ([SECURITY.md](https://github.com/rocky-data/rocky/blob/main/SECURITY.md))
-
-## License
-
-[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+- [Quickstart](/getting-started/quickstart/)
+- [Architecture](/concepts/architecture/)
+- [Roadmap](/getting-started/roadmap/)
+- [Benchmarks](/getting-started/benchmarks/)
+- Questions: [GitHub Discussions](https://github.com/rocky-data/rocky/discussions), [hello@rocky-data.dev](mailto:hello@rocky-data.dev). Security: [SECURITY.md](https://github.com/rocky-data/rocky/blob/main/SECURITY.md). License: Apache 2.0.

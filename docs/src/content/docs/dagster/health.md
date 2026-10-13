@@ -2,7 +2,7 @@
 title: Health Checks
 description: Probe Rocky-managed pipelines via rocky doctor
 sidebar:
-  order: 15
+  order: 14
 ---
 
 `rocky_healthcheck()` wraps the `rocky doctor` command. `rocky doctor` runs
