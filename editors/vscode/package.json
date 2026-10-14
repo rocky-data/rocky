@@ -994,10 +994,10 @@
     "vscode-languageclient": "^10.1.2"
   },
   "devDependencies": {
-    "@dagrejs/dagre": "^3.1.0",
+    "@dagrejs/dagre": "^3.1.1",
     "@tailwindcss/cli": "^4.3.3",
     "@tailwindplus/elements": "^1.0.22",
-    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^26.6.5",
@@ -1007,7 +1007,7 @@
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",
     "@xyflow/react": "^12.12.0",
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "eslint": "^10.12.0",
     "glob": "^13.0.6",
     "jsdom": "^30.1.2",
@@ -1015,10 +1015,10 @@
     "mocha": "^12.0.3",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "tailwindcss": "^4.3.0",
+    "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.71.1",
-    "vitest": "^5.0.3"
+    "typescript-eslint": "^8.71.2",
+    "vitest": "^5.0.4"
   },
   "overrides_comment": "Force-patch transitive deps that haven't been bumped upstream yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion), and the GHSA-q3j6-qgpj-74h6 / GHSA-v39h-62p7-jpjc fast-uri path-traversal/host-confusion advisories (transitive via ajv → @vscode/test-electron). Drop these once upstreams ship the bumps.",
   "overrides": {

@@ -17,7 +17,7 @@ updates:
           - patch
     ignore:
       # arrow and parquet follow the duckdb crate's arrow major: engine/Cargo.toml
-      # pins duckdb 1.10503, which ships against arrow 58, and duckdb's
+      # pins duckdb 1.10506, which ships against arrow 58, and duckdb's
       # RecordBatch is that arrow's type. A standalone arrow or parquet major
       # bump does not compile (#2097, #2098). Bump all three by hand, in
       # lockstep, when duckdb moves to the next arrow major.

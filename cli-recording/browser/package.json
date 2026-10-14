@@ -8,6 +8,6 @@
     "record": "node record.mjs"
   },
   "devDependencies": {
-    "playwright": "^1.60.0"
+    "playwright": "^1.64.0"
   }
 }

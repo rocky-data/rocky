@@ -78,7 +78,7 @@ engine/                         # this directory, inside the rocky monorepo
 │   ├── rocky-server/           # HTTP API + LSP server
 │   │   └── src/                # axum REST + tower-lsp for IDE integration
 │   ├── rocky-engine/           # Local execution engine
-│   │   └── src/                # DuckDB-backed execution (DataFusion + Arrow)
+│   │   └── src/                # DuckDB-backed execution (Arrow)
 │   ├── rocky-adapter-sdk/      # Adapter SDK for building custom warehouse adapters
 │   │   └── src/
 │   ├── rocky-databricks/       # Databricks warehouse adapter

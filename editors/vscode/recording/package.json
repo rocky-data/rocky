@@ -9,8 +9,8 @@
     "test:e2e": "playwright test --config e2e/playwright.config.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "^1.60.0",
+    "@playwright/test": "^1.64.0",
     "@vscode/test-electron": "^2.5.2",
-    "playwright": "^1.60.0"
+    "playwright": "^1.64.0"
   }
 }

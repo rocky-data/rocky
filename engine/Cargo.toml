@@ -165,7 +165,7 @@ tiberius = { version = "0.13", default-features = false, features = ["tds80", "r
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Redis/Valkey
-redis = "1.2"
+redis = "1.7"
 
 # Cloud object store (unified S3/GCS/Azure backend for state sync + loaders)
 object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
@@ -182,7 +182,7 @@ percent-encoding = "2"
 # ships against workspace `arrow 58` directly — earlier 1.4.x releases
 # tracked `arrow 56` and required an IPC-stream bridge inside the
 # rocky-duckdb adapter to reconcile with the workspace arrow major.
-duckdb = { version = "1.10503", features = ["bundled"] }
+duckdb = { version = "1.10506", features = ["bundled"] }
 
 # CSV parsing
 csv = "1"
@@ -214,7 +214,7 @@ md-5 = "0.11"
 # links both backends — see the `rustls` note above.)
 # `pem` keeps `EncodingKey::from_rsa_pem` available for PEM-encoded
 # service-account keys.
-jsonwebtoken = { version = "11.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.23"
 
@@ -222,7 +222,7 @@ base64 = "0.23"
 # always zlib-compresses before base64 — see `rocky-cli/src/pipes.rs::detect`). Version pinned
 # to what was already resolved transitively in Cargo.lock, so adding it as a direct dependency
 # causes no lockfile churn.
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 
 # String similarity
 strsim = "0.11"
@@ -253,8 +253,7 @@ tower-lsp = "0.20"
 # File watching
 notify = "8"
 
-# DataFusion
-datafusion = "45"
+# Arrow and Parquet stay on duckdb's arrow major (see .github/dependabot.yml)
 arrow = "58"
 parquet = "58"
 
