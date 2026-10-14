@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The bundled DuckDB moves to the `duckdb` crate 1.10506. Other engine dependencies take their latest compatible versions. `object_store` stays at 0.14.1 (#2124), and `arrow` and `parquet` stay on 58.
 
+### Fixed
+
+- The Linux release binaries no longer crash with a segfault when DuckDB loads an extension. 1.81.0 crashed the first time it opened a DuckDB connection, because it loads `icu` there (#2367). The Linux binaries are now built with gcc in a `manylinux_2_28` image instead of with `cargo zigbuild`, so DuckDB's downloaded extensions can load. The glibc floor stays at 2.28. The binaries now need `libstdc++.so.6` on the host, which most Linux distributions install by default. The arm64 binary is built on an arm64 runner. Before it publishes, the release runs each Linux binary and checks that the `icu` extension loads.
+
 ## [1.81.0] — 2026-10-14
 
 A cast to `INT`, `BIGINT`, `FLOAT`, `REAL` or `TIMESTAMP` now takes the width of the model's warehouse. The language server, `rocky serve`, `rocky docs` and `rocky publish-ir` type it as `rocky compile` does. In operator mode, the browser UI can cancel a job that `rocky serve` started. URL passwords are kept out of plans and logs. A loopback `rocky serve` checks `Host` and `Origin` on every request except `GET /api/v1/health`.

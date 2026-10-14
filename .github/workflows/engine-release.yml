@@ -55,20 +55,23 @@ jobs:
             lsp_archive: rocky-lsp-x86_64-apple-darwin.tar.gz
             ext: tar.gz
 
+          # Linux: built natively with gcc in a manylinux_2_28 image, on a
+          # runner of the same architecture (scripts/linux_release_build.sh
+          # says why not cargo-zigbuild). The image is pinned by digest, like
+          # every other release source. manylinux_2_28 tag 2026.09.29-1.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: rocky-x86_64-unknown-linux-gnu.tar.gz
             lsp_archive: rocky-lsp-x86_64-unknown-linux-gnu.tar.gz
             ext: tar.gz
-            zigbuild: true
+            manylinux: quay.io/pypa/manylinux_2_28_x86_64@sha256:407f771c51a2c3e83ebe5a7970b4289ead3a6db21d9b9c089168775cad11d328
 
-          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: rocky-aarch64-unknown-linux-gnu.tar.gz
             lsp_archive: rocky-lsp-aarch64-unknown-linux-gnu.tar.gz
             ext: tar.gz
-            zigbuild: true
-            cross: true
+            manylinux: quay.io/pypa/manylinux_2_28_aarch64@sha256:c22ffd129ac99a8a42d1f2c2f4e88a9089288dd9ee987a7092da1c7dc48f27a9
 
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
@@ -118,33 +121,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
 
-      # Linux: install zig + cargo-zigbuild for portable glibc builds
-      - name: Install zig
-        if: matrix.zigbuild
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.14.1
-
-      - name: Install cargo-zigbuild
-        if: matrix.zigbuild
-        # Prebuilt binary — avoids ~35s of `cargo install cargo-zigbuild
-        # --locked` (compiles from source) per Linux target.
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
-        with:
-          tool: cargo-zigbuild
-
-      # Linux cross-compile: install the cross-compilation toolchain
-      - name: Install cross-compilation toolchain
-        if: matrix.cross
-        run: |
-          # See the note in engine-ci.yml: a third-party source with a bad
-          # index fails `apt-get update` for everyone, and the cross
-          # toolchain does not come from one.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       # The browser UI, built once by the `ui` job below, embedded into
       # every target with `--features ui`.
       - name: Fetch the browser UI build
@@ -153,16 +129,47 @@ jobs:
           name: rocky-ui-dist
           path: engine/ui/dist
 
-      # Linux: build with cargo-zigbuild (portable glibc). Build both
-      # binaries in the same invocation so the workspace compile cache
-      # is shared and we don't pay rocky-core / rocky-compiler twice.
-      - name: Build release binaries (zigbuild)
-        if: matrix.zigbuild
-        run: cargo zigbuild --release --bin rocky --bin rocky-lsp --features ui --target ${{ matrix.target }}
+      # Linux: build with gcc inside the manylinux_2_28 image. The runner's
+      # Rust toolchain (installed above) is mounted in, so the image adds a
+      # C/C++ toolchain and an old glibc, nothing else. No secret or token
+      # is passed into the container.
+      - name: Build release binaries (manylinux gcc)
+        if: matrix.manylinux
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$HOME/.cargo:/cargo" \
+            -v "$HOME/.rustup:/rustup" \
+            -e CARGO_HOME=/cargo \
+            -e RUSTUP_HOME=/rustup \
+            -e CARGO_BUILD_JOBS \
+            -e CARGO_TERM_COLOR \
+            -w /work \
+            "${{ matrix.manylinux }}" \
+            bash scripts/linux_release_build.sh "${{ matrix.target }}"
 
-      # macOS / Windows: build with plain cargo
+      # Run the Linux binary before it is attached: glibc floor, shared
+      # libraries, and a real DuckDB extension load (#2367). Once in the
+      # build image (the oldest glibc the release supports), once on the
+      # runner (a current Ubuntu).
+      - name: Smoke the Linux binary (manylinux_2_28)
+        if: matrix.manylinux
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            "${{ matrix.manylinux }}" \
+            bash scripts/linux_release_smoke.sh "engine/target/${{ matrix.target }}/release/rocky"
+
+      - name: Smoke the Linux binary (runner)
+        if: matrix.manylinux
+        run: bash ../scripts/linux_release_smoke.sh "target/${{ matrix.target }}/release/rocky"
+
+      # macOS / Windows: build with plain cargo. Build both binaries in the
+      # same invocation so the workspace compile cache is shared and we
+      # don't pay rocky-core / rocky-compiler twice.
       - name: Build release binaries (cargo)
-        if: ${{ !matrix.zigbuild }}
+        if: ${{ !matrix.manylinux }}
         run: cargo build --release --bin rocky --bin rocky-lsp --features ui --target ${{ matrix.target }}
 
       # Unix: package each binary as its own .tar.gz. Split archives so

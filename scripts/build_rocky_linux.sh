@@ -5,6 +5,11 @@
 # Use this when GitHub Actions release credits are exhausted, or when you need
 # to test a Rocky source change locally before pushing.
 #
+# WARNING: a zigbuild binary crashes when DuckDB loads a downloaded extension
+# such as icu (#2367), and engine 1.81.0 loads icu on every connection. Do not
+# ship one. engine-release.yml builds Linux with gcc in a manylinux_2_28 image
+# instead (scripts/linux_release_build.sh), and that is the build to release.
+#
 # Requirements (zigbuild, default):
 #   - cargo-zigbuild:  cargo install cargo-zigbuild
 #   - zig:             brew install zig
