@@ -1,6 +1,6 @@
 [project]
 name = "rocky-sdk"
-version = "0.21.0"
+version = "0.22.0"
 description = "Typed Python client for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,7 +30,7 @@ dependencies = [
 # The local model behind `rocky_sdk.classify.suggest(..., use_model=True)`.
 # Heavy (PyTorch + transformers); the rules-only path needs none of it.
 # Pinned: the aid's error rate was measured on this exact version.
-classify = ["laya==0.4.1"]
+classify = ["laya==0.4.2"]
 
 [project.urls]
 Homepage = "https://rocky-data.dev/"

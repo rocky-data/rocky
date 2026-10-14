@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-10-14
+
+Pairs with engine 1.81.0.
+
 ### Changed
 
-- `datamodel-code-generator` is now 0.83.0 (Dependabot #100). The generated model-detail types change shape: the recursive `RockyType` is now a `RootModel` class, not an inline union, so a column's `data_type` value is read through `.root`. Nothing else in the generated models changes.
+- Generated models follow engine 1.81.0. `JobStatus.state` gains `cancelled`, so code that matches every state needs the new case. The error envelope documents the `job_not_running` and `job_not_cancellable` codes. `SettingsOutput.allowed_hosts` is now also reported on a loopback bind without `--ui`.
+- `datamodel-code-generator` is now 0.83.0 (Dependabot #100). The generated model-detail types change shape: the recursive `RockyType` is now a `RootModel` class, not an inline union, so a column's `data_type` value is read through `.root`. `Array` and `Map` elements are `RockyType` roots too, read through `.root`. A `Map` now must have exactly two entries.
 
 ## [0.21.0] — 2026-10-09
 

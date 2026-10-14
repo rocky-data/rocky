@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "rocky"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-adapter-sdk"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-ai"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "indexmap",
  "reqwest 0.12.28",
@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-airbyte"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4133,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-bigquery"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-cache"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "redis",
  "rocky-secret-registry",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-catalog-core"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "rocky-secret-registry",
@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-cli"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4262,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-clickhouse"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-compiler"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-core"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-databricks"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-duckdb"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4413,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-engine"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4432,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-fivetran"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4463,7 +4463,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-fulfill"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4482,7 +4482,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-iceberg"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4508,7 +4508,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-ir"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -4521,7 +4521,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-lang"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "logos",
  "miette",
@@ -4533,7 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-lsp"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "rocky-server",
  "rustls",
@@ -4542,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-mcp"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-observe"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -4592,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-postgres"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4612,11 +4612,11 @@ dependencies = [
 
 [[package]]
 name = "rocky-secret-registry"
-version = "1.80.0"
+version = "1.81.0"
 
 [[package]]
 name = "rocky-server"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4648,7 +4648,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-snowflake"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-spark"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4696,7 +4696,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-sql"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "miette",
  "regex",
@@ -4710,7 +4710,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-sqlserver"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4730,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-trino"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4767,7 +4767,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-wasm"
-version = "1.80.0"
+version = "1.81.0"
 dependencies = [
  "rocky-lang",
  "rocky-sql",
@@ -5148,9 +5148,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
