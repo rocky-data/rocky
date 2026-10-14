@@ -11,7 +11,7 @@ Rocky's quality pipeline type is a dedicated pipeline that runs data quality che
 
 - A standalone pipeline with its own schedule
 - Targeted at specific schemas/tables
-- Able to express DQX-parity row-level assertions (`not_null`, `unique`,
+- Able to express row-level assertions (`not_null`, `unique`,
   `accepted_values`, `expression`, `row_count_range`,
   `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`) via
   `[[pipeline.x.checks.assertions]]` blocks on the same surface used by

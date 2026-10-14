@@ -67,28 +67,9 @@ fixes the SQL, and re-drafts until the compile is clean.
 
 ## Generators and write tools
 
-The write surface splits in two, and the prefix tells you which half you are in.
+The write surface splits in two, and the prefix tells you which half you are in. The **`ai_*` generators** call a language model under your own `ANTHROPIC_API_KEY` and hand back a draft. They change nothing on disk. The **`draft_*` write tools** write content into the project and compile it, whether it is the agent's own work or a generator's output.
 
-The **`ai_*` generators** call a language model under your own
-`ANTHROPIC_API_KEY` and hand back a draft. They change nothing on disk. Each one
-matches a `rocky ai-*` CLI verb.
-
-The **`draft_*` write tools** write content into the project and compile it.
-The content can be the agent's own work or a generator's output. The write tool
-does not care where it came from, only that it compiles and clears your policy
-rules.
-
-Keeping them apart is what makes a rule like *this agent may not author
-contracts in the `pii` schema* enforceable. Generating is cheap and speculative.
-Writing is a governed act, so it has one place to be checked.
-
-The write tools do not give an agent new power. An agent in a coding harness can
-already write files. What the tools add is compile feedback with the write and a
-visible policy verdict. They also work in a harness with no filesystem access at
-all. Rocky supplies the tools, the rules, and the verification. The loop itself
-stays in whatever client you connect.
-
-See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
+Keeping them apart makes a rule like *this agent may not author contracts in the `pii` schema* enforceable. Generating is cheap and speculative. Writing is a governed act, so it has one place to be checked. The write tools give an agent no new power. They add compile feedback with the write, a visible policy verdict, and they work in a harness with no filesystem access. The loop itself stays in whatever client you connect. [MCP Authoring](/concepts/mcp-authoring/) lists every tool in both families.
 
 ## The three gates
 
@@ -133,8 +114,8 @@ change what. Rocky evaluates every `draft_*` and `propose` call against it befor
 anything persists. A `deny` removes a new file, or restores the prior content of
 a file the agent re-drafted, so a denial leaves nothing behind. This is the same
 evaluator that gates `apply` and `promote`, so an agent learns the verdict with
-the write rather than three steps later. See
-[Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
+the write rather than three steps later. The
+[`[policy]` reference](/reference/configuration/#policy) shows how the rules are
 written.
 
 Rocky records policy decisions in an audit ledger, and `rocky audit` lists them.
@@ -172,11 +153,7 @@ set by the caller, and Rocky still does not check that a person set it. So
 `--profile approver` gives you a server where an agent's `confirm` is
 sufficient. Start one only where that is what you want.
 
-Be exact about what this check verifies. It reads a file, parses it, and compares
-the plan id. It does not authenticate who approved, or that a person approved at
-all. That check is a floor: it runs on every AI-authored apply whatever your
-`[policy]` rules say, so an `allow` rule cannot waive it, and a policy rule can
-only add restrictions on top. What the marker cannot tell you is covered below.
+The check reads a file, parses it, and compares the plan id. It does not authenticate who approved, or that a person approved at all. It is a floor: it runs on every AI-authored apply whatever your `[policy]` rules say. An `allow` rule cannot waive it, and a policy rule can only add restrictions on top. The next section says what the marker cannot tell you.
 
 ## What the three gates do not defend against
 
@@ -249,8 +226,11 @@ committed file and hashed there, exactly as if the agent had written it.
 The window is open only between the loop's own repair dispatch and its next
 merge, and only a process that can write your models directory can use it. That
 same process can write an approval marker, which is a larger capability than
-this one. Trusted handling of the repair agent's output bytes is planned work.
-Tracked in [#1515](https://github.com/rocky-data/rocky/issues/1515).
+this one. Issue [#1515](https://github.com/rocky-data/rocky/issues/1515), which
+tracked trusted handling of the repair agent's output, is closed. `rocky fulfill`
+now refuses a round whose model files differ from the copy the agent handed off
+through `draft_model`. That check does not stop a process that runs as the same
+user, which can write the hand-off copy too.
 
 **The committed manifest is data, not a credential.** The lowering manifest
 records which files belong to a product generation, which phase it is in, and
@@ -260,7 +240,7 @@ file in your project, so a process that can edit it can change what gets checked
 the loop skip that file rather than report drift. The engine already treats
 manifests this way: matching identity fields in a manifest authenticate nothing.
 The verification is a check on files, not a proof about them. This needs the same
-write access as the point above, and is covered by the same planned work.
+write access as the point above, and has the same limit.
 
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
 its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
@@ -373,4 +353,4 @@ that need a language model add their scores when a key is present.
 - [MCP Authoring](/concepts/mcp-authoring/) — the full tool catalog, what data leaves your environment, and the bring-your-own-key boundaries.
 - [AI and Intent](/concepts/ai-intent/) — the compiler-as-guardrail loop both the CLI and MCP surfaces rely on.
 - [AI Commands](/reference/commands/ai/) — the `rocky ai-*` CLI verbs, the human-facing counterpart to the `ai_*` tools.
-- [Cross-team contracts](/concepts/cross-team-contracts/) — how a `[policy]` block declares who may change what.
+- [`[policy]` reference](/reference/configuration/#policy) — how a `[policy]` block declares who may change what.

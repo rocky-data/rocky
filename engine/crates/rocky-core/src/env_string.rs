@@ -81,7 +81,7 @@ where
     f()
 }
 
-fn env_values_scope_active() -> bool {
+pub(crate) fn env_values_scope_active() -> bool {
     ENV_VALUES_DEPTH.with(|d| d.get() > 0)
 }
 

@@ -394,7 +394,7 @@ async fn compute_review_with_disclosure_and_seam(
                 super::apply::run_model_selection_at(&cfg, root, &resolved_config_path, &run_plan)?
             }
             None => (
-                root.join(run_plan.models_dir.as_deref().unwrap_or("models")),
+                super::apply::plan_models_dir(root, run_plan.models_dir.as_deref().map(Path::new)),
                 None,
             ),
         }

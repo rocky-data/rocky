@@ -7,8 +7,11 @@
 <!-- Tick all that apply -->
 
 - [ ] `engine/` (Rust CLI / crates)
+- [ ] `engine/ui/` (browser UI for `rocky serve --ui`)
+- [ ] `sdk/python/` (`rocky-sdk` Python client)
 - [ ] `integrations/dagster/` (Python package)
 - [ ] `editors/vscode/` (TypeScript extension)
+- [ ] `docs/` (documentation site)
 - [ ] `examples/playground/` (sample project / benchmarks)
 - [ ] `schemas/` (canonical CLI JSON schema)
 - [ ] Cross-project (CI, scripts, root docs)
@@ -31,13 +34,24 @@ If this is your first pull request from a fork, CI waits for a maintainer to app
 
 - [ ] Commit messages follow [conventional commits](https://www.conventionalcommits.org/), scoped by subproject when relevant (e.g. `feat(engine/rocky-databricks): ...`, `fix(dagster): ...`)
 - [ ] No `Co-Authored-By` trailers
-- [ ] If this is a CLI JSON schema or DSL syntax change, all consumers (`integrations/dagster/`, `editors/vscode/`) are updated in this same PR
+- [ ] If this is a CLI JSON schema or DSL syntax change, all consumers (`sdk/python/`, `integrations/dagster/`, `engine/ui/`, `editors/vscode/`) are updated in this same PR
 
 ### Engine (`engine/`)
 - [ ] `cargo test --all-targets` passes
 - [ ] `cargo clippy --all-targets -- -D warnings` is clean
 - [ ] `cargo fmt --check` passes
 - [ ] Behaviour change: added an `engine/CHANGELOG.md` entry under `[Unreleased]`, or, if none is needed, said why in this body with a line shaped like "Changelog: none - test-only refactor, no behaviour change" (10+ character reason, `because` also accepted)
+
+### Browser UI (`engine/ui/`)
+- [ ] `npm run lint` is clean
+- [ ] `npm run typecheck` passes
+- [ ] `npm test` passes
+- [ ] `npm run build` succeeds
+
+### Python SDK (`sdk/python/`)
+- [ ] `uv run pytest` passes
+- [ ] `uv run ruff check src/ tests/ examples/` is clean
+- [ ] `uv run ruff format --check src/ tests/ examples/` passes
 
 ### Dagster (`integrations/dagster/`)
 - [ ] `uv run pytest` passes

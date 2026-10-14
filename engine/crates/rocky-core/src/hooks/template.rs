@@ -8,13 +8,21 @@ use super::HookContext;
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum TemplateError {
     #[error("failed to serialize hook context: {0}")]
     Serialize(#[from] serde_json::Error),
 
     #[error("unclosed conditional block: {{{{#if {field}}}}}")]
     UnclosedConditional { field: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for TemplateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "TemplateError", self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,5 +406,23 @@ mod tests {
         let ctx = test_context();
         let result = render_template("Model: {{model}}", &ctx).unwrap();
         assert_eq!(result, "Model: my_model");
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn template_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "tmpl-field-1919-0a07";
+        rocky_core::secret_registry::register_substitution("RV_TEMPLATE_ERR_DBG", SECRET);
+        let err = TemplateError::UnclosedConditional {
+            field: SECRET.into(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_TEMPLATE_ERR_DBG}"), "{debug}");
     }
 }

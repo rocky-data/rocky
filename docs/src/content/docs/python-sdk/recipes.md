@@ -24,30 +24,11 @@ client = RockyClient(config_path="rocky.toml")
 client.run(filter="tenant=acme", log_callback=log.info)
 ```
 
-The typed `RunResult` still comes back when the run finishes. The callback only
-adds live visibility.
+The typed `RunResult` still comes back when the run finishes.
 
 ## Handle failures
 
-Errors are typed, so you branch on the cause rather than parsing a message:
-
-```python
-from rocky_sdk import RockyClient
-from rocky_sdk.exceptions import RockyCommandError, RockyTimeoutError
-
-client = RockyClient(config_path="rocky.toml", timeout_seconds=900)
-try:
-    client.run(filter="tenant=acme")
-except RockyTimeoutError as exc:
-    print(f"timed out after {exc.timeout_seconds}s")  # retry, alert, ...
-except RockyCommandError as exc:
-    print(f"exit {exc.returncode}: {exc.stderr_tail}")
-```
-
-`timeout_seconds` is a wall-clock budget for one CLI invocation, and it defaults
-to 3600 seconds. Setting it on the client, as above, applies it to every call.
-Pass `timeout_seconds=` to a single `run()` when one run needs a larger budget
-than the rest:
+The exception types and the timeout rules are in [Errors](/python-sdk/introduction/#errors). To give one run a larger budget, pass `timeout_seconds=` to that `run()` call:
 
 ```python
 client.run(filter="tenant=acme", timeout_seconds=7200)

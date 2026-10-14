@@ -207,7 +207,8 @@ fn prepare_preview(
     }
 
     let compiler_cfg = CompilerConfig {
-        target_dialects: Default::default(),
+        // Each model's warehouse, as `rocky compile` resolves it (#2342).
+        target_dialects: super::compile::target_dialects(Some(&rocky_cfg), config_path),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

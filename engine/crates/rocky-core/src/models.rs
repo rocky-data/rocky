@@ -18,7 +18,7 @@ use rocky_ir::{
 };
 
 /// Errors from loading and parsing model files.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ModelError {
     #[error("failed to read model file: {0}")]
     ReadFile(#[from] std::io::Error),
@@ -101,6 +101,14 @@ pub enum ModelError {
         #[source]
         source: Box<crate::config::ConfigError>,
     },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "ModelError", self)
+    }
 }
 
 /// Per-model `[governance]` sidecar block.
@@ -5294,5 +5302,24 @@ mod tree_sidecar_tests {
         }
         let map = load_surrogate_keys_from_tree(root).unwrap();
         assert_eq!(map["m"][0].columns, vec!["shallow_col"]);
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn model_error_debug_renders_a_resolved_value_in_a_toml_error() {
+        const SECRET: &str = "model-toml-1919-ff06";
+        rocky_core::secret_registry::register_substitution("RV_MODEL_ERR_DBG", SECRET);
+        let err = ModelError::ParseFrontmatter {
+            path: EnvString::from_resolved("m.toml"),
+            error: toml::from_str::<toml::Table>(&format!("key = {SECRET} oops")).unwrap_err(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_MODEL_ERR_DBG}"), "{debug}");
     }
 }

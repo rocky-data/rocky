@@ -3272,7 +3272,18 @@ fn run_models_dir(
 /// absolute directory is kept as is. The CLI passes the absolute cwd as
 /// `root`, so its behaviour does not change.
 pub(crate) fn backfill_models_dir(root: &Path, run_plan: &RunPlan) -> PathBuf {
-    root.join(run_plan.models_dir.as_deref().unwrap_or("models"))
+    plan_models_dir(root, run_plan.models_dir.as_deref().map(Path::new))
+}
+
+/// A models directory a plan names itself (`dir`, or the `models` default),
+/// anchored at the project `root` exactly once.
+///
+/// Making a backfill plan (#2340), applying it, and reviewing it all resolve
+/// the plan's directory here, so they read the same models whatever the cwd
+/// is. An absolute directory is kept as is. The plan persists `dir` as given,
+/// not this anchored form, so a relative `root` is not joined twice.
+pub(crate) fn plan_models_dir(root: &Path, dir: Option<&Path>) -> PathBuf {
+    root.join(dir.unwrap_or(Path::new("models")))
 }
 
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
@@ -10186,6 +10197,72 @@ auto_create_schemas = true
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
     }
 
+    /// #2339: a Fivetran `valkey_url` can embed a password. Rotating that
+    /// password must not refuse a plan, like every other credential. Pointing
+    /// the URL at another server still must.
+    #[test]
+    fn config_identity_ignores_a_valkey_password_but_not_its_host() {
+        fn identity(url: &str) -> String {
+            let body = format!(
+                "[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\napi_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\n\n[adapter.ft.circuit_breaker]\nbackend = \"valkey\"\nvalkey_url = \"{url}\"\n\n[adapter.default]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("rocky.toml");
+            std::fs::write(&p, body).unwrap();
+            super::config_policy_identity(&rocky_core::config::load_rocky_config(&p).unwrap())
+        }
+        assert_eq!(
+            identity("rediss://default:PASSWORD_A@valkey-a:6379/0"),
+            identity("rediss://default:PASSWORD_B@valkey-a:6379/0"),
+            "a rotated Valkey password must not change the config identity"
+        );
+        assert_ne!(
+            identity("rediss://default:PASSWORD_A@valkey-a:6379/0"),
+            identity("rediss://default:PASSWORD_A@valkey-b:6379/0"),
+            "another Valkey host must change the config identity"
+        );
+        // Each pair selects another database, TLS mode, server or container.
+        for (a, b) in [
+            ("redis+unix:///s.sock?db=1", "redis+unix:///s.sock?db=2"),
+            ("rediss://h:6379/", "rediss://h:6379/#insecure"),
+            (
+                "redis://hostA/0?client_name=a@b",
+                "redis://hostB/0?client_name=a@b",
+            ),
+            (
+                "az://container-a@account.dfs.core.windows.net/p",
+                "az://container-b@account.dfs.core.windows.net/p",
+            ),
+            ("redis://h:6379/?protocol=2", "redis://h:6379/?protocol=3"),
+        ] {
+            assert_ne!(identity(a), identity(b), "{a} and {b} must differ");
+        }
+    }
+
+    /// #2339: the plan's config snapshot is written to disk in plaintext, so
+    /// a Fivetran URL's password, secret query values and a token put where
+    /// the user name goes must not be in it, not even as a digest.
+    #[test]
+    fn plan_config_snapshot_holds_no_url_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            "[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\napi_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\n\n[adapter.ft.cache]\nbackend = \"tiered\"\nvalkey_url = \"rediss://default:PW_SECRET@valkey:6379/0?db=1&pass=PASS_SECRET\"\nobject_store_url = \"az://c/p/?sv=2024&sig=SIG_SECRET\"\n\n[adapter.ft.circuit_breaker]\nbackend = \"valkey\"\nvalkey_url = \"redis://TOKEN_SECRET@breaker:6379\"\n\n[adapter.default]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+        let (snapshot, _) =
+            crate::commands::plan::config_snapshot_forms(dir.path(), &cfg, true).unwrap();
+        let text = snapshot.to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("blake3"), "{text}");
+        assert!(
+            text.contains("rediss://default:***@valkey:6379/0?db=1&***=***"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {
@@ -11816,15 +11893,19 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// #2336: the backfill twin of the test above. `<cwd>/<dir>` and
-    /// `<root>/<dir>` hold DIFFERENT `totals` models. Only the cwd's carries
-    /// a `pii` column, and the policy denies `pii` models. The policy gate
-    /// must read the root's (no `pii`, so it allows) and the backfill must
-    /// rebuild the root's. Read against the cwd, the gate denies the apply,
-    /// or the run materializes the `unchecked` column.
+    /// The #2336 / #2340 fixture: a project under a relative root that is not
+    /// the cwd, and a models directory name that exists under both. Only the
+    /// cwd's `totals` carries a `pii` column, and the policy denies agent
+    /// changes to `pii` models. Returns the two temp dirs (keep them alive),
+    /// the root, its config and the models directory name.
     #[cfg(all(unix, feature = "duckdb"))]
-    #[tokio::test]
-    async fn a_backfill_gates_and_runs_the_models_under_the_project_root() -> anyhow::Result<()> {
+    fn backfill_root_decoy_project() -> anyhow::Result<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    )> {
         let dir = tempfile::tempdir()?;
         let proj = dir.path().join("proj");
         std::fs::create_dir(&proj)?;
@@ -11876,6 +11957,19 @@ autonomy_budget = { failures = 3, window = "7d" }
         // A backfill does not create schemas: the closure was built before.
         rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?
             .execute_sql("CREATE SCHEMA IF NOT EXISTS marts")?;
+        Ok((dir, decoy, root, config, models_dir))
+    }
+
+    /// #2336: the backfill twin of the test above. `<cwd>/<dir>` and
+    /// `<root>/<dir>` hold DIFFERENT `totals` models. Only the cwd's carries
+    /// a `pii` column, and the policy denies `pii` models. The policy gate
+    /// must read the root's (no `pii`, so it allows) and the backfill must
+    /// rebuild the root's. Read against the cwd, the gate denies the apply,
+    /// or the run materializes the `unchecked` column.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn a_backfill_gates_and_runs_the_models_under_the_project_root() -> anyhow::Result<()> {
+        let (_dir, _decoy, root, config, models_dir) = backfill_root_decoy_project()?;
 
         let rp = RunPlan {
             models_dir: Some(models_dir.to_string_lossy().into_owned()),
@@ -11923,6 +12017,76 @@ autonomy_budget = { failures = 3, window = "7d" }
             db.execute_sql("SELECT * FROM marts.totals")?.columns,
             vec!["checked".to_string()],
             "the backfill must rebuild the root's `totals`, the model the gate checked"
+        );
+        Ok(())
+    }
+
+    /// #2340: making a backfill plan reads the models under the project root,
+    /// as applying it does. `<cwd>/<dir>` and `<root>/<dir>` hold different
+    /// `totals` models. The plan is made through `rocky backfill`'s own path
+    /// with a root that is not the cwd, keeps `<dir>` root-relative, and its
+    /// apply rebuilds the root's `totals`. Planned against the cwd, the plan
+    /// binds the cwd's `totals`, so the apply refuses it as changed.
+    #[cfg(all(unix, feature = "duckdb"))]
+    #[tokio::test]
+    async fn a_backfill_plan_reads_the_models_under_the_project_root() -> anyhow::Result<()> {
+        let (_dir, _decoy, root, _config, models_dir) = backfill_root_decoy_project()?;
+        // Both sides take the config path relative to the root, as the CLI's
+        // `--config rocky.toml` is.
+        let config = Path::new("rocky.toml");
+        let state = root.join("state.redb");
+
+        crate::commands::backfill::run_backfill_in(
+            &root,
+            config,
+            &state,
+            &models_dir,
+            &["totals".to_string()],
+            false,
+            None,
+            None,
+            true,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )?;
+        let plan_ids: Vec<String> = std::fs::read_dir(root.join(".rocky").join("plans"))?
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                e.file_name()
+                    .into_string()
+                    .ok()?
+                    .strip_suffix(".json")
+                    .map(str::to_string)
+            })
+            .collect();
+        let [plan_id] = plan_ids.as_slice() else {
+            anyhow::bail!("expected one backfill plan, found {plan_ids:?}");
+        };
+        let plan = crate::plan_store::read_plan(&root, plan_id)?;
+        let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())?;
+        assert_eq!(
+            run_plan.models_dir.as_deref(),
+            Some(&*models_dir.to_string_lossy()),
+            "the plan keeps the directory root-relative, for apply to join to the root"
+        );
+        crate::commands::review::write_test_review_marker(&root, plan_id);
+
+        super::run_apply_core_in(
+            &root,
+            config,
+            plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            true,
+        )
+        .await?;
+        let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
+        assert_eq!(
+            db.execute_sql("SELECT * FROM marts.totals")?.columns,
+            vec!["checked".to_string()],
+            "plan and apply must both read the root's `totals`"
         );
         Ok(())
     }

@@ -33,7 +33,7 @@ use crate::traits::SqlDialect;
 // ---------------------------------------------------------------------------
 
 /// Errors from seed discovery, parsing, and SQL generation.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SeedError {
     #[error("failed to read seed file {path}: {source}")]
     ReadFile {
@@ -55,6 +55,14 @@ pub enum SeedError {
 
     #[error("seed directory does not exist: {0}")]
     DirNotFound(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "SeedError", self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,5 +1122,21 @@ post_hook = ["ANALYZE main.seeds.dim_date"]
     fn format_value_non_numeric_in_numeric_col_is_quoted() {
         // If a "numeric" column has a non-parseable value, quote it safely.
         assert_eq!(format_value("abc", "BIGINT", &TestDialect), "'abc'");
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn seed_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "seed-dir-1919-3d0a";
+        rocky_core::secret_registry::register_substitution("RV_SEED_ERR_DBG", SECRET);
+        let err = SeedError::DirNotFound(format!("/seeds/{SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SEED_ERR_DBG}"), "{debug}");
     }
 }

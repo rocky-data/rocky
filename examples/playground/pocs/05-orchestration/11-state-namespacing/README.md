@@ -42,12 +42,10 @@ the key.
   namespacing for that invocation. Otherwise `--state-namespace` wins over
   `[state] namespacing = "pipeline"` in `rocky.toml`.
 
-:::note
-This POC proves the **structural** isolation (separate files, separate locks),
-which is what removes the single-writer contention. It deliberately does not
-race two writers, as a timing-dependent concurrency test would be flaky under the
-catalog's 60s smoke timeout.
-:::
+> **Note:** This POC proves the **structural** isolation (separate files,
+> separate locks), which is what removes the single-writer contention. It does
+> not race two writers: a timing-dependent concurrency test would be flaky under
+> the catalog's 60s smoke timeout.
 
 ## Why it's distinctive
 

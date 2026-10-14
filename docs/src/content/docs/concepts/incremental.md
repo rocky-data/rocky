@@ -1,11 +1,11 @@
 ---
 title: Incremental Processing
-description: How Rocky reprocesses only what changed, using watermarks, partition checksums, and column-level change propagation.
+description: How Rocky reprocesses only what changed, using watermarks, per-partition state, and the skip-unchanged gate.
 sidebar:
   order: 10
 ---
 
-Rocky reprocesses only what changed. This page covers the mechanisms it uses to decide what "changed" means: watermarks, partition checksums, column-level propagation, and the skip-unchanged gate.
+Rocky reprocesses only what changed. This page covers how it decides what "changed" means: watermarks, per-partition state, and the skip-unchanged gate. It also marks two building blocks that `rocky run` does not use yet: partition checksums and column-level propagation.
 
 ## Materialization strategies
 
@@ -72,7 +72,7 @@ strategy = "incremental"
 timestamp_column = "_fivetran_synced"
 ```
 
-The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Partition checksums, below, catch that case.
+The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Rocky does not detect that case today. Run a full refresh to pick them up.
 
 ### Recovering an interrupted replication
 
@@ -175,8 +175,7 @@ Then restore `strategy = "incremental"`.
 Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
 an INSERT but before its watermark flush can leave a stale cursor. The first
 run after upgrading can append those rows again. Repair the cursor from the
-target before that run if the old flush is uncertain. #2235 stays open for
-recovery gaps that this checkpoint rule does not address.
+target before that run if the old flush is uncertain.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
 `rocky state reconcile-watermark --pipeline <name>` sets the replacement
@@ -212,9 +211,13 @@ If `update_columns` is omitted, all columns are updated on match.
 
 ## Partition-level checksums
 
-A watermark only finds appended rows. Partition checksums find changes to rows that are already there. The `incremental` module of `rocky-core` implements them.
+:::caution[Not wired into runs]
+`rocky run` does not compare partition checksums today. The `incremental` module of `rocky-core` holds the building blocks (`diff_checksums`, `generate_checksum_sql`). No run path calls them, and the state store keeps no checksums. Only `rocky compact --measure-dedup` computes table checksums.
+:::
 
-### How Rocky compares partition checksums
+A watermark only finds appended rows. Partition checksums are designed to find changes to rows that are already there.
+
+### How the checksum comparison works
 
 1. Each partition of a model, for example one partition per date, gets a checksum: a hash of the partition contents and its row count.
 2. On the next run, Rocky compares the current checksums against the stored ones.
@@ -228,11 +231,15 @@ Result:        Changed: ["2026-03-29", "2026-03-30"]
                Unchanged: ["2026-03-28"]
 ```
 
-This catches what watermarks miss: backfills, late-arriving corrections, and retroactive edits to historical data.
+This would catch what watermarks miss: backfills, late-arriving corrections, and retroactive edits to historical data.
 
 ## Column-level change propagation
 
-The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler/)) tracks column-level lineage across the whole DAG. Lineage is the map of which columns feed which. Rocky reads it to skip downstream models that do not depend on any changed column.
+:::caution[Not wired into runs]
+`rocky run` does not skip models by column-level propagation today. `compute_propagation` in `rocky-core` holds the logic, but no run path calls it. To skip unchanged models, use the [skip-unchanged gate](#skipping-unchanged-models).
+:::
+
+The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler/)) tracks column-level lineage across the whole DAG. Lineage is the map of which columns feed which. The propagation logic reads it to find downstream models that do not depend on any changed column.
 
 ### Example
 
@@ -243,54 +250,24 @@ orders (source) → orders_summary (uses: amount, customer_id)
                 → orders_audit   (uses: status, updated_at)
 ```
 
-If an upstream schema change only affects the `status` column, Rocky determines:
+If an upstream schema change only affects the `status` column, the logic decides:
 
 - `orders_summary` does not depend on `status`, so it is skipped
 - `orders_audit` depends on `status`, so it is recomputed
 
-This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`. Rocky logs the skip reason so you can check the decision.
-
-Column propagation works with any incremental strategy. It runs on top of watermarks or checksums and prunes the DAG to what actually needs to change.
+This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`.
 
 ## Skipping unchanged models
 
-The strategies above decide *how* a model rebuilds. The `--skip-unchanged` gate decides *whether* a transformation model rebuilds at all. It skips re-materializing a model when both its logic and its upstream data look unchanged since the model's last successful build.
+The strategies above decide *how* a model rebuilds. The `--skip-unchanged` gate decides *whether* a transformation model rebuilds at all. It skips a model only when both its logic and its upstream data look unchanged since its last successful build.
 
-Treat it as a cost saving, not a promise. It does **not** guarantee that two runs produce identical rows.
+Treat it as a cost saving, not a promise. It does **not** guarantee that two runs produce identical rows. The gate is **default-off**. Turn it on with `--skip-unchanged` or `[run] skip_unchanged = true`.
 
-The gate is **default-off**. A plain `rocky run` behaves exactly as it did before the gate existed. Turn it on per invocation with `--skip-unchanged`, or project-wide with `[run] skip_unchanged = true`.
-
-### The two conditions: logic and data
-
-Rocky skips a model only when **both** conditions hold. Skipping on logic alone, while upstream data has moved, is the staleness bug the gate exists to prevent.
-
-- **B2 — logic unchanged.** The model's logic key matches the one recorded on the prior successful build. The key is a hash of the normalised SQL plus typed structural facts, so reformatting the SQL is not a change. Altering what it computes is.
-- **B3 — upstream data unchanged.** Every upstream is provably stable. That means an upstream Rocky model that was *skipped* this run, whose output is unchanged by definition. Or it means a raw source whose `MAX(<timestamp>)` matches the signature recorded on the prior build. Behind the `skip_rowcount_fallback` opt-in, `COUNT(*)` counts too.
-
-### Every ambiguous input resolves to *build*
-
-A wrong skip is silent production staleness, the worst failure a transformation engine can have. So exactly one code path yields a skip, and everything else resolves the other way: **build**. A flaky freshness probe rebuilds. A model with no prior successful build rebuilds. An unparseable SQL body rebuilds. `--force-rebuild` always rebuilds.
-
-### Models that are never skip-eligible
-
-Eligibility is a conservative static check. These always rebuild:
-
-- **Non-deterministic SQL** — any model calling a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …) or any function not on Rocky's pure-function allowlist. The aggregates `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, and `MODE` are excluded too. Without a `WITHIN GROUP (ORDER BY …)` their output can differ run to run.
-- **Models whose lineage isn't provably complete** — anything beyond a single plain `SELECT` over bare tables. That covers CTEs, sub-queries in `FROM`, and `PIVOT` / `UNNEST` / nested-join table factors. It also covers `IN (SELECT …)` / `EXISTS` / scalar sub-selects, and set operations (`UNION` / `INTERSECT` / `EXCEPT`). Each could read an upstream the freshness walk never examined, so the model rebuilds.
-- **`content_addressed` and `time_interval` strategies** — these use the content-addressed and per-partition paths, not the skip gate. A `full_refresh` model **is** eligible.
-
-A model owner can override the automatic decision per model with a `[skip]` sidecar block (`eligible` / `deterministic`). For the flags, the `[run]` knobs, and the `[skip]` overrides, see [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/).
+Every ambiguous input resolves to *build*. A flaky freshness probe, a model with no prior successful build, and an unparseable SQL body all rebuild. Non-deterministic SQL, lineage that is not provably complete, and the `content_addressed` and `time_interval` strategies are never skip-eligible. A `full_refresh` model is eligible. `--force-rebuild` always rebuilds. The two conditions, the full ineligible list and the `[skip]` overrides are in [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/).
 
 ## Time-interval processing
 
-The `time_interval` strategy processes time-series data one partition at a time. The model SQL uses `@start_date` and `@end_date` placeholders:
-
-```sql
-SELECT event_date, event_type, COUNT(*) AS event_count
-FROM events.page_views
-WHERE event_date >= @start_date AND event_date < @end_date
-GROUP BY event_date, event_type
-```
+The `time_interval` strategy processes time-series data one partition at a time. The model SQL uses `@start_date` and `@end_date` placeholders, which Rocky replaces with quoted timestamp literals for each partition.
 
 ```toml
 [strategy]
@@ -300,31 +277,14 @@ granularity = "day"
 lookback = 3
 ```
 
-### How Rocky processes one partition
-
-1. Rocky decides which partitions to process from the CLI flags (`--partition`, `--from/--to`, `--latest`, `--missing`, `--lookback`).
-2. For each partition, it replaces `@start_date` and `@end_date` with quoted timestamp literals.
-3. The generated SQL uses `INSERT OVERWRITE` semantics. That is one atomic statement on Databricks via Delta, and a multi-statement transaction on Snowflake.
-4. Rocky tracks per-partition state in the state store, which is what makes gap discovery (`--missing`) possible.
-
-### Per-warehouse SQL
-
-- **Databricks**: `INSERT INTO <target> REPLACE WHERE <filter> <select>` (single atomic statement via Delta)
-- **Snowflake**: `BEGIN; DELETE FROM <target> WHERE <filter>; INSERT INTO <target> <select>; COMMIT;` (4 statements)
-- **DuckDB**: Same shape as Snowflake
-
-### CLI flags
-
-> Note: the canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`. Every partition-selection flag below is accepted on both `rocky plan` and the `rocky run` single-step alias. `rocky run` fuses plan and apply into one invocation, for local iteration and automation.
+Each partition is one `INSERT OVERWRITE`-style write. It is one atomic statement on Databricks (`REPLACE WHERE` on Delta). It is a multi-statement transaction on Snowflake and DuckDB. Rocky records per-partition state in the state store, which is what makes `--missing` gap discovery possible.
 
 ```bash
-rocky plan --partition 2026-04-01 && rocky apply <plan-id>          # Process one partition
-rocky plan --from 2026-03-01 --to 2026-04-01 && rocky apply <plan-id>  # Date range
-rocky plan --latest && rocky apply <plan-id>                        # Most recent partition
-rocky plan --missing && rocky apply <plan-id>                       # Discover and fill gaps
-rocky plan --lookback 7 && rocky apply <plan-id>                    # Reprocess last N partitions
-rocky plan --parallel 4 && rocky apply <plan-id>                    # Parallelize partitions
+rocky plan --partition 2026-04-01 && rocky apply <plan-id>   # one partition
+rocky plan --missing && rocky apply <plan-id>                # fill gaps
 ```
+
+`rocky run` fuses plan and apply into one step. The partition flags (`--partition`, `--from/--to`, `--latest`, `--missing`, `--lookback`, `--parallel`) work on both. [Time Interval Materialization](/concepts/time-interval/) has the flag table, the per-warehouse SQL, and the first-run fill limit.
 
 ## Full refresh fallback
 
@@ -332,13 +292,7 @@ Rocky falls back to a full refresh in two situations.
 
 ### Schema drift
 
-The schema drift detector (in `rocky-core/drift.rs`) compares source and target column types. On a type mismatch it triggers `DropAndRecreate`: Rocky drops the target table and rebuilds it from scratch. It has to, because inserting rows with an incompatible type would fail at the warehouse.
-
-```
-Source: orders.amount (DECIMAL(10,2))
-Target: orders.amount (STRING)
-→ Schema drift detected → DROP TABLE → Full refresh
-```
+The drift detector compares source and target column types. On a type mismatch it triggers `DropAndRecreate`. Rocky drops the target table and rebuilds it from scratch, because inserting rows with an incompatible type would fail at the warehouse. See [Schema Drift](/concepts/schema-drift/).
 
 ### Missing watermark
 
@@ -346,14 +300,4 @@ The state store may hold no watermark for a table. The table is new, the state b
 
 ## State store
 
-Rocky keeps watermarks and partition checksums in an embedded key-value store backed by [redb](https://github.com/cberner/redb). For the remote persistence backends and the state lifecycle, see [State Management](/concepts/state-management/).
-
-The state store tracks:
-
-- **Watermarks:** last successfully replicated timestamp per table
-- **Check history:** historical row counts for anomaly detection
-- **Run history:** metadata about previous runs
-- **Partition checksums:** per-partition hashes for checksum-based incremental
-- **DAG snapshots:** previous DAG structure for change detection
-
-All state is scoped per environment. Dev, staging, and prod maintain independent state with no cross-environment coordination.
+Rocky keeps watermarks and partition checksums in an embedded key-value store backed by [redb](https://github.com/cberner/redb). The store also holds check history, run history, per-partition records for `time_interval` models, and DAG snapshots. All state is scoped per environment, with no cross-environment coordination. See [State Management](/concepts/state-management/).

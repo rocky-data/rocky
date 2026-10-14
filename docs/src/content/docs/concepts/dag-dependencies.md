@@ -80,8 +80,8 @@ connection.
 ### Cycle detection
 
 Rocky reports a circular dependency as the set of models in the cycle.
-Models that only read from the cycle are not listed. `rocky compile` exits
-`1`. `rocky run --dag` refuses before it runs any node, so no table is
+Models that only read from the cycle are not listed. `rocky compile` reports
+it as [`E058`](/concepts/compiler/#dependency-cycles-e058) and exits `1`. `rocky run --dag` refuses before it runs any node, so no table is
 written.
 
 ```toml
@@ -145,5 +145,5 @@ JOIN dbt_fivetran.stg_facebook_ads__ad_history f
     ON o.campaign_id = f.campaign_id
 ```
 
-See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for the full
+See [Read dbt Package Tables](/guides/using-dbt-packages/) for the full
 guide to this pattern.

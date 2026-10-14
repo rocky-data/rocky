@@ -3,7 +3,14 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, SESSION_EXPIRED_EVENT } from "./api";
-import { App, EnginePanel, SESSION_EXPIRED_TITLE, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
+import {
+  App,
+  EnginePanel,
+  SESSION_EXPIRED_TITLE,
+  WIDE_ENOUGH_FOR_THE_SIDEBAR,
+  WAITING_REFRESH_MS,
+  waitingLine,
+} from "./App";
 import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { OPERATOR_MODE_LABEL, READ_ONLY_REASON } from "./operator";
@@ -152,6 +159,8 @@ describe("EnginePanel", () => {
 
 describe("App", () => {
   const slots = {
+    // Every App test gets a fake count, so none reaches jsdom's fetch.
+    fetchWaiting: async () => 0,
     engine: <span>engine slot</span>,
     estate: <span>estate slot</span>,
     review: <span>review slot</span>,
@@ -221,6 +230,130 @@ describe("App", () => {
     for (const entry of disabled) expect(entry.closest("a")).toBeNull();
     expect(within(nav).getByText("No page of its own yet. The runs table is on Estate.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
+  });
+
+  /** The badge's digit beside a link, or null when there is none. */
+  const badgeOf = (name: string) =>
+    areas()
+      .getByRole("link", { name })
+      .parentElement?.querySelector('span[aria-hidden="true"]')?.textContent ?? null;
+  /** Let every pending read settle, so a "no badge" check is not vacuous. */
+  const settle = () => act(async () => {});
+
+  it("badges Needs you and Review with what waits, keeping each link's name", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => 2} />);
+    const needs = await waitFor(() => {
+      const link = areas().getByRole("link", { name: "Needs you" });
+      expect(link).toHaveAccessibleDescription(waitingLine(2));
+      return link;
+    });
+    // The digit is beside the link, never in its text or its name.
+    expect(needs.textContent).toBe("Needs you");
+    expect(badgeOf("Needs you")).toBe("2");
+    expect(areas().getByRole("link", { name: "Review" })).toHaveAccessibleDescription(
+      "2 decisions wait on you",
+    );
+    // Only those two: nothing else in the sidebar waits on a person.
+    expect(areas().getByRole("link", { name: "Estate" })).not.toHaveAttribute("aria-describedby");
+    expect(waitingLine(1)).toBe("1 decision waits on you");
+  });
+
+  it.each([
+    ["zero", async () => 0],
+    ["a section the engine could not read", async () => null],
+    [
+      "a refused read",
+      async (): Promise<number> => {
+        throw new Error("refused");
+      },
+    ],
+  ])("shows no badge for %s", async (_label, fetchWaiting) => {
+    window.history.pushState(null, "", "/ui/estate");
+    const read = vi.fn(fetchWaiting);
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
+    await waitFor(() => expect(read).toHaveBeenCalled());
+    await settle();
+    expect(badgeOf("Needs you")).toBeNull();
+    expect(areas().getByRole("link", { name: "Review" })).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("reads nothing before the engine answers", async () => {
+    const read = vi.fn(async () => 1);
+    render(
+      <App fetchMeta={() => new Promise<MetaOutput>(() => {})} {...slots} fetchWaiting={read} />,
+    );
+    await settle();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  describe("refreshing the count", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    });
+
+    it("reads again on its interval, and clears a count it can no longer vouch for", async () => {
+      vi.useFakeTimers();
+      window.history.pushState(null, "", "/ui/estate");
+      const answers: (() => Promise<number>)[] = [
+        async () => 3,
+        async () => {
+          throw new Error("engine_busy");
+        },
+        async () => 1,
+      ];
+      const read = vi.fn(() => (answers.shift() ?? (async () => 1))());
+      render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
+      await settle();
+      expect(badgeOf("Review")).toBe("3");
+
+      await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS));
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(badgeOf("Review")).toBeNull();
+
+      await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS));
+      expect(badgeOf("Review")).toBe("1");
+    });
+
+    it("never stacks a read on one still running", async () => {
+      vi.useFakeTimers();
+      window.history.pushState(null, "", "/ui/estate");
+      const read = vi.fn(() => new Promise<number>(() => {}));
+      render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
+      await settle();
+      await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS * 3));
+      expect(read).toHaveBeenCalledTimes(1);
+    });
+
+    it("pauses while the tab is hidden, and reads at once when it comes back", async () => {
+      vi.useFakeTimers();
+      window.history.pushState(null, "", "/ui/estate");
+      const read = vi.fn(async () => 2);
+      render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
+      await settle();
+      expect(read).toHaveBeenCalledTimes(1);
+
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS * 2));
+      expect(read).toHaveBeenCalledTimes(1);
+
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+    });
+
+    it("reads again on navigation", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      const read = vi.fn(async () => 2);
+      render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+      await settle();
+      areas().getByRole("link", { name: "Review" }).click();
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    });
   });
 
   it("switches areas on a click without a reload, and marks exactly one current", async () => {

@@ -2,7 +2,7 @@
 title: AI Features
 description: Generate models from a plain-English description, sync schema changes, and generate tests with Rocky's AI commands.
 sidebar:
-  order: 6
+  order: 16
 ---
 
 Rocky's AI commands call Claude to generate models, describe existing models,

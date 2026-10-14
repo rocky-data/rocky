@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::cost_check;
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
+use rocky_compiler::model_targets::{ModelTargets, push_unique};
 use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
@@ -432,7 +433,10 @@ fn compile_inner(
         preserve_authored_sql: true,
         external_dependencies: Default::default(),
         project: None,
-        target_dialects: target_dialects_of(model_targets.as_ref()),
+        target_dialects: model_targets
+            .as_ref()
+            .map(ModelTargets::target_dialects)
+            .unwrap_or_default(),
     };
 
     // Without `--models`, one compile over every transformation pipeline's
@@ -942,60 +946,25 @@ fn operand_target_for(
 
 /// The warehouse each model runs on, for the compile itself: a `CAST` to a
 /// type whose width differs between warehouses is typed for it (#2333).
-///
-/// Only the adapters of the pipelines that load the model count. Unlike the
-/// operand checks ([`operand_target_for`]), `--target-dialect` and
-/// `[portability] target_dialect` are not used: they name a dialect to lint
-/// the SQL against, not the warehouse that writes the column, so a type
-/// taken from them could be wrong. A model with no known adapter, or with
-/// one Rocky has no width table for, keeps such casts `Unknown`.
+/// The one resolver every compiling surface uses:
+/// [`rocky_compiler::model_targets`].
 pub(crate) fn target_dialects(
     config: Option<&rocky_config::RockyConfig>,
     config_path: &Path,
 ) -> rocky_compiler::operand_check::TargetDialects {
-    let targets = config.map(|config| ModelTargets::resolve(config, config_path));
-    target_dialects_of(targets.as_ref())
+    rocky_compiler::model_targets::target_dialects(config, config_path)
 }
 
-/// [`target_dialects`] given the resolved [`ModelTargets`].
-fn target_dialects_of(
-    targets: Option<&ModelTargets<'_>>,
+/// [`target_dialects`] of the project config at `config_path`, for a caller
+/// that has already refused an unreadable `rocky.toml` (the source-schema
+/// loader does). A missing file gives no target for any model.
+pub(crate) fn target_dialects_at(
+    config_path: &Path,
 ) -> rocky_compiler::operand_check::TargetDialects {
-    use rocky_compiler::operand_check::TargetDialects;
-
-    let Some(targets) = targets else {
-        return TargetDialects::default();
-    };
-    let mut out = TargetDialects::uniform(adapter_target(&targets.for_unlisted_model()));
-    for model in targets.by_model.keys() {
-        out.set(model.clone(), adapter_target(&targets.for_model(model)));
-    }
-    out
-}
-
-/// The dialects of `adapters`, with no fallback to a configured lint
-/// dialect. An adapter Rocky has no dialect for is `unruled`.
-fn adapter_target(
-    adapters: &[&rocky_config::AdapterConfig],
-) -> rocky_compiler::operand_check::OperandTarget {
-    use rocky_compiler::operand_check::{OperandDialect, OperandTarget};
-
-    if adapters.is_empty() {
-        return OperandTarget::Unconfigured;
-    }
-    let mut dialects = Vec::new();
-    let mut unruled = Vec::new();
-    for adapter in adapters {
-        match OperandDialect::from_adapter_type(&adapter.adapter_type) {
-            Some(d) if !dialects.contains(&d) => dialects.push(d),
-            Some(_) => {}
-            None if !unruled.contains(&adapter.adapter_type) => {
-                unruled.push(adapter.adapter_type.clone());
-            }
-            None => {}
-        }
-    }
-    OperandTarget::Targets { dialects, unruled }
+    let config = rocky_config::load_optional_project_config(Some(config_path))
+        .ok()
+        .flatten();
+    target_dialects(config.as_ref(), config_path)
 }
 
 /// [`operand_target_for`] given the warehouses the model runs on.
@@ -1125,135 +1094,6 @@ fn function_details(
             calls: sig.calls.iter().cloned().collect(),
         })
         .collect()
-}
-
-/// Whether an adapter block acts as a warehouse (the data role): every
-/// block except a discovery-only type (`fivetran`, `airbyte`, …) or one
-/// declared `kind = "discovery"`. An adapter type Rocky does not know counts
-/// as a warehouse.
-fn is_warehouse(adapter: &rocky_config::AdapterConfig) -> bool {
-    adapter.kind != Some(rocky_config::AdapterKind::Discovery)
-        && rocky_core::adapter_capability::capability_for(&adapter.adapter_type)
-            .is_none_or(|cap| cap.supports_data)
-}
-
-/// The warehouse adapters each model runs on, resolved from the pipelines
-/// that actually target them — not from every configured adapter.
-///
-/// ```text
-///   model ──(matches pipeline.<p>.models glob)──▶ transformation pipeline
-///         ──(pipeline.<p>.target.adapter)──────▶ warehouse adapter
-/// ```
-///
-/// - A model that a transformation pipeline's `models` glob loads runs on
-///   that pipeline's target. Several pipelines can load one model; it then
-///   has several targets.
-/// - A model no transformation pipeline loads can still run through
-///   `rocky run --models` on any pipeline, so it gets every pipeline's
-///   target. With no pipeline at all, it gets every warehouse adapter.
-/// - A pipeline whose model set cannot be read adds its target to every
-///   model (fail closed).
-///
-/// The compile-time refusals (E049, E051, E053, E054, E042/E043) refuse a
-/// model when ANY of its targets refuses it. An adapter that no pipeline
-/// targets no longer hides a refusal.
-struct ModelTargets<'c> {
-    by_model: HashMap<String, Vec<&'c rocky_config::AdapterConfig>>,
-    unclaimed: Vec<&'c rocky_config::AdapterConfig>,
-    everywhere: Vec<&'c rocky_config::AdapterConfig>,
-}
-
-impl<'c> ModelTargets<'c> {
-    fn resolve(config: &'c rocky_config::RockyConfig, config_path: &Path) -> Self {
-        let warehouse = |name: &str| config.adapters.get(name).filter(|a| is_warehouse(a));
-        let mut pipelines: Vec<(&String, &rocky_config::PipelineConfig)> =
-            config.pipelines.iter().collect();
-        pipelines.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut by_model: HashMap<String, Vec<&'c rocky_config::AdapterConfig>> = HashMap::new();
-        let mut everywhere = Vec::new();
-        let mut unclaimed = Vec::new();
-        for (_, pipeline) in &pipelines {
-            let Some(adapter) = warehouse(pipeline.target_adapter()) else {
-                continue;
-            };
-            push_unique(&mut unclaimed, adapter);
-            let Some(tx) = pipeline.as_transformation() else {
-                continue;
-            };
-            match pipeline_model_names(tx, config_path) {
-                Some(names) => {
-                    for name in names {
-                        push_unique(by_model.entry(name).or_default(), adapter);
-                    }
-                }
-                None => push_unique(&mut everywhere, adapter),
-            }
-        }
-        if pipelines.is_empty() {
-            let mut names: Vec<&String> = config.adapters.keys().collect();
-            names.sort();
-            for name in names {
-                if let Some(adapter) = warehouse(name) {
-                    push_unique(&mut unclaimed, adapter);
-                }
-            }
-        }
-        Self {
-            by_model,
-            unclaimed,
-            everywhere,
-        }
-    }
-
-    /// The warehouses `model` can run on. Empty when nothing is configured.
-    fn for_model(&self, model: &str) -> Vec<&'c rocky_config::AdapterConfig> {
-        match self.by_model.get(model) {
-            Some(claimed) => self.with_everywhere(claimed.clone()),
-            None => self.for_unlisted_model(),
-        }
-    }
-
-    /// The warehouses a model no pipeline lists by name can run on.
-    fn for_unlisted_model(&self) -> Vec<&'c rocky_config::AdapterConfig> {
-        self.with_everywhere(self.unclaimed.clone())
-    }
-
-    fn with_everywhere(
-        &self,
-        mut out: Vec<&'c rocky_config::AdapterConfig>,
-    ) -> Vec<&'c rocky_config::AdapterConfig> {
-        for adapter in &self.everywhere {
-            push_unique(&mut out, adapter);
-        }
-        out
-    }
-}
-
-fn push_unique<'c>(
-    list: &mut Vec<&'c rocky_config::AdapterConfig>,
-    adapter: &'c rocky_config::AdapterConfig,
-) {
-    if !list.iter().any(|a| std::ptr::eq(*a, adapter)) {
-        list.push(adapter);
-    }
-}
-
-/// The names of the models a transformation pipeline loads, through the
-/// same glob resolution `rocky run` uses. `None` when the set cannot be read.
-fn pipeline_model_names(
-    tx: &rocky_config::TransformationPipelineConfig,
-    config_path: &Path,
-) -> Option<Vec<String>> {
-    match crate::models_loader::locate_models_dir(&tx.models, config_path).ok()? {
-        crate::models_loader::ModelsDir::Absent(_) => Some(Vec::new()),
-        crate::models_loader::ModelsDir::Present(dir) => {
-            let glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
-            let models =
-                crate::models_loader::load_project_models_matching(&dir, &glob, None).ok()?;
-            Some(models.into_iter().map(|m| m.config.name).collect())
-        }
-    }
 }
 
 /// The SCD2 snapshot refusal of one warehouse, if it has one.

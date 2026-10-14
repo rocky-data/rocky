@@ -392,6 +392,9 @@ pub struct RockyLsp {
     /// Populated in `did_open` (after `read_source` succeeds) and
     /// `did_change`; survives `did_close` (cached for re-open).
     salsa_sources: Arc<RwLock<HashMap<Url, SourceFile>>>,
+    /// The warehouse each model runs on, for typing a `CAST` whose width
+    /// differs between warehouses (#2342). See [`CastTargets`].
+    cast_targets: Arc<CastTargets>,
 }
 
 impl RockyLsp {
@@ -498,6 +501,7 @@ impl RockyLsp {
         )
         .await;
 
+        let cast_targets = CastTargets::resolve(&dir_path);
         let config = CompilerConfig {
             models_dir: dir_path.clone(),
             contracts_dir: None,
@@ -514,16 +518,19 @@ impl RockyLsp {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
-            // The language server and `rocky serve` do not resolve each model's
-            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
-            target_dialects: Default::default(),
+            // A full compile: resolve each model's warehouse afresh, as
+            // `rocky compile` does. Kept for the edits that follow once
+            // this compile's result is the stored one.
+            target_dialects: cast_targets.targets.clone(),
         };
 
         let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
                 apply_project_gates(&dir_path, &mut result);
-                self.publish_diagnostics(generation, result).await;
+                if self.publish_diagnostics(generation, result).await {
+                    self.cast_targets.keep(generation, cast_targets);
+                }
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
@@ -1453,6 +1460,7 @@ impl LanguageServer for RockyLsp {
             let published_files = self.published_files.clone();
             let salsa_db = self.salsa_db.clone();
             let salsa_sources = self.salsa_sources.clone();
+            let cast_targets = self.cast_targets.clone();
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1483,7 +1491,7 @@ impl LanguageServer for RockyLsp {
                     config_unreadable.as_deref(),
                 )
                 .await;
-                let config = CompilerConfig {
+                let mut config = CompilerConfig {
                     models_dir: dir_path,
                     contracts_dir: None,
                     required_explicit_contract_model: None,
@@ -1499,8 +1507,8 @@ impl LanguageServer for RockyLsp {
                     preserve_authored_sql: true,
                     external_dependencies: Default::default(),
                     project: None,
-                    // The language server and `rocky serve` do not resolve each model's
-                    // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+                    // Set below: kept for an incremental compile, resolved
+                    // afresh for a full one (see `CastTargets`).
                     target_dialects: Default::default(),
                 };
 
@@ -1513,28 +1521,45 @@ impl LanguageServer for RockyLsp {
                 // fast (<50 ms on 100-model projects), needs a live borrow
                 // of the previous result, and won't dominate the runtime.
                 let generation = published_files.begin_compile();
-                let use_incremental =
-                    changed_file.is_some() && compile_result.read().await.is_some();
-                let new_result = if use_incremental {
+                // An incremental compile keeps the previous types of every
+                // model the edit does not reach, so it needs the targets the
+                // previous compile used. A changed `rocky.toml` can change
+                // them: compile in full then.
+                let kept_targets =
+                    if changed_file.is_some() && compile_result.read().await.is_some() {
+                        cast_targets.kept(&config.models_dir)
+                    } else {
+                        None
+                    };
+                // A full compile also returns the targets it resolved, kept
+                // only once its result is the stored one.
+                let new_result = if let Some(targets) = kept_targets {
+                    config.target_dialects = targets;
                     let prev = compile_result.read().await;
                     let prev_ref = prev.as_ref().expect("checked use_incremental above");
                     let cf = changed_file
                         .as_ref()
                         .expect("checked use_incremental above");
-                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config).ok()
+                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config)
+                        .ok()
+                        .map(|result| (result, None))
                 } else {
-                    let config_for_blocking = config.clone();
+                    let mut config_for_blocking = config.clone();
                     tokio::task::spawn_blocking(move || {
-                        rocky_compiler::compile::compile(&config_for_blocking).ok()
+                        let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
+                        config_for_blocking.target_dialects = resolved.targets.clone();
+                        rocky_compiler::compile::compile(&config_for_blocking)
+                            .ok()
+                            .map(|result| (result, Some(resolved)))
                     })
                     .await
                     .ok()
                     .flatten()
                 };
 
-                if let Some(mut result) = new_result {
+                if let Some((mut result, resolved)) = new_result {
                     apply_project_gates(&config.models_dir, &mut result);
-                    Self::publish_compile_diagnostics(
+                    let stored = Self::publish_compile_diagnostics(
                         &client,
                         &published_files,
                         &compile_result,
@@ -1542,6 +1567,9 @@ impl LanguageServer for RockyLsp {
                         result,
                     )
                     .await;
+                    if stored && let Some(resolved) = resolved {
+                        cast_targets.keep(generation, resolved);
+                    }
                 } else {
                     // A newer compile that failed still outranks an older
                     // one that may yet succeed.
@@ -4838,6 +4866,119 @@ fn apply_project_gates(
     );
 }
 
+/// The warehouse each model runs on, resolved the way `rocky compile`
+/// resolves it ([`rocky_compiler::model_targets`]), so the editor types a
+/// `CAST` whose width differs between warehouses as the CLI does (#2342).
+///
+/// Resolving reads every pipeline's model files, so the result is kept:
+///
+/// ```text
+///   full compile (startup, save, no previous result)
+///       resolve ── compile ── result stored ── keep (targets, rocky.toml hash)
+///   an edit ── rocky.toml unchanged since the kept ones ── incremental, kept targets
+///           └─ changed, or nothing kept ──────────────── full compile
+/// ```
+///
+/// A changed target retypes every cast, so an incremental compile, which
+/// keeps the previous types of the models an edit does not reach, must not
+/// run with targets other than those of the stored result. So targets are
+/// kept only when their compile's result is stored: a full compile that
+/// fails, or loses to a newer one, keeps nothing, and the previous kept
+/// targets still match the stored result. A full compile still running when
+/// an edit comes leaves the old kept hash in place, which no longer matches
+/// a changed `rocky.toml`, so that edit compiles in full too.
+///
+/// Which models a pipeline loads changes only when a file on disk changes,
+/// and a save runs a full compile. An unsaved edit changes neither.
+///
+/// The lock is a plain `std` mutex, held only while the value is read or
+/// replaced, never across an `.await`.
+#[derive(Default)]
+struct CastTargets {
+    kept: std::sync::Mutex<Option<KeptCastTargets>>,
+}
+
+struct KeptCastTargets {
+    /// The compile generation whose stored result these targets typed.
+    generation: u64,
+    resolved: ResolvedCastTargets,
+}
+
+/// Targets resolved from disk, with the `rocky.toml` they came from.
+struct ResolvedCastTargets {
+    /// A hash of the `rocky.toml` bytes, read before the targets; `None`
+    /// when there was no readable file.
+    config: Option<u64>,
+    targets: rocky_compiler::operand_check::TargetDialects,
+}
+
+impl CastTargets {
+    /// Resolve the targets from disk. Nothing is kept until
+    /// [`Self::keep`].
+    fn resolve(models_dir: &std::path::Path) -> ResolvedCastTargets {
+        let config = config_fingerprint(models_dir);
+        let targets = project_target_dialects(models_dir);
+        ResolvedCastTargets { config, targets }
+    }
+
+    /// Keep `resolved`: the full compile of `generation` that used it
+    /// stored its result. An older generation never replaces a newer one.
+    fn keep(&self, generation: u64, resolved: ResolvedCastTargets) {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.as_ref().is_none_or(|k| k.generation <= generation) {
+            *kept = Some(KeptCastTargets {
+                generation,
+                resolved,
+            });
+        }
+    }
+
+    /// The kept targets, while `rocky.toml` is unchanged since they were
+    /// resolved. `None` when nothing is kept or the file changed: the caller
+    /// then runs a full compile, which resolves them again.
+    fn kept(
+        &self,
+        models_dir: &std::path::Path,
+    ) -> Option<rocky_compiler::operand_check::TargetDialects> {
+        let config = config_fingerprint(models_dir);
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.as_ref()
+            .filter(|kept| kept.resolved.config == config)
+            .map(|kept| kept.resolved.targets.clone())
+    }
+}
+
+/// A hash of the project's `rocky.toml` bytes, or `None` when it cannot be
+/// read.
+fn config_fingerprint(models_dir: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(RockyLsp::project_config_path(models_dir)?).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// The cast targets of the project around `models_dir`: the same resolver
+/// `rocky compile` uses. No target for any model when `rocky.toml` is
+/// missing or unreadable (the unreadable case is published as W013).
+fn project_target_dialects(
+    models_dir: &std::path::Path,
+) -> rocky_compiler::operand_check::TargetDialects {
+    let Some(toml_path) = RockyLsp::project_config_path(models_dir) else {
+        return Default::default();
+    };
+    let Ok(config) = rocky_core::config::load_optional_project_config(Some(&toml_path)) else {
+        return Default::default();
+    };
+    rocky_compiler::model_targets::target_dialects(config.as_ref(), &toml_path)
+}
+
 /// Incremental compilation: recompile only changed models + dependents.
 ///
 /// §P3.1 — delegates to `rocky_compiler::compile::compile_incremental`,
@@ -4872,6 +5013,7 @@ pub async fn run_lsp() {
         published_files: Arc::default(),
         salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
         salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        cast_targets: Arc::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -4913,6 +5055,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(&root).unwrap();
@@ -5027,6 +5170,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(&root).unwrap();
@@ -5064,6 +5208,332 @@ mod tests {
             "the project gates did not run over the LSP compile result: {:?}",
             result.diagnostics
         );
+    }
+
+    /// A project whose one pipeline writes to Snowflake, where `FLOAT` is
+    /// 64-bit. Model `b` casts to `FLOAT`; its contract declares
+    /// `contract_type`. `rocky compile` on this layout reports E011 exactly
+    /// when the contract is not `Float64` (`rocky/tests/run_cast_targets.rs`).
+    fn snowflake_cast_project(root: &std::path::Path, contract_type: &str) {
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\nwarehouse = \"wh\"\n\
+             username = \"u\"\npassword = \"p\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("b.sql"), "SELECT CAST(1.5 AS FLOAT) AS f").unwrap();
+        std::fs::write(
+            models.join("b.toml"),
+            "name = \"b\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"b\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("b.contract.toml"),
+            format!("[[columns]]\nname = \"f\"\ntype = \"{contract_type}\"\n"),
+        )
+        .unwrap();
+        // Ten more models, so an edit of one model runs the incremental
+        // compile: `compile_incremental` compiles in full below ten models.
+        for i in 0..10 {
+            std::fs::write(models.join(format!("filler_{i}.sql")), "SELECT 1 AS x").unwrap();
+            std::fs::write(
+                models.join(format!("filler_{i}.toml")),
+                format!(
+                    "name = \"filler_{i}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"filler_{i}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// The codes of the stored compile result, and the type of `b.f`.
+    async fn cast_verdict(lsp: &RockyLsp) -> (Vec<String>, Option<RockyType>) {
+        let stored = lsp.compile_result.read().await;
+        let result = stored.as_ref().expect("a compile result is stored");
+        let codes = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.model == "b")
+            .map(|d| d.code.to_string())
+            .collect();
+        let f = result
+            .type_check
+            .typed_models
+            .get("b")
+            .and_then(|cols| cols.iter().find(|c| c.name == "f"))
+            .map(|c| c.data_type.clone());
+        (codes, f)
+    }
+
+    /// #2342: the language server types a `CAST` for the warehouse the model
+    /// runs on, as `rocky compile` does, on the startup compile and on the
+    /// incremental compile an edit runs. It used to compile with no
+    /// warehouse, so the cast was `Unknown` and the contract went unchecked
+    /// (`I003`) while `rocky compile` reported E011.
+    #[tokio::test]
+    async fn the_lsp_types_a_cast_for_the_models_warehouse() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        for (contract_type, expect_e011) in [("Float32", true), ("Float64", false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            // Canonical, so the edited file's path is the one the compile
+            // loaded (macOS temp paths go through a `/private` link).
+            let root = tmp.path().canonicalize().unwrap().join("project");
+            snowflake_cast_project(&root, contract_type);
+            let model = root.join("models/b.sql");
+
+            let (mut service, mut socket) = LspService::new(test_lsp);
+            // Drain what the server sends: an undrained socket stalls the
+            // publication that stores each compile result.
+            tokio::spawn(async move { while socket.next().await.is_some() {} });
+            let root_uri = Url::from_directory_path(&root).unwrap();
+            for request in [
+                Request::build("initialize")
+                    .id(1)
+                    .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                    .finish(),
+                Request::build("initialized")
+                    .params(serde_json::json!({}))
+                    .finish(),
+            ] {
+                service.ready().await.unwrap().call(request).await.unwrap();
+            }
+
+            let (codes, f) = cast_verdict(service.inner()).await;
+            assert_eq!(f, Some(RockyType::Float64), "startup, {contract_type}");
+            assert_eq!(
+                codes.iter().any(|c| c == "E011"),
+                expect_e011,
+                "startup, contract {contract_type}: {codes:?}"
+            );
+            assert!(!codes.iter().any(|c| c == "I003"), "startup, {codes:?}");
+
+            // An edit: the debounced incremental compile, which reuses the
+            // targets the startup compile resolved.
+            let text = "SELECT CAST(2.5 AS FLOAT) AS f, 1 AS marker";
+            std::fs::write(&model, text).unwrap();
+            let change = Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": Url::from_file_path(&model).unwrap(), "version": 2 },
+                    "contentChanges": [{ "text": text }],
+                }))
+                .finish();
+            service.ready().await.unwrap().call(change).await.unwrap();
+            let edited = || async {
+                service
+                    .inner()
+                    .compile_result
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|r| r.type_check.typed_models.get("b").cloned())
+                    .is_some_and(|cols| cols.iter().any(|c| c.name == "marker"))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !edited().await && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(edited().await, "the edit was never compiled");
+            let (codes, f) = cast_verdict(service.inner()).await;
+            assert_eq!(
+                f,
+                Some(RockyType::Float64),
+                "after an edit, {contract_type}"
+            );
+            assert_eq!(
+                codes.iter().any(|c| c == "E011"),
+                expect_e011,
+                "after an edit, contract {contract_type}: {codes:?}"
+            );
+        }
+    }
+
+    /// An edit after `rocky.toml` changed warehouse retypes every cast, not
+    /// only those of the edited model: an incremental compile would keep
+    /// `b`'s old type, so the edit compiles in full.
+    #[tokio::test]
+    async fn an_edit_after_a_warehouse_change_retypes_every_cast() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        snowflake_cast_project(&root, "Float64");
+        let other = root.join("models/a.sql");
+        std::fs::write(&other, "SELECT 1 AS x").unwrap();
+        std::fs::write(
+            root.join("models/a.toml"),
+            "name = \"a\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"a\"\n",
+        )
+        .unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        assert_eq!(
+            cast_verdict(service.inner()).await.1,
+            Some(RockyType::Float64)
+        );
+
+        // The pipeline now writes to DuckDB, where `FLOAT` is 32-bit. Then
+        // `a`, not `b`, is edited.
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.duck]\ntype = \"duckdb\"\npath = \":memory:\"\n\
+             [pipeline.local]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.local.target]\nadapter = \"duck\"\n",
+        )
+        .unwrap();
+        let text = "SELECT 1 AS x, 2 AS marker";
+        std::fs::write(&other, text).unwrap();
+        let change = Request::build("textDocument/didChange")
+            .params(serde_json::json!({
+                "textDocument": { "uri": Url::from_file_path(&other).unwrap(), "version": 2 },
+                "contentChanges": [{ "text": text }],
+            }))
+            .finish();
+        service.ready().await.unwrap().call(change).await.unwrap();
+        let edited = || async {
+            service
+                .inner()
+                .compile_result
+                .read()
+                .await
+                .as_ref()
+                .and_then(|r| r.type_check.typed_models.get("a").cloned())
+                .is_some_and(|cols| cols.iter().any(|c| c.name == "marker"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !edited().await && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(edited().await, "the edit was never compiled");
+        assert_eq!(
+            cast_verdict(service.inner()).await.1,
+            Some(RockyType::Float32),
+            "b keeps the Snowflake type after the warehouse changed"
+        );
+    }
+
+    /// The targets are resolved by a full compile and kept while
+    /// `rocky.toml` is unchanged: an edit does not read every pipeline's
+    /// models again. A changed `rocky.toml` keeps nothing, so the edit
+    /// compiles in full and resolves them afresh.
+    #[test]
+    fn cast_targets_are_kept_until_the_config_changes() {
+        use rocky_compiler::operand_check::{OperandDialect, OperandTarget};
+
+        // `local` loads every model onto DuckDB; `prod` loads `b*` onto
+        // Snowflake. A model only `local` lists runs on DuckDB alone; a model
+        // no pipeline lists (not yet read) gets both.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        snowflake_cast_project(&root, "Float64");
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.duck]\ntype = \"duckdb\"\npath = \":memory:\"\n\
+             [adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\nwarehouse = \"wh\"\n\
+             username = \"u\"\npassword = \"p\"\n\
+             [pipeline.local]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.local.target]\nadapter = \"duck\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/b*\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        let target = |dialects: &[OperandDialect]| OperandTarget::Targets {
+            dialects: dialects.to_vec(),
+            unruled: Vec::new(),
+        };
+        let duck = target(&[OperandDialect::DuckDb]);
+        let both = target(&[OperandDialect::DuckDb, OperandDialect::Snowflake]);
+
+        let cache = CastTargets::default();
+        // A full compile of generation `g` that stored its result.
+        let full_compile = |g: u64| {
+            let resolved = CastTargets::resolve(&models);
+            let targets = resolved.targets.clone();
+            cache.keep(g, resolved);
+            targets
+        };
+        assert_eq!(cache.kept(&models), None, "nothing resolved yet");
+        let resolved = full_compile(1);
+        assert_eq!(resolved.for_model("b"), &both);
+        assert_eq!(resolved.for_model("c"), &both, "c is not on disk yet");
+        // A slow full compile that resolved now but stores last.
+        let older = CastTargets::resolve(&models);
+
+        // `c` appears on disk. An edit keeps the resolved targets, so `c`
+        // is still read as a model no pipeline lists.
+        std::fs::write(models.join("c.sql"), "SELECT 1 AS x").unwrap();
+        std::fs::write(
+            models.join("c.toml"),
+            "name = \"c\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"c\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cache
+                .kept(&models)
+                .expect("rocky.toml is unchanged")
+                .for_model("c"),
+            &both,
+            "kept, not re-read"
+        );
+
+        // A full compile (startup, save) resolves again and sees `c`. An
+        // older compile that stores after it does not put back its targets.
+        assert_eq!(full_compile(3).for_model("c"), &duck);
+        cache.keep(2, older);
+        assert_eq!(cache.kept(&models).unwrap().for_model("c"), &duck);
+
+        // A changed `rocky.toml` is noticed on an edit: nothing is kept, so
+        // the edit runs a full compile, which resolves the new targets.
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\nwarehouse = \"wh\"\n\
+             username = \"u\"\npassword = \"p\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        )
+        .unwrap();
+        assert_eq!(cache.kept(&models), None);
+        // A resolve whose compile failed keeps nothing: the stale kept
+        // targets still do not match the new `rocky.toml`.
+        let failed = CastTargets::resolve(&models);
+        assert_eq!(
+            failed.targets.for_model("c"),
+            &target(&[OperandDialect::Snowflake])
+        );
+        assert_eq!(cache.kept(&models), None, "a failed compile keeps nothing");
+        assert_eq!(
+            full_compile(4).for_model("c"),
+            &target(&[OperandDialect::Snowflake])
+        );
+        assert!(cache.kept(&models).is_some());
     }
 
     use super::*;
@@ -5108,8 +5578,7 @@ mod tests {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
-            // The language server and `rocky serve` do not resolve each model's
-            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            // No warehouse: these fixtures have no `CAST` whose type depends on one.
             target_dialects: Default::default(),
         };
         rocky_compiler::compile::compile(&config).expect("the project compiles")
@@ -5238,6 +5707,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         });
         // Collect what the editor receives; an undrained socket would stall
         // the handshake.
@@ -5369,6 +5839,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         });
         let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
         let sink = seen.clone();
@@ -5463,6 +5934,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         }
     }
 
@@ -6271,6 +6743,7 @@ mod tests {
             published_files: Arc::default(),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+            cast_targets: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(root).unwrap();
@@ -7369,8 +7842,7 @@ mod tests {
             preserve_authored_sql: true,
             external_dependencies: Default::default(),
             project: None,
-            // The language server and `rocky serve` do not resolve each model's
-            // warehouse: a `CAST` whose width differs by warehouse stays Unknown.
+            // No warehouse: these fixtures have no `CAST` whose type depends on one.
             target_dialects: Default::default(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();

@@ -2,7 +2,7 @@
 title: Verify a Run Without Rocky
 description: Check what a Rocky run did with three general-purpose tools, a small redb reader, a SQL client, and a file hasher. You do not need the rocky binary.
 sidebar:
-  order: 9
+  order: 14
 ---
 
 This guide is for a compliance, governance, or finance reviewer. It shows you how to check what a Rocky pipeline did without trusting, or installing, the `rocky` binary. You use three general-purpose tools instead.
@@ -368,5 +368,5 @@ Every load-bearing claim above, graded against what ships today:
 | Content-addressed Parquet named by BLAKE3 + recorded in `output_artifacts` | Shipped, but on the S3 content-addressed path only — not what a general DuckDB/Snowflake/BigQuery/Databricks run produces |
 | `[reuse]` input-match index + provenance record (offline-recomputable `skip_hash` *and* `input_hash` over persisted `upstreams` + `b3sum` + `proof_class`) | Shipped — opt-in (`[reuse] enabled`, default-off), recorded on the content-addressed (S3/UniForm) write path only |
 | Reuse *decision*: actually reusing a prior run's bytes instead of re-executing | Shipped — opt-in (`[reuse] enabled`, default-off), a fail-closed point-to decision on the content-addressed (S3/UniForm) write path, live-verified; any doubt builds |
-| `bytes_written` per model | Not yet — `null` on every adapter today |
-| Warehouse-native zero-copy clones for branches | Not yet — branches are isolated schema prefixes, not engine-native clones |
+| `bytes_written` per model | Only on the content-addressed (S3) write path. `null` on every warehouse adapter today |
+| Warehouse-native zero-copy clones for branches | Not yet for `rocky branch`: a branch is an isolated schema prefix. `rocky preview create` already clones its copy set natively on Databricks, Snowflake and BigQuery ([Preview a PR](/guides/preview-a-pr/)) |

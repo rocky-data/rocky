@@ -65,18 +65,15 @@ ALTER TABLE acme_warehouse.staging__us_west__shopify.orders
 ALTER COLUMN amount TYPE DECIMAL(12, 2)
 ```
 
-Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Snowflake and BigQuery override it with narrower rules that match what their own `ALTER COLUMN` accepts.
+Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Four warehouses override it with narrower rules that match what their own `ALTER COLUMN` accepts. A change outside a warehouse's rules falls through to a full refresh.
 
 - **Snowflake** allows `NUMBER(p,s)` precision widening and `VARCHAR` length widening, and nothing else. Its `DESCRIBE TABLE` output canonicalizes every integer type to `NUMBER(38,0)`, so integer widening never surfaces as drift there.
-- **BigQuery** allows `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC`, and nothing else. A numeric → `STRING` change is not assignable on BigQuery, so it falls through to a full refresh.
+- **BigQuery** allows `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC`, and nothing else. A numeric → `STRING` change is not assignable on BigQuery.
+- **Databricks** allows integer → wider integer, `TINYINT`/`SMALLINT`/`INT` → `DOUBLE`, `FLOAT` → `DOUBLE`, and `DECIMAL` precision widening at the same scale. Rocky turns on Delta's type-widening table feature (`delta.enableTypeWidening`, DBR 15.4 LTS or later) before the `ALTER`. Delta never accepts numeric → `STRING`.
+- **Trino** allows `INTEGER → BIGINT`, `REAL → DOUBLE`, and `DECIMAL` precision widening at the same scale, with the `SET DATA TYPE` form. These are the Iceberg connector's rules.
 
-:::caution[Databricks and Trino execution gaps]
-Databricks and Trino inherit the default allowlist, but their `ALTER` execution paths have known gaps:
-
-- Delta tables reject `ALTER COLUMN ... TYPE` unless the type-widening table feature is enabled, and Rocky does not set it. Delta never accepts numeric → `STRING`.
-- Trino requires `SET DATA TYPE` syntax, which the default statement does not use.
-
-On those two warehouses a safe widening does not evolve the column in place. The table's run fails with the warehouse's own error. The failure is loud, never a silent divergence, but Rocky does not yet fall back to a full refresh after a failed `ALTER`. Tracked in [#1115](https://github.com/rocky-data/rocky/issues/1115).
+:::caution[Trino connectors other than Iceberg]
+Rocky cannot see which connector backs a Trino table. On a non-Iceberg connector it still attempts an allowlisted widening. The connector either accepts it or the table's run fails with the warehouse's error. Rocky does not fall back to a full refresh after a failed `ALTER`.
 :::
 
 ### Unsafe Type Changes

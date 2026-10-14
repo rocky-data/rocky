@@ -724,6 +724,8 @@ export interface FivetranCacheConfig {
   file_root?: string | null;
   /**
    * URL passed to `object_store::parse_url` for `backend = "object_store"` or `backend = "tiered"` (secondary layer). Examples: `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`, `file:///path/`.
+   *
+   * A [`CredentialUrl`], like `valkey_url`: a password or a query (an Azure SAS token, say) is dropped from every printed form (#2339).
    */
   object_store_url?: string | null;
   /**
@@ -732,6 +734,8 @@ export interface FivetranCacheConfig {
   valkey_ttl_seconds?: number | null;
   /**
    * Connection URL for `backend = "valkey"` or `backend = "tiered"` (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
+   *
+   * It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
    */
   valkey_url?: string | null;
 }
@@ -769,6 +773,8 @@ export interface FivetranCircuitBreakerConfig {
   failure_threshold?: number | null;
   /**
    * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   *
+   * It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
    */
   valkey_url?: string | null;
   /**
@@ -800,6 +806,8 @@ export interface FivetranRatelimitConfig {
   max_wake_seconds?: number | null;
   /**
    * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   *
+   * It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
    */
   valkey_url?: string | null;
 }
@@ -895,6 +903,8 @@ export interface FivetranStampedeConfig {
   poll_timeout_seconds?: number | null;
   /**
    * Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+   *
+   * It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
    */
   valkey_url?: string | null;
 }

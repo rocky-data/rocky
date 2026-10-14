@@ -65,6 +65,9 @@ pub struct ObjectStoreCache {
     /// URL scheme tag for `Debug` output and log messages — keeps the
     /// raw bucket / credentials out of any log line.
     scheme: String,
+    /// The URL the store was built from, kept only to scrub its secrets out
+    /// of a runtime error (#2339). `None` for [`Self::from_parts`].
+    credential: Option<rocky_core::credential_url::CredentialUrl>,
 }
 
 impl std::fmt::Debug for ObjectStoreCache {
@@ -86,15 +89,25 @@ impl ObjectStoreCache {
     /// - `az://container/prefix` — Azure Blob Storage
     /// - `file:///path/prefix` — local filesystem (for tests and dev)
     pub fn from_url(url: &str) -> Result<Self, CacheError> {
-        let parsed =
-            Url::parse(url).map_err(|e| CacheError::ObjectStoreUrl(format!("{url}: {e}")))?;
+        // The URL can hold a credential (#2339), and `object_store` echoes
+        // it: `Unable to recognise URL "<url>"`, and each builder's
+        // `Unable parse source url. Url: <url>`. So the message names the
+        // shown form, and the error text is scrubbed of every secret part.
+        let credential = rocky_core::credential_url::CredentialUrl::from(url);
+        let fail = |e: &dyn std::fmt::Display| {
+            CacheError::ObjectStoreUrl(format!(
+                "{credential}: {}",
+                credential.scrub(&e.to_string())
+            ))
+        };
+        let parsed = Url::parse(url).map_err(|e| fail(&e))?;
         let scheme = parsed.scheme().to_string();
-        let (store, prefix) = object_store::parse_url(&parsed)
-            .map_err(|e| CacheError::ObjectStoreUrl(format!("{url}: {e}")))?;
+        let (store, prefix) = object_store::parse_url(&parsed).map_err(|e| fail(&e))?;
         Ok(ObjectStoreCache {
             store: Arc::from(store),
             prefix,
             scheme,
+            credential: Some(credential),
         })
     }
 
@@ -111,6 +124,17 @@ impl ObjectStoreCache {
             store,
             prefix,
             scheme: scheme.to_string(),
+            credential: None,
+        }
+    }
+
+    /// A runtime `object_store` error, with the store URL's secrets
+    /// scrubbed out of its text: a client error can echo the request URL,
+    /// which starts with the configured one (#2339).
+    fn store_error(&self, e: object_store::Error) -> CacheError {
+        match &self.credential {
+            Some(credential) => CacheError::ObjectStoreRemote(credential.scrub(&e.to_string())),
+            None => CacheError::ObjectStore(e),
         }
     }
 
@@ -158,9 +182,9 @@ impl FivetranStateCache for ObjectStoreCache {
         let result = match self.store.get(&path).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(CacheError::ObjectStore(e)),
+            Err(e) => return Err(self.store_error(e)),
         };
-        let bytes = result.bytes().await?;
+        let bytes = result.bytes().await.map_err(|e| self.store_error(e))?;
         let envelope: FivetranStateEnvelope = serde_json::from_slice(&bytes)?;
         Ok(Some(envelope))
     }
@@ -203,10 +227,13 @@ impl FivetranStateCache for ObjectStoreCache {
             Err(object_store::Error::NotFound { .. }) => {
                 // No prior object — fall through to unconditional PUT.
             }
-            Err(e) => return Err(CacheError::ObjectStore(e)),
+            Err(e) => return Err(self.store_error(e)),
         }
 
-        self.store.put(&path, Bytes::from(bytes).into()).await?;
+        self.store
+            .put(&path, Bytes::from(bytes).into())
+            .await
+            .map_err(|e| self.store_error(e))?;
         Ok(WriteOutcome::Written)
     }
 
@@ -218,6 +245,34 @@ impl FivetranStateCache for ObjectStoreCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2339: a runtime error that echoes the store URL must not carry its
+    /// secrets out.
+    #[test]
+    fn a_runtime_store_error_holds_no_secret() {
+        let cache = ObjectStoreCache::from_url("memory:///p/?sig=SIG-SECRET").unwrap();
+        let echo = object_store::Error::Generic {
+            store: "test",
+            source: "request to memory:///p/?sig=SIG-SECRET failed (SIG-SECRET)".into(),
+        };
+        let text = cache.store_error(echo).to_string();
+        assert!(text.contains("failed"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    /// #2339: `object_store` echoes the URL it cannot recognise, so the
+    /// error must not carry the URL's secrets back out.
+    #[test]
+    fn an_unrecognised_url_error_holds_no_secret() {
+        let Err(err) =
+            ObjectStoreCache::from_url("nope://user:PW-SECRET@host/p?sig=SIG-SECRET#F-SECRET")
+        else {
+            panic!("an unknown scheme must not build a store");
+        };
+        let text = err.to_string();
+        assert!(text.contains("recognise"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
 
     #[test]
     fn md5_hex_round_trip() {

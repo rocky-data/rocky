@@ -1,4 +1,4 @@
-# 07-run-trace-gantt — Trust arc 4: render a run as a timeline
+# 07-run-trace-gantt — render a run as a timeline
 
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
@@ -40,7 +40,7 @@ Your OpenTelemetry collector receives them as ordinary spans.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.11.0 on PATH
+- `rocky` on PATH
 - `duckdb` CLI for seeding
 
 ## Run

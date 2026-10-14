@@ -68,7 +68,7 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Errors from macro loading and expansion.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum MacroError {
     #[error("failed to read macro file {path}: {source}")]
     ReadFile {
@@ -115,6 +115,14 @@ pub enum MacroError {
 
     #[error("macro expansion exceeded maximum depth ({depth}); possible circular reference")]
     MaxDepthExceeded { depth: usize },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for MacroError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "MacroError", self)
+    }
 }
 
 /// Detail for a macro parameter type mismatch (boxed inside [`MacroError::TypeMismatch`]
@@ -1714,5 +1722,21 @@ WHERE @is_active(is_active_flag)";
         assert!(MacroParamType::Bool.matches_arg("true"));
         assert!(MacroParamType::Bool.matches_arg("FALSE"));
         assert!(MacroParamType::Bool.matches_arg("True"));
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn macro_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "macro-dir-1919-4e0b";
+        rocky_core::secret_registry::register_substitution("RV_MACRO_ERR_DBG", SECRET);
+        let err = MacroError::DirNotFound(format!("/macros/{SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_MACRO_ERR_DBG}"), "{debug}");
     }
 }

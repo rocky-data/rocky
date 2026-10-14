@@ -55,21 +55,20 @@ warehouse-neutral on purpose.
 
 ## The trust primitives, graded honestly
 
-Each primitive below names its real CLI surface or diagnostic code. The inline
-grade tells you how far it ships today, so you can plan around the edges instead
-of finding them later.
+Each primitive below names its real CLI surface or diagnostic code. The
+[grade table](#the-honesty-grade) at the end says how far each one ships today,
+so you can plan around the edges instead of finding them later.
 
 ### Compile-time types and diagnostics
 
 Rocky infers column-level types across the whole DAG. It reports problems as
-diagnostic codes you can grep in a CI log. The error codes run from `E001` to
-`E037`, with `W` warnings and `P` lints alongside.
+diagnostic codes you can grep in a CI log. Errors carry an `E` code, warnings a
+`W` code, and lints a `P` code.
 
 Compilation fails on any error-level diagnostic. That is the whole point: the
 failure becomes a non-zero exit code at PR time, not a wrong number in
 production.
 
-**Shipped.** This is the foundation the other primitives build on.
 
 ### Compile-time column-level lineage
 
@@ -86,7 +85,6 @@ merge.
 The lineage graph is intra-project. It knows the columns inside one Rocky
 project, not across project boundaries.
 
-**Shipped, within a project.**
 
 ### Branches
 
@@ -150,7 +148,6 @@ clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
 creation near-instant and free of storage cost. That integration is a follow-up,
 not what runs now.
 
-**Partial.** Schema-prefix branches and promotion ship today. The approval gate ships too, but it is off until you set `[branch.approval] required = true`, and its check is a digest, not a signature. Warehouse-native clones and signed approvals do not ship.
 
 ### Per-model cost
 
@@ -163,78 +160,55 @@ The accuracy depends on the warehouse:
 - **Databricks and Snowflake.** The figure is a duration × DBU-rate estimate. A DBU is Databricks' compute billing unit. Databricks also reports warehouse-scanned bytes, surfaced for observability rather than pricing, because Databricks prices by DBU. Snowflake's bytes plumbing is still a follow-up.
 - **DuckDB.** Zero.
 
-**Partial.** Per-model cost populates on every run. It is billing-exact on BigQuery and a duration-based estimate on Databricks and Snowflake. Databricks surfaces scanned bytes for observability. Snowflake's bytes plumbing is the follow-up.
 
 ### Compile-time contracts
 
 A `.contract.toml` declares what a model must produce. The compiler checks the
-model's inferred schema against it. Five codes cover the intra-project case:
+model's inferred schema against it. `E010` to `E014` cover a missing required
+column, a type mismatch, a nullability violation, a removed protected column,
+and an undeclared nullable column. The last applies only while `[rules]
+no_new_nullable` is on, which is off by default. Any of them fails compilation,
+so a broken contract is a red CI check rather than a production surprise. The
+[Checks and Tests](/concepts/data-quality-checks/#data-contracts) page has the
+format and every code.
 
-- `E010`: a required column is missing from the model output.
-- `E011`: a column's type does not match the contract.
-- `E012`: the contract says non-nullable and the model output is nullable.
-- `E013`: a protected column has been removed.
-- `E014`: the model output holds a nullable column the contract does not declare, while `[rules] no_new_nullable` is on. That rule is off by default.
-
-Any of these fails compilation, so a broken contract is a red CI check rather
-than a production surprise.
-
-Those five are intra-project: they check a model against a contract inside one
-Rocky project. Enforcement across a project boundary also ships, through a
-**vendored snapshot**. Vendored means the consuming team keeps its own committed
-copy of the producing team's compiled schema, and diffs against that copy.
-
-The flow has three parts. A producer runs `rocky publish-ir` to publish a
-snapshot of its compiled IR. A consumer vendors that snapshot and declares an
-`[imports.<name>]` block, with `baseline`, `snapshot`, and an optional `pin`,
-maintained by `rocky imports update [--check]`. The consumer's `rocky compile`
-then diffs the baseline against the snapshot and fails on a producer's breaking
-change:
-
-- `E030`: a column the consumer reads was dropped.
-- `E031`: that column's type narrowed.
-- `E032`: it went from nullable to NOT NULL.
-- `E033`: the snapshot drifted from the pinned recipe hash.
-- `E034`: the snapshot format is newer than this build can read.
-
-`W030` and `W031` cover the non-breaking cases: an added column and a widened
-type. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full
-workflow.
-
-**Shipped.** Intra-project (`E010`–`E014`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
+Those codes are intra-project. Enforcement across a project boundary also ships,
+through a **vendored snapshot**: the consuming team keeps its own committed copy
+of the producing team's compiled schema, and diffs against that copy. A producer
+runs `rocky publish-ir`. A consumer declares an `[imports.<name>]` block and the
+consumer's `rocky compile` fails on a breaking change with `E030` to `E034`.
+`W030` and `W031` cover an added column and a widened type. See
+[Cross-Team Contracts](/concepts/cross-team-contracts/) for the workflow and the
+meaning of each code.
 
 ### Declarative governance
 
 Rocky models governance as code through a `GovernanceAdapter`. The surface covers
-tag management, grant and revoke, workspace bindings, column tags, masking
-policies bound to classification tags, and role-graph reconciliation.
+tag management, grants, workspace bindings, column tags, masking
+policies bound to classification tags, and role-graph reconciliation. The adapter trait has a
+revoke method (`revoke_grants`), but `rocky run` does not call it. Rocky grants and never revokes.
 
 How much of that is real depends entirely on the warehouse:
 
 - **Databricks** implements the full surface through Unity Catalog.
-- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT`/`REVOKE` role grants, plus retention policy. Workspace binding and masking are not driven.
+- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT` role grants, plus retention policy. Workspace binding and masking are not driven.
 - **BigQuery** reconciles tags as labels (`ALTER … SET OPTIONS(labels=…)`). Grants map to IAM, so `apply_grants` and `revoke_grants` currently log and do nothing. Real IAM integration is a follow-up.
 - **DuckDB** does nothing, because it has no governance model to drive.
 
 So governance at depth is a Databricks capability today. The skeleton is
 warehouse-neutral. The depth is not yet portable.
 
-**Partial.** Full on Databricks; tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB.
 
 ### Schema drift handling
 
 Rocky checks for drift as it copies each table, whenever the target already
-exists. By default it grades the response and applies it in the same run. A new
-source column becomes `ALTER TABLE ADD COLUMN`. A safe type widening becomes
-`ALTER COLUMN TYPE`, which keeps the data. Any other type change drops the target
-and rebuilds it with a full refresh.
-
-Set `auto_apply_additive_drift = true` under `[resilience]` to route drift through
-the policy plane instead. The run then applies only a nullable new column, and
-only when policy resolves to `allow` for `schema_change.additive`. A matching rule
-can grant that, and so can `default_agent_effect = "allow"`. With no `[policy]`
-block, nothing is granted. Every other change is refused before it touches the
-target, including a safe widening.
+exists. By default it grades the response and applies it in the same run: add a
+column, widen a safe type, or drop and rebuild the target for any other type
+change. Set `auto_apply_additive_drift = true` under `[resilience]` to route
+drift through the policy plane. The run then applies only a nullable new column,
+and only when policy resolves to `allow` for `schema_change.additive`. With no
+`[policy]` block, nothing is granted. Every other change is refused before it
+touches the target, including a safe widening. See [Schema Drift](/concepts/schema-drift/).
 
 Three limits matter. The drop happens in the same run that finds the change: no
 grace period runs first. Rocky does not detect a column that disappeared from the
@@ -244,7 +218,6 @@ default, can then rebuild the table and report it as materialized, with no sign 
 the drop. See [Failure modes](/advanced/failure-modes/) for each action and its
 recovery.
 
-**Shipped.**
 
 ### Content-addressed writes and replay
 
@@ -291,7 +264,6 @@ models. A model that reads a mutable source is classified `non_replayable`
 instead of being re-run against current data. A non-deterministic recipe is
 flagged, so a `diverged` verdict there is expected rather than a failure.
 
-**Shipped for deterministic content-addressed models.** Recording and ledger verification ship; re-execution ships for the deterministic content-addressed case (mutable-source models classified `non_replayable`, non-deterministic recipes flagged).
 
 Content-addressed materialization itself ships for single-writer Delta and
 UniForm, a Delta feature that also publishes Iceberg metadata. It writes
@@ -301,19 +273,21 @@ multi-writer concurrency, broad schema evolution, or deletion vectors. A deletio
 vector is a Delta feature that records deleted rows in a side file rather than
 rewriting the Parquet.
 
-**Partial.** Single-writer content-addressed Delta/UniForm ships; multi-writer, broad schema evolution, and deletion vectors do not.
 
 ### VS Code trust overlays
 
-The VS Code extension draws the lineage graph and paints four trust signals onto
-it. Each one is backed by CLI output.
+The VS Code extension draws the lineage graph and paints five trust signals onto
+it. Each one is backed by Rocky output.
 
-1. **Drift**: schema drift against the warehouse. This overlay expects a dedicated drift command. There is no standalone `rocky drift` subcommand yet, because drift is detected inside `rocky run` and `rocky plan`. The overlay degrades to unavailable until that surface lands.
-2. **Breaking**: breaking changes from the semantic CI diff.
-3. **Replay**: the last recorded run for each model.
-4. **Governance**: compliance and masking status.
+1. **Cost**: the compile-time cost estimate for each model.
+2. **Freshness**: the declared freshness policy.
+3. **Breaking**: breaking changes from the semantic CI diff.
+4. **Last run**: the last recorded run for each model.
+5. **Governance**: classified columns and unmasked exceptions.
 
-**Shipped (four overlays).**
+There is no drift overlay. Rocky has no standalone `rocky drift` command. It
+detects drift inside `rocky run` and `rocky plan`.
+
 
 ## The honesty grade
 
@@ -324,15 +298,15 @@ surprised.
 |---|---|---|
 | Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
-| Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
+| Compile-time contracts (`E010`–`E014`) | Shipped | Intra-project contract validation against inferred schema. |
 | Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it by default; with `auto_apply_additive_drift`, only a nullable addition that policy resolves to `allow`. No grace period before a drop. A column removed from the source is not detected. The `drift` output can omit a drop whose first rebuild failed. |
-| Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
-| VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
+| Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect` or `[portability] target_dialect`; error severity. |
+| VS Code trust overlays | Shipped | Five: Cost, Freshness, Breaking, Last run, Governance. No drift overlay. |
 | Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Databricks surfaces scanned bytes for observability; Snowflake's warehouse-reported-bytes plumbing is the follow-up. |
-| Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB. |
+| Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB. |
 | Cross-team / cross-project contract enforcement | Shipped | Producer `rocky publish-ir` → consumer `[imports.<name>]` vendored snapshot → `E030`–`E034` enforced at the consumer's `rocky compile`. |
 
 ## What to lead with

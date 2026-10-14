@@ -1,6 +1,6 @@
 ---
 title: Governance & Reclamation Commands
-description: Agent policy checks, the decision-ledger audit trail, review gating, the governor's brief, backfill recovery, and storage reclamation
+description: Agent policy checks, the decision-ledger audit trail, review gating, the governor's brief, backfill recovery, and storage reclamation and restore
 sidebar:
   order: 6
 ---
@@ -77,6 +77,28 @@ Re-running the pipeline is not a substitute. A re-run recomputes from the curren
 
 ---
 
+## `rocky restore`
+
+Write a review-gated plan to rebuild an artifact that `rocky gc` evicted. Restore never writes bytes directly.
+
+```bash
+rocky restore <target>
+rocky review <plan-id> --approve
+rocky apply <plan-id>
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `target` | `string` | **(required)** | The artifact: a model name, `model@<recipe-hash-prefix>`, or a content-hash prefix of at least 8 hex characters. An ambiguous target is refused, with the matching candidates listed. |
+
+The plan is review-gated even for a person. At apply time, Rocky rebuilds the artifact from the recipe its tombstone references. It checks that the recomputed blake3 hash equals the tombstoned hash before any write becomes visible. Then it writes the bytes at the tombstoned path, never over mismatched bytes, and reinstates the ledger row.
+
+Restore rebuilds only a recipe that is content-addressed, not partitioned, and reads no recorded upstream. See [What restore can and cannot undo](#what-restore-can-and-cannot-undo) for every case that refuses.
+
+---
+
 ## `rocky backfill`
 
 Compose a scoped recovery plan: which models to re-run, in what order, over what partition window, at what estimated cost.
@@ -93,9 +115,9 @@ rocky backfill --model fct_orders --from 2026-07-01 --to 2026-07-07
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--model <NAME>` | `string` (repeatable) | | A model to rebuild; its downstream lineage closure is included. Mutually exclusive with `--from-last-run`. |
-| `--from-last-run` | `bool` | `false` | Seed the backfill from the previous run's failed models. |
-| `--from <KEY>` / `--to <KEY>` | `string` | | Partition-window bounds applied to partitioned models. |
+| `--model <NAME>` | `string` (repeatable) | | A model to rebuild. Its downstream lineage closure is included. |
+| `--from-last-run` | `bool` | `false` | Seed the backfill from the previous run's failed models. Conflicts with `--model`. |
+| `--from <KEY>` / `--to <KEY>` | `string` | | Partition-window bounds applied to partitioned models. Each requires the other. |
 | `--no-downstream` | `bool` | `false` | Rebuild only the named/seed models, not their downstream closure. |
 | `--models <DIR>` | `path` | `models` | Models directory to compose the backfill against. |
 
@@ -119,9 +141,23 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 |---|---|
 | `check` | Explain the effect the policy plane resolves for a `(principal, capability, model)` triple: the verdict, the winning rule, and the reason. Read-only. |
 | `test` | Run the project's `[[policy.tests]]` scenario assertions through the real evaluator; exits non-zero if any resolved effect differs from its expectation, so a policy edit cannot silently open a hole in CI. |
-| `show` | The policy plane as it stands: the rules in file order with their position as `id` (the `matched_rule` that `check` reports), each rule's scope and its `verify_after` checks, the default agent effect, and the freezes in force that the read could see. Read-only. Read `freeze_sources` before treating the freeze list as exhaustive; the two cases below say when it is not. A source that exists but cannot be read is an error, never an empty list. `freeze_sources` says how each source was read, and the two cases below are the ones to know about. |
+| `show` | The policy plane as it stands: the rules in file order with their position as `id` (the `matched_rule` that `check` reports), each rule's scope and its `verify_after` checks, the default agent effect, and the freezes in force that the read could see. Read-only. A source that exists but cannot be read is an error, never an empty list. `freeze_sources` says how each source was read. Read it before you treat the freeze list as complete: the two cases below say when it is not. |
 | `freeze` | The kill switch. Records a freeze decision in the decision ledger; at the enforcement seam an active freeze forces `deny` for the matched `(principal, scope)`. No config file is rewritten, and freezing is always allowed. Omitting `--principal` freezes both principals; omitting `--scope` freezes every model. |
 | `unfreeze` | Lift a matching freeze by recording a superseding decision. Pass the same `--principal` / `--scope` used to freeze. |
+
+### Flags
+
+| Subcommand | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `check` | `--principal <P>` | `human` \| `agent` | **(required)** | The principal attempting the action. |
+| `check` | `--capability <C>` | see below | **(required)** | The capability attempted. |
+| `check` | `--model <NAME>` | `string` | **(required)** | The target model. |
+| `check` | `--models <DIR>` | `path` | `models` | Models directory to compile for the model's attributes. |
+| `freeze`, `unfreeze` | `--principal <P>` | `human` \| `agent` | both | The principal to freeze or unfreeze. |
+| `freeze`, `unfreeze` | `--scope <SCOPE>` | `string` | `any` | `any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`. `unfreeze` must match the freeze's scope. |
+| `freeze`, `unfreeze` | `--reason <TEXT>` | `string` | a generated description | Reason recorded on the ledger row and the durable marker. |
+
+The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. `test` and `show` take no flags.
 
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
 
@@ -160,7 +196,11 @@ rocky brief --since 24h
 rocky brief --since 7d --output json
 ```
 
-Read-only. Rocky composes the brief from typed queries over the state store and the decision ledger. The digest covers:
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--since <WINDOW>` | `last` \| `24h` \| `7d` | `last` | The window. `last` reads since the previous `--since last` digest and advances that stored cursor. |
+
+Read-only, apart from that cursor. Rocky composes the brief from typed queries over the state store and the decision ledger. The digest covers:
 
 - decisions awaiting review, ranked;
 - agent activity by principal. The counts are policy evaluations only. Freeze, unfreeze, and post-apply verification rows are listed with their `kind` but not counted, so a freeze never shows as a deny;
@@ -198,6 +238,7 @@ rocky audit --actor unrecorded               # rows written before principal ids
 | `--product <NAME>` | `string` | | List only the decisions about one product: the rows whose model is the product's output model (`product.output.model`, default the product name), read from `products/<NAME>.toml`. Conflicts with `--for` and `--scorecard`. |
 | `--actor <ID>` | `string` | | List only the decisions one actor made: the rows whose principal id is `<ID>`. `unrecorded` lists the rows with no id. Composes with `--product` and `--since`. Conflicts with `--for` and `--scorecard`. Reads no environment variable. |
 | `--since <WHEN>` | `string` | | List only the decisions recorded at or after `<WHEN>`. Accepts `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset (Rocky converts it to UTC), or a `<N>d` / `<N>h` duration back from now. A future time lists nothing. Conflicts with `--for` and `--scorecard`. |
+| `--models <DIR>` | `path` | `models` | Models directory used to compute the downstream blast radius for `--for`. |
 
 Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.
 

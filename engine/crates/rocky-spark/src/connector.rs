@@ -21,7 +21,7 @@ use crate::proto::{self, ExecutePlanRequest, ExecutePlanResponse, execute_plan_r
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors from the Spark adapter.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SparkError {
     /// The `[adapter]` block is invalid.
     #[error("spark configuration: {0}")]
@@ -46,6 +46,14 @@ pub enum SparkError {
     /// The server sent an Arrow batch Rocky could not read.
     #[error("spark returned an unreadable Arrow batch: {0}")]
     Arrow(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SparkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "SparkError", self)
+    }
 }
 
 /// Spark error classes that mean "the object does not exist".
@@ -523,5 +531,21 @@ mod tests {
         let err = client.execute("SELECT 1").await.unwrap_err();
         assert!(matches!(err, SparkError::Connect(_)), "{err}");
         assert!(err.is_transient());
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn spark_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "spark-host-1919-f316";
+        rocky_core::secret_registry::register_substitution("RV_SPARK_ERR_DBG", SECRET);
+        let err = SparkError::Connect(format!("dns error for {SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SPARK_ERR_DBG}"), "{debug}");
     }
 }

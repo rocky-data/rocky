@@ -2451,10 +2451,20 @@ impl RockyMcpServer {
     /// behaviour as `rocky compile` without a warm cache).
     fn compile_full(&self) -> anyhow::Result<CompilerResult> {
         let source_schemas = self.load_source_schemas()?;
+        // Each model's warehouse, so a cast's column type matches `rocky
+        // compile` (#2342). The schema load above refused an unreadable
+        // `rocky.toml`.
+        let project = rocky_core::config::load_optional_project_config(Some(&self.config_path))
+            .ok()
+            .flatten();
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
             source_schemas,
+            target_dialects: rocky_compiler::model_targets::target_dialects(
+                project.as_ref(),
+                &self.config_path,
+            ),
             ..Default::default()
         };
         compile::compile(&config).map_err(|e| anyhow::anyhow!("compile failed: {e}"))

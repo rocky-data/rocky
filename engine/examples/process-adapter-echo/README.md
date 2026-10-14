@@ -120,8 +120,9 @@ The tests behind that capability move from the first reason to the second, and
 they still skip. The pass count stays at 1. Pipe the command or pass
 `--output json` to get the same result as JSON.
 
-The built-in list is `databricks`, `snowflake`, and `duckdb`. `--adapter echo`
-works because a name outside that list falls back to a `rocky-<name>` binary on
+The built-in list is `databricks`, `snowflake`, `duckdb`, `postgres`, `redshift`,
+`clickhouse`, `sqlserver`, and `spark`. `--adapter echo` works because a name
+outside that list falls back to a `rocky-<name>` binary on
 `$PATH`. Point at the file instead if you would rather not link it:
 
 ```bash

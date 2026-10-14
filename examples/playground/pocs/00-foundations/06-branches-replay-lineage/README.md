@@ -25,8 +25,9 @@ surface, all on a single 3-model DuckDB pipeline:
    state store: every model, SQL hash, row count, timings, per-model
    status. The reproducibility artefact for *"what exactly ran?"*.
    `rocky history` lists recent runs; `rocky cost latest` rolls up
-   per-run cost from the same record. Content-addressed re-execution is
-   the next primitive on the Arc 1 roadmap.
+   per-run cost from the same record. `rocky replay <run_id> --execute
+   --verify` re-runs the recorded recipe and compares output hashes. This
+   POC does not run it.
 4. **Column-level blast radius** — `rocky lineage raw_orders --column
    amount --downstream` traces every consumer of `amount`, so you can
    see before you ship a schema change exactly which downstream columns
@@ -39,8 +40,8 @@ surface, all on a single 3-model DuckDB pipeline:
   away here and wouldn't be in any warehouse.
 - **Replay captures SQL hashes and row counts** at the time of the run,
   so the same `run_id` answers both *"what ran at 03:15 UTC?"* and
-  *"are you sure it was deterministic?"* (content-addressed re-run
-  comes next; inspection already works).
+  *"are you sure it was deterministic?"* (`rocky replay --execute
+  --verify` answers the second; this POC shows only inspection).
 - **Column lineage is semantic-graph aware** (compiler-driven, not
   regex). An expression like `group customer_id { total: sum(amount) }`
   is correctly traced as `amount → total` through the group-by.

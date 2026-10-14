@@ -48,6 +48,7 @@ Some methods need a newer engine than that floor:
 | `review_status()`, `apply(..., expect_spec_digest=...)` | 1.71.0 |
 | `product_verify()`, `product_compile()`, `product_approve()`, `product_status()` | 1.72.0 |
 | `product_list()`, `product_journal()`, `schedule_spool()` | 1.74.0 |
+| `package_add()`, `package_update()`, `package_list()`, `package_remove()`, `profile(..., sample=N)` with `N > 0` | 1.77.0 |
 
 Only `dag(models_dir=None)` and `run_model(pipeline=...)` check the engine
 version first and raise `RockyVersionError`. The others run the command, and

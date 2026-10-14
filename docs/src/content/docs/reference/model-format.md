@@ -9,6 +9,41 @@ A Rocky model is one SQL query plus the configuration that says how to materiali
 
 Rocky reads two model formats: **sidecar** (recommended) and **inline** (legacy).
 
+## Model format at a glance
+
+| Block | What it does |
+|---|---|
+| [Top-level keys](#toml-config-file) | `name`, `depends_on`, `group`, `access`, `retention`, `adapter`, `intent`. |
+| [`[strategy]`](#toml-config-file) | How Rocky writes the table. Examples are under [Strategy Examples](#strategy-examples). |
+| [`[target]`](#toml-config-file), [`[[sources]]`](#toml-config-file) | Where the output lands; input tables for lineage. |
+| [`[skip]`](#skip) | Override the `--skip-unchanged` gate for this model. |
+| [`[args]`](#toml-config-file), [config groups](#config-groups) | Shared routing and materialization for a fan-out of models. |
+| [`[classification]`](#classification), [`[tags]`](#tags), [`[governance.tags]`](#governancetags) | Column sensitivity, model attributes, warehouse tags. |
+| [`[[surrogate_key]]`](#surrogate_key) | Inject a stable hash key column. |
+| [`[[tests]]`](#tests), [`[[use_test]]`](#use_test), [`[[test]]`](#test) | Output assertions, shared assertions, unit tests with mock inputs. |
+| [`[columns.NAME]`](#columnsname) | Column descriptions. |
+| [`retention`](#retention) | How long to keep the data. |
+| `[freshness]`, `[budget]`, `[redshift]`, `[clickhouse]` | Described in the notes under the field table. |
+
+A minimal model is two files:
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+depends_on = ["stg_orders"]
+
+[strategy]
+type = "merge"
+unique_key = ["order_id"]
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "fct_orders"
+```
+
+The `.sql` file next to it holds a plain `SELECT`.
+
 ## Sidecar Format (Recommended)
 
 Keep the SQL and the configuration in two files that share a name. The `.toml` file is the [sidecar](/reference/glossary/#sidecar): it carries everything that is not SQL.
@@ -59,6 +94,14 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `access` | string | No | `private`, `protected` (default) or `public`. Who may reference the model. See [Model governance](/concepts/model-governance/). |
 | `access_group` | string | No | Ownership group for access checks. Falls back to `group`. Inherits no config. See [Model governance](/concepts/model-governance/#ownership-groups-and-owners). |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+| `adapter` | string | No | An `[adapter.NAME]` key from `rocky.toml`. Runs this model on that adapter instead of the pipeline's. |
+| `intent` | string | No | A plain-language description of what the model does. `rocky ai-sync` reads it. |
+
+More sidecar blocks: `[freshness]` (`max_lag_seconds`, `time_column`, `severity`; see [`[freshness]`](/reference/configuration/#freshness)), `[budget]` (a per-model override of the project [`[budget]`](/reference/configuration/#budget), checked at compile time as `E027`), and the adapter-specific [`[redshift]`](/reference/adapters/redshift/#table-distribution-and-sort-keys) and [`[clickhouse]`](/reference/adapters/clickhouse/#table-engine-partitions-and-sort-key) blocks.
+
+:::caution[Unknown top-level keys are ignored]
+Rocky does not refuse an unknown top-level key in a sidecar. A typo such as `depends_onn = ["x"]` loads without an error, and the setting has no effect. Check each key against this page.
+:::
 
 `drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. Rocky refuses a `full_refresh` or `view` model carrying this key on every other adapter. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
 
@@ -72,10 +115,8 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"ephemeral"` (see [Ephemeral](#ephemeral)). `"incremental"` is refused on a transformation model (`E037`, see [Incremental](#incremental)). |
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. `"incremental"` needs a watermark column (`E037` without one, see [Incremental](#incremental)). `"ephemeral"` is refused outright (`E038`, see [Ephemeral](#ephemeral)). |
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"snapshot"` (see [Snapshot](#snapshot)). Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
-| `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"ephemeral"`, `"snapshot"`. `"incremental"` needs a watermark column, or compile fails with `E037` (see [Incremental](#incremental)). `"ephemeral"` is inlined into its readers; `E038` marks a use that cannot work (see [Ephemeral](#ephemeral)). See [Snapshot](#snapshot) for `"snapshot"`. |
+| `timestamp_column` | string | | The watermark column. Required for `incremental` (alias `watermark`) and for `microbatch`, where it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
 | `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
@@ -118,27 +159,9 @@ Overrule the `--skip-unchanged` gate for this one model. By default the gate is 
 | `eligible` | bool \| null | `null` | Explicit eligibility override. `false` ⇒ this model **always builds**, even when the gate is on and everything looks unchanged (use for a known-volatile model the static scan might miss). `true` ⇒ the model is eligible, subject to the other gate clauses. `null` ⇒ fall back to the automatic rules. |
 | `deterministic` | bool \| null | `null` | Owner assertion about the SQL's purity. `true` is the only way a model the static non-determinism scan flagged (timestamps, randomness, unresolved UDFs, order-unstable aggregates) becomes skip-eligible — an explicit, auditable opt-in. `false` forces the model to be treated as non-deterministic (never auto-skipped). `null` ⇒ trust the static scan. |
 
-```toml
-name = "fct_orders"
+Example: `eligible = false` always rebuilds the model. `deterministic = true` re-qualifies a model the scan flagged.
 
-[skip]
-eligible = false        # opt this model out — always rebuild
-```
-
-```toml
-name = "dim_dates"
-
-[skip]
-deterministic = true    # owner asserts the SQL is pure → re-eligible despite the scan
-```
-
-**Fail-safe rules.** The gate exists to avoid silent production staleness, so it builds on any doubt. Beyond `[skip]`, a model is **never** auto-skip-eligible (it always rebuilds) when:
-
-- its SQL is **non-deterministic**: it calls a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …), an order/tie-break-unstable aggregate (`ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, `MODE`), an unordered `LIMIT`/`TOP`/`FETCH`, or any function not on Rocky's pure-function allowlist;
-- its **lineage isn't provably complete**: anything beyond a single plain `SELECT` over bare tables (CTEs, sub-queries in `FROM`, `PIVOT`/`UNNEST`/nested joins, `IN (SELECT …)`/`EXISTS`/scalar sub-selects, or set operations) forces a rebuild;
-- it uses a `content_addressed` or `time_interval` strategy (a `full_refresh` model **is** eligible).
-
-`deterministic = true` overrides only the first bullet. Even an eligible model is skipped only when its logic and every upstream's data are both unchanged. See [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/) for the full workflow and the `[run]` tuning knobs.
+**Fail-safe rules.** The gate builds on any doubt. A model is never auto-skip-eligible when its SQL is non-deterministic, its lineage is not provably complete, or it uses `content_addressed` or `time_interval` (a `full_refresh` model **is** eligible). `deterministic = true` overrides only the non-deterministic case. See [What is and is not skip-eligible](/reference/configuration/#what-is-and-is-not-skip-eligible) for the full list, and [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/) for the workflow.
 
 ### Environment variables
 
@@ -222,17 +245,7 @@ One combination is rejected. A model that pins its own `schema` bypasses the gro
 
 #### Enforced groups
 
-Make the group's fields binding instead of overridable. Set `enforce = true`. A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It cannot quietly route or materialize itself differently from the rest of the group:
-
-```toml
-# models/groups/regulated.toml
-enforce = true
-schema_template = "mart_{region}"
-
-[strategy]
-type = "merge"
-unique_key = ["id"]
-```
+Make the group's fields binding instead of overridable. Set `enforce = true` in the group file. A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It cannot quietly route or materialize itself differently from the rest of the group:
 
 Enforcement is opt-in. Without `enforce`, a group stays a set of overridable defaults. A model under an enforced group still supplies its own `[args]`, and any field the group leaves unset such as `target.catalog`. It simply cannot override what the group owns. Use enforcement when a set of models must share routing and materialization as a governance guarantee.
 
@@ -276,26 +289,16 @@ ssn = "confidential"
 Tags are free-form strings (no enum), so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
 
 :::note[Adapter support]
-Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort: failures emit `warn!` and don't abort the run.
+Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Other adapters do not support them yet. Best-effort: a failure logs a warning and does not abort the run.
 :::
 
 ### `[tags]`
 
 Describe the model **as a whole**: its `domain`, its `tier`, its `owner`, or anything else your governance model needs. This differs from `[classification]`, which is keyed by column and drives masking.
 
-```toml
-# models/fct_orders.toml
-name = "fct_orders"
-
-[tags]
-domain = "finance"
-tier = "gold"
-owner = "data-eng"
-```
-
 | Key pattern | Value type | Description |
 |---|---|---|
-| `<tag_name>` | string | Free-form governance attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
+| `<tag_name>` | string | Free-form governance attribute, such as `domain`, `tier` or `owner`. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
 
 `rocky compile --output json` reports the resolved tags as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so one attribute drives both Rocky's view of the model and the orchestrator's. A model in a config group inherits that group's tags too — see [Group tags](#group-tags).
 
@@ -368,9 +371,6 @@ name = "fct_orders"
 type = "not_null"
 column = "order_id"
 
-[[tests]]
-type = "unique"
-column = "order_id"
 
 [[tests]]
 type = "accepted_values"
@@ -382,10 +382,6 @@ severity = "warning"
 type = "expression"
 expression = "amount >= 0"
 filter = "status != 'cancelled'"
-
-[[tests]]
-type = "row_count_range"
-min = 1
 ```
 
 `expression` is bounded. Rocky parses it under the target dialect and refuses anything that is not one boolean expression over the model's own columns: a subquery, a qualified function name (`schema.fn(...)`), or a function outside its allowlist of pure scalar functions is refused when the test SQL is generated, before anything runs. Comparisons, `CASE`, `CAST`, and functions such as `coalesce`, `length`, `lower` and `date_trunc` pass; anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function.
@@ -481,16 +477,7 @@ Document what an output column means. Each `[columns.<name>]` table describes on
 |---|---|---|
 | `description` | string | Natural-language description of the column. |
 
-```toml
-# models/fct_orders.toml
-name = "fct_orders"
-
-[columns.order_id]
-description = "Unique order identifier"
-
-[columns.amount]
-description = "Order total in USD"
-```
+Write one table per column, for example `[columns.order_id]` with `description = "Unique order identifier"`.
 
 `rocky catalog --output json` reports each description as the asset's `CatalogColumn.description`. Rocky attaches a description only when `<name>` matches a column the model actually projects. It drops a description for a column the SELECT does not produce, silently, so keep these keys in step with your output columns. `rocky docs` shows each description next to its column on the model page. It takes the column list from the offline compile, so it needs no warehouse connection.
 
@@ -504,20 +491,7 @@ Declare how long this model's data should be kept. The top-level `retention` key
 |-------|------|---------|-------------|
 | `retention` | string \| null | `null` (disabled) | Grammar `^\d+[dy]$`. `"d"` = days verbatim, `"y"` = years flattened at 365 days per year (no leap-year semantics). Zero (`"0d"`, `"0y"`) is rejected — use `null` to disable. |
 
-```toml
-# models/fct_orders.toml
-name = "fct_orders"
-retention = "90d"
-
-[strategy]
-type = "merge"
-unique_key = ["order_id"]
-
-[target]
-catalog = "analytics"
-schema = "warehouse"
-table = "fct_orders"
-```
+Example: `retention = "90d"` at the top level of the sidecar.
 
 Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG run:
 
@@ -525,7 +499,7 @@ Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG ru
 |---|---|
 | **Databricks (Delta)** | `ALTER TABLE ... SET TBLPROPERTIES ('delta.logRetentionDuration' = '{N} days', 'delta.deletedFileRetentionDuration' = '{N} days')` — both keys written together. |
 | **Snowflake** | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = {N}`. |
-| **BigQuery / DuckDB** | Default-unsupported — those warehouses lack a first-class retention knob at the config level. |
+| **Other adapters** | Not supported. Rocky emits nothing. |
 
 Rocky rejects a malformed value when it parses the sidecar: `"abc"`, `"90"`, `"-3d"`, `"1.5d"`, a leading sign, an exponent. The `ModelError::InvalidRetention` diagnostic names what it saw. Inspect the resolved policies with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
 
@@ -568,24 +542,10 @@ This format exists for backward compatibility. Prefer the sidecar.
 
 Drops and recreates the target table on every run. Use this for small dimension tables or when you need a clean rebuild.
 
-**SQL** (`models/dim_products.sql`):
-
-```sql
-SELECT
-    product_id,
-    product_name,
-    category,
-    price,
-    is_active
-FROM raw_catalog.src__acme__us_west__shopify.products
-WHERE _fivetran_deleted = false
-```
-
 **Config** (`models/dim_products.toml`):
 
 ```toml
 name = "dim_products"
-depends_on = []
 
 [strategy]
 type = "full_refresh"
@@ -594,14 +554,9 @@ type = "full_refresh"
 catalog = "analytics"
 schema = "warehouse"
 table = "dim_products"
-
-[[sources]]
-catalog = "raw_catalog"
-schema = "src__acme__us_west__shopify"
-table = "products"
 ```
 
-Generated SQL:
+Generated SQL, for a model whose SQL file selects from `raw_catalog.src__acme__us_west__shopify.products`:
 
 ```sql
 CREATE OR REPLACE TABLE analytics.warehouse.dim_products AS
@@ -700,25 +655,10 @@ On a replication pipeline, `incremental` copies source tables and filters each c
 
 [Upserts](/reference/glossary/#upsert) on a unique key: Rocky updates a row whose key already exists and inserts one whose key does not. Use it for a [slowly changing dimension](/reference/glossary/#scd-slowly-changing-dimension), or for any table that gets late-arriving updates.
 
-**SQL** (`models/dim_customers.sql`):
-
-```sql
-SELECT
-    customer_id,
-    customer_name,
-    email,
-    segment,
-    lifetime_value,
-    updated_at
-FROM raw_catalog.src__acme__us_west__shopify.customers
-WHERE _fivetran_deleted = false
-```
-
 **Config** (`models/dim_customers.toml`):
 
 ```toml
 name = "dim_customers"
-depends_on = []
 
 [strategy]
 type = "merge"
@@ -729,11 +669,6 @@ update_columns = ["customer_name", "email", "segment", "lifetime_value", "update
 catalog = "analytics"
 schema = "warehouse"
 table = "dim_customers"
-
-[[sources]]
-catalog = "raw_catalog"
-schema = "src__acme__us_west__shopify"
-table = "customers"
 ```
 
 Generated SQL:
@@ -830,7 +765,6 @@ Deletes the rows in a [partition](/reference/glossary/#partition) — a slice of
 
 ```toml
 name = "fct_daily_activity"
-depends_on = []
 
 [strategy]
 type = "delete_insert"
@@ -850,20 +784,12 @@ An alias for `time_interval` that defaults to `hour` granularity. The name match
 
 The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). A placeholder that is only in a comment, a string or the `SELECT` list counts as missing. So does one that does not bound a column in an `AND`-joined comparison, such as `ts >= @start_date OR 1 = 1` or `NOT (ts >= @start_date)`. So does a filter that misses some emitted rows: an unfiltered `UNION ALL` branch, a filter in a CTE the output never reads, or a filter inside a scalar subquery in the `SELECT` list. See [Time interval](/concepts/time-interval/#sql-placeholders). Each run replaces its selected partitions instead of appending the full result again.
 
-**SQL** (`models/fct_hourly_events.sql`):
-
-```sql
-SELECT event_at, event_type
-FROM raw_catalog.events.page_views
-WHERE event_at >= @start_date
-  AND event_at < @end_date
-```
+The SQL bounds each partition with `WHERE event_at >= @start_date AND event_at < @end_date`, as in [Time Interval](#time-interval).
 
 **Config** (`models/fct_hourly_events.toml`):
 
 ```toml
 name = "fct_hourly_events"
-depends_on = []
 
 [strategy]
 type = "microbatch"
@@ -886,7 +812,6 @@ Writes the model's SELECT result to a Delta UniForm table as content-addressed P
 
 ```toml
 name = "fct_events"
-depends_on = []
 
 [strategy]
 type = "content_addressed"
@@ -899,7 +824,7 @@ schema = "marts"
 table = "fct_events"
 ```
 
-The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer (shipped in engine v1.30.0 across Phases 1–5: discover, write, sync, partitioned, rowTracking, schema evolution).
+The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer.
 
 ---
 
@@ -1015,7 +940,6 @@ GROUP BY event_date, event_type
 
 ```toml
 name = "fct_daily_events"
-depends_on = []
 
 [strategy]
 type = "time_interval"
@@ -1032,25 +956,16 @@ table = "fct_daily_events"
 
 **CLI flags** for time-interval models. Every flag below is accepted on both `rocky plan` and the `rocky run` single-step alias, which fuses plan + apply into one invocation for local iteration and automation. The canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`.
 
-```bash
-# Process a specific partition
-rocky plan --partition 2026-04-01 && rocky apply <plan-id>
+| Flag | Effect |
+|---|---|
+| `--partition 2026-04-01` | Process one partition. |
+| `--from 2026-03-01 --to 2026-04-01` | Process a date range. |
+| `--latest` | Process the latest partition. |
+| `--missing` | Discover and process missing partitions. |
+| `--lookback 7` | Set the lookback window. |
+| `--parallel 4` | Parallelize partition processing. |
 
-# Process a date range
-rocky plan --from 2026-03-01 --to 2026-04-01 && rocky apply <plan-id>
-
-# Process the latest partition
-rocky plan --latest && rocky apply <plan-id>
-
-# Discover and process missing partitions
-rocky plan --missing && rocky apply <plan-id>
-
-# Set lookback window
-rocky plan --lookback 7 && rocky apply <plan-id>
-
-# Parallelize partition processing
-rocky plan --parallel 4 && rocky apply <plan-id>
-```
+Run each as `rocky plan <flag> && rocky apply <plan-id>`.
 
 Per-partition state is tracked in the state store. The `--missing` flag consults stored partition records to discover gaps.
 
@@ -1058,7 +973,7 @@ Per-partition state is tracked in the state store. The `--missing` flag consults
 
 ## DAG Resolution
 
-You never write an execution order. Rocky derives it from the `depends_on` declarations and runs the models in [topological order](/reference/glossary/#topological-order), so every upstream finishes before anything that reads it starts.
+You never write an execution order. Rocky derives it from the `depends_on` declarations and the table references in each model's SQL, and runs the models in [topological order](/reference/glossary/#topological-order), so every upstream finishes before anything that reads it starts.
 
 ```
    stg_orders ─────┐

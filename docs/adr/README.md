@@ -8,11 +8,11 @@ Convention: one file per decision, `ADR-<TOPIC>.md`, status one of **Proposed** 
 
 Closes the 3 open Critical audit findings (RD-001/002/003) plus #1120 (freeze kill-switch / config-swap TOCTOU) and #1093 (governance-from-gated-snapshot), on a **live, concurrent multi-pod** `[state]` deployment. Read in this order:
 
-| # | ADR | PR | Closes |
-|---|---|---|---|
-| 1 | [`ADR-AUTHORITY.md`](ADR-AUTHORITY.md) | PR-A | RD-001 — typed `StateAuthority` (Authoritative / FreshStart / Indeterminate); the safe-standalone keystone. |
-| 2 | [`ADR-STATE-SESSION.md`](ADR-STATE-SESSION.md) | PR-B | RD-003 (bypass), #1120 (config-swap TOCTOU incl. promote), #1093 (`GovernanceSnapshot`) — the `RemoteStateSession` spine. |
-| 3 | [`ADR-CONCURRENCY.md`](ADR-CONCURRENCY.md) | PR-C→PR-D (+ spine-urgent PR-F) | RD-002 (CAS: retry-seams / refuse-runs) + the rollout-independent add-wins freeze marker. |
+| # | ADR | Status | PR | Closes |
+|---|---|---|---|---|
+| 1 | [`ADR-AUTHORITY.md`](ADR-AUTHORITY.md) | Accepted (2026-07-17) | PR-A | RD-001 — typed `StateAuthority` (Authoritative / FreshStart / Indeterminate); the safe-standalone keystone. |
+| 2 | [`ADR-STATE-SESSION.md`](ADR-STATE-SESSION.md) | Accepted (2026-07-17) | PR-B | RD-003 (bypass), #1120 (config-swap TOCTOU incl. promote), #1093 (`GovernanceSnapshot`) — the `RemoteStateSession` spine. |
+| 3 | [`ADR-CONCURRENCY.md`](ADR-CONCURRENCY.md) | Accepted (2026-07-17) | PR-C→PR-D (+ spine-urgent PR-F) | RD-002 (CAS: retry-seams / refuse-runs) + the rollout-independent add-wins freeze marker. |
 
 Staging: **spine-first** (PR-A → PR-B → PR-F) then the CAS **fast-follow** (PR-C consistent snapshot → PR-D CAS), closed by an operational **rollout gate** (fleet-wide deploy → `concurrency_control = "cas"` on every live prefix → doctor-verified effective-CAS). Until that gate completes, RD-002 exposure is bounded by orchestrator-level per-`[state]`-prefix writer serialization.
 

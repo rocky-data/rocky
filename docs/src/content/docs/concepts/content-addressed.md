@@ -5,7 +5,7 @@ sidebar:
   order: 16
 ---
 
-`materialization = "content_addressed"` writes a model's SELECT result to an
+A model with `[strategy] type = "content_addressed"` writes its SELECT result to an
 object-store prefix you control. It writes **Parquet files named by the hash of
 their own bytes, plus a Delta log commit**. That naming is what
 [content-addressed](/reference/glossary/#content-addressed) means: the file's name
@@ -14,9 +14,8 @@ comes from its contents, not from a timestamp or a counter.
 Any engine that reads Iceberg or Delta reads those files directly. DuckDB
 `iceberg_scan`, Trino, and Spark do not go through Rocky.
 
-Shipped end to end in engine v1.30.0. That includes partitioned tables,
-post-`ALTER` schema evolution, and rowTracking, a Delta feature that gives every
-row a stable ID.
+The writer supports partitioned tables, post-`ALTER` schema evolution, and
+rowTracking, a Delta feature that gives every row a stable ID.
 
 ## When to use it
 
@@ -163,5 +162,5 @@ writer handles it for you. You declare the logical names only.
 
 - [Model Format](/reference/model-format/#content-addressed) — the sidecar field reference, including the full Strategy Examples block.
 - [Silver Layer](/concepts/silver-layer/) — where content-addressed models sit in the lakehouse mental model.
-- [Adapters](/concepts/adapters/) — the adapter contracts on the writer side.
+- [Adapters](/guides/adapter-sdk/) — the adapter contracts on the writer side.
 - [The Architecture of Trust](/concepts/architecture-of-trust/) — the recipe-identity hashes stamped on every materialization, and what replay can and cannot verify.

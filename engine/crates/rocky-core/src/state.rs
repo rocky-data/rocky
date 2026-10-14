@@ -1020,7 +1020,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 const CURRENT_SCHEMA_VERSION: u32 = 32;
 
 /// Errors from the embedded redb state store.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum StateError {
     #[error("state store not found at {path}")]
     NotFound { path: String },
@@ -1137,6 +1137,14 @@ pub enum StateError {
     /// An environment or publish request was refused before any write.
     #[error(transparent)]
     Environment(#[from] crate::environments::EnvironmentError),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "StateError", self)
+    }
 }
 
 impl From<redb::TransactionError> for StateError {
@@ -18995,5 +19003,23 @@ mod tests {
             "offline input_hash recompute from the persisted record must equal the recorded value"
         );
         assert_eq!(got.input_hash, input_hash);
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn state_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "state-path-1919-aa01";
+        rocky_core::secret_registry::register_substitution("RV_STATE_ERR_DBG", SECRET);
+        let err = StateError::NotFound {
+            path: format!("/mnt/{SECRET}/state.redb"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_STATE_ERR_DBG}"), "{debug}");
     }
 }

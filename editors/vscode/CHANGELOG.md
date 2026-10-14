@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.48.0] — 2026-10-14
+
+Pairs with engine 1.81.0.
+
+### Changed
+
+- Generated types and the `rocky.toml` schema follow engine 1.81.0. The `JobState` union gains `"cancelled"`, so an exhaustive `switch` needs the new case. The error envelope documents `job_not_running` and `job_not_cancellable`. The `allowed_hosts` setting and the `valkey_url` and `object_store_url` descriptions are updated.
+
 ## [1.47.0] — 2026-10-09
 
 Pairs with engine 1.80.0.

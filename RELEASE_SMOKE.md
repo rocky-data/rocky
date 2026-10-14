@@ -201,6 +201,23 @@ rocky -c rocky.toml seed
 | **FAIL** | Non-zero exit; CSV parse errors or DDL execution failures |
 | **Time** | <10 s |
 
+### 1.14 Browser UI
+
+Needs a binary built with the UI embedded: `just build-engine-ui` from the repo root, or the release archive. A plain `cargo build --release` does not embed it, and `serve --ui` then refuses to start.
+
+```bash
+rocky playground /tmp/ui-smoke
+rocky --config /tmp/ui-smoke/rocky.toml serve --ui --models /tmp/ui-smoke/models --token t --token-scope read-only --port 18080
+```
+
+In a second shell, open `http://127.0.0.1:18080/login?t=t` in a browser.
+
+| | |
+|---|---|
+| **PASS** | The page loads at `/ui/` and shows the project; `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/api/v1/meta` prints `401` |
+| **FAIL** | `serve --ui` refuses to start; blank page; the API answers without the token |
+| **Time** | <30 s |
+
 ---
 
 ## 2. Databricks (GA)
@@ -548,7 +565,7 @@ rocky -c rocky.toml run --filter source=NONEXISTENT; echo "exit: $?"
 
 | Section | Status | Tester | Notes |
 |---|---|---|---|
-| 1. DuckDB (local) | | | |
+| 1. DuckDB (local, with the browser UI) | | | |
 | 2. Databricks | | | |
 | 3. Snowflake | | | |
 | 4. Fivetran | | | |

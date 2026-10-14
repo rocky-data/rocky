@@ -1067,7 +1067,7 @@
           ]
         },
         "object_store_url": {
-          "description": "URL passed to `object_store::parse_url` for `backend = \"object_store\"` or `backend = \"tiered\"` (secondary layer). Examples: `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`, `file:///path/`.",
+          "description": "URL passed to `object_store::parse_url` for `backend = \"object_store\"` or `backend = \"tiered\"` (secondary layer). Examples: `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`, `file:///path/`.\n\nA [`CredentialUrl`], like `valkey_url`: a password or a query (an Azure SAS token, say) is dropped from every printed form (#2339).",
           "type": [
             "string",
             "null"
@@ -1083,7 +1083,7 @@
           ]
         },
         "valkey_url": {
-          "description": "Connection URL for `backend = \"valkey\"` or `backend = \"tiered\"` (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).",
+          "description": "Connection URL for `backend = \"valkey\"` or `backend = \"tiered\"` (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).\n\nIt may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).",
           "type": [
             "string",
             "null"
@@ -1152,7 +1152,7 @@
           ]
         },
         "valkey_url": {
-          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).\n\nIt may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).",
           "type": [
             "string",
             "null"
@@ -1212,7 +1212,7 @@
           ]
         },
         "valkey_url": {
-          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).\n\nIt may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).",
           "type": [
             "string",
             "null"
@@ -1272,7 +1272,7 @@
           ]
         },
         "valkey_url": {
-          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).",
+          "description": "Connection URL for `backend = \"valkey\"`. Standard `redis://` (plain) or `rediss://` (TLS).\n\nIt may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).",
           "type": [
             "string",
             "null"

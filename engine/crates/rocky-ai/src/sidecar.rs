@@ -17,7 +17,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// Errors emitted while writing the body + sidecar files.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SidecarError {
     #[error("file already exists at {path} (pass --overwrite to replace)")]
     AlreadyExists { path: String },
@@ -54,6 +54,14 @@ pub enum SidecarError {
 
     #[error("invalid --target '{value}': expected catalog.schema.table")]
     InvalidTarget { value: String },
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for SidecarError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "SidecarError", self)
+    }
 }
 
 /// Materialization strategy authorable from the `rocky ai --materialization`
@@ -535,5 +543,23 @@ mod tests {
 
         assert!(sidecar.contains("type = \"merge\""));
         assert!(!sidecar.contains("unique_key"));
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn sidecar_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "sidecar-path-1919-d114";
+        rocky_core::secret_registry::register_substitution("RV_SIDECAR_ERR_DBG", SECRET);
+        let err = SidecarError::AlreadyExists {
+            path: format!("models/{SECRET}.sql"),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SIDECAR_ERR_DBG}"), "{debug}");
     }
 }

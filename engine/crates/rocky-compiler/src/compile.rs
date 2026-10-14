@@ -669,9 +669,8 @@ pub fn compile_incremental(
     // changes affect every downstream model, so if they shift the caller
     // must invoke `compile` directly rather than this path. The same holds
     // for `config.target_dialects`: a changed target retypes every cast.
-    // The LSP constructs `CompilerConfig` once per workspace-init
-    // (see `RockyLsp::config_for_compile`), so this invariant holds in
-    // practice.
+    // The LSP keeps the targets of its last full compile and compiles in
+    // full when `rocky.toml` changes (`CastTargets` in rocky-server).
 
     // 1. Load the new project + rebuild the semantic graph. Both are cheap
     //    relative to typecheck — the whole point of the optimization.
@@ -1180,6 +1179,18 @@ fn validate_all_contracts(
 /// here (#1646).
 pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
     let upper = warehouse_type.trim().to_uppercase();
+    // A length or precision does not change these types: Snowflake reports
+    // `VARCHAR(16777216)`, `BINARY(8388608)` and `TIMESTAMP_NTZ(9)` (#2344).
+    if let Some(base) = parameterised_base(&upper) {
+        match base {
+            "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "TEXT" | "NVARCHAR" | "NCHAR" => {
+                return RockyType::String;
+            }
+            "BINARY" | "VARBINARY" => return RockyType::Binary,
+            "TIMESTAMP_NTZ" => return RockyType::TimestampNtz,
+            _ => {}
+        }
+    }
     match upper.as_str() {
         "BOOLEAN" | "BOOL" => RockyType::Boolean,
         "TINYINT" | "BYTE" | "SMALLINT" | "SHORT" | "INT" | "INTEGER" => RockyType::Int32,
@@ -1198,6 +1209,15 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         _ if is_clickhouse_datetime64(&upper) => RockyType::Timestamp,
         _ => decimal_family_type(&upper),
     }
+}
+
+/// The name before a single `(n)` parameter, as in `VARCHAR(10)`; `None`
+/// for a bare name or a parameter that is not one unsigned integer.
+fn parameterised_base(upper: &str) -> Option<&str> {
+    let (base, rest) = upper.split_once('(')?;
+    let n = rest.strip_suffix(')')?;
+    n.trim().parse::<u32>().ok()?;
+    Some(base.trim_end())
 }
 
 /// `DATETIME64(p)` (upper-cased ClickHouse `DateTime64(p)`), `p` in 0..=9.
@@ -2180,6 +2200,15 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+        // Snowflake's full types, as `DESCRIBE` and the bulk describe report
+        // them (#2344): a length or precision keeps the type.
+        assert_eq!(default_type_mapper("VARCHAR(16777216)"), RockyType::String);
+        assert_eq!(default_type_mapper("BINARY(8388608)"), RockyType::Binary);
+        assert_eq!(
+            default_type_mapper("TIMESTAMP_NTZ(9)"),
+            RockyType::TimestampNtz
+        );
+        assert_eq!(default_type_mapper("VARCHAR(x)"), RockyType::Unknown);
         // ClickHouse `DateTime64(p)`, as the ClickHouse adapter reports it.
         assert_eq!(default_type_mapper("DateTime64(6)"), RockyType::Timestamp);
         assert_eq!(default_type_mapper("DateTime64(x)"), RockyType::Unknown);

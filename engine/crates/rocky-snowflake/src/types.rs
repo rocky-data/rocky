@@ -3,7 +3,9 @@
 use rocky_core::traits::TypeMapper;
 
 /// The type string Rocky stores for a column Snowflake reports as
-/// `reported` (`DESCRIBE TABLE` or `INFORMATION_SCHEMA.COLUMNS`).
+/// `reported`: a `DESCRIBE TABLE` type, or the full type
+/// [`InformationSchemaType::describe_type`] rebuilds from
+/// `INFORMATION_SCHEMA.COLUMNS`.
 ///
 /// Every Snowflake float is 64-bit: `FLOAT`, `FLOAT4`, `FLOAT8`, `REAL`,
 /// `DOUBLE` and `DOUBLE PRECISION` are one type, which `DESCRIBE` reports as
@@ -20,6 +22,77 @@ pub fn canonical_type(reported: &str) -> String {
             "DOUBLE PRECISION".to_string()
         }
         _ => trimmed.to_string(),
+    }
+}
+
+/// The type columns of one `INFORMATION_SCHEMA.COLUMNS` row.
+///
+/// `DATA_TYPE` holds the bare type name (`NUMBER`, `TEXT`,
+/// `TIMESTAMP_NTZ`). The precision, scale and length sit in their own
+/// columns. [`Self::describe_type`] puts them back together (#2344).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InformationSchemaType {
+    /// `DATA_TYPE`.
+    pub data_type: String,
+    /// `CHARACTER_MAXIMUM_LENGTH`.
+    pub character_maximum_length: Option<u64>,
+    /// `NUMERIC_PRECISION`.
+    pub numeric_precision: Option<u64>,
+    /// `NUMERIC_SCALE`.
+    pub numeric_scale: Option<u64>,
+    /// `DATETIME_PRECISION`.
+    pub datetime_precision: Option<u64>,
+}
+
+impl InformationSchemaType {
+    /// The type `DESCRIBE TABLE` prints for this column.
+    ///
+    /// Drift compares the batch spelling with the `DESCRIBE` spelling, and
+    /// the safe-widening check needs the precision or the length. So the
+    /// batch describe must return what `DESCRIBE` returns. The parameters
+    /// come from these columns:
+    ///
+    /// - `NUMBER`: `NUMERIC_PRECISION` and `NUMERIC_SCALE` give
+    ///   `NUMBER(p,s)`.
+    /// - `TEXT`: `CHARACTER_MAXIMUM_LENGTH` gives `VARCHAR(n)`. `DESCRIBE`
+    ///   prints every text type as `VARCHAR`.
+    /// - `BINARY`: `CHARACTER_MAXIMUM_LENGTH` gives `BINARY(n)`.
+    /// - `DECFLOAT`: `NUMERIC_PRECISION` gives `DECFLOAT(p)`.
+    /// - `TIME`, `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, `TIMESTAMP_TZ`: the
+    ///   fractional-seconds precision gives `TIMESTAMP_NTZ(p)`. Snowflake
+    ///   documents `DATETIME_PRECISION` as not applicable, and
+    ///   `SHOW COLUMNS` reports this precision as the type's `scale`, so
+    ///   `NUMERIC_SCALE` is the fallback.
+    ///
+    /// A parameter that is NULL leaves the type bare, as `DATA_TYPE`
+    /// reports it. No default is guessed. Every other type (`FLOAT`,
+    /// `BOOLEAN`, `DATE`, `VARIANT`, `OBJECT`, `ARRAY`, `GEOGRAPHY`,
+    /// `GEOMETRY`, `VECTOR`) is returned as reported.
+    /// `INFORMATION_SCHEMA` has no column for a `VECTOR` element type and
+    /// dimension, so that type stays bare. Pass the result through
+    /// [`canonical_type`], as the `DESCRIBE` path does.
+    pub fn describe_type(&self) -> String {
+        let data_type = self.data_type.trim();
+        let upper = data_type.to_ascii_uppercase();
+        let built = match upper.as_str() {
+            "NUMBER" => match (self.numeric_precision, self.numeric_scale) {
+                (Some(p), Some(s)) => Some(format!("NUMBER({p},{s})")),
+                _ => None,
+            },
+            "TEXT" => self
+                .character_maximum_length
+                .map(|n| format!("VARCHAR({n})")),
+            "BINARY" => self
+                .character_maximum_length
+                .map(|n| format!("BINARY({n})")),
+            "DECFLOAT" => self.numeric_precision.map(|p| format!("DECFLOAT({p})")),
+            "TIME" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => self
+                .datetime_precision
+                .or(self.numeric_scale)
+                .map(|p| format!("{upper}({p})")),
+            _ => None,
+        };
+        built.unwrap_or_else(|| data_type.to_string())
     }
 }
 

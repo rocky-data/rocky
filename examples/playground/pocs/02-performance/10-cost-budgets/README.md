@@ -7,12 +7,12 @@
 
 ## What it shows
 
-Every `rocky run` now emits a `cost_summary` block in its JSON output:
+Every `rocky run` emits a `cost_summary` block in its JSON output:
 per-model durations, aggregate wall-clock, and (on adapters that wire
 `bytes_scanned`) a USD estimate.
 
 A top-level `[budget]` block in `rocky.toml` turns those numbers into
-enforcement: set `max_usd` or `max_duration_ms`, pick `on_breach =
+enforcement: set `max_usd`, `max_duration_ms` or `max_bytes_scanned`, pick `on_breach =
 "warn" | "error"`, and Rocky records the breach in the run output's
 top-level `budget_breaches` array. `"error"` fails the run with a
 non-zero exit code; the `on_budget_breach` hook fires either way.
@@ -22,10 +22,10 @@ non-zero exit code; the `on_budget_breach` hook fires either way.
 - **Cost appears in the run output**, not a separate billing export. The
   same JSON that carries row counts and timings carries cost: one
   artefact, one run, one source of truth.
-- **PR-time cost projection** is the natural next step:
-  a GitHub Action that runs `rocky estimate` against the diffed models
-  and posts the projected delta as a check. The plumbing here is the
-  precondition.
+- **Cost before the run** comes from `rocky estimate`
+  ([`13-estimate-explain-cost`](../13-estimate-explain-cost/)) and
+  `rocky preview cost`
+  ([`06-developer-experience/10-pr-preview-and-data-diff`](../../06-developer-experience/10-pr-preview-and-data-diff/)).
 
 ## Layout
 
@@ -54,11 +54,11 @@ non-zero exit code; the `on_budget_breach` hook fires either way.
 1. `rocky validate` parses the `[budget]` block: `max_duration_ms =
    1`, `on_breach = "warn"`.
 2. `rocky run` replicates the 500-row orders table; the run exceeds the
-   1ms budget, so a `budget_breach` event is pushed onto the run's
-   event stream.
+   1ms budget, so Rocky records a breach and fires the `on_budget_breach`
+   hook.
 3. The JSON run output contains both `cost_summary` (with
-   `total_duration_ms` and `per_model` entries) and the `budget_breach`
-   event in `events`.
+   `total_duration_ms` and `per_model` entries) and the top-level
+   `budget_breaches` array. `run.sh` prints both.
 
 ## Related
 

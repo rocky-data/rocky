@@ -8,8 +8,7 @@
 
 ## What it shows
 
-The semantic breaking-change classifier introduced in `rocky-core`
-diffs two compiled `ProjectIr` snapshots (base ref vs HEAD) and
+The semantic breaking-change classifier in `rocky-core` diffs two compiled `ProjectIr` snapshots (base ref vs HEAD) and
 classifies each structural delta into `Info` / `Warning` / `Breaking`
 severities. Two CLI surfaces consume the classifier:
 
@@ -58,7 +57,7 @@ gate is a clean no-op.
 .
 ├── README.md         this file
 ├── rocky.toml        replication pipeline (promote targets) + transformation models
-├── run.sh            git init + 6-step demo
+├── run.sh            git init + 7-step demo
 ├── data/seed.sql     raw__orders.orders bootstrap
 └── models/           orders_summary + raw_orders, with column drop applied mid-run
     ├── _defaults.toml
@@ -68,8 +67,7 @@ gate is a clean no-op.
 
 ## Prerequisites
 
-- `rocky` ≥ 1.31.0 on PATH (the `--semantic` flag landed in 1.31.0, the
-  pre-promote gate followed in the same triple-cut)
+- `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
 - `git` (the POC initializes a throw-away repo *inside* this directory
   so the gate has real `main` ↔ `HEAD` refs to diff)

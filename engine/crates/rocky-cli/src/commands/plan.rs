@@ -2487,10 +2487,19 @@ fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Op
 /// unexpected full refresh, or a freeze recorded in the reviewed authority going
 /// unseen.
 ///
-/// Credential-free on purpose. For Valkey this keeps scheme, host, port and
-/// database and drops any `user:password@`, so the identity is comparable
-/// without the plan payload carrying a secret. `expose()` is the audited
-/// accessor; the exposed value is parsed and discarded, never stored.
+/// Credential-free on purpose. The Valkey URL goes through
+/// [`rocky_core::credential_url::CredentialUrl::identity`]. It parses with the
+/// `url` crate, the parser the Redis client uses. The user name, host, port,
+/// path, the `db`, `user` and `protocol` query values and `#insecure` stay.
+/// The password and every other query value are masked (#2352). The earlier
+/// text cut (at the last `@`, query dropped) gave `redis://h1/0?a=@` and
+/// `redis://h2/0?a=@` one identity, and `redis+unix:///s?db=1` and `?db=2`
+/// another.
+///
+/// The Valkey parts are written as `valkey_url="..."`. An identity written
+/// before #2352 used `valkey=...`, so no old Valkey or Tiered identity can
+/// equal a new one: such a plan refuses once, and never matches a different
+/// store.
 pub(crate) fn state_authority_identity(
     state: &rocky_core::config::StateConfig,
     state_path: &std::path::Path,
@@ -2506,7 +2515,8 @@ pub(crate) fn state_authority_identity(
         format!("schema=v{}", rocky_core::state::current_schema_version()),
     ];
     match state.backend {
-        StateBackend::S3 => {
+        // Tiered keeps its durable copy in S3, so the bucket is part of it.
+        StateBackend::S3 | StateBackend::Tiered => {
             parts.push(format!(
                 "bucket={}",
                 state.s3_bucket.as_deref().unwrap_or("")
@@ -2526,28 +2536,19 @@ pub(crate) fn state_authority_identity(
                 state.gcs_prefix.as_deref().unwrap_or("")
             ));
         }
-        _ => {}
+        StateBackend::Local | StateBackend::Valkey => {}
     }
     if let Some(url) = state.valkey_url.as_ref() {
-        // Keep only where it points. Two secret carriers to remove, not one:
-        //
-        //   redis://user:pass@host:6379/0   -> userinfo before the LAST '@'
-        //                                      (last, because a password may
-        //                                       itself contain '@')
-        //   redis://host:6379?password=xyz  -> query string
-        //
-        // Stripping only the userinfo would write the second form's secret into
-        // a plan file on disk.
-        let raw = url.expose();
-        let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
-        let no_userinfo = rest.rsplit_once('@').map_or(rest, |(_creds, host)| host);
-        let no_query = no_userinfo
-            .split_once('?')
-            .map_or(no_userinfo, |(host, _query)| host);
-        let no_fragment = no_query
-            .split_once('#')
-            .map_or(no_query, |(host, _frag)| host);
-        parts.push(format!("valkey={scheme}://{no_fragment}"));
+        // `identity()`, not the printed form: it keeps each resolved `${VAR}`
+        // value, so a different `${VALKEY_HOST}` gives a different identity.
+        // It holds no password. Quoted, because the unparseable-URL form can
+        // hold a space, the separator of the parts.
+        let identity = rocky_core::credential_url::CredentialUrl::from(url.expose()).identity();
+        parts.push(format!("valkey_url={identity:?}"));
+        parts.push(format!(
+            "valkey_prefix={:?}",
+            state.valkey_prefix.as_deref().unwrap_or("")
+        ));
     }
     // The local ledger is identified by its resolved path, which the config
     // never carries.
@@ -3877,6 +3878,90 @@ mod tests {
             ident("redis://b:6379/0"),
             "different hosts must produce different identities"
         );
+    }
+
+    fn valkey_identity(backend: rocky_core::config::StateBackend, url: &str) -> String {
+        let st = rocky_core::config::StateConfig {
+            backend,
+            valkey_url: Some(rocky_core::redacted::RedactedString::new(url.to_string())),
+            s3_bucket: Some("bucket-a".to_string()),
+            ..Default::default()
+        };
+        super::state_authority_identity(&st, std::path::Path::new("/s.redb"))
+    }
+
+    /// #2352: each pair names two different state stores. The old text cut
+    /// (at the last `@`, query dropped) gave each pair one identity.
+    #[test]
+    fn state_authority_identity_separates_stores_a_text_cut_merged() {
+        use rocky_core::config::StateBackend;
+        for (a, b) in [
+            ("redis://h1/0?a=@", "redis://h2/0?a=@"),
+            ("redis+unix:///s?db=1", "redis+unix:///s?db=2"),
+        ] {
+            for backend in [StateBackend::Valkey, StateBackend::Tiered] {
+                assert_ne!(
+                    valkey_identity(backend, a),
+                    valkey_identity(backend, b),
+                    "{a} and {b} are two stores"
+                );
+            }
+        }
+    }
+
+    /// A rotated password names the same store, so it must not refuse a plan.
+    /// The identity must also hold no secret.
+    #[test]
+    fn state_authority_identity_ignores_a_rotated_password() {
+        use rocky_core::config::StateBackend;
+        for (a, b) in [
+            (
+                "rediss://default:PW-A-SECRET@h:6379/0",
+                "rediss://default:PW-B-SECRET@h:6379/0",
+            ),
+            (
+                "redis+unix:///s?db=1&pass=PW-A-SECRET",
+                "redis+unix:///s?db=1&pass=PW-B-SECRET",
+            ),
+        ] {
+            let (got_a, got_b) = (
+                valkey_identity(StateBackend::Valkey, a),
+                valkey_identity(StateBackend::Valkey, b),
+            );
+            assert_eq!(got_a, got_b, "{a} and {b} are one store");
+            assert!(!got_a.contains("SECRET"), "{a} -> {got_a}");
+        }
+    }
+
+    /// Tiered keeps its durable copy in S3, and both Valkey backends key the
+    /// ledger by `valkey_prefix`, so each must move the identity.
+    #[test]
+    fn state_authority_identity_records_the_tiered_bucket_and_valkey_prefix() {
+        use rocky_core::config::{StateBackend, StateConfig};
+        let ident = |bucket: &str, prefix: &str| {
+            let st = StateConfig {
+                backend: StateBackend::Tiered,
+                valkey_url: Some(rocky_core::redacted::RedactedString::new(
+                    "redis://h:6379/0".to_string(),
+                )),
+                s3_bucket: Some(bucket.to_string()),
+                valkey_prefix: Some(prefix.to_string()),
+                ..Default::default()
+            };
+            super::state_authority_identity(&st, std::path::Path::new("/s.redb"))
+        };
+        assert_ne!(ident("bucket-a", "p:"), ident("bucket-b", "p:"));
+        assert_ne!(ident("bucket-a", "p:"), ident("bucket-a", "q:"));
+    }
+
+    /// An identity written before #2352 (`valkey=redis://h/0`, query dropped)
+    /// must never equal a new one, or a plan made against `?db=2` could pass
+    /// against `/0`. The key changed so such a plan refuses once.
+    #[test]
+    fn state_authority_identity_never_uses_the_pre_2352_valkey_key() {
+        let got = valkey_identity(rocky_core::config::StateBackend::Valkey, "redis://h/0");
+        assert!(!got.contains(" valkey="), "{got}");
+        assert!(got.contains(r#"valkey_url="redis://h/0""#), "{got}");
     }
     use std::sync::Arc;
 

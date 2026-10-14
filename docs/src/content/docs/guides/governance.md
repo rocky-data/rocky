@@ -2,18 +2,22 @@
 title: Data Governance
 description: Configure schema patterns, data contracts, permissions, tagging, quality checks, and audit trails.
 sidebar:
-  order: 7
+  order: 17
 ---
 
-Rocky enforces data quality, schema stability, access control, masking, retention, and auditability. Most of it is declarative: write the rules in `rocky.toml` or in a model sidecar, and `rocky apply` carries them out. Two features run as standalone commands instead, so you can gate a PR on them. `rocky compliance` rolls up classification against masking, and `rocky retention-status` reports retention per model.
+Governance in Rocky is declarative. Write the rules in `rocky.toml` or a model sidecar, and `rocky apply` carries them out. Two features run as standalone commands, so you can gate a PR on them: `rocky compliance` and `rocky retention-status`.
 
-Five governance features do the enforcement. Each one names what Rocky does:
-
-1. **Grants** -- Rocky reconciles catalog and schema ACLs against Unity Catalog on every apply.
-2. **Column classification and masking** -- you tag columns in the model sidecar; project-level `[mask]` and `[mask.<env>]` blocks decide how Rocky obscures them.
-3. **Compliance rollup** -- `rocky compliance` resolves tags against strategies and reports the gaps, without touching the warehouse.
-4. **Role-graph reconciliation** -- Rocky flattens your `[role.<name>]` hierarchy and reconciles the result.
-5. **Data retention** -- a model sidecar sets `retention = "<N>[dy]"`, and each adapter writes it as the warehouse-native property.
+| You get | You write | Rocky does |
+|---|---|---|
+| Schema routing ([1](#1-schema-patterns)) | `schema_pattern` and target templates | Routes each source schema to a catalog and schema. |
+| Contracts ([2](#2-data-contracts)) | `contracts/*.contract.toml` | Fails the compile on a broken schema agreement. |
+| Grants ([3](#3-grants-pillar-1-of-5)) | `governance.grants` | Issues a `GRANT` on every apply. It never revokes. |
+| Masking ([4](#4-column-classification-and-masking-pillar-2-of-5)) | `[classification]` and `[mask]` | Obscures tagged columns (Databricks only today). |
+| Compliance ([5](#5-compliance-rollup-pillar-3-of-5)) | Nothing | `rocky compliance` reports unmasked classified columns. |
+| Roles ([6](#6-role-graph-reconciliation-pillar-4-of-5)) | `[role.<name>]` | Flattens the hierarchy and reconciles it. |
+| Retention ([7](#7-data-retention-pillar-5-of-5)) | `retention = "90d"` | Writes the warehouse-native property. |
+| Isolation, tags, groups ([8](#8-workspace-isolation)-[11](#11-model-tags)) | `governance.isolation`, `tags`, `group` | Binds workspaces, tags objects, enforces shared config. |
+| Checks and audit ([12](#12-quality-checks)-[13](#13-audit-trail)) | `[pipeline.*.checks]` | Checks each copied table and records every run. |
 
 Each one runs at a different moment. This is where they fire:
 
@@ -22,7 +26,7 @@ Each one runs at a different moment. This is where they fire:
   ───────────        ───────           ───────────────────────────────
   role graph         data contracts    during the run:
   validated          checked             catalogs + schemas created
-  (cycles, unknown                       grants reconciled
+  (cycles, unknown                       grants applied
    parents)                              tags applied
   mask strategy                          quality checks, per copied
   names checked                          table (replication)
@@ -38,9 +42,7 @@ Each one runs at a different moment. This is where they fire:
 
 ## 1. Schema Patterns
 
-A schema pattern maps a source schema name onto a target catalog and schema. Patterns are what let one pipeline route many tenants.
-
-### Configuration
+A schema pattern maps a source schema name onto a target catalog and schema. Patterns let one pipeline route many tenants. [Schema patterns](/concepts/schema-patterns/) has the parsing rules, multi-region examples, and error cases.
 
 The pattern lives on the pipeline source. The templates live on the pipeline target. Both use the same component names:
 
@@ -56,54 +58,7 @@ catalog_template = "{client}_warehouse"
 schema_template = "staging__{regions}__{connector}"
 ```
 
-### How parsing works
-
-Given a source schema `src__acme__us_west__shopify`:
-
-1. Rocky strips the prefix `src__`
-2. Splits on the separator `__` to get segments: `["acme", "us_west", "shopify"]`
-3. Maps segments to components:
-   - `client` = `"acme"` (single segment)
-   - `regions` = `["us_west"]` (variable-length, marked with `...`)
-   - `connector` = `"shopify"` (terminal segment)
-4. Resolves target templates:
-   - `{client}_warehouse` becomes `acme_warehouse`
-   - `staging__{regions}__{connector}` becomes `staging__us_west__shopify`
-
-### Multi-region examples
-
-The `...` suffix on `regions` captures one or more segments between the fixed components:
-
-| Source Schema | client | regions | connector |
-|---|---|---|---|
-| `src__acme__us_west__shopify` | `acme` | `["us_west"]` | `shopify` |
-| `src__acme__us_west__us_east__shopify` | `acme` | `["us_west", "us_east"]` | `shopify` |
-| `src__globex__emea__france__paris__zendesk` | `globex` | `["emea", "france", "paris"]` | `zendesk` |
-
-Rocky joins multi-valued regions with the separator when it fills the target schema:
-
-```
-staging__us_west__us_east__shopify
-staging__emea__france__paris__zendesk
-```
-
-### Custom patterns
-
-You choose the component names. Use the ones your naming convention already has:
-
-```toml
-[pipeline.bronze.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["environment", "department", "system"]
-
-[pipeline.bronze.target]
-adapter = "prod"
-catalog_template = "{environment}_analytics"
-schema_template = "{department}__{system}"
-```
-
-This maps `raw__prod__finance__sap` to `prod_analytics.finance__sap`.
+Source schema `src__acme__us_west__shopify` lands in `acme_warehouse.staging__us_west__shopify`. The `...` suffix captures one or more segments. Rocky joins them with the separator in the target schema.
 
 ## 2. Data Contracts
 
@@ -165,19 +120,11 @@ A violation is a compiler error:
     = help: restore `order_count` in the SELECT, or remove it from `[rules] protected`
 ```
 
-### Contract validation in CI
-
-Run the same check in your CI pipeline:
-
-```bash
-rocky ci --models models --contracts contracts
-```
-
-The PR then fails on a contract violation, before the code reaches production.
+Run the same check in CI with `rocky ci --models models --contracts contracts`. The PR then fails on a violation, before the code reaches production.
 
 ## 3. Grants (Pillar 1 of 5)
 
-You declare the permissions you want in `rocky.toml`. Rocky reconciles Databricks Unity Catalog against that declaration on every `rocky apply`.
+You declare the permissions you want in `rocky.toml`. Rocky issues a `GRANT` for each declared permission on every `rocky apply`. Rocky does not read the current grants and never revokes one.
 
 ### Catalog-level grants
 
@@ -211,7 +158,7 @@ principal = "analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 ```
 
-### Reconciliation flow
+### How Rocky applies grants
 
 `rocky apply` runs this loop for each catalog and schema it manages:
 
@@ -220,27 +167,21 @@ permissions = ["USE SCHEMA", "SELECT"]
                      [pipeline.<name>.target.governance.schema_grants]
                                    │
                                    ▼
-  2. query actual    SHOW GRANTS ON CATALOG / ON SCHEMA
-                                   │
-                                   ▼
-  3. diff            which grants to add, which to revoke
-                                   │
-                    ┌──────────────┴──────────────┐
-                    ▼                             ▼
-  4. apply     Databricks:                  no REST permissions API:
-               one batched request          GRANT / REVOKE SQL
-               to the Unity Catalog
-               permissions API
+  2. apply           one GRANT per declared permission
 ```
 
-The privilege effect is identical on both branches. Only the transport differs, so a Databricks audit log shows PATCH requests rather than `GRANT` statements. Rocky batches one request per securable, grouped by principal.
+Rocky does not read the grants that already exist. A grant that `rocky.toml` does not declare stays in place.
 
 ```sql
--- Equivalent SQL (the form emitted on SQL-only warehouses)
 GRANT SELECT ON CATALOG `acme_warehouse` TO `analysts`;
 GRANT USE SCHEMA ON SCHEMA `acme_warehouse`.`staging__us_west__shopify` TO `analysts`;
-REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `temp_access`;
 ```
+
+:::caution[Rocky never revokes]
+Removing a grant from `rocky.toml` leaves it on the warehouse. A person must revoke an unwanted grant by hand. `grants_revoked` in the run output is always `0`.
+:::
+
+Catalog grants run only with `auto_create_catalogs = true`. Schema grants run only with `auto_create_schemas = true`. See [Permissions](/reference/permissions/).
 
 ### Managed vs skipped permissions
 
@@ -253,7 +194,7 @@ REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `temp_access`;
 | `MODIFY` | |
 | `MANAGE` | |
 
-Rocky never grants or revokes a skipped permission. It therefore cannot disturb ownership or admin-level grants.
+Rocky never grants a skipped permission. It therefore cannot disturb ownership or admin-level grants.
 
 ### Principal validation
 
@@ -277,7 +218,7 @@ A classification tag marks a column as sensitive. A masking strategy decides how
                                    └────────────────────┘
 ```
 
-Shipped in engine-v1.16.0. Implemented on Databricks today. Other adapters do nothing.
+Implemented on Databricks today. Other adapters do nothing.
 
 ### Tag columns in the model sidecar
 
@@ -321,6 +262,8 @@ confidential = "partial" # keep first/last 2 chars, mask the middle
 | `"partial"` | Keep the first and last 2 characters; mask the middle. |
 | `"none"` | Explicit identity -- no masking applied. Counts as masked for compliance. |
 
+`rocky preview rows` applies `hash` and `partial` on Databricks, Snowflake and DuckDB only. On other adapters it refuses with `unmaskable_column` and returns no rows. `redact` works everywhere. See [`rocky preview rows`](/reference/commands/modeling/#rocky-preview-rows).
+
 An unknown strategy name, such as `"mask"` or `"obfuscate"`, fails at config-load time. Rocky never accepts a strategy it cannot emit SQL for.
 
 ### Allowed unmasked tags
@@ -346,7 +289,7 @@ See the [configuration reference](/reference/configuration/) for the full schema
 
 `rocky compliance` answers one question: **is every classified column masked wherever policy says it should be?**
 
-It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip. Shipped in engine-v1.16.0.
+It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip.
 
 ### Basic usage
 
@@ -373,15 +316,8 @@ EXCEPTIONS:
 |---|---|
 | `--env <name>` | Scope the report to a single environment. Without it, Rocky expands across the defaults plus every `[mask.<env>]` override. |
 | `--exceptions-only` | Filter the `per_column` table to rows that produced at least one exception. The `exceptions` list itself is always shown. |
-| `--fail-on exception` | Exit with code `1` when any exception is emitted. Wire this into CI to block merges that leave classified columns unmasked. |
+| `--fail-on exception` | Exit with code `1` when any exception is emitted. Without it the exit code stays `0`, whether or not exceptions exist. Wire this into CI to block merges that leave classified columns unmasked. |
 | `--models <dir>` | Models directory to scan (defaults to `models/`). |
-
-### Exit codes
-
-| Exit code | Meaning |
-|---|---|
-| `0` | Report produced. Exceptions may or may not be present -- exit stays 0 unless `--fail-on exception` is passed. |
-| `1` | `--fail-on exception` was set and at least one exception was emitted. |
 
 ### How `none` counts
 
@@ -395,13 +331,13 @@ The `[classifications] allow_unmasked = [...]` list suppresses exceptions for th
 rocky compliance --env prod --output json
 ```
 
-The payload follows the `ComplianceOutput` schema: a `summary` block of counters, a `per_column` array, and an `exceptions` array. Feed it to a dashboard or a CI step summary.
+The payload follows the `ComplianceOutput` schema: a `summary` block of counters, a `per_column` array, and an `exceptions` array. Feed it to a dashboard, a CI step summary, or a policy engine. The schema stays stable across minor versions, so point your tooling at the JSON and not at the text table.
 
 ## 6. Role-Graph Reconciliation (Pillar 4 of 5)
 
 You declare roles that inherit from other roles. Rocky flattens that hierarchy into one resolved permission set per role. It rejects cycles and unknown parents at config-load time.
 
-Shipped in engine-v1.16.0. What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
+What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
 
 ### Declare roles in `rocky.toml`
 
@@ -448,8 +384,6 @@ Both passes only add. Rocky revokes no grant and deletes no group. Removing a ro
 ## 7. Data Retention (Pillar 5 of 5)
 
 A retention policy tells the warehouse how long to keep a table's historical data. You write one sidecar key. Each adapter translates it into the warehouse's own TBLPROPERTIES or session parameter.
-
-Shipped in engine-v1.16.0.
 
 ### Declare retention on a model
 
@@ -695,9 +629,7 @@ The three tag surfaces are independent, and each reaches a different consumer. K
 
 ## 12. Quality Checks
 
-Rocky runs data quality checks inside a replication run. Each check executes as soon as its table is copied, and the run output carries the results.
-
-### Configuration
+Rocky runs data quality checks inside a replication run. Each check executes as soon as its table is copied. The run output carries the results. [Data quality checks](/concepts/data-quality-checks/) has the JSON result shapes, the anomaly rules, and the freshness edge cases.
 
 ```toml
 [pipeline.bronze.checks]
@@ -706,101 +638,26 @@ row_count = true
 column_match = true
 freshness = { threshold_seconds = 86400 }
 anomaly_threshold_pct = 50.0
-```
-
-### Check types
-
-#### Row count
-
-Compares `COUNT(*)` on the source against `COUNT(*)` on the target. Rocky batches these into `UNION ALL` queries, 200 tables per batch:
-
-```json
-{
-  "name": "row_count",
-  "passed": true,
-  "source_count": 15000,
-  "target_count": 15000
-}
-```
-
-#### Column match
-
-Compares the source and target column sets, ignoring case, and reports a missing or extra column. Rocky reads both column lists again after the copy, so the check costs two extra metadata queries per table, one per side:
-
-```json
-{
-  "name": "column_match",
-  "passed": false,
-  "missing": ["new_column"],
-  "extra": []
-}
-```
-
-#### Freshness
-
-Compares `MAX(timestamp_column)` against the current time, which gives the age of the newest row:
-
-```toml
-freshness = { threshold_seconds = 86400 }  # 24 hours
-```
-
-Rocky flags a table that has received no new data within the threshold:
-
-```json
-{
-  "name": "freshness",
-  "passed": false,
-  "lag_seconds": 172800,
-  "threshold_seconds": 86400
-}
-```
-
-#### Null rate
-
-Samples the table with `TABLESAMPLE` and computes the percentage of nulls per column:
-
-```toml
-[pipeline.bronze.checks]
 null_rate = { columns = ["email", "phone"], threshold = 0.05, sample_percent = 10 }
-```
 
-`sample_percent` keeps the query fast on a large table.
-
-#### Anomaly detection
-
-Compares the current row count against a moving average of past runs. Rocky flags the table when the difference exceeds the threshold:
-
-```toml
-anomaly_threshold_pct = 50.0  # Flag if count changes by more than 50%
-```
-
-This catches three failures:
-
-- A source table was truncated, so the count drops to near zero
-- A bad sync duplicated data, so the count spikes
-- A connector stopped, so the count stays flat
-
-#### Custom checks
-
-Your own SQL query, with a `{target}` placeholder:
-
-```toml
 [[pipeline.bronze.checks.custom]]
 name = "no_future_dates"
 sql = "SELECT COUNT(*) FROM {target} WHERE order_date > CURRENT_DATE()"
 threshold = 0
-
-[[pipeline.bronze.checks.custom]]
-name = "revenue_positive"
-sql = "SELECT COUNT(*) FROM {target} WHERE revenue < 0"
-threshold = 0
 ```
 
-The check passes when the query result is less than or equal to the threshold.
+| Check | What it compares |
+|---|---|
+| Row count | `COUNT(*)` on the source against the target. Rocky batches tables into `UNION ALL` queries, 200 per batch. |
+| Column match | Source and target column sets, ignoring case. Reports missing and extra columns. Costs two extra metadata queries per table. |
+| Freshness | `MAX(timestamp_column)` against now. Fails when the newest row is older than `threshold_seconds`. |
+| Null rate | Null percentage per column, from a `TABLESAMPLE`. `sample_percent` keeps it fast on a large table. |
+| Anomaly | Row count against a moving average of past runs. Flags a change above `anomaly_threshold_pct`. |
+| Custom | Your SQL, with a `{target}` placeholder. Passes when the result is at most `threshold`. |
 
 ## 13. Audit Trail
 
-Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`, shipped in engine-v1.16.0. `rocky history --audit` shows them.
+Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`. `rocky history --audit` shows them.
 
 ### `rocky history --audit` and the 8 audit fields
 
@@ -834,94 +691,19 @@ The audit trail took the redb schema from v5 to v6. Rocky migrates by deserializ
 
 An old run therefore still renders under `rocky history --audit`. It shows those placeholder strings for the three fields that did not exist when it ran.
 
-### View run history
+### Read history and metrics
 
-```bash
-rocky history
-```
+| Command | Shows |
+|---|---|
+| `rocky history` | Recent runs: id, start, status, model count, trigger. |
+| `rocky history --since 2026-03-29` | Runs on or after a date. |
+| `rocky history --model fct_daily_revenue` | One model's executions: duration, rows, status, SQL hash. |
+| `rocky metrics fct_daily_revenue` | The latest quality snapshot: row count, freshness lag, null rates. |
+| `rocky metrics fct_daily_revenue --trend` | Row count and freshness for each run. |
+| `rocky metrics fct_daily_revenue --column email --alerts` | Metrics for one column, with alerts. |
+| `rocky metrics fct_daily_revenue --alerts` | Quality alerts for the model. |
 
-```
-RUN ID       STARTED                  STATUS     MODELS   TRIGGER
-────────────────────────────────────────────────────────────────────
-abc12345678  2026-03-30 10:00:00      Completed  42       Scheduled
-def98765432  2026-03-29 10:00:00      Completed  42       Scheduled
-ghi11111111  2026-03-28 14:30:00      Failed     38       Manual
-
-Total runs: 3
-```
-
-### Filter by date
-
-```bash
-rocky history --since 2026-03-29
-```
-
-### View model execution history
-
-```bash
-rocky history --model fct_daily_revenue
-```
-
-```
-STARTED                  DURATION   ROWS         STATUS         SQL HASH
-────────────────────────────────────────────────────────────────────────────
-2026-03-30 10:00:00      2300ms     15432        succeeded      a1b2c3d4
-2026-03-29 10:00:00      2100ms     15200        succeeded      a1b2c3d4
-2026-03-28 14:30:00      0ms        -            failed         a1b2c3d4
-
-Total executions: 3
-```
-
-### View quality metrics
-
-```bash
-rocky metrics fct_daily_revenue
-```
-
-```
-Latest snapshot (run: abc12345678):
-  Row count: 15432
-  Freshness lag: 300s
-  Null rates:
-    email: 2.10%
-    phone: 15.30%
-```
-
-### View quality trends
-
-```bash
-rocky metrics fct_daily_revenue --trend
-```
-
-```
-TIMESTAMP                ROW COUNT    RUN ID     FRESHNESS
-──────────────────────────────────────────────────────────────
-2026-03-30 10:00:00      15432        abc123456  300s
-2026-03-29 10:00:00      15200        def987654  280s
-2026-03-28 10:00:00      14980        ghi111111  310s
-```
-
-### View column-specific metrics
-
-```bash
-rocky metrics fct_daily_revenue --column email --alerts
-```
-
-### Quality alerts
-
-Pass `--alerts` to see quality issues:
-
-```bash
-rocky metrics fct_daily_revenue --alerts
-```
-
-```
-Latest snapshot (run: abc12345678):
-  Row count: 15432
-
-ALERTS:
-  [WARNING] null rate 25.0% exceeds 20% threshold (column: phone)
-```
+`--alerts` prints lines such as `[WARNING] null rate 25.0% exceeds 20% threshold (column: phone)`.
 
 Alert severity levels:
 - **critical**: the null rate exceeds 50%
@@ -936,115 +718,25 @@ rocky history -o json
 rocky metrics fct_daily_revenue --trend -o json
 ```
 
-## 14. Complete Governance Configuration
+## 14. Where Each Block Lives
 
-This is one pipeline target with every governance feature turned on. Governance lives under each pipeline's target, so two pipelines can carry different policies:
+Governance lives in three places. Pipeline-level blocks sit under each pipeline's target, so two pipelines can carry different policies. Project-level blocks sit at the top of `rocky.toml`. Model-level blocks sit in the sidecar.
+
+| Level | Block | Section |
+|---|---|---|
+| Pipeline target | `[pipeline.<name>.target.governance]`: `auto_create_*`, `tags`, `grants`, `schema_grants`, `isolation` | 3, 8, 9 |
+| Pipeline | `[pipeline.<name>.checks]` | 12 |
+| Project | `[mask]`, `[mask.<env>]`, `[classifications]`, `[role.<name>]` | 4, 6 |
+| Model sidecar | `[classification]`, `retention`, `[tags]`, `[governance.tags]`, `group` | 4, 7, 10, 11 |
+| Contracts | `contracts/<model>.contract.toml` | 2 |
+
+The smallest working target block turns on both `auto_create_*` switches. Grants need them (see [section 3](#3-grants-pillar-1-of-5)):
 
 ```toml
 [pipeline.bronze.target.governance]
 auto_create_catalogs = true
 auto_create_schemas = true
-
-# Tags applied to all managed catalogs, schemas, and tables
-[pipeline.bronze.target.governance.tags]
-managed_by = "rocky"
-environment = "production"
-data_owner = "analytics-team"
-
-# Catalog-level grants
-[[pipeline.bronze.target.governance.grants]]
-principal = "data_engineers"
-permissions = ["USE CATALOG", "MANAGE"]
-
-[[pipeline.bronze.target.governance.grants]]
-principal = "analysts"
-permissions = ["BROWSE", "USE CATALOG"]
-
-[[pipeline.bronze.target.governance.grants]]
-principal = "ml_team"
-permissions = ["BROWSE", "USE CATALOG", "SELECT"]
-
-# Schema-level grants
-[[pipeline.bronze.target.governance.schema_grants]]
-principal = "data_engineers"
-permissions = ["USE SCHEMA", "SELECT", "MODIFY"]
-
-[[pipeline.bronze.target.governance.schema_grants]]
-principal = "analysts"
-permissions = ["USE SCHEMA", "SELECT"]
-
-# Workspace isolation
-[pipeline.bronze.target.governance.isolation]
-enabled = true
-
-[[pipeline.bronze.target.governance.isolation.workspace_ids]]
-id = 123456789
-binding_type = "READ_WRITE"
-
-[[pipeline.bronze.target.governance.isolation.workspace_ids]]
-id = 987654321
-binding_type = "READ_ONLY"
 ```
-
-Combined with quality checks (also under the pipeline):
-
-```toml
-[pipeline.bronze.checks]
-enabled = true
-row_count = true
-column_match = true
-freshness = { threshold_seconds = 86400 }
-anomaly_threshold_pct = 50.0
-null_rate = { columns = ["email"], threshold = 0.05, sample_percent = 10 }
-
-[[pipeline.bronze.checks.custom]]
-name = "no_future_dates"
-sql = "SELECT COUNT(*) FROM {target} WHERE order_date > CURRENT_DATE()"
-threshold = 0
-```
-
-Classification, masking, roles, and retention sit outside the pipeline target, because they are project-level. Together they complete the picture:
-
-```toml
-# Project-level masking policy
-[mask]
-pii = "hash"
-confidential = "redact"
-
-[mask.prod]
-pii = "none"
-confidential = "partial"
-
-[classifications]
-allow_unmasked = ["internal"]
-
-# Project-level role graph
-[role.reader]
-permissions = ["SELECT", "USE CATALOG", "USE SCHEMA"]
-
-[role.analytics_engineer]
-inherits = ["reader"]
-permissions = ["MODIFY"]
-
-[role.admin]
-inherits = ["analytics_engineer"]
-permissions = ["MANAGE"]
-```
-
-Paired with a model sidecar:
-
-```toml
-# models/customers.toml
-name = "customers"
-retention = "365d"
-
-[classification]
-pii_email = "pii"
-phone = "pii"
-ssn = "confidential"
-```
-
-That one configuration exercises every feature in this guide: schema routing, declarative grants with reconciliation, workspace isolation, per-environment classification and masking, role-graph validation at config load, retention, inline quality checks, and the audit trail.
 
 ## 15. CI Gate Example
 
@@ -1076,22 +768,3 @@ jobs:
 ```
 
 The gate exits `0` when every classified column has a resolved strategy, or appears in `allow_unmasked`. It exits `1`, and fails the job, as soon as one exception appears.
-
-### Local quiet-mode run
-
-```bash
-rocky compliance --env prod --exceptions-only
-```
-
-When everything is compliant, this prints the summary counters alone. When exceptions exist, it filters the `per_column` table to the offending rows.
-
-### Machine-readable gate
-
-For a dashboard or your own policy engine, emit JSON and pipe it into `jq`:
-
-```bash
-rocky compliance --env prod --output json \
-  | jq '.exceptions[] | {model, column, env, reason}'
-```
-
-The `ComplianceOutput` schema stays stable across minor versions. Point your tooling at the JSON payload, not at the text table.

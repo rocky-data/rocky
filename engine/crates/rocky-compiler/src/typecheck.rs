@@ -4716,6 +4716,89 @@ mod tests {
     use crate::semantic::build_semantic_graph;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
 
+    /// The typed columns of `model`, as `(name, type, nullable)`.
+    fn typed_columns_of(result: &TypeCheckResult, model: &str) -> Vec<(String, RockyType, bool)> {
+        result.typed_models[model]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2320 across models. An upstream model stores a column whose type is
+    /// a guess (`LENGTH`'s width, `x * 1.5`) as `Unknown`, so a downstream
+    /// aggregate over it is `Unknown` too, as it is inline or through a CTE.
+    /// This holds by a bare, a qualified and a target-table read, and in an
+    /// incremental typecheck. A bare source column and a cast stay exact.
+    #[test]
+    fn a_downstream_aggregate_over_an_upstream_guess_is_not_typed() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let mut by_target = make_model(
+            "by_target",
+            "SELECT MAX(l) AS m, SUM(amt) AS s, MAX(d) AS md FROM warehouse.silver.up",
+        );
+        by_target.config.depends_on = vec!["up".to_string()];
+        let models = vec![
+            make_model(
+                "up",
+                "SELECT LENGTH(n) AS l, x * 1.5 AS amt, CAST(x AS DOUBLE) AS d, x FROM t",
+            ),
+            make_model(
+                "down",
+                "SELECT MAX(l) AS m, SUM(amt) AS s, MAX(d) AS md, MAX(x) AS mx, \
+                 MAX(up.l) AS q FROM up",
+            ),
+            by_target,
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let full = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let expected = |names: &[&str]| -> Vec<(String, RockyType, bool)> {
+            names
+                .iter()
+                .map(|name| match *name {
+                    "md" => ("md".to_string(), RockyType::Float64, true),
+                    "mx" => ("mx".to_string(), RockyType::Int32, true),
+                    other => (other.to_string(), RockyType::Unknown, true),
+                })
+                .collect()
+        };
+        assert_eq!(
+            typed_columns_of(&full, "down"),
+            expected(&["m", "s", "md", "mx", "q"])
+        );
+        assert_eq!(
+            typed_columns_of(&full, "by_target"),
+            expected(&["m", "s", "md"])
+        );
+        assert_eq!(
+            typed_columns_of(&full, "up"),
+            vec![
+                ("l".to_string(), RockyType::Unknown, true),
+                ("amt".to_string(), RockyType::Unknown, true),
+                ("d".to_string(), RockyType::Float64, false),
+                ("x".to_string(), RockyType::Int32, false),
+            ]
+        );
+
+        // Only `down` is re-typechecked; `up` comes from the previous result.
+        let incremental = typecheck_project_incremental(
+            &graph,
+            &sources,
+            &project.models,
+            &HashSet::from(["down".to_string()]),
+            &full,
+            None,
+            &TargetDialects::default(),
+        );
+        assert_eq!(incremental.typed_models, full.typed_models);
+    }
+
     /// The decimal arms of the THIRD normaliser (#1721).
     ///
     /// Rocky has three type normalisers and this one had drifted: a bare

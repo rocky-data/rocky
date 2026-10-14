@@ -21,7 +21,7 @@ use duckdb::{Connection, params, types::Value};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum DuckDbError {
     #[error("DuckDB error: {0}")]
     Database(#[from] duckdb::Error),
@@ -45,6 +45,14 @@ pub enum DuckDbError {
 
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
     KindSwitchCommitUncertain(duckdb::Error),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for DuckDbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "DuckDbError", self)
+    }
 }
 
 /// Query result matching the structure of rocky-databricks QueryResult.
@@ -585,5 +593,21 @@ mod tests {
         let result = db.execute_sql("SELECT * FROM target_table").unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.columns.len(), 4); // id, name, _fivetran_synced, _loaded_by
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn duckdb_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "duckdb-path-1919-e215";
+        rocky_core::secret_registry::register_substitution("RV_DUCKDB_ERR_DBG", SECRET);
+        let err = DuckDbError::Arrow(format!("cannot open /db/{SECRET}.duckdb"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_DUCKDB_ERR_DBG}"), "{debug}");
     }
 }

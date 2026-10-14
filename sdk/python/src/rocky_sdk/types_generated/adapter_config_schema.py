@@ -101,6 +101,8 @@ class FivetranCacheConfig(BaseModel):
     object_store_url: str | None = None
     """
     URL passed to `object_store::parse_url` for `backend = "object_store"` or `backend = "tiered"` (secondary layer). Examples: `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`, `file:///path/`.
+
+    A [`CredentialUrl`], like `valkey_url`: a password or a query (an Azure SAS token, say) is dropped from every printed form (#2339).
     """
     valkey_ttl_seconds: conint(ge=0) | None = None
     """
@@ -109,6 +111,8 @@ class FivetranCacheConfig(BaseModel):
     valkey_url: str | None = None
     """
     Connection URL for `backend = "valkey"` or `backend = "tiered"` (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
+
+    It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
     """
 
 
@@ -169,6 +173,8 @@ class FivetranCircuitBreakerConfig(BaseModel):
     valkey_url: str | None = None
     """
     Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+
+    It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
     """
     window_seconds: conint(ge=0) | None = None
     """
@@ -221,6 +227,8 @@ class FivetranRatelimitConfig(BaseModel):
     valkey_url: str | None = None
     """
     Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+
+    It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
     """
 
 
@@ -273,6 +281,8 @@ class FivetranStampedeConfig(BaseModel):
     valkey_url: str | None = None
     """
     Connection URL for `backend = "valkey"`. Standard `redis://` (plain) or `rediss://` (TLS).
+
+    It may embed a password (`redis://:password@host`), so it is a [`CredentialUrl`]: it prints without its password, query and fragment, and the config identity ignores a rotated password (#2339).
     """
 
 

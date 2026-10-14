@@ -129,9 +129,10 @@ fn governed_export(
 ///
 /// # Errors
 ///
-/// Returns an error if compilation fails, the seed loader fails, or the
-/// snapshot cannot be written.
+/// Returns an error if `rocky.toml` exists but cannot be read, compilation
+/// fails, the seed loader fails, or the snapshot cannot be written.
 pub fn run_publish_ir(
+    config_path: &Path,
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     out_path: &Path,
@@ -143,8 +144,15 @@ pub fn run_publish_ir(
         HashMap::new()
     };
 
+    // Each model's warehouse, as `rocky compile` and `rocky run` resolve it.
+    // A `CAST` whose width differs between warehouses is then typed as the
+    // run types it, so the snapshot's typed columns, and its recipe hash,
+    // match the run's (#2342). As in `rocky compile`, only a missing
+    // `rocky.toml` is tolerated.
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let config = CompilerConfig {
-        target_dialects: Default::default(),
+        target_dialects: super::compile::target_dialects(project_config.as_ref(), config_path),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),

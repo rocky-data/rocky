@@ -125,6 +125,7 @@ pub fn run_docs(
     // unselected upstreams.
     let compiled = compile_for_docs(
         &rocky_cfg,
+        config_path,
         all_models.clone(),
         models_dir,
         state_path,
@@ -379,6 +380,7 @@ fn lineage_edges_of(
 /// (and without lineage) rather than refusing.
 fn compile_for_docs(
     rocky_cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
     models: Vec<rocky_core::models::Model>,
     models_dir: &Path,
     state_path: &Path,
@@ -391,7 +393,9 @@ fn compile_for_docs(
         .clone()
         .with_ttl_override(cache_ttl_override);
     let compiler_cfg = CompilerConfig {
-        target_dialects: Default::default(),
+        // Each model's warehouse, as `rocky compile` resolves it: a `CAST`
+        // whose width differs between warehouses is typed the same (#2342).
+        target_dialects: super::compile::target_dialects(Some(rocky_cfg), config_path),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

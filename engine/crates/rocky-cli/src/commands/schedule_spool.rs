@@ -31,7 +31,7 @@ use crate::output::{ScheduleSpoolOutput, SpoolPendingEntry, SpoolSkippedEntry};
 /// *in* the output — a single unreadable file is a `skipped` entry, not a
 /// failure of the whole listing, because refusing to report nine healthy
 /// demands over one bad file helps nobody.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ScheduleSpoolError {
     /// The spool directory exists but could not be read.
     ///
@@ -52,6 +52,14 @@ pub enum ScheduleSpoolError {
     /// resolution exists to prevent.
     #[error("the spool directory could not be resolved: {0}")]
     Unresolvable(String),
+}
+
+/// `Debug` prints the rendered `Display` text. A derived `Debug` would print
+/// the plaintext of every field and wrapped error (#1919).
+impl std::fmt::Debug for ScheduleSpoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "ScheduleSpoolError", self)
+    }
 }
 
 /// Read the spool and build the output document.
@@ -504,5 +512,21 @@ mod tests {
         let out = compute_schedule_spool(&config).unwrap();
         assert_eq!(out.counts.pending, out.pending.len());
         assert_eq!(out.counts.skipped, out.skipped.len());
+    }
+}
+
+/// `Debug` prints a resolved `${VAR}` value as `${NAME}` (#1919).
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn schedule_spool_error_debug_renders_a_resolved_value() {
+        const SECRET: &str = "spool-path-1919-ae11";
+        rocky_core::secret_registry::register_substitution("RV_SPOOL_ERR_DBG", SECRET);
+        let err = ScheduleSpoolError::Unreadable(format!("/spool/{SECRET}"));
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SPOOL_ERR_DBG}"), "{debug}");
     }
 }

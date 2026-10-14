@@ -200,7 +200,12 @@ fn emit_models_selected(
     let models_dir = models_dir.as_path();
 
     let config = CompilerConfig {
-        target_dialects: Default::default(),
+        // Each model's warehouse, as `rocky compile` resolves it (#2342): the
+        // compile below refuses on the errors `rocky compile` refuses on.
+        target_dialects: super::compile::target_dialects(
+            project_config.as_ref(),
+            config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+        ),
         strict_contracts: false,
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

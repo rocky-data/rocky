@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::credential_url::CredentialUrl;
 use crate::env_string::{EnvString, ExposeOpt};
 use crate::hooks::HooksConfig;
 use crate::path_presence::{PathPresence, classify_not_found};
@@ -2446,12 +2447,9 @@ impl ModelBudgetConfig {
 /// (schemas section).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValkeyCacheConfig {
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message. (Not
-    // wrapped in RedactedString because the cache client consumes it as a
-    // plain connection URL — threading RedactedString through that
-    // construction is invasive; this comment is the guard instead.)
-    pub valkey_url: String,
+    /// Valkey/Redis URL. May embed a password, so it prints without its
+    /// password, query and fragment (#2339).
+    pub valkey_url: CredentialUrl,
 }
 
 /// Top-level `[cache]` configuration.
@@ -5590,15 +5588,20 @@ pub struct FivetranCacheConfig {
     /// or `backend = "tiered"` (secondary layer). Examples:
     /// `s3://bucket/prefix/`, `gs://bucket/prefix/`, `az://container/prefix/`,
     /// `file:///path/`.
+    ///
+    /// A [`CredentialUrl`], like `valkey_url`: a password or a query (an
+    /// Azure SAS token, say) is dropped from every printed form (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_store_url: Option<String>,
+    pub object_store_url: Option<CredentialUrl>,
 
     /// Connection URL for `backend = "valkey"` or `backend = "tiered"`
     /// (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message.
+    ///
+    /// It may embed a password (`redis://:password@host`), so it is a
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valkey_url: Option<String>,
+    pub valkey_url: Option<CredentialUrl>,
 
     /// TTL applied to every `SET` against the Valkey backend. Defaults
     /// to 600s when unset. Ignored for non-Valkey backends.
@@ -5648,8 +5651,8 @@ impl FivetranCacheConfig {
     /// rather than at first cache touch.
     pub fn validate(&self, adapter_name: &str) -> Result<(), ConfigError> {
         let backend = self.backend;
-        let need = |field: &str, value: Option<&String>| -> Result<(), ConfigError> {
-            if value.map(String::is_empty).unwrap_or(true) {
+        let need = |field: &str, value: Option<&str>| -> Result<(), ConfigError> {
+            if value.is_none_or(str::is_empty) {
                 Err(ConfigError::FivetranCacheMissingField {
                     adapter: adapter_name.to_string().into(),
                     backend: backend.as_str().to_string().into(),
@@ -5661,14 +5664,24 @@ impl FivetranCacheConfig {
         };
         match self.backend {
             FivetranCacheBackend::None => Ok(()),
-            FivetranCacheBackend::File => need("file_root", self.file_root.as_ref()),
-            FivetranCacheBackend::ObjectStore => {
-                need("object_store_url", self.object_store_url.as_ref())
-            }
-            FivetranCacheBackend::Valkey => need("valkey_url", self.valkey_url.as_ref()),
+            FivetranCacheBackend::File => need("file_root", self.file_root.as_deref()),
+            FivetranCacheBackend::ObjectStore => need(
+                "object_store_url",
+                self.object_store_url.as_ref().map(CredentialUrl::expose),
+            ),
+            FivetranCacheBackend::Valkey => need(
+                "valkey_url",
+                self.valkey_url.as_ref().map(CredentialUrl::expose),
+            ),
             FivetranCacheBackend::Tiered => {
-                need("object_store_url", self.object_store_url.as_ref())?;
-                need("valkey_url", self.valkey_url.as_ref())
+                need(
+                    "object_store_url",
+                    self.object_store_url.as_ref().map(CredentialUrl::expose),
+                )?;
+                need(
+                    "valkey_url",
+                    self.valkey_url.as_ref().map(CredentialUrl::expose),
+                )
             }
         }
     }
@@ -5732,10 +5745,12 @@ pub struct FivetranRatelimitConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message.
+    ///
+    /// It may embed a password (`redis://:password@host`), so it is a
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valkey_url: Option<String>,
+    pub valkey_url: Option<CredentialUrl>,
 
     /// Cap (seconds) applied to the Valkey key's `EXPIRE` so an
     /// abandoned `wake_at` value never outlives its useful window.
@@ -5753,7 +5768,7 @@ impl FivetranRatelimitConfig {
         match self.backend {
             FivetranRatelimitBackend::File => Ok(()),
             FivetranRatelimitBackend::Valkey => {
-                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                if self.valkey_url.as_ref().is_none_or(CredentialUrl::is_empty) {
                     Err(ConfigError::FivetranRatelimitMissingField {
                         adapter: adapter_name.to_string().into(),
                         backend: self.backend.as_str().to_string().into(),
@@ -5827,10 +5842,12 @@ pub struct FivetranStampedeConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message.
+    ///
+    /// It may embed a password (`redis://:password@host`), so it is a
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valkey_url: Option<String>,
+    pub valkey_url: Option<CredentialUrl>,
 
     /// Lock TTL applied to the `SET NX EX <ttl>` call. The lock
     /// auto-expires after this many seconds so a crashed leader
@@ -5852,7 +5869,7 @@ impl FivetranStampedeConfig {
         match self.backend {
             FivetranStampedeBackend::None => Ok(()),
             FivetranStampedeBackend::Valkey => {
-                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                if self.valkey_url.as_ref().is_none_or(CredentialUrl::is_empty) {
                     Err(ConfigError::FivetranStampedeMissingField {
                         adapter: adapter_name.to_string().into(),
                         backend: self.backend.as_str().to_string().into(),
@@ -5932,10 +5949,12 @@ pub struct FivetranCircuitBreakerConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message.
+    ///
+    /// It may embed a password (`redis://:password@host`), so it is a
+    /// [`CredentialUrl`]: it prints without its password, query and
+    /// fragment, and the config identity ignores a rotated password (#2339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valkey_url: Option<String>,
+    pub valkey_url: Option<CredentialUrl>,
 
     /// Consecutive failures required to transition `Closed → Open`.
     /// Defaults to 5 when unset.
@@ -5967,7 +5986,7 @@ impl FivetranCircuitBreakerConfig {
         match self.backend {
             FivetranCircuitBreakerBackend::None => Ok(()),
             FivetranCircuitBreakerBackend::Valkey => {
-                if self.valkey_url.as_deref().is_none_or(str::is_empty) {
+                if self.valkey_url.as_ref().is_none_or(CredentialUrl::is_empty) {
                     Err(ConfigError::FivetranCircuitBreakerMissingField {
                         adapter: adapter_name.to_string().into(),
                         backend: self.backend.as_str().to_string().into(),
@@ -15831,6 +15850,74 @@ backend = "file"
         let config: RockyConfig = toml::from_str(&toml_str).unwrap();
         let errors = validate_fivetran_resilience(&config);
         assert!(errors.is_empty(), "file backend must validate: {errors:?}");
+    }
+
+    /// #2339: every Fivetran coordination URL can embed a password. None of
+    /// them may print it in `Debug` or write it through `serde_json`, which
+    /// is what the plan config snapshot and the config identity hash. The
+    /// host must stay, because it says where the data lives.
+    #[test]
+    fn fivetran_coordination_urls_never_print_their_password() {
+        let mut toml_str = fivetran_cache_base();
+        toml_str.push_str(
+            r#"
+[adapter.fivetran_main.cache]
+backend = "tiered"
+object_store_url = "az://container/prefix/?sig=SAS_SECRET_TOKEN"
+valkey_url = "rediss://default:CACHE_PW_SECRET@cache.example:6379/0"
+
+[adapter.fivetran_main.ratelimit]
+backend = "valkey"
+valkey_url = "rediss://:RATELIMIT_PW_SECRET@ratelimit.example:6379"
+
+[adapter.fivetran_main.stampede]
+backend = "valkey"
+valkey_url = "rediss://:STAMPEDE_PW_SECRET@stampede.example:6379"
+
+[adapter.fivetran_main.circuit_breaker]
+backend = "valkey"
+valkey_url = "rediss://:BREAKER_PW_SECRET@breaker.example:6379"
+"#,
+        );
+        let config: RockyConfig = toml::from_str(&toml_str).unwrap();
+        let adapter = &config.adapters["fivetran_main"];
+        let debug = format!("{adapter:?}");
+        let json = serde_json::to_string(adapter).unwrap();
+        let digest_json =
+            crate::env_string::with_env_values_scope(|| serde_json::to_string(adapter).unwrap());
+        // Test markers, not credentials: each must be absent from every form.
+        for marker in [
+            "SAS_SECRET_TOKEN",
+            "CACHE_PW_SECRET",
+            "RATELIMIT_PW_SECRET",
+            "STAMPEDE_PW_SECRET",
+            "BREAKER_PW_SECRET",
+        ] {
+            assert!(!debug.contains(marker), "{marker} leaked into Debug");
+            assert!(!json.contains(marker), "{marker} leaked into JSON");
+            assert!(
+                !digest_json.contains(marker),
+                "{marker} leaked into the digested JSON"
+            );
+        }
+        for host in [
+            "rediss://default:***@cache.example:6379/0",
+            "rediss://:***@ratelimit.example:6379",
+            "rediss://:***@stampede.example:6379",
+            "rediss://:***@breaker.example:6379",
+            "az://container/prefix/?***",
+        ] {
+            assert!(debug.contains(host), "{host} missing from Debug: {debug}");
+            assert!(json.contains(host), "{host} missing from JSON: {json}");
+        }
+        // The client still connects with the full URL.
+        let cache = adapter.cache.as_ref().unwrap();
+        assert_eq!(
+            cache.valkey_url.as_ref().unwrap().expose(),
+            "rediss://default:CACHE_PW_SECRET@cache.example:6379/0"
+        );
+        assert!(validate_fivetran_cache(&config).is_empty());
+        assert!(validate_fivetran_resilience(&config).is_empty());
     }
 
     #[test]

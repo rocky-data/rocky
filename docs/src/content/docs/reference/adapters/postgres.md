@@ -18,7 +18,7 @@ The adapter reads the shared `[adapter]` fields:
 | `host` | string | Yes | Server host name. Add a port as `host:port`. The default port is `5432`. |
 | `database` | string | Yes | The database to connect to. A model's `catalog` must be this database or empty. |
 | `username` | string | Yes | Login role. |
-| `password` | string | No | Password. Leave it out for trust or peer auth. |
+| `password` | string | No | Password. Leave it out when the server asks for none, for example under `trust` auth. |
 | `timeout_secs` | integer | No | Connect timeout and per-statement `statement_timeout`. Default `300`. |
 
 Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses a key it does not know, so a typo fails loudly:
@@ -44,6 +44,10 @@ sslmode = "verify-full"
 ```
 
 `rocky validate` runs the same parse the adapter runs, so a missing field or an unknown `extra` key shows up there first.
+
+## Authentication
+
+Rocky supports password auth with `username` and `password`. IAM and certificate auth are not built in.
 
 ## TLS
 

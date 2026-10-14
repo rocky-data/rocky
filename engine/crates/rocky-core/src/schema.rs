@@ -115,7 +115,7 @@ pub enum SchemaValue {
 }
 
 /// Errors that can occur when parsing a schema name against a pattern.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SchemaError {
     #[error("schema '{schema}' does not start with prefix '{prefix}'")]
     MissingPrefix { schema: String, prefix: String },
@@ -166,6 +166,15 @@ pub enum SchemaError {
          or drop the placeholder from this value."
     )]
     UnsafeSeparator { template: String, separator: String },
+}
+
+/// `Debug` prints the rendered `Display` text. The prefix, fixed segments
+/// and separator come from the configured schema pattern, which can hold a
+/// resolved `${VAR}` value (#1919).
+impl std::fmt::Debug for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::secret_registry::fmt_rendered_debug(f, "SchemaError", self)
+    }
 }
 
 /// A separator may only contain `[A-Za-z0-9_.-]` (#1934).
@@ -1417,5 +1426,23 @@ mod tests {
         // An unknown placeholder that HAS a closing brace is not a stray
         // brace — V049 (unknown-placeholder) is the check for that case.
         assert!(!has_unclosed_placeholder_brace("{nope}"));
+    }
+}
+
+#[cfg(test)]
+mod rendered_debug_1919 {
+    use super::*;
+
+    #[test]
+    fn schema_error_debug_renders_a_resolved_prefix() {
+        const SECRET: &str = "schema-prefix-1919-c3d4";
+        crate::secret_registry::register_substitution("RV_SCHEMA_ERR_DBG", SECRET);
+        let err = SchemaError::MissingPrefix {
+            schema: "raw_x".to_string(),
+            prefix: SECRET.to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_SCHEMA_ERR_DBG}"), "{debug}");
     }
 }

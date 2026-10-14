@@ -291,12 +291,16 @@ pub fn build_circuit_breaker(
         FivetranCircuitBreakerBackend::None => Ok(std::sync::Arc::new(AlwaysClosed)),
         #[cfg(feature = "valkey")]
         FivetranCircuitBreakerBackend::Valkey => {
-            let url = cfg.valkey_url.as_ref().ok_or_else(|| {
-                CircuitError::Config(
+            let url = cfg
+                .valkey_url
+                .as_ref()
+                .map(rocky_core::credential_url::CredentialUrl::expose)
+                .ok_or_else(|| {
+                    CircuitError::Config(
                     "backend = \"valkey\" requires `valkey_url` in [adapter.<name>.circuit_breaker]"
                         .into(),
                 )
-            })?;
+                })?;
             let cb = crate::circuit_breaker::valkey::ValkeyCircuit::from_url(url, resolved)?;
             Ok(std::sync::Arc::new(cb))
         }

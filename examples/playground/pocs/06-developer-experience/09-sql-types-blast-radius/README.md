@@ -1,4 +1,4 @@
-# 09-sql-types-blast-radius — Trust arc 7: SQL as first-class with types
+# 09-sql-types-blast-radius — typed raw SQL + `SELECT *` lints
 
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB, ephemeral)
@@ -11,10 +11,10 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
 
 1. **Seed-typed `rocky compile`** — load `data/seed.sql` into an
    in-memory DuckDB, introspect `information_schema`, and use the
-   result as the source of truth for raw source schemas. Since engine
-   1.79.0 (#2329) a plain `rocky compile` does this whenever the project
-   has `data/seed.sql`; `--with-seed` makes the seed required, so a
-   missing or broken seed fails the compile. Leaf `.sql`
+   result as the source of truth for raw source schemas. A plain
+   `rocky compile` does this whenever the project has `data/seed.sql`;
+   `--with-seed` makes the seed required, so a missing or broken seed
+   fails the compile. Leaf `.sql`
    models that read from `raw__*` tables go from `Unknown` columns to
    concrete types, which lets a data contract's type check run and
    cascades into downstream type inference.
@@ -85,5 +85,6 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
   `engine/crates/rocky-compiler/src/blast_radius.rs` (`P002`)
 - Companion POC: [`08-portability-lint/`](../08-portability-lint/)
   covers the P001 portability lint (sibling compile-time gate).
-- Future: Arc 7 wave 2 ships cached `DESCRIBE TABLE` so real warehouses
-  get the same type grounding without a local seed.
+- Against a real warehouse, the schema cache (cached `DESCRIBE TABLE`
+  results) gives leaf models the same type grounding without a local seed;
+  see [`05-orchestration/06-valkey-distributed-cache`](../../05-orchestration/06-valkey-distributed-cache/).
