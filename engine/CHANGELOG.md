@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The bundled DuckDB moves to the `duckdb` crate 1.10506. Other engine dependencies take their latest compatible versions. `object_store` stays at 0.14.1 (#2124), and `arrow` and `parquet` stay on 58.
+
 ## [1.81.0] — 2026-10-14
 
 A cast to `INT`, `BIGINT`, `FLOAT`, `REAL` or `TIMESTAMP` now takes the width of the model's warehouse. The language server, `rocky serve`, `rocky docs` and `rocky publish-ir` type it as `rocky compile` does. In operator mode, the browser UI can cancel a job that `rocky serve` started. URL passwords are kept out of plans and logs. A loopback `rocky serve` checks `Host` and `Origin` on every request except `GET /api/v1/health`.
