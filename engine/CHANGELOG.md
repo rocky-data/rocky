@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.81.1] — 2026-10-15
+
+Use this release instead of 1.81.0 on Linux. The 1.81.0 Linux binaries crash with a segfault the first time they open a DuckDB connection, so 1.81.0 was withdrawn (its release is a draft again). 1.81.1 carries every 1.81.0 change listed below, plus these.
+
+Earlier Linux releases, 1.80.0 included, crash in the same way on any SQL that makes DuckDB load a downloaded extension, for example `current_date + 1` or a time-zone conversion, which need `icu`. That was seen on x86_64. Upgrade to 1.81.1 to fix it.
+
 ### Changed
 
 - The bundled DuckDB moves to the `duckdb` crate 1.10506. Other engine dependencies take their latest compatible versions. `object_store` stays at 0.14.1 (#2124), and `arrow` and `parquet` stay on 58.
