@@ -159,11 +159,16 @@ jobs:
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
             "${{ matrix.manylinux }}" \
-            bash scripts/linux_release_smoke.sh "engine/target/${{ matrix.target }}/release/rocky"
+            bash scripts/linux_release_smoke.sh \
+            "engine/target/${{ matrix.target }}/release/rocky" \
+            "engine/target/${{ matrix.target }}/release/rocky-lsp"
 
       - name: Smoke the Linux binary (runner)
         if: matrix.manylinux
-        run: bash ../scripts/linux_release_smoke.sh "target/${{ matrix.target }}/release/rocky"
+        run: |
+          bash ../scripts/linux_release_smoke.sh \
+            "target/${{ matrix.target }}/release/rocky" \
+            "target/${{ matrix.target }}/release/rocky-lsp"
 
       # macOS / Windows: build with plain cargo. Build both binaries in the
       # same invocation so the workspace compile cache is shared and we

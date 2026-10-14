@@ -6,17 +6,18 @@ set -euo pipefail
 #
 # For engine releases, the primary path is now CI-driven: push an engine-v*
 # tag and engine-release.yml builds all 5 platforms. This script remains as a
-# hotfix fallback that builds macOS ARM64 + Linux x86_64 locally.
+# hotfix fallback that builds macOS ARM64 locally. It builds no Linux binary:
+# Linux comes only from engine-release.yml (#2367).
 #
 # Usage:
-#   ./scripts/release.sh engine  0.2.0              # engine macOS + Linux, create GH release
+#   ./scripts/release.sh engine  0.2.0              # engine macOS, create GH release
 #   ./scripts/release.sh dagster 0.4.0              # build wheel, create GH release
 #   ./scripts/release.sh dagster 0.4.0 --publish    # + publish to PyPI
 #   ./scripts/release.sh vscode  0.3.0              # build VSIX, create GH release
 #   ./scripts/release.sh vscode  0.3.0 --publish    # + publish to VS Code Marketplace
 #
 # Prerequisites:
-#   engine:  cargo, Docker (for Linux cross-compile)
+#   engine:  cargo
 #   dagster: uv;  --publish requires PyPI token in ~/.pypirc or UV_PUBLISH_TOKEN
 #   vscode:  npm, npx;  --publish requires VSCE_PAT env var
 #   all:     gh CLI (authenticated)
@@ -100,16 +101,12 @@ release_engine() {
     tar czf "$macos_archive" -C "$(dirname "$macos_bin")" rocky
     info "Packaged $macos_archive ($(du -h "$macos_archive" | cut -f1))"
 
-    # 2. Build Linux x86_64 (Docker)
-    info "Building rocky for Linux x86_64 (Docker)"
-    "$SCRIPT_DIR/build_rocky_linux.sh"
-
-    local linux_bin="$WORKSPACE_ROOT/vendor/rocky-linux-amd64"
-    [[ -f "$linux_bin" ]] || die "Linux build produced no binary at $linux_bin"
-
-    local linux_archive="$DIST_DIR/rocky-x86_64-unknown-linux-gnu.tar.gz"
-    tar czf "$linux_archive" -C "$(dirname "$linux_bin")" --transform 's/rocky-linux-amd64/rocky/' rocky-linux-amd64
-    info "Packaged $linux_archive ($(du -h "$linux_archive" | cut -f1))"
+    # 2. No local Linux build. scripts/build_rocky_linux.sh builds with
+    # cargo-zigbuild by default, and a zigbuild binary crashes when DuckDB
+    # loads a downloaded extension such as icu (#2367). Linux binaries come
+    # only from engine-release.yml, which builds them with gcc in a
+    # manylinux_2_28 image and smoke-tests them before publishing.
+    info "WARNING: skipping Linux: a local zigbuild binary crashes on DuckDB extensions (#2367). CI builds Linux."
 
     # 3. Tag and push. Each step is guarded so a tag-creation failure (e.g.
     # unsigned config, protected ref) never proceeds to `push` on a missing
@@ -120,9 +117,9 @@ release_engine() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create the GitHub Release as a DRAFT with macOS + Linux.
+    # 4. Create the GitHub Release as a DRAFT with macOS.
     # The tag push also triggers engine-release.yml, which builds all 5
-    # targets, overwrites these two, adds checksums.txt, and publishes the
+    # targets, overwrites this one, adds checksums.txt, and publishes the
     # draft with --latest (the engine binary owns the repo's "Latest" badge).
     # A draft is invisible to engine/install.sh's "latest" lookup, so the
     # public never resolves a release the matrix has not finished, or one it
@@ -130,11 +127,10 @@ release_engine() {
     # installable: this script builds neither checksums.txt nor the rocky-lsp
     # archives that install.sh downloads.
     create_release "$tag" \
-        "$macos_archive" \
-        "$linux_archive"
+        "$macos_archive"
 
     echo
-    info "Engine release $tag created as a DRAFT with macOS ARM64 + Linux x86_64 binaries."
+    info "Engine release $tag created as a DRAFT with the macOS ARM64 binary."
     info "CI will build all 5 targets, attach them with checksums.txt, and publish the draft."
     info "Monitor: gh run list --repo rocky-data/rocky --workflow engine-release"
     info "If CI cannot run, publish by hand: gh release edit $tag --repo rocky-data/rocky --draft=false --latest"
@@ -338,7 +334,7 @@ usage() {
 Usage: ./scripts/release.sh <component> <version> [--publish]
 
 Components:
-  engine  <version>              Build macOS + Linux, create a DRAFT GH release (CI completes + publishes it)
+  engine  <version>              Build macOS, create a DRAFT GH release (CI completes + publishes it)
   sdk     <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   dagster <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   vscode  <version> [--publish]  Build VSIX, create GH release, optionally publish to Marketplace
