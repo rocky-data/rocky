@@ -1,0 +1,50 @@
+name: diag-linux-icu
+
+# Temporary diagnostic for the engine 1.81.0 Linux segfault. Not for merge.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diag-linux-icu.yml
+
+permissions: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install gdb
+        run: sudo apt-get install -y -qq gdb > /dev/null
+      - name: Download engine 1.81.0 and 1.80.0
+        run: |
+          for v in 1.81.0 1.80.0; do
+            mkdir -p "$HOME/r$v"
+            curl -fsSL "https://github.com/rocky-data/rocky/releases/download/engine-v$v/rocky-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/r$v"
+            "$HOME/r$v/rocky" --version
+          done
+      - name: "A: 1.81.0, normal"
+        run: |
+          set +e
+          RUST_LOG=debug "$HOME/r1.81.0/rocky" playground /tmp/a --template quickstart > /tmp/a.log 2>&1
+          echo "exit=$?"; tail -20 /tmp/a.log
+          find "$HOME/.duckdb" -type f 2>/dev/null
+      - name: "B: 1.81.0, no network (icu cannot download)"
+        run: |
+          set +e
+          rm -rf "$HOME/.duckdb"
+          sudo unshare -n sudo -u "$USER" env HOME="$HOME" RUST_LOG=warn "$HOME/r1.81.0/rocky" playground /tmp/b --template quickstart > /tmp/b.log 2>&1
+          echo "exit=$?"; tail -20 /tmp/b.log
+      - name: "C: 1.81.0 under gdb"
+        run: |
+          set +e
+          gdb -batch -ex run -ex bt -ex 'info sharedlibrary' --args "$HOME/r1.81.0/rocky" playground /tmp/c --template quickstart 2>&1 | tail -80
+      - name: "D: 1.80.0 control"
+        run: |
+          set +e
+          "$HOME/r1.80.0/rocky" playground /tmp/d --template quickstart > /tmp/d.log 2>&1
+          echo "exit=$?"; tail -5 /tmp/d.log
+      - name: "E: symbols the host exports to extensions"
+        run: |
+          nm -D --defined-only "$HOME/r1.81.0/rocky" | grep -c duckdb || true
+          ldd "$HOME/r1.81.0/rocky"
+          ls "$HOME/.duckdb/extensions"/*/* 2>/dev/null
