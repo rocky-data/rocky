@@ -22,7 +22,7 @@ Never do this in a leaf crate:
 ```toml
 # DON'T — bypasses the workspace pin
 [dependencies]
-reqwest = "0.12"
+reqwest = "0.13"
 ```
 
 Why: the workspace has dozens of crates. Per-crate version pins drift, cause duplicate dep compilations, and break the MSRV contract.
@@ -100,7 +100,7 @@ cargo audit
 Rocky does **not** ship a `deny.toml` or run `cargo-deny` in CI as of this skill's authoring. The project's license is Apache-2.0 (`engine/Cargo.toml` → `[workspace.package]`). If you want to enforce license compatibility or a banned-deps policy, proposing `cargo-deny` adoption is the right move — but do it as a dedicated PR, not smuggled into an unrelated change. A minimal `deny.toml` for Rocky would cover:
 
 - `licenses`: allow `Apache-2.0`, `MIT`, `BSD-3-Clause`, `ISC`, `Unicode-DFS-2016`; deny `GPL-*` / `AGPL-*` (Rocky is Apache-2.0 and can't take copyleft deps).
-- `bans`: ban known-bad crates (e.g. `openssl-sys` when `rustls` is already the chosen TLS stack — Rocky uses `reqwest = { features = ["rustls-tls"] }`).
+- `bans`: ban known-bad crates (e.g. `openssl-sys` when `rustls` is already the chosen TLS stack — Rocky uses `reqwest = { features = ["rustls"] }`).
 - `advisories`: fail on `unmaintained` + `unsound` (beyond what `cargo audit` already catches).
 - `sources`: restrict to `crates-io` unless explicit git deps are reviewed.
 

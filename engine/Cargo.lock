@@ -2103,7 +2103,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3165,7 +3164,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rand 0.10.3",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3228,7 +3227,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest 0.13.5",
+ "reqwest",
 ]
 
 [[package]]
@@ -3244,7 +3243,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest 0.13.5",
+ "reqwest",
  "thiserror",
  "tokio",
  "tonic",
@@ -3978,45 +3977,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-core",
- "h2",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tower 0.5.3",
- "tower-http 0.6.11",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webpki-roots",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
@@ -4041,6 +4001,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4156,7 +4119,7 @@ name = "rocky-ai"
 version = "1.81.1"
 dependencies = [
  "indexmap",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-compiler",
  "rocky-core",
  "rocky-ir",
@@ -4179,7 +4142,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "serde",
  "serde_json",
@@ -4202,7 +4165,7 @@ dependencies = [
  "googleapis-tonic-google-cloud-bigquery-storage-v1",
  "jsonwebtoken",
  "prost",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
@@ -4269,7 +4232,7 @@ dependencies = [
  "notify",
  "object_store",
  "parquet",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-ai",
  "rocky-airbyte",
@@ -4324,7 +4287,7 @@ version = "1.81.1"
 dependencies = [
  "async-trait",
  "chrono",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-ir",
  "rocky-sql",
@@ -4393,7 +4356,7 @@ dependencies = [
  "redb",
  "redis",
  "regex",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-duckdb",
  "rocky-ir",
@@ -4433,7 +4396,7 @@ dependencies = [
  "chrono",
  "futures",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-catalog-core",
  "rocky-core",
@@ -4504,7 +4467,7 @@ dependencies = [
  "object_store",
  "percent-encoding",
  "redis",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-observe",
  "schemars 0.8.22",
@@ -4551,7 +4514,7 @@ dependencies = [
  "object_store",
  "parquet",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-catalog-core",
  "rocky-core",
  "rocky-databricks",
@@ -4712,7 +4675,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "jsonwebtoken",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
@@ -4773,7 +4736,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-ir",
  "rocky-sql",
@@ -4795,7 +4758,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chrono",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",

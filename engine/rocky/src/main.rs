@@ -3878,7 +3878,7 @@ fn main() -> Result<()> {
 /// Install the process-level rustls [`CryptoProvider`] before any TLS.
 ///
 /// The dependency graph compiles in *both* rustls crypto backends —
-/// `ring` (via `hyper-rustls` → `reqwest`) and `aws_lc_rs` (via
+/// `ring` (via `object_store` and `ureq`) and `aws_lc_rs` (via
 /// `jsonwebtoken` + `rustls`). With two providers present, rustls cannot
 /// determine a default from crate features, so the first
 /// `rustls::ClientConfig::builder()` — which `reqwest` calls when building
@@ -3886,7 +3886,7 @@ fn main() -> Result<()> {
 /// — panics with *"Could not automatically determine the process-level
 /// CryptoProvider from Rustls crate features"*. Installing aws-lc-rs
 /// explicitly resolves the ambiguity; it matches the aws-lc-rs stack already
-/// in the tree (`reqwest` `rustls-tls`, `tonic` `tls-aws-lc`, `jsonwebtoken`
+/// in the tree (`reqwest` `rustls`, `tonic` `tls-aws-lc`, `jsonwebtoken`
 /// `aws_lc_rs`).
 ///
 /// Idempotent: a no-op if a provider was already installed (the `Err`
