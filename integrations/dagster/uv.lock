@@ -895,7 +895,7 @@ wheels = [
 
 [[package]]
 name = "rocky-sdk"
-version = "0.21.0"
+version = "0.22.0"
 source = { editable = "../../sdk/python" }
 dependencies = [
     { name = "pydantic" },

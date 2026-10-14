@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.81.0] — 2026-10-14
+
+Casts now take the width of the model's warehouse, on every surface: compile, run, the language server, `rocky serve` and `rocky docs`. The browser UI can cancel a running job. URL secrets are kept out of plans and logs. A loopback `rocky serve` checks `Host` and `Origin` on every request.
+
+Read these first. Each one can change what an existing project does.
+
+- **New `E011` on cast columns.** A cast to `INT`, `BIGINT`, `FLOAT`, `REAL` or `TIMESTAMP` now has the type of the model's warehouse. A contract that declared the old type fails with `E011`. Example: a Snowflake `CAST(x AS FLOAT)` is now `Float64`, not `Float32`. Where the warehouse is not known or not agreed, these casts are unknown. Under strict contracts, that is the `E059` error. The first run after upgrading can also rebuild these models.
+- **Fewer columns typed through a CTE.** An expression over a CTE or derived-table column is typed only when the expression that built the column is exact. A contract on such a column can go from checked to `I003`, or to `E059` under strict contracts.
+- **Some agent plans refuse once.** An agent plan whose config has a Fivetran `valkey_url`, a cache `object_store_url` or a `[state] valkey_url` refuses on its first apply after upgrading. Plan again.
+- **A loopback `rocky serve` refuses unknown `Host` names with `421`.** A same-machine reverse proxy that sends its own `Host` needs `--allowed-host`. A Ctrl-C at the terminal no longer reaches a running job directly; `rocky serve` sends its jobs `SIGTERM` when it shuts down. `JobStatus.state` gains `cancelled`.
+- **DuckDB loads `icu` in every session.** `now()`, `current_date` and `date_trunc` on `TIMESTAMPTZ` follow the machine's time zone, even in a session that never used a time-zone function.
+
 ### Added
 
 - **Cancel a running job: `POST /api/v1/jobs/{id}/cancel`, and a Cancel button in the browser UI (#2323).** The first request sends the job's process group `SIGTERM`; once that is delivered, a later one sends `SIGKILL`. On Windows each request kills the job. The answer is `202 {"job_id", "signal"}`, with `signal` `terminate` or `kill`, and comes only after the signal reached the job. The job then ends in the new `cancelled` state, or `succeeded` if it still exits 0. A run or apply of a replication pipeline handles `SIGTERM` like Ctrl-C: it finishes the copies in flight, saves their watermarks, marks the other tables `Interrupted` and exits `130`. Other jobs have no clean-stop step yet (#1606) and stop at once. A cancelled job keeps the single mutation lane until its process has exited. A finished job, or one that exited before the signal reached it, answers `409 job_not_running`; a job this server process did not start, such as a scheduled run, answers `409 job_not_cancellable`. The route is a write: a read-only token gets `403`, and a browser-cookie request needs the server's own `Origin` and `X-Rocky-UI: 1`. In operator mode the UI shows Cancel under a running job, then Force stop. Each job now runs as the leader of its own process group, so a cancel also reaches the commands it starts. A Ctrl-C at the terminal running `rocky serve` therefore no longer reaches a job by itself: `rocky serve` now sends each running job the same `SIGTERM` when it shuts down, on its own `SIGTERM` too, and waits up to 5 seconds for the signals to be sent. It does not wait for the jobs to finish. `JobStatus.state` gains `cancelled`, so a client that matches every state needs the new case.
