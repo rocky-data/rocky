@@ -9,14 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.81.0] — 2026-10-14
 
-Casts now take the width of the model's warehouse, on every surface: compile, run, the language server, `rocky serve` and `rocky docs`. The browser UI can cancel a running job. URL secrets are kept out of plans and logs. A loopback `rocky serve` checks `Host` and `Origin` on every request.
+A cast to `INT`, `BIGINT`, `FLOAT`, `REAL` or `TIMESTAMP` now takes the width of the model's warehouse. The language server, `rocky serve`, `rocky docs` and `rocky publish-ir` type it as `rocky compile` does. In operator mode, the browser UI can cancel a job that `rocky serve` started. URL passwords are kept out of plans and logs. A loopback `rocky serve` checks `Host` and `Origin` on every request except `GET /api/v1/health`.
 
 Read these first. Each one can change what an existing project does.
 
-- **New `E011` on cast columns.** A cast to `INT`, `BIGINT`, `FLOAT`, `REAL` or `TIMESTAMP` now has the type of the model's warehouse. A contract that declared the old type fails with `E011`. Example: a Snowflake `CAST(x AS FLOAT)` is now `Float64`, not `Float32`. Where the warehouse is not known or not agreed, these casts are unknown. Under strict contracts, that is the `E059` error. The first run after upgrading can also rebuild these models.
-- **Fewer columns typed through a CTE.** An expression over a CTE or derived-table column is typed only when the expression that built the column is exact. A contract on such a column can go from checked to `I003`, or to `E059` under strict contracts.
-- **Some agent plans refuse once.** An agent plan whose config has a Fivetran `valkey_url`, a cache `object_store_url` or a `[state] valkey_url` refuses on its first apply after upgrading. Plan again.
-- **A loopback `rocky serve` refuses unknown `Host` names with `421`.** A same-machine reverse proxy that sends its own `Host` needs `--allowed-host`. A Ctrl-C at the terminal no longer reaches a running job directly; `rocky serve` sends its jobs `SIGTERM` when it shuts down. `JobStatus.state` gains `cancelled`.
+- **New `E011` on cast columns.** A contract that declared a cast's old type fails with `E011`. For example:
+  - On Snowflake, an integer cast is now `Decimal(38,0)`, and `FLOAT` and `REAL` are `Float64`.
+  - On BigQuery, every integer cast is `Int64`.
+  - On PostgreSQL, Redshift and SQL Server, `FLOAT` is `Float64`.
+- **Casts with no known warehouse are unknown.** That is the case with no transformation pipeline, on Spark or ClickHouse, and for a model whose pipelines are on warehouses that disagree. A contract type on such a column is not checked (`I003`). Under strict contracts, it is the `E059` error.
+- **The first run can rebuild models.** With the skip gate on, a model whose cast type changed is not skipped as unchanged on the first run after upgrading.
+- **Fewer columns typed through a CTE.** An expression over a CTE or derived-table column is typed only when the expression that built the column is exact. Such a column becomes unknown, so a contract type on it is not checked (`I003`), as in the cast rule above.
+- **A decimal with a scale above its precision is no type.** `DECIMAL(10,11)` is now unknown, also at the load gate.
+- **Snowflake types change.** Snowflake float columns read as `Float64`. The bulk describe returns `NUMBER(p,s)`, `VARCHAR(n)`, `BINARY(n)` and `TIMESTAMP_*(p)`, so drift now sees a precision or length change. Contracts on those source columns are now checked, where before they got `I003`. A schema cache entry written before the upgrade reads `FLOAT` as `Float32` until it expires (24 h by default). Run `rocky state clear-schema-cache` to refresh now.
+- **Some plans refuse once.** These plans refuse once after upgrading. Plan again.
+  - An agent plan whose config has a Fivetran `valkey_url` or a cache `object_store_url`.
+  - A plan made with a `[state] valkey_url`. Its refusal says "state authority has changed".
+- **A loopback `rocky serve` refuses other hosts and sites.** A request with a `Host` it does not know gets `421 host_not_allowed`. A request with an `Origin` from another site gets `403 origin_not_allowed`. A same-machine reverse proxy that sends its own `Host` needs `--allowed-host`, which now works without `--ui`.
+- **`rocky serve` jobs.** A Ctrl-C at the terminal no longer reaches a running job directly. `rocky serve` sends its jobs `SIGTERM` when it shuts down. `JobStatus.state` gains `cancelled`, so a client that matches every state needs the new case.
+- **`rocky publish-ir` reads `rocky.toml`.** It refuses a config it cannot read, as `rocky compile` does.
 - **DuckDB loads `icu` in every session.** `now()`, `current_date` and `date_trunc` on `TIMESTAMPTZ` follow the machine's time zone, even in a session that never used a time-zone function.
 
 ### Added
