@@ -51,6 +51,11 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # rocky_sdk.classify accepts only the laya version its accuracy was
+      # measured on (LAYA_VERSION in classify/_laya.py). Bump the `classify`
+      # pin by hand, together with LAYA_VERSION and a new measurement.
+      - dependency-name: "laya"
 
   # --- Dagster integration (Python) ---
   - package-ecosystem: pip

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import tomllib
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from rocky_sdk import RockyClient
 from rocky_sdk.classify import (
+    LAYA_VERSION,
     ColumnEvidence,
     Suggestion,
     apply_accepted,
@@ -304,3 +306,11 @@ def test_custom_kind_to_tag_drops_unmapped_kinds():
     with patch.object(client, "run_cli", return_value=payload):
         out = suggest(client, "m", kind_to_tag={"email": "contact"})
     assert [(s.column, s.tag) for s in out] == [("email", "contact")]
+
+
+def test_classify_extra_pins_the_laya_version_the_classifier_accepts():
+    # LayaClassifier refuses any laya but LAYA_VERSION, so the extra must
+    # install exactly that version (a 0.4.2 pin shipped and always failed).
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"]
+    assert extras["classify"] == [f"laya=={LAYA_VERSION}"]

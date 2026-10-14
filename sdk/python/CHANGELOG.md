@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] — 2026-10-14
+
+### Fixed
+
+- **`rocky-sdk[classify]` installs a laya that the SDK accepts again.** 0.22.0 pinned the extra to `laya==0.4.2`, but `rocky_sdk.classify` accepts only laya 0.3.26, which its accuracy was measured on. So `suggest(..., use_model=True)` always raised `ImportError`. The extra is back to `laya==0.3.26`. If you installed 0.22.0 with `classify`, upgrade to 0.22.1.
+
 ## [0.22.0] — 2026-10-14
 
 Pairs with engine 1.81.0.
