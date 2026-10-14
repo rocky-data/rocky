@@ -17,7 +17,8 @@
     "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
   ],
   "DOWNLOAD_ARTIFACT_SOURCE": [
-    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
   ],
   "GH_RELEASE_SOURCE": [
     "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
@@ -38,21 +39,23 @@
     "ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b"
   ],
   "SETUP_NODE_SOURCE": [
-    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+    "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
   ],
   "SETUP_UV_SOURCE": [
-    "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-    "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7"
+    "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7",
+    "astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
   ],
   "SETUP_ZIG_SOURCE": [
     "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
   ],
   "TAIKI_INSTALL_SOURCE": [
-    "taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8",
-    "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172"
+    "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",
+    "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe"
   ],
   "UPLOAD_ARTIFACT_SOURCE": [
-    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
   ],
   "UPLOAD_PAGES_ARTIFACT_SOURCE": [
     "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9"
