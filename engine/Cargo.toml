@@ -81,7 +81,7 @@ chrono-tz = "0.10"
 croner = "=4.0.1"
 
 # JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
-schemars = { version = "0.8", features = ["chrono", "indexmap2"] }
+schemars = { version = "1.2", features = ["chrono04", "indexmap2"] }
 
 # Error handling
 thiserror = "2"
@@ -109,9 +109,7 @@ clap_complete = "4"
 tokio = { version = "1", features = ["full"] }
 
 # MCP server (Model Context Protocol) — stdio transport only.
-# Transitively pulls schemars 1.x; the rest of the workspace uses schemars
-# 0.8. The dual-major is disjoint (rmcp's `#[tool]` param structs derive
-# schemars 1.x; Rocky's `*Output` structs derive 0.8) and compiles cleanly.
+# Shares the workspace schemars 1.x with rocky-mcp's `#[tool]` param structs.
 # PINNED EXACT, deliberately. rmcp changes how a protocol version is
 # negotiated between minor releases: 3.2 started answering every `initialize`
 # with a handshake version whatever the client names (the 2026-07-28 spec

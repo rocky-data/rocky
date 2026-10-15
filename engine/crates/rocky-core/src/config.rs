@@ -573,39 +573,20 @@ impl<'de> Deserialize<'de> for ConcurrencyMode {
 }
 
 impl JsonSchema for ConcurrencyMode {
-    fn schema_name() -> String {
-        "ConcurrencyMode".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ConcurrencyMode".into()
     }
 
-    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Mirrors the custom Deserialize: either the literal "adaptive" or
         // a positive integer. Schemars can't derive this — `ConcurrencyMode`
         // doesn't have `Serialize`/`Deserialize` derive flags it can read.
-        let adaptive = schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            enum_values: Some(vec![serde_json::Value::String("adaptive".to_owned())]),
-            ..Default::default()
-        });
-        let fixed = schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
-            number: Some(Box::new(schemars::schema::NumberValidation {
-                minimum: Some(1.0),
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            metadata: Some(Box::new(schemars::schema::Metadata {
-                description: Some(
-                    "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency.".to_owned(),
-                ),
-                ..Default::default()
-            })),
-            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
-                any_of: Some(vec![adaptive, fixed]),
-                ..Default::default()
-            })),
-            ..Default::default()
+        schemars::json_schema!({
+            "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency.",
+            "anyOf": [
+                { "type": "string", "enum": ["adaptive"] },
+                { "type": "integer", "minimum": 1.0 }
+            ]
         })
     }
 }
@@ -6064,11 +6045,11 @@ impl<'de> Deserialize<'de> for PipelineConfig {
 }
 
 impl JsonSchema for PipelineConfig {
-    fn schema_name() -> String {
-        "PipelineConfig".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PipelineConfig".into()
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Hand-written to mirror the custom `Deserialize` impl. A
         // `#[derive(JsonSchema)]` would derive from the struct shape and
         // miss two things: (a) the back-compat default that lets a
@@ -6085,38 +6066,19 @@ impl JsonSchema for PipelineConfig {
         // `oneOf` (which requires exactly-one match) because variant
         // shapes can overlap once `type` is omitted from the back-compat
         // arm; `anyOf` is the standard shape for tagged unions.
-        use schemars::schema::{InstanceType, Schema, SchemaObject, SubschemaValidation};
-
-        fn type_constraint(name: &'static str, required: bool) -> Schema {
-            let const_schema = Schema::Object(SchemaObject {
-                instance_type: Some(InstanceType::String.into()),
-                enum_values: Some(vec![serde_json::Value::String(name.to_owned())]),
-                ..Default::default()
+        fn arm(
+            variant_schema: &schemars::Schema,
+            type_name: &'static str,
+            type_required: bool,
+        ) -> schemars::Schema {
+            let mut constraint = serde_json::json!({
+                "type": "object",
+                "properties": { "type": { "type": "string", "enum": [type_name] } }
             });
-            let mut obj = SchemaObject {
-                instance_type: Some(InstanceType::Object.into()),
-                ..Default::default()
-            };
-            obj.object()
-                .properties
-                .insert("type".to_owned(), const_schema);
-            if required {
-                obj.object().required.insert("type".to_owned());
+            if type_required {
+                constraint["required"] = serde_json::json!(["type"]);
             }
-            Schema::Object(obj)
-        }
-
-        fn arm(variant_schema: Schema, type_name: &'static str, type_required: bool) -> Schema {
-            Schema::Object(SchemaObject {
-                subschemas: Some(Box::new(SubschemaValidation {
-                    all_of: Some(vec![
-                        variant_schema,
-                        type_constraint(type_name, type_required),
-                    ]),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })
+            schemars::json_schema!({ "allOf": [variant_schema, constraint] })
         }
 
         let replication = generator.subschema_for::<ReplicationPipelineConfig>();
@@ -6126,25 +6088,16 @@ impl JsonSchema for PipelineConfig {
         let load = generator.subschema_for::<LoadPipelineConfig>();
 
         let arms = vec![
-            arm(replication, "replication", false),
-            arm(transformation, "transformation", true),
-            arm(quality, "quality", true),
-            arm(snapshot, "snapshot", true),
-            arm(load, "load", true),
+            arm(&replication, "replication", false),
+            arm(&transformation, "transformation", true),
+            arm(&quality, "quality", true),
+            arm(&snapshot, "snapshot", true),
+            arm(&load, "load", true),
         ];
 
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(schemars::schema::Metadata {
-                description: Some(
-                    "Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.".to_owned(),
-                ),
-                ..Default::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                any_of: Some(arms),
-                ..Default::default()
-            })),
-            ..Default::default()
+        schemars::json_schema!({
+            "description": "Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.",
+            "anyOf": arms
         })
     }
 }

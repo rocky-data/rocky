@@ -60,8 +60,7 @@
 use std::fmt;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
+use schemars::{Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
@@ -340,11 +339,11 @@ impl<'de> Deserialize<'de> for CredentialUrl {
 /// Delegates to [`String`] under the name `String`, and is never a `$ref`,
 /// so the exported schemas and generated bindings match a plain `String`.
 impl JsonSchema for CredentialUrl {
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
-    fn schema_name() -> String {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
         String::schema_name()
     }
 

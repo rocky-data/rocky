@@ -39,11 +39,13 @@
               "properties": {
                 "precision": {
                   "format": "uint8",
+                  "maximum": 255.0,
                   "minimum": 0.0,
                   "type": "integer"
                 },
                 "scale": {
                   "format": "uint8",
+                  "maximum": 255.0,
                   "minimum": 0.0,
                   "type": "integer"
                 }

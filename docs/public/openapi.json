@@ -9634,6 +9634,9 @@
         "type": "object"
       },
       "HooksConfig": {
+        "additionalProperties": {
+          "$ref": "#/components/schemas/HookConfigOrList"
+        },
         "description": "The `[hook]` section from rocky.toml.\n\nEach key is an event name like `on_pipeline_start`. The value can be either a single hook config (TOML table) or an array of hook configs (TOML array of tables).\n\nWebhook entries live under `[hook.webhooks.on_<event>]` or `[[hook.webhooks.on_<event>]]`.",
         "properties": {
           "webhooks": {
@@ -20449,11 +20452,13 @@
                 "properties": {
                   "precision": {
                     "format": "uint8",
+                    "maximum": 255.0,
                     "minimum": 0.0,
                     "type": "integer"
                   },
                   "scale": {
                     "format": "uint8",
+                    "maximum": 255.0,
                     "minimum": 0.0,
                     "type": "integer"
                   }

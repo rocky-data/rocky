@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use jsonschema::Validator;
-use schemars::schema_for;
+use rocky_core::schema_gen::draft07_schema_for;
 
 use rocky_core::config::{AdapterConfig, RockyConfig};
 
@@ -123,8 +123,7 @@ fn every_committed_poc_adapter_block_matches_generated_schema() {
         return;
     };
 
-    let schema_value = serde_json::to_value(schema_for!(AdapterConfig))
-        .expect("schema serialization is infallible");
+    let schema_value = draft07_schema_for::<AdapterConfig>();
     let validator = Validator::new(&schema_value).expect("generated schema is valid JSON Schema");
 
     let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -187,8 +186,7 @@ fn every_committed_poc_matches_project_schema() {
         return;
     };
 
-    let schema_value =
-        serde_json::to_value(schema_for!(RockyConfig)).expect("schema serialization is infallible");
+    let schema_value = draft07_schema_for::<RockyConfig>();
     let validator = Validator::new(&schema_value).expect("generated schema is valid JSON Schema");
 
     let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();

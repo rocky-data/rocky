@@ -45,8 +45,7 @@
 use std::fmt;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
+use schemars::{Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use std::cell::Cell;
@@ -260,11 +259,11 @@ impl<'de> Deserialize<'de> for ExtraMap {
 
 /// Delegates to the plain map, so the exported schema is unchanged.
 impl JsonSchema for ExtraMap {
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
-    fn schema_name() -> String {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
         <std::collections::BTreeMap<String, serde_json::Value>>::schema_name()
     }
 
@@ -310,11 +309,11 @@ impl<'de> Deserialize<'de> for EnvString {
 /// The exported schemas, and the Pydantic and TypeScript bindings generated
 /// from them, are therefore byte-identical to a plain `String` field.
 impl JsonSchema for EnvString {
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
-    fn schema_name() -> String {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
         String::schema_name()
     }
 
@@ -544,11 +543,10 @@ mod tests {
 
     #[test]
     fn the_schema_is_a_plain_inline_string() {
-        let ours = schemars::schema_for!(EnvString);
-        let plain = schemars::schema_for!(String);
+        let ours = crate::schema_gen::draft07_schema_for::<EnvString>();
+        let plain = crate::schema_gen::draft07_schema_for::<String>();
         assert_eq!(
-            serde_json::to_value(&ours.schema).unwrap(),
-            serde_json::to_value(&plain.schema).unwrap(),
+            ours, plain,
             "a schema change would drift the generated SDK and VS Code bindings"
         );
     }

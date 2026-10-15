@@ -27,8 +27,7 @@ use std::cell::Cell;
 use std::fmt;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
+use schemars::{Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 thread_local! {
@@ -169,8 +168,8 @@ impl<'de> Deserialize<'de> for RedactedString {
 /// The `***` redaction is a runtime concern; the schema only describes
 /// the wire shape.
 impl JsonSchema for RedactedString {
-    fn schema_name() -> String {
-        "RedactedString".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RedactedString".into()
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {

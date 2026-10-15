@@ -444,8 +444,7 @@ pub fn covered_leaf_fields() -> BTreeMap<String, BTreeSet<String>> {
 /// `additionalProperties`) are stable parts of JSON Schema, while the
 /// Rust types that carry them are a dependency's internals.
 fn spec_schema() -> serde_json::Value {
-    let schema = schemars::schema_for!(SpecFile);
-    serde_json::to_value(schema).expect("the spec schema serializes to JSON")
+    crate::schema_gen::draft07_schema_for::<SpecFile>()
 }
 
 /// The definition name a schema fragment refers to, when it refers to a

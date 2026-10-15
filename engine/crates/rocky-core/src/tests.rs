@@ -266,24 +266,15 @@ pub enum AggregateCmp {
 }
 
 impl JsonSchema for AggregateCmp {
-    fn schema_name() -> String {
-        "AggregateCmp".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AggregateCmp".into()
     }
 
-    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        let values = [
-            "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "eq", "==", "ne", "!=",
-        ];
-        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            enum_values: Some(values.iter().map(|s| serde_json::Value::String((*s).to_owned())).collect()),
-            metadata: Some(Box::new(schemars::schema::Metadata {
-                description: Some(
-                    "Comparison operator for `Aggregate` assertions. Each comparison has a long form (`lt`, `lte`, `gt`, `gte`, `eq`, `ne`) and an equivalent symbolic alias (`<`, `<=`, `>`, `>=`, `==`, `!=`).".to_owned(),
-                ),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Comparison operator for `Aggregate` assertions. Each comparison has a long form (`lt`, `lte`, `gt`, `gte`, `eq`, `ne`) and an equivalent symbolic alias (`<`, `<=`, `>`, `>=`, `==`, `!=`).",
+            "type": "string",
+            "enum": ["lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "eq", "==", "ne", "!="]
         })
     }
 }

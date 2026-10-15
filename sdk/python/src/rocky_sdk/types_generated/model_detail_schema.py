@@ -47,8 +47,8 @@ class RockyType1(StrEnum):
 
 
 class Decimal(BaseModel):
-    precision: conint(ge=0)
-    scale: conint(ge=0)
+    precision: conint(ge=0, le=255)
+    scale: conint(ge=0, le=255)
 
 
 class RockyType2(BaseModel):

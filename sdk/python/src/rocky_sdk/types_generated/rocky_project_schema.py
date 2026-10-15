@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Dict
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, conint
 
@@ -784,15 +784,6 @@ class HookConfig(BaseModel):
     timeout_ms: conint(ge=0) | None = 30000
     """
     Maximum time to wait for the hook to complete.
-    """
-
-
-class HookConfigOrList(RootModel[HookConfig | list[HookConfig]]):
-    root: HookConfig | list[HookConfig]
-    """
-    Supports both single-hook and multi-hook syntax per event.
-
-    Single: `[hook.on_pipeline_start]` Multiple: `[[hook.on_after_checks]]`
     """
 
 
@@ -2338,6 +2329,12 @@ class HooksConfig(BaseModel):
     Webhook entries live under `[hook.webhooks.on_<event>]` or `[[hook.webhooks.on_<event>]]`.
     """
 
+    model_config = ConfigDict(
+        extra="allow",
+    )
+    __annotations__ = {
+        "__pydantic_extra__": Dict[str, HookConfig | list[HookConfig]],
+    }
     webhooks: dict[str, WebhookConfig | list[WebhookConfig]] | None = Field(
         {}, validate_default=True
     )

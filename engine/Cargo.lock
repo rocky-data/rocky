@@ -4045,7 +4045,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rmcp-macros",
- "schemars 1.2.3",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -4257,7 +4257,7 @@ dependencies = [
  "rocky-sql",
  "rocky-sqlserver",
  "rocky-trino",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sqlparser",
@@ -4318,7 +4318,7 @@ dependencies = [
  "rocky-lang",
  "rocky-sql",
  "salsa",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4362,7 +4362,7 @@ dependencies = [
  "rocky-ir",
  "rocky-secret-registry",
  "rocky-sql",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -4470,7 +4470,7 @@ dependencies = [
  "reqwest",
  "rocky-core",
  "rocky-observe",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -4534,7 +4534,7 @@ dependencies = [
  "blake3",
  "chrono",
  "rocky-sql",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -4581,7 +4581,7 @@ dependencies = [
  "rocky-ir",
  "rocky-snowflake",
  "rocky-sql",
- "schemars 1.2.3",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -4600,7 +4600,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -4722,7 +4722,7 @@ dependencies = [
  "miette",
  "regex",
  "rocky-secret-registry",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sqlparser",
@@ -5015,42 +5015,17 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "chrono",
- "dyn-clone",
- "indexmap",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "chrono",
  "dyn-clone",
+ "indexmap",
  "ref-cast",
- "schemars_derive 1.2.3",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals 0.29.1",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -5061,7 +5036,7 @@ checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals 0.30.0",
+ "serde_derive_internals",
  "syn 3.0.9",
 ]
 
@@ -5143,17 +5118,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "serde_derive_internals"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

@@ -12,8 +12,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rocky_core::config::{AdapterConfig, RockyConfig};
+use rocky_core::schema_gen::draft07_schema_for;
 use rocky_fivetran::envelope::FivetranStateEnvelope;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::commands::doctor::DoctorOutput;
@@ -52,11 +53,7 @@ use crate::output::{
 /// keeping the served HTTP surface and the exported bindings in lockstep.
 pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
     fn entry<T: JsonSchema + Serialize>(name: &'static str) -> (&'static str, serde_json::Value) {
-        let schema = schema_for!(T);
-        (
-            name,
-            serde_json::to_value(schema).expect("schema serialization is infallible"),
-        )
+        (name, draft07_schema_for::<T>())
     }
 
     vec![

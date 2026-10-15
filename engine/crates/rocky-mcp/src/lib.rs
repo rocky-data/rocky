@@ -26,14 +26,12 @@
 //! / root. A warm Salsa cache is a deferred optimization (not implemented
 //! here) — correctness-first.
 //!
-//! ## schemars dual-major note
+//! ## Result projections
 //!
-//! rmcp 3.x pulls schemars 1.x; the rest of the Rocky workspace uses
-//! schemars 0.8. The two `JsonSchema` traits are disjoint. Every result
-//! struct returned inside `Json<T>` therefore derives schemars **1.x** and is
-//! built from "pure" types only (`String`, `usize`, `bool`, `Vec<_>`, local
-//! lite structs) — Rocky's 0.8-deriving `*Output` types are projected into
-//! these lite shapes at the tool boundary.
+//! Every result struct returned inside `Json<T>` is built from "pure" types
+//! only (`String`, `usize`, `bool`, `Vec<_>`, local lite structs). Rocky's
+//! `*Output` types are projected into these lite shapes at the tool
+//! boundary, so the MCP tool schemas stay small and stable.
 
 mod error;
 mod result_types;

@@ -103,11 +103,11 @@ impl<'de> Deserialize<'de> for IncrementalLookback {
 }
 
 impl JsonSchema for IncrementalLookback {
-    fn schema_name() -> String {
-        "IncrementalLookback".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "IncrementalLookback".into()
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         String::json_schema(generator)
     }
 }

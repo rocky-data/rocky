@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use schemars::schema_for;
+use rocky_core::schema_gen::draft07_schema_for;
 use serde_json::{Map, Value, json};
 
 use super::export_schemas::schemas;
@@ -145,8 +145,7 @@ fn build_components() -> Result<BTreeMap<String, Value>> {
     // The job-submission request body. `JobRequest` derives `JsonSchema` but is
     // intentionally not in the export-schemas registry (it is a request input,
     // not a `--output json` payload), so it is added here directly.
-    let job_request = serde_json::to_value(schema_for!(JobRequest))
-        .context("serializing the JobRequest schema")?;
+    let job_request = draft07_schema_for::<JobRequest>();
     hoist_schema("job_request", job_request, &mut components)?;
 
     // Draft-07 → OpenAPI 3.1 (JSON Schema 2020-12) bridge: relocate refs, strip

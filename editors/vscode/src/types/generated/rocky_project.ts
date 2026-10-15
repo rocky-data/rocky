@@ -92,6 +92,12 @@ export type FulfillDriverConfig =
 export type WebhookConfigOrList = WebhookConfig | WebhookConfig[];
 export type FailureAction = "abort" | "warn" | "ignore";
 /**
+ * Supports both single-hook and multi-hook syntax per event.
+ *
+ * Single: `[hook.on_pipeline_start]` Multiple: `[[hook.on_after_checks]]`
+ */
+export type HookConfigOrList = HookConfig | HookConfig[];
+/**
  * Severity of a `rocky lint` finding. `rocky lint` exits non-zero when it reports at least one `error`.
  */
 export type LintSeverity = "error" | "warning" | "info";
@@ -1135,7 +1141,12 @@ export interface HooksConfig {
   webhooks?: {
     [k: string]: WebhookConfigOrList;
   };
-  [k: string]: unknown;
+  [k: string]:
+    | HookConfigOrList
+    | {
+        [k: string]: WebhookConfigOrList;
+      }
+    | undefined;
 }
 /**
  * Configuration for a single webhook endpoint.
@@ -1187,6 +1198,26 @@ export interface WebhookConfig {
    * Target URL for the webhook request.
    */
   url: string;
+}
+export interface HookConfig {
+  /**
+   * Shell command to execute (passed to `sh -c`).
+   */
+  command: string;
+  /**
+   * Extra environment variables passed to the hook process.
+   */
+  env?: {
+    [k: string]: string;
+  };
+  /**
+   * What to do if the hook command exits non-zero or times out.
+   */
+  on_failure?: FailureAction & string;
+  /**
+   * Maximum time to wait for the hook to complete.
+   */
+  timeout_ms?: number;
 }
 /**
  * A single imported producer-project snapshot.
