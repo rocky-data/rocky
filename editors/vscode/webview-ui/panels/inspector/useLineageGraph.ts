@@ -32,6 +32,7 @@ export function useLineageGraph() {
   const [replay, setReplay] = useState<ReplayData | null>(null);
   const [governance, setGovernance] = useState<GovernanceData | null>(null);
   const [planCost, setPlanCost] = useState<PlanCostData | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     void getRpc()
@@ -40,6 +41,34 @@ export function useLineageGraph() {
       .catch((err) => setError(String(err)));
   }, []);
 
+  // The cost overlay reads a stored plan estimate (never runs `rocky plan`).
+  // Fetch only while it is on, refetch when the host reports a new Plan or a
+  // model/sidecar/rocky.toml change, tick `now` so "30 min ago" ages, and
+  // drop the data on toggle-off so a re-enable cannot show a stale snapshot.
+  const costOn = active.has("cost");
+  useEffect(() => {
+    if (!costOn) {
+      setPlanCost(null);
+      return;
+    }
+    let ignore = false;
+    const load = (): void => {
+      setNow(Date.now());
+      void getRpc()
+        .request<PlanCostData | null>("planCost")
+        .then((d) => !ignore && setPlanCost(d))
+        .catch(() => !ignore && setPlanCost(null));
+    };
+    load();
+    const off = getRpc().onPush("planCostChanged", load);
+    const tick = setInterval(() => setNow(Date.now()), 60_000);
+    return () => {
+      ignore = true;
+      off();
+      clearInterval(tick);
+    };
+  }, [costOn]);
+
   const toggleOverlay = (kind: OverlayKind): void => {
     setActive((prev) => {
       const next = new Set(prev);
@@ -47,15 +76,6 @@ export function useLineageGraph() {
       else next.add(kind);
       return next;
     });
-    // The cost overlay re-reads the last plan every time it is enabled, so a
-    // Plan run since the last toggle shows up. This reads a stored estimate;
-    // it never runs `rocky plan`.
-    if (kind === "cost") {
-      void getRpc()
-        .request<PlanCostData | null>("planCost")
-        .then(setPlanCost)
-        .catch(() => setPlanCost(null));
-    }
     // Each data-backed overlay fetches on first enable; the base graph is unaffected.
     if (kind === "breaking" && breaking === null) {
       void getRpc()
@@ -81,7 +101,7 @@ export function useLineageGraph() {
 
   const overlays = useMemo<LineageOverlay[]>(() => {
     const list: LineageOverlay[] = [];
-    if (active.has("cost")) list.push(makeCostOverlay(planCost));
+    if (active.has("cost")) list.push(makeCostOverlay(planCost, now));
     if (active.has("freshness")) list.push(freshnessOverlay);
     if (active.has("breaking") && breaking && graph) {
       list.push(makeBreakingOverlay(breaking, graph));
@@ -91,7 +111,7 @@ export function useLineageGraph() {
       list.push(makeGovernanceOverlay(governance));
     }
     return list;
-  }, [active, breaking, replay, governance, graph, planCost]);
+  }, [active, breaking, replay, governance, graph, planCost, now]);
 
   return {
     graph,

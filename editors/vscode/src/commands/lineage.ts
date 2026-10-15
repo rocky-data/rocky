@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
-import { changedSince, readPlanCost } from "../planCostStore";
 import {
   RockyCliError,
   runRockyJson,
@@ -21,7 +20,6 @@ import type {
   GraphData,
   GraphEdge,
   GraphNode,
-  PlanCostData,
   ReplayData,
 } from "../webviews/lineage/contract";
 import { runAiExplain, runAiGenerate, runAiTest } from "./ai";
@@ -169,37 +167,6 @@ export async function loadBreaking(): Promise<BreakingData> {
         ? err.stderr.trim() || err.message
         : String(err);
     return { baseRef, findings: [], unavailable };
-  }
-}
-
-/**
- * Plan-time cost for the cost overlay: the estimate recorded by the user's last
- * Plan command. Never runs `rocky plan` (it persists a plan file per call).
- */
-export async function loadPlanCost(): Promise<PlanCostData | null> {
-  const recorded = readPlanCost();
-  if (!recorded) return null;
-  try {
-    const files = await vscode.workspace.findFiles(
-      "**/models/**/*.{rocky,sql}",
-      "**/node_modules/**",
-    );
-    const mtimes = await Promise.all(
-      files.map(async (f) => {
-        try {
-          return (await vscode.workspace.fs.stat(f)).mtime;
-        } catch {
-          return 0;
-        }
-      }),
-    );
-    return {
-      ...recorded,
-      modelsChangedSince: changedSince(recorded.recordedAt, mtimes),
-    };
-  } catch {
-    // Cannot tell: label it stale rather than current.
-    return { ...recorded, modelsChangedSince: true };
   }
 }
 

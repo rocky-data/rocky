@@ -6,6 +6,7 @@ import type {
   PlanResult,
   RunResult,
 } from "../types/rockyJson";
+import { resolveProjectRoot } from "../config";
 import { recordPlanCost } from "../planCostStore";
 import { showRunSummary } from "../webviews/runSummary";
 import {
@@ -68,14 +69,17 @@ export async function plan(): Promise<void> {
   if (!filter) return;
 
   try {
+    // Run in the project root the Inspector resolves, so the recorded cost
+    // is for the same project the overlay shows.
+    const cwd = resolveProjectRoot();
     const result = await runRockyJsonWithProgress<PlanResult>(
       `Planning pipeline (${filter})...`,
       ["plan", "--filter", filter, "--output", "json"],
-      { timeoutMs: 60000 },
+      { timeoutMs: 60000, cwd },
     );
 
     // Keep the estimate for the Inspector's cost overlay ("from last plan").
-    recordPlanCost(result, filter);
+    recordPlanCost(result, filter, cwd);
 
     const statements = result.statements ?? [];
     if (statements.length === 0) {

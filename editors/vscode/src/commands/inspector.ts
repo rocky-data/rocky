@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
+import { loadPlanCost, onPlanCostRecorded } from "../planCostStore";
 import { RockyCliError, runRockyJson, runRockyJsonCached } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput } from "../types/generated/compile";
@@ -23,7 +24,6 @@ import {
   buildGraph,
   loadBreaking,
   loadGovernance,
-  loadPlanCost,
   loadReplay,
   openModelFile,
   runAiAction,
@@ -57,6 +57,32 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
   });
 
   registerActiveEditorFollow(context);
+  registerPlanCostRefresh(context);
+}
+
+/**
+ * Tell the Inspector to re-read the plan cost when a new Plan finishes or a
+ * model, sidecar or `rocky.toml` changes (either can flip the stale flag).
+ * Debounced so a burst of saves is one refresh.
+ */
+function registerPlanCostRefresh(context: vscode.ExtensionContext): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const notify = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => controller?.push("planCostChanged", {}), 400);
+  };
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    "**/*.{rocky,sql,toml}",
+  );
+  watcher.onDidCreate(notify);
+  watcher.onDidChange(notify);
+  watcher.onDidDelete(notify);
+  context.subscriptions.push(
+    watcher,
+    vscode.workspace.onDidSaveTextDocument(notify),
+    { dispose: onPlanCostRecorded(notify) },
+    { dispose: () => timer && clearTimeout(timer) },
+  );
 }
 
 /**

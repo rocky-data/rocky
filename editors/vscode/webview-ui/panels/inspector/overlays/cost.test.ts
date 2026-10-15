@@ -42,7 +42,7 @@ describe("cost overlay", () => {
 
   it("shows the plan figure labelled 'from last plan' with its time", () => {
     const [b] = makeCostOverlay(plan(), NOW).decorate(node("a"))!;
-    expect(b.text).toBe("~$0.050 (plan)");
+    expect(b.text).toBe("~$0.050 (plan, adapter)");
     expect(b.title).toContain("from last plan");
     expect(b.title).toContain("30 min ago");
     expect(b.title).not.toContain("stale");

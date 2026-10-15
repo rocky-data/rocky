@@ -1,3 +1,5 @@
+import * as vscode from "vscode";
+import { resolveProjectRoot } from "./config";
 import type { PlanOutput } from "./types/generated/plan";
 import type { PlanCostData } from "./webviews/lineage/contract";
 
@@ -7,30 +9,48 @@ export interface PlanCostMemento {
   update(key: string, value: unknown): PromiseLike<void>;
 }
 
-type RecordedPlanCost = Omit<PlanCostData, "modelsChangedSince">;
+/** What is stored: the payload minus the flag computed at read time. */
+export type RecordedPlanCost = Omit<PlanCostData, "modelsChangedSince"> & {
+  /** Record layout version; a mismatch reads as "no plan". */
+  version: number;
+  /** Project root the plan ran in. Model names match bare, so this scopes them. */
+  projectRoot: string;
+};
 
 const KEY = "rocky.lastPlanCost";
+const VERSION = 1;
 
 let memento: PlanCostMemento | undefined;
+const listeners = new Set<() => void>();
 
 /** Bind the store to workspace state so the estimate survives a reload. */
 export function initPlanCostStore(state: PlanCostMemento): void {
   memento = state;
 }
 
+/** Subscribe to new plan records (the Inspector refreshes its overlay on this). */
+export function onPlanCostRecorded(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
 /**
- * Keep the cost preview of a plan the user ran explicitly. A plan without a
- * `cost_preview` (replication-only, older engine) leaves the previous record
- * alone: it says nothing about cost, so it must not erase a real estimate.
+ * Keep the cost preview of a plan the user ran explicitly in `projectRoot`. A
+ * plan without a `cost_preview` (replication-only, older engine) leaves the
+ * previous record alone: it says nothing about cost, so it must not erase a
+ * real estimate.
  */
 export function recordPlanCost(
   plan: PlanOutput,
   filter: string,
+  projectRoot: string | undefined,
   now: Date = new Date(),
 ): void {
   const preview = plan.cost_preview;
   if (!preview || !memento) return;
   const data: RecordedPlanCost = {
+    version: VERSION,
+    projectRoot: projectRoot ?? "",
     recordedAt: plan.created_at ?? now.toISOString(),
     filter,
     source: preview.source,
@@ -42,16 +62,63 @@ export function recordPlanCost(
     })),
   };
   void memento.update(KEY, data);
+  for (const l of listeners) l();
 }
 
-/** The last recorded plan estimate, without the staleness flag. */
-export function readPlanCost(): RecordedPlanCost | null {
-  return memento?.get<RecordedPlanCost>(KEY) ?? null;
+/** The last recorded estimate for `projectRoot`, or null (none, other project, other layout). */
+export function readPlanCost(
+  projectRoot: string | undefined,
+): RecordedPlanCost | null {
+  const rec = memento?.get<RecordedPlanCost>(KEY);
+  if (!rec || rec.version !== VERSION) return null;
+  if (rec.projectRoot !== (projectRoot ?? "")) return null;
+  return rec;
 }
 
-/** True when any model file was modified after the plan ran. */
+/** True when any file was modified after the plan ran. */
 export function changedSince(recordedAt: string, mtimesMs: number[]): boolean {
   const t = Date.parse(recordedAt);
   if (Number.isNaN(t)) return true;
   return mtimesMs.some((m) => m > t);
+}
+
+/**
+ * Plan-time cost for the cost overlay: the estimate recorded by the user's last
+ * Plan command in this project. Never runs `rocky plan` (it persists a plan
+ * file per call). The plan is stale when any `.rocky`, `.sql` or `.toml` file
+ * under the project root changed after it: model bodies, sidecars,
+ * `_defaults.toml` and `rocky.toml` (an adapter or `[cost]` change reprices).
+ * The models directory is configurable per pipeline, so the scan covers the
+ * whole root rather than assuming `models/`.
+ */
+export async function loadPlanCost(): Promise<PlanCostData | null> {
+  const root = resolveProjectRoot();
+  const recorded = readPlanCost(root);
+  if (!recorded) return null;
+  const { version: _version, projectRoot: _root, ...payload } = recorded;
+  if (!root) return { ...payload, modelsChangedSince: true };
+  try {
+    // `undefined` exclude keeps the user's `files.exclude` (node_modules, .git).
+    const files = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(root, "**/*.{rocky,sql,toml}"),
+      undefined,
+      20000,
+    );
+    const mtimes = await Promise.all(
+      files.map(async (f) => {
+        try {
+          return (await vscode.workspace.fs.stat(f)).mtime;
+        } catch {
+          return 0;
+        }
+      }),
+    );
+    return {
+      ...payload,
+      modelsChangedSince: changedSince(recorded.recordedAt, mtimes),
+    };
+  } catch {
+    // Cannot tell: label it stale rather than current.
+    return { ...payload, modelsChangedSince: true };
+  }
 }

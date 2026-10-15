@@ -66,7 +66,7 @@ export function makeCostOverlay(
         const label = stale ? "from last plan, stale" : "from last plan";
         return [
           {
-            text: `~$${row.estimatedCostUsd.toFixed(3)} (plan${stale ? ", stale" : ""})`,
+            text: `~$${row.estimatedCostUsd.toFixed(3)} (plan, ${row.source}${stale ? ", stale" : ""})`,
             color: stale ? STALE : BLUE,
             title: `${label} · ${when} (${plan.recordedAt}) · ${row.source} estimate${
               row.estimatedRows != null
