@@ -78,6 +78,9 @@ pub async fn run_watch(
     // `--skip-unchanged` / `--force-rebuild` overlay; threaded into each
     // watch iteration's `run()`. Default OFF ⇒ unchanged watch behavior.
     skip_opts: &super::run::SkipRunOptions,
+    // `--var name=value`, parsed once by the caller and handed to every
+    // iteration's `run()` (#2379).
+    run_vars: &rocky_core::run_vars::RunVars,
     // Who is running (RV4-P1), handed to each iteration's `run()`.
     actor: &rocky_core::config::PrincipalRef,
 ) -> Result<()> {
@@ -257,6 +260,7 @@ pub async fn run_watch(
             cache_ttl_override,
             env,
             skip_opts,
+            run_vars,
             actor,
         )));
         let interrupted = tokio::select! {
@@ -379,6 +383,7 @@ pub async fn run_watch(
                     cache_ttl_override,
                     env,
                     skip_opts,
+                    run_vars,
                     actor,
                 )));
                 let interrupted = tokio::select! {
@@ -533,6 +538,7 @@ async fn iter_once(
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
     skip_opts: &super::run::SkipRunOptions,
+    run_vars: &rocky_core::run_vars::RunVars,
     actor: &rocky_core::config::PrincipalRef,
 ) -> IterOutcome {
     let started = std::time::Instant::now();
@@ -585,8 +591,8 @@ async fn iter_once(
         // selection to defer against.
         &super::run::DeferOptions::default(),
         skip_opts,
-        // `--watch` does not expose `--var` today; pass an empty set.
-        &rocky_core::run_vars::RunVars::new(),
+        // The same `--var` map on every iteration (#2379).
+        run_vars,
         // `--watch` mints the usual timestamp run_id per iteration.
         None,
         // `--watch` is a dev loop, never a governed two-step apply — no gate.
@@ -812,10 +818,84 @@ mod tests {
             None,
             None,
             &super::super::run::SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
             &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .fingerprint
+    }
+
+    /// `--var` reaches the run a watch iteration drives (#2379). This calls
+    /// `iter_once` directly, so one cycle runs with no filesystem events or
+    /// sleeps. The `--watch` loop hands the same `run_vars` to every
+    /// iteration; the loop itself is covered by `rocky/tests/run_watch.rs`.
+    ///
+    /// Mutation that must turn this red: pass `RunVars::new()` instead of
+    /// `run_vars` to `run()` in `iter_once`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn iter_once_passes_var_to_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let db_path = root.join("db.duckdb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"local\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("models/m.sql"),
+            "SELECT '@var(region)' AS region, '@var(tag, dflt)' AS tag\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("models/m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"db\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let vars = rocky_core::run_vars::RunVars::parse_pairs(&[
+            "region=emea".to_string(),
+            "tag=supplied".to_string(),
+        ])
+        .unwrap();
+        let outcome = iter_once(
+            &config_path,
+            None,
+            None,
+            &root.join(".rocky-state.redb"),
+            None,
+            false,
+            Some(&root.join("models")),
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            &super::super::run::SkipRunOptions::default(),
+            &vars,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await;
+        assert!(!outcome.interrupted);
+
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT region, tag FROM db.main.m")
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][0], "emea");
+        assert_eq!(rows.rows[0][1], "supplied");
     }
 
     #[tokio::test]

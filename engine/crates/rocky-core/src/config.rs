@@ -6363,9 +6363,10 @@ pub struct ReplicationPipelineConfig {
     ///
     /// - `"incremental"` — append rows past the source-side watermark.
     /// - `"full_refresh"` — `CREATE OR REPLACE TABLE … AS SELECT …`.
-    /// - `"merge"` — upserts the watermarked delta into the target via
-    ///   `MERGE INTO … USING (delta) ON merge_keys WHEN MATCHED UPDATE SET *
-    ///   WHEN NOT MATCHED INSERT *`. Requires `merge_keys` (or
+    /// - `"merge"` — upserts the whole source table into the target via
+    ///   `MERGE INTO … USING (SELECT … FROM source) ON merge_keys WHEN MATCHED
+    ///   UPDATE SET … WHEN NOT MATCHED INSERT …`. It applies no watermark
+    ///   filter, so every run reads all source rows. Requires `merge_keys` (or
     ///   `merge_keys_fallback`) to be set.
     /// - `"view"` — emits a `CREATE OR REPLACE VIEW` over the source. Every
     ///   read against the target re-runs the SELECT; no row movement.

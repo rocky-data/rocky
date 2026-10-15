@@ -104,9 +104,11 @@ impl StateTurnstile {
     }
 }
 
-/// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
-/// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
-/// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
+/// The [`SubRunner`] tests use: drives one pipeline through [`super::run::run`]
+/// with the DAG sub-run's fixed arguments (no `--defer`, an empty `--var` map,
+/// config-derived TTL, no idempotency key). Only `run_with_dag_and_contracts`
+/// threads the outer `--var` map; `run_with_dag`, which `rocky apply` uses,
+/// passes none. Only `config`, `loaded`, `state`, `pipeline`,
 /// `model_name`, `partition_opts`, and `skip_opts` vary per node — `loaded` is
 /// always a clone of the ONE snapshot `run_with_dag` captured, never a per-node
 /// reload, and transformation nodes supply their model name so each node
@@ -134,7 +136,13 @@ fn default_sub_runner(
     actor: rocky_core::config::PrincipalRef,
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
 ) -> SubRunner {
-    sub_runner_with_contracts(actor, external_dependencies, None, None)
+    sub_runner_with_contracts(
+        actor,
+        external_dependencies,
+        None,
+        None,
+        rocky_core::run_vars::RunVars::new(),
+    )
 }
 
 /// The options every `--dag` sub-run carries. The graph judged `consumers/`
@@ -160,6 +168,7 @@ fn sub_runner_with_contracts(
     external_dependencies: Arc<std::collections::BTreeSet<String>>,
     contracts_dir: Option<PathBuf>,
     project: Option<rocky_compiler::compile::ProjectContext>,
+    run_vars: rocky_core::run_vars::RunVars,
 ) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
@@ -172,6 +181,7 @@ fn sub_runner_with_contracts(
               shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
             let contracts_dir = contracts_dir.clone();
+            let run_vars = run_vars.clone();
             let defer_opts = sub_run_defer_options(&external_dependencies, project.clone());
             Box::pin(async move {
                 super::run::run_with_explicit_contracts(
@@ -201,8 +211,9 @@ fn sub_runner_with_contracts(
                     // The build-escape-hatch overlay (`--force-rebuild` /
                     // `--no-reuse`) threaded from the outer `rocky run --dag`.
                     &skip_opts,
-                    // The unified-DAG driver does not surface `--var`.
-                    &rocky_core::run_vars::RunVars::new(),
+                    // The outer `--var` map, the same one the graph builder
+                    // substituted (#2379).
+                    &run_vars,
                     // No run_id override — DAG sub-runs mint their own ids.
                     None,
                     // DAG sub-runs are not governed two-step applies — no gate.
@@ -299,6 +310,7 @@ pub async fn run_with_dag(
         node_concurrency,
         actor,
         None,
+        &rocky_core::run_vars::RunVars::new(),
     )
     .await
 }
@@ -317,6 +329,9 @@ pub async fn run_with_dag_and_contracts(
     node_concurrency: Option<u32>,
     actor: &rocky_core::config::PrincipalRef,
     contracts_dir: Option<&Path>,
+    // `--var name=value`. The graph builder and every sub-run read the same
+    // map, so the edges and the SQL that runs cannot differ (#2379).
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     // Seed nodes do not pass through run(), so reject broken Pipes before
     // the DAG can execute any node.
@@ -353,7 +368,7 @@ pub async fn run_with_dag_and_contracts(
         seeds_dir,
         seed_pipeline,
         ephemeral_nodes,
-    } = plan_runtime_dag(config_path, cfg)?;
+    } = plan_runtime_dag(config_path, cfg, run_vars)?;
     let dag = runtime.dag;
     let physical_edge_warnings = runtime.warnings;
     for w in &physical_edge_warnings {
@@ -464,6 +479,7 @@ pub async fn run_with_dag_and_contracts(
             Arc::new(dag_external_dependencies(&dag)),
             contracts_dir.map(Path::to_path_buf),
             Some(project.clone()),
+            run_vars.clone(),
         ),
         state_turns: StateTurnstile::new(),
     };
@@ -567,6 +583,7 @@ struct PlannedDag {
 fn plan_runtime_dag(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<PlannedDag> {
     // Load models from the model set each transformation pipeline actually
     // declares — NOT a hardcoded `<config_dir>/models`. Hardcoding it was wrong
@@ -577,13 +594,13 @@ fn plan_runtime_dag(
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
     let mut models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
-    // Each node's sub-run compiles its model with `@var()` replaced by its
-    // inline default (the DAG driver takes no `--var`). The graph reads the
-    // same SQL, so a model whose `@var()` would not parse still derives its
-    // edges, and a cycle through it is refused before any node runs.
-    let no_vars = rocky_core::run_vars::RunVars::new();
+    // Each node's sub-run compiles its model with `@var()` replaced by the
+    // `--var` value, or its inline default when none was supplied. The graph
+    // reads the same SQL with the same map, so a model whose `@var()` would
+    // not parse still derives its edges, and a cycle through it is refused
+    // before any node runs.
     for model in models_by_pipeline.values_mut().flatten() {
-        model.sql = rocky_core::run_vars::substitute_run_vars(&model.sql, &no_vars).sql;
+        model.sql = rocky_core::run_vars::substitute_run_vars(&model.sql, run_vars).sql;
     }
     let ephemeral_nodes: HashSet<NodeId> = models_by_pipeline
         .values()
@@ -2020,7 +2037,12 @@ mod tests {
 
         let config_path = root.join("rocky.toml");
         let cfg = dag_snapshot(&config_path);
-        let planned = plan_runtime_dag(&config_path, &cfg.config).expect("graph builds");
+        let planned = plan_runtime_dag(
+            &config_path,
+            &cfg.config,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("graph builds");
         assert!(
             planned.runtime.dag.edges.iter().any(|e| {
                 e.from == NodeId::new("seed", "countries")
@@ -3388,7 +3410,11 @@ mod tests {
     fn plan_fixture(root: &Path) -> Result<PlannedDag> {
         let config_path = root.join("rocky.toml");
         let loaded = dag_snapshot(&config_path);
-        plan_runtime_dag(&config_path, &loaded.config)
+        plan_runtime_dag(
+            &config_path,
+            &loaded.config,
+            &rocky_core::run_vars::RunVars::new(),
+        )
     }
 
     /// Whether node `from` must complete before node `to` (ids, `kind:name`).
@@ -3408,6 +3434,123 @@ mod tests {
             .iter()
             .position(|phase| phase.iter().any(|n| n.id.0 == id))
             .unwrap_or_else(|| panic!("no node {id}"))
+    }
+
+    /// `--var` reaches the graph builder (#2379). Model `b` reads the table
+    /// its `@var(src, other)` marker names, so the edge `a -> b` exists only
+    /// when the supplied value, not the inline default, is substituted before
+    /// the graph is built.
+    ///
+    /// Mutation that must turn this red: pass `RunVars::new()` to
+    /// `substitute_run_vars` in `plan_runtime_dag`.
+    #[test]
+    fn run_dag_graph_builder_substitutes_the_supplied_var() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_project(
+            dir.path(),
+            &transformation_block("t"),
+            &[
+                ("a", "db", "main", "a", "SELECT 1 AS id"),
+                (
+                    "b",
+                    "db",
+                    "main",
+                    "b",
+                    "SELECT id FROM db.main.@var(src, other)",
+                ),
+            ],
+        );
+        let config_path = dir.path().join("rocky.toml");
+        let loaded = dag_snapshot(&config_path);
+
+        let default = plan_runtime_dag(
+            &config_path,
+            &loaded.config,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("plans with the inline default");
+        assert!(
+            !planned_edge(&default, "transformation:a", "transformation:b"),
+            "with no `--var`, `b` reads `other`, not `a`"
+        );
+
+        let vars = rocky_core::run_vars::RunVars::parse_pairs(&["src=a".to_string()]).unwrap();
+        let supplied =
+            plan_runtime_dag(&config_path, &loaded.config, &vars).expect("plans with --var");
+        assert!(
+            planned_edge(&supplied, "transformation:a", "transformation:b"),
+            "with `--var src=a`, `b` reads `a`, so the graph must order `a` first"
+        );
+    }
+
+    /// `--var` reaches every model a `--dag` run executes (#2379): two
+    /// independent models, one with a required marker and one with an inline
+    /// default that the supplied value overrides.
+    ///
+    /// Mutation that must turn this red: pass `RunVars::new()` instead of
+    /// `&run_vars` to `run_with_explicit_contracts` in
+    /// `sub_runner_with_contracts`.
+    #[tokio::test]
+    async fn run_dag_passes_var_to_every_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                (
+                    "m1",
+                    "db",
+                    "main",
+                    "m1",
+                    "SELECT '@var(region)' AS region, '@var(tag, dflt)' AS tag",
+                ),
+                (
+                    "m2",
+                    "db",
+                    "main",
+                    "m2",
+                    "SELECT '@var(region)' AS region, '@var(tag, dflt)' AS tag",
+                ),
+            ],
+        );
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        let vars = rocky_core::run_vars::RunVars::parse_pairs(&[
+            "region=emea".to_string(),
+            "tag=supplied".to_string(),
+        ])
+        .unwrap();
+        run_with_dag_and_contracts(
+            &config_path,
+            dag_snapshot(&config_path),
+            &state_path,
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            None,
+            &vars,
+        )
+        .await
+        .expect("run --dag --var should succeed");
+
+        let adapter = DuckDbWarehouseAdapter::open(&root.join("db.duckdb")).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["m1", "m2"] {
+            let rows = guard
+                .execute_sql(&format!("SELECT region, tag FROM db.main.{table}"))
+                .unwrap();
+            assert_eq!(rows.rows.len(), 1, "{table} has one row");
+            assert_eq!(rows.rows[0][0], "emea", "{table}: --var region reached it");
+            assert_eq!(
+                rows.rows[0][1], "supplied",
+                "{table}: --var tag overrides the inline default"
+            );
+        }
     }
 
     /// #1629's repro through the production planner. `customers` writes

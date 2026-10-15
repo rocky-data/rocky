@@ -995,3 +995,85 @@ fn run_watch_transformation_emits_one_compact_json_line_per_iteration() {
         );
     }
 }
+
+/// `run --watch --var` hands the value to the first build and to every
+/// re-run (#2379). The model needs `@var(region)`, so a dropped map fails
+/// the iteration with E028 ("run failed in"), not "run completed in".
+#[test]
+fn run_watch_var_reaches_the_first_build_and_a_rerun() {
+    const CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "probe.duckdb"
+
+[pipeline.probe]
+type = "transformation"
+models = "models"
+
+[pipeline.probe.target.governance]
+auto_create_schemas = true
+"#;
+    const SIDECAR: &str = r#"
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "probe"
+schema = "main"
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, CONFIG).expect("write rocky.toml");
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("mkdir models");
+    fs::write(
+        models.join("alpha.sql"),
+        "SELECT '@var(region)' AS region\n",
+    )
+    .expect("model sql");
+    fs::write(models.join("alpha.toml"), SIDECAR).expect("model toml");
+
+    let calibration_start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["-c", "rocky.toml", "run", "--watch", "--var", "region=emea"])
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+    let pid = child.id();
+    let stderr_rx = spawn_line_reader(child.stderr.take().expect("stderr piped"));
+
+    // Each iteration ends with "[watch] run completed in" or "[watch] run
+    // failed in"; wait for either, then check which one it was.
+    let iteration = |budget: Duration| wait_for(&stderr_rx, "[watch] run ", budget);
+    let first = iteration(BOOTSTRAP_BUDGET);
+    let one_run = calibration_start.elapsed().max(Duration::from_millis(100));
+    if !first.matched || !first.buffered.contains("run completed in") {
+        sigterm(pid);
+        let _ = child.wait();
+        panic!(
+            "the first build must succeed with --var:\n{}",
+            first.buffered
+        );
+    }
+
+    touch(&cfg_path);
+    let second = iteration(scaled_budget(one_run, RERUN_BUDGET_RUNS));
+    sigterm(pid);
+    let _ = child.wait();
+    assert!(
+        second.matched && second.buffered.contains("run completed in"),
+        "the re-run must succeed with --var:\n{}",
+        second.buffered
+    );
+
+    // The process has exited, so the database is free to open.
+    let conn = duckdb::Connection::open(dir.join("probe.duckdb")).expect("open duckdb");
+    let region: String = conn
+        .query_row("SELECT region FROM probe.main.alpha", [], |r| r.get(0))
+        .expect("alpha must exist");
+    assert_eq!(region, "emea");
+}

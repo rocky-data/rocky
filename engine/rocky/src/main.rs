@@ -1149,8 +1149,8 @@ enum Command {
         /// time. `run_with_dag` takes no resume arguments and its sub-runner
         /// passes `None` for both, so the combination used to run every
         /// pipeline FRESH while reporting success — the #1543 fail-open shape,
-        /// on the widest-blast-radius path. Same reasoning as the `--var` and
-        /// `--models` bails below; `--watch` already names both flags.
+        /// on the widest-blast-radius path. Same reasoning as the `--models`
+        /// bail below; `--watch` already names both flags.
         #[arg(long, conflicts_with_all = ["resume", "resume_latest"])]
         dag: bool,
 
@@ -4669,24 +4669,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     rocky_cli::commands::RunContracts::Directory(dir)
                 }
             });
-            // `--var` is only threaded through the standard run path. The `--dag`
-            // and `--watch` dispatch paths compile their sub-runs with an empty
-            // `RunVars`, so a supplied `--var` would be silently dropped —
-            // resolving to inline defaults (wrong data reported as success) or
-            // failing a required var that was in fact supplied. Reject the
-            // combination loudly until `--var` is threaded through those paths.
-            if !var.is_empty() && (dag || watch) {
-                anyhow::bail!(
-                    "--var is not yet supported with --dag or --watch (it would be \
-                     silently dropped); run without --dag/--watch, or remove --var"
-                );
-            }
             // `--models` is not threaded into the `--dag` dispatch path either.
             // The unified DAG resolves each transformation pipeline's own
             // `models` glob from rocky.toml, so an override passed here would be
             // silently ignored and the DAG built from a different set of files
-            // than the caller asked for. Reject it loudly, the same way `--var`
-            // is rejected above.
+            // than the caller asked for. Reject it loudly.
             if models_dir.is_some() && dag {
                 anyhow::bail!(
                     "--models is not supported with --dag (it would be silently \
@@ -4815,6 +4802,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     env.as_deref(),
                     &skip_opts,
+                    &run_vars,
                     &actor,
                 )
                 .await
@@ -4845,6 +4833,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     parallel,
                     &actor,
                     contracts.as_deref(),
+                    &run_vars,
                 );
                 tokio::select! {
                     result = run_future => result,

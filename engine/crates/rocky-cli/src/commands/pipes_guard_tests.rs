@@ -223,6 +223,7 @@ async fn direct_watch_guard_refuses_bad_pipes() {
             None,
             None,
             &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
             &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await,
