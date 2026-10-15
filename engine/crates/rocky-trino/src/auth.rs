@@ -59,9 +59,13 @@ pub enum TrinoAuth {
 impl std::fmt::Debug for TrinoAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // A `${VAR}`-resolved user prints as `${NAME}` (#1919).
             TrinoAuth::Basic { user, .. } => f
                 .debug_struct("TrinoAuth::Basic")
-                .field("user", user)
+                .field(
+                    "user",
+                    &rocky_core::secret_registry::render_placeholders(user),
+                )
                 .field("password", &"***")
                 .finish(),
             TrinoAuth::Jwt(_) => f
@@ -186,6 +190,16 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(!debug.contains("very_secret_jwt_value"));
         assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn debug_basic_renders_a_substituted_user() {
+        const USER: &str = "trino-user-1919-b8e4";
+        rocky_core::secret_registry::register_substitution("RV_TRINO_USER_DBG", USER);
+        let auth = TrinoAuth::basic(USER, "pw-1919-not-printed").unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(USER), "Debug leaks the user: {debug}");
+        assert!(debug.contains("${RV_TRINO_USER_DBG}"), "{debug}");
     }
 
     /// No variant holds a value, so this pins the shape only: `Debug` goes
