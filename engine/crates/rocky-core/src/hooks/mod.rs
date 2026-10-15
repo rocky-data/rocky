@@ -898,12 +898,11 @@ fn context_stdin(json: &str) -> std::io::Result<std::fs::File> {
 }
 
 async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
-    use tokio::io::AsyncWriteExt;
-
     let mut cmd = shell_command(&hook.command);
     // A host with no writable temp directory (a read-only container root)
     // still runs the hook: the context goes through a pipe, as before #2360.
-    // There, a hook that exits before the write can still raise SIGPIPE.
+    // The pipe is written through `ChildStdinWriter`, so a hook that exits
+    // before the write cannot kill Rocky with SIGPIPE (#2374).
     let piped_context = match context_stdin(json) {
         Ok(file) => {
             cmd.stdin(file);
@@ -930,21 +929,31 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
 
     let mut child = cmd.spawn()?;
+    let timeout = Duration::from_millis(hook.timeout_ms);
 
-    if piped_context && let Some(mut stdin) = child.stdin.take() {
-        // A hook that exits without reading closes the pipe. When SIGPIPE
-        // is ignored, that is `BrokenPipe`, and the hook chose to ignore
-        // its stdin, which is fine.
-        match stdin.write_all(json.as_bytes()).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => return Err(HookError::Io(e)),
+    if piped_context && let Some(stdin) = child.stdin.take() {
+        let stdin = rocky_adapter_sdk::child_stdin::ChildStdinWriter::new(stdin)?;
+        // A hook that exits without reading closes the pipe: that is
+        // `BrokenPipe`, and the hook chose to ignore its stdin, which is
+        // fine. A hook that neither reads nor exits would block the write
+        // on a full pipe, so the write shares the hook's timeout; dropping
+        // `child` then kills the hook, which ends the write.
+        match tokio::time::timeout(timeout, stdin.write_all(json.as_bytes().to_vec())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Ok(Err(e)) => return Err(HookError::Io(e)),
+            Err(_) => {
+                return Err(HookError::Timeout {
+                    command: hook.command.clone(),
+                    timeout_ms: hook.timeout_ms,
+                });
+            }
         }
+        // Close the pipe so the hook sees end-of-file.
         drop(stdin);
     }
 
     // Wait with timeout
-    let timeout = Duration::from_millis(hook.timeout_ms);
     let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
     match wait_result {

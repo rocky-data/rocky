@@ -10,6 +10,8 @@ rust-version.workspace = true
 rocky-ir = { path = "../rocky-ir" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-secret-registry = { path = "../rocky-secret-registry" }
+# Only for `child_stdin::ChildStdinWriter`, the hook pipe fallback (#2374).
+rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
