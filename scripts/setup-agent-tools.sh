@@ -41,8 +41,16 @@ warn() { echo "setup-agent-tools: $*" >&2; }
 # install_tool NAME VERSION_CMD WANT URL SHA256 MEMBER
 install_tool() {
   local name="$1" have_cmd="$2" want="$3" url="$4" sha="$5" member="$6"
-  # Match the exact version: "$want" followed by end of line, a space or "(".
-  if bash -c "$have_cmd" 2>/dev/null | head -n1 | grep -qE "^${want//./\\.}( |\(|\$)"; then
+  # Never replace a copy that is already installed, whatever its version: on
+  # a developer machine it may be newer than the pin. Only a missing tool is
+  # installed.
+  local have
+  have="$(bash -c "$have_cmd" 2>/dev/null | head -n1)"
+  if [ -n "$have" ]; then
+    case "$have" in
+      "$want"|"$want "*) ;;
+      *) warn "$name: found '$have', leaving it (pin is '$want')" ;;
+    esac
     return 0
   fi
   local tmp
