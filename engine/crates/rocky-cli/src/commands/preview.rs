@@ -1868,8 +1868,18 @@ fn git_changed_paths_in(dir: Option<&Path>, base_ref: &str) -> Result<Vec<String
     let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
     let top = top.canonicalize().unwrap_or(top);
 
+    // `-z`: NUL-separated and never quoted, so a non-ASCII or odd file name
+    // (which `core.quotePath` would print as `"caf\303\251.sql"`) still
+    // matches. `--no-renames`: a rename reports both the old and the new
+    // path, so models downstream of the old name are pruned too.
     let three_dot = git()
-        .args(["diff", "--name-only", &format!("{base_ref}...HEAD")])
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &format!("{base_ref}...HEAD"),
+        ])
         .output()
         .context("`git diff` failed — is git installed?")?;
     let raw = if three_dot.status.success() {
@@ -1880,7 +1890,14 @@ fn git_changed_paths_in(dir: Option<&Path>, base_ref: &str) -> Result<Vec<String
             three_dot.status
         );
         let two_dot = git()
-            .args(["diff", "--name-only", base_ref, "HEAD"])
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base_ref,
+                "HEAD",
+            ])
             .output()
             .context("`git diff` (two-dot) failed")?;
         if !two_dot.status.success() {
@@ -1896,11 +1913,12 @@ fn git_changed_paths_in(dir: Option<&Path>, base_ref: &str) -> Result<Vec<String
 }
 
 /// Split `git diff --name-only` output into trimmed lines.
+/// Split `git diff -z` output: one path per NUL, kept byte for byte (a
+/// name may start or end with a space).
 fn parse_paths(raw: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(raw)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+    raw.split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect()
 }
 
@@ -3449,8 +3467,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let models = tmp.path().join("models");
         std::fs::create_dir_all(&models).unwrap();
-        // Use raw paths that aren't real on disk — `changed_models_under`
-        // falls back to string match when canonicalize fails.
+        // Raw paths that aren't real on disk: `canonicalize_lenient`
+        // resolves the existing models dir and re-appends the file name.
         let paths = vec![
             format!("{}/foo.sql", models.display()),
             format!("{}/bar.toml", models.display()),
@@ -3488,7 +3506,7 @@ mod tests {
         std::fs::create_dir_all(root.join("other/models")).unwrap();
         std::fs::write(project.join("models/orders.sql"), "select 1").unwrap();
         std::fs::write(root.join("other/models/x.sql"), "select 1").unwrap();
-        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["init", "-q"]);
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-q", "-m", "base"]);
         std::fs::write(project.join("models/orders.sql"), "select 2").unwrap();
@@ -3505,6 +3523,8 @@ mod tests {
         assert_eq!(out, BTreeSet::from(["orders".to_string()]));
     }
 
+    // Builds the relative path from `/`-rooted components, so Unix only.
+    #[cfg(unix)]
     #[test]
     fn changed_models_found_when_project_is_nested_and_models_dir_relative() {
         let (_tmp, project) = nested_project_repo();
@@ -3557,10 +3577,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_paths_strips_whitespace() {
-        let raw = b"foo.sql\n  bar.toml\n\nbaz\n";
+    fn parse_paths_splits_on_nul_and_keeps_names_verbatim() {
+        let raw = b"foo.sql\0 bar .toml\0\0caf\xc3\xa9.sql\0";
         let out = parse_paths(raw);
-        assert_eq!(out, vec!["foo.sql", "bar.toml", "baz"]);
+        assert_eq!(out, vec!["foo.sql", " bar .toml", "caf\u{e9}.sql"]);
+    }
+
+    #[test]
+    fn changed_models_found_for_a_non_ascii_file_name() {
+        let (_tmp, project) = nested_project_repo();
+        let cafe = project.join("models/caf\u{e9}.sql");
+        std::fs::write(&cafe, "select 1").unwrap();
+        run_git(&project, &["add", "."]);
+        run_git(&project, &["commit", "-q", "-m", "add cafe"]);
+        let paths = git_changed_paths_in(Some(&project), "HEAD~1").unwrap();
+        let out = changed_models_under(&paths, &project.join("models"));
+        assert_eq!(out, BTreeSet::from(["caf\u{e9}".to_string()]));
+    }
+
+    #[test]
+    fn a_renamed_model_reports_its_old_and_new_names() {
+        let (_tmp, project) = nested_project_repo();
+        run_git(
+            &project,
+            &["mv", "models/orders.sql", "models/orders_v2.sql"],
+        );
+        run_git(&project, &["commit", "-q", "-m", "rename"]);
+        let paths = git_changed_paths_in(Some(&project), "HEAD~1").unwrap();
+        let out = changed_models_under(&paths, &project.join("models"));
+        assert_eq!(
+            out,
+            BTreeSet::from(["orders".to_string(), "orders_v2".to_string()])
+        );
     }
 
     // ---------------------- diff + cost substance ----------------------

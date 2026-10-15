@@ -122,6 +122,20 @@ describe("Preview create", () => {
     expect(text).toContain("stock");
   });
 
+  it("with no changed models but copies made, never says nothing was copied", async () => {
+    await runWith({
+      branch_schema: "branch__pr_x",
+      prune_set: [],
+      copy_set: [copy("customers", "ctas"), copy("orders", "ctas")],
+    });
+    await screen.findByText("Preview: done.", {}, { timeout: 3000 });
+    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    expect(text).toContain("Copied from production: 2 models.");
+    expect(text).toContain("No changed models.");
+    expect(text).not.toContain("nothing was copied");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("warns, never says done, when nothing was copied and nothing changed", async () => {
     await runWith({ branch_schema: "branch__pr_x", prune_set: [], copy_set: [] });
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });

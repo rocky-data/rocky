@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `rocky preview create` now finds the changed models when the project is a subfolder of the git repository, or when `--models` is an absolute path (#2323). Before, the paths git reports (relative to the repository root) were read from the folder that holds `rocky.toml`, so a changed model was missed and cloned from production. Each path is now resolved against the repository root. This also fixes the browser UI, which passes an absolute `--models`.
+- `rocky preview create` now finds the changed models when the project is a subfolder of the git repository, or when `--models` is an absolute path (#2323). Before, the paths git reports (relative to the repository root) were read from the process's working directory, so a changed model was missed and cloned from production. Each path is now resolved against the repository root. A file name with non-ASCII characters is no longer dropped, and a renamed model now counts under both its old and new names. This also fixes the browser UI, which passes an absolute `--models`.
 - `rocky preview create` now creates the branch schema with the warehouse's own identifier quoting. Before, it always used double quotes, which Databricks reads as a string, so every copy there failed and the models were only planned.
 
 ## [1.82.2] — 2026-10-15

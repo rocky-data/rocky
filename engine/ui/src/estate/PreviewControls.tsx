@@ -99,7 +99,9 @@ function PreviewJobLine({ view, cancel }: { view: JobView; cancel: JobCancel }) 
   lines.push(
     s.changed.length > 0
       ? `Changed and downstream, planned but not re-run: ${nameList(s.changed)}.`
-      : "No changed models, so nothing was copied.",
+      : nothing
+        ? "No changed models, so nothing was copied."
+        : "No changed models.",
   );
   return (
     <div className="space-y-1">
