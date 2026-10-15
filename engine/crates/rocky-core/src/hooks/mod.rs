@@ -929,16 +929,18 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
 
     let mut child = cmd.spawn()?;
-    let timeout = Duration::from_millis(hook.timeout_ms);
+    // One deadline for the stdin write and the wait together, so
+    // `timeout_ms` bounds the whole hook.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(hook.timeout_ms);
 
     if piped_context && let Some(stdin) = child.stdin.take() {
         let stdin = rocky_adapter_sdk::child_stdin::ChildStdinWriter::new(stdin)?;
         // A hook that exits without reading closes the pipe: that is
         // `BrokenPipe`, and the hook chose to ignore its stdin, which is
         // fine. A hook that neither reads nor exits would block the write
-        // on a full pipe, so the write shares the hook's timeout; dropping
+        // on a full pipe, so the write shares the hook's deadline; dropping
         // `child` then kills the hook, which ends the write.
-        match tokio::time::timeout(timeout, stdin.write_all(json.as_bytes().to_vec())).await {
+        match tokio::time::timeout_at(deadline, stdin.write_all(json.as_bytes().to_vec())).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Ok(Err(e)) => return Err(HookError::Io(e)),
@@ -953,8 +955,8 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
         drop(stdin);
     }
 
-    // Wait with timeout
-    let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // Wait until the same deadline.
+    let wait_result = tokio::time::timeout_at(deadline, child.wait_with_output()).await;
 
     match wait_result {
         Ok(Ok(output)) => {

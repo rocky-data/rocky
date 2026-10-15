@@ -3,7 +3,7 @@
 //!
 //! This file is its own test binary: it sets SIGPIPE to the default action,
 //! as `rocky`'s `main` does, and changes `TMPDIR` for the whole process.
-//! Both tests set the same values.
+//! The setup runs once, before either test spawns a hook.
 
 #![cfg(unix)]
 
@@ -17,14 +17,18 @@ use rocky_core::hooks::{
 /// larger than any pipe buffer, so the write cannot finish unless the hook
 /// reads it.
 async fn fire_with_large_context(command: &str, timeout_ms: u64) -> HookResult {
-    let out_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hook_fallback_sigpipe");
-    std::fs::create_dir_all(&out_dir).unwrap();
-    // SAFETY: every test in this binary sets these same two values before
-    // its hook runs, so a concurrent test reads the value it would set.
-    unsafe {
-        std::env::set_var("TMPDIR", out_dir.join("does-not-exist"));
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    static SETUP: std::sync::Once = std::sync::Once::new();
+    SETUP.call_once(|| {
+        let out_dir =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hook_fallback_sigpipe");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        // SAFETY: `Once` runs this before any test in this binary reads the
+        // environment or spawns a hook; a second test blocks until it ends.
+        unsafe {
+            std::env::set_var("TMPDIR", out_dir.join("does-not-exist"));
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    });
 
     let mut hooks = HashMap::new();
     hooks.insert(
