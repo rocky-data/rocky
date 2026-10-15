@@ -25,6 +25,8 @@ duckdb = ["rocky-cli/duckdb"]
 # place deciding the feature set (mirrors its own rocky-cli dependency).
 rocky-cli = { path = "../rocky-cli", default-features = false }
 rocky-core = { path = "../rocky-core" }
+# Only for `child_stdin::ChildStdinWriter` (#2370); rocky-cli already links it.
+rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

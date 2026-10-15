@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An external process adapter or a `rocky fulfill` replay MCP server that exits mid-session no longer kills Rocky (#2370). Before, the next request Rocky wrote to the child's stdin raised SIGPIPE, and Rocky exited with no error message. Now the write fails, and Rocky reports it: `failed to write to adapter: …` for an adapter, `replay session error: write: …` for the replay server.
+- `rocky fulfill` on macOS reports the real error when its MCP server exits early. Before, the cleanup step's `killpg(15) failed: Operation not permitted` replaced it.
+
 ## [1.82.0] — 2026-10-15
 
 ### Changed

@@ -4106,6 +4106,7 @@ version = "1.82.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "libc",
  "rocky-secret-registry",
  "serde",
  "serde_json",
@@ -4490,6 +4491,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "libc",
+ "rocky-adapter-sdk",
  "rocky-cli",
  "rocky-core",
  "rocky-mcp",

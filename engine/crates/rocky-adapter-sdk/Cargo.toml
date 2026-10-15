@@ -16,6 +16,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 

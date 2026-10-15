@@ -1641,6 +1641,56 @@ fn worker_profile_excluded_tools_are_not_found() {
     assert!(!plan_id.is_empty(), "the gate held and the flow completed");
 }
 
+/// The MCP server answers `initialize`, then exits. The next request is
+/// 1 MiB, larger than any pipe buffer, so its write must reach the closed
+/// pipe. `rocky` keeps SIGPIPE at its default action; the write must
+/// still return an error the loop reports, not kill `rocky` (#2370).
+#[test]
+fn a_server_that_exits_mid_session_fails_the_task_and_does_not_kill_rocky() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let reply = r#"{"jsonrpc":"2.0","id":0,"result":{}}"#;
+    // The trailing `--state-path` is an unused script argument. Without
+    // it the driver inserts `--state-path <path>` right after `/bin/sh`,
+    // and `sh` exits on the unknown option before it reads `initialize`.
+    let script = format!("read line; echo '{reply}'");
+    let session = serde_json::json!({
+        "mcp_command": ["/bin/sh", "-c", script, "sh", "--state-path", "unused"],
+        "tasks": {
+            "elicitation": {
+                "calls": [{
+                    "tool": "draft_model",
+                    "arguments": { "blob": "x".repeat(1 << 20) },
+                    "expect": "ok"
+                }],
+                "outcome": {
+                    "candidate_spec": CANDIDATE_SPEC,
+                    "questions": [],
+                    "expected_digest": "unused"
+                }
+            }
+        }
+    })
+    .to_string();
+    write_project(dir, &session);
+
+    let (code, _, stdout, stderr) = rocky(dir, &["fulfill", PRODUCT]);
+    // The helper maps a signal death to -1; a real exit code means it lived.
+    assert_ne!(
+        code, -1,
+        "rocky died by a signal\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_ne!(
+        code, 0,
+        "the task must fail\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let output = format!("{stdout}{stderr}");
+    assert!(
+        output.contains("write:"),
+        "the failure names the failed write\n{output}"
+    );
+}
+
 // =========================================================================
 // FF-WP-F3 — the declared data checks, read against the APPLIED output
 // =========================================================================

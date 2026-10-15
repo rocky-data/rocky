@@ -29,10 +29,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+use crate::child_stdin::ChildStdinWriter;
 use crate::manifest::AdapterManifest;
 use crate::traits::{
     AdapterError, AdapterResult, ColumnInfo, QueryResult, SqlDialect, TableRef, WarehouseAdapter,
@@ -98,8 +99,9 @@ pub struct RpcError {
 pub struct ProcessAdapter {
     /// The child process.
     child: Mutex<Child>,
-    /// Buffered writer to the child's stdin.
-    stdin: Mutex<BufWriter<ChildStdin>>,
+    /// Writer to the child's stdin. A write to an adapter that has exited
+    /// returns an error instead of killing Rocky with SIGPIPE (#2370).
+    stdin: ChildStdinWriter,
     /// Buffered reader from the child's stdout.
     stdout: Mutex<BufReader<ChildStdout>>,
     /// Serializes the request/response pair in [`ProcessAdapter::call`].
@@ -166,7 +168,8 @@ impl ProcessAdapter {
             .take()
             .ok_or_else(|| AdapterError::msg("failed to capture adapter stdout"))?;
 
-        let stdin = Mutex::new(BufWriter::new(child_stdin));
+        let stdin = ChildStdinWriter::new(child_stdin)
+            .map_err(|e| AdapterError::msg(format!("failed to set up adapter stdin: {e}")))?;
         let stdout = Mutex::new(BufReader::new(child_stdout));
         let next_id = AtomicU64::new(1);
 
@@ -177,23 +180,12 @@ impl ProcessAdapter {
             serde_json::json!({ "config": config }),
         );
 
-        let request_json = serde_json::to_string(&init_request).map_err(AdapterError::new)?;
-
-        {
-            let mut writer = stdin.lock().await;
-            writer
-                .write_all(request_json.as_bytes())
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to write to adapter stdin: {e}")))?;
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to write newline: {e}")))?;
-            writer
-                .flush()
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to flush adapter stdin: {e}")))?;
-        }
+        let mut request_line = serde_json::to_vec(&init_request).map_err(AdapterError::new)?;
+        request_line.push(b'\n');
+        stdin
+            .write_all(request_line)
+            .await
+            .map_err(|e| AdapterError::msg(format!("failed to write to adapter stdin: {e}")))?;
 
         // Read initialize response.
         let response = {
@@ -260,7 +252,8 @@ impl ProcessAdapter {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = RpcRequest::new(id, method, params);
 
-        let request_json = serde_json::to_string(&request).map_err(AdapterError::new)?;
+        let mut request_line = serde_json::to_vec(&request).map_err(AdapterError::new)?;
+        request_line.push(b'\n');
 
         // Hold `call_lock` across the entire write→read pair so concurrent
         // callers cannot interleave on stdin/stdout. Without this, two
@@ -270,21 +263,10 @@ impl ProcessAdapter {
         let _guard = self.call_lock.lock().await;
 
         // Write request.
-        {
-            let mut writer = self.stdin.lock().await;
-            writer
-                .write_all(request_json.as_bytes())
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to write to adapter: {e}")))?;
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to write newline: {e}")))?;
-            writer
-                .flush()
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to flush adapter: {e}")))?;
-        }
+        self.stdin
+            .write_all(request_line)
+            .await
+            .map_err(|e| AdapterError::msg(format!("failed to write to adapter: {e}")))?;
 
         // Read response.
         let mut line = String::new();

@@ -16,6 +16,7 @@
 //! Breaking changes to traits require a minor version bump with a migration guide.
 
 pub mod auth;
+pub mod child_stdin;
 pub mod conformance;
 pub mod manifest;
 pub mod process;

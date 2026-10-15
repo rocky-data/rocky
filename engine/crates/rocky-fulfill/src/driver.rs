@@ -677,7 +677,11 @@ pub async fn kill_group(
         })
         .collect();
     if group_exists(pgid) {
-        signal_group(pgid, libc::SIGTERM)?;
+        // Best effort. A leader that already exited is an unreaped zombie
+        // here, and macOS then fails `killpg` with EPERM; that error used
+        // to replace the session's own error. The SIGKILL loop below is
+        // the check: it reports any member still standing as `Survivors`.
+        let _ = signal_group(pgid, libc::SIGTERM);
     }
     // Reap our direct children within the grace: they usually exit on
     // SIGTERM, and an unreaped zombie would wedge the group probe.
@@ -1004,8 +1008,9 @@ impl AgentDriver for ReplayDriver {
         let result = replay_calls(&mut server, task, &mut transcript).await;
 
         // Group kill + no-survivors on every path (success and failure).
-        // The server's stdin handle dropped inside `replay_calls`, so it
-        // already saw EOF; the kill sweeps it and anything it spawned.
+        // The server's stdin writer dropped inside `replay_calls`, so its
+        // thread closes the pipe and the server sees EOF; the kill sweeps
+        // it and anything it spawned.
         kill_group(pgid, Duration::from_secs(5), vec![&mut server]).await?;
 
         result?;
@@ -1053,10 +1058,14 @@ async fn replay_calls(
     use std::io::Write as _;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut stdin = server
+    // A write to a server that has exited must return an error, not kill
+    // Rocky with SIGPIPE (#2370).
+    let stdin = server
         .stdin
         .take()
         .ok_or_else(|| DriverError::Session("server stdin unavailable".to_string()))?;
+    let stdin = rocky_adapter_sdk::child_stdin::ChildStdinWriter::new(stdin)
+        .map_err(|e| DriverError::Session(format!("server stdin: {e}")))?;
     let stdout = server
         .stdout
         .take()
@@ -1066,26 +1075,21 @@ async fn replay_calls(
     /// One JSON-RPC exchange over the stdio pair. A request without an
     /// `id` is a notification: written, no response awaited.
     async fn roundtrip(
-        stdin: &mut tokio::process::ChildStdin,
+        stdin: &rocky_adapter_sdk::child_stdin::ChildStdinWriter,
         lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
         request: serde_json::Value,
     ) -> Result<Option<serde_json::Value>, DriverError> {
-        use tokio::io::AsyncWriteExt as _;
         const CALL_BUDGET: Duration = Duration::from_secs(120);
-        let payload = serde_json::to_string(&request)
+        let mut payload = serde_json::to_vec(&request)
             .map_err(|e| DriverError::Session(format!("encode: {e}")))?;
-        stdin
-            .write_all(payload.as_bytes())
+        payload.push(b'\n');
+        // The write gets the same budget as the read: a server that stops
+        // reading must not hang the session. The caller's group kill then
+        // ends the server, which ends the blocked write.
+        tokio::time::timeout(CALL_BUDGET, stdin.write_all(payload))
             .await
+            .map_err(|_| DriverError::Session("server request write timed out".to_string()))?
             .map_err(|e| DriverError::Session(format!("write: {e}")))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| DriverError::Session(format!("write: {e}")))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| DriverError::Session(format!("flush: {e}")))?;
         let Some(want_id) = request.get("id").cloned() else {
             return Ok(None); // a notification expects no response
         };
@@ -1118,11 +1122,11 @@ async fn replay_calls(
             "clientInfo": {"name": "rocky-fulfill-replay", "version": "0"}
         }
     });
-    let response = roundtrip(&mut stdin, &mut lines, init).await?;
+    let response = roundtrip(&stdin, &mut lines, init).await?;
     log_exchange(transcript, "initialize", &response);
     next_id += 1;
     roundtrip(
-        &mut stdin,
+        &stdin,
         &mut lines,
         serde_json::json!({
             "jsonrpc": "2.0", "method": "notifications/initialized"
@@ -1136,7 +1140,7 @@ async fn replay_calls(
             "params": {"name": call.tool, "arguments": call.arguments}
         });
         next_id += 1;
-        let response = roundtrip(&mut stdin, &mut lines, request)
+        let response = roundtrip(&stdin, &mut lines, request)
             .await?
             .ok_or_else(|| DriverError::Session("call produced no response".to_string()))?;
         log_exchange(transcript, &call.tool, &Some(response.clone()));
