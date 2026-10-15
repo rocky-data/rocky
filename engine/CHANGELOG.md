@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A shell hook that exits without reading its stdin no longer kills the run. Before, `rocky run` could exit nonzero with no error message when a hook such as `touch done` finished before Rocky wrote the event context (#2360). The context now reaches the hook's stdin from an unnamed temporary file, not a pipe. A hook that reads its stdin gets the same JSON as before. If Rocky cannot create the file, for example on a read-only container filesystem, it logs a warning and uses a pipe as before.
-- The Trino Basic-auth `user` now prints as `${NAME}` in `Debug` output when a `${VAR}` set it (#1919). The Trino `AuthError` `Debug` now prints its rendered error text, like the Snowflake, BigQuery and Databricks `AuthError`.
+- The Trino Basic-auth `user` and the Trino client config (coordinator URL, user, catalog, schema) now print as `${NAME}` in `Debug` output when a `${VAR}` set them (#1919). The Trino `AuthError` `Debug` now prints its rendered error text, like the Snowflake, BigQuery and Databricks `AuthError`.
 
 ## [1.81.1] — 2026-10-15
 
