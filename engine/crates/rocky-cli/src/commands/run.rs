@@ -36213,6 +36213,12 @@ auto_create_schemas = true
     /// A derived physical-read edge orders the run; it is not part of a
     /// model's logic. Deriving one must leave every model's `skip_hash()`
     /// unchanged, or an ordering fact would force rebuilds and break reuse.
+    ///
+    /// This guards the run-path seam: it fails if the augment ever writes
+    /// into a `Model`. The hash projection itself is guarded by
+    /// `derived_physical_edge_does_not_enter_skip_hash` in `rocky-core`.
+    /// The skip gate's upstream check (B3) does read these edges, on
+    /// purpose: a built producer still rebuilds its reader.
     #[cfg(feature = "duckdb")]
     #[test]
     fn a_derived_physical_edge_never_changes_skip_hash() {
@@ -36257,6 +36263,18 @@ auto_create_schemas = true
         assert!(
             before.values().all(Option::is_some),
             "precondition: every model canonicalises — {before:?}"
+        );
+        // The edge must not exist yet, or the augment below derives nothing.
+        let consumer = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "mart_qualified")
+            .expect("consumer node");
+        assert!(
+            !consumer.depends_on.contains(&"orders".to_string()),
+            "precondition: compile did not bind the qualified read — {:?}",
+            consumer.depends_on
         );
 
         let mut warnings = Vec::new();
