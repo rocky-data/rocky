@@ -1,6 +1,6 @@
 [package]
 name = "rocky-clickhouse"
-version = "1.82.2"
+version = "1.83.0"
 description = "ClickHouse warehouse adapter for Rocky (beta)"
 edition.workspace = true
 license.workspace = true

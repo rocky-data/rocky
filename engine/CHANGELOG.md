@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.83.0] — 2026-10-15
+
 ### Added
 
 - The browser UI can run `rocky test` and `rocky ci` in operator mode (#2323). Two new routes, `POST /api/v1/jobs/test` and `POST /api/v1/jobs/ci`, start the job like `run` and `plan`. The estate screen has **Test** and **CI** buttons. A model panel has **Test this model**. Both jobs only read the project and take no mutation lock. They read the same models and contracts as the server: its `--contracts`, and its `--models` when one was given. A failed job names its compile errors and failed tests. A read-only token, a foreign `Host` and a missing credential are refused exactly as for `run`. `JobKind` gains `test` and `ci` in the `job_status` schema, so a client that switches on `kind` must handle the two new values.
@@ -16,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `rocky preview create` now finds the changed models when the project is a subfolder of the git repository, or when `--models` is an absolute path (#2323). Before, the paths git reports (relative to the repository root) were read from the process's working directory, so a changed model was missed and cloned from production. Each path is now resolved against the repository root. A file name with non-ASCII characters is no longer dropped, and after a rename, models downstream of the old name are now treated as changed. This also fixes the browser UI, which passes an absolute `--models`.
-- `rocky preview create` now creates the branch schema with the warehouse's own identifier quoting. Before, it always used double quotes, which Databricks reads as a string, so every copy there failed and the models were only planned.
+- `rocky preview create` now creates the branch schema with the warehouse's own identifier quoting. Before, it always used double quotes, which Databricks reads as a string, so every copy there failed and the models were only planned. A model whose catalog differs from the connection's default catalog still fails to copy (#2389).
 
 ## [1.82.2] — 2026-10-15
 
