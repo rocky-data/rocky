@@ -41,6 +41,22 @@ class JobKind4(StrEnum):
     approve = "approve"
 
 
+class JobKind5(StrEnum):
+    """
+    `rocky test` — runs the models' tests in local DuckDB. Reads the project, writes no warehouse state; no permit.
+    """
+
+    test = "test"
+
+
+class JobKind6(StrEnum):
+    """
+    `rocky ci` — compile + test without warehouse credentials. Non-mutating; no permit.
+    """
+
+    ci = "ci"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -100,7 +116,7 @@ class JobStatus(BaseModel):
     """
     Opaque job identifier (as returned by `POST /api/v1/jobs/{kind}`).
     """
-    kind: JobKind1 | JobKind2 | JobKind3 | JobKind4
+    kind: JobKind1 | JobKind2 | JobKind3 | JobKind4 | JobKind5 | JobKind6
     """
     Which operation the job wraps.
     """

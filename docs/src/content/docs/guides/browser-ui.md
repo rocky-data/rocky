@@ -172,7 +172,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 ### Cancel a running job
 

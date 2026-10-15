@@ -812,6 +812,38 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "post",
+            path: "/api/v1/jobs/test",
+            operation_id: "submitTestJob",
+            tag: "jobs",
+            summary: "Submit a test job",
+            description: "Submit a non-mutating `test` job: `rocky test` in local DuckDB. \
+                 Does not take the mutating permit. The optional `model` field limits the \
+                 run to one model.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/ci",
+            operation_id: "submitCiJob",
+            tag: "jobs",
+            summary: "Submit a ci job",
+            description: "Submit a non-mutating `ci` job: `rocky ci`, compile plus test with \
+                 no warehouse credentials. Does not take the mutating permit. The body is \
+                 ignored.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST],
+            auth_exempt: false,
+        },
+        Route {
             method: "get",
             path: "/api/v1/jobs/{id}",
             operation_id: "getJob",

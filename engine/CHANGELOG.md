@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The browser UI can run `rocky test` and `rocky ci` in operator mode (#2323). Two new routes, `POST /api/v1/jobs/test` and `POST /api/v1/jobs/ci`, start the job like `run` and `plan`. The estate screen has **Test** and **CI** buttons. A model panel has **Test this model**. Both jobs only read the project and take no mutation lock. They read the same models and contracts as the server: its `--contracts`, and its `--models` when one was given. A failed job names its compile errors and failed tests. A read-only token, a foreign `Host` and a missing credential are refused exactly as for `run`. `JobKind` gains `test` and `ci` in the `job_status` schema, so a client that switches on `kind` must handle the two new values.
+
 ## [1.82.2] — 2026-10-15
 
 ### Fixed

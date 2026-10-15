@@ -111,6 +111,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
        /api/v1/jobs/plan                │
        /api/v1/jobs/apply               │
        /api/v1/jobs/approve             │
+       /api/v1/jobs/test                │
+       /api/v1/jobs/ci                  │
         ┌───────────────────────────────┘
         ▼
   GET /api/v1/jobs/{id} ──► running ───► poll again
@@ -121,6 +123,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
 ```
 
 The polled result is the same payload the CLI would have produced.
+
+`POST /api/v1/jobs/test` runs `rocky test` in local DuckDB. The optional body `{"model": "<name>"}` tests one model. `POST /api/v1/jobs/ci` runs `rocky ci` (compile and test, no warehouse credentials) and ignores the body. Neither takes the single-mutation lock, so a `test` or `ci` job is never blocked by a run. Both sit behind the same write gate as `run`. A read-only token gets `403`.
 
 `POST /api/v1/jobs/approve` takes `{"plan_id": "<64 lowercase hex>"}`. It runs `rocky review <plan_id> --approve` as a subprocess and takes the same single-mutation lock as `run` and `apply`. While one of them runs, it answers `409 mutation_in_progress`. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`. The approval records the approver source `http_api` and the server's git identity. If `git config user.email` cannot be resolved, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`, so run records show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
 

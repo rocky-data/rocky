@@ -10543,6 +10543,20 @@
               "approve"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky test` — runs the models' tests in local DuckDB. Reads the project, writes no warehouse state; no permit.",
+            "enum": [
+              "test"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`rocky ci` — compile + test without warehouse credentials. Non-mutating; no permit.",
+            "enum": [
+              "ci"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10567,7 +10581,7 @@
           },
           "model": {
             "default": null,
-            "description": "`--model <name>` for `run`/`plan` (single-model execution).",
+            "description": "`--model <name>` for `run`/`plan` (single-model execution) and `test`.",
             "type": [
               "string",
               "null"
@@ -26075,6 +26089,68 @@
         ]
       }
     },
+    "/api/v1/jobs/ci": {
+      "post": {
+        "description": "Submit a non-mutating `ci` job: `rocky ci`, compile plus test with no warehouse credentials. Does not take the mutating permit. The body is ignored.",
+        "operationId": "submitCiJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          }
+        },
+        "summary": "Submit a ci job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
     "/api/v1/jobs/plan": {
       "post": {
         "description": "Submit a non-mutating `plan` job. Does not take the mutating permit, so it is never blocked by a running run/apply.",
@@ -26204,6 +26280,68 @@
           }
         },
         "summary": "Submit a run job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/test": {
+      "post": {
+        "description": "Submit a non-mutating `test` job: `rocky test` in local DuckDB. Does not take the mutating permit. The optional `model` field limits the run to one model.",
+        "operationId": "submitTestJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          }
+        },
+        "summary": "Submit a test job",
         "tags": [
           "jobs"
         ]

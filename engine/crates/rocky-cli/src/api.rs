@@ -26,6 +26,8 @@
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
 //! POST /api/v1/jobs/apply                       → submit an apply job → 202 {job_id}
 //! POST /api/v1/jobs/approve                     → approve a plan (= rocky review --approve) → 202 {job_id}
+//! POST /api/v1/jobs/test                        → submit a test job   → 202 {job_id}
+//! POST /api/v1/jobs/ci                          → submit a ci job     → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -190,6 +192,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/approve", post(submit_approve))
+        .route("/api/v1/jobs/test", post(submit_test))
+        .route("/api/v1/jobs/ci", post(submit_ci))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
@@ -958,6 +962,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/plan",
         "POST /api/v1/jobs/apply",
         "POST /api/v1/jobs/approve",
+        "POST /api/v1/jobs/test",
+        "POST /api/v1/jobs/ci",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
@@ -2774,7 +2780,7 @@ pub(crate) struct JobRequest {
     filter: Option<String>,
     /// `--pipeline <name>` for `run`/`plan`.
     pipeline: Option<String>,
-    /// `--model <name>` for `run`/`plan` (single-model execution).
+    /// `--model <name>` for `run`/`plan` (single-model execution) and `test`.
     model: Option<String>,
     /// The positional `<plan_id>` for `apply` and `approve`: required there,
     /// and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.
@@ -3222,7 +3228,27 @@ async fn submit_approve(
     submit_job(JobKind::Approve, state, &headers, &body).await
 }
 
-/// Shared submission path for all three job kinds.
+/// `POST /api/v1/jobs/test` — submit a test job: `rocky test` in local
+/// DuckDB (non-mutating; no permit). Body `{"model": "<name>"}` is optional.
+async fn submit_test(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Test, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/ci` — submit a ci job: `rocky ci`, compile + test with
+/// no warehouse credentials (non-mutating; no permit). The body is ignored.
+async fn submit_ci(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Ci, state, &headers, &body).await
+}
+
+/// Shared submission path for all job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
 /// — a second attempt while one is held is a `409 mutation_in_progress` — and
@@ -3275,6 +3301,7 @@ async fn submit_job(
 
     let state_path = state_path_for(&state);
     let config_path = state.config_path.clone();
+    let dirs = JobProjectDirs::of(&state);
 
     // Register + persist the `running` record BEFORE spawning the subprocess and
     // BEFORE returning 202, so a crash immediately after submission still reports
@@ -3310,8 +3337,15 @@ async fn submit_job(
     cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
-        let (final_state, result, error) =
-            execute_job_subprocess(kind, config_path, state_path.clone(), request, cancel_rx).await;
+        let (final_state, result, error) = execute_job_subprocess(
+            kind,
+            config_path,
+            dirs,
+            state_path.clone(),
+            request,
+            cancel_rx,
+        )
+        .await;
 
         finish_job(
             task_state,
@@ -3338,7 +3372,7 @@ async fn submit_job(
 /// ignore the field, as before.
 fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
     match kind {
-        JobKind::Run | JobKind::Plan => Ok(()),
+        JobKind::Run | JobKind::Plan | JobKind::Test | JobKind::Ci => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3386,9 +3420,41 @@ async fn finish_job<P>(
 /// proven by the live reachability transcript, while THIS seam pins exactly
 /// which request fields become which flags (notably `expect_spec_digest` →
 /// `--expect-spec-digest` on `apply`).
+/// The server's own `--models` and `--contracts`. A `test` or `ci` child
+/// reads the project from these, not from its cwd, so it checks the same
+/// models and contracts the UI shows.
+#[derive(Debug, Clone, Default)]
+struct JobProjectDirs {
+    /// Set only when `rocky serve` got an explicit `--models`. Otherwise the
+    /// child resolves models the same way the CLI does with no flag.
+    models: Option<std::path::PathBuf>,
+    contracts: Option<std::path::PathBuf>,
+}
+
+impl JobProjectDirs {
+    fn of(state: &ServerState) -> Self {
+        Self {
+            models: state
+                .models_dir_is_explicit
+                .then(|| state.models_dir.clone()),
+            contracts: state.contracts_dir.clone(),
+        }
+    }
+
+    /// Resolve against the server's cwd, before the child moves to the
+    /// project root.
+    fn absolute(&self) -> Self {
+        Self {
+            models: self.models.as_deref().map(absolute_path),
+            contracts: self.contracts.as_deref().map(absolute_path),
+        }
+    }
+}
+
 fn job_subprocess_args(
     kind: JobKind,
     config_path: Option<&std::path::Path>,
+    dirs: &JobProjectDirs,
     state_path: &std::path::Path,
     request: &JobRequest,
 ) -> Vec<std::ffi::OsString> {
@@ -3436,6 +3502,22 @@ fn job_subprocess_args(
             }
             args.push("--approve".into());
         }
+        JobKind::Test | JobKind::Ci => {
+            if let Some(models) = &dirs.models {
+                args.push("--models".into());
+                args.push(models.into());
+            }
+            if let Some(contracts) = &dirs.contracts {
+                args.push("--contracts".into());
+                args.push(contracts.into());
+            }
+            if kind == JobKind::Test
+                && let Some(model) = &request.model
+            {
+                args.push("--model".into());
+                args.push(model.into());
+            }
+        }
     }
     args
 }
@@ -3449,6 +3531,7 @@ fn job_subprocess_args(
 async fn execute_job_subprocess(
     kind: JobKind,
     config_path: Option<std::path::PathBuf>,
+    dirs: JobProjectDirs,
     state_path: std::path::PathBuf,
     request: JobRequest,
     cancel: tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
@@ -3464,7 +3547,14 @@ async fn execute_job_subprocess(
         }
     };
 
-    let cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
+    let cmd = job_subprocess_command(
+        exe,
+        kind,
+        config_path.as_deref(),
+        &dirs,
+        &state_path,
+        &request,
+    );
 
     let output = match run_job_child(cmd, cancel).await {
         Ok(output) => output,
@@ -4017,6 +4107,7 @@ fn job_subprocess_command(
     exe: std::path::PathBuf,
     kind: JobKind,
     config_path: Option<&std::path::Path>,
+    dirs: &JobProjectDirs,
     state_path: &std::path::Path,
     request: &JobRequest,
 ) -> tokio::process::Command {
@@ -4036,10 +4127,11 @@ fn job_subprocess_command(
     // cwd cannot change what a relative `--config` or `--state-path` names.
     let config_path = config_path.map(absolute_path);
     let state_path = absolute_path(state_path);
+    let dirs = dirs.absolute();
     if let Some(root) = config_path.as_deref().and_then(std::path::Path::parent) {
         cmd.current_dir(root);
     }
-    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, request) {
+    for arg in job_subprocess_args(kind, config_path.as_deref(), &dirs, &state_path, request) {
         cmd.arg(arg);
     }
     cmd
@@ -4149,6 +4241,7 @@ mod tests {
             probe,
             JobKind::Run,
             None,
+            &JobProjectDirs::default(),
             &dir.path().join("state.redb"),
             &JobRequest::default(),
         );
@@ -9744,6 +9837,12 @@ mod tests {
         assert!(JobKind::Apply.mutates());
         assert!(JobKind::Approve.mutates());
         assert!(!JobKind::Plan.mutates());
+        assert!(!JobKind::Test.mutates());
+        assert!(!JobKind::Ci.mutates());
+        assert_eq!(JobKind::Test.verb(), "test");
+        assert_eq!(JobKind::Ci.verb(), "ci");
+        assert_eq!(JobKind::Test.subcommand(), "test");
+        assert_eq!(JobKind::Ci.subcommand(), "ci");
         assert_eq!(JobKind::Run.verb(), "run");
         assert_eq!(JobKind::Plan.verb(), "plan");
         assert_eq!(JobKind::Apply.verb(), "apply");
@@ -9754,8 +9853,145 @@ mod tests {
             JobKind::Plan,
             JobKind::Apply,
             JobKind::Approve,
+            JobKind::Test,
+            JobKind::Ci,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
+        }
+    }
+
+    /// `test` and `ci` jobs spawn `rocky test [--model m]` and `rocky ci`; only
+    /// `test` carries `--model`, and neither carries run/plan flags.
+    #[test]
+    fn test_and_ci_job_argv() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let request = JobRequest {
+            model: Some("dim_customers".to_string()),
+            filter: Some("client=acme".to_string()),
+            ..JobRequest::default()
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(kind, None, &JobProjectDirs::default(), state, &request)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let head = ["--output", "json", "--state-path", "/tmp/state.redb"];
+        let mut test = head.to_vec();
+        test.extend(["test", "--model", "dim_customers"]);
+        assert_eq!(argv(JobKind::Test), test);
+        let mut ci = head.to_vec();
+        ci.push("ci");
+        assert_eq!(argv(JobKind::Ci), ci);
+    }
+
+    /// A `test` or `ci` child reads the project from its flags, so it gets
+    /// the server's own `--models` and `--contracts`. Without them, `rocky
+    /// serve --ui --contracts c/` would show contract errors in the compile
+    /// view while the Test job reported "done". The other kinds read models
+    /// from the config's pipelines and never carry either flag.
+    #[test]
+    fn test_and_ci_jobs_carry_the_servers_models_and_contracts() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/src/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let request = JobRequest {
+            model: Some("dim_customers".to_string()),
+            ..JobRequest::default()
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(kind, None, &dirs, state, &request)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let head = ["--output", "json", "--state-path", "/tmp/state.redb"];
+        let project = ["--models", "/p/src/models", "--contracts", "/p/contracts"];
+        let mut test = head.to_vec();
+        test.push("test");
+        test.extend(project);
+        test.extend(["--model", "dim_customers"]);
+        assert_eq!(argv(JobKind::Test), test);
+        let mut ci = head.to_vec();
+        ci.push("ci");
+        ci.extend(project);
+        assert_eq!(argv(JobKind::Ci), ci);
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            let args = argv(kind);
+            assert!(
+                !args.iter().any(|a| a == "--models" || a == "--contracts"),
+                "{kind:?} must not carry the project dirs: {args:?}"
+            );
+        }
+    }
+
+    /// A models dir the server derived (no explicit `--models`) stays off the
+    /// child's argv, so `rocky ci` still compiles every pipeline's models. The
+    /// contracts dir always rides along.
+    #[tokio::test]
+    async fn job_project_dirs_pass_models_only_when_the_server_was_given_them() {
+        let derived = ServerState::with_auth(
+            PathBuf::from("models"),
+            Some(PathBuf::from("contracts")),
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        let dirs = JobProjectDirs::of(&derived);
+        assert_eq!(dirs.models, None);
+        assert_eq!(dirs.contracts, Some(PathBuf::from("contracts")));
+
+        let explicit = ServerState::with_auth_and_webhook(
+            PathBuf::from("src/models"),
+            true,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            rocky_server::state::SettingsSnapshot::default(),
+        );
+        let dirs = JobProjectDirs::of(&explicit);
+        assert_eq!(dirs.models, Some(PathBuf::from("src/models")));
+        assert_eq!(dirs.contracts, None);
+    }
+
+    /// The child's cwd moves to the project root, so a relative `--models`
+    /// or `--contracts` the server was started with must be made absolute
+    /// first, against the server's own cwd.
+    #[test]
+    fn the_job_command_passes_absolute_project_dirs() {
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("rel-models")),
+            contracts: Some(PathBuf::from("rel-contracts")),
+        };
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Ci,
+            Some(std::path::Path::new("sub/rocky.toml")),
+            &dirs,
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        let args: Vec<PathBuf> = command.as_std().get_args().map(PathBuf::from).collect();
+        let cwd = std::env::current_dir().unwrap();
+        for (flag, value) in [("--models", "rel-models"), ("--contracts", "rel-contracts")] {
+            let at = args
+                .iter()
+                .position(|a| a.as_os_str() == flag)
+                .unwrap_or_else(|| panic!("{flag} missing: {args:?}"));
+            assert_eq!(args[at + 1], cwd.join(value), "{flag}");
         }
     }
 
@@ -9772,7 +10008,13 @@ mod tests {
             expect_spec_digest: Some("sha256:feed".to_string()),
             ..JobRequest::default()
         };
-        let args = job_subprocess_args(JobKind::Apply, None, state, &with);
+        let args = job_subprocess_args(
+            JobKind::Apply,
+            None,
+            &JobProjectDirs::default(),
+            state,
+            &with,
+        );
         let args: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -9793,7 +10035,13 @@ mod tests {
             plan_id: Some("abc123".to_string()),
             ..JobRequest::default()
         };
-        let args = job_subprocess_args(JobKind::Apply, None, state, &without);
+        let args = job_subprocess_args(
+            JobKind::Apply,
+            None,
+            &JobProjectDirs::default(),
+            state,
+            &without,
+        );
         assert!(
             !args
                 .iter()
@@ -9807,7 +10055,7 @@ mod tests {
             ..JobRequest::default()
         };
         for kind in [JobKind::Run, JobKind::Plan] {
-            let args = job_subprocess_args(kind, None, state, &stray);
+            let args = job_subprocess_args(kind, None, &JobProjectDirs::default(), state, &stray);
             assert!(
                 !args
                     .iter()
@@ -11995,6 +12243,7 @@ adapter = "db"
         let args: Vec<String> = job_subprocess_args(
             JobKind::Approve,
             Some(std::path::Path::new("rocky.toml")),
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &request,
         )
@@ -12039,6 +12288,7 @@ adapter = "db"
                 probe.clone(),
                 kind,
                 None,
+                &JobProjectDirs::default(),
                 &dir.path().join("state.redb"),
                 &JobRequest::default(),
             );
@@ -12057,6 +12307,7 @@ adapter = "db"
                 probe.clone(),
                 kind,
                 None,
+                &JobProjectDirs::default(),
                 &dir.path().join("state.redb"),
                 &JobRequest::default(),
             )
@@ -12086,6 +12337,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Approve,
             Some(&config),
+            &JobProjectDirs::default(),
             std::path::Path::new("relative-state.redb"),
             &request,
         );
@@ -12104,6 +12356,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Run,
             Some(std::path::Path::new("sub/rocky.toml")),
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &JobRequest::default(),
         );
@@ -12117,6 +12370,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Run,
             None,
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &JobRequest::default(),
         );
@@ -12203,6 +12457,90 @@ adapter = "db"
         assert_eq!(resp.status(), 403, "a read-only token");
         let body: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(body.code, "forbidden_read_only_token");
+    }
+
+    /// The `test` and `ci` job routes sit behind the same write gate as the
+    /// run route: no credential is 401, a foreign `Host` 421, a UI cookie
+    /// without `X-Rocky-UI` (or without this server's Origin) 403, and a
+    /// read-only token (operator mode off) 403. A request that passes the gate
+    /// reaches the handler: a malformed body is a 400 there, which never
+    /// spawns a child.
+    #[tokio::test]
+    async fn test_and_ci_routes_are_behind_the_write_gate() {
+        for route in ["test", "ci"] {
+            let url = |base: &str| format!("{base}/api/v1/jobs/{route}");
+            let client = no_redirect_client();
+
+            let full = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+            let resp = client.post(url(&full)).send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{route}: no credential");
+
+            let resp = client
+                .post(url(&full))
+                .bearer_auth(OPERATOR_TOKEN)
+                .header("host", "evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 421, "{route}: a foreign Host");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "host_not_allowed", "{route}");
+
+            let cookie = login_cookie(&client, &full).await;
+            for (origin, marker, why) in [
+                (Some(full.as_str()), false, "a cookie without X-Rocky-UI"),
+                (None, true, "a cookie without Origin"),
+                (
+                    Some("http://127.0.0.1:1"),
+                    true,
+                    "a cookie from another local page",
+                ),
+            ] {
+                let mut req = client.post(url(&full)).header("cookie", &cookie);
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                if marker {
+                    req = req.header("x-rocky-ui", "1");
+                }
+                let resp = req.send().await.unwrap();
+                assert_eq!(resp.status(), 403, "{route}: {why}");
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(body.code, "ui_write_not_from_ui", "{route}: {why}");
+            }
+
+            // Through the gate: the handler answers (a bad body, no spawn).
+            let resp = client
+                .post(url(&full))
+                .header("cookie", &cookie)
+                .header("origin", &full)
+                .header("x-rocky-ui", "1")
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{route}: the page's own submit");
+            let resp = client
+                .post(url(&full))
+                .bearer_auth(OPERATOR_TOKEN)
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{route}: a full-scope Bearer");
+
+            let read_only = spawn_router(ui_state_scoped(TokenScope::ReadOnly, &[], None)).await;
+            let resp = client
+                .post(url(&read_only))
+                .bearer_auth(OPERATOR_TOKEN)
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{route}: a read-only token");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "forbidden_read_only_token", "{route}");
+        }
     }
 
     /// The refusals: a finished job and a job whose child has exited are

@@ -12624,6 +12624,12 @@ pub enum JobKind {
     /// unblocks `apply`. Takes the mutation permit, so an approval cannot
     /// land while a run or an apply is in flight.
     Approve,
+    /// `rocky test` — runs the models' tests in local DuckDB. Reads the project,
+    /// writes no warehouse state; no permit.
+    Test,
+    /// `rocky ci` — compile + test without warehouse credentials. Non-mutating;
+    /// no permit.
+    Ci,
 }
 
 impl JobKind {
@@ -12636,6 +12642,8 @@ impl JobKind {
             JobKind::Plan => "plan",
             JobKind::Apply => "apply",
             JobKind::Approve => "approve",
+            JobKind::Test => "test",
+            JobKind::Ci => "ci",
         }
     }
 
@@ -12647,16 +12655,18 @@ impl JobKind {
             JobKind::Plan => "plan",
             JobKind::Apply => "apply",
             JobKind::Approve => "review",
+            JobKind::Test => "test",
+            JobKind::Ci => "ci",
         }
     }
 
     /// Whether this kind takes the single mutation permit. `run` and `apply`
-    /// change warehouse state; `approve` changes what `apply` may do. `plan`
-    /// previews only.
+    /// change warehouse state; `approve` changes what `apply` may do. `plan`,
+    /// `test` and `ci` only preview or check.
     pub fn mutates(self) -> bool {
         match self {
             JobKind::Run | JobKind::Apply | JobKind::Approve => true,
-            JobKind::Plan => false,
+            JobKind::Plan | JobKind::Test | JobKind::Ci => false,
         }
     }
 
@@ -12667,6 +12677,8 @@ impl JobKind {
             "plan" => Some(JobKind::Plan),
             "apply" => Some(JobKind::Apply),
             "approve" => Some(JobKind::Approve),
+            "test" => Some(JobKind::Test),
+            "ci" => Some(JobKind::Ci),
             _ => None,
         }
     }
