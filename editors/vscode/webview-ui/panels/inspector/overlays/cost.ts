@@ -52,7 +52,10 @@ export function makeCostOverlay(
 ): LineageOverlay {
   const byModel = new Map((plan?.models ?? []).map((m) => [m.model, m]));
   const stale = plan ? staleReason(plan, now) : null;
-  const when = plan ? relativeTime(plan.recordedAt, now) : "";
+  const filterNote = plan?.filter ? ` · filter ${plan.filter}` : "";
+  const when = plan
+    ? `${relativeTime(plan.recordedAt, now)}${filterNote}`
+    : "";
   return {
     id: "cost",
     decorate(node) {

@@ -48,6 +48,15 @@ describe("cost overlay", () => {
     expect(b.title).not.toContain("stale");
   });
 
+  it("names the planned filter in the tooltip and legend, only when set", () => {
+    const o = makeCostOverlay(plan(), NOW);
+    expect(o.decorate(node("a"))![0].title).toContain("30 min ago · filter client=acme");
+    expect(o.legend!()[0].text).toContain("filter client=acme");
+    const none = makeCostOverlay(plan({ filter: "" }), NOW);
+    expect(none.decorate(node("a"))![0].title).not.toContain("filter");
+    expect(none.legend!()[0].text).not.toContain("filter");
+  });
+
   it("labels a plan stale when a model changed since", () => {
     const [b] = makeCostOverlay(plan({ modelsChangedSince: true }), NOW).decorate(node("a"))!;
     expect(b.text).toContain("stale");
