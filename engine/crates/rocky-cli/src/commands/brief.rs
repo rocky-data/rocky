@@ -838,6 +838,7 @@ fn build_autonomy(
             scope: f.scope,
             frozen_at: f.frozen_at.to_rfc3339(),
             plan_id: f.plan_id,
+            unreadable_marker: false,
         })
         .collect();
 
@@ -969,6 +970,7 @@ fn merge_marker_freezes(
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_default(),
                 plan_id: format!("freeze:{}", marker.freeze_id),
+                unreadable_marker: marker.principal.is_none(),
             });
         }
     }
@@ -2904,5 +2906,47 @@ mod tests {
             out.scheduler
         );
         assert_eq!(out.scheduler.scheduled_pipelines, 0);
+    }
+
+    /// A marker with an unreadable body is listed once per principal, and
+    /// every such row says so: the browser UI needs the flag to lift it, as
+    /// `rocky policy unfreeze` lifts it only with no principal and scope `any`.
+    /// A readable marker row never carries the flag.
+    #[test]
+    fn an_unreadable_marker_freeze_is_flagged_on_both_rows() {
+        use rocky_core::freeze_marker::ActiveMarkerFreeze;
+        let marker = |id: &str, principal, scope: &str| ActiveMarkerFreeze {
+            freeze_id: id.to_string(),
+            principal,
+            scope: scope.to_string(),
+            reason: String::new(),
+            created_at: None,
+        };
+        let mut active = Vec::new();
+        merge_marker_freezes(
+            &mut active,
+            vec![
+                marker("bad", None, "any"),
+                marker("ok", Some(PolicyPrincipal::Agent), "layer=gold"),
+            ],
+        );
+        assert_eq!(active.len(), 3);
+        let flagged: Vec<_> = active
+            .iter()
+            .filter(|f| f.unreadable_marker)
+            .map(|f| (f.principal, f.scope.as_str(), f.plan_id.as_str()))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                (PolicyPrincipal::Agent, "any", "freeze:bad"),
+                (PolicyPrincipal::Human, "any", "freeze:bad"),
+            ]
+        );
+        assert!(
+            active
+                .iter()
+                .any(|f| f.plan_id == "freeze:ok" && !f.unreadable_marker)
+        );
     }
 }

@@ -3265,7 +3265,8 @@ async fn submit_ci(
 }
 
 /// `POST /api/v1/jobs/freeze` — submit a freeze job: `rocky policy freeze`,
-/// the kill switch (mutating; takes the permit). Body
+/// the kill switch (mutating; takes no permit, so it can land during a run:
+/// a freeze only adds a deny, and the run's freeze fence stops the run). Body
 /// `{"principal": "agent"|"human", "scope": "<selector>", "reason": "<text>"}`,
 /// every field optional: no principal freezes both, no scope freezes every model.
 async fn submit_freeze(
@@ -3315,7 +3316,7 @@ async fn submit_job(
     // Layer 1: the app-level single-mutating-job guard. `plan` never takes it.
     // A second `run`/`apply` while one is held returns the holder's id as a
     // `409 mutation_in_progress` rather than colliding on the redb flock.
-    let permit = if kind.mutates() {
+    let permit = if kind.takes_permit() {
         match state.mutation_permit.try_acquire(&job_id) {
             Ok(guard) => Some(guard),
             Err(running_job_id) => return Err(ApiError::mutation_in_progress(&running_job_id)),
@@ -3696,6 +3697,12 @@ async fn execute_job_subprocess(
     // or a backtrace the browser would display.
     if let Some(result) = result.as_mut() {
         sanitize_result_errors(result);
+        // A freeze or unfreeze result carries `notes` that the UI shows (the
+        // "recorded but NOT enforced" warning names the config path), so they
+        // get the same cleaning.
+        if matches!(kind, JobKind::Freeze | JobKind::Unfreeze) {
+            sanitize_result_notes(result);
+        }
     }
 
     let state = settled_job_state(output.status.success(), output.signalled);
@@ -4033,6 +4040,22 @@ fn sanitize_result_errors(result: &mut serde_json::Value) {
                 text
             };
             *error = serde_json::Value::String(text);
+        }
+    }
+}
+
+/// Run every string in a job result's `notes` through [`sanitize_job_text`].
+/// Entries that are not strings are left as they are; the UI shows strings only.
+fn sanitize_result_notes(result: &mut serde_json::Value) {
+    let Some(notes) = result
+        .get_mut("notes")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for note in notes {
+        if let Some(text) = note.as_str() {
+            *note = serde_json::Value::String(sanitize_job_text(text));
         }
     }
 }
@@ -9958,10 +9981,17 @@ mod tests {
         assert!(!JobKind::Plan.mutates());
         assert!(!JobKind::Test.mutates());
         assert!(!JobKind::Ci.mutates());
-        // A freeze writes the policy ledger in the state store, so it takes the
-        // permit like a run: a freeze cannot land while a run holds the store.
+        // Both write the policy ledger, so both mutate. Only unfreeze takes the
+        // permit: a freeze is add-only and must land while a run holds it, so
+        // the run's freeze fence can stop that run.
         assert!(JobKind::Freeze.mutates());
         assert!(JobKind::Unfreeze.mutates());
+        assert!(!JobKind::Freeze.takes_permit());
+        assert!(JobKind::Unfreeze.takes_permit());
+        assert!(JobKind::Run.takes_permit());
+        assert!(JobKind::Apply.takes_permit());
+        assert!(JobKind::Approve.takes_permit());
+        assert!(!JobKind::Plan.takes_permit());
         assert_eq!(JobKind::Freeze.verb(), "freeze");
         assert_eq!(JobKind::Unfreeze.verb(), "unfreeze");
         assert_eq!(JobKind::Freeze.subcommand(), "policy");
@@ -10079,16 +10109,18 @@ mod tests {
     }
 
     /// The freeze fields are checked before the permit and the argv: a bad
-    /// principal, scope or reason is a `400` that never spawns a child, and a
-    /// good body takes the permit like a run (`409` while one is held).
+    /// principal, scope or reason is a `400` that never spawns a child. A good
+    /// body differs by route. An unfreeze takes the permit like a run (`409`
+    /// while one is held). A freeze takes none, so the kill switch can land
+    /// while a run holds it and the run's freeze fence then stops that run.
     #[tokio::test]
-    async fn freeze_routes_validate_their_fields_and_take_the_permit() {
+    async fn freeze_routes_validate_their_fields_and_only_unfreeze_takes_the_permit() {
         let state = test_state();
         let held = state
             .mutation_permit
             .try_acquire("job_incumbent")
             .expect("permit is free");
-        let base = spawn_router(state).await;
+        let base = spawn_router(state.clone()).await;
         let client = reqwest::Client::new();
         let long_scope = format!("model={}", "x".repeat(300));
         let long_reason = "r".repeat(501);
@@ -10123,14 +10155,30 @@ mod tests {
                 let envelope: ErrorEnvelope = resp.json().await.unwrap();
                 assert_eq!(envelope.code, "bad_request", "{route}: {body}");
             }
-            // Valid bodies pass validation and reach the permit, which is held.
-            for body in &good {
-                let resp = client.post(&url).json(body).send().await.unwrap();
-                assert_eq!(resp.status(), 409, "{route}: {body}");
-                let envelope: ErrorEnvelope = resp.json().await.unwrap();
-                assert_eq!(envelope.code, "mutation_in_progress", "{route}: {body}");
-                assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
-            }
+        }
+        // Unfreeze: valid bodies reach the permit, which is held.
+        let url = format!("{base}/api/v1/jobs/unfreeze");
+        for body in &good {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 409, "unfreeze: {body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "mutation_in_progress", "unfreeze: {body}");
+            assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+        }
+        // Freeze: accepted while the permit is held, and it leaves the permit
+        // with its holder. The child here is the test harness, not `rocky`, so
+        // the job settles as failed; only the acceptance is under test.
+        let url = format!("{base}/api/v1/jobs/freeze");
+        for body in &good {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 202, "freeze must not wait for the permit: {body}");
+            let accepted: serde_json::Value = resp.json().await.unwrap();
+            assert!(accepted["job_id"].is_string(), "{accepted}");
+            assert_eq!(
+                state.mutation_permit.running_job().as_deref(),
+                Some("job_incumbent"),
+                "a freeze job must not take or release the permit"
+            );
         }
         drop(held);
     }
@@ -13296,5 +13344,24 @@ Error: boom
         let long = result["errors"][1]["error"].as_str().unwrap();
         assert!(long.len() <= JOB_ERROR_MAX_BYTES + '…'.len_utf8());
         assert_eq!(result["other"], "/home/me/untouched");
+    }
+
+    /// A freeze result's `notes` reach the browser, and the "NOT enforced"
+    /// note names the config path, so they are cleaned like `errors`.
+    #[test]
+    fn freeze_result_notes_are_sanitized() {
+        let mut result = serde_json::json!({
+            "notes": [
+                "freeze recorded but NOT enforced: no [policy] block configured in /home/me/proj/rocky.toml. Every seam short-circuits.",
+                7,
+            ],
+            "scope": "/home/me/untouched",
+        });
+        super::sanitize_result_notes(&mut result);
+        let note = result["notes"][0].as_str().unwrap();
+        assert!(note.starts_with("freeze recorded but NOT enforced"), "{note}");
+        assert!(!note.contains("/home/me"), "the path is redacted: {note}");
+        assert_eq!(result["notes"][1], 7);
+        assert_eq!(result["scope"], "/home/me/untouched");
     }
 }

@@ -405,6 +405,10 @@ class BriefActiveFreeze(BaseModel):
     """
     The scope selector the freeze targets.
     """
+    unreadable_marker: bool | None = None
+    """
+    `true` when this row stands for a durable freeze marker whose body could not be read. Such a marker is in force for both principals on scope `any`, and is listed once per principal. `rocky policy unfreeze` lifts it only with no `--principal` and scope `any`. Omitted when `false`.
+    """
 
 
 class BriefAutonomySection(BaseModel):

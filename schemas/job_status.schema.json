@@ -47,14 +47,14 @@
           "type": "string"
         },
         {
-          "description": "`rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: it opens the state store for write, as `run` does.",
+          "description": "`rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes no permit: a freeze only adds a deny, so it must be able to land while a run holds the permit. On a remote `[state]` backend it goes through the ledger seam and never opens the local store, so it lands mid-run and the run stops at its next freeze fence. On a local state store it needs the store lock a run holds, so the job fails; retry after the run.",
           "enum": [
             "freeze"
           ],
           "type": "string"
         },
         {
-          "description": "`rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.",
+          "description": "`rocky policy unfreeze` — lifts a freeze. Takes the mutation permit, so a freeze cannot be lifted under a run in flight.",
           "enum": [
             "unfreeze"
           ],

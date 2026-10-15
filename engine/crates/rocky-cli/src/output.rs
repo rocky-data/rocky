@@ -10291,6 +10291,13 @@ pub struct BriefActiveFreeze {
     pub frozen_at: String,
     /// The freeze decision's `plan_id`.
     pub plan_id: String,
+    /// `true` when this row stands for a durable freeze marker whose body
+    /// could not be read. Such a marker is in force for both principals on
+    /// scope `any`, and is listed once per principal. `rocky policy unfreeze`
+    /// lifts it only with no `--principal` and scope `any`. Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable_marker: bool,
 }
 
 /// Agent-activity section — the policy-decision ledger rolled up by principal.
@@ -12632,10 +12639,15 @@ pub enum JobKind {
     Ci,
     /// `rocky policy freeze` — the kill switch: records a freeze decision in the
     /// policy-decision ledger (and a durable marker on a remote `[state]`).
-    /// Takes the mutation permit: it opens the state store for write, as `run`
-    /// does.
+    /// Takes no permit: a freeze only adds a deny, so it must be able to land
+    /// while a run holds the permit. On a remote `[state]` backend it goes
+    /// through the ledger seam and never opens the local store, so it lands
+    /// mid-run and the run stops at its next freeze fence. On a local state
+    /// store it needs the store lock a run holds, so the job fails; retry
+    /// after the run.
     Freeze,
-    /// `rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.
+    /// `rocky policy unfreeze` — lifts a freeze. Takes the mutation permit, so
+    /// a freeze cannot be lifted under a run in flight.
     Unfreeze,
 }
 
@@ -12671,10 +12683,11 @@ impl JobKind {
         }
     }
 
-    /// Whether this kind takes the single mutation permit. `run` and `apply`
-    /// change warehouse state; `approve` changes what `apply` may do; `freeze`
-    /// and `unfreeze` write the policy ledger in the state store. `plan`,
-    /// `test` and `ci` only preview or check.
+    /// Whether this kind changes state. `run` and `apply` change warehouse
+    /// state; `approve` changes what `apply` may do; `freeze` and `unfreeze`
+    /// write the policy ledger. `plan`, `test` and `ci` only preview or check.
+    /// Not the same as [`JobKind::takes_permit`]: `freeze` mutates but never
+    /// waits for the permit.
     pub fn mutates(self) -> bool {
         match self {
             JobKind::Run
@@ -12683,6 +12696,18 @@ impl JobKind {
             | JobKind::Freeze
             | JobKind::Unfreeze => true,
             JobKind::Plan | JobKind::Test | JobKind::Ci => false,
+        }
+    }
+
+    /// Whether a job of this kind takes the single mutation permit, so a
+    /// second one is refused with `409 mutation_in_progress`. `freeze` is the
+    /// exception among the mutating kinds: it is add-only, and the mid-run
+    /// freeze fence exists so a freeze landing during a run stops that run.
+    /// Making it wait for the run would defeat the kill switch.
+    pub fn takes_permit(self) -> bool {
+        match self {
+            JobKind::Run | JobKind::Apply | JobKind::Approve | JobKind::Unfreeze => true,
+            JobKind::Freeze | JobKind::Plan | JobKind::Test | JobKind::Ci => false,
         }
     }
 
