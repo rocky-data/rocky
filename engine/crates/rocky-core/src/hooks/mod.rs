@@ -2083,4 +2083,44 @@ url = "https://example.com/hook"
         assert_eq!(registry.fire(&ctx).await.unwrap(), HookResult::Continue);
         server.verify().await;
     }
+
+    #[tokio::test]
+    async fn a_webhook_that_returns_an_http_error_prints_its_url_only_as_its_name() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let url = format!("{}/services/T2383-status-3b8c/B3/frob", server.uri());
+        crate::secret_registry::register_substitution("ROCKY_T2383_STATUS_URL", &url);
+        let placeholder = "${ROCKY_T2383_STATUS_URL}";
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+
+        let config = webhook_hooks_config(&url, "on_failure = \"abort\"");
+        let registry = HookRegistry::from_config(&config);
+        let ctx = HookContext::pipeline_start("run-2383", "p");
+        let HookResult::Abort { reason } = registry.fire(&ctx).await.unwrap() else {
+            panic!("a 500 from an abort webhook must abort");
+        };
+        assert!(reason.contains("status 500"), "PRECONDITION: {reason}");
+        assert!(
+            !reason.contains("T2383-status-3b8c"),
+            "abort reason leaks: {reason}"
+        );
+        assert!(reason.contains(placeholder), "{reason}");
+
+        let text = logs.text();
+        assert!(
+            text.contains("webhook failed, aborting"),
+            "PRECONDITION: {text}"
+        );
+        assert!(
+            !text.contains("T2383-status-3b8c"),
+            "a log line leaks: {text}"
+        );
+    }
 }
