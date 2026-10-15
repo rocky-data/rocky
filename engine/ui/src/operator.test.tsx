@@ -372,6 +372,15 @@ describe("Approve and Apply on the plan page", () => {
       expect(submitted).toEqual([]);
     });
 
+    it("says where the approved digest lives, and not to copy the plan's own", async () => {
+      const { section, input } = await open(bound());
+      expect(input.value).toBe("");
+      expect(section).toHaveTextContent("approval.spec_digest");
+      expect(section).toHaveTextContent("rocky product status <name>");
+      expect(section).toHaveTextContent(/Do not copy the plan.s own digest from the spec card above/);
+      expect(section).toHaveTextContent("compare the plan with itself");
+    });
+
     it("sends exactly the typed digest as expect_spec_digest, after a confirm step", async () => {
       const { section, input, submitted } = await open(bound(), OPERATOR, [job("apply", "succeeded")]);
       fireEvent.change(input, { target: { value: "sha256:typed-by-hand" } });
@@ -437,6 +446,10 @@ describe("Approve and Apply on the plan page", () => {
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
       const alert = await within(section).findByRole("alert");
       expect(alert).toHaveTextContent("Apply: failed. Error: spec digest mismatch for plan 'x'");
+      // The engine's refusal line stays whole, with both digests it carries.
+      expect(alert).toHaveTextContent(
+        "Error: spec digest mismatch for plan 'x': the plan was authored against 'sha256:aaaa' but the applier expected 'sha256:bbbb'.",
+      );
       expect(alert.textContent).not.toContain("/Users/ops");
       expect(alert.textContent).not.toContain("state.redb");
     });

@@ -220,16 +220,28 @@ function SpecDrift({
   product: ProductStatusOutput;
 }) {
   const planned = status.spec_digest ?? null;
-  const current = product.spec_digest ?? product.committed_spec_digest ?? null;
-  if (planned === null || current === null) {
+  // The plan is checked against the APPROVED digest. The working spec
+  // (`product.spec_digest`) may be edited after approval without moving it.
+  const approved = product.approval?.spec_digest ?? null;
+  if (approved === null) {
+    return (
+      <StatusCard
+        label="the spec it was planned against"
+        value="no approval recorded"
+        sub="The product has no approval record, so the screen has no approved digest to compare this plan with."
+      />
+    );
+  }
+  if (planned === null) {
     return (
       <StatusCard
         label="the spec it was planned against"
         value="not recorded"
-        sub="One of the two digests is missing, so the screen cannot say whether the spec moved."
+        sub="The plan carries no spec digest, so the screen cannot say whether it matches the approval."
       />
     );
   }
+  const current = approved;
   if (planned === current) {
     return (
       <StatusCard
@@ -250,7 +262,7 @@ function SpecDrift({
       tone="risk"
       sub={
         <>
-          Planned against <Clip value={planned} />; the product is now <Clip value={current} />.
+          Planned against <Clip value={planned} />; the approved spec is <Clip value={current} />.
           Apply compares the digest you pass with the one this plan carries, not with the spec
           on disk. Passing the current digest refuses this plan; passing the digest it was
           planned against applies it, stale. Re-propose against the current spec.
@@ -540,6 +552,12 @@ function ProductApply({
       ) : (
         <WriteButton label="Apply" busy={busy} disabledReason={blocked} onClick={() => undefined} />
       )}
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        The approved digest is <code className="font-mono">approval.spec_digest</code> in{" "}
+        <code className="font-mono">rocky product status &lt;name&gt;</code>, or in your approval
+        record. Do not copy the plan&apos;s own digest from the spec card above: the check would
+        then compare the plan with itself.
+      </p>
       <JobLine label="Apply" view={apply} cancel={cancel} />
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
         The engine compares your digest with the one the plan carries and refuses the apply if

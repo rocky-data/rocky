@@ -10439,6 +10439,8 @@ mod tests {
             serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:ab cd" }),
             serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": " sha256:abcd" }),
             serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:abcd\n" }),
+            // A control character that is not whitespace (BEL), so only the control check refuses it.
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:ab\u{7}cd" }),
             serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": long }),
         ];
         for body in &bad {
