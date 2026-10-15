@@ -10563,7 +10563,7 @@
             "type": "string"
           },
           {
-            "description": "`rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: even on a remote `[state]` backend it opens the local store, which a run holds for its whole run. A browser freeze waits (`409 mutation_in_progress`) for a run, apply or approve in progress; to stop a running run, cancel that job.",
+            "description": "`rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: even on a remote `[state]` backend it opens the local store, which a run holds for its whole run. A browser freeze is refused (`409 mutation_in_progress`) while a run, apply or approve is in progress; retry once it finishes, or cancel that job.",
             "enum": [
               "freeze"
             ],
@@ -26195,7 +26195,7 @@
     },
     "/api/v1/jobs/freeze": {
       "post": {
-        "description": "Submit a mutating `freeze` job: `rocky policy freeze`, the kill switch. Records a freeze decision in the policy ledger. Takes the mutating permit: a freeze opens the local state store, which a run holds, so it waits (409 `mutation_in_progress`) for a run, apply or approve in progress. To stop a running run, cancel that job. The optional `principal` (`agent` or `human`; both when absent), `scope` (a selector; every model when absent) and `reason` fields are validated before the job starts.",
+        "description": "Submit a mutating `freeze` job: `rocky policy freeze`, the kill switch. Records a freeze decision in the policy ledger. Takes the mutating permit: a freeze opens the local state store, which a run holds, so it is refused (409 `mutation_in_progress`) while a run, apply or approve is in progress. Retry once it finishes, or cancel that job. The optional `principal` (`agent` or `human`; both when absent), `scope` (a selector; every model when absent) and `reason` fields are validated before the job starts.",
         "operationId": "submitFreezeJob",
         "parameters": [
           {

@@ -192,7 +192,7 @@ function UnfreezeRow({
           label={`Unfreeze ${name}`}
           question={
             unreadable
-              ? "Lift the unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again."
+              ? "Lift every unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again."
               : `Lift the freeze on ${name}? Those actions can run again.`
           }
           confirmLabel="Confirm unfreeze"
@@ -208,9 +208,9 @@ function UnfreezeRow({
 /**
  * The kill switch from the browser: freeze actions to `deny` for a principal
  * and a scope, and lift a freeze in force. Each runs `rocky policy freeze` or
- * `rocky policy unfreeze` on the server. Both wait for a run, apply or approve
- * in progress (409 until it finishes); to stop a running run, use Cancel on
- * that job. The ledger row names the server's principal id, not the
+ * `rocky policy unfreeze` on the server. Both are refused (409) while a run,
+ * apply or approve is in progress, so retry once it finishes; to stop a
+ * running run, use Cancel on that job. The ledger row names the server's principal id, not the
  * person at the page, and does not say the freeze came from the browser.
  */
 export function FreezeControls({

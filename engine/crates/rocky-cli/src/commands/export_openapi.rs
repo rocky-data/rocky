@@ -852,8 +852,8 @@ fn route_table() -> Vec<Route> {
             description: "Submit a mutating `freeze` job: `rocky policy freeze`, the kill \
                  switch. Records a freeze decision in the policy ledger. Takes the mutating \
                  permit: a freeze opens the local state store, which a run holds, so it \
-                 waits (409 `mutation_in_progress`) for a run, apply or approve in \
-                 progress. To stop a running run, cancel that job. The \
+                 is refused (409 `mutation_in_progress`) while a run, apply or approve \
+                 is in progress. Retry once it finishes, or cancel that job. The \
                  optional `principal` (`agent` or `human`; both when absent), \
                  `scope` (a selector; every model when absent) and `reason` fields are \
                  validated before the job starts.",

@@ -432,7 +432,7 @@ describe("Freeze and unfreeze on the brief", () => {
     fireEvent.click(buttons[0]);
     expect(
       screen.getByText(
-        "Lift the unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again.",
+        "Lift every unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again.",
       ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));

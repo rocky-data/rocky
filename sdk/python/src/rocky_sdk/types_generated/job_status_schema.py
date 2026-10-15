@@ -59,7 +59,7 @@ class JobKind6(StrEnum):
 
 class JobKind7(StrEnum):
     """
-    `rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: even on a remote `[state]` backend it opens the local store, which a run holds for its whole run. A browser freeze waits (`409 mutation_in_progress`) for a run, apply or approve in progress; to stop a running run, cancel that job.
+    `rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: even on a remote `[state]` backend it opens the local store, which a run holds for its whole run. A browser freeze is refused (`409 mutation_in_progress`) while a run, apply or approve is in progress; retry once it finishes, or cancel that job.
     """
 
     freeze = "freeze"
