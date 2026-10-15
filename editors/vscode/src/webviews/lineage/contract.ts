@@ -33,6 +33,8 @@ export interface GraphEdge {
 
 /** The full project graph, returned by the `"graph"` request. */
 export interface GraphData {
+  /** Project root the graph was built from; scopes the plan-cost overlay. */
+  projectRoot?: string | null;
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
@@ -78,6 +80,11 @@ export interface ReplayData {
   models: ReplayModelLite[];
   /** Set when there is no run to replay. */
   unavailable?: string;
+}
+
+/** Params for the `"planCost"` request: the root the graph was built from. */
+export interface PlanCostParam {
+  projectRoot: string | null;
 }
 
 /** One model's plan-time cost estimate, from the last `rocky plan` the extension ran. */

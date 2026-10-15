@@ -19,6 +19,7 @@ import type {
   InspectorTestsData,
   ModelParam,
 } from "../webviews/inspector/contract";
+import type { PlanCostParam } from "../webviews/lineage/contract";
 import type { AiActionParam } from "../webviews/lineage/contract";
 import {
   buildGraph,
@@ -50,7 +51,9 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
       h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
       h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
       h.onRequest("breaking", () => loadBreaking());
-      h.onRequest("planCost", () => loadPlanCost());
+      h.onRequest("planCost", (p) =>
+        loadPlanCost((p as PlanCostParam | undefined)?.projectRoot),
+      );
       h.onRequest("replay", () => loadReplay());
       h.onRequest("governance", () => loadGovernance());
     },
@@ -79,7 +82,9 @@ function registerPlanCostRefresh(context: vscode.ExtensionContext): void {
   watcher.onDidDelete(notify);
   context.subscriptions.push(
     watcher,
-    vscode.workspace.onDidSaveTextDocument(notify),
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (/\.(rocky|sql|toml)$/i.test(doc.fileName)) notify();
+    }),
     { dispose: onPlanCostRecorded(notify) },
     { dispose: () => timer && clearTimeout(timer) },
   );

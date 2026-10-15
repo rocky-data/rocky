@@ -75,7 +75,7 @@ export async function buildGraph(): Promise<GraphData> {
     }
   }
 
-  return { nodes, edges };
+  return { nodes, edges, projectRoot: cwd ?? null };
 }
 
 export async function openModelFile(model: string): Promise<void> {

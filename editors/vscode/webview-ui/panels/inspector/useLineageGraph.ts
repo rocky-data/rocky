@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   BreakingData,
   GovernanceData,
   GraphData,
   PlanCostData,
+  PlanCostParam,
   ReplayData,
 } from "../../../src/webviews/lineage/contract";
 import { getRpc } from "../../runtime/rpcClient";
@@ -46,28 +47,45 @@ export function useLineageGraph() {
   // model/sidecar/rocky.toml change, tick `now` so "30 min ago" ages, and
   // drop the data on toggle-off so a re-enable cannot show a stale snapshot.
   const costOn = active.has("cost");
+  const costOnRef = useRef(costOn);
+  costOnRef.current = costOn;
+  const graphRoot = graph ? (graph.projectRoot ?? null) : undefined;
+  const loadRef = useRef<() => void>(() => {});
   useEffect(() => {
-    if (!costOn) {
+    if (!costOn || graphRoot === undefined) {
       setPlanCost(null);
+      loadRef.current = () => {};
       return;
     }
     let ignore = false;
     const load = (): void => {
       setNow(Date.now());
       void getRpc()
-        .request<PlanCostData | null>("planCost")
+        .request<PlanCostData | null>("planCost", {
+          projectRoot: graphRoot,
+        } satisfies PlanCostParam)
         .then((d) => !ignore && setPlanCost(d))
         .catch(() => !ignore && setPlanCost(null));
     };
+    loadRef.current = load;
     load();
-    const off = getRpc().onPush("planCostChanged", load);
     const tick = setInterval(() => setNow(Date.now()), 60_000);
     return () => {
       ignore = true;
-      off();
+      loadRef.current = () => {};
       clearInterval(tick);
     };
-  }, [costOn]);
+  }, [costOn, graphRoot]);
+
+  // Subscribe once at mount so pushes sent while the overlay is off are
+  // consumed (and dropped) here instead of piling up in the RPC buffer.
+  useEffect(
+    () =>
+      getRpc().onPush("planCostChanged", () => {
+        if (costOnRef.current) loadRef.current();
+      }),
+    [],
+  );
 
   const toggleOverlay = (kind: OverlayKind): void => {
     setActive((prev) => {

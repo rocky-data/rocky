@@ -152,6 +152,23 @@ describe("planCostStore", () => {
       expect(call[1]).toBeUndefined();
     });
 
+    it("checks the root the graph was built from, not the active editor's", async () => {
+      // Active editor is in project B; the Inspector graph is project A's.
+      projectRoot = "/proj/b";
+      expect(await loadPlanCost("/proj/a")).not.toBeNull();
+      // Graph from project B while the plan is project A's: no cost.
+      projectRoot = "/proj/a";
+      expect(await loadPlanCost("/proj/b")).toBeNull();
+    });
+
+    it("reads stale when the scan hit its file cap", async () => {
+      found = Array.from({ length: 20000 }, (_, i) => ({
+        fsPath: `/proj/a/m${i}.sql`,
+        mtime: t0 - 1000,
+      }));
+      expect((await loadPlanCost("/proj/a"))!.modelsChangedSince).toBe(true);
+    });
+
     it("does not leak the storage-only fields", async () => {
       const got = (await loadPlanCost()) as unknown as Record<string, unknown>;
       expect(got.projectRoot).toBeUndefined();

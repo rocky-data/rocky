@@ -19,6 +19,8 @@ export type RecordedPlanCost = Omit<PlanCostData, "modelsChangedSince"> & {
 
 const KEY = "rocky.lastPlanCost";
 const VERSION = 1;
+/** Most files the staleness scan looks at; reaching it reads as "changed". */
+const SCAN_CAP = 20000;
 
 let memento: PlanCostMemento | undefined;
 const listeners = new Set<() => void>();
@@ -91,8 +93,13 @@ export function changedSince(recordedAt: string, mtimesMs: number[]): boolean {
  * The models directory is configurable per pipeline, so the scan covers the
  * whole root rather than assuming `models/`.
  */
-export async function loadPlanCost(): Promise<PlanCostData | null> {
-  const root = resolveProjectRoot();
+export async function loadPlanCost(
+  graphRoot?: string | null,
+): Promise<PlanCostData | null> {
+  // The root the Inspector's graph was built from, not whichever editor is
+  // active now: a Plan run in another project must not price this graph.
+  const root =
+    graphRoot === undefined ? resolveProjectRoot() : (graphRoot ?? undefined);
   const recorded = readPlanCost(root);
   if (!recorded) return null;
   const { version: _version, projectRoot: _root, ...payload } = recorded;
@@ -102,8 +109,12 @@ export async function loadPlanCost(): Promise<PlanCostData | null> {
     const files = await vscode.workspace.findFiles(
       new vscode.RelativePattern(root, "**/*.{rocky,sql,toml}"),
       undefined,
-      20000,
+      SCAN_CAP,
     );
+    // A capped scan may have missed a newer file: fail toward stale.
+    if (files.length >= SCAN_CAP) {
+      return { ...payload, modelsChangedSince: true };
+    }
     const mtimes = await Promise.all(
       files.map(async (f) => {
         try {
