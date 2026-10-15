@@ -681,7 +681,9 @@ pub async fn kill_group(
         // here, and macOS then fails `killpg` with EPERM; that error used
         // to replace the session's own error. The SIGKILL loop below is
         // the check: it reports any member still standing as `Survivors`.
-        let _ = signal_group(pgid, libc::SIGTERM);
+        if let Err(e) = signal_group(pgid, libc::SIGTERM) {
+            tracing::debug!(pgid, error = %e, "SIGTERM to the group failed; escalating");
+        }
     }
     // Reap our direct children within the grace: they usually exit on
     // SIGTERM, and an unreaped zombie would wedge the group probe.
