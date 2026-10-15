@@ -6,6 +6,8 @@ Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-tim
 
 **License:** Apache 2.0
 
+**Engine skills** live in `engine/.agents/skills/` (mirrored in `engine/.claude/skills/`): `rocky` (CLI cheat sheet), `databricks`, `fivetran`, and Rust conventions (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`). If your client does not load them on its own, read the matching `SKILL.md` before that kind of work.
+
 ## Key Concepts
 
 - **Adapter-based ELT** — source adapters discover what data is available (metadata only, no extraction); warehouse adapters execute SQL and manage governance. Rocky operates on data already in the warehouse — it does not extract from external systems

@@ -240,7 +240,7 @@ CI is path-filtered. The paths your PR touches decide which workflows run. Every
 | `editors/vscode/**` | `vscode-ci.yml` | compile, vitest unit tests, the electron integration tests, eslint |
 | `docs/**` | `docs-build.yml` | an Astro build of the docs site |
 | `scripts/**` | `scripts-ci.yml` | shellcheck, and a self-test of the soak-verdict script |
-| `.agents/skills/**` or `.claude/skills/**` | `skills-mirror-drift.yml` | diffs the two skill trees and fails unless they are byte-identical |
+| `.agents/skills/**` or `.claude/skills/**` (root, `engine/`, `editors/vscode/`) | `skills-mirror-drift.yml` | diffs each `.agents/skills` tree against its `.claude/skills` twin and fails unless every pair is byte-identical |
 | `engine/**`, `schemas/**`, `justfile`, `examples/playground/pocs/**`, or a generated binding | `codegen-drift.yml` | re-runs `just codegen` and `just regen-fixtures`, then fails on any diff |
 | `examples/playground/pocs/**` | `poc-counts-drift.yml` | recounts the POCs and fails on any diff |
 | `engine/evals/**` or `engine/crates/rocky-mcp/**` | `engine-evals.yml` | the eval harness self-test and the structured-error contract |

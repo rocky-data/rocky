@@ -62,4 +62,4 @@ Transitions use read-only `data-closed` / `data-enter` / `data-leave` / `data-tr
 
 Using the library in this (open-source) extension app is fine — it's an app, not a component library. Do **not** commit TailwindPlus's component markup or docs verbatim into the repo; adapt the patterns and re-theme to `--vscode-*`. That re-theming is required anyway (their palette would clash with the workbench), so it falls out naturally.
 
-See the webview architecture in [`editors/vscode/CLAUDE.md`](../../../CLAUDE.md) and the React apps under `editors/vscode/webview-ui/`.
+See the webview architecture in [`editors/vscode/AGENTS.md`](../../../AGENTS.md) and the React apps under `editors/vscode/webview-ui/`.

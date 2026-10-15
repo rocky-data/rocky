@@ -5,7 +5,7 @@ description: Decision tree for thiserror (library crates) vs anyhow (CLI/binary)
 
 # Rust error handling in Rocky
 
-Rocky uses a **two-tier** error handling strategy. The rule, from `engine/CLAUDE.md` § Coding Standards:
+Rocky uses a **two-tier** error handling strategy. The rule, from `engine/AGENTS.md` § Coding Standards:
 
 > Use `thiserror` for library errors, `anyhow` for binary/CLI errors.
 

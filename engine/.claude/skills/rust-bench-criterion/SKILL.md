@@ -146,7 +146,7 @@ Rocky's benchmarks are **not** free — the CI job builds DuckDB with swap and t
 
 You do **not** need the label for:
 
-- Docs / CLAUDE.md / skills / comments-only changes.
+- Docs / AGENTS.md / skills / comments-only changes.
 - Changes scoped to a single adapter crate's API client (those are I/O bound, not CPU bound).
 - Tests, fixture regens, dagster integration changes.
 
