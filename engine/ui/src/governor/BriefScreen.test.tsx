@@ -375,18 +375,15 @@ describe("Freeze and unfreeze on the brief", () => {
     expect(screen.queryByText("Freeze: done.")).toBeNull();
   });
 
-  it("shows an unfreeze that lifted nothing", async () => {
+  it("shows an unfreeze note verbatim, without a warning", async () => {
     const note = "no matching active freeze markers to lift";
     const { client } = fakeJobs([job("unfreeze", "succeeded", { result: { notes: [note] } })]);
     renderBrief(OPERATOR, client);
     fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    const headline = await screen.findByText(
-      "Unfreeze agent on model=fct_*: nothing was lifted.",
-      {},
-      { timeout: 3000 },
-    );
-    expect(headline).toHaveAttribute("role", "alert");
+    const headline = await screen.findByText("Unfreeze agent on model=fct_*: done.", {}, { timeout: 3000 });
+    expect(headline).not.toHaveAttribute("role", "alert");
+    expect(screen.queryByText(/nothing was lifted/)).toBeNull();
     expect(screen.getByText(note)).toBeInTheDocument();
   });
 
@@ -433,6 +430,11 @@ describe("Freeze and unfreeze on the brief", () => {
     const buttons = await screen.findAllByRole("button", { name: `Unfreeze ${name}` });
     expect(buttons).toHaveLength(1);
     fireEvent.click(buttons[0]);
+    expect(
+      screen.getByText(
+        "Lift the unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again.",
+      ),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
     await screen.findByText(`Unfreeze ${name}: done.`, {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "unfreeze", body: { scope: "any" } }]);
@@ -443,7 +445,7 @@ describe("Freeze and unfreeze on the brief", () => {
       submit: vi.fn(async () => {
         throw new ApiError(409, {
           code: "mutation_in_progress",
-          message: "another run, apply, approve or unfreeze job is already in progress on this project",
+          message: "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
         });
       }),
       status: vi.fn(),
@@ -452,7 +454,7 @@ describe("Freeze and unfreeze on the brief", () => {
     renderBrief(OPERATOR, busy);
     fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve or unfreeze is already in progress");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, freeze or unfreeze is already in progress");
 
     const failed = job("freeze", "failed", {
       error: [

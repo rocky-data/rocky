@@ -626,7 +626,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply, approve or unfreeze job is already in progress on this project",
+            "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -3265,8 +3265,7 @@ async fn submit_ci(
 }
 
 /// `POST /api/v1/jobs/freeze` — submit a freeze job: `rocky policy freeze`,
-/// the kill switch (mutating; takes no permit, so it can land during a run:
-/// a freeze only adds a deny, and the run's freeze fence stops the run). Body
+/// the kill switch (mutating; takes the permit). Body
 /// `{"principal": "agent"|"human", "scope": "<selector>", "reason": "<text>"}`,
 /// every field optional: no principal freezes both, no scope freezes every model.
 async fn submit_freeze(
@@ -3316,7 +3315,7 @@ async fn submit_job(
     // Layer 1: the app-level single-mutating-job guard. `plan` never takes it.
     // A second `run`/`apply` while one is held returns the holder's id as a
     // `409 mutation_in_progress` rather than colliding on the redb flock.
-    let permit = if kind.takes_permit() {
+    let permit = if kind.mutates() {
         match state.mutation_permit.try_acquire(&job_id) {
             Ok(guard) => Some(guard),
             Err(running_job_id) => return Err(ApiError::mutation_in_progress(&running_job_id)),
@@ -9981,17 +9980,10 @@ mod tests {
         assert!(!JobKind::Plan.mutates());
         assert!(!JobKind::Test.mutates());
         assert!(!JobKind::Ci.mutates());
-        // Both write the policy ledger, so both mutate. Only unfreeze takes the
-        // permit: a freeze is add-only and must land while a run holds it, so
-        // the run's freeze fence can stop that run.
+        // A freeze writes the policy ledger in the state store, so it takes the
+        // permit like a run: a freeze cannot land while a run holds the store.
         assert!(JobKind::Freeze.mutates());
         assert!(JobKind::Unfreeze.mutates());
-        assert!(!JobKind::Freeze.takes_permit());
-        assert!(JobKind::Unfreeze.takes_permit());
-        assert!(JobKind::Run.takes_permit());
-        assert!(JobKind::Apply.takes_permit());
-        assert!(JobKind::Approve.takes_permit());
-        assert!(!JobKind::Plan.takes_permit());
         assert_eq!(JobKind::Freeze.verb(), "freeze");
         assert_eq!(JobKind::Unfreeze.verb(), "unfreeze");
         assert_eq!(JobKind::Freeze.subcommand(), "policy");
@@ -10109,29 +10101,16 @@ mod tests {
     }
 
     /// The freeze fields are checked before the permit and the argv: a bad
-    /// principal, scope or reason is a `400` that never spawns a child. A good
-    /// body differs by route. An unfreeze takes the permit like a run (`409`
-    /// while one is held). A freeze takes none, so the kill switch can land
-    /// while a run holds it and the run's freeze fence then stops that run.
+    /// principal, scope or reason is a `400` that never spawns a child, and a
+    /// good body takes the permit like a run (`409` while one is held).
     #[tokio::test]
-    async fn freeze_routes_validate_their_fields_and_only_unfreeze_takes_the_permit() {
-        // Accepted freeze jobs spawn a child and write job records, so this
-        // server gets its own state file. The shared fixture path would lock
-        // out the other tests that read it.
-        let dir = tempfile::tempdir().unwrap();
-        let state = ServerState::with_auth(
-            simple_project_models(),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Some(dir.path().join("state.redb")),
-        );
+    async fn freeze_routes_validate_their_fields_and_take_the_permit() {
+        let state = test_state();
         let held = state
             .mutation_permit
             .try_acquire("job_incumbent")
             .expect("permit is free");
-        let base = spawn_router(state.clone()).await;
+        let base = spawn_router(state).await;
         let client = reqwest::Client::new();
         let long_scope = format!("model={}", "x".repeat(300));
         let long_reason = "r".repeat(501);
@@ -10166,52 +10145,13 @@ mod tests {
                 let envelope: ErrorEnvelope = resp.json().await.unwrap();
                 assert_eq!(envelope.code, "bad_request", "{route}: {body}");
             }
-        }
-        // Unfreeze: valid bodies reach the permit, which is held.
-        let url = format!("{base}/api/v1/jobs/unfreeze");
-        for body in &good {
-            let resp = client.post(&url).json(body).send().await.unwrap();
-            assert_eq!(resp.status(), 409, "unfreeze: {body}");
-            let envelope: ErrorEnvelope = resp.json().await.unwrap();
-            assert_eq!(envelope.code, "mutation_in_progress", "unfreeze: {body}");
-            assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
-        }
-        // Freeze: accepted while the permit is held, and it leaves the permit
-        // with its holder. The child here is the test harness, not `rocky`, so
-        // the job settles as failed; only the acceptance is under test.
-        let url = format!("{base}/api/v1/jobs/freeze");
-        let mut job_ids = Vec::new();
-        for body in &good {
-            let resp = client.post(&url).json(body).send().await.unwrap();
-            assert_eq!(
-                resp.status(),
-                202,
-                "freeze must not wait for the permit: {body}"
-            );
-            let accepted: serde_json::Value = resp.json().await.unwrap();
-            let job_id = accepted["job_id"].as_str().expect("a job id").to_string();
-            assert_eq!(
-                state.mutation_permit.running_job().as_deref(),
-                Some("job_incumbent"),
-                "a freeze job must not take or release the permit"
-            );
-            job_ids.push(job_id);
-        }
-        // Let every child settle before the state file goes away.
-        for job_id in job_ids {
-            for _ in 0..300 {
-                let status: serde_json::Value = client
-                    .get(format!("{base}/api/v1/jobs/{job_id}"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-                if !matches!(status["state"].as_str(), Some("queued" | "running")) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Valid bodies pass validation and reach the permit, which is held.
+            for body in &good {
+                let resp = client.post(&url).json(body).send().await.unwrap();
+                assert_eq!(resp.status(), 409, "{route}: {body}");
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(envelope.code, "mutation_in_progress", "{route}: {body}");
+                assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
             }
         }
         drop(held);

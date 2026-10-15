@@ -38,7 +38,7 @@ const NOTE_MAX_CHARS = 300;
  * them), so the page shows the strings as they are. Anything that is not a
  * string is dropped, and the count and length are capped.
  */
-function resultNotes(job: JobStatus): { notes: string[]; notEnforced: boolean; nothingLifted: boolean } {
+function resultNotes(job: JobStatus): { notes: string[]; notEnforced: boolean } {
   const result = job.result as { notes?: unknown } | null | undefined;
   const raw = result !== null && typeof result === "object" && Array.isArray(result.notes) ? result.notes : [];
   const all = raw
@@ -51,28 +51,24 @@ function resultNotes(job: JobStatus): { notes: string[]; notEnforced: boolean; n
       .map((note) => (note.length <= NOTE_MAX_CHARS ? note : `${note.slice(0, NOTE_MAX_CHARS)}…`)),
     // Judged on every note, not only the ones shown.
     notEnforced: all.some((note) => note.includes("NOT enforced")),
-    nothingLifted: all.some((note) => note.includes("no matching active freeze markers to lift")),
   };
 }
 
 /**
  * The job line for a freeze or unfreeze. A succeeded job can still have done
  * nothing useful: with no `[policy]` block the freeze is recorded but binds
- * nothing, and an unfreeze can find no marker to lift. The engine says so in
- * `result.notes`, so the page shows them and never a bare "done" over them.
+ * nothing. The engine says so in `result.notes`, so the page shows them and
+ * never a bare "done" over them. Only "NOT enforced" is a warning; any other
+ * note is shown as the engine wrote it.
  */
 function FreezeJobLine({ label, view, cancel }: { label: string; view: JobView; cancel: JobCancel }) {
   if (view.kind !== "done" || view.job.state !== "succeeded") {
     return <JobLine label={label} view={view} cancel={cancel} />;
   }
-  const { notes, notEnforced, nothingLifted } = resultNotes(view.job);
+  const { notes, notEnforced } = resultNotes(view.job);
   if (notes.length === 0) return <JobLine label={label} view={view} cancel={cancel} />;
-  const warn = notEnforced || nothingLifted;
-  const headline = notEnforced
-    ? `${label}: recorded, but NOT enforced.`
-    : nothingLifted
-      ? `${label}: nothing was lifted.`
-      : `${label}: done.`;
+  const warn = notEnforced;
+  const headline = notEnforced ? `${label}: recorded, but NOT enforced.` : `${label}: done.`;
   return (
     <div className="space-y-1">
       <p
@@ -184,17 +180,21 @@ function UnfreezeRow({
   onChanged: () => void;
 }) {
   const unfreeze = useJob("unfreeze", jobs, onChanged);
-  const name =
-    freeze.unreadable_marker === true
-      ? "unreadable marker (agent and human) on every model"
-      : `${freeze.principal} on ${scopeWords(freeze.scope)}`;
+  const unreadable = freeze.unreadable_marker === true;
+  const name = unreadable
+    ? "unreadable marker (agent and human) on every model"
+    : `${freeze.principal} on ${scopeWords(freeze.scope)}`;
   return (
     <li className="space-y-1">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm text-zinc-700 dark:text-zinc-200">{name}</span>
         <ConfirmedWrite
           label={`Unfreeze ${name}`}
-          question={`Lift the freeze on ${name}? Those actions can run again.`}
+          question={
+            unreadable
+              ? "Lift the unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again."
+              : `Lift the freeze on ${name}? Those actions can run again.`
+          }
           confirmLabel="Confirm unfreeze"
           busy={jobBusy(unfreeze.view)}
           onConfirm={() => unfreeze.start(unfreezeBody(freeze))}
@@ -208,9 +208,9 @@ function UnfreezeRow({
 /**
  * The kill switch from the browser: freeze actions to `deny` for a principal
  * and a scope, and lift a freeze in force. Each runs `rocky policy freeze` or
- * `rocky policy unfreeze` on the server. A freeze does not wait for a running
- * change (it only adds a deny, and the run stops at its next freeze check); an
- * unfreeze does. The ledger row names the server's principal id, not the
+ * `rocky policy unfreeze` on the server. Both wait for a run, apply or approve
+ * in progress (409 until it finishes); to stop a running run, use Cancel on
+ * that job. The ledger row names the server's principal id, not the
  * person at the page, and does not say the freeze came from the browser.
  */
 export function FreezeControls({
