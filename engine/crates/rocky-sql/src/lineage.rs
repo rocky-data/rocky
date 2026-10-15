@@ -116,7 +116,7 @@ pub enum RowSelectionKind {
     /// A `DISTINCT ON (...)` key, which picks one row per key value, or an
     /// `ORDER BY` key of a `DISTINCT ON` query, which picks which row that is.
     DistinctOn,
-    /// An `ORDER BY` key of a query that also has `LIMIT`, `FETCH` or `TOP`:
+    /// An `ORDER BY` key of a query that also has `LIMIT`, `OFFSET`, `FETCH` or `TOP`:
     /// the order decides which rows survive the cut.
     OrderLimit,
 }
@@ -791,7 +791,7 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
     Ok(result)
 }
 
-/// `ORDER BY` keys of a query that also cuts its rows (`LIMIT`, `FETCH`,
+/// `ORDER BY` keys of a query that also cuts its rows (`LIMIT`, `OFFSET`, `FETCH`,
 /// `TOP`, kind `order_limit`) or uses `DISTINCT ON (...)` (kind
 /// `distinct_on`: the order picks the row kept per key). Without either, the
 /// order only arranges rows, so no edge is made.
@@ -2762,6 +2762,63 @@ mod tests {
             RowSelectionKind::OrderLimit,
             None
         ));
+    }
+
+    /// An ordinal `ORDER BY 2` names the second projected expression, so the
+    /// cut is attributed to the column under it.
+    #[test]
+    fn order_by_ordinal_with_limit_resolves_to_the_projected_column() {
+        let edges = row_sel(
+            "SELECT o.order_id, o.amount * 2 AS doubled FROM raw.orders o \
+             ORDER BY 2 DESC LIMIT 1",
+        );
+        assert!(
+            has_edge(
+                &edges,
+                Some("raw.orders"),
+                "amount",
+                RowSelectionKind::OrderLimit,
+                None
+            ),
+            "{edges:?}"
+        );
+    }
+
+    /// `OFFSET` alone also cuts rows: the order decides which rows are skipped.
+    #[test]
+    fn order_by_with_offset_only_is_a_row_selection() {
+        let edges = row_sel("SELECT order_id FROM raw.orders ORDER BY created_at OFFSET 5 ROWS");
+        assert!(
+            has_edge(
+                &edges,
+                Some("raw.orders"),
+                "created_at",
+                RowSelectionKind::OrderLimit,
+                None
+            ),
+            "{edges:?}"
+        );
+    }
+
+    /// A `DISTINCT ON` key and an `ORDER BY ... LIMIT` key that read a CTE
+    /// trace to the table the CTE body reads.
+    #[test]
+    fn distinct_on_and_order_limit_keys_through_a_cte_name_the_bodys_table() {
+        let edges = row_sel(
+            "WITH s AS (SELECT customer_id, created_at FROM raw.orders) \
+             SELECT DISTINCT ON (customer_id) customer_id FROM s \
+             ORDER BY customer_id, created_at DESC LIMIT 10",
+        );
+        for (column, kind) in [
+            ("customer_id", RowSelectionKind::DistinctOn),
+            ("created_at", RowSelectionKind::DistinctOn),
+            ("created_at", RowSelectionKind::OrderLimit),
+        ] {
+            assert!(
+                has_edge(&edges, Some("raw.orders"), column, kind, None),
+                "{column} {kind}: {edges:?}"
+            );
+        }
     }
 
     /// `NATURAL JOIN` keys are the columns both sides share. Only the warehouse
