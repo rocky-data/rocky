@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rocky run --var` now works with `--dag` and `--watch` (#2379). Before, Rocky refused the combination. The value now reaches every model in a `--dag` run, and the dependency graph uses the same value as the runs. A `--watch` run applies it on every re-run.
 - An external process adapter or a `rocky fulfill` replay MCP server that exits mid-session no longer kills Rocky (#2370). Before, outside Dagster Pipes, the next request Rocky wrote to the child's stdin raised SIGPIPE, and Rocky exited with no error message. Now the write fails, and Rocky reports it: `failed to write to adapter…` for an adapter, `replay session error: write: …` for the replay server. A replay server that stops reading now fails the write after 120 s with `server request write timed out`, like a read.
 - The same holds for a shell hook when Rocky cannot create a temporary file for its stdin and falls back to a pipe (#2374). A hook there that exits without reading a large context no longer kills Rocky. A hook that neither reads nor exits now times out after its `timeout_ms`, which covers the stdin write and the wait together. Before, the write blocked the run forever.
 - `rocky fulfill` on macOS reports the real error when its MCP server exits early. Before, the cleanup step's `killpg(15) failed: Operation not permitted` replaced it.
