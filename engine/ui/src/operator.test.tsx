@@ -59,7 +59,7 @@ describe("Run and Plan on the estate", () => {
         <ProjectActions jobs={client} />
       </WriteAccessProvider>,
     );
-    for (const name of ["Run", "Plan"]) {
+    for (const name of ["Run", "Plan", "Test", "CI"]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
       // The reason is the tooltip; the banner says it once, so it is not
@@ -95,6 +95,32 @@ describe("Run and Plan on the estate", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Run this model" }));
     await waitFor(() => expect(submitted).toEqual([{ kind: "run", body: { model: "orders" } }]));
+  });
+
+  it("submit test and ci jobs, and Test one model with its name", async () => {
+    const { client, submitted } = fakeJobs([job("test", "succeeded")]);
+    const { unmount } = render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} />
+      </WriteAccessProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    await screen.findByText("Test the project: done.", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "CI" }));
+    await screen.findByText("CI: done.", {}, { timeout: 3000 });
+    expect(submitted).toEqual([
+      { kind: "test", body: {} },
+      { kind: "ci", body: {} },
+    ]);
+    unmount();
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} model="orders" />
+      </WriteAccessProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "CI" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Test this model" }));
+    await waitFor(() => expect(submitted.at(-1)).toEqual({ kind: "test", body: { model: "orders" } }));
   });
 
   it("says plainly when another change holds the project (409 mutation_in_progress)", async () => {
@@ -402,6 +428,27 @@ describe("a failed job, said concisely", () => {
       },
     });
     expect(failureSummary(failed)).toBe("main.dim_customer: model 'dim_customer' failed: boom");
+  });
+
+  it("names the compile errors and failed tests of a test or ci job, never their text", () => {
+    const failed = job("ci", "failed", {
+      error: "Error: test failures detected",
+      result: {
+        diagnostics: [
+          { severity: "Error", code: "E001", message: "SELECT x FROM /Users/me/secret.csv", model: "fct_orders" },
+          { severity: "Warning", code: "W001", message: "a warning", model: "fct_orders" },
+        ],
+        failures: [
+          { name: "dim_customers", error: "Binder Error at /Users/me/project/models/x.sql" },
+          { name: "fct_orders", error: "boom" },
+        ],
+      },
+    });
+    const summary = failureSummary(failed);
+    expect(summary).toBe("Compile error: fct_orders E001\nFailed tests: dim_customers, fct_orders");
+    for (const leaked of ["/Users/me", "SELECT"]) {
+      expect(summary).not.toContain(leaked);
+    }
   });
 
   it("else shows the final Error: block, never a tracing line", () => {

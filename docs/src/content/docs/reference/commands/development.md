@@ -400,7 +400,7 @@ rocky serve --ui
 
 With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
 
-The generated token has full scope. This is operator mode: the UI can run, plan, approve and apply as the OS user who started the server, like the VS Code extension. The stderr note says so. For a view-only UI, add `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it generates a read-only token and refuses `--token-scope full`.
+The generated token has full scope. This is operator mode: the UI can run, plan, test, run CI, approve and apply as the OS user who started the server, like the VS Code extension. The stderr note says so. For a view-only UI, add `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it generates a read-only token and refuses `--token-scope full`.
 
 An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detected: the server still looks local. Use `--read-only` whenever someone else can reach your port. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. The address is also printed on stdout, so it lands in anything that captures stdout (a terminal log, `docker logs`, a service journal) and in browser history. On a shared host, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
 
