@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `SqlDialect` gains a required method, `watermark_hold_back`. A custom dialect must implement it, with the same column reference and literal as its `watermark_where`. `rocky init-adapter` scaffolds it. To migrate an out-of-tree dialect, add `fn watermark_hold_back(&self, timestamp_col: &str, held_max: &DateTime<Utc>, nulls: NullTimestamps) -> AdapterResult<String>` and return `rocky_core::traits::hold_back_predicate(<column>, <literal for held_max>, nulls)`, with the column and literal your `watermark_where` renders. If your literal is coarser than the column, round it down.
 
+### Fixed
+
+- A shutdown signal (Ctrl-C, or SIGTERM) during `rocky run` now settles the run outside replication too (#1606). Before, only the replication fan-out listened for signals. A transformation or `--model` run was killed at once on SIGTERM, with no run record and its `--idempotency-key` claim left in flight. Now one cancellation token covers the whole run. On a signal, the run lets the statement in flight finish, starts no new model or table, records itself as interrupted, releases its claim and settles its state session. It then exits 130. A second Ctrl-C still exits 130 at once. Under `rocky run --watch`, a signal now gives the iteration up to 5 seconds to settle the same way. An iteration still stuck after that (a statement that does not return) is dropped as before, and the watcher still exits 0. A model that is already running is never cut short, so a plain `rocky run` on SIGTERM now waits for it, as replication already did. Stop a stuck one with a second Ctrl-C or SIGKILL.
+
 ## [1.83.0] — 2026-10-15
 
 ### Added

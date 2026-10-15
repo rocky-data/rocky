@@ -51359,7 +51359,10 @@ timestamp_column = "ts"
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let rt = remote_state_test_runtime();
         let harness = CrossPodHarness::new_s3_like();
-        let config = rt.block_on(checkpoint_ordering_project(harness.pod_a.dir.path(), "skip"));
+        let config = rt.block_on(checkpoint_ordering_project(
+            harness.pod_a.dir.path(),
+            "skip",
+        ));
         let run_id = "cancelled-before-the-fan-out";
 
         let token = tokio_util::sync::CancellationToken::new();
