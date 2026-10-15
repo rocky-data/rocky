@@ -110,6 +110,54 @@ jobs:
         # Read the output with `--nocapture`.
         continue-on-error: true
         run: cargo test -p rocky-core --test spool_probe_windows -- --ignored --nocapture
+      - name: Spool probe (SMB share with access-based enumeration, loopback)
+        # Plan B for #1903. The NTFS step above is the control: a local deny
+        # gives `PermissionDenied`. This step asks the open question: what do the
+        # readers return when an SMB share hides a file the user cannot read?
+        # A loopback share may not behave like a remote one, and the setup (a
+        # local user, `icacls`, `New-SmbShare`, `net use`) can fail on the
+        # runner. `continue-on-error: true` keeps a setup failure from turning
+        # the weekly job red. Read the printed output; a green step proves nothing.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $user = 'probe_b'
+          $share = 'probe'
+          $root = 'C:\probe-share'
+          $spool = Join-Path $root '.rocky\pending-demands'
+          $password = [guid]::NewGuid().ToString('N') + 'Aa1!'
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          try {
+            New-LocalUser -Name $user -Password $secure -PasswordNeverExpires | Out-Null
+            New-Item -ItemType Directory -Path $spool -Force | Out-Null
+            Set-Content -Path (Join-Path $spool 'child.json') -Value '{}' -NoNewline
+            Set-Content -Path (Join-Path $spool '.spool-sentinel') -Value 'probe' -NoNewline
+            # List and traverse on the folders. No inheritance, so the files get nothing.
+            foreach ($dir in @($root, (Join-Path $root '.rocky'), $spool)) {
+              icacls $dir /grant "${user}:(RX)"
+              if ($LASTEXITCODE -ne 0) { throw "icacls /grant failed on $dir" }
+            }
+            # No read on the two files. A deny beats the inherited allow entries.
+            foreach ($name in @('child.json', '.spool-sentinel')) {
+              icacls (Join-Path $spool $name) /deny "${user}:(R)"
+              if ($LASTEXITCODE -ne 0) { throw "icacls /deny failed on $name" }
+            }
+            New-SmbShare -Name $share -Path $root -FullAccess $user | Out-Null
+            Set-SmbShare -Name $share -FolderEnumerationMode AccessBased -Force
+            # Error 1219: Windows refuses a second credential for the same server.
+            net use * /delete /y
+            net use "\\localhost\$share" "/user:$user" $password
+            if ($LASTEXITCODE -ne 0) { throw 'net use failed' }
+            $env:ROCKY_PROBE_SMB_DIR = "\\localhost\$share\.rocky\pending-demands"
+            Write-Host "ROCKY_PROBE_SMB_DIR=$env:ROCKY_PROBE_SMB_DIR"
+            cargo test -p rocky-core --test spool_probe_windows spool_probe_smb_share -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
+          } finally {
+            net use "\\localhost\$share" /delete /y
+            Remove-SmbShare -Name $share -Force -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+          }
 
   coverage:
     name: Coverage
