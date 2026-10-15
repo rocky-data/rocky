@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.82.1] — 2026-10-15
+
 ### Fixed
 
 - `rocky run --var` now works with `--dag` and `--watch` (#2379). Before, Rocky refused the combination. The value now reaches every model in a `--dag` run, and the dependency graph uses the same value as the runs. A `--watch` run applies it on every re-run.
