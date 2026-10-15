@@ -26,6 +26,8 @@
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
 //! POST /api/v1/jobs/apply                       → submit an apply job → 202 {job_id}
 //! POST /api/v1/jobs/approve                     → approve a plan (= rocky review --approve) → 202 {job_id}
+//! POST /api/v1/jobs/test                        → submit a test job   → 202 {job_id}
+//! POST /api/v1/jobs/ci                          → submit a ci job     → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -190,6 +192,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/approve", post(submit_approve))
+        .route("/api/v1/jobs/test", post(submit_test))
+        .route("/api/v1/jobs/ci", post(submit_ci))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
@@ -958,6 +962,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/plan",
         "POST /api/v1/jobs/apply",
         "POST /api/v1/jobs/approve",
+        "POST /api/v1/jobs/test",
+        "POST /api/v1/jobs/ci",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
@@ -2774,7 +2780,7 @@ pub(crate) struct JobRequest {
     filter: Option<String>,
     /// `--pipeline <name>` for `run`/`plan`.
     pipeline: Option<String>,
-    /// `--model <name>` for `run`/`plan` (single-model execution).
+    /// `--model <name>` for `run`/`plan` (single-model execution) and `test`.
     model: Option<String>,
     /// The positional `<plan_id>` for `apply` and `approve`: required there,
     /// and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.
@@ -3222,7 +3228,27 @@ async fn submit_approve(
     submit_job(JobKind::Approve, state, &headers, &body).await
 }
 
-/// Shared submission path for all three job kinds.
+/// `POST /api/v1/jobs/test` — submit a test job: `rocky test` in local
+/// DuckDB (non-mutating; no permit). Body `{"model": "<name>"}` is optional.
+async fn submit_test(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Test, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/ci` — submit a ci job: `rocky ci`, compile + test with
+/// no warehouse credentials (non-mutating; no permit). The body is ignored.
+async fn submit_ci(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Ci, state, &headers, &body).await
+}
+
+/// Shared submission path for all job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
 /// — a second attempt while one is held is a `409 mutation_in_progress` — and
@@ -3338,7 +3364,7 @@ async fn submit_job(
 /// ignore the field, as before.
 fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
     match kind {
-        JobKind::Run | JobKind::Plan => Ok(()),
+        JobKind::Run | JobKind::Plan | JobKind::Test | JobKind::Ci => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3436,6 +3462,13 @@ fn job_subprocess_args(
             }
             args.push("--approve".into());
         }
+        JobKind::Test => {
+            if let Some(model) = &request.model {
+                args.push("--model".into());
+                args.push(model.into());
+            }
+        }
+        JobKind::Ci => {}
     }
     args
 }
@@ -9744,6 +9777,12 @@ mod tests {
         assert!(JobKind::Apply.mutates());
         assert!(JobKind::Approve.mutates());
         assert!(!JobKind::Plan.mutates());
+        assert!(!JobKind::Test.mutates());
+        assert!(!JobKind::Ci.mutates());
+        assert_eq!(JobKind::Test.verb(), "test");
+        assert_eq!(JobKind::Ci.verb(), "ci");
+        assert_eq!(JobKind::Test.subcommand(), "test");
+        assert_eq!(JobKind::Ci.subcommand(), "ci");
         assert_eq!(JobKind::Run.verb(), "run");
         assert_eq!(JobKind::Plan.verb(), "plan");
         assert_eq!(JobKind::Apply.verb(), "apply");
@@ -9754,9 +9793,36 @@ mod tests {
             JobKind::Plan,
             JobKind::Apply,
             JobKind::Approve,
+            JobKind::Test,
+            JobKind::Ci,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
+    }
+
+    /// `test` and `ci` jobs spawn `rocky test [--model m]` and `rocky ci`; only
+    /// `test` carries `--model`, and neither carries run/plan flags.
+    #[test]
+    fn test_and_ci_job_argv() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let request = JobRequest {
+            model: Some("dim_customers".to_string()),
+            filter: Some("client=acme".to_string()),
+            ..JobRequest::default()
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(kind, None, state, &request)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let head = ["--output", "json", "--state-path", "/tmp/state.redb"];
+        let mut test = head.to_vec();
+        test.extend(["test", "--model", "dim_customers"]);
+        assert_eq!(argv(JobKind::Test), test);
+        let mut ci = head.to_vec();
+        ci.push("ci");
+        assert_eq!(argv(JobKind::Ci), ci);
     }
 
     /// FF-WP1 (finding 5) — the apply job's argv threading, pinned at the
@@ -12203,6 +12269,90 @@ adapter = "db"
         assert_eq!(resp.status(), 403, "a read-only token");
         let body: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(body.code, "forbidden_read_only_token");
+    }
+
+    /// The `test` and `ci` job routes sit behind the same write gate as the
+    /// run route: no credential is 401, a foreign `Host` 421, a UI cookie
+    /// without `X-Rocky-UI` (or without this server's Origin) 403, and a
+    /// read-only token (operator mode off) 403. A request that passes the gate
+    /// reaches the handler: a malformed body is a 400 there, which never
+    /// spawns a child.
+    #[tokio::test]
+    async fn test_and_ci_routes_are_behind_the_write_gate() {
+        for route in ["test", "ci"] {
+            let url = |base: &str| format!("{base}/api/v1/jobs/{route}");
+            let client = no_redirect_client();
+
+            let full = spawn_router(ui_state_scoped(TokenScope::Full, &[], None)).await;
+            let resp = client.post(url(&full)).send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{route}: no credential");
+
+            let resp = client
+                .post(url(&full))
+                .bearer_auth(OPERATOR_TOKEN)
+                .header("host", "evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 421, "{route}: a foreign Host");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "host_not_allowed", "{route}");
+
+            let cookie = login_cookie(&client, &full).await;
+            for (origin, marker, why) in [
+                (Some(full.as_str()), false, "a cookie without X-Rocky-UI"),
+                (None, true, "a cookie without Origin"),
+                (
+                    Some("http://127.0.0.1:1"),
+                    true,
+                    "a cookie from another local page",
+                ),
+            ] {
+                let mut req = client.post(url(&full)).header("cookie", &cookie);
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                if marker {
+                    req = req.header("x-rocky-ui", "1");
+                }
+                let resp = req.send().await.unwrap();
+                assert_eq!(resp.status(), 403, "{route}: {why}");
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(body.code, "ui_write_not_from_ui", "{route}: {why}");
+            }
+
+            // Through the gate: the handler answers (a bad body, no spawn).
+            let resp = client
+                .post(url(&full))
+                .header("cookie", &cookie)
+                .header("origin", &full)
+                .header("x-rocky-ui", "1")
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{route}: the page's own submit");
+            let resp = client
+                .post(url(&full))
+                .bearer_auth(OPERATOR_TOKEN)
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{route}: a full-scope Bearer");
+
+            let read_only = spawn_router(ui_state_scoped(TokenScope::ReadOnly, &[], None)).await;
+            let resp = client
+                .post(url(&read_only))
+                .bearer_auth(OPERATOR_TOKEN)
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{route}: a read-only token");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "forbidden_read_only_token", "{route}");
+        }
     }
 
     /// The refusals: a finished job and a job whose child has exited are

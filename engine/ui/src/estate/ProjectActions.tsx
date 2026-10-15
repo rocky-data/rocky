@@ -39,7 +39,8 @@ export function planUnavailable(project: ProjectOutput | null): string | undefin
 }
 
 /**
- * Run and Plan, for the whole project or for one model.
+ * Run, Plan, Test and CI, for the whole project or for one model (CI is
+ * project-wide only: `rocky ci` takes no model).
  *
  * Each submits a job (`POST /api/v1/jobs/run` or `/plan`), follows it by
  * polling `GET /api/v1/jobs/{id}`, and calls `onDone` once it ends so the
@@ -62,6 +63,8 @@ export function ProjectActions({
 }) {
   const run = useJob("run", jobs, onDone);
   const plan = useJob("plan", jobs, onDone);
+  const test = useJob("test", jobs, onDone);
+  const ci = useJob("ci", jobs, onDone);
   const body = model === undefined ? {} : { model };
   const scope = model === undefined ? "the project" : model;
   const planned = plan.view.kind === "done" ? planIdOf(plan.view.job) : null;
@@ -80,6 +83,14 @@ export function ProjectActions({
           primary={model === undefined}
           onClick={() => run.start(body)}
         />
+        <WriteButton
+          label={model === undefined ? "Test" : "Test this model"}
+          busy={jobBusy(test.view)}
+          onClick={() => test.start(body)}
+        />
+        {model === undefined && (
+          <WriteButton label="CI" busy={jobBusy(ci.view)} onClick={() => ci.start({})} />
+        )}
       </div>
       <JobLine label={`Plan ${scope}`} view={plan.view} cancel={plan.cancel} />
       {planned !== null && (
@@ -98,6 +109,8 @@ export function ProjectActions({
         </p>
       )}
       <JobLine label={`Run ${scope}`} view={run.view} cancel={run.cancel} />
+      <JobLine label={`Test ${scope}`} view={test.view} cancel={test.cancel} />
+      {model === undefined && <JobLine label="CI" view={ci.view} cancel={ci.cancel} />}
     </div>
   );
 }

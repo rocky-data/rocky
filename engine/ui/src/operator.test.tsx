@@ -59,7 +59,7 @@ describe("Run and Plan on the estate", () => {
         <ProjectActions jobs={client} />
       </WriteAccessProvider>,
     );
-    for (const name of ["Run", "Plan"]) {
+    for (const name of ["Run", "Plan", "Test", "CI"]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
       // The reason is the tooltip; the banner says it once, so it is not
@@ -95,6 +95,32 @@ describe("Run and Plan on the estate", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Run this model" }));
     await waitFor(() => expect(submitted).toEqual([{ kind: "run", body: { model: "orders" } }]));
+  });
+
+  it("submit test and ci jobs, and Test one model with its name", async () => {
+    const { client, submitted } = fakeJobs([job("test", "succeeded")]);
+    const { unmount } = render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} />
+      </WriteAccessProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    await screen.findByText("Test the project: done.", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "CI" }));
+    await screen.findByText("CI: done.", {}, { timeout: 3000 });
+    expect(submitted).toEqual([
+      { kind: "test", body: {} },
+      { kind: "ci", body: {} },
+    ]);
+    unmount();
+    render(
+      <WriteAccessProvider value={OPERATOR}>
+        <ProjectActions jobs={client} model="orders" />
+      </WriteAccessProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "CI" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Test this model" }));
+    await waitFor(() => expect(submitted.at(-1)).toEqual({ kind: "test", body: { model: "orders" } }));
   });
 
   it("says plainly when another change holds the project (409 mutation_in_progress)", async () => {

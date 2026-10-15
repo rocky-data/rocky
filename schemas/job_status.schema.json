@@ -31,6 +31,20 @@
             "approve"
           ],
           "type": "string"
+        },
+        {
+          "description": "`rocky test` — runs the models' tests in local DuckDB. Reads the project, writes no warehouse state; no permit.",
+          "enum": [
+            "test"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`rocky ci` — compile + test without warehouse credentials. Non-mutating; no permit.",
+          "enum": [
+            "ci"
+          ],
+          "type": "string"
         }
       ]
     },

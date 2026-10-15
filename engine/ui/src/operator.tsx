@@ -2,8 +2,8 @@
  * Operator mode: what this page may change, and the controls that change it.
  *
  * The engine says what the session's token may do in `GET /api/v1/meta`
- * (`token_scope`). `full` is operator mode: the page can run, plan, approve
- * and apply, and every change runs as the OS user who started `rocky serve`.
+ * (`token_scope`). `full` is operator mode: the page can run, plan, test, run ci,
+ * approve and apply, and every change runs as the OS user who started `rocky serve`.
  * `read_only` shows the same controls, disabled, with the reason. `null`
  * means the server has no token at all (a loopback server without `--ui`,
  * the `just ui-dev` loop), which accepts writes too.
