@@ -359,10 +359,9 @@ function cap(text: string): string {
  *
  * First the structured errors of the child's own output (`result.errors`,
  * e.g. `model 'dim_customer' failed: ...`). Then, for `test` and `ci`, the
- * compile errors (`result.diagnostics`, as the compile view shows them) and
- * the names of the failed tests (`result.failures`). A test failure's own
- * text is not shown: the server does not strip paths from it. Failing that,
- * the final
+ * model and code of each compile error (`result.diagnostics`) and the names
+ * of the failed tests (`result.failures`). Their message text is not shown:
+ * the server does not strip paths or SQL from it. Failing that, the final
  * `Error:` / `Caused by:` block of `error`, with any tracing lines dropped:
  * a server run with `RUST_LOG` can carry SQL and local paths there. Never
  * the raw stderr. Capped at [`FAILURE_MAX_CHARS`].
@@ -392,7 +391,7 @@ export function failureSummary(job: JobStatus): string {
   return text === "" ? "The job ended without a message." : cap(text);
 }
 
-/** The compile errors and failed test names of a `test` or `ci` result. */
+/** The compile error codes and failed test names of a `test` or `ci` result. */
 function testAndCiFailures(result: unknown): string[] {
   if (result === null || typeof result !== "object") return [];
   const { diagnostics, failures } = result as { diagnostics?: unknown; failures?: unknown };
@@ -400,10 +399,10 @@ function testAndCiFailures(result: unknown): string[] {
   if (Array.isArray(diagnostics)) {
     for (const entry of diagnostics as unknown[]) {
       if (entry === null || typeof entry !== "object") continue;
-      const { severity, code, message, model } = entry as Record<string, unknown>;
-      if (severity !== "Error" || typeof message !== "string") continue;
+      const { severity, code, model } = entry as Record<string, unknown>;
+      if (severity !== "Error") continue;
       const head = [model, code].filter((part) => typeof part === "string" && part !== "").join(" ");
-      lines.push(head === "" ? message : `${head}: ${message}`);
+      lines.push(head === "" ? "Compile error" : `Compile error: ${head}`);
     }
   }
   if (Array.isArray(failures)) {

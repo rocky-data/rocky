@@ -9948,6 +9948,23 @@ mod tests {
         let dirs = JobProjectDirs::of(&derived);
         assert_eq!(dirs.models, None);
         assert_eq!(dirs.contracts, Some(PathBuf::from("contracts")));
+
+        let explicit = ServerState::with_auth_and_webhook(
+            PathBuf::from("src/models"),
+            true,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            rocky_server::state::SettingsSnapshot::default(),
+        );
+        let dirs = JobProjectDirs::of(&explicit);
+        assert_eq!(dirs.models, Some(PathBuf::from("src/models")));
+        assert_eq!(dirs.contracts, None);
     }
 
     /// The child's cwd moves to the project root, so a relative `--models`

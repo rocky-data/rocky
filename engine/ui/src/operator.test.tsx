@@ -430,12 +430,12 @@ describe("a failed job, said concisely", () => {
     expect(failureSummary(failed)).toBe("main.dim_customer: model 'dim_customer' failed: boom");
   });
 
-  it("names the compile errors and failed tests of a test or ci job, not their text", () => {
+  it("names the compile errors and failed tests of a test or ci job, never their text", () => {
     const failed = job("ci", "failed", {
       error: "Error: test failures detected",
       result: {
         diagnostics: [
-          { severity: "Error", code: "E001", message: "unknown column 'x'", model: "fct_orders" },
+          { severity: "Error", code: "E001", message: "SELECT x FROM /Users/me/secret.csv", model: "fct_orders" },
           { severity: "Warning", code: "W001", message: "a warning", model: "fct_orders" },
         ],
         failures: [
@@ -445,8 +445,10 @@ describe("a failed job, said concisely", () => {
       },
     });
     const summary = failureSummary(failed);
-    expect(summary).toBe("fct_orders E001: unknown column 'x'\nFailed tests: dim_customers, fct_orders");
-    expect(summary).not.toContain("/Users/me");
+    expect(summary).toBe("Compile error: fct_orders E001\nFailed tests: dim_customers, fct_orders");
+    for (const leaked of ["/Users/me", "SELECT"]) {
+      expect(summary).not.toContain(leaked);
+    }
   });
 
   it("else shows the final Error: block, never a tracing line", () => {
