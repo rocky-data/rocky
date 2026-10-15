@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.82.0] — 2026-10-15
+
 ### Changed
 
 - HTTP-based connections now trust the operating system's certificate store, not the Mozilla root set built into the binary (`reqwest` 0.13). This covers Databricks, Snowflake, BigQuery (REST and Storage Read), Trino, ClickHouse, Fivetran, Airbyte, Iceberg REST, webhooks and the AI client. A private or corporate CA that the host trusts now works there. ClickHouse `ca_cert` adds to the OS store. A host or container with no CA bundle now fails TLS: install `ca-certificates`, or point `SSL_CERT_FILE` at a bundle. The official image already ships one. On macOS and Windows the OS also applies its own certificate rules, so a long-lived self-signed certificate may now be refused. Postgres, SQL Server, Spark Connect and Valkey still use the built-in Mozilla roots.
 - JSON schemas are generated with `schemars` 1.x. Two schemas change: `Decimal.precision` and `Decimal.scale` in `model_detail` gain `maximum: 255`, and `HooksConfig` in `rocky_project` now describes its per-event hook keys, which 0.8 dropped.
+
+### Fixed
+
+- A shell hook that exits without reading its stdin no longer kills the run. Before, `rocky run` could exit nonzero with no error message when a hook such as `touch done` finished before Rocky wrote the event context (#2360). The context now reaches the hook's stdin from an unnamed temporary file, not a pipe. A hook that reads its stdin gets the same JSON as before.
 
 ## [1.81.1] — 2026-10-15
 

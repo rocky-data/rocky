@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.49.0] — 2026-10-15
+
 ### Changed
 
 - The `rocky.toml` schema now checks entries under `[hook]`, so a malformed hook shows a warning in the editor. Generated types add `HookConfig` and `HookConfigOrList`, and `HooksConfig` index values are typed, not `unknown`.

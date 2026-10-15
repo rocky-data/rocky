@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-10-15
+
 ### Changed
 
 - Generated models follow the `schemars` 1.x schemas. `Decimal.precision` and `Decimal.scale` now reject values above 255. `HooksConfig` accepts its per-event hook keys as typed extras. The `HookConfigOrList` class is gone from `rocky_project_schema`; its union is now inline.
