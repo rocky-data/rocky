@@ -898,8 +898,23 @@ fn context_stdin(json: &str) -> std::io::Result<std::fs::File> {
 }
 
 async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
+    use tokio::io::AsyncWriteExt;
+
     let mut cmd = shell_command(&hook.command);
-    cmd.stdin(context_stdin(json)?);
+    // A host with no writable temp directory (a read-only container root)
+    // still runs the hook: the context goes through a pipe, as before #2360.
+    // There, a hook that exits before the write can still raise SIGPIPE.
+    let piped_context = match context_stdin(json) {
+        Ok(file) => {
+            cmd.stdin(file);
+            false
+        }
+        Err(e) => {
+            warn!(command = %hook.command, error = %e, "cannot create the hook's stdin file; using a pipe");
+            cmd.stdin(std::process::Stdio::piped());
+            true
+        }
+    };
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // SIGKILL the child if our `Child` handle is dropped — including when
@@ -914,7 +929,19 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     }
     crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+
+    if piped_context && let Some(mut stdin) = child.stdin.take() {
+        // A hook that exits without reading closes the pipe. When SIGPIPE
+        // is ignored, that is `BrokenPipe`, and the hook chose to ignore
+        // its stdin, which is fine.
+        match stdin.write_all(json.as_bytes()).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(HookError::Io(e)),
+        }
+        drop(stdin);
+    }
 
     // Wait with timeout
     let timeout = Duration::from_millis(hook.timeout_ms);
