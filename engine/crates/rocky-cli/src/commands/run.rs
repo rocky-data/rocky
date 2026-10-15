@@ -302,9 +302,11 @@ struct TableError {
 /// Kubernetes during pod eviction). The outer binary
 /// (`rocky/src/main.rs`) downcasts this off the `anyhow::Error` chain and
 /// maps it to exit code 130 so callers (shell, CI, orchestrators) can
-/// distinguish "interrupted" from a generic run failure. A second signal
-/// bypasses this path entirely and calls `std::process::exit(130)`
-/// directly via the watcher armed on first signal.
+/// distinguish "interrupted" from a generic run failure. Every phase that
+/// observes the run's cancellation token (`run_cancel`) returns this only
+/// after the run settled: record persisted, claim released, session settled
+/// (#1606). A second SIGINT bypasses this path entirely and calls
+/// `std::process::exit(130)` directly from the signal listener.
 #[derive(Debug, thiserror::Error)]
 #[error("run was interrupted by a shutdown signal")]
 pub struct Interrupted;
@@ -710,6 +712,13 @@ pub(crate) fn run_status_exit_result(
     // than on the error type, which says nothing about the write.
     custody: RecordCustody,
 ) -> Result<()> {
+    // A cancelled run (#1606) exits 130 whatever else it recorded: the caller
+    // has already persisted its record and emitted its payload, so this is
+    // the exit code alone. Checked first so an interrupted run with a failed
+    // model still reads as interrupted, not as a model failure.
+    if output.interrupted {
+        return Err(anyhow::Error::new(Interrupted));
+    }
     if output.tables_failed == 0
         && !output.check_gate_failed
         && !output.verify_after_failed
@@ -841,24 +850,6 @@ fn replication_check_gate_failed(
 /// run, so the verdict is unchanged everywhere else.
 fn resolved_check_gate(this_run_gated: bool, inherited_gate: Option<&String>) -> bool {
     this_run_gated || inherited_gate.is_some()
-}
-
-/// Arm a background watcher that hard-exits with code 130 on a *second*
-/// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
-/// `tokio::select!` branch — this watcher gives the user an out when
-/// graceful cleanup itself hangs (e.g. a stuck warehouse query that
-/// ignores cancellation). Only SIGINT is watched here because K8s escalates
-/// SIGTERM → SIGKILL itself after `terminationGracePeriodSeconds`; the
-/// hard-exit we care about is the interactive "Ctrl-C again" case.
-fn arm_hard_exit_on_second_signal() {
-    eprintln!(
-        "\n[rocky] shutdown signal received — finishing in-flight statements; press Ctrl-C again to terminate"
-    );
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("\n[rocky] second SIGINT — terminating");
-        std::process::exit(130);
-    });
 }
 
 /// Input for a single table processing task.
@@ -3483,6 +3474,13 @@ pub async fn run_with_explicit_contracts(
 
     let start = Instant::now();
     let started_at = Utc::now();
+    // The run's one cancellation token (#1606). Every phase below observes it
+    // instead of registering its own signal handlers, so a signal anywhere in
+    // the run reaches a settle step. Held to the end of the run: dropping it
+    // stops the signal listener this run owns (none under `--watch`, whose
+    // loop owns the signals and the token).
+    let run_cancel = super::run_cancel::for_run();
+    let cancel = run_cancel.token().clone();
     // Unified run_id minted up front so the idempotency claim and every
     // downstream persistence site (model-only, replication, interrupted,
     // main exit) share one identifier. That keeps
@@ -3885,6 +3883,7 @@ pub async fn run_with_explicit_contracts(
             false,
             contracts,
             rocky_cfg.contracts.strict,
+            &cancel,
         )
         .await;
 
@@ -3904,7 +3903,9 @@ pub async fn run_with_explicit_contracts(
             // Finding #1: only when the model phase is CLEAN (no new failures) —
             // a soft compile/runtime failure returns `Ok`, so `Ok` alone is
             // not enough to authorize governance/manifest writes.
-            Ok(snapshot) if output.tables_failed == failures_before => {
+            // An interrupted run (#1606) did not build its whole selection, so
+            // it must not reconcile governance either.
+            Ok(snapshot) if output.tables_failed == failures_before && !output.interrupted => {
                 // Pre-reconcile freeze fence (fresh LIST): a freeze landing
                 // after the model built must withhold the governance
                 // reconcile, recorded as a failure so the terminal path
@@ -4394,6 +4395,7 @@ pub async fn run_with_explicit_contracts(
                 contracts.map(RunContracts::dir),
                 defer_opts.project.as_ref(),
                 defer_opts.target_dialects.as_ref(),
+                &cancel,
             )
             .await;
             // A success whose record did not land is still a success here
@@ -6488,20 +6490,13 @@ pub async fn run_with_explicit_contracts(
     let error_rate_abort_pct = pipeline.execution.error_rate_abort_pct;
     let mut total_completed: usize = 0;
 
-    // Shutdown-signal handling: a single pinned future per signal source
-    // drives both the spawn loop's permit-wait and the drain loop below.
-    // On first SIGINT (Ctrl-C) or SIGTERM (K8s pod eviction) we arm a
-    // hard-exit watcher for a second SIGINT, set `interrupted`, and stop
-    // issuing new work. In-flight tasks drain naturally so state updates
-    // remain consistent; anything not yet `Success` or `Failed` in the
-    // state store after drain is marked `Interrupted`.
-    let ctrl_c_signal = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c_signal);
-    // SIGTERM only on Unix — Windows doesn't have it, so the future is
-    // wrapped in an `Option` and a `#[cfg(unix)]`-guarded branch.
-    #[cfg(unix)]
-    let mut sigterm_stream =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    // Shutdown handling: the run's cancellation token (#1606) drives both the
+    // spawn loop's permit-wait and the drain loop below. A first SIGINT
+    // (Ctrl-C) or SIGTERM (K8s pod eviction) cancels it — the listener that
+    // owns the token also arms the hard exit on a second SIGINT — and we set
+    // `interrupted` and stop issuing new work. In-flight tasks drain naturally
+    // so state updates remain consistent; anything not yet `Success` or
+    // `Failed` in the state store after drain is marked `Interrupted`.
     let mut interrupted = false;
 
     // Freeze fence — ONE fresh LIST bounding the gate-to-copy window (the
@@ -6545,6 +6540,11 @@ pub async fn run_with_explicit_contracts(
     };
 
     for (idx, task) in tables_to_process.iter().enumerate() {
+        // A cancel that landed before the fan-out (discovery, setup) stops it
+        // before the first table, rather than racing the first permit.
+        if cancel.is_cancelled() {
+            interrupted = true;
+        }
         if interrupted || freeze_withheld.is_some() || drain_abort.is_some() {
             break;
         }
@@ -6611,22 +6611,7 @@ pub async fn run_with_explicit_contracts(
 
         let permit = tokio::select! {
             permit = semaphore.clone().acquire_owned() => permit?,
-            _ = &mut ctrl_c_signal, if !interrupted => {
-                arm_hard_exit_on_second_signal();
-                interrupted = true;
-                break;
-            }
-            _ = async {
-                #[cfg(unix)]
-                if let Some(s) = sigterm_stream.as_mut() {
-                    let _ = s.recv().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-                #[cfg(not(unix))]
-                std::future::pending::<()>().await;
-            }, if !interrupted => {
-                arm_hard_exit_on_second_signal();
+            () = cancel.cancelled(), if !interrupted => {
                 interrupted = true;
                 break;
             }
@@ -6678,22 +6663,7 @@ pub async fn run_with_explicit_contracts(
                 Some(r) => r,
                 None => break,
             },
-            _ = &mut ctrl_c_signal, if !interrupted => {
-                arm_hard_exit_on_second_signal();
-                interrupted = true;
-                continue;
-            }
-            _ = async {
-                #[cfg(unix)]
-                if let Some(s) = sigterm_stream.as_mut() {
-                    let _ = s.recv().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-                #[cfg(not(unix))]
-                std::future::pending::<()>().await;
-            }, if !interrupted => {
-                arm_hard_exit_on_second_signal();
+            () = cancel.cancelled(), if !interrupted => {
                 interrupted = true;
                 continue;
             }
@@ -6899,6 +6869,11 @@ pub async fn run_with_explicit_contracts(
     // are all skipped — they implicitly need a "successful" run baseline.
     #[cfg(test)]
     if INTERRUPT_AFTER_COPY_FOR_TEST.lock().ok().is_some_and(|mut ids| ids.remove(&run_id)) {
+        interrupted = true;
+    }
+    // A cancel that landed after the last table was spawned and the drain
+    // finished settles here too, before auto-retry starts new copies.
+    if cancel.is_cancelled() {
         interrupted = true;
     }
     if interrupted {
@@ -7124,7 +7099,17 @@ pub async fn run_with_explicit_contracts(
                 "retrying failed tables (attempt 2)"
             );
             let mut still_failed = Vec::new();
-            for idx in retryable {
+            // A cancel stops the retries (#1606): a table not yet retried
+            // keeps its first-attempt error, and the run settles as
+            // interrupted at its terminal exit.
+            let mut not_retried: Vec<usize> = Vec::new();
+            let mut pending = retryable.into_iter();
+            for idx in pending.by_ref() {
+                if cancel.is_cancelled() {
+                    output.interrupted = true;
+                    not_retried.push(idx);
+                    break;
+                }
                 let task = &tables_to_process[idx];
                 match retry_table_after_recovery(
                     shared_warehouse.as_ref(),
@@ -7214,7 +7199,8 @@ pub async fn run_with_explicit_contracts(
                     }
                 }
             }
-            table_errors.retain(|e| e.task_index.is_none());
+            not_retried.extend(pending);
+            table_errors.retain(|e| e.task_index.is_none_or(|idx| not_retried.contains(&idx)));
             table_errors.extend(still_failed);
         }
     }
@@ -7545,6 +7531,7 @@ pub async fn run_with_explicit_contracts(
                     true,
                     contracts,
                     rocky_cfg.contracts.strict,
+                    &cancel,
                 )
                 .await
             }
@@ -7559,7 +7546,10 @@ pub async fn run_with_explicit_contracts(
             // governance to the warehouse *despite the gate detecting the change*.
             // On any failure we record it and SKIP all post-model governance
             // below, falling through to the failure payload + non-zero exit.
-            let mut exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
+            // An interrupted model phase (#1606) is not clean: governance below
+            // must not reconcile a set that did not fully execute.
+            let mut exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed)
+                && !output.interrupted;
             model_phase_clean = exec_ok;
             let governance_snapshot = match exec_result {
                 // #1093: keep the gated snapshot for the reconcile below.
@@ -8099,6 +8089,22 @@ pub async fn run_with_explicit_contracts(
     // Default skip trades durability for liveness; explicit fail and governed
     // apply must not report success when the cursor transaction was lost.
     watermark_flush_exit_result(watermark_flush_failed, governed, rocky_cfg.state.on_upload_failure)?;
+
+    // A cancel after the fan-out (#1606) — during auto-retry or the model
+    // phase — settled through the ordinary terminal path above: the record
+    // is persisted, the claim finalized, the session finalized. Only the exit
+    // differs: the conventional 130, never a failure or success code.
+    if output.interrupted {
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(
+                &run_id,
+                pipeline_name,
+                "interrupted by signal",
+            ))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return Err(anyhow::Error::new(Interrupted));
+    }
 
     if !table_errors.is_empty() {
         let count = table_errors.len();
@@ -12488,6 +12494,9 @@ pub(crate) async fn execute_models(
         reconciles_masks,
         None,
         strict_contracts,
+        // Backfill and tests: no run owns a token here, so adopt a `--watch`
+        // scope's when there is one and otherwise never cancel.
+        &super::run_cancel::ambient().unwrap_or_default(),
     )
     .await
 }
@@ -12602,6 +12611,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // cannot check (`E059` in place of the `I003` note), after the source
     // describe below has had its chance to resolve the type.
     strict_contracts: bool,
+    // The run's cancellation token (#1606). Checked before each execution
+    // layer and before each serially dispatched model: once cancelled, no new
+    // model starts, `output.interrupted` is set and this returns `Ok` so the
+    // caller's terminal persist + settle runs (the freeze fence's shape).
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -13649,6 +13663,12 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     };
 
     for layer in execution_layers {
+        // Cancel (#1606): start no further layer. Layers already run keep
+        // their results in `output`, which the caller persists.
+        if cancel.is_cancelled() {
+            output.interrupted = true;
+            return Ok(governance_snapshot);
+        }
         // Freeze fence — one fresh LIST per execution-layer boundary
         // (ADR-CONCURRENCY.md D3 fence granularity): a freeze landing mid-run
         // withholds this and all remaining layers fail-closed. The `Ok`
@@ -14004,6 +14024,12 @@ pub(crate) async fn execute_models_with_explicit_contracts(
 
         for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
+
+            // Cancel (#1606): dispatch no further model on the serial path.
+            if cancel.is_cancelled() {
+                output.interrupted = true;
+                return Ok(governance_snapshot);
+            }
 
             // Re-adjudicate immediately before dispatch (serial path): the
             // layer's verdicts were computed before any of this layer's models
@@ -34343,6 +34369,7 @@ backend = "local"
                 false,
                 Some(super::RunContracts::SelectedModelGuard(&contracts)),
                 false,
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await
             .expect("a contract rejection is carried in RunOutput");
@@ -34418,6 +34445,7 @@ backend = "local"
             false,
             Some(super::RunContracts::SelectedModelGuard(&contracts)),
             false,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
         result.expect("compile rejection is carried in RunOutput");

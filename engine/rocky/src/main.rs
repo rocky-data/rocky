@@ -3624,9 +3624,15 @@ fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelSc
 /// rows committed in the warehouse and its watermark commit is then cut, the
 /// next run re-reads from the old watermark and appends the same delta twice.
 /// The unbounded drop this replaces would let that commit finish, at the price
-/// of the hang it also produces. Removing the trade-off needs a cancellation
-/// protocol that separates "stop starting warehouse work" from "settle the
-/// state tail", which a process-wide timer cannot express — tracked in #1606.
+/// of the hang it also produces.
+///
+/// Since #1606 `rocky run` has a cancellation token that separates "stop
+/// starting warehouse work" from "settle the state tail": a signalled run
+/// flushes its watermarks and writes its record before it returns, and
+/// `--watch` drops an iteration only after it failed to settle within its own
+/// grace. This timeout is now the backstop for that dropped case — a statement
+/// still in flight on the blocking pool — not the thing that orders the state
+/// tail.
 ///
 /// # Why five seconds
 ///

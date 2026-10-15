@@ -25,6 +25,8 @@ use tracing::warn;
 use rocky_core::config::GovernanceOverride;
 use rocky_core::state_sync::DroppedSessionSink;
 
+use tokio_util::sync::CancellationToken;
+
 use super::run::{Interrupted, PartitionRunOptions, run};
 
 /// Debounce window: collect events for this long before triggering a re-run.
@@ -46,16 +48,17 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// change to a watched path triggers a debounced re-run. Errors from the
 /// inner `run` are logged and the loop continues — only adapter-init /
 /// config-parse errors at startup exit non-zero. A single SIGINT always exits
-/// the watch loop with status 0, whether it lands between runs (caught by the
-/// loop's own `ctrl_c` arm) or during one (consumed by the inner run, which
-/// reports it back as [`IterOutcome::interrupted`]). Requiring a second signal
-/// in the second case was #1405.
+/// the watch loop with status 0, whether it lands between runs or during one.
+/// Requiring a second signal in the second case was #1405.
 ///
-/// A signal that makes the loop drop an in-flight iteration first settles the
-/// remote-state session that iteration held — its terminal upload, under the
-/// session's own durability rules (#1603). The exit is non-zero only when that
-/// upload fails and `[state] on_upload_failure = "fail"` says it must not be
-/// lost; see `stop_interrupted_iteration`.
+/// A signal during an iteration cancels that iteration's token (#1606). The
+/// run stops starting warehouse work and settles its record, claim and state
+/// session itself, within [`SIGNAL_SETTLE_GRACE`]. An iteration that does not
+/// settle in time (a stalled statement) is dropped, and the loop then settles
+/// the remote-state session it held — its terminal upload, under the session's
+/// own durability rules (#1603). The exit is non-zero only when that upload
+/// fails and `[state] on_upload_failure = "fail"` says it must not be lost;
+/// see `stop_interrupted_iteration`.
 ///
 /// # Arguments
 ///
@@ -230,42 +233,50 @@ pub async fn run_watch(
     //
     // The run is RACED against the signal arms rather than plainly awaited.
     // With the streams registered above, a signal arriving mid-run is only
-    // latched — nothing polls the streams while `iter_once` is in flight —
-    // and the replication path's own graceful arms (`run.rs`) exist only
-    // after its setup, while the transformation path has none at all. An
+    // latched — nothing polls the streams while `iter_once` is in flight. An
     // un-raced await would therefore defer shutdown to the end of the
     // iteration and make a stalled run unkillable by SIGTERM, where the
     // pre-registration code died instantly on the default disposition.
-    // Racing restores prompt shutdown: the outer arm fires, the iteration
-    // future is dropped, and the process exits. Dropping mid-run is
-    // crash-parity — the state store's commit protocol and `InProgress`
-    // breadcrumbs are designed for exactly that — and is strictly cleaner
-    // than the old mid-run default-disposition kill.
+    //
+    // When an arm fires, `stop_iteration` cancels the iteration's token and
+    // waits at most `SIGNAL_SETTLE_GRACE` for the run to settle itself (#1606).
+    // That bound is what keeps SIGTERM prompt: a stalled iteration is then
+    // dropped, and the process exits. Dropping mid-run is crash-parity — the
+    // state store's commit protocol and `InProgress` breadcrumbs are designed
+    // for exactly that — and is strictly cleaner than the old mid-run
+    // default-disposition kill.
     {
         // The sink catches any remote-state session the iteration still holds
         // if a signal makes us drop it, so its terminal upload is settled
         // rather than skipped (#1603). See `stop_interrupted_iteration`.
         let sink = DroppedSessionSink::new();
-        let mut first_run = Box::pin(sink.scope(iter_once(
-            config_path,
-            filter,
-            pipeline_name_arg,
-            state_path,
-            governance_override,
-            output_json,
-            models_dir,
-            run_all,
-            shadow_config,
-            partition_opts,
-            cache_ttl_override,
-            env,
-            skip_opts,
-            run_vars,
-            actor,
+        // The iteration's cancellation token (#1606). The run inside adopts it
+        // instead of listening for signals itself, so the arms below can ask
+        // it to stop and settle rather than only drop it.
+        let cancel = CancellationToken::new();
+        let mut first_run = Box::pin(sink.scope(super::run_cancel::scope(
+            cancel.clone(),
+            iter_once(
+                config_path,
+                filter,
+                pipeline_name_arg,
+                state_path,
+                governance_override,
+                output_json,
+                models_dir,
+                run_all,
+                shadow_config,
+                partition_opts,
+                cache_ttl_override,
+                env,
+                skip_opts,
+                run_vars,
+                actor,
+            ),
         )));
-        let interrupted = tokio::select! {
-            outcome = &mut first_run => outcome.interrupted,
-            _ = &mut ctrl_c_signal => true,
+        let stop = tokio::select! {
+            outcome = &mut first_run => IterStop::Finished { interrupted: outcome.interrupted },
+            _ = &mut ctrl_c_signal => IterStop::Signal,
             Some(()) = async {
                 #[cfg(unix)]
                 {
@@ -278,7 +289,7 @@ pub async fn run_watch(
                 {
                     std::future::pending().await
                 }
-            } => true,
+            } => IterStop::Signal,
             Some(()) = async {
                 #[cfg(unix)]
                 {
@@ -291,10 +302,9 @@ pub async fn run_watch(
                 {
                     std::future::pending().await
                 }
-            } => true,
+            } => IterStop::Signal,
         };
-        if interrupted {
-            stop_interrupted_iteration(first_run, &sink).await?;
+        if stop_iteration(stop, &cancel, first_run, &sink).await? {
             eprintln!("\n[watch] stopped");
             return Ok(());
         }
@@ -369,7 +379,10 @@ pub async fn run_watch(
                 // stalled one). A signal latched during the debounce fires
                 // here immediately, before the re-run starts.
                 let sink = DroppedSessionSink::new();
-                let mut rerun = Box::pin(sink.scope(iter_once(
+                let cancel = CancellationToken::new();
+                let mut rerun = Box::pin(sink.scope(super::run_cancel::scope(
+                    cancel.clone(),
+                    iter_once(
                     config_path,
                     filter,
                     pipeline_name_arg,
@@ -385,10 +398,11 @@ pub async fn run_watch(
                     skip_opts,
                     run_vars,
                     actor,
+                ),
                 )));
-                let interrupted = tokio::select! {
-                    outcome = &mut rerun => outcome.interrupted,
-                    _ = &mut ctrl_c_signal => true,
+                let stop = tokio::select! {
+                    outcome = &mut rerun => IterStop::Finished { interrupted: outcome.interrupted },
+                    _ = &mut ctrl_c_signal => IterStop::Signal,
                     Some(()) = async {
                         #[cfg(unix)]
                         {
@@ -401,7 +415,7 @@ pub async fn run_watch(
                         {
                             std::future::pending().await
                         }
-                    } => true,
+                    } => IterStop::Signal,
                     Some(()) = async {
                         #[cfg(unix)]
                         {
@@ -414,16 +428,108 @@ pub async fn run_watch(
                         {
                             std::future::pending().await
                         }
-                    } => true,
+                    } => IterStop::Signal,
                 };
-                if interrupted {
-                    stop_interrupted_iteration(rerun, &sink).await?;
+                if stop_iteration(stop, &cancel, rerun, &sink).await? {
                     eprintln!("\n[watch] stopped");
                     return Ok(());
                 }
             }
         }
     }
+}
+
+/// How long a signalled iteration may take to stop and settle on its own
+/// before the watch loop drops it (#1606).
+///
+/// The iteration's run observes the cancellation token: it starts no new
+/// warehouse work and settles its run record, claim and state session. It
+/// cannot stop a statement already in flight, and nothing can cancel a
+/// `spawn_blocking` statement. So the wait is bounded, and a stalled iteration
+/// is then dropped exactly as before — crash parity, settled by
+/// [`stop_interrupted_iteration`]. Ten seconds is well clear of a local settle
+/// and, with `main`'s five-second blocking-pool grace after it, well inside
+/// Kubernetes' default 30-second termination grace.
+const SIGNAL_SETTLE_GRACE: Duration = Duration::from_secs(10);
+
+/// What ended the wait on one watch iteration.
+enum IterStop {
+    /// The iteration returned by itself; `interrupted` when its run reported
+    /// [`Interrupted`].
+    Finished { interrupted: bool },
+    /// A signal arm fired while the iteration was still running.
+    Signal,
+}
+
+/// Act on how an iteration's wait ended. Returns `true` when the watch loop
+/// must stop.
+///
+/// On a signal, cancel the iteration's token and give it
+/// [`SIGNAL_SETTLE_GRACE`] to stop and settle through its own terminal path
+/// (#1606). Past the grace, drop it as before. A second SIGINT during the
+/// grace exits 130 at once.
+///
+/// ```text
+///   signal ──▶ cancel.cancel() ──▶ wait ≤ grace for the iteration
+///                                     │ settled            │ grace elapsed
+///                                     ▼                    ▼
+///                      stop_interrupted_iteration (no-op)  drop it (crash
+///                                                          parity) + settle
+///                                                          its session
+/// ```
+async fn stop_iteration<F: std::future::Future>(
+    stop: IterStop,
+    cancel: &CancellationToken,
+    mut iteration: std::pin::Pin<Box<F>>,
+    sink: &DroppedSessionSink,
+) -> Result<bool> {
+    match stop {
+        IterStop::Finished { interrupted: false } => return Ok(false),
+        IterStop::Finished { interrupted: true } => {}
+        IterStop::Signal => {
+            // Registered before the notice, so a second SIGINT sent after the
+            // operator sees it is never lost. A fresh stream sees only signals
+            // delivered after it exists, not the one that brought us here.
+            #[cfg(unix)]
+            let mut second_sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+            cancel.cancel();
+            eprintln!(
+                "\n[watch] shutdown signal received — letting the run settle (up to {}s); press \
+                 Ctrl-C again to terminate",
+                SIGNAL_SETTLE_GRACE.as_secs()
+            );
+            let second = async {
+                #[cfg(unix)]
+                {
+                    match second_sigint.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c().await.ok()
+                }
+            };
+            tokio::select! {
+                settled = tokio::time::timeout(SIGNAL_SETTLE_GRACE, iteration.as_mut()) => {
+                    if settled.is_err() {
+                        eprintln!(
+                            "[watch] the run did not settle within {}s; stopping it",
+                            SIGNAL_SETTLE_GRACE.as_secs()
+                        );
+                    }
+                }
+                Some(()) = second => {
+                    eprintln!("\n[watch] second SIGINT — terminating");
+                    std::process::exit(130);
+                }
+            }
+        }
+    }
+    stop_interrupted_iteration(iteration, sink).await?;
+    Ok(true)
 }
 
 /// Stop an iteration a signal interrupted, and settle what it owed its remote

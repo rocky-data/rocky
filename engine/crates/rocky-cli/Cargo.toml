@@ -43,6 +43,7 @@ indexmap = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 miette = { workspace = true }
