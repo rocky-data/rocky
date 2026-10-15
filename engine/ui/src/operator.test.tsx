@@ -430,6 +430,25 @@ describe("a failed job, said concisely", () => {
     expect(failureSummary(failed)).toBe("main.dim_customer: model 'dim_customer' failed: boom");
   });
 
+  it("names the compile errors and failed tests of a test or ci job, not their text", () => {
+    const failed = job("ci", "failed", {
+      error: "Error: test failures detected",
+      result: {
+        diagnostics: [
+          { severity: "Error", code: "E001", message: "unknown column 'x'", model: "fct_orders" },
+          { severity: "Warning", code: "W001", message: "a warning", model: "fct_orders" },
+        ],
+        failures: [
+          { name: "dim_customers", error: "Binder Error at /Users/me/project/models/x.sql" },
+          { name: "fct_orders", error: "boom" },
+        ],
+      },
+    });
+    const summary = failureSummary(failed);
+    expect(summary).toBe("fct_orders E001: unknown column 'x'\nFailed tests: dim_customers, fct_orders");
+    expect(summary).not.toContain("/Users/me");
+  });
+
   it("else shows the final Error: block, never a tracing line", () => {
     const summary = failureSummary(job("apply", "failed", { error: STDERR }));
     expect(summary.startsWith("Error: plan_models_changed")).toBe(true);

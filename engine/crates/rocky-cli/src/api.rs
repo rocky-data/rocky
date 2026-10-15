@@ -3301,6 +3301,7 @@ async fn submit_job(
 
     let state_path = state_path_for(&state);
     let config_path = state.config_path.clone();
+    let dirs = JobProjectDirs::of(&state);
 
     // Register + persist the `running` record BEFORE spawning the subprocess and
     // BEFORE returning 202, so a crash immediately after submission still reports
@@ -3336,8 +3337,15 @@ async fn submit_job(
     cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
-        let (final_state, result, error) =
-            execute_job_subprocess(kind, config_path, state_path.clone(), request, cancel_rx).await;
+        let (final_state, result, error) = execute_job_subprocess(
+            kind,
+            config_path,
+            dirs,
+            state_path.clone(),
+            request,
+            cancel_rx,
+        )
+        .await;
 
         finish_job(
             task_state,
@@ -3412,9 +3420,41 @@ async fn finish_job<P>(
 /// proven by the live reachability transcript, while THIS seam pins exactly
 /// which request fields become which flags (notably `expect_spec_digest` →
 /// `--expect-spec-digest` on `apply`).
+/// The server's own `--models` and `--contracts`. A `test` or `ci` child
+/// reads the project from these, not from its cwd, so it checks the same
+/// models and contracts the UI shows.
+#[derive(Debug, Clone, Default)]
+struct JobProjectDirs {
+    /// Set only when `rocky serve` got an explicit `--models`. Otherwise the
+    /// child resolves models the same way the CLI does with no flag.
+    models: Option<std::path::PathBuf>,
+    contracts: Option<std::path::PathBuf>,
+}
+
+impl JobProjectDirs {
+    fn of(state: &ServerState) -> Self {
+        Self {
+            models: state
+                .models_dir_is_explicit
+                .then(|| state.models_dir.clone()),
+            contracts: state.contracts_dir.clone(),
+        }
+    }
+
+    /// Resolve against the server's cwd, before the child moves to the
+    /// project root.
+    fn absolute(&self) -> Self {
+        Self {
+            models: self.models.as_deref().map(absolute_path),
+            contracts: self.contracts.as_deref().map(absolute_path),
+        }
+    }
+}
+
 fn job_subprocess_args(
     kind: JobKind,
     config_path: Option<&std::path::Path>,
+    dirs: &JobProjectDirs,
     state_path: &std::path::Path,
     request: &JobRequest,
 ) -> Vec<std::ffi::OsString> {
@@ -3462,13 +3502,22 @@ fn job_subprocess_args(
             }
             args.push("--approve".into());
         }
-        JobKind::Test => {
-            if let Some(model) = &request.model {
+        JobKind::Test | JobKind::Ci => {
+            if let Some(models) = &dirs.models {
+                args.push("--models".into());
+                args.push(models.into());
+            }
+            if let Some(contracts) = &dirs.contracts {
+                args.push("--contracts".into());
+                args.push(contracts.into());
+            }
+            if kind == JobKind::Test
+                && let Some(model) = &request.model
+            {
                 args.push("--model".into());
                 args.push(model.into());
             }
         }
-        JobKind::Ci => {}
     }
     args
 }
@@ -3482,6 +3531,7 @@ fn job_subprocess_args(
 async fn execute_job_subprocess(
     kind: JobKind,
     config_path: Option<std::path::PathBuf>,
+    dirs: JobProjectDirs,
     state_path: std::path::PathBuf,
     request: JobRequest,
     cancel: tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
@@ -3497,7 +3547,14 @@ async fn execute_job_subprocess(
         }
     };
 
-    let cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
+    let cmd = job_subprocess_command(
+        exe,
+        kind,
+        config_path.as_deref(),
+        &dirs,
+        &state_path,
+        &request,
+    );
 
     let output = match run_job_child(cmd, cancel).await {
         Ok(output) => output,
@@ -4050,6 +4107,7 @@ fn job_subprocess_command(
     exe: std::path::PathBuf,
     kind: JobKind,
     config_path: Option<&std::path::Path>,
+    dirs: &JobProjectDirs,
     state_path: &std::path::Path,
     request: &JobRequest,
 ) -> tokio::process::Command {
@@ -4069,10 +4127,11 @@ fn job_subprocess_command(
     // cwd cannot change what a relative `--config` or `--state-path` names.
     let config_path = config_path.map(absolute_path);
     let state_path = absolute_path(state_path);
+    let dirs = dirs.absolute();
     if let Some(root) = config_path.as_deref().and_then(std::path::Path::parent) {
         cmd.current_dir(root);
     }
-    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, request) {
+    for arg in job_subprocess_args(kind, config_path.as_deref(), &dirs, &state_path, request) {
         cmd.arg(arg);
     }
     cmd
@@ -4182,6 +4241,7 @@ mod tests {
             probe,
             JobKind::Run,
             None,
+            &JobProjectDirs::default(),
             &dir.path().join("state.redb"),
             &JobRequest::default(),
         );
@@ -9811,7 +9871,7 @@ mod tests {
             ..JobRequest::default()
         };
         let argv = |kind| -> Vec<String> {
-            job_subprocess_args(kind, None, state, &request)
+            job_subprocess_args(kind, None, &JobProjectDirs::default(), state, &request)
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
@@ -9823,6 +9883,99 @@ mod tests {
         let mut ci = head.to_vec();
         ci.push("ci");
         assert_eq!(argv(JobKind::Ci), ci);
+    }
+
+    /// A `test` or `ci` child reads the project from its flags, so it gets
+    /// the server's own `--models` and `--contracts`. Without them, `rocky
+    /// serve --ui --contracts c/` would show contract errors in the compile
+    /// view while the Test job reported "done". The other kinds read models
+    /// from the config's pipelines and never carry either flag.
+    #[test]
+    fn test_and_ci_jobs_carry_the_servers_models_and_contracts() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/src/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let request = JobRequest {
+            model: Some("dim_customers".to_string()),
+            ..JobRequest::default()
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(kind, None, &dirs, state, &request)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let head = ["--output", "json", "--state-path", "/tmp/state.redb"];
+        let project = ["--models", "/p/src/models", "--contracts", "/p/contracts"];
+        let mut test = head.to_vec();
+        test.push("test");
+        test.extend(project);
+        test.extend(["--model", "dim_customers"]);
+        assert_eq!(argv(JobKind::Test), test);
+        let mut ci = head.to_vec();
+        ci.push("ci");
+        ci.extend(project);
+        assert_eq!(argv(JobKind::Ci), ci);
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Apply,
+            JobKind::Approve,
+        ] {
+            let args = argv(kind);
+            assert!(
+                !args.iter().any(|a| a == "--models" || a == "--contracts"),
+                "{kind:?} must not carry the project dirs: {args:?}"
+            );
+        }
+    }
+
+    /// A models dir the server derived (no explicit `--models`) stays off the
+    /// child's argv, so `rocky ci` still compiles every pipeline's models. The
+    /// contracts dir always rides along.
+    #[tokio::test]
+    async fn job_project_dirs_pass_models_only_when_the_server_was_given_them() {
+        let derived = ServerState::with_auth(
+            PathBuf::from("models"),
+            Some(PathBuf::from("contracts")),
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        let dirs = JobProjectDirs::of(&derived);
+        assert_eq!(dirs.models, None);
+        assert_eq!(dirs.contracts, Some(PathBuf::from("contracts")));
+    }
+
+    /// The child's cwd moves to the project root, so a relative `--models`
+    /// or `--contracts` the server was started with must be made absolute
+    /// first, against the server's own cwd.
+    #[test]
+    fn the_job_command_passes_absolute_project_dirs() {
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("rel-models")),
+            contracts: Some(PathBuf::from("rel-contracts")),
+        };
+        let command = job_subprocess_command(
+            PathBuf::from("rocky"),
+            JobKind::Ci,
+            Some(std::path::Path::new("sub/rocky.toml")),
+            &dirs,
+            std::path::Path::new("state.redb"),
+            &JobRequest::default(),
+        );
+        let args: Vec<PathBuf> = command.as_std().get_args().map(PathBuf::from).collect();
+        let cwd = std::env::current_dir().unwrap();
+        for (flag, value) in [("--models", "rel-models"), ("--contracts", "rel-contracts")] {
+            let at = args
+                .iter()
+                .position(|a| a.as_os_str() == flag)
+                .unwrap_or_else(|| panic!("{flag} missing: {args:?}"));
+            assert_eq!(args[at + 1], cwd.join(value), "{flag}");
+        }
     }
 
     /// FF-WP1 (finding 5) — the apply job's argv threading, pinned at the
@@ -9838,7 +9991,13 @@ mod tests {
             expect_spec_digest: Some("sha256:feed".to_string()),
             ..JobRequest::default()
         };
-        let args = job_subprocess_args(JobKind::Apply, None, state, &with);
+        let args = job_subprocess_args(
+            JobKind::Apply,
+            None,
+            &JobProjectDirs::default(),
+            state,
+            &with,
+        );
         let args: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -9859,7 +10018,13 @@ mod tests {
             plan_id: Some("abc123".to_string()),
             ..JobRequest::default()
         };
-        let args = job_subprocess_args(JobKind::Apply, None, state, &without);
+        let args = job_subprocess_args(
+            JobKind::Apply,
+            None,
+            &JobProjectDirs::default(),
+            state,
+            &without,
+        );
         assert!(
             !args
                 .iter()
@@ -9873,7 +10038,7 @@ mod tests {
             ..JobRequest::default()
         };
         for kind in [JobKind::Run, JobKind::Plan] {
-            let args = job_subprocess_args(kind, None, state, &stray);
+            let args = job_subprocess_args(kind, None, &JobProjectDirs::default(), state, &stray);
             assert!(
                 !args
                     .iter()
@@ -12061,6 +12226,7 @@ adapter = "db"
         let args: Vec<String> = job_subprocess_args(
             JobKind::Approve,
             Some(std::path::Path::new("rocky.toml")),
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &request,
         )
@@ -12105,6 +12271,7 @@ adapter = "db"
                 probe.clone(),
                 kind,
                 None,
+                &JobProjectDirs::default(),
                 &dir.path().join("state.redb"),
                 &JobRequest::default(),
             );
@@ -12123,6 +12290,7 @@ adapter = "db"
                 probe.clone(),
                 kind,
                 None,
+                &JobProjectDirs::default(),
                 &dir.path().join("state.redb"),
                 &JobRequest::default(),
             )
@@ -12152,6 +12320,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Approve,
             Some(&config),
+            &JobProjectDirs::default(),
             std::path::Path::new("relative-state.redb"),
             &request,
         );
@@ -12170,6 +12339,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Run,
             Some(std::path::Path::new("sub/rocky.toml")),
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &JobRequest::default(),
         );
@@ -12183,6 +12353,7 @@ adapter = "db"
             PathBuf::from("rocky"),
             JobKind::Run,
             None,
+            &JobProjectDirs::default(),
             std::path::Path::new("state.redb"),
             &JobRequest::default(),
         );

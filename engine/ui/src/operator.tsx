@@ -358,7 +358,11 @@ function cap(text: string): string {
  * What a failed job says, concisely.
  *
  * First the structured errors of the child's own output (`result.errors`,
- * e.g. `model 'dim_customer' failed: ...`). Failing that, the final
+ * e.g. `model 'dim_customer' failed: ...`). Then, for `test` and `ci`, the
+ * compile errors (`result.diagnostics`, as the compile view shows them) and
+ * the names of the failed tests (`result.failures`). A test failure's own
+ * text is not shown: the server does not strip paths from it. Failing that,
+ * the final
  * `Error:` / `Caused by:` block of `error`, with any tracing lines dropped:
  * a server run with `RUST_LOG` can carry SQL and local paths there. Never
  * the raw stderr. Capped at [`FAILURE_MAX_CHARS`].
@@ -377,6 +381,8 @@ export function failureSummary(job: JobStatus): string {
       .filter((line): line is string => line !== null);
     if (lines.length > 0) return cap(lines.join("\n"));
   }
+  const checks = testAndCiFailures(job.result);
+  if (checks.length > 0) return cap(checks.join("\n"));
   const lines = (job.error ?? "").split("\n").filter((line) => !isTracingLine(line));
   let start = -1;
   lines.forEach((line, index) => {
@@ -384,6 +390,29 @@ export function failureSummary(job: JobStatus): string {
   });
   const text = (start >= 0 ? lines.slice(start) : lines.slice(-10)).join("\n").trim();
   return text === "" ? "The job ended without a message." : cap(text);
+}
+
+/** The compile errors and failed test names of a `test` or `ci` result. */
+function testAndCiFailures(result: unknown): string[] {
+  if (result === null || typeof result !== "object") return [];
+  const { diagnostics, failures } = result as { diagnostics?: unknown; failures?: unknown };
+  const lines: string[] = [];
+  if (Array.isArray(diagnostics)) {
+    for (const entry of diagnostics as unknown[]) {
+      if (entry === null || typeof entry !== "object") continue;
+      const { severity, code, message, model } = entry as Record<string, unknown>;
+      if (severity !== "Error" || typeof message !== "string") continue;
+      const head = [model, code].filter((part) => typeof part === "string" && part !== "").join(" ");
+      lines.push(head === "" ? message : `${head}: ${message}`);
+    }
+  }
+  if (Array.isArray(failures)) {
+    const names = (failures as unknown[])
+      .map((entry) => (entry !== null && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined))
+      .filter((name): name is string => typeof name === "string" && name !== "");
+    if (names.length > 0) lines.push(`Failed tests: ${names.join(", ")}`);
+  }
+  return lines;
 }
 
 /** What the Cancel button says once a stop was delivered to the job. */
