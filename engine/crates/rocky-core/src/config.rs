@@ -8518,6 +8518,18 @@ mod tests {
                 assert!(shown.contains("${RV_CFG_DBG}"), "{shown}");
             }
         }
+
+        // A wrapped foreign error does not render by itself: the TOML error
+        // quotes the offending line. This case fails under a derived `Debug`.
+        let toml_err = toml::from_str::<toml::Table>(&format!("host = \"{SECRET}\" ]"))
+            .expect_err("malformed TOML");
+        assert!(
+            format!("{toml_err:?}").contains(SECRET),
+            "fixture quotes it"
+        );
+        let debug = format!("{:?}", ConfigError::ParseToml(toml_err));
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CFG_DBG}"), "{debug}");
     }
 
     // ---- credential-tolerant loading (#1536) ----
