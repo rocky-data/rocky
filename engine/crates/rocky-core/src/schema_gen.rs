@@ -28,6 +28,8 @@ pub fn draft07_schema_for<T: JsonSchema + ?Sized>() -> Value {
     value
 }
 
+const DATA_KEYWORDS: [&str; 4] = ["default", "examples", "enum", "const"];
+
 fn normalize(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -52,8 +54,12 @@ fn normalize(value: &mut Value) {
                     map.insert(key.to_owned(), Value::Number(float));
                 }
             }
-            for child in map.values_mut() {
-                normalize(child);
+            // These keys hold data, not schemas: a default value with a
+            // `const` or `required` key must come out as written.
+            for (key, child) in map.iter_mut() {
+                if !DATA_KEYWORDS.contains(&key.as_str()) {
+                    normalize(child);
+                }
             }
         }
         Value::Array(items) => items.iter_mut().for_each(normalize),
@@ -74,4 +80,33 @@ fn unwrap_paragraphs(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::normalize;
+
+    #[test]
+    fn data_under_default_and_examples_is_left_as_written() {
+        let mut schema = json!({
+            "type": "object",
+            "const": "x",
+            "default": {"const": "y", "required": ["b", "a"], "minimum": 1},
+            "examples": [{"description": "line one\nline two"}],
+            "properties": {"n": {"type": "integer", "minimum": 0, "required": ["z", "y"]}}
+        });
+        normalize(&mut schema);
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "enum": ["x"],
+                "default": {"const": "y", "required": ["b", "a"], "minimum": 1},
+                "examples": [{"description": "line one\nline two"}],
+                "properties": {"n": {"type": "integer", "minimum": 0.0, "required": ["y", "z"]}}
+            })
+        );
+    }
 }

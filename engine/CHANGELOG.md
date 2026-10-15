@@ -16,7 +16,7 @@ Earlier Linux releases, 1.80.0 included, crash in the same way on any SQL that m
 ### Changed
 
 - The bundled DuckDB moves to the `duckdb` crate 1.10506. Other engine dependencies take their latest compatible versions. `object_store` stays at 0.14.1 (#2124), and `arrow` and `parquet` stay on 58.
-- HTTPS connections now trust the operating system's certificate store, not a CA list built into the binary (`reqwest` 0.13). A private or corporate CA that the host trusts now works. A host or container with no CA bundle now fails TLS; install `ca-certificates`, or point `SSL_CERT_FILE` at a bundle. The official image already ships one.
+- HTTP-based connections now trust the operating system's certificate store, not the Mozilla root set built into the binary (`reqwest` 0.13). This covers Databricks, Snowflake, BigQuery (REST and Storage Read), Trino, ClickHouse, Fivetran, Airbyte, Iceberg REST, webhooks and the AI client. A private or corporate CA that the host trusts now works there. ClickHouse `ca_cert` adds to the OS store. A host or container with no CA bundle now fails TLS: install `ca-certificates`, or point `SSL_CERT_FILE` at a bundle. The official image already ships one. On macOS and Windows the OS also applies its own certificate rules, so a long-lived self-signed certificate may now be refused. Postgres, SQL Server, Spark Connect and Valkey still use the built-in Mozilla roots.
 - JSON schemas are generated with `schemars` 1.x. Two schemas change: `Decimal.precision` and `Decimal.scale` in `model_detail` gain `maximum: 255`, and `HooksConfig` in `rocky_project` now describes its per-event hook keys, which 0.8 dropped.
 
 ### Fixed

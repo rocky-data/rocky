@@ -46,7 +46,7 @@ secure = true
 
 Rocky sends the user and password in the `X-ClickHouse-User` and `X-ClickHouse-Key` headers. It never puts them in the URL, which proxies and server logs record.
 
-With `secure = true`, Rocky connects over HTTPS and checks the certificate chain and the host name. It trusts the Mozilla root set plus `ca_cert`. There is no mode that skips the check.
+With `secure = true`, Rocky connects over HTTPS and checks the certificate chain and the host name. It trusts the operating system's certificate store plus `ca_cert`. There is no mode that skips the check.
 
 ## Names: databases, not catalogs
 

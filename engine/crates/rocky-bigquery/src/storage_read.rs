@@ -215,8 +215,11 @@ pub struct StorageTableRef<'a> {
     pub table: &'a str,
 }
 
+// The OS trust store, the same one the reqwest REST calls use. With different
+// roots, a host-trusted proxy CA would let `jobs.query` run (and bill) and then
+// fail the Storage Read.
 async fn build_channel() -> Result<Channel, StorageReadError> {
-    let tls = ClientTlsConfig::new().with_webpki_roots();
+    let tls = ClientTlsConfig::new().with_native_roots();
     let channel = Endpoint::from_static(STORAGE_READ_ENDPOINT)
         .tls_config(tls)?
         .connect()

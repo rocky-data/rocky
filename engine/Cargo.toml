@@ -289,7 +289,7 @@ tracing-opentelemetry = "0.34"
 # same aws-lc-rs provider; ring stays linked via `object_store`, so the binary
 # links both rustls backends; the startup `install_crypto_provider` call selects aws-lc-rs.
 # See the `rustls` note above.
-tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "transport", "tls-aws-lc", "tls-webpki-roots"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "transport", "tls-aws-lc", "tls-webpki-roots", "tls-native-roots"] }
 prost = "0.14"
 # The prost codec tonic 0.14 split out of its core crate. `rocky-spark`
 # hand-declares the Spark Connect messages it sends with `prost` derives and

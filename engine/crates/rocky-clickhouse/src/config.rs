@@ -27,7 +27,7 @@ pub struct ChConfig {
     /// `None` until resolved: the default depends on `secure`.
     port: Option<u16>,
     /// HTTPS instead of HTTP. The certificate is always verified, against
-    /// the Mozilla root set plus `ca_cert` when given.
+    /// the OS certificate store plus `ca_cert` when given.
     pub secure: bool,
     /// Extra PEM root certificate(s) to trust, e.g. a self-signed server's
     /// CA. Read when the client is built.
