@@ -82,7 +82,11 @@ fn run_dag_without_a_required_var_still_fails() {
     let models = root.join("models");
     fs::create_dir_all(&models).unwrap();
     fs::write(root.join("rocky.toml"), CONFIG).unwrap();
-    fs::write(models.join("alpha.sql"), "SELECT '@var(region)' AS region\n").unwrap();
+    fs::write(
+        models.join("alpha.sql"),
+        "SELECT '@var(region)' AS region\n",
+    )
+    .unwrap();
     fs::write(models.join("alpha.toml"), SIDECAR).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_rocky"))

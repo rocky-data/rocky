@@ -2039,7 +2039,8 @@ mod tests {
             &config_path,
             &cfg.config,
             &rocky_core::run_vars::RunVars::new(),
-        ).expect("graph builds");
+        )
+        .expect("graph builds");
         assert!(
             planned.runtime.dag.edges.iter().any(|e| {
                 e.from == NodeId::new("seed", "countries")
@@ -3448,7 +3449,13 @@ mod tests {
             &transformation_block("t"),
             &[
                 ("a", "db", "main", "a", "SELECT 1 AS id"),
-                ("b", "db", "main", "b", "SELECT id FROM db.main.@var(src, other)"),
+                (
+                    "b",
+                    "db",
+                    "main",
+                    "b",
+                    "SELECT id FROM db.main.@var(src, other)",
+                ),
             ],
         );
         let config_path = dir.path().join("rocky.toml");
