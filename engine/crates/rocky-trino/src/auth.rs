@@ -196,7 +196,9 @@ mod tests {
     fn debug_basic_renders_a_substituted_user() {
         const USER: &str = "trino-user-1919-b8e4";
         rocky_core::secret_registry::register_substitution("RV_TRINO_USER_DBG", USER);
-        let (_, pass, _) = crate::test_helpers::test_basic_auth_inputs();
+        // Built at runtime: only the user matters here, and a literal
+        // password trips the hard-coded-credential scan.
+        let pass = std::process::id().to_string();
         let auth = TrinoAuth::basic(USER, pass).unwrap();
         let debug = format!("{auth:?}");
         assert!(!debug.contains(USER), "Debug leaks the user: {debug}");
