@@ -15,7 +15,7 @@ Rocky is **async end-to-end**. Tokio is the only runtime; there's a single `#[to
 
 ## Async trait rule
 
-Every async trait uses `#[async_trait]` from the `async-trait` crate (`async-trait = "0.1"` in `[workspace.dependencies]`). This is a hard rule from `engine/CLAUDE.md`.
+Every async trait uses `#[async_trait]` from the `async-trait` crate (`async-trait = "0.1"` in `[workspace.dependencies]`). This is a hard rule from `engine/AGENTS.md`.
 
 ```rust
 // DO — matches the pattern used throughout rocky-adapter-sdk
@@ -58,7 +58,7 @@ Rocky uses adaptive concurrency on remote calls that can be rate-limited. The ca
 
 ## Structured logging: `tracing`, not `println!`
 
-Hard rule from `engine/CLAUDE.md`: **use `tracing`, not `println!` or `eprintln!`**. The subscriber is initialized in `crates/rocky-observe/src/tracing_setup.rs` and emits structured JSON lines when `RUST_LOG` / `tracing_subscriber::EnvFilter` is set.
+Hard rule from `engine/AGENTS.md`: **use `tracing`, not `println!` or `eprintln!`**. The subscriber is initialized in `crates/rocky-observe/src/tracing_setup.rs` and emits structured JSON lines when `RUST_LOG` / `tracing_subscriber::EnvFilter` is set.
 
 ```rust
 use tracing::{info, warn, error, debug};

@@ -6,9 +6,9 @@ description: Rocky CLI quick reference. Use when you need to recall a `rocky <co
 # Rocky CLI reference
 
 Concise cheat sheet for the `rocky` binary. For full detail:
-- Config authoring → `rocky-config` skill (monorepo root `.claude/skills/`)
+- Config authoring → `rocky-config` skill (monorepo root `.agents/skills/`)
 - JSON output schema cascade → `rocky-codegen` skill
-- Engine architecture → `engine/CLAUDE.md`
+- Engine architecture → `engine/AGENTS.md`
 
 ## Commands
 
@@ -71,7 +71,7 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 
 ## JSON output shape
 
-Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. Full list in `engine/CLAUDE.md` → "JSON Output Schema" (`ls schemas/*.schema.json | wc -l` for the count). Highlights:
+Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. Full list: `ls schemas/*.schema.json` (each schema's `title` is the struct name); see `engine/AGENTS.md` → "JSON Output Schema". Highlights:
 
 ```
 discover  → { connectors: [{ id, client, components, tables, excluded_tables }] }
@@ -145,7 +145,7 @@ Three execution modes for `rocky run` in `RockyResource`:
 - `run_streaming(context, ...)` — `Popen` with stderr streaming to `context.log`
 - `run_pipes(context, ...)` — full Dagster Pipes via `PipesSubprocessClient`
 
-See `integrations/dagster/CLAUDE.md` for the layer architecture.
+See `integrations/dagster/AGENTS.md` for the layer architecture.
 
 ## Related skills
 

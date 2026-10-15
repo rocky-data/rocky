@@ -1,7 +1,8 @@
 name: skills-mirror-drift
 
-# AGENTS.md requires .agents/skills/ and .claude/skills/ to stay byte-identical
-# (the same root task skills, discovered by different agent clients). If an
+# AGENTS.md requires each .agents/skills/ tree and its .claude/skills/ twin to
+# stay byte-identical (root, engine/, editors/vscode/; the same skills,
+# discovered by different agent clients). If an
 # edit lands in one tree without the other, this workflow fails the PR.
 
 on:
@@ -10,12 +11,20 @@ on:
     paths:
       - '.agents/skills/**'
       - '.claude/skills/**'
+      - 'engine/.agents/skills/**'
+      - 'engine/.claude/skills/**'
+      - 'editors/vscode/.agents/skills/**'
+      - 'editors/vscode/.claude/skills/**'
       - '.github/workflows/skills-mirror-drift.yml'
   pull_request:
     branches: [main]
     paths:
       - '.agents/skills/**'
       - '.claude/skills/**'
+      - 'engine/.agents/skills/**'
+      - 'engine/.claude/skills/**'
+      - 'editors/vscode/.agents/skills/**'
+      - 'editors/vscode/.claude/skills/**'
       - '.github/workflows/skills-mirror-drift.yml'
 
 # CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
@@ -31,13 +40,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Diff .agents/skills against .claude/skills
+      - name: Diff each .agents/skills tree against its .claude/skills twin
         run: |
-          if ! diff -r .agents/skills .claude/skills; then
-            echo ""
-            echo "❌ .agents/skills/ and .claude/skills/ have diverged."
-            echo "AGENTS.md requires the two trees to stay byte-identical."
+          status=0
+          for root in . engine editors/vscode; do
+            if ! diff -r "$root/.agents/skills" "$root/.claude/skills"; then
+              echo ""
+              echo "❌ $root/.agents/skills/ and $root/.claude/skills/ have diverged."
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "AGENTS.md requires each pair of skill trees to stay byte-identical."
             echo "Apply the same edit to both trees (copy the changed file across) and commit."
             exit 1
           fi
-          echo "✓ Skill trees are byte-identical."
+          echo "✓ All skill trees are byte-identical."

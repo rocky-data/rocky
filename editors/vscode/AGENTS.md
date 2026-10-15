@@ -2,6 +2,8 @@
 
 VS Code extension for the Rocky SQL transformation engine. LSP client that communicates with `rocky lsp` over stdio, plus commands for AI features, diagnostics, and operational tasks.
 
+**Local skill:** `editors/vscode/.agents/skills/tailwind-plus-elements/` (mirrored in `.claude/skills/`) covers `@tailwindplus/elements` web components in the React webviews under `webview-ui/`. Read its `SKILL.md` before building or upgrading an interactive webview surface.
+
 ## Architecture
 
 ```
