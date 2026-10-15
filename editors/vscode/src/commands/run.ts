@@ -6,6 +6,7 @@ import type {
   PlanResult,
   RunResult,
 } from "../types/rockyJson";
+import { recordPlanCost } from "../planCostStore";
 import { showRunSummary } from "../webviews/runSummary";
 import {
   confirmAction,
@@ -72,6 +73,9 @@ export async function plan(): Promise<void> {
       ["plan", "--filter", filter, "--output", "json"],
       { timeoutMs: 60000 },
     );
+
+    // Keep the estimate for the Inspector's cost overlay ("from last plan").
+    recordPlanCost(result, filter);
 
     const statements = result.statements ?? [];
     if (statements.length === 0) {

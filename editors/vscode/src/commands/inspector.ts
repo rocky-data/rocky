@@ -23,6 +23,7 @@ import {
   buildGraph,
   loadBreaking,
   loadGovernance,
+  loadPlanCost,
   loadReplay,
   openModelFile,
   runAiAction,
@@ -49,6 +50,7 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
       h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
       h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
       h.onRequest("breaking", () => loadBreaking());
+      h.onRequest("planCost", () => loadPlanCost());
       h.onRequest("replay", () => loadReplay());
       h.onRequest("governance", () => loadGovernance());
     },

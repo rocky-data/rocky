@@ -3,12 +3,13 @@ import type {
   BreakingData,
   GovernanceData,
   GraphData,
+  PlanCostData,
   ReplayData,
 } from "../../../src/webviews/lineage/contract";
 import { getRpc } from "../../runtime/rpcClient";
 import { type ColorMode, type OverlayKind } from "./context";
 import { makeBreakingOverlay } from "./overlays/breaking";
-import { costOverlay } from "./overlays/cost";
+import { makeCostOverlay } from "./overlays/cost";
 import { freshnessOverlay } from "./overlays/freshness";
 import { makeGovernanceOverlay } from "./overlays/governance";
 import { makeLastRunOverlay } from "./overlays/lastRun";
@@ -30,6 +31,7 @@ export function useLineageGraph() {
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
   const [replay, setReplay] = useState<ReplayData | null>(null);
   const [governance, setGovernance] = useState<GovernanceData | null>(null);
+  const [planCost, setPlanCost] = useState<PlanCostData | null>(null);
 
   useEffect(() => {
     void getRpc()
@@ -45,6 +47,15 @@ export function useLineageGraph() {
       else next.add(kind);
       return next;
     });
+    // The cost overlay re-reads the last plan every time it is enabled, so a
+    // Plan run since the last toggle shows up. This reads a stored estimate;
+    // it never runs `rocky plan`.
+    if (kind === "cost") {
+      void getRpc()
+        .request<PlanCostData | null>("planCost")
+        .then(setPlanCost)
+        .catch(() => setPlanCost(null));
+    }
     // Each data-backed overlay fetches on first enable; the base graph is unaffected.
     if (kind === "breaking" && breaking === null) {
       void getRpc()
@@ -70,7 +81,7 @@ export function useLineageGraph() {
 
   const overlays = useMemo<LineageOverlay[]>(() => {
     const list: LineageOverlay[] = [];
-    if (active.has("cost")) list.push(costOverlay);
+    if (active.has("cost")) list.push(makeCostOverlay(planCost));
     if (active.has("freshness")) list.push(freshnessOverlay);
     if (active.has("breaking") && breaking && graph) {
       list.push(makeBreakingOverlay(breaking, graph));
@@ -80,7 +91,7 @@ export function useLineageGraph() {
       list.push(makeGovernanceOverlay(governance));
     }
     return list;
-  }, [active, breaking, replay, governance, graph]);
+  }, [active, breaking, replay, governance, graph, planCost]);
 
   return {
     graph,

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The Inspector cost overlay now shows the plan-time estimate from the last Plan you ran in the editor, labelled "from last plan" with its time. A plan is marked stale when it is over a day old or a model file changed after it. Models the plan did not price keep the heuristic estimate, labelled "heuristic". The Inspector never runs `rocky plan` itself, because each call writes a plan file. Plans run from the terminal are not picked up, because the CLI does not save the cost estimate in the plan file.
+
 ## [1.49.0] — 2026-10-15
 
 ### Changed

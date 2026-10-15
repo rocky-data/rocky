@@ -11,6 +11,7 @@ import { registerFormattingProvider } from "./formattingProvider";
 import { startLspClient, stopLspClient } from "./lspClient";
 import { registerRockyMcpProvider } from "./mcpServer";
 import { disposeOutputChannel } from "./output";
+import { initPlanCostStore } from "./planCostStore";
 import { registerRockyCacheInvalidation } from "./rockyCli";
 import { registerRunDecorations } from "./runDecorations";
 import { registerTaskProvider } from "./taskProvider";
@@ -19,6 +20,7 @@ import { registerDeclarativeTestProvider } from "./testProvider";
 import { registerViews } from "./views";
 
 export function activate(context: vscode.ExtensionContext): void {
+  initPlanCostStore(context.workspaceState);
   setExtensionUri(context.extensionUri);
   // Gates dev-only affordances (e.g. the webview devtools command) so they
   // never surface in a released build's command palette.
