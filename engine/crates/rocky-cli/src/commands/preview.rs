@@ -1838,32 +1838,61 @@ fn default_branch_name_from_git() -> Result<String> {
     }
 }
 
-/// Run `git diff --name-status` between `base_ref` and `HEAD`. Mirrors
+/// Run `git diff --name-only` between `base_ref` and `HEAD`. Mirrors
 /// `rocky_core::ci_diff` semantics: three-dot syntax first (merge-base),
-/// two-dot fallback for shallow clones. Returns paths relative to the
-/// repository root.
+/// two-dot fallback for shallow clones. Returns absolute paths: git prints
+/// them relative to the repository root, so each is joined onto
+/// `git rev-parse --show-toplevel` (not the process cwd, which is the
+/// `rocky.toml` folder and may be a subfolder of the repository).
 fn git_changed_paths(base_ref: &str) -> Result<Vec<String>> {
-    let three_dot = git_command()
+    git_changed_paths_in(None, base_ref)
+}
+
+/// [`git_changed_paths`] with an explicit working directory for every git call.
+fn git_changed_paths_in(dir: Option<&Path>, base_ref: &str) -> Result<Vec<String>> {
+    let git = || {
+        let mut c = git_command();
+        if let Some(d) = dir {
+            c.current_dir(d);
+        }
+        c
+    };
+    let top = git()
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("`git rev-parse --show-toplevel` failed — is git installed?")?;
+    if !top.status.success() {
+        let stderr = String::from_utf8_lossy(&top.stderr);
+        anyhow::bail!("not inside a git repository: {stderr}");
+    }
+    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+    let top = top.canonicalize().unwrap_or(top);
+
+    let three_dot = git()
         .args(["diff", "--name-only", &format!("{base_ref}...HEAD")])
         .output()
         .context("`git diff` failed — is git installed?")?;
-    if three_dot.status.success() {
-        return Ok(parse_paths(&three_dot.stdout));
-    }
-
-    debug!(
-        "three-dot git diff failed (exit {}), falling back to two-dot",
-        three_dot.status
-    );
-    let two_dot = git_command()
-        .args(["diff", "--name-only", base_ref, "HEAD"])
-        .output()
-        .context("`git diff` (two-dot) failed")?;
-    if !two_dot.status.success() {
-        let stderr = String::from_utf8_lossy(&two_dot.stderr);
-        anyhow::bail!("git diff failed against base ref '{base_ref}': {stderr}");
-    }
-    Ok(parse_paths(&two_dot.stdout))
+    let raw = if three_dot.status.success() {
+        parse_paths(&three_dot.stdout)
+    } else {
+        debug!(
+            "three-dot git diff failed (exit {}), falling back to two-dot",
+            three_dot.status
+        );
+        let two_dot = git()
+            .args(["diff", "--name-only", base_ref, "HEAD"])
+            .output()
+            .context("`git diff` (two-dot) failed")?;
+        if !two_dot.status.success() {
+            let stderr = String::from_utf8_lossy(&two_dot.stderr);
+            anyhow::bail!("git diff failed against base ref '{base_ref}': {stderr}");
+        }
+        parse_paths(&two_dot.stdout)
+    };
+    Ok(raw
+        .into_iter()
+        .map(|p| top.join(p).to_string_lossy().into_owned())
+        .collect())
 }
 
 /// Split `git diff --name-only` output into trimmed lines.
@@ -1873,6 +1902,25 @@ fn parse_paths(raw: &[u8]) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// Canonicalize `p`; when it does not exist (a deleted file), canonicalize
+/// the nearest existing ancestor and re-append the missing tail.
+fn canonicalize_lenient(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return tail.iter().rev().fold(c, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// Filter changed paths to model files under `models_dir` and return the
@@ -1887,20 +1935,10 @@ fn changed_models_under(paths: &[String], models_dir: &Path) -> BTreeSet<String>
     let mut out = BTreeSet::new();
     for raw in paths {
         let p = PathBuf::from(raw);
-        let abs = match p.canonicalize() {
-            Ok(a) => a,
-            Err(_) => p.clone(),
-        };
-        // Path filter: must be under the models dir (best-effort —
-        // canonicalize may fail for deleted files, in which case we
-        // string-match the raw path instead).
-        let in_models_dir = abs.starts_with(&canonical_models)
-            || raw.contains(&format!(
-                "{}{}",
-                models_dir.display(),
-                std::path::MAIN_SEPARATOR
-            ));
-        if !in_models_dir {
+        // Path filter: must be under the models dir. A deleted file cannot
+        // be canonicalized, so resolve its nearest existing ancestor.
+        let abs = canonicalize_lenient(&p);
+        if !abs.starts_with(&canonical_models) {
             continue;
         }
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -2142,6 +2180,21 @@ pub fn empty_cost_summary() -> PreviewCostSummary {
 // Phase 1.5 — copy-from-base execution via the WarehouseAdapter trait
 // ---------------------------------------------------------------------------
 
+/// `CREATE SCHEMA IF NOT EXISTS` for the branch schema, quoted with the
+/// adapter's own identifier quoting (Databricks reads `"x"` as a string).
+/// The name is validated first.
+fn branch_schema_create_sql(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    branch_schema: &str,
+) -> Result<String> {
+    rocky_sql::validation::validate_identifier(branch_schema)
+        .map_err(|e| anyhow::anyhow!("invalid branch schema '{branch_schema}': {e}"))?;
+    Ok(format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        dialect.quote_identifier(branch_schema)
+    ))
+}
+
 /// Execute the copy-from-base step against the configured adapter.
 ///
 /// Builds the adapter registry from `rocky.toml`, resolves each
@@ -2207,7 +2260,7 @@ async fn execute_copy_from_base(
 
     // Create the branch schema once (idempotent across both DuckDB and
     // cloud warehouses).
-    let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS \"{branch_schema}\"");
+    let create_schema_sql = branch_schema_create_sql(adapter.dialect(), branch_schema)?;
     if let Err(e) = adapter.execute_statement(&create_schema_sql).await {
         // A schema-create failure on a writeable adapter is unrecoverable
         // for the copy step — bail to planning-only.
@@ -3411,6 +3464,96 @@ mod tests {
         assert!(!out.contains("_defaults"));
         assert!(!out.contains("README"));
         assert!(!out.contains("baz"));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Repo root holds `analytics/` (the project); the second commit
+    /// changes `analytics/models/orders.sql` and an unrelated
+    /// `other/models/x.sql`.
+    fn nested_project_repo() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let project = root.join("analytics");
+        std::fs::create_dir_all(project.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("other/models")).unwrap();
+        std::fs::write(project.join("models/orders.sql"), "select 1").unwrap();
+        std::fs::write(root.join("other/models/x.sql"), "select 1").unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::write(project.join("models/orders.sql"), "select 2").unwrap();
+        std::fs::write(root.join("other/models/x.sql"), "select 2").unwrap();
+        run_git(&root, &["commit", "-q", "-am", "change"]);
+        (tmp, project)
+    }
+
+    #[test]
+    fn changed_models_found_when_project_is_nested_and_models_dir_absolute() {
+        let (_tmp, project) = nested_project_repo();
+        let paths = git_changed_paths_in(Some(&project), "HEAD~1").unwrap();
+        let out = changed_models_under(&paths, &project.join("models"));
+        assert_eq!(out, BTreeSet::from(["orders".to_string()]));
+    }
+
+    #[test]
+    fn changed_models_found_when_project_is_nested_and_models_dir_relative() {
+        let (_tmp, project) = nested_project_repo();
+        let paths = git_changed_paths_in(Some(&project), "HEAD~1").unwrap();
+        // A models dir relative to the process cwd, as the CLI default is.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        let rel = rel.join(project.canonicalize().unwrap().strip_prefix("/").unwrap());
+        let out = changed_models_under(&paths, &rel.join("models"));
+        assert_eq!(out, BTreeSet::from(["orders".to_string()]));
+    }
+
+    #[test]
+    fn changed_models_include_deleted_files_in_nested_project() {
+        let (_tmp, project) = nested_project_repo();
+        std::fs::remove_file(project.join("models/orders.sql")).unwrap();
+        run_git(&project, &["commit", "-q", "-am", "delete"]);
+        let paths = git_changed_paths_in(Some(&project), "HEAD~1").unwrap();
+        let out = changed_models_under(&paths, &project.join("models"));
+        assert_eq!(out, BTreeSet::from(["orders".to_string()]));
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn branch_schema_create_sql_duckdb_double_quotes() {
+        let duck = rocky_duckdb::dialect::DuckDbSqlDialect;
+        assert_eq!(
+            branch_schema_create_sql(&duck, "branch__x").unwrap(),
+            "CREATE SCHEMA IF NOT EXISTS \"branch__x\""
+        );
+    }
+
+    #[test]
+    fn branch_schema_create_sql_databricks_backticks() {
+        let dbx = rocky_databricks::dialect::DatabricksSqlDialect;
+        assert_eq!(
+            branch_schema_create_sql(&dbx, "branch__x").unwrap(),
+            "CREATE SCHEMA IF NOT EXISTS `branch__x`"
+        );
+    }
+
+    #[test]
+    fn branch_schema_create_sql_rejects_unsafe_names() {
+        let dbx = rocky_databricks::dialect::DatabricksSqlDialect;
+        assert!(branch_schema_create_sql(&dbx, "x`; drop schema y; --").is_err());
+        assert!(branch_schema_create_sql(&dbx, "").is_err());
     }
 
     #[test]
