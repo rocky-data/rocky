@@ -36210,6 +36210,83 @@ auto_create_schemas = true
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
+    /// A derived physical-read edge orders the run; it is not part of a
+    /// model's logic. Deriving one must leave every model's `skip_hash()`
+    /// unchanged, or an ordering fact would force rebuilds and break reuse.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_derived_physical_edge_never_changes_skip_hash() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart_qualified",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart_qualified",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let hashes = |compiled: &rocky_compiler::compile::CompileResult| {
+            let surrogate_keys = HashMap::new();
+            compiled
+                .project
+                .models
+                .iter()
+                .map(|m| {
+                    let ir = super::typed_model_ir(
+                        m,
+                        &compiled.type_check.typed_models,
+                        &surrogate_keys,
+                        &dialect,
+                    )
+                    .expect("typed ir");
+                    (m.config.name.clone(), ir.skip_hash())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = hashes(&compiled);
+        assert!(
+            before.values().all(Option::is_some),
+            "precondition: every model canonicalises — {before:?}"
+        );
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
+        let consumer = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "mart_qualified")
+            .expect("consumer node");
+        assert!(
+            consumer.depends_on.contains(&"orders".to_string()),
+            "precondition: the edge was derived — {:?}",
+            consumer.depends_on
+        );
+
+        assert_eq!(
+            before,
+            hashes(&compiled),
+            "a derived physical edge must never enter skip_hash()"
+        );
+    }
+
     /// #1275 cycle policy: mutual physical reads serialize deterministically
     /// with a warning — the run is never refused.
     #[cfg(feature = "duckdb")]
