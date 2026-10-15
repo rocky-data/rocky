@@ -594,6 +594,43 @@ function DetailHarness({ name, load }: { name: string; load: EstateLoaders["deta
   return <ModelDetail name={name} load={load} onClose={() => {}} />;
 }
 
+describe("The Promote panel on the estate", () => {
+  it("is not offered when the project does not require a branch approval, and names the key", async () => {
+    render(
+      <EstateScreen
+        loaders={loaders({ project: async () => ({ ...project, branch_approval_required: false }) })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "Promote" });
+    await within(panel).findByText(/Promote is not offered here/);
+    expect(panel.textContent).toContain("[branch.approval] required = true");
+    expect(within(panel).queryByRole("button")).toBeNull();
+  });
+
+  it("says the config could not be read when the project does not say", async () => {
+    render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
+    const panel = await screen.findByRole("region", { name: "Promote" });
+    await within(panel).findByText(/could not be read/);
+    expect(within(panel).queryByRole("button")).toBeNull();
+  });
+
+  it("is offered when the project requires a branch approval", async () => {
+    render(
+      <EstateScreen
+        loaders={loaders({ project: async () => ({ ...project, branch_approval_required: true }) })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "Promote" });
+    await waitFor(() => expect(panel.textContent).not.toContain("Loading"));
+    expect(panel.textContent).not.toContain("Promote is not offered here");
+    expect(panel.textContent).not.toContain("could not be read");
+  });
+});
+
 describe("ProjectStrip", () => {
   it("renders the project's config, pipelines, adapters and newest run", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);

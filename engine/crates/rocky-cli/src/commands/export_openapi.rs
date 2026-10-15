@@ -396,6 +396,23 @@ fn route_table() -> Vec<Route> {
              The holder's id is carried in `running_job_id`.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const APPLY_REFUSED: Resp = Resp {
+        status: "409",
+        description: "Another run/apply job already holds the single-mutating-job permit \
+             (`mutation_in_progress`, with the holder's id in `running_job_id`), or the plan \
+             may not be applied over the HTTP API: an archive plan \
+             (`archive_apply_terminal_only`), a promote plan when the config does not set \
+             `[branch.approval] required = true` (`branch_approval_not_required`), or a \
+             promote plan that was not built behind the approval gate \
+             (`promote_plan_not_approved`).",
+        body: Body::Component("ErrorEnvelope"),
+    };
+    const BRANCH_APPROVAL_NOT_REQUIRED: Resp = Resp {
+        status: "409",
+        description: "The bound config does not set `[branch.approval] required = true` \
+             (`branch_approval_not_required`).",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const STATE_NEEDS_MIGRATION: Resp = Resp {
         status: "409",
         description: "The state store on disk lacks tables this server reads, and a read \
@@ -784,12 +801,18 @@ fn route_table() -> Vec<Route> {
             summary: "Submit an apply job",
             description: "Submit a mutating `apply` job. Takes the single-mutating-job \
                  permit; a second run/apply while one is held returns 409. `plan_id` \
-                 must be 64 lowercase hex characters (400 `invalid_plan_id`).",
+                 must be 64 lowercase hex characters (400 `invalid_plan_id`). The server \
+                 reads the plan before it takes the permit. An archive plan is refused \
+                 (409 `archive_apply_terminal_only`): it deletes rows and vacuums with no \
+                 retention window, so it is applied in a terminal. A promote plan is \
+                 refused unless the config sets `[branch.approval] required = true` (409 \
+                 `branch_approval_not_required`) and the plan was built behind that gate \
+                 (409 `promote_plan_not_approved`).",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
-            responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, APPLY_REFUSED],
             auth_exempt: false,
         },
         Route {
@@ -903,6 +926,52 @@ fn route_table() -> Vec<Route> {
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/promote",
+            operation_id: "submitPromoteJob",
+            tag: "jobs",
+            summary: "Submit a branch promote plan job",
+            description: "Submit a `promote` job: `rocky plan promote <name>`. Runs the \
+                 branch's approval and breaking-change gates and writes a promote plan; the \
+                 result lists each production table the plan would replace. It replaces \
+                 nothing and takes no permit. Applying the plan is a separate `apply` job \
+                 with the returned `plan_id`. Refused with 409 \
+                 `branch_approval_not_required` unless the config sets `[branch.approval] \
+                 required = true`. `name` (the branch; 1 to 64 letters, digits, `_`, `.` or \
+                 `-`) is required; `base` (a git ref, default `main`) and `pipeline` are \
+                 optional. All are validated before the job starts.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, BRANCH_APPROVAL_NOT_REQUIRED],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/branches",
+            operation_id: "listBranches",
+            tag: "branches",
+            summary: "List branches",
+            description: "Every branch in the state store. The same bytes as `rocky branch \
+                 list --output json` against the store `--state-path` names (or the default \
+                 under the models directory). Read-only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The branch list.",
+                    body: Body::Component("BranchListOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
+            ],
             auth_exempt: false,
         },
         Route {

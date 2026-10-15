@@ -368,6 +368,32 @@ export function approverLine(approver: ApproverIdentity | null | undefined): str
   }
 }
 
+/** The plan kind the server never applies over the HTTP API. */
+export const ARCHIVE_PLAN_KIND = "archive";
+
+/**
+ * An archive plan deletes rows and then vacuums with no retention window,
+ * which cannot be undone. The server refuses to apply one over the HTTP API
+ * (`archive_apply_terminal_only`), so this page does not offer the button.
+ * It can still be approved above; applying is a terminal step.
+ */
+function ArchiveTerminalOnly({ planId }: { planId: string }) {
+  return (
+    <div className="space-y-2">
+      <WriteButton
+        label="Apply"
+        disabledReason="An archive plan is applied in a terminal, not from this page."
+        onClick={() => undefined}
+      />
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        Archive deletes rows and then vacuums with no retention window, so it cannot be undone. The server
+        refuses to apply it over the HTTP API. Apply it in a terminal:
+      </p>
+      <CommandLine command={`rocky apply ${planId}`} />
+    </div>
+  );
+}
+
 /** The terminal command a product-bound apply needs. The digest is the reader's. */
 function productApplyCommand(planId: string): string {
   return `rocky apply ${planId} --expect-spec-digest <the spec digest you approved>`;
@@ -464,7 +490,9 @@ function Approval({
         </div>
       )}
 
-      {productBound ? (
+      {status.kind === ARCHIVE_PLAN_KIND ? (
+        <ArchiveTerminalOnly planId={planId} />
+      ) : productBound ? (
         <ProductApply planId={planId} reviewed={status.reviewed} apply={apply.view} cancel={apply.cancel} start={apply.start} />
       ) : (
         <div className="space-y-2">

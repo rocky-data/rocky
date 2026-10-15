@@ -3734,6 +3734,21 @@ pub(crate) async fn build_promote_plan_inner(
     plan_output.plan_id = Some(plan_id);
     plan_output.plan_kind = Some("promote".to_string());
     plan_output.created_at = Some(created_at);
+    // One statement per production table the plan would replace, so a reader
+    // of the output (the browser UI's confirm step among them) can name every
+    // table before it applies the plan.
+    plan_output.statements = promote_plan
+        .targets
+        .iter()
+        .map(|step| crate::output::PlannedStatement {
+            purpose: format!(
+                "promote branch '{}' ({})",
+                promote_plan.branch_name, step.strategy
+            ),
+            target: step.target.clone(),
+            sql: step.statement.clone(),
+        })
+        .collect();
 
     Ok(PromotePlanResult {
         plan: promote_plan,

@@ -709,6 +709,41 @@ describe("PlanDetail", () => {
     expect(screen.getByText("refused (404)")).toBeTruthy();
   });
 
+  /// Archive deletes rows and vacuums with no retention window. The server
+  /// refuses to apply it over the HTTP API, and the page mirrors that: no
+  /// button that would only be refused, and the terminal command instead.
+  it("does not offer to apply an archive plan, and shows the terminal command", async () => {
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "archive", reviewed: true })) })}
+          jobs={{ submit: vi.fn(), status: vi.fn(), cancel: vi.fn() }}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    const apply = screen.getByRole("button", { name: "Apply" });
+    expect(apply).toBeDisabled();
+    expect(apply).toHaveAttribute("title", "An archive plan is applied in a terminal, not from this page.");
+    expect(screen.getByText(`rocky apply ${PLAN}`)).toBeTruthy();
+    fireEvent.click(apply);
+  });
+
+  it("keeps Apply for a plan that is not an archive plan", async () => {
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "gc", reviewed: true })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    expect(screen.getByRole("button", { name: "Apply" })).not.toBeDisabled();
+    expect(screen.queryByText(`rocky apply ${PLAN}`)).toBeNull();
+  });
+
   it("offers no control that can change anything on a read-only page", async () => {
     const { container } = render(
       <WriteAccessProvider value={{ kind: "read_only", reason: READ_ONLY_REASON }}>

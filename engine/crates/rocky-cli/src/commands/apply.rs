@@ -176,6 +176,20 @@ pub(crate) async fn run_apply_core_in(
             .map(|()| ApplyOutcome::Applied { run_id: None })
         }
         PlanKind::Archive => {
+            // Archive deletes rows and then vacuums with no retention window,
+            // which cannot be undone. A job the HTTP API started (it sets
+            // `ROCKY_SESSION_SOURCE=http_api`) never runs it: the route refuses
+            // an archive plan first, and this refuses it again in the child so
+            // a plan that reached the child by another path still stops here.
+            if super::run_audit::detect_session_source()
+                == rocky_core::state::SessionSource::HttpApi
+            {
+                bail!(
+                    "[archive-apply-terminal-only] archive plan '{plan_id}' is not applied over \
+                     the HTTP API: it deletes rows and vacuums with no retention window. Apply \
+                     it in a terminal with `rocky apply {plan_id}`."
+                );
+            }
             // Delegate to the archive apply path (destructive: DELETE + VACUUM),
             // gated at the sink under `PolicyCapability::Apply`.
             run_archive_apply_in(
@@ -7640,6 +7654,65 @@ mod tests {
             "the shadow guard must precede review and policy: {error:#}"
         );
         assert!(!state_path.exists(), "no state store was opened");
+        Ok(())
+    }
+
+    /// A job the HTTP API started (`ROCKY_SESSION_SOURCE=http_api`) never runs
+    /// an archive plan: archive deletes rows and then vacuums with no retention
+    /// window. The refusal comes before the config is read or any warehouse
+    /// work, and it is the dispatcher's, so `rocky apply <archive-plan>` from a
+    /// terminal is not affected.
+    #[tokio::test]
+    async fn archive_plan_is_refused_in_a_job_the_http_api_started() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id = write_plan(
+            dir.path(),
+            PlanKind::Archive,
+            &serde_json::json!({ "tables": ["a.b.c"] }),
+        )?;
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        let actor = rocky_core::config::PrincipalRef::unnamed();
+        let run = |principal| {
+            super::run_apply_core_in(
+                dir.path(),
+                &config_path,
+                &plan_id,
+                &state_path,
+                principal,
+                &actor,
+                None,
+                true,
+            )
+        };
+
+        let _env = crate::testing::lock_pipes_env();
+        // SAFETY: serialized by the pipes-env lock, which every reader of
+        // ROCKY_SESSION_SOURCE takes; restored below.
+        let previous = std::env::var_os("ROCKY_SESSION_SOURCE");
+        unsafe { std::env::set_var("ROCKY_SESSION_SOURCE", "http_api") };
+        let refused = run(PolicyPrincipal::Human).await;
+        unsafe { std::env::remove_var("ROCKY_SESSION_SOURCE") };
+        let terminal = run(PolicyPrincipal::Human).await;
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("ROCKY_SESSION_SOURCE", v),
+                None => std::env::remove_var("ROCKY_SESSION_SOURCE"),
+            }
+        }
+
+        let error = refused.expect_err("an archive plan is refused under http_api");
+        assert!(
+            format!("{error:#}").contains("archive-apply-terminal-only"),
+            "{error:#}"
+        );
+        // From a terminal the dispatcher goes on to the archive apply, which
+        // fails here on the missing config, not on this refusal.
+        let error = terminal.expect_err("the stub project has no config");
+        assert!(
+            !format!("{error:#}").contains("archive-apply-terminal-only"),
+            "{error:#}"
+        );
         Ok(())
     }
 

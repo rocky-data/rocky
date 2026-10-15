@@ -10582,6 +10582,13 @@
               "preview"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky plan promote <branch>` — runs the branch's approval and breaking-change gates and writes a promote plan. It writes no warehouse object and no state: the plan file is the only output, and applying it (`rocky apply <plan_id>`, kind `apply`) is what replaces production tables. Non-mutating; no permit. The server refuses it unless `[branch.approval] required = true`.",
+            "enum": [
+              "promote"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10590,7 +10597,7 @@
         "properties": {
           "base": {
             "default": null,
-            "description": "`--base <git ref>` for `preview`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
+            "description": "`--base <git ref>` for `preview` and `promote`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -10622,7 +10629,7 @@
           },
           "name": {
             "default": null,
-            "description": "`--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`, 1 to 64 characters. Absent means a name derived from the project's git branch. Ignored by every other kind.",
+            "description": "`--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`, 1 to 64 characters. Absent means a name derived from the project's git branch. For `promote`: the branch to promote (required). Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -10630,7 +10637,7 @@
           },
           "pipeline": {
             "default": null,
-            "description": "`--pipeline <name>` for `run`/`plan`.",
+            "description": "`--pipeline <name>` for `run`/`plan`/`promote`.",
             "type": [
               "string",
               "null"
@@ -17627,6 +17634,13 @@
               "$ref": "#/components/schemas/ProjectAdapterOutput"
             },
             "type": "array"
+          },
+          "branch_approval_required": {
+            "description": "Whether `[branch.approval] required = true` in the bound config, read per request. The browser UI offers branch promote only when this is `true`, and the server refuses a promote job otherwise. Absent when the config could not be loaded (see `config_error`) or none is bound: an unknown answer is not shown as `false`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "compile_error": {
             "description": "Why the last compile produced no result, when it did not: the models could not be read, a model failed to load, the compile task panicked. While this stands `models_compiled` is absent and `diagnostics.has_errors` is `true`, whatever an earlier compile found: a project whose models cannot be compiled is not a clean project, and counts from a compile that no longer describes it are not shown beside its failure (#1823). Absent when the last compile produced a result, and before the first compile finishes.",
@@ -25602,6 +25616,48 @@
         ]
       }
     },
+    "/api/v1/branches": {
+      "get": {
+        "description": "Every branch in the state store. The same bytes as `rocky branch list --output json` against the store `--state-path` names (or the default under the models directory). Read-only.",
+        "operationId": "listBranches",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchListOutput"
+                }
+              }
+            },
+            "description": "The branch list."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "List branches",
+        "tags": [
+          "branches"
+        ]
+      }
+    },
     "/api/v1/brief": {
       "get": {
         "description": "What happened over the window and what needs a human: agent activity by principal, the ranked escalations, runs, drift, freshness, quality, cost, autonomy budgets and the scheduler's posture, every line citing a ledger id. The same bytes as `rocky brief --since <since> --output json`, except `generated_at` and, for the relative windows, `since_timestamp`, which derive from the request instant. Never advances the digest cursor: `since=last` reads it as it stands. The default is `7d`, not the CLI's `last`, because a read cannot advance the cursor. Scans at most 10,000 runs and decisions; compiles nothing. Reads only.",
@@ -26012,7 +26068,7 @@
     },
     "/api/v1/jobs/apply": {
       "post": {
-        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409. `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`).",
+        "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409. `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The server reads the plan before it takes the permit. An archive plan is refused (409 `archive_apply_terminal_only`): it deletes rows and vacuums with no retention window, so it is applied in a terminal. A promote plan is refused unless the config sets `[branch.approval] required = true` (409 `branch_approval_not_required`) and the plan was built behind that gate (409 `promote_plan_not_approved`).",
         "operationId": "submitApplyJob",
         "parameters": [
           {
@@ -26073,7 +26129,7 @@
                 }
               }
             },
-            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+            "description": "Another run/apply job already holds the single-mutating-job permit (`mutation_in_progress`, with the holder's id in `running_job_id`), or the plan may not be applied over the HTTP API: an archive plan (`archive_apply_terminal_only`), a promote plan when the config does not set `[branch.approval] required = true` (`branch_approval_not_required`), or a promote plan that was not built behind the approval gate (`promote_plan_not_approved`)."
           }
         },
         "summary": "Submit an apply job",
@@ -26417,6 +26473,78 @@
           }
         },
         "summary": "Submit a preview create job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/promote": {
+      "post": {
+        "description": "Submit a `promote` job: `rocky plan promote <name>`. Runs the branch's approval and breaking-change gates and writes a promote plan; the result lists each production table the plan would replace. It replaces nothing and takes no permit. Applying the plan is a separate `apply` job with the returned `plan_id`. Refused with 409 `branch_approval_not_required` unless the config sets `[branch.approval] required = true`. `name` (the branch; 1 to 64 letters, digits, `_`, `.` or `-`) is required; `base` (a git ref, default `main`) and `pipeline` are optional. All are validated before the job starts.",
+        "operationId": "submitPromoteJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound config does not set `[branch.approval] required = true` (`branch_approval_not_required`)."
+          }
+        },
+        "summary": "Submit a branch promote plan job",
         "tags": [
           "jobs"
         ]

@@ -12372,6 +12372,13 @@ pub struct ProjectOutput {
     /// none was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ProjectRunOutput>,
+    /// Whether `[branch.approval] required = true` in the bound config, read
+    /// per request. The browser UI offers branch promote only when this is
+    /// `true`, and the server refuses a promote job otherwise. Absent when the
+    /// config could not be loaded (see `config_error`) or none is bound: an
+    /// unknown answer is not shown as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_approval_required: Option<bool>,
 }
 
 /// One pipeline of the bound config.
@@ -12653,6 +12660,13 @@ pub enum JobKind {
     /// does not re-run the changed models (`run_status` is `planned`). `preview
     /// diff` and `preview cost` are not jobs.
     Preview,
+    /// `rocky plan promote <branch>` — runs the branch's approval and
+    /// breaking-change gates and writes a promote plan. It writes no warehouse
+    /// object and no state: the plan file is the only output, and applying it
+    /// (`rocky apply <plan_id>`, kind `apply`) is what replaces production
+    /// tables. Non-mutating; no permit. The server refuses it unless
+    /// `[branch.approval] required = true`.
+    Promote,
 }
 
 impl JobKind {
@@ -12670,13 +12684,15 @@ impl JobKind {
             JobKind::Freeze => "freeze",
             JobKind::Unfreeze => "unfreeze",
             JobKind::Preview => "preview",
+            JobKind::Promote => "promote",
         }
     }
 
     /// The `rocky` subcommand this kind spawns. `Approve` runs `review` with
     /// `--approve`; there is no `rocky approve` verb. `Freeze` and `Unfreeze`
     /// run `policy` and `Preview` runs `preview`; the argv builder adds the verb
-    /// (`freeze`, `unfreeze`, `create`) after it.
+    /// (`freeze`, `unfreeze`, `create`) after it. `Promote` runs `plan` and the
+    /// builder adds `promote`.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12687,6 +12703,7 @@ impl JobKind {
             JobKind::Ci => "ci",
             JobKind::Freeze | JobKind::Unfreeze => "policy",
             JobKind::Preview => "preview",
+            JobKind::Promote => "plan",
         }
     }
 
@@ -12703,7 +12720,7 @@ impl JobKind {
             | JobKind::Freeze
             | JobKind::Unfreeze
             | JobKind::Preview => true,
-            JobKind::Plan | JobKind::Test | JobKind::Ci => false,
+            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote => false,
         }
     }
 
@@ -12719,6 +12736,7 @@ impl JobKind {
             "freeze" => Some(JobKind::Freeze),
             "unfreeze" => Some(JobKind::Unfreeze),
             "preview" => Some(JobKind::Preview),
+            "promote" => Some(JobKind::Promote),
             _ => None,
         }
     }

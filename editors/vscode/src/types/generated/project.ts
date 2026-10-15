@@ -21,6 +21,10 @@ export interface ProjectOutput {
    */
   adapters: ProjectAdapterOutput[];
   /**
+   * Whether `[branch.approval] required = true` in the bound config, read per request. The browser UI offers branch promote only when this is `true`, and the server refuses a promote job otherwise. Absent when the config could not be loaded (see `config_error`) or none is bound: an unknown answer is not shown as `false`.
+   */
+  branch_approval_required?: boolean | null;
+  /**
    * Why the last compile produced no result, when it did not: the models could not be read, a model failed to load, the compile task panicked. While this stands `models_compiled` is absent and `diagnostics.has_errors` is `true`, whatever an earlier compile found: a project whose models cannot be compiled is not a clean project, and counts from a compile that no longer describes it are not shown beside its failure (#1823). Absent when the last compile produced a result, and before the first compile finishes.
    */
   compile_error?: string | null;

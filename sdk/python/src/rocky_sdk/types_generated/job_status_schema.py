@@ -81,6 +81,14 @@ class JobKind9(StrEnum):
     preview = "preview"
 
 
+class JobKind10(StrEnum):
+    """
+    `rocky plan promote <branch>` — runs the branch's approval and breaking-change gates and writes a promote plan. It writes no warehouse object and no state: the plan file is the only output, and applying it (`rocky apply <plan_id>`, kind `apply`) is what replaces production tables. Non-mutating; no permit. The server refuses it unless `[branch.approval] required = true`.
+    """
+
+    promote = "promote"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -150,6 +158,7 @@ class JobStatus(BaseModel):
         | JobKind7
         | JobKind8
         | JobKind9
+        | JobKind10
     )
     """
     Which operation the job wraps.

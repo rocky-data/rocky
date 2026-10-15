@@ -176,7 +176,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, promote a branch (only when the project requires a branch approval), and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 ### Freeze and unfreeze
 
@@ -197,6 +197,31 @@ The command registers the branch in the local state store file on the server. It
 The command does not re-run the changed models. The page lists them as "planned but not re-run". A copy that fails for one model does not fail the job, so the page shows a warning that names the model, not a plain "done". A model the command planned but did not copy shows as "planned but not copied", and the server log says why. A preview with no changed models copies nothing, and the page shows a warning for that too. If the job fails after it registered the branch, for example when the warehouse cannot be reached, the branch stays registered. A retry needs a new name. The page shows only model names, the schema name and fixed words from the result. It never shows warehouse error text.
 
 Preview create opens the state store for write, so it takes the same single write slot as a run. It answers `409 mutation_in_progress` while a run, apply, approve, freeze or unfreeze is in progress. It finds the changed models with `git diff` between the base ref and `HEAD`. The project folder must be inside a git repository, and it may be a subfolder of it. The paths git reports are resolved against the repository root, so a project in a subfolder works, with a relative or an absolute `--models`.
+
+### Promote a branch
+
+The **Estate** screen has a **Promote** panel. Promote replaces production tables with the contents of a branch, so the page offers it only when `rocky.toml` sets `[branch.approval] required = true`. The server reads that key on every request and shows it as `branch_approval_required` in `GET /api/v1/project`. With the key off, or when the config cannot be read, the panel shows one line instead. The line says why the control is absent and names the key.
+
+The key makes the engine ask for a signed branch approval before it plans a promote. The page does not sign that approval. Sign it in a terminal, from the project folder:
+
+```bash
+rocky branch approve <branch>
+```
+
+Promote then takes two steps, so you see what changes before it changes.
+
+```
+Plan promote ──▶ plan written, tables listed ──▶ Promote (confirm) ──▶ production tables replaced
+ (checks the approval            nothing in production             applies that exact plan,
+  and breaking changes)          has changed yet                   it is not planned again
+```
+
+1. Pick a branch and press **Plan promote**. The server runs `rocky plan promote <branch>`. It checks the signed approval and the breaking changes, writes a promote plan, and replaces nothing. The page lists every production table the plan would replace. A refused plan shows the engine's last `Error:` lines, for example that no valid approval was found.
+2. Press **Promote**. The confirm text names every production table that will be replaced. After you confirm, the page applies the plan by its id, through the same apply as the Review screen. It does not plan again. Apply writes the warehouse with the server's credentials, and Rocky cannot undo it. The result lists each table as replaced or not replaced.
+
+The server enforces the same rule, so a call that skips the page is checked too. `POST /api/v1/jobs/promote` and an apply of a promote plan answer `409 branch_approval_not_required` unless the config sets `required = true`. An apply of a promote plan that was built without the approval gate answers `409 promote_plan_not_approved`. That covers a plan built while `required` was off, a plan built with the gate bypassed, and a plan that holds fewer approvals than `min_approvers`. The promote job runs without `ROCKY_BRANCH_APPROVAL_SKIP`, whatever the server's environment holds.
+
+The page has no **Approve** button for a branch. A browser click would record the approval as `local`, although it came over the network, and one session could then approve and promote its own branch.
 
 ### Cancel a running job
 
@@ -248,6 +273,8 @@ An approval from the UI records the approver source `http_api` and the server's 
 ## What the UI cannot do
 
 - **With a read-only token, it cannot write.** A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write.
+- **It cannot apply an archive plan.** Archive deletes rows and then vacuums with no retention window, so it cannot be undone. The plan screen shows no Apply button for an archive plan, and the server answers `409 archive_apply_terminal_only` to `POST /api/v1/jobs/apply` for one. Apply it in a terminal with `rocky apply <plan-id>`.
+- **It cannot sign a branch approval.** Sign it in a terminal with `rocky branch approve <branch>`.
 - **It cannot know the spec digest for you.** A product-bound plan applies only with a digest you type, and the digest must come from the approval. The page never reads it from the plan.
 - **It cannot change policy.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules themselves live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
 
