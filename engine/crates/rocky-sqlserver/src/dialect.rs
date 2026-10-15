@@ -955,6 +955,76 @@ mod tests {
         one_leading_with("merge", &merge_ctes);
     }
 
+    /// The real inliner's output, not a hand-built string: an ephemeral model
+    /// ending in a bare `ORDER BY` (also one with its own `WITH`) becomes a
+    /// CTE. T-SQL refuses `ORDER BY` in a CTE without `TOP` / `OFFSET` / `FOR`
+    /// (error 1033), so no write path may render it inside the `WITH` list.
+    /// The consumer's own top-level `ORDER BY` is not this test's concern.
+    #[test]
+    fn an_inlined_ephemeral_order_by_is_dropped_on_every_write_path() {
+        use rocky_sql::ephemeral::{EphemeralModel, inline_ephemeral_refs};
+        use std::collections::BTreeMap;
+
+        for body in [
+            "SELECT id, v FROM raw.t ORDER BY v DESC",
+            "WITH x AS (SELECT id, v FROM raw.t) SELECT id, v FROM x ORDER BY v",
+        ] {
+            let mut ephemerals = BTreeMap::new();
+            ephemerals.insert(
+                "eph".to_string(),
+                EphemeralModel {
+                    sql: body.to_string(),
+                    catalog: String::new(),
+                    schema: "marts".to_string(),
+                    table: "eph".to_string(),
+                },
+            );
+            let model = inline_ephemeral_refs("fct", "SELECT id, v FROM eph", &ephemerals)
+                .unwrap()
+                .sql
+                .expect("the ephemeral read was inlined");
+            assert!(model.to_uppercase().contains("ORDER BY"), "{model}");
+
+            let target = "[an].[marts].[fct]";
+            let rendered = [
+                ("full_refresh", d().create_table_as(target, &model)),
+                ("first_create", d().create_table_as_new(target, &model)),
+                ("insert", d().insert_into(target, &model)),
+                (
+                    "insert_columns",
+                    d().insert_into_columns(target, &["id".into(), "v".into()], &model),
+                ),
+                ("view", d().view_ddl(target, &model).unwrap()),
+                (
+                    "merge",
+                    d().merge_into(target, &model, &keys(&["id"]), &explicit(&["id", "v"]))
+                        .unwrap(),
+                ),
+                (
+                    "delete_partitions",
+                    d().delete_partitions_sql(target, &keys(&["id"]), &model),
+                ),
+                (
+                    "insert_overwrite",
+                    d().insert_overwrite_partition(target, "1 = 1", &model)
+                        .unwrap()
+                        .join("\n"),
+                ),
+                ("wrap_limited", d().wrap_select_limited(&model, "s", "*", 5)),
+            ];
+            for (path, sql) in rendered {
+                assert!(
+                    sql.contains("__rocky_ephemeral__eph"),
+                    "{path}: the inlined CTE is present: {sql}"
+                );
+                assert!(
+                    !sql.to_uppercase().contains("ORDER BY"),
+                    "{path}: no ORDER BY survives in the CTE list: {sql}"
+                );
+            }
+        }
+    }
+
     /// A `time_interval` window renders language-independent literals: a
     /// bare `'2026-04-07 00:00:00'` against a `DATETIME` column reads as
     /// July 4th under `SET DATEFORMAT dmy`.
