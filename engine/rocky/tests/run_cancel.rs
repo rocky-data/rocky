@@ -136,7 +136,12 @@ impl Fixture {
     fn spawn_run_blocked_on_the_fifo(
         &self,
         idempotency_key: &str,
-    ) -> (Child, Receiver<String>, thread::JoinHandle<String>, fs::File) {
+    ) -> (
+        Child,
+        Receiver<String>,
+        thread::JoinHandle<String>,
+        fs::File,
+    ) {
         self.make_source_a_fifo();
         let (open_tx, open_rx) = channel::<fs::File>();
         let fifo = self.source.clone();
@@ -312,7 +317,11 @@ fn sigterm_during_a_transformation_model_settles_the_run() {
     // The payload says so.
     let payload: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout is one JSON RunOutput ({e}):\n{stdout}"));
-    assert_eq!(payload["interrupted"], serde_json::Value::Bool(true), "{payload}");
+    assert_eq!(
+        payload["interrupted"],
+        serde_json::Value::Bool(true),
+        "{payload}"
+    );
     assert_eq!(payload["status"], "PartialFailure", "{payload}");
 
     // The run record landed.
@@ -350,7 +359,9 @@ fn sigterm_during_a_transformation_model_settles_the_run() {
     let rerun_payload: serde_json::Value =
         serde_json::from_str(rerun_stdout.trim()).expect("rerun stdout is JSON");
     assert!(
-        rerun_payload.get("skipped_by_run_id").is_none_or(serde_json::Value::is_null),
+        rerun_payload
+            .get("skipped_by_run_id")
+            .is_none_or(serde_json::Value::is_null),
         "the interrupted run's claim must not dedup the rerun: {rerun_payload}"
     );
     assert!(table_exists(&fx.dir, "after"));
@@ -377,9 +388,12 @@ fn a_second_sigint_still_terminates_a_cancelled_run_at_once() {
         let _ = child.wait();
     }
     let transcript = drain(&stderr);
-    let status =
-        status.unwrap_or_else(|| panic!("a second SIGINT did not terminate.\nstderr:\n{transcript}"));
+    let status = status
+        .unwrap_or_else(|| panic!("a second SIGINT did not terminate.\nstderr:\n{transcript}"));
     assert_eq!(status.code(), Some(130), "stderr:\n{transcript}");
-    assert!(transcript.contains("second SIGINT"), "stderr:\n{transcript}");
+    assert!(
+        transcript.contains("second SIGINT"),
+        "stderr:\n{transcript}"
+    );
     drop(write_end);
 }

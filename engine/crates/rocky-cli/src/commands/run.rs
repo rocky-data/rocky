@@ -51344,6 +51344,69 @@ timestamp_column = "ts"
         }
     }
 
+    /// #1606. The replication fan-out observes the run's cancellation token
+    /// rather than its own signal handlers, so a cancel issued by whoever owns
+    /// the token (`rocky run --watch` here, the signal listener otherwise)
+    /// reaches the fan-out's settle: every planned table is marked
+    /// `Interrupted`, the run record lands, the checkpoint travels to the
+    /// remote state, and the run returns the `Interrupted` sentinel.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_cancelled_token_settles_the_replication_fan_out_as_interrupted() {
+        use rocky_core::state::{RunStatus, TableStatus};
+        use rocky_core::state_sync::StateAuthority;
+        use rocky_core::test_harness::CrossPodHarness;
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        let harness = CrossPodHarness::new_s3_like();
+        let config = rt.block_on(checkpoint_ordering_project(harness.pod_a.dir.path(), "skip"));
+        let run_id = "cancelled-before-the-fan-out";
+
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let outcome = rt.block_on(super::super::run_cancel::scope(
+            token,
+            checkpoint_ordering_run(&config, &harness.pod_a.state_path, run_id, false),
+        ));
+        let error = outcome.expect_err("a cancelled run must not report success");
+        assert!(error.is::<super::Interrupted>(), "{error:#}");
+
+        let local = harness.open_store(&harness.pod_a);
+        let progress = local
+            .get_run_progress(run_id)
+            .unwrap()
+            .expect("the fan-out's checkpoint");
+        assert!(
+            !progress.tables.is_empty()
+                && progress
+                    .tables
+                    .iter()
+                    .all(|table| table.status == TableStatus::Interrupted),
+            "no table may start after the cancel, and each must be marked: {:?}",
+            progress.tables
+        );
+        assert_eq!(
+            local.get_run(run_id).unwrap().expect("run record").status,
+            RunStatus::Failure,
+            "an interrupted run with no progress records as Failure"
+        );
+        drop(local);
+
+        let authority = rt.block_on(harness.download(&harness.pod_b)).unwrap();
+        assert!(
+            matches!(authority, StateAuthority::Authoritative),
+            "{authority:?}"
+        );
+        assert!(
+            harness
+                .open_store(&harness.pod_b)
+                .get_run_progress(run_id)
+                .unwrap()
+                .is_some(),
+            "the interrupted checkpoint must reach the remote state"
+        );
+    }
+
     #[cfg(feature = "duckdb")]
     #[test]
     fn checkpoint_recovery_run_flush_failure_publishes_intent_and_replays_once() {

@@ -447,10 +447,11 @@ pub async fn run_watch(
 /// cannot stop a statement already in flight, and nothing can cancel a
 /// `spawn_blocking` statement. So the wait is bounded, and a stalled iteration
 /// is then dropped exactly as before — crash parity, settled by
-/// [`stop_interrupted_iteration`]. Ten seconds is well clear of a local settle
-/// and, with `main`'s five-second blocking-pool grace after it, well inside
-/// Kubernetes' default 30-second termination grace.
-const SIGNAL_SETTLE_GRACE: Duration = Duration::from_secs(10);
+/// [`stop_interrupted_iteration`]. Five seconds is well clear of a local
+/// settle, and with `main`'s five-second blocking-pool grace after it a stalled
+/// iteration still exits within ten — well inside Kubernetes' default
+/// 30-second termination grace.
+const SIGNAL_SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 /// What ended the wait on one watch iteration.
 enum IterStop {

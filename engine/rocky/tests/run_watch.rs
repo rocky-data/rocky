@@ -894,6 +894,256 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
     );
 }
 
+/// A signal during an iteration now lets the run settle itself (#1606).
+///
+/// The sibling test above holds the statement open forever, so it covers the
+/// drop after the grace. This one releases the statement right after the
+/// signal, inside the grace. The run must then observe the cancel — start no
+/// further model — and report itself interrupted, and the watcher still exits
+/// 0 (#1405).
+///
+/// A second model, downstream of the blocking one, is what makes the cancel
+/// observable: with one model, a settled run and a run that ignored the token
+/// look the same.
+#[test]
+fn run_watch_signal_lets_the_iteration_settle_within_the_grace() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let source_path = dir.join(BLOCKING_SOURCE_FILE);
+    fs::write(&source_path, "1\n").expect("write source csv");
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(&blocking_seed_sql(&source_path))
+            .expect("seed sql");
+    }
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, BLOCKING_ROCKY_TOML).expect("write rocky.toml");
+    let models_dir = dir.join("models");
+    fs::create_dir(&models_dir).expect("mkdir models");
+    fs::write(models_dir.join("blocking.sql"), BLOCKING_MODEL_SQL).expect("write model sql");
+    fs::write(models_dir.join("blocking.toml"), BLOCKING_MODEL_TOML).expect("write model toml");
+    fs::write(
+        models_dir.join("after.sql"),
+        "SELECT id FROM staging.blocking\n",
+    )
+    .expect("write model sql");
+    fs::write(
+        models_dir.join("after.toml"),
+        "depends_on = [\"blocking\"]\n\n[target]\ncatalog = \"fixture\"\nschema = \"staging\"\n",
+    )
+    .expect("write model toml");
+
+    let calibration_start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(&cfg_path)
+        .arg("--output")
+        .arg("json")
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+    let pid = child.id();
+    let stderr_rx = spawn_line_reader(child.stderr.take().expect("stderr piped"));
+    let stdout_lines = spawn_collecting_reader(child.stdout.take().expect("stdout piped"));
+
+    let first = wait_for(&stderr_rx, "run completed in", BOOTSTRAP_BUDGET);
+    if !first.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "first run never completed.\nstderr so far:\n{}",
+            first.buffered
+        );
+    }
+    let one_run = calibration_start.elapsed().max(Duration::from_millis(100));
+    let mut transcript = first.buffered;
+
+    fs::remove_file(&source_path).expect("remove source csv");
+    mkfifo(&source_path);
+    let (open_tx, open_rx) = channel::<fs::File>();
+    let fifo_path = source_path.clone();
+    thread::spawn(move || {
+        if let Ok(write_end) = fs::OpenOptions::new().write(true).open(&fifo_path) {
+            let _ = open_tx.send(write_end);
+        }
+    });
+    touch(&cfg_path);
+    let handshake_budget = scaled_budget(one_run, RERUN_BUDGET_RUNS);
+    let Ok(mut write_end) = open_rx.recv_timeout(handshake_budget) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the re-run never opened the FIFO; the fixture proves nothing.\n{transcript}");
+    };
+
+    sigterm(pid);
+    let notice = wait_for(&stderr_rx, "letting the run settle", handshake_budget);
+    transcript.push_str(&notice.buffered);
+    if !notice.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("no settle notice after SIGTERM.\nstderr:\n{transcript}");
+    }
+    // Release the statement inside the grace: one row, then EOF.
+    {
+        use std::io::Write;
+        write_end.write_all(b"1\n").expect("write fifo");
+    }
+    drop(write_end);
+
+    let outcome = wait_with_timeout(&mut child, scaled_budget(one_run, SHUTDOWN_BUDGET_RUNS));
+    if !matches!(outcome, WaitOutcome::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_secs(5)) {
+        transcript.push_str(&line);
+        transcript.push('\n');
+    }
+    let WaitOutcome::Exited(status) = outcome else {
+        panic!("rocky run --watch did not exit after the settle.\nstderr:\n{transcript}");
+    };
+    assert!(
+        status.success(),
+        "exit 0 (#1405); got {status:?}.\nstderr:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("[watch] run interrupted"),
+        "the run must observe the cancel and settle as interrupted, not complete or be \
+         dropped.\nstderr:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("did not settle"),
+        "the statement was released inside the grace; the iteration must not be \
+         dropped.\nstderr:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("[watch] stopped"),
+        "stderr:\n{transcript}"
+    );
+
+    // The interrupted iteration's payload: one model built, flagged interrupted.
+    let lines = stdout_lines.join().expect("stdout reader");
+    let last: serde_json::Value = serde_json::from_str(
+        lines
+            .last()
+            .unwrap_or_else(|| panic!("no stdout lines.\nstderr:\n{transcript}")),
+    )
+    .expect("last stdout line is a RunOutput");
+    assert_eq!(last["interrupted"], serde_json::Value::Bool(true), "{last}");
+    assert_eq!(
+        last["materializations"].as_array().map(Vec::len),
+        Some(1),
+        "the downstream model must not start after the cancel: {last}"
+    );
+}
+
+/// A second SIGINT during the settle grace exits 130 at once (#1606).
+///
+/// The grace waits for an in-flight statement, so the operator's "Ctrl-C
+/// again" must still cut it short, as it always has.
+#[test]
+fn run_watch_second_sigint_during_the_settle_grace_terminates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let source_path = dir.join(BLOCKING_SOURCE_FILE);
+    fs::write(&source_path, "1\n").expect("write source csv");
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(&blocking_seed_sql(&source_path))
+            .expect("seed sql");
+    }
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, BLOCKING_ROCKY_TOML).expect("write rocky.toml");
+    let models_dir = dir.join("models");
+    fs::create_dir(&models_dir).expect("mkdir models");
+    fs::write(models_dir.join("blocking.sql"), BLOCKING_MODEL_SQL).expect("write model sql");
+    fs::write(models_dir.join("blocking.toml"), BLOCKING_MODEL_TOML).expect("write model toml");
+
+    let calibration_start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(&cfg_path)
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+    let pid = child.id();
+    let stderr_rx = spawn_line_reader(child.stderr.take().expect("stderr piped"));
+    let _stdout_drain = spawn_collecting_reader(child.stdout.take().expect("stdout piped"));
+
+    let first = wait_for(&stderr_rx, "run completed in", BOOTSTRAP_BUDGET);
+    if !first.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "first run never completed.\nstderr so far:\n{}",
+            first.buffered
+        );
+    }
+    let one_run = calibration_start.elapsed().max(Duration::from_millis(100));
+    let mut transcript = first.buffered;
+
+    fs::remove_file(&source_path).expect("remove source csv");
+    mkfifo(&source_path);
+    let (open_tx, open_rx) = channel::<fs::File>();
+    let fifo_path = source_path.clone();
+    thread::spawn(move || {
+        if let Ok(write_end) = fs::OpenOptions::new().write(true).open(&fifo_path) {
+            let _ = open_tx.send(write_end);
+        }
+    });
+    touch(&cfg_path);
+    let handshake_budget = scaled_budget(one_run, RERUN_BUDGET_RUNS);
+    let Ok(write_end) = open_rx.recv_timeout(handshake_budget) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the re-run never opened the FIFO; the fixture proves nothing.\n{transcript}");
+    };
+
+    sigterm(pid);
+    let notice = wait_for(&stderr_rx, "letting the run settle", handshake_budget);
+    transcript.push_str(&notice.buffered);
+    if !notice.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("no settle notice after SIGTERM.\nstderr:\n{transcript}");
+    }
+    let second = Instant::now();
+    sigint(pid);
+    // Well under the five-second grace: the exit must come from the second
+    // SIGINT, not from the grace running out.
+    let outcome = wait_with_timeout(&mut child, Duration::from_secs(4));
+    if !matches!(outcome, WaitOutcome::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_secs(5)) {
+        transcript.push_str(&line);
+        transcript.push('\n');
+    }
+    let WaitOutcome::Exited(status) = outcome else {
+        panic!(
+            "a second SIGINT did not terminate within {:?}.\nstderr:\n{transcript}",
+            second.elapsed()
+        );
+    };
+    assert_eq!(status.code(), Some(130), "stderr:\n{transcript}");
+    assert!(
+        transcript.contains("second SIGINT"),
+        "stderr:\n{transcript}"
+    );
+    drop(write_end);
+}
+
 /// #1604: a TRANSFORMATION pipeline must honour the NDJSON contract too.
 ///
 /// `run --watch` sets the process-global `COMPACT_JSON` flag, and
