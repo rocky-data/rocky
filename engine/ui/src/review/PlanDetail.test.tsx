@@ -352,7 +352,7 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     // The product read did happen (the spec-drift card needs it)…
-    await screen.findByText("unchanged");
+    await screen.findByText("matches the approval");
     // …and still no offer.
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
     expect(screen.getByText(/The samples route would read none of the models this plan names/))
@@ -626,7 +626,7 @@ describe("PlanDetail", () => {
         })}
       />,
     );
-    await screen.findByText("unchanged");
+    await screen.findByText("matches the approval");
     expect(screen.queryByText("the spec moved")).toBeNull();
   });
 
@@ -653,17 +653,24 @@ describe("PlanDetail", () => {
     });
 
     it("says no approval is recorded, and does not compare with the working spec", async () => {
-      // The working spec equals the plan; with no approval that must not read as "unchanged".
+      // The working spec equals the plan; with no approval that must not read as a match.
       planWith("sha256:1111", { ...PRODUCT, approval: null } as ProductStatusOutput);
       await screen.findByText("no approval recorded");
-      expect(screen.queryByText("unchanged")).toBeNull();
+      expect(screen.queryByText("matches the approval")).toBeNull();
       expect(screen.queryByText("the spec moved")).toBeNull();
     });
 
-    it("does not report drift when only the working spec was edited", async () => {
-      planWith("sha256:1111", { ...PRODUCT, spec_digest: "sha256:edited-after-approval" } as ProductStatusOutput);
-      await screen.findByText("unchanged");
+    it("does not report drift when only the working spec was edited, but says the edits are not approved", async () => {
+      planWith("sha256:1111", {
+        ...PRODUCT,
+        spec_digest: "sha256:edited-after-approval",
+        spec_matches_approval: false,
+      } as ProductStatusOutput);
+      await screen.findByText("matches the approval");
       expect(screen.queryByText("the spec moved")).toBeNull();
+      expect(
+        await screen.findByText(/The working spec has been edited since the approval; those edits are not approved\./),
+      ).toBeInTheDocument();
     });
 
     it("reports drift when the working spec matches the plan but the approval does not", async () => {

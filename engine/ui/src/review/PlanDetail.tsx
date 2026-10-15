@@ -241,15 +241,17 @@ function SpecDrift({
       />
     );
   }
-  const current = approved;
-  if (planned === current) {
+  if (planned === approved) {
     return (
       <StatusCard
         label="the spec it was planned against"
-        value="unchanged"
+        value="matches the approval"
         sub={
           <>
             Still <Clip value={planned} />.
+            {product.spec_matches_approval === false
+              ? " The working spec has been edited since the approval; those edits are not approved."
+              : null}
           </>
         }
       />
@@ -262,10 +264,10 @@ function SpecDrift({
       tone="risk"
       sub={
         <>
-          Planned against <Clip value={planned} />; the approved spec is <Clip value={current} />.
+          Planned against <Clip value={planned} />; the approved spec is <Clip value={approved} />.
           Apply compares the digest you pass with the one this plan carries, not with the spec
-          on disk. Passing the current digest refuses this plan; passing the digest it was
-          planned against applies it, stale. Re-propose against the current spec.
+          on disk. Passing the approved digest refuses this plan; passing the digest it was
+          planned against applies it, stale. Re-propose against the approved spec.
         </>
       }
     />
@@ -553,10 +555,12 @@ function ProductApply({
         <WriteButton label="Apply" busy={busy} disabledReason={blocked} onClick={() => undefined} />
       )}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        The approved digest is <code className="font-mono">approval.spec_digest</code> in{" "}
-        <code className="font-mono">rocky product status &lt;name&gt;</code>, or in your approval
-        record. Do not copy the plan&apos;s own digest from the spec card above: the check would
-        then compare the plan with itself.
+        The approved digest is on the <code className="font-mono">approval:</code> line of{" "}
+        <code className="font-mono">rocky product status &lt;name&gt;</code> (
+        <code className="font-mono">approval.spec_digest</code> with{" "}
+        <code className="font-mono">--output json</code>), or in your approval record. Do not copy
+        the plan&apos;s own digest from the spec card: the check would then compare the plan with
+        itself.
       </p>
       <JobLine label="Apply" view={apply} cancel={cancel} />
       <p className="text-xs text-zinc-500 dark:text-zinc-400">

@@ -376,8 +376,9 @@ describe("Approve and Apply on the plan page", () => {
       const { section, input } = await open(bound());
       expect(input.value).toBe("");
       expect(section).toHaveTextContent("approval.spec_digest");
+      expect(section).toHaveTextContent("approval:");
       expect(section).toHaveTextContent("rocky product status <name>");
-      expect(section).toHaveTextContent(/Do not copy the plan.s own digest from the spec card above/);
+      expect(section).toHaveTextContent(/Do not copy the plan.s own digest from the spec card/);
       expect(section).toHaveTextContent("compare the plan with itself");
     });
 
