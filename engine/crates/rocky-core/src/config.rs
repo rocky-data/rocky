@@ -8498,6 +8498,26 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
         assert!(debug.contains("${RV_CFG_DBG}"), "{debug}");
+
+        // The two variants #1934 added interpolate config-derived values.
+        let later = [
+            ConfigError::UnsafeSeparator {
+                pipeline: "raw".into(),
+                field: "schema_separator".into(),
+                separator: format!("x{SECRET}").into(),
+            },
+            ConfigError::MetadataColumnValueRefused {
+                pipeline: "raw".into(),
+                column: format!("col_{SECRET}").into(),
+                reason: format!("holds {SECRET}").into(),
+            },
+        ];
+        for err in later {
+            for shown in [err.to_string(), format!("{err:?}")] {
+                assert!(!shown.contains(SECRET), "leaks: {shown}");
+                assert!(shown.contains("${RV_CFG_DBG}"), "{shown}");
+            }
+        }
     }
 
     // ---- credential-tolerant loading (#1536) ----
