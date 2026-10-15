@@ -1440,7 +1440,7 @@ backend = "${ROCKY_STATE_BACKEND:-local}"
 Run a shell command or post to an HTTP endpoint when something happens in a pipeline. A shell hook receives the event's JSON context on stdin. A webhook posts a templated body to a URL.
 
 ```toml
-# Shell hooks — run a command, pipe JSON context to stdin.
+# Shell hooks — run a command, JSON context on stdin.
 [[hook.on_pipeline_start]]
 command = "bash scripts/notify.sh"
 timeout_ms = 5000

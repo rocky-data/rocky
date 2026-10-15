@@ -110,7 +110,7 @@ The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky wri
 
 ## Shell hooks
 
-A shell hook runs a command and pipes the event context to its stdin as JSON:
+A shell hook runs a command and gives it the event context as JSON on its stdin. The hook can ignore its stdin and exit early:
 
 ```toml
 [[hook.on_pipeline_complete]]
