@@ -1305,12 +1305,15 @@ pub trait SqlDialect: Send + Sync {
     /// the WHERE clause uses the sentinel `1970-01-01` so the whole source
     /// is scanned.
     ///
-    /// Source-side semantics: the watermark reflects what's been processed
-    /// *from* source, not what's *in* target. The runner computes
-    /// `SELECT MAX({ts}) FROM source` post-execute and persists that value;
-    /// the next run reads it back and passes it here. This composes
-    /// correctly with `merge`, `delete_insert`, and other strategies that
-    /// collapse source rows on write.
+    /// The predicate references source only (no correlated subquery against
+    /// target). For `Incremental` and `Microbatch`, after a successful write
+    /// the runner computes `SELECT MAX({ts}) FROM target` — the rows actually
+    /// loaded — and persists that value; other strategies record the run time
+    /// (`run.rs::resolve_new_watermark`). The next run reads it back and
+    /// passes it here. Reading target rather than source means a row appended
+    /// to source mid-run is never skipped; on the replication path the ts
+    /// column passes through unchanged, so target MAX is in source's value
+    /// space.
     fn watermark_where(
         &self,
         timestamp_col: &str,

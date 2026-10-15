@@ -253,8 +253,8 @@ fn test_incremental_pipeline_with_watermark() {
 
     let table_key = "acme_warehouse.staging__us_west__shopify.orders";
 
-    // Set a source-side watermark (simulating a previous successful run that
-    // recorded `MAX(_fivetran_synced) FROM source`).
+    // Set a prior watermark (simulating a previous successful run that
+    // recorded `MAX(_fivetran_synced)` over the target).
     let prior_watermark = chrono::Utc::now();
     store
         .set_watermark(
@@ -302,7 +302,7 @@ fn test_incremental_pipeline_with_watermark() {
     );
 
     // State store keeps the prior watermark; the runner re-records it at
-    // end-of-run from a fresh `SELECT MAX(ts) FROM source` query.
+    // end-of-run from a fresh `SELECT MAX(ts) FROM target` query.
     let stored_wm = store.get_watermark(table_key).unwrap().unwrap();
     assert_eq!(stored_wm.last_value, prior_watermark);
 }
@@ -1112,7 +1112,7 @@ fn test_exact_incremental_sql_output_with_prior_watermark() {
         filter_column: None,
     });
 
-    // Second run: state has the previous run's `MAX(ts) FROM source` value.
+    // Second run: state has the previous run's `MAX(ts)` over the target.
     let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
     let sql = sql_gen::generate_select_sql(&plan, &dialect, Some(&prior)).unwrap();
 

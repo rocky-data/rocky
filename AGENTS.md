@@ -99,7 +99,7 @@ just --list      # all recipes
 
 Each subproject's tools (`cargo`, `uv`, `npm`) work directly from inside the subproject directory. The `justfile` is a convenience, not a requirement.
 
-Some environments, cloud agent containers among them, have no `just` and no `cargo-nextest`. Then run the commands inside the matching `justfile` recipe directly, or install them (`cargo install just cargo-nextest --locked`). The engine CI runs `cargo nextest run --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`. A plain `cargo test` skips feature-gated code. `--all-features` builds need `cmake`, which CI installs.
+Some environments, cloud agent containers among them, have no `just` and no `cargo-nextest`. Then run the commands inside the matching `justfile` recipe directly, or install them (`cargo install just cargo-nextest --locked`). Claude Code cloud sessions install pinned, checksum-verified copies through `.claude/hooks/session-start.sh`; it does not turn on `.git-hooks/`. Other agent clients get no such hook and use the fallback above. The engine CI runs `cargo nextest run --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`. A plain `cargo test` skips feature-gated code. `--all-features` builds need `cmake`, which CI installs.
 
 ## Releases
 

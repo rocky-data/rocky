@@ -2329,7 +2329,7 @@ WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'";
     #[test]
     fn test_sample_incremental_sql_with_prior_watermark_matches_expected() {
         // Second-run shape: state carries the previous run's
-        // `MAX(_fivetran_synced) FROM source`, threaded in as a literal.
+        // `MAX(_fivetran_synced)` over the target, threaded in as a literal.
         use chrono::TimeZone;
         let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
         let sql = generate_select_sql(&sample_incremental_ir(), &dialect(), Some(&prior)).unwrap();

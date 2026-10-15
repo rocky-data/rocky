@@ -380,14 +380,15 @@ pub struct GovernanceConfig {
 
 /// Tracks the last-seen watermark for incremental loads.
 ///
-/// `last_value` is **source-side**: the `MAX(timestamp_column) FROM source`
-/// observed during the last successful run. The runner re-queries source
-/// post-execute and persists the value here; the next run reads it back
-/// and threads it into the dialect's `watermark_where` clause as a literal
-/// (no correlated subquery against target).
+/// `last_value` is the `MAX(timestamp_column)` over the **target** after the
+/// last successful incremental or microbatch run — the rows actually loaded.
+/// The runner queries it post-execute (`resolve_new_watermark`) and persists
+/// the value here; the next run reads it back and threads it into the
+/// dialect's `watermark_where` clause as a literal (no correlated subquery
+/// against target).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatermarkState {
-    /// The `MAX(timestamp_column) FROM source` from the last successful run.
+    /// The `MAX(timestamp_column)` over the target after the last successful run.
     pub last_value: DateTime<Utc>,
     /// When this watermark was recorded.
     pub updated_at: DateTime<Utc>,

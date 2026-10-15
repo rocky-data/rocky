@@ -23,7 +23,7 @@ The legacy `Plan` enum is gone; `ModelIr` is the sole transformation intermediat
 ```
 engine/                         # this directory, inside the rocky monorepo
 ├── Cargo.toml                  # Workspace manifest
-├── crates/
+├── crates/                   # Key files shown for core crates only; `ls crates/<name>/src` for the rest
 │   ├── rocky-ir/               # Typed IR (data only — no runtime traits)
 │   │   └── src/
 │   │       ├── ir.rs           # ModelIr, ModelIrVariant, ProjectIr, MaterializationStrategy (FullRefresh, Incremental, Merge, MaterializedView, DynamicTable, TimeInterval), TargetRef, SourceRef, ColumnSelection, governance, grants, masks
@@ -60,87 +60,32 @@ engine/                         # this directory, inside the rocky monorepo
 │   │   │   ├── traits.rs       # Shared trait definitions
 │   │   │   └── unit_test.rs    # In-process test utilities
 │   │   └── tests/
-│   │       └── e2e.rs          # E2E integration tests (DuckDB-backed, no credentials needed)
+│   │       └── e2e.rs, …       # Integration tests (DuckDB-backed, no credentials needed); `ls` for the rest
 │   ├── rocky-secret-registry/  # Resolved ${VAR} values -> ${NAME}; no deps, so crates without rocky-core use it too
 │   ├── rocky-sql/              # SQL parsing + typed AST (sqlparser-rs)
-│   │   └── src/
-│   │       ├── parser.rs       # sqlparser-rs wrapper with typed extensions
-│   │       ├── dialect.rs      # Databricks SQL dialect
-│   │       ├── validation.rs   # SQL identifier validation, injection prevention
-│   │       ├── transpile.rs    # SQL transpilation between dialects
-│   │       └── lineage.rs      # SQL-level column lineage extraction
-│   ├── rocky-lang/             # Rocky DSL parser (.rocky files)
-│   │   └── src/                # Lexer (logos) + parser → IR lowering
+│   ├── rocky-lang/             # Rocky DSL lexer + parser; lower.rs compiles .rocky to a SQL string (not IR)
 │   ├── rocky-compiler/         # Type checking + semantic analysis
-│   │   └── src/                # Semantic graph, contract validation, diagnostics
 │   ├── rocky-ai/               # AI intent layer
-│   │   └── src/                # explain, sync, test, generate (requires ANTHROPIC_API_KEY)
 │   ├── rocky-server/           # HTTP API + LSP server
-│   │   └── src/                # axum REST + tower-lsp for IDE integration
 │   ├── rocky-engine/           # Local execution engine
-│   │   └── src/                # DuckDB-backed execution (Arrow)
 │   ├── rocky-adapter-sdk/      # Adapter SDK for building custom warehouse adapters
-│   │   └── src/
-│   ├── rocky-databricks/       # Databricks warehouse adapter
-│   │   └── src/
-│   │       ├── connector.rs    # SQL Statement Execution REST API (with is_transient/is_rate_limit)
-│   │       ├── throttle.rs     # Adaptive concurrency (AIMD algorithm)
-│   │       ├── catalog.rs      # Unity Catalog CRUD + tagging + isolation
-│   │       ├── permissions.rs  # GRANT/REVOKE + SHOW GRANTS
-│   │       ├── workspace.rs    # Workspace binding (isolation)
-│   │       ├── auth.rs         # PAT + OAuth M2M auto-detection
-│   │       └── batch.rs        # information_schema batching (UNION ALL)
+│   ├── rocky-databricks/       # Databricks warehouse adapter (incl. throttle.rs: AIMD adaptive concurrency)
 │   ├── rocky-fivetran/         # Fivetran source adapter
-│   │   └── src/
-│   │       ├── adapter.rs      # Adapter trait implementation
-│   │       ├── client.rs       # Async REST client (reqwest + Basic Auth)
-│   │       ├── connector.rs    # Connector discovery + filtering
-│   │       ├── schema.rs       # Schema config parsing (nested JSON)
-│   │       └── sync.rs         # Sync detection (timestamp comparison)
-│   ├── rocky-cache/            # Three-tier caching (memory → Valkey → API)
-│   │   └── src/
-│   │       ├── memory.rs       # In-process LRU with TTL
-│   │       ├── valkey.rs       # Valkey/Redis distributed cache (feature-gated: `valkey`)
-│   │       └── tiered.rs       # Fallback chain: memory → valkey → source
+│   ├── rocky-cache/            # Three-tier caching (memory → Valkey → API); Valkey tier behind cargo feature `valkey`
 │   ├── rocky-snowflake/        # Snowflake warehouse adapter
-│   │   └── src/
-│   │       ├── auth.rs         # OAuth, password, RS256 key-pair JWT auth
-│   │       ├── connector.rs    # Snowflake REST client
-│   │       └── dialect.rs      # Snowflake SQL dialect
 │   ├── rocky-duckdb/           # DuckDB local execution adapter
-│   │   └── src/
-│   │       ├── adapter.rs      # Adapter trait implementation
-│   │       ├── dialect.rs      # DuckDB SQL dialect specifics
-│   │       ├── discovery.rs    # Local schema/table discovery
-│   │       ├── seed.rs         # Seed data loading (data/seed.sql)
-│   │       ├── test_harness.rs # In-memory DuckDB test harness
-│   │       └── types.rs        # DuckDB type mapping
-│   ├── rocky-bigquery/          # BigQuery warehouse adapter
-│   │   └── src/
-│   │       ├── adapter.rs      # Adapter trait implementation
-│   │       ├── dialect.rs      # BigQuery SQL dialect (backtick quoting, DML transactions)
-│   │       └── auth.rs         # GCP Service Account / ADC authentication
-│   ├── rocky-trino/            # Trino warehouse adapter (REST /v1/statement polling, Basic + JWT auth)
-│   │   └── src/                # Adapter trait impl + Docker-backed conformance harness behind `trino-conformance`
+│   ├── rocky-bigquery/         # BigQuery warehouse adapter
+│   ├── rocky-trino/            # Trino warehouse adapter (REST /v1/statement polling, Basic + JWT auth); Docker conformance harness behind `trino-conformance`
 │   ├── rocky-postgres/         # PostgreSQL + Amazon Redshift warehouse adapters
 │   ├── rocky-clickhouse/       # ClickHouse warehouse adapter (beta)
 │   ├── rocky-sqlserver/        # SQL Server, Azure SQL and Fabric Warehouse adapter
 │   ├── rocky-spark/            # Apache Spark adapter over Spark Connect (beta)
 │   ├── rocky-airbyte/          # Airbyte source adapter
-│   │   └── src/                # Airbyte protocol integration
 │   ├── rocky-iceberg/          # Apache Iceberg table format adapter
-│   │   └── src/                # Iceberg metadata + snapshot management
 │   ├── rocky-catalog-core/     # Shared catalog primitives across warehouse adapters
-│   │   └── src/                # Catalog/schema lifecycle, isolation policies, grant primitives
 │   ├── rocky-mcp/              # MCP server (rmcp, stdio transport) — backs `rocky mcp` for AI agents
-│   │   └── src/
 │   ├── rocky-wasm/             # WebAssembly exports
-│   │   └── src/                # WASM-compatible entry points for browser/edge execution
 │   ├── rocky-observe/          # Observability
-│   │   └── src/
-│   │       ├── metrics.rs      # In-process counters + histograms
-│   │       ├── events.rs       # Event bus (tokio::broadcast) for pipeline lifecycle events
-│   │       └── tracing_setup.rs # Structured JSON logging
 │   ├── rocky-fulfill/          # Fulfillment reconciler behind `rocky fulfill`
 │   ├── rocky-verify/           # Standalone offline verifier for rocky-manifest v0.1 attestations
 │   ├── rocky-core-compiletest/ # trybuild compile-fail guards for rocky-core's #[must_use] boundaries
@@ -151,9 +96,8 @@ engine/                         # this directory, inside the rocky monorepo
 │           │   └── doctor.rs   # Aggregate health checks (config, state, adapters, pipelines)
 │           ├── pipes.rs        # Dagster Pipes protocol emitter — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
 │           └── output.rs       # JSON / table formatters (incl. MaterializationMetadata + sql_fingerprint helper)
-├── rocky/                      # Binary crate (the `rocky` CLI)
-│   └── src/
-│       └── main.rs
+├── rocky/                      # Binary crate (the `rocky` CLI); src/main.rs holds the clap `Command` enum
+├── rocky-lsp/                  # Binary crate (the standalone LSP server)
 ├── ui/                         # The browser UI `rocky serve --ui` embeds (vite + React + Tailwind Plus); `npm run build` → ui/dist, embedded behind cargo feature `ui`
 └── examples/                   # 15 self-contained example projects (DuckDB, no credentials)
 ```
@@ -244,31 +188,9 @@ rocky run --filter key=value         # Execute full pipeline: discover → drift
 rocky state                          # Show stored watermarks
 ```
 
-### Modeling
-```bash
-rocky compile                        # Type-check models, validate contracts, column-level diagnostics
-rocky lineage <model> [--column col] # Trace column-level lineage
-rocky test                           # Run local tests via DuckDB
-rocky ci                             # Combined compile + test for CI pipelines
-```
+### Everything else
 
-### AI
-```bash
-rocky ai "<intent>"                  # Generate a model from natural language
-rocky ai-explain <model>             # Generate intent description from code
-rocky ai-sync                        # Propose intent-guided updates for schema changes
-rocky ai-test <model>                # Generate test assertions from intent
-```
-
-### Development
-```bash
-rocky playground [path]              # Create a sample DuckDB project
-rocky import-dbt --dbt-project <p>   # Convert a dbt project to Rocky
-rocky serve                          # HTTP API server with watch mode; `--ui` serves the browser UI (feature `ui`)
-rocky lsp                            # Language Server Protocol for IDE integration
-rocky mcp                            # Model Context Protocol server over stdio (for AI agents)
-rocky init-adapter <name>            # Scaffold a new warehouse adapter crate
-```
+Rocky has about 75 top-level verbs: modeling (`compile`, `lineage`, `test`, `ci`), AI (`ai`, `ai-explain`, `ai-sync`, `ai-test`), development (`playground`, `import-dbt`, `serve`, `lsp`, `mcp`, `init-adapter`), administration (`history`, `metrics`, `optimize`, `doctor`, …) and more. This file does not list them. Use `rocky --help` and `rocky <verb> --help`, or the grouped reference pages in `../docs/src/content/docs/reference/commands/`.
 
 ### Products (spec-driven fulfillment, gate side)
 ```bash
@@ -289,18 +211,6 @@ rocky fulfill approve-spec <name>  # Same authority transition as `rocky product
 ```
 
 The loop lives in `crates/rocky-fulfill` (state machine + subprocess agent driver) and consumes `rocky-cli` ONLY through `commands/fulfill_api.rs`; configure it via `[fulfill.driver]` in `rocky.toml`. Reference: `../docs/src/content/docs/reference/commands/fulfill.md`.
-
-### Administration
-```bash
-rocky history                        # Run history with trend analysis
-rocky metrics <model>                # Quality metrics with alerts
-rocky optimize                       # Materialization cost recommendations
-rocky compact                        # Generate OPTIMIZE/VACUUM SQL
-rocky profile-storage                # Column encoding recommendations
-rocky archive                        # Partition archival
-rocky doctor                         # Aggregate health checks
-rocky compare                        # Shadow vs production comparison
-```
 
 Schema drift is not a standalone verb — there is no `rocky drift` command. Drift
 detection runs inside `rocky run` / `rocky plan` (surfaced on `RunOutput.drift`);
@@ -382,45 +292,7 @@ To change a CLI output:
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Run `ls schemas/*.schema.json | wc -l` for the current count.
-
-| Command | Output struct |
-|---|---|
-| `rocky discover --output json` | `DiscoverOutput` (+ `ChecksConfigOutput` when pipeline declares `[checks]`) |
-| `rocky run --output json` | `RunOutput` (materializations, check results, drift, permissions, anomalies; supports `--resume`/`--resume-latest`) |
-| `rocky plan --output json` | `PlanOutput` |
-| `rocky state --output json` | `StateOutput` (watermarks) |
-| `rocky doctor --output json` | `DoctorOutput` (config, state, adapters, pipelines, state_sync) |
-| `rocky compile --output json` | `CompileOutput` (typed model schemas, diagnostics, per-phase timings) |
-| `rocky test --output json` | `TestOutput` (DuckDB-backed assertions) |
-| `rocky ci --output json` | `CiOutput` (compile + test combined) |
-| `rocky lineage <model>` | `LineageOutput` |
-| `rocky lineage <model> --column <col>` | `ColumnLineageOutput` |
-| `rocky history --output json` | `HistoryOutput` (recent runs) |
-| `rocky history --model <name> --output json` | `ModelHistoryOutput` |
-| `rocky metrics <model> --output json` | `MetricsOutput` (quality snapshots, alerts, column trend) |
-| `rocky optimize --output json` | `OptimizeOutput` (materialization-strategy recommendations) |
-| `rocky compare --output json` | `CompareOutput` (shadow vs production) |
-| `rocky compact --output json` | `CompactOutput` (OPTIMIZE/VACUUM SQL plan) |
-| `rocky archive --output json` | `ArchiveOutput` (DELETE + VACUUM SQL plan) |
-| `rocky profile-storage --output json` | `ProfileStorageOutput` (encoding recommendations) |
-| `rocky import-dbt --output json` | `ImportDbtOutput` (dbt → Rocky migration result) |
-| `rocky validate-migration --output json` | `ValidateMigrationOutput` |
-| `rocky test-adapter --output json` | `TestAdapterOutput` (conformance suite results) |
-| `rocky hooks list --output json` | `HooksListOutput` |
-| `rocky hooks test <event> --output json` | `HooksTestOutput` |
-| `rocky ai "<intent>"` | `AiGenerateOutput` |
-| `rocky ai-sync --output json` | `AiSyncOutput` |
-| `rocky ai-explain --output json` | `AiExplainOutput` |
-| `rocky ai-test --output json` | `AiTestOutput` |
-| `rocky validate --output json` | `ValidateOutput` |
-| `rocky compact --measure-dedup --output json` | `CompactDedupOutput` |
-| `rocky seed --output json` | `SeedOutput` |
-| `rocky dag --output json` | `DagOutput` |
-| `rocky dag --run --output json` | `DagRunOutput` |
-| `rocky ci --diff --output json` | `CiDiffOutput` |
-| `rocky estimate --output json` | `EstimateOutput` |
-| `rocky load --output json` | `LoadOutput` |
+Every `--output json` payload has a typed output struct. To find one, open `../schemas/<command>.schema.json` (its `title` is the struct name) or grep `output.rs`. The registry of exported types is `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`. Full workflow and pitfalls: the `rocky-codegen` skill.
 
 Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema`). It's embedded in other command outputs rather than emitted standalone.
 

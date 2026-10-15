@@ -289,9 +289,10 @@ impl SqlDialect for {name_pascal}SqlDialect {{
         timestamp_col: &str,
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {{
-        // Substitute the previous run's max source watermark as a literal —
-        // the runner queries SELECT MAX(ts) FROM source post-execute and
-        // records that value to the state store. None means "no prior
+        // Substitute the previous run's watermark as a literal. For
+        // incremental and microbatch runs the runner records
+        // SELECT MAX(ts) FROM target (the rows actually loaded) after a
+        // successful write. None means "no prior
         // watermark" (first run / after delete_watermark); scan everything.
         let literal = last_watermark
             .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())

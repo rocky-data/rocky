@@ -27,6 +27,8 @@ on:
     branches: [main]
     paths:
       - "scripts/**"
+      - ".claude/hooks/**"
+      - ".claude/hooks/**"
       - ".github/workflows/scripts-ci.yml"
       - ".github/workflows/engine-ci.yml"
       - ".github/workflows/codegen-drift.yml"
@@ -115,7 +117,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh .claude/hooks/session-start.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
