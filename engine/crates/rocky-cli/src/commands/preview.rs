@@ -1912,7 +1912,6 @@ fn git_changed_paths_in(dir: Option<&Path>, base_ref: &str) -> Result<Vec<String
         .collect())
 }
 
-/// Split `git diff --name-only` output into trimmed lines.
 /// Split `git diff -z` output: one path per NUL, kept byte for byte (a
 /// name may start or end with a space).
 fn parse_paths(raw: &[u8]) -> Vec<String> {
