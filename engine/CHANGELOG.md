@@ -16,6 +16,8 @@ Earlier Linux releases, 1.80.0 included, crash in the same way on any SQL that m
 ### Changed
 
 - The bundled DuckDB moves to the `duckdb` crate 1.10506. Other engine dependencies take their latest compatible versions. `object_store` stays at 0.14.1 (#2124), and `arrow` and `parquet` stay on 58.
+- HTTPS connections now trust the operating system's certificate store, not a CA list built into the binary (`reqwest` 0.13). A private or corporate CA that the host trusts now works. A host or container with no CA bundle now fails TLS; install `ca-certificates`, or point `SSL_CERT_FILE` at a bundle. The official image already ships one.
+- JSON schemas are generated with `schemars` 1.x. Two schemas change: `Decimal.precision` and `Decimal.scale` in `model_detail` gain `maximum: 255`, and `HooksConfig` in `rocky_project` now describes its per-event hook keys, which 0.8 dropped.
 
 ### Fixed
 
