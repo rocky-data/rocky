@@ -116,8 +116,19 @@ describe("Preview create", () => {
     const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
     expect(text).toContain("Copied from production: 1 model.");
     expect(text).toContain("Copy failed for: items.");
-    expect(text).toContain("could not be used");
+    expect(text).toContain("Planned but not copied");
+    expect(text).not.toContain("could not be used");
+    expect(text).not.toContain("warehouse");
     expect(text).toContain("stock");
+  });
+
+  it("warns, never says done, when nothing was copied and nothing changed", async () => {
+    await runWith({ branch_schema: "branch__pr_x", prune_set: [], copy_set: [] });
+    const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
+    expect(alert.textContent).toBe("Preview: branch registered, but nothing was copied.");
+    expect(screen.queryByText("Preview: done.")).toBeNull();
+    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    expect(text).toContain("No changed models, so nothing was copied.");
   });
 
   it("shows only fixed words and names, never a message a result might carry", async () => {

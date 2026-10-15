@@ -25,7 +25,7 @@ export interface PreviewSummary {
   copied: number;
   /** Copies that failed, by model name. */
   failed: string[];
-  /** Models the command only planned: it could not use the warehouse. */
+  /** Models the command only planned, not copied. The server log says why. */
   planned: string[];
 }
 
@@ -73,28 +73,33 @@ function nameList(all: string[]): string {
 
 /**
  * The job line for a preview. A succeeded job can still have copied nothing:
- * a failed copy is recorded per model and the command still exits 0, and with
- * no usable warehouse it only plans. Both are shown as a warning, never as a
- * bare "done". The changed models are said to be planned, not run.
+ * a failed copy is recorded per model and the command still exits 0, a model
+ * can be planned but not copied, and a preview with no changed models copies
+ * nothing. Each is shown as a warning, never as a bare "done". The changed models are said to be planned, not run.
  */
 function PreviewJobLine({ view, cancel }: { view: JobView; cancel: JobCancel }) {
   if (view.kind !== "done" || view.job.state !== "succeeded") {
     return <JobLine label="Preview" view={view} cancel={cancel} />;
   }
   const s = previewSummary(view.job);
-  const warn = s.failed.length > 0 || s.planned.length > 0;
-  const headline = warn ? "Preview: branch registered, but not every model was copied." : "Preview: done.";
+  const nothing = s.copied === 0 && s.changed.length === 0 && s.failed.length === 0 && s.planned.length === 0;
+  const warn = nothing || s.failed.length > 0 || s.planned.length > 0;
+  const headline = nothing
+    ? "Preview: branch registered, but nothing was copied."
+    : warn
+      ? "Preview: branch registered, but not every model was copied."
+      : "Preview: done.";
   const lines: string[] = [];
   if (s.branchSchema !== "") lines.push(`Warehouse schema: ${s.branchSchema}`);
   lines.push(`Copied from production: ${s.copied} model${s.copied === 1 ? "" : "s"}.`);
   if (s.failed.length > 0) lines.push(`Copy failed for: ${nameList(s.failed)}. See the server log.`);
   if (s.planned.length > 0) {
-    lines.push(`Not copied, because the warehouse could not be used (see the server log): ${nameList(s.planned)}.`);
+    lines.push(`Planned but not copied (the server log says why): ${nameList(s.planned)}.`);
   }
   lines.push(
     s.changed.length > 0
       ? `Changed and downstream, planned but not re-run: ${nameList(s.changed)}.`
-      : "No changed models.",
+      : "No changed models, so nothing was copied.",
   );
   return (
     <div className="space-y-1">
