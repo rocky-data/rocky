@@ -206,7 +206,7 @@ fn same_origin(base: &str, candidate: &str) -> bool {
 }
 
 /// Static configuration for a [`TrinoClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TrinoClientConfig {
     /// Coordinator URL — e.g. `http://localhost:8080` or
     /// `https://trino.example.com`. Trailing slashes are trimmed.
@@ -227,6 +227,28 @@ pub struct TrinoClientConfig {
     pub source: String,
     /// Per-query timeout. Polling aborts once this elapses.
     pub timeout: Duration,
+}
+
+/// A `${VAR}`-resolved field prints as `${NAME}` (#1919). `TrinoClient`
+/// and `TrinoAdapter` print this config in their own `Debug`.
+impl std::fmt::Debug for TrinoClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use rocky_core::secret_registry::render_placeholders as render;
+        f.debug_struct("TrinoClientConfig")
+            .field("coordinator_url", &render(&self.coordinator_url))
+            .field("user", &self.user.as_deref().map(render))
+            .field(
+                "default_catalog",
+                &self.default_catalog.as_deref().map(render),
+            )
+            .field(
+                "default_schema",
+                &self.default_schema.as_deref().map(render),
+            )
+            .field("source", &render(&self.source))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl TrinoClientConfig {
@@ -758,6 +780,31 @@ mod tests {
     fn config_trims_trailing_slash() {
         let c = TrinoClientConfig::new("http://trino.example.com:8080/");
         assert_eq!(c.coordinator_url, "http://trino.example.com:8080");
+    }
+
+    #[test]
+    fn config_debug_renders_substituted_fields() {
+        const HOST: &str = "trino-host-1919-c5d2.example.com";
+        const USER: &str = "trino-cfg-user-1919-c5d2";
+        const CATALOG: &str = "trino-catalog-1919-c5d2";
+        const SCHEMA: &str = "trino-schema-1919-c5d2";
+        for (name, value) in [
+            ("RV_TRINO_HOST_DBG", HOST),
+            ("RV_TRINO_CFG_USER_DBG", USER),
+            ("RV_TRINO_CATALOG_DBG", CATALOG),
+            ("RV_TRINO_SCHEMA_DBG", SCHEMA),
+        ] {
+            rocky_core::secret_registry::register_substitution(name, value);
+        }
+        let cfg = TrinoClientConfig::new(format!("https://{HOST}"))
+            .with_user(USER)
+            .with_default_catalog(CATALOG)
+            .with_default_schema(SCHEMA);
+        let debug = format!("{cfg:?}");
+        for value in [HOST, USER, CATALOG, SCHEMA] {
+            assert!(!debug.contains(value), "Debug leaks {value}: {debug}");
+        }
+        assert!(debug.contains("${RV_TRINO_CFG_USER_DBG}"), "{debug}");
     }
 
     #[test]
