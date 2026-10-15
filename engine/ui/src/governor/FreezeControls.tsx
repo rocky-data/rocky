@@ -1,10 +1,9 @@
 import { useState } from "react";
 import type { BriefActiveFreeze } from "@rocky-types/brief";
 import type { JobStatus } from "@rocky-types/job_status";
-import { READ_BUTTON } from "../components";
 import {
+  ConfirmedWrite,
   JobLine,
-  WriteButton,
   defaultJobClient,
   jobBusy,
   useJob,
@@ -93,51 +92,6 @@ function FreezeJobLine({ label, view, cancel }: { label: string; view: JobView; 
           </li>
         ))}
       </ul>
-    </div>
-  );
-}
-
-/**
- * A two-step control: the first press asks, the second runs. Freeze and
- * unfreeze change what every agent may do, so neither runs on one click.
- */
-function ConfirmedWrite({
-  label,
-  question,
-  confirmLabel,
-  busy,
-  onConfirm,
-}: {
-  label: string;
-  question: string;
-  confirmLabel: string;
-  busy: boolean;
-  onConfirm: () => void;
-}) {
-  const [asking, setAsking] = useState(false);
-  if (!asking || busy) {
-    return <WriteButton label={label} busy={busy} onClick={() => setAsking(true)} />;
-  }
-  return (
-    <div
-      role="group"
-      aria-label={question}
-      className="space-y-2 rounded-md border border-amber-300 p-3 dark:border-amber-700"
-    >
-      <p className="text-sm text-zinc-800 dark:text-zinc-100">{question}</p>
-      <div className="flex flex-wrap items-center gap-2">
-        <WriteButton
-          label={confirmLabel}
-          primary
-          onClick={() => {
-            setAsking(false);
-            onConfirm();
-          }}
-        />
-        <button type="button" className={READ_BUTTON} onClick={() => setAsking(false)}>
-          Back
-        </button>
-      </div>
     </div>
   );
 }

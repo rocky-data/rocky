@@ -882,6 +882,30 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "post",
+            path: "/api/v1/jobs/preview",
+            operation_id: "submitPreviewJob",
+            tag: "jobs",
+            summary: "Submit a preview create job",
+            description: "Submit a mutating `preview` job: `rocky preview create`. Registers a \
+                 branch in the state store (the job fails if the name is taken) and \
+                 copies the unchanged models from their production schema into the \
+                 warehouse schema `branch__<name>`, using the warehouse credentials in \
+                 `rocky.toml`. It reads production tables and writes only the branch \
+                 schema; it does not re-run the changed models (`run_status` is \
+                 `planned`). Takes the mutating permit (409 `mutation_in_progress` while a \
+                 run, apply, approve, freeze or unfreeze holds it). The optional `name` \
+                 (1 to 64 letters, digits or underscores; derived from the git branch when \
+                 absent) and `base` (a git ref, default `main`) are validated before the \
+                 job starts.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
+            auth_exempt: false,
+        },
+        Route {
             method: "get",
             path: "/api/v1/jobs/{id}",
             operation_id: "getJob",

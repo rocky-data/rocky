@@ -8,7 +8,7 @@
 /**
  * The kind of long-running operation a job wraps.
  */
-export type JobKind = "run" | "plan" | "apply" | "approve" | "test" | "ci" | "freeze" | "unfreeze";
+export type JobKind = "run" | "plan" | "apply" | "approve" | "test" | "ci" | "freeze" | "unfreeze" | "preview";
 /**
  * Lifecycle state of a job.
  */

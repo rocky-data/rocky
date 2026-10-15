@@ -30,6 +30,7 @@
 //! POST /api/v1/jobs/ci                          → submit a ci job     → 202 {job_id}
 //! POST /api/v1/jobs/freeze                      → submit a freeze job → 202 {job_id}
 //! POST /api/v1/jobs/unfreeze                    → submit an unfreeze  → 202 {job_id}
+//! POST /api/v1/jobs/preview                     → submit a preview create → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -198,6 +199,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/ci", post(submit_ci))
         .route("/api/v1/jobs/freeze", post(submit_freeze))
         .route("/api/v1/jobs/unfreeze", post(submit_unfreeze))
+        .route("/api/v1/jobs/preview", post(submit_preview))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
@@ -626,7 +628,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
+            "another run, apply, approve, freeze, unfreeze or preview job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -970,6 +972,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/ci",
         "POST /api/v1/jobs/freeze",
         "POST /api/v1/jobs/unfreeze",
+        "POST /api/v1/jobs/preview",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
@@ -2808,6 +2811,13 @@ pub(crate) struct JobRequest {
     /// `--reason <text>` for `freeze` and `unfreeze`, recorded with the
     /// decision. Ignored by every other kind.
     reason: Option<String>,
+    /// `--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`,
+    /// 1 to 64 characters. Absent means a name derived from the project's git
+    /// branch. Ignored by every other kind.
+    name: Option<String>,
+    /// `--base <git ref>` for `preview`: the ref the change set is computed
+    /// against. Absent means `main`. Ignored by every other kind.
+    base: Option<String>,
 }
 
 /// Mint an opaque, collision-resistant job id for this sidecar.
@@ -3287,6 +3297,19 @@ async fn submit_unfreeze(
     submit_job(JobKind::Unfreeze, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/preview` — submit a preview job: `rocky preview create`
+/// (mutating; takes the permit). Registers a branch in the state store and
+/// copies the unchanged models from their production schema into the warehouse
+/// schema `branch__<name>`. Body `{"name": "<branch>", "base": "<git ref>"}`,
+/// both optional.
+async fn submit_preview(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Preview, state, &headers, &body).await
+}
+
 /// Shared submission path for all job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
@@ -3309,6 +3332,7 @@ async fn submit_job(
     };
     validate_job_plan_id(kind, &request)?;
     validate_freeze_fields(kind, &request)?;
+    validate_preview_fields(kind, &request)?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3417,7 +3441,8 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
         | JobKind::Test
         | JobKind::Ci
         | JobKind::Freeze
-        | JobKind::Unfreeze => Ok(()),
+        | JobKind::Unfreeze
+        | JobKind::Preview => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3476,6 +3501,46 @@ fn validate_freeze_fields(kind: JobKind, request: &JobRequest) -> Result<(), Api
         if reason.chars().count() > FREEZE_REASON_MAX_CHARS {
             return Err(ApiError::bad_request(format!(
                 "invalid reason: at most {FREEZE_REASON_MAX_CHARS} characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The most characters a preview `base` may carry.
+const PREVIEW_BASE_MAX_CHARS: usize = 200;
+
+/// Refuse a `preview` body the CLI would not take, before the permit is taken
+/// or an argv is built. `name` becomes part of a warehouse schema name
+/// (`branch__<name>`), so it is held to the CLI's own alphabet: `[A-Za-z0-9_]`,
+/// 1 to 64 characters. `base` is passed to `git` as a revision, so it must be
+/// plain text that does not start with `-`, which git would read as an option.
+/// Other kinds ignore these fields.
+fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Preview {
+        return Ok(());
+    }
+    if let Some(name) = request.name.as_deref()
+        && (name.is_empty()
+            || name.len() > 64
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(ApiError::bad_request(
+            "invalid name: use 1 to 64 letters, digits or underscores (for example pr_preview_x), or omit it",
+        ));
+    }
+    if let Some(base) = request.base.as_deref() {
+        if base.is_empty()
+            || base.starts_with('-')
+            || base.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(ApiError::bad_request(
+                "invalid base: it must be a git ref with no spaces or control characters, and must not start with '-'",
+            ));
+        }
+        if base.chars().count() > PREVIEW_BASE_MAX_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "invalid base: at most {PREVIEW_BASE_MAX_CHARS} characters"
             )));
         }
     }
@@ -3619,6 +3684,26 @@ fn job_subprocess_args(
             if let Some(reason) = &request.reason {
                 args.push("--reason".into());
                 args.push(reason.into());
+            }
+        }
+        JobKind::Preview => {
+            // `rocky preview create`. Each value is its own entry, so it can
+            // never read as a flag. The child reads the models to build the
+            // dependency graph, so it gets the server's `--models` when one
+            // was given; it reads no contracts. `--config` and `--state-path`
+            // are already in the head.
+            args.push("create".into());
+            if let Some(base) = &request.base {
+                args.push("--base".into());
+                args.push(base.into());
+            }
+            if let Some(name) = &request.name {
+                args.push("--name".into());
+                args.push(name.into());
+            }
+            if let Some(models) = &dirs.models {
+                args.push("--models".into());
+                args.push(models.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -9988,6 +10073,11 @@ mod tests {
         assert_eq!(JobKind::Unfreeze.verb(), "unfreeze");
         assert_eq!(JobKind::Freeze.subcommand(), "policy");
         assert_eq!(JobKind::Unfreeze.subcommand(), "policy");
+        // A preview registers a branch in the state store and writes warehouse
+        // objects, so it takes the permit.
+        assert!(JobKind::Preview.mutates());
+        assert_eq!(JobKind::Preview.verb(), "preview");
+        assert_eq!(JobKind::Preview.subcommand(), "preview");
         assert_eq!(JobKind::Test.verb(), "test");
         assert_eq!(JobKind::Ci.verb(), "ci");
         assert_eq!(JobKind::Test.subcommand(), "test");
@@ -10006,6 +10096,7 @@ mod tests {
             JobKind::Ci,
             JobKind::Freeze,
             JobKind::Unfreeze,
+            JobKind::Preview,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
@@ -10154,6 +10245,143 @@ mod tests {
                 assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
             }
         }
+        drop(held);
+    }
+
+    /// `preview` spawns `rocky preview create`; each validated field is its own
+    /// `--flag value` pair, an absent field adds nothing, the server's explicit
+    /// `--models` rides along (a derived one does not), and no contracts dir is
+    /// passed because the command reads none. The same request under another kind
+    /// adds none of the preview flags.
+    #[test]
+    fn preview_job_argv() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let full = JobRequest {
+            name: Some("pr_preview_x".to_string()),
+            base: Some("origin/main".to_string()),
+            reason: Some("ignored".to_string()),
+            ..JobRequest::default()
+        };
+        let explicit = JobProjectDirs {
+            models: Some(PathBuf::from("/p/src/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let derived = JobProjectDirs {
+            models: None,
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind, dirs: &JobProjectDirs, request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                dirs,
+                state,
+                request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--config",
+            "/p/rocky.toml",
+            "--state-path",
+            "/tmp/state.redb",
+            "preview",
+            "create",
+        ];
+        let mut expected = head.to_vec();
+        expected.extend([
+            "--base",
+            "origin/main",
+            "--name",
+            "pr_preview_x",
+            "--models",
+            "/p/src/models",
+        ]);
+        assert_eq!(argv(JobKind::Preview, &explicit, &full), expected);
+        assert_eq!(
+            argv(JobKind::Preview, &derived, &JobRequest::default()),
+            head.to_vec(),
+            "no fields, no explicit models dir"
+        );
+        for kind in [
+            JobKind::Run,
+            JobKind::Plan,
+            JobKind::Test,
+            JobKind::Ci,
+            JobKind::Freeze,
+        ] {
+            let args = argv(kind, &explicit, &full);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "create" || a == "--base" || a == "--name"),
+                "{kind:?} must not carry the preview flags: {args:?}"
+            );
+        }
+    }
+
+    /// The preview fields are checked before the permit and the argv: a bad
+    /// name or base is a `400` that never spawns a child, and a good body takes
+    /// the permit like a run (`409` while one is held).
+    #[tokio::test]
+    async fn preview_route_validates_its_fields_and_takes_the_permit() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/preview");
+        let long_name = "n".repeat(65);
+        let long_base = "b".repeat(201);
+        let bad = [
+            serde_json::json!({ "name": "" }),
+            serde_json::json!({ "name": "-x" }),
+            serde_json::json!({ "name": "my-branch" }),
+            serde_json::json!({ "name": "a b" }),
+            serde_json::json!({ "name": "a.b" }),
+            serde_json::json!({ "name": "x\n" }),
+            serde_json::json!({ "name": "é" }),
+            serde_json::json!({ "name": long_name }),
+            serde_json::json!({ "base": "" }),
+            serde_json::json!({ "base": "--upload-pack=touch" }),
+            serde_json::json!({ "base": "-x" }),
+            serde_json::json!({ "base": "main branch" }),
+            serde_json::json!({ "base": "main\n" }),
+            serde_json::json!({ "base": long_base }),
+        ];
+        let good = [
+            serde_json::json!({}),
+            serde_json::json!({ "name": "pr_preview_x", "base": "origin/main" }),
+            serde_json::json!({ "name": "A_1", "base": "HEAD~3" }),
+            serde_json::json!({ "base": "abc1234" }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        for body in &good {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 409, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "mutation_in_progress", "{body}");
+            assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+        }
+        // Another kind ignores the fields: a bad `name` on `freeze` is not a 400.
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "name": "my-branch", "base": "-x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores name and base");
         drop(held);
     }
 
@@ -12750,6 +12978,13 @@ adapter = "db"
     #[tokio::test]
     async fn freeze_and_unfreeze_routes_are_behind_the_write_gate() {
         assert_routes_behind_the_write_gate(&["freeze", "unfreeze"]).await;
+    }
+
+    /// `preview` creates warehouse objects, so it sits behind the same gate as
+    /// `run`. Same probes as the other write routes.
+    #[tokio::test]
+    async fn preview_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["preview"]).await;
     }
 
     async fn assert_routes_behind_the_write_gate(routes: &[&str]) {

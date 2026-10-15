@@ -73,6 +73,14 @@ class JobKind8(StrEnum):
     unfreeze = "unfreeze"
 
 
+class JobKind9(StrEnum):
+    """
+    `rocky preview create` — registers a branch in the state store and copies the unchanged models into the warehouse schema `branch__<name>`. Takes the mutation permit: it opens the state store for write and writes warehouse objects. It reads production tables and writes only the branch schema; it does not re-run the changed models (`run_status` is `planned`). `preview diff` and `preview cost` are not jobs.
+    """
+
+    preview = "preview"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -141,6 +149,7 @@ class JobStatus(BaseModel):
         | JobKind6
         | JobKind7
         | JobKind8
+        | JobKind9
     )
     """
     Which operation the job wraps.

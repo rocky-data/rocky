@@ -13,6 +13,7 @@ import type { JobClient } from "../operator";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
+import { PreviewControls } from "./PreviewControls";
 import { ProjectActions, planUnavailable } from "./ProjectActions";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
@@ -171,6 +172,10 @@ export function EstateScreen({
             </div>
           )}
         </Loaded>
+      </Panel>
+
+      <Panel title="Preview" producer="POST /api/v1/jobs/preview">
+        <PreviewControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 
       <Panel title="Runs" producer="GET /api/v1/runs">

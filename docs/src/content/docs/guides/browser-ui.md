@@ -172,7 +172,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 ### Freeze and unfreeze
 
@@ -183,6 +183,16 @@ The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server.
 Freeze and unfreeze take the same single write slot as a run. Both open the local state store, even on a remote `[state]` backend, and a run holds that store for its whole run. So a browser freeze is refused while a run, apply or approve is in progress: it answers `409 mutation_in_progress` until that job finishes, and you retry then. To stop a running run, use **Cancel** on that job. A run this server did not start, such as one from a terminal or an orchestrator, also holds the local store but not the server's slot. A freeze then fails on the store lock; on a remote `[state]` backend with durable markers, its marker is already written and the run stops at its next fence, but a retry writes a second marker. Retry after that run ends.
 
 The ledger row names the server's principal id, not the person at the page. The server reads it from `ROCKY_PRINCIPAL_ID` in its own environment, else `unnamed`. A `--principal-id` flag on `rocky serve` does not reach these jobs. The row does not record that the freeze came from the browser.
+
+### Create a preview
+
+The **Estate** screen has a **Preview** panel. Give a branch name (optional) and a base ref (optional, default `main`). The page asks you to confirm, then runs `rocky preview create` on the server. The name takes letters, digits and underscores, up to 64. With no name, the server derives one from the current branch of the project's repository. A name already in use fails the job, so pick another.
+
+The command registers the branch in the state store. It then copies each unchanged model from its production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. Production tables are only read. Depending on the warehouse, each copy is a metadata-only clone or a full copy of the table, which costs compute and storage. The confirm text says this before you start.
+
+The command does not re-run the changed models. The page lists them as "planned but not re-run". A copy that fails for one model does not fail the job, so the page shows a warning that names the model, not a plain "done". If the warehouse cannot be used at all, the branch is still registered and nothing is copied. The page says so, and the reason is in the server log. The page shows only model names, the schema name and fixed words from the result. It never shows warehouse error text.
+
+Preview create opens the state store for write, so it takes the same single write slot as a run. It answers `409 mutation_in_progress` while a run, apply, approve, freeze or unfreeze is in progress. It needs a repository in the project folder to find the changed models.
 
 ### Cancel a running job
 

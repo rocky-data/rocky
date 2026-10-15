@@ -17,6 +17,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { MetaTokenScope } from "@rocky-types/meta";
 import { ApiError, apiGet, apiPost } from "./api";
+import { READ_BUTTON } from "./components";
 
 /** What the page may do. */
 export type WriteAccess =
@@ -323,6 +324,51 @@ export function WriteButton({
         <span className="max-w-xs text-xs text-zinc-500 dark:text-zinc-400">{ownReason}</span>
       )}
     </span>
+  );
+}
+
+/**
+ * A two-step control: the first press asks, the second runs. A freeze, an
+ * unfreeze and a preview create change shared state, so none runs on one click.
+ */
+export function ConfirmedWrite({
+  label,
+  question,
+  confirmLabel,
+  busy,
+  onConfirm,
+}: {
+  label: string;
+  question: string;
+  confirmLabel: string;
+  busy: boolean;
+  onConfirm: () => void;
+}) {
+  const [asking, setAsking] = useState(false);
+  if (!asking || busy) {
+    return <WriteButton label={label} busy={busy} onClick={() => setAsking(true)} />;
+  }
+  return (
+    <div
+      role="group"
+      aria-label={question}
+      className="space-y-2 rounded-md border border-amber-300 p-3 dark:border-amber-700"
+    >
+      <p className="text-sm text-zinc-800 dark:text-zinc-100">{question}</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <WriteButton
+          label={confirmLabel}
+          primary
+          onClick={() => {
+            setAsking(false);
+            onConfirm();
+          }}
+        />
+        <button type="button" className={READ_BUTTON} onClick={() => setAsking(false)}>
+          Back
+        </button>
+      </div>
+    </div>
   );
 }
 

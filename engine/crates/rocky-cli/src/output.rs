@@ -12646,6 +12646,13 @@ pub enum JobKind {
     Freeze,
     /// `rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.
     Unfreeze,
+    /// `rocky preview create` — registers a branch in the state store and copies
+    /// the unchanged models into the warehouse schema `branch__<name>`. Takes the
+    /// mutation permit: it opens the state store for write and writes warehouse
+    /// objects. It reads production tables and writes only the branch schema; it
+    /// does not re-run the changed models (`run_status` is `planned`). `preview
+    /// diff` and `preview cost` are not jobs.
+    Preview,
 }
 
 impl JobKind {
@@ -12662,12 +12669,14 @@ impl JobKind {
             JobKind::Ci => "ci",
             JobKind::Freeze => "freeze",
             JobKind::Unfreeze => "unfreeze",
+            JobKind::Preview => "preview",
         }
     }
 
     /// The `rocky` subcommand this kind spawns. `Approve` runs `review` with
     /// `--approve`; there is no `rocky approve` verb. `Freeze` and `Unfreeze`
-    /// run `policy`; the argv builder adds the verb after it.
+    /// run `policy` and `Preview` runs `preview`; the argv builder adds the verb
+    /// (`freeze`, `unfreeze`, `create`) after it.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12677,20 +12686,23 @@ impl JobKind {
             JobKind::Test => "test",
             JobKind::Ci => "ci",
             JobKind::Freeze | JobKind::Unfreeze => "policy",
+            JobKind::Preview => "preview",
         }
     }
 
     /// Whether this kind takes the single mutation permit. `run` and `apply`
     /// change warehouse state; `approve` changes what `apply` may do; `freeze`
-    /// and `unfreeze` write the policy ledger in the state store. `plan`,
-    /// `test` and `ci` only preview or check.
+    /// and `unfreeze` write the policy ledger in the state store; `preview`
+    /// registers a branch in the state store and writes the branch schema in the
+    /// warehouse. `plan`, `test` and `ci` only preview or check.
     pub fn mutates(self) -> bool {
         match self {
             JobKind::Run
             | JobKind::Apply
             | JobKind::Approve
             | JobKind::Freeze
-            | JobKind::Unfreeze => true,
+            | JobKind::Unfreeze
+            | JobKind::Preview => true,
             JobKind::Plan | JobKind::Test | JobKind::Ci => false,
         }
     }
@@ -12706,6 +12718,7 @@ impl JobKind {
             "ci" => Some(JobKind::Ci),
             "freeze" => Some(JobKind::Freeze),
             "unfreeze" => Some(JobKind::Unfreeze),
+            "preview" => Some(JobKind::Preview),
             _ => None,
         }
     }
