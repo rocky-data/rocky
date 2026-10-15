@@ -799,7 +799,7 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit an approve job",
             description: "Approve a plan: runs `rocky review <plan_id> --approve` as a job. \
-                 Takes the single-mutating-job permit (409 while a run, apply, approve, freeze or unfreeze \
+                 Takes the single-mutating-job permit (409 while a run, apply, approve or unfreeze \
                  holds it). `plan_id` must be 64 lowercase hex characters (400 \
                  `invalid_plan_id`). The marker records approver source `http_api` and the \
                  server's git identity; with no git identity the job fails with \
@@ -850,15 +850,18 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit a freeze job",
             description: "Submit a mutating `freeze` job: `rocky policy freeze`, the kill \
-                 switch. Records a freeze decision in the policy ledger. Takes the mutating \
-                 permit. The optional `principal` (`agent` or `human`; both when absent), \
+                 switch. Records a freeze decision in the policy ledger. Takes no permit: a \
+                 freeze only adds a deny, so it can land while a run holds the permit and \
+                 stops that run at its next freeze check. On a local state store the run \
+                 holds the store lock and the freeze job fails; retry after the run. The \
+                 optional `principal` (`agent` or `human`; both when absent), \
                  `scope` (a selector; every model when absent) and `reason` fields are \
                  validated before the job starts.",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
-            responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
+            responses: &[JOB_ACCEPTED, BAD_REQUEST],
             auth_exempt: false,
         },
         Route {
@@ -868,8 +871,9 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit an unfreeze job",
             description: "Submit a mutating `unfreeze` job: `rocky policy unfreeze`. Lifts a \
-                 freeze; `principal` and `scope` must match the freeze being lifted. Takes \
-                 the mutating permit.",
+                 freeze; `principal` and `scope` must match the freeze being lifted. A \
+                 freeze marker with an unreadable body is lifted only with no `principal` \
+                 and `scope` `any`. Takes the mutating permit.",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],

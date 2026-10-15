@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { BriefOutput } from "@rocky-types/brief";
 import { NOT_RECORDED } from "../format";
@@ -362,21 +362,97 @@ describe("Freeze and unfreeze on the brief", () => {
     expect(submitted).toEqual([{ kind: "unfreeze", body: FROZEN }]);
   });
 
+  it("shows a freeze that binds nothing as a warning, not as plain done", async () => {
+    const note =
+      "freeze recorded but NOT enforced: no [policy] block configured in <path> Every enforcement seam short-circuits.";
+    const { client } = fakeJobs([job("freeze", "succeeded", { result: { notes: [note] } })]);
+    renderBrief(OPERATOR, client);
+    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
+    const headline = await screen.findByText("Freeze: recorded, but NOT enforced.", {}, { timeout: 3000 });
+    expect(headline).toHaveAttribute("role", "alert");
+    expect(screen.getByText(note)).toBeInTheDocument();
+    expect(screen.queryByText("Freeze: done.")).toBeNull();
+  });
+
+  it("shows an unfreeze that lifted nothing", async () => {
+    const note = "no matching active freeze markers to lift";
+    const { client } = fakeJobs([job("unfreeze", "succeeded", { result: { notes: [note] } })]);
+    renderBrief(OPERATOR, client);
+    fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
+    const headline = await screen.findByText(
+      "Unfreeze agent on model=fct_*: nothing was lifted.",
+      {},
+      { timeout: 3000 },
+    );
+    expect(headline).toHaveAttribute("role", "alert");
+    expect(screen.getByText(note)).toBeInTheDocument();
+  });
+
+  it("shows only string notes, capped in number and length", async () => {
+    const long = "x".repeat(400);
+    const notes = [1, null, { a: 1 }, "n1", "n2", "n3", "n4", "n5", "n6", long];
+    const { client } = fakeJobs([job("freeze", "succeeded", { result: { notes } })]);
+    renderBrief(OPERATOR, client);
+    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
+    await screen.findByText("Freeze: done.", {}, { timeout: 3000 });
+    const items = within(screen.getByRole("list", { name: "Freeze notes" })).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual(["n1", "n2", "n3", "n4", "n5"]);
+    const capped = fakeJobs([job("freeze", "succeeded", { result: { notes: [long] } })]);
+    cleanup();
+    renderBrief(OPERATOR, capped.client);
+    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
+    await screen.findByText("Freeze: done.", {}, { timeout: 3000 });
+    const [item] = within(screen.getByRole("list", { name: "Freeze notes" })).getAllByRole("listitem");
+    expect(item.textContent).toBe(`${"x".repeat(300)}…`);
+  });
+
+  it("lifts an unreadable marker with no principal and scope any, from a single row", async () => {
+    const marker = {
+      scope: "any",
+      frozen_at: "",
+      plan_id: "freeze:abc",
+      unreadable_marker: true,
+    } as const;
+    const brief: BriefOutput = {
+      ...BRIEF,
+      autonomy: {
+        ...BRIEF.autonomy,
+        active_freezes: [
+          { ...marker, principal: "agent" },
+          { ...marker, principal: "human" },
+        ],
+      },
+    };
+    const { client, submitted } = fakeJobs([job("unfreeze", "succeeded")]);
+    renderBrief(OPERATOR, client, vi.fn(async () => brief));
+    const name = "unreadable marker (agent and human) on every model";
+    const buttons = await screen.findAllByRole("button", { name: `Unfreeze ${name}` });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
+    await screen.findByText(`Unfreeze ${name}: done.`, {}, { timeout: 3000 });
+    expect(submitted).toEqual([{ kind: "unfreeze", body: { scope: "any" } }]);
+  });
+
   it("says plainly when a run holds the project, and shows a failed freeze without its log lines", async () => {
     const busy: JobClient = {
       submit: vi.fn(async () => {
         throw new ApiError(409, {
           code: "mutation_in_progress",
-          message: "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
+          message: "another run, apply, approve or unfreeze job is already in progress on this project",
         });
       }),
       status: vi.fn(),
       cancel: vi.fn(),
     };
     renderBrief(OPERATOR, busy);
-    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve or freeze is already in progress");
+    fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve or unfreeze is already in progress");
 
     const failed = job("freeze", "failed", {
       error: [

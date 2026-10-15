@@ -176,9 +176,16 @@ Operator mode lets the page make changes: run, plan, test, run CI, approve and a
 
 ### Freeze and unfreeze
 
-The **Needs you** screen has a **Freeze** form below the autonomy section. Pick a principal (`agent`, `human` or both) and a scope (`any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`), and add a reason if you want one. The page asks you to confirm before it freezes. Each freeze in force has an **Unfreeze** button that asks the same way and lifts exactly that principal and scope.
+The **Needs you** screen has a **Freeze** form below the autonomy section. Pick a principal (`agent`, `human` or both) and a scope (`any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`), and add a reason if you want one. The page asks you to confirm before it freezes. Each freeze in force has an **Unfreeze** button that asks the same way and lifts that freeze's principal and scope. One kind of row is the exception. A durable freeze marker whose body cannot be read is in force for both principals on every model. It is listed once, as **unreadable marker**, and its Unfreeze sends no principal and scope `any`, the only form `rocky policy unfreeze` accepts for it. That also lifts any freeze on scope `any` in the ledger, for both principals.
 
-The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server. They write the policy ledger in the state store, so they take the same single write slot as a run: while a run, apply or approve holds it, they answer `409 mutation_in_progress`. The ledger row names the server's principal id (`ROCKY_PRINCIPAL_ID`, else `unnamed`), not the person at the page.
+The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server. A result can succeed and still need your attention, so the page shows the result's notes under the button. A freeze with no `[policy]` block in `rocky.toml` is recorded but enforced nowhere, and the page shows it as a warning, not as done. An unfreeze that finds no matching marker says nothing was lifted.
+
+Unfreeze takes the same single write slot as a run: while a run, apply or approve holds it, it answers `409 mutation_in_progress`. Freeze does not take the slot. A freeze only adds a deny, and a freeze that lands during a run stops that run at its next freeze check. What happens next depends on the state backend:
+
+- On a remote `[state]` backend, the freeze goes through the ledger and the markers and does not open the local store. It lands during the run and the run stops.
+- On a local state store, a run holds the store lock. A freeze during a run fails with a lock error, and the page shows it as failed. Retry once the run ends.
+
+The ledger row names the server's principal id, not the person at the page. The server reads it from `ROCKY_PRINCIPAL_ID` in its own environment, else `unnamed`. A `--principal-id` flag on `rocky serve` does not reach these jobs. The row does not record that the freeze came from the browser.
 
 ### Cancel a running job
 

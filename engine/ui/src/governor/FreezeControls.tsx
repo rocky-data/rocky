@@ -1,7 +1,17 @@
 import { useState } from "react";
 import type { BriefActiveFreeze } from "@rocky-types/brief";
+import type { JobStatus } from "@rocky-types/job_status";
 import { READ_BUTTON } from "../components";
-import { JobLine, WriteButton, defaultJobClient, jobBusy, useJob, type JobClient } from "../operator";
+import {
+  JobLine,
+  WriteButton,
+  defaultJobClient,
+  jobBusy,
+  useJob,
+  type JobCancel,
+  type JobClient,
+  type JobView,
+} from "../operator";
 
 type FreezePrincipal = "both" | "agent" | "human";
 
@@ -16,6 +26,79 @@ function principalWords(principal: FreezePrincipal | string): string {
 /** The scope a freeze names, said in words (`any` is every model). */
 function scopeWords(scope: string): string {
   return scope === "any" ? "every model" : scope;
+}
+
+/** The most notes a freeze result shows, and the most characters of each. */
+const NOTES_MAX = 5;
+const NOTE_MAX_CHARS = 300;
+
+/**
+ * What a succeeded freeze or unfreeze says in `result.notes`. The engine
+ * writes them as fixed sentences (and the server cleans file paths out of
+ * them), so the page shows the strings as they are. Anything that is not a
+ * string is dropped, and the count and length are capped.
+ */
+function resultNotes(job: JobStatus): { notes: string[]; notEnforced: boolean; nothingLifted: boolean } {
+  const result = job.result as { notes?: unknown } | null | undefined;
+  const raw = result !== null && typeof result === "object" && Array.isArray(result.notes) ? result.notes : [];
+  const all = raw
+    .filter((note): note is string => typeof note === "string")
+    .map((note) => note.trim())
+    .filter((note) => note !== "");
+  return {
+    notes: all
+      .slice(0, NOTES_MAX)
+      .map((note) => (note.length <= NOTE_MAX_CHARS ? note : `${note.slice(0, NOTE_MAX_CHARS)}…`)),
+    // Judged on every note, not only the ones shown.
+    notEnforced: all.some((note) => note.includes("NOT enforced")),
+    nothingLifted: all.some((note) => note.includes("no matching active freeze markers to lift")),
+  };
+}
+
+/**
+ * The job line for a freeze or unfreeze. A succeeded job can still have done
+ * nothing useful: with no `[policy]` block the freeze is recorded but binds
+ * nothing, and an unfreeze can find no marker to lift. The engine says so in
+ * `result.notes`, so the page shows them and never a bare "done" over them.
+ */
+function FreezeJobLine({ label, view, cancel }: { label: string; view: JobView; cancel: JobCancel }) {
+  if (view.kind !== "done" || view.job.state !== "succeeded") {
+    return <JobLine label={label} view={view} cancel={cancel} />;
+  }
+  const { notes, notEnforced, nothingLifted } = resultNotes(view.job);
+  if (notes.length === 0) return <JobLine label={label} view={view} cancel={cancel} />;
+  const warn = notEnforced || nothingLifted;
+  const headline = notEnforced
+    ? `${label}: recorded, but NOT enforced.`
+    : nothingLifted
+      ? `${label}: nothing was lifted.`
+      : `${label}: done.`;
+  return (
+    <div className="space-y-1">
+      <p
+        role={warn ? "alert" : undefined}
+        className={
+          warn
+            ? "text-xs font-medium text-amber-800 dark:text-amber-300"
+            : "text-xs text-emerald-700 dark:text-emerald-300"
+        }
+      >
+        {headline}
+      </p>
+      <ul aria-label={`${label} notes`} className="list-disc space-y-0.5 pl-5">
+        {notes.map((note, index) => (
+          <li
+            key={index}
+            className={`break-words text-xs ${
+              warn ? "text-amber-800 dark:text-amber-300" : "text-zinc-600 dark:text-zinc-300"
+            }`}
+          >
+            {note}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 /**
@@ -63,6 +146,33 @@ function ConfirmedWrite({
   );
 }
 
+/**
+ * The body that lifts one freeze row. A row normally names its principal and
+ * scope, and the unfreeze names the same. A freeze marker whose body could not
+ * be read is in force for both principals on `any`, and `rocky policy
+ * unfreeze` lifts it only with no principal and scope `any`, so that row sends
+ * no principal.
+ */
+function unfreezeBody(freeze: BriefActiveFreeze): Record<string, unknown> {
+  return freeze.unreadable_marker === true
+    ? { scope: "any" }
+    : { principal: freeze.principal, scope: freeze.scope };
+}
+
+/**
+ * The freezes to list. An unreadable marker arrives as one row per principal
+ * and one Unfreeze lifts it for both, so it is listed once.
+ */
+function listedFreezes(freezes: BriefActiveFreeze[]): BriefActiveFreeze[] {
+  const seen = new Set<string>();
+  return freezes.filter((entry) => {
+    if (entry.unreadable_marker !== true) return true;
+    if (seen.has(entry.plan_id)) return false;
+    seen.add(entry.plan_id);
+    return true;
+  });
+}
+
 /** Lift one freeze in force: the same principal and scope it names. */
 function UnfreezeRow({
   freeze,
@@ -74,7 +184,10 @@ function UnfreezeRow({
   onChanged: () => void;
 }) {
   const unfreeze = useJob("unfreeze", jobs, onChanged);
-  const name = `${freeze.principal} on ${scopeWords(freeze.scope)}`;
+  const name =
+    freeze.unreadable_marker === true
+      ? "unreadable marker (agent and human) on every model"
+      : `${freeze.principal} on ${scopeWords(freeze.scope)}`;
   return (
     <li className="space-y-1">
       <div className="flex flex-wrap items-center gap-2">
@@ -84,10 +197,10 @@ function UnfreezeRow({
           question={`Lift the freeze on ${name}? Those actions can run again.`}
           confirmLabel="Confirm unfreeze"
           busy={jobBusy(unfreeze.view)}
-          onConfirm={() => unfreeze.start({ principal: freeze.principal, scope: freeze.scope })}
+          onConfirm={() => unfreeze.start(unfreezeBody(freeze))}
         />
       </div>
-      <JobLine label={`Unfreeze ${name}`} view={unfreeze.view} cancel={unfreeze.cancel} />
+      <FreezeJobLine label={`Unfreeze ${name}`} view={unfreeze.view} cancel={unfreeze.cancel} />
     </li>
   );
 }
@@ -95,8 +208,10 @@ function UnfreezeRow({
 /**
  * The kill switch from the browser: freeze actions to `deny` for a principal
  * and a scope, and lift a freeze in force. Each runs `rocky policy freeze` or
- * `rocky policy unfreeze` on the server, so it waits for a running change.
- * The ledger row names the server's principal id, not the person at the page.
+ * `rocky policy unfreeze` on the server. A freeze does not wait for a running
+ * change (it only adds a deny, and the run stops at its next freeze check); an
+ * unfreeze does. The ledger row names the server's principal id, not the
+ * person at the page, and does not say the freeze came from the browser.
  */
 export function FreezeControls({
   freezes,
@@ -126,7 +241,8 @@ export function FreezeControls({
       <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Freeze</h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         A freeze denies the matching actions until you lift it. It runs{" "}
-        <code>rocky policy freeze</code> on this server and records the server&apos;s principal id.
+        <code>rocky policy freeze</code> on this server and records the server&apos;s principal id. The
+        ledger does not record that the freeze came from the browser.
       </p>
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1 text-xs text-zinc-600 dark:text-zinc-300">
@@ -167,10 +283,10 @@ export function FreezeControls({
           onConfirm={() => freeze.start(body)}
         />
       </div>
-      <JobLine label="Freeze" view={freeze.view} cancel={freeze.cancel} />
+      <FreezeJobLine label="Freeze" view={freeze.view} cancel={freeze.cancel} />
       {freezes.length > 0 && (
         <ul aria-label="Lift a freeze" className="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
-          {freezes.map((entry) => (
+          {listedFreezes(freezes).map((entry) => (
             <UnfreezeRow
               key={`${entry.principal}|${entry.scope}|${entry.plan_id}`}
               freeze={entry}

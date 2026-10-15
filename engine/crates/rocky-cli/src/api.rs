@@ -626,7 +626,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
+            "another run, apply, approve or unfreeze job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -10115,7 +10115,18 @@ mod tests {
     /// while a run holds it and the run's freeze fence then stops that run.
     #[tokio::test]
     async fn freeze_routes_validate_their_fields_and_only_unfreeze_takes_the_permit() {
-        let state = test_state();
+        // Accepted freeze jobs spawn a child and write job records, so this
+        // server gets its own state file. The shared fixture path would lock
+        // out the other tests that read it.
+        let dir = tempfile::tempdir().unwrap();
+        let state = ServerState::with_auth(
+            simple_project_models(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(dir.path().join("state.redb")),
+        );
         let held = state
             .mutation_permit
             .try_acquire("job_incumbent")
@@ -10169,16 +10180,39 @@ mod tests {
         // with its holder. The child here is the test harness, not `rocky`, so
         // the job settles as failed; only the acceptance is under test.
         let url = format!("{base}/api/v1/jobs/freeze");
+        let mut job_ids = Vec::new();
         for body in &good {
             let resp = client.post(&url).json(body).send().await.unwrap();
-            assert_eq!(resp.status(), 202, "freeze must not wait for the permit: {body}");
+            assert_eq!(
+                resp.status(),
+                202,
+                "freeze must not wait for the permit: {body}"
+            );
             let accepted: serde_json::Value = resp.json().await.unwrap();
-            assert!(accepted["job_id"].is_string(), "{accepted}");
+            let job_id = accepted["job_id"].as_str().expect("a job id").to_string();
             assert_eq!(
                 state.mutation_permit.running_job().as_deref(),
                 Some("job_incumbent"),
                 "a freeze job must not take or release the permit"
             );
+            job_ids.push(job_id);
+        }
+        // Let every child settle before the state file goes away.
+        for job_id in job_ids {
+            for _ in 0..300 {
+                let status: serde_json::Value = client
+                    .get(format!("{base}/api/v1/jobs/{job_id}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !matches!(status["state"].as_str(), Some("queued" | "running")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
         drop(held);
     }
@@ -13359,7 +13393,10 @@ Error: boom
         });
         super::sanitize_result_notes(&mut result);
         let note = result["notes"][0].as_str().unwrap();
-        assert!(note.starts_with("freeze recorded but NOT enforced"), "{note}");
+        assert!(
+            note.starts_with("freeze recorded but NOT enforced"),
+            "{note}"
+        );
         assert!(!note.contains("/home/me"), "the path is redacted: {note}");
         assert_eq!(result["notes"][1], 7);
         assert_eq!(result["scope"], "/home/me/untouched");
