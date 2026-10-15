@@ -12,7 +12,7 @@ A new CLI verb (e.g. `rocky diff`) touches 4 layers. The engine is the source of
 Read the related skills first:
 - `rocky-codegen` — for the Rust → Pydantic/TS cascade (you'll run `just codegen`).
 - `engine/AGENTS.md` → "JSON Output Schema" — has the full table of existing commands and their output structs.
-- `integrations/dagster/AGENTS.md` → "Adding support for a new Rocky CLI command" — the 9-step dagster-side checklist.
+- `integrations/dagster/AGENTS.md` and `sdk/python/AGENTS.md` → the layer architecture each step below plugs into.
 
 ## Step 1 — Engine: the command itself
 
@@ -64,23 +64,29 @@ From the monorepo root:
 just codegen
 ```
 
-This rebuilds the engine in release mode, writes `schemas/diff.schema.json`, regenerates `sdk/python/src/rocky_sdk/types_generated/diff_schema.py`, and regenerates `editors/vscode/src/types/generated/diff.ts`. See the `rocky-codegen` skill for the details of what each sub-recipe does.
+This builds the engine (dev profile; the output is identical to a release build), writes `schemas/diff.schema.json`, regenerates `sdk/python/src/rocky_sdk/types_generated/diff_schema.py`, and regenerates `editors/vscode/src/types/generated/diff.ts`. See the `rocky-codegen` skill for the details of what each sub-recipe does.
 
-## Step 5 — Dagster: consume the output
+## Step 5 — SDK (`rocky-sdk`): parse and expose the output
 
-9-step checklist (from `integrations/dagster/AGENTS.md`):
+`just codegen` (step 4) already wrote `sdk/python/src/rocky_sdk/types_generated/diff_schema.py` and refreshed the curated `__init__.py` barrel. Then, in `sdk/python/`:
 
-1. `*Output` struct exists (step 2 above). ✓
-2. Registered in `export_schemas.rs::schemas()`. ✓
-3. `just codegen-sdk` ran. ✓
-4. Re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` in the re-export section near the bottom — both the generated name (`DiffOutput`) and a legacy Python-flavored alias (`DiffResult`) for forward-compat.
-5. Add a route in `parse_rocky_output()` to dispatch `"diff"` → `DiffOutput`.
-6. `just regen-fixtures` from the monorepo root to capture a fresh fixture — or add a hand-crafted scenario dict to `integrations/dagster/tests/scenarios.py` if the playground POC doesn't produce that command naturally.
-7. Expose it as a `*_json` pytest fixture via `integrations/dagster/tests/conftest.py`.
-8. Add parsing tests in `integrations/dagster/tests/test_types.py`.
-9. Add a method to `RockyResource` in `integrations/dagster/src/dagster_rocky/resource.py` that calls the CLI and returns the parsed `DiffOutput`. Follow the existing pattern (see `run`, `plan`, or `discover`).
+1. Re-export the new type from `src/rocky_sdk/types.py` in the bridge section near the bottom — the generated name (`DiffOutput`) and the Python-flavored alias (`DiffResult = DiffOutput`), like the existing pairs.
+2. Add a route in `parse_rocky_output()` (also in `types.py`) to dispatch `"diff"` → `DiffOutput`.
+3. If you add a hand-written runtime model in `types.py`, carry every top-level field the schema has; `tests/test_schema_parity.py` fails otherwise.
+4. Add a typed method to `RockyClient` in `src/rocky_sdk/client.py` that runs the CLI and returns `DiffOutput`. Follow `discover` or `plan`.
+5. Add parsing tests in `tests/test_types.py` and a client test in `tests/test_client.py`.
 
-## Step 6 — VS Code: expose as a command
+## Step 6 — Dagster: consume the output
+
+`dagster_rocky.types` re-exports the whole SDK surface (`from rocky_sdk.types import *`), so there is no per-type re-export. In `integrations/dagster/`:
+
+1. Add a delegating method to `RockyResource` in `src/dagster_rocky/resource.py` that calls the new `RockyClient` method and translates SDK errors into `dagster.Failure`. Follow `discover` or `plan`.
+2. Add a hand-crafted scenario dict to `tests/scenarios.py` and expose it as a `*_json` pytest fixture in `tests/conftest.py`.
+3. Add tests that use it.
+4. Optionally run `just regen-fixtures` (or extend `scripts/regen_fixtures.sh` with a `capture` call) so a playground POC contributes a live-binary sample under `tests/fixtures_generated/`.
+5. If `resource.py` now imports a name the released `rocky-sdk` lacks, raise the `rocky-sdk>=` floor in `integrations/dagster/pyproject.toml`, and release the SDK first.
+
+## Step 7 — VS Code: expose as a command
 
 ```
 editors/vscode/src/commands/<group>.ts     ← add handler (group by concern: ops, run, inspect, ...)
@@ -96,7 +102,7 @@ Conventions:
 - If the command takes editor context (current file), get it via `vscode.window.activeTextEditor`.
 - Follow the existing command pattern — see `commands/run.ts` or `commands/ops.ts` for templates.
 
-## Step 7 — Docs + engine README
+## Step 8 — Docs + engine README
 
 - `docs/src/content/docs/reference/commands/<name>.md` (Astro/Starlight) — user-facing reference.
 - `engine/README.md` and monorepo `README.md` if the command is user-prominent enough to warrant a top-level mention.

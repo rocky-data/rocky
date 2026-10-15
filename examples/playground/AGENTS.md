@@ -9,6 +9,7 @@ This file is for **agents authoring new POCs in this directory**. For the engine
 - **`pocs/`** — One folder per feature, each fully self-contained and runnable.
 - **`benchmarks/`** — Rocky vs dbt-core / dbt-fusion / PySpark performance suite. Don't touch unless explicitly asked.
 - **`scripts/`** — POC scaffolder and CI helper.
+- **`policy-gallery/`** — A runnable `[policy]` block over three tiny models. Drive it with `rocky policy check` to see how the agent policy plane decides a `(principal, capability, model)` triple.
 
 The official starter examples live in `../../engine/examples/` (quickstart, multi-layer, dbt-migration, ai-intent, dagster-integration). **Do not duplicate them here.** This directory covers what they don't.
 
@@ -25,7 +26,7 @@ run.sh         # Executable end-to-end demo (chmod +x)
 models/        # .sql / .rocky files + .toml sidecars
 contracts/     # Only if contracts are part of the feature
 data/          # seed.sql — CSV / SQL sample data, keep ≤1000 rows
-expected/      # Captured golden output from run.sh (gitignored)
+expected/      # Golden output from run.sh (generated files gitignored; see below)
 ```
 
 `rocky.toml` is required only for POCs that exercise the pipeline path (`rocky -c rocky.toml run/plan/discover`). A handful of POCs that only drive the models/compile path — e.g. `import-dbt`-based POCs and compile-only adapter smokes — legitimately ship no top-level `rocky.toml`.
@@ -41,7 +42,7 @@ Use the scaffolder:
 - Each POC focuses on **one** feature group. If it grows beyond ~5 models or needs deep setup, split it.
 - Default to **DuckDB**. Only require credentials when the feature genuinely requires Databricks / Snowflake / Anthropic API / Fivetran. Mark credential needs prominently in the README.
 - POCs must be **runnable** with a single `./run.sh` invocation.
-- The POC's `expected/` directory is for golden JSON output that committed runs would produce — gitignored, regenerated each run.
+- The POC's `expected/` directory holds golden output from `run.sh`. Generated files (`*.json`, `*.dot`, `*.txt`, `*.jsonl`, `*.log`, `*.err`, `*.stderr`, and any `*.redb`) are gitignored and rebuilt each run. `.gitkeep` and `*.example.json` files are committed; see `.gitignore`.
 
 ### Runtime conventions
 

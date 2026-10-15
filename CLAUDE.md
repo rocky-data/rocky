@@ -37,3 +37,5 @@ This repo ships a set of task-specific skills in `.claude/skills/` that should b
 Engine-local skills also live at `engine/.claude/skills/` and load when you first read or edit a file inside `engine/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, plus the Rust convention skills (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`).
 
 VS Code-local skills live at `editors/vscode/.claude/skills/` and activate when working inside `editors/vscode/`: `tailwind-plus-elements` (using `@tailwindplus/elements` headless web components in the React webviews).
+
+The permission allowlists in `engine/.claude/settings.json`, `editors/vscode/.claude/settings.json` and `integrations/dagster/.claude/settings.json` apply only when Claude Code starts in that directory. Claude Code does not merge a subdirectory's project settings into a session started at the repo root. The root `.claude/settings.json` holds only the cloud session-start hook. Run `/status` to see which settings files a session loaded.

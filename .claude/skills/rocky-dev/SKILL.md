@@ -68,7 +68,7 @@ When a change touches X, what else moves?
 |---|---|
 | `engine/crates/rocky-cli/src/output.rs` (any `*Output` struct) | Run `just codegen` — auto-regenerates `schemas/`, `sdk/python/src/rocky_sdk/types_generated/`, `editors/vscode/src/types/generated/`. Then in `sdk/python/src/rocky_sdk/types.py`: re-export the new type and add a `parse_rocky_output()` dispatch entry (the hand-written runtime models there are gated by `test_schema_parity.py`, not codegen); `dagster_rocky.types` re-exports from `rocky_sdk`. |
 | A `.rocky` keyword or operator | `engine/crates/rocky-lang/src/{token,parser,lower}.rs`, `engine/crates/rocky-compiler/src/`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, `docs/src/content/docs/concepts/rocky-dsl.md`, `docs/rocky-lang-spec.md` |
-| A new CLI command | Engine impl + `rocky-cli/src/output.rs` struct + `rocky-cli/src/commands/export_schemas.rs` registration + `just codegen` + dagster `resource.py` method + vscode `src/commands/<group>.ts` + `package.json` contribution |
+| A new CLI command | Follow the **`rocky-new-cli-command`** skill (the single checklist): engine impl + `rocky-cli/src/output.rs` struct + `commands/export_schemas.rs` registration + `just codegen` + `rocky-sdk` `types.py`/`RockyClient` + dagster `RockyResource` + vscode `src/commands/<group>.ts` + `package.json` contribution |
 | A new adapter | New crate in `engine/crates/` + `engine/Cargo.toml` members + conformance test hookup + append the type string to `KNOWN_ADAPTER_TYPES` and add its dispatch arm in `rocky-cli/src/registry.rs` + its connection locators in `AdapterConfig::endpoint_identity` (`rocky-core/src/config.rs`; a missing arm falls to a generic `_ =>`) |
 | `rocky.toml` config schema | `engine/crates/rocky-core/src/config.rs` + `editors/vscode/schemas/rocky-config.schema.json` (for IDE autocompletion) |
 | Test fixture for dagster | `just regen-fixtures` (writes to `integrations/dagster/tests/fixtures_generated/` for drift detection) or `./scripts/regen_fixtures.sh --in-place` to promote to `fixtures/` (destructive) |
@@ -104,7 +104,7 @@ See the `rocky-release` skill for the full checklist.
 
 - `AGENTS.md` (root) — monorepo-wide cascade rules
 - `engine/AGENTS.md` — engine coding standards, JSON output schema table, Databricks SQL patterns, auth flows
-- `integrations/dagster/AGENTS.md` — dagster layer architecture, "Adding support for a new Rocky CLI command" 9-step checklist
+- `integrations/dagster/AGENTS.md` — dagster layer architecture and test layout (the new-command checklist is the `rocky-new-cli-command` skill)
 - `editors/vscode/AGENTS.md` — vscode extension architecture + command table
 - `examples/playground/AGENTS.md` — POC authoring conventions
 - `justfile` (root) — orchestration recipes (build, test, lint, codegen, release, fixtures)

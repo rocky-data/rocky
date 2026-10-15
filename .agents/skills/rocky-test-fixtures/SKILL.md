@@ -47,11 +47,10 @@ This catches any captured-output shape that no longer parses against the current
 
 The script hard-fails if either is missing:
 
-1. **Release binary at `engine/target/release/rocky`** — build with:
+1. **A `rocky` binary.** The script uses `$ROCKY_BIN` if set, then `engine/target/debug/rocky`, then the release binary. `just codegen` builds the debug one, so `just codegen && just regen-fixtures` compiles once. Or build it directly:
    ```bash
-   cd engine && cargo build --release --bin rocky
+   cd engine && cargo build --bin rocky
    ```
-   or run `just codegen` (which also builds in release mode and shares the artifact).
 
 2. **`duckdb` CLI on `$PATH`** — used to seed the playground POC's DuckDB file:
    ```bash

@@ -142,17 +142,7 @@ uv build
 
 Tests read hand-written scenarios from `tests/scenarios.py` and live-binary captures from `tests/fixtures_generated/`. No Rocky binary or credentials are needed to run tests. Everything is mocked or fixture-based. `just regen-fixtures` recaptures the generated fixtures; it does need the binary.
 
-**Adding a new Rocky command:**
-
-1. Add the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs` deriving `JsonSchema`.
-2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
-3. From the monorepo root, run `just codegen-sdk`. This regenerates `sdk/python/src/rocky_sdk/types_generated/`.
-4. In `rocky_sdk/types.py`, re-export the new type if needed and add a `parse_rocky_output()` dispatch entry.
-5. Add a typed method to `RockyClient` in `rocky_sdk/client.py`.
-6. Add a delegating method to `RockyResource` in `resource.py`.
-7. Run `just regen-fixtures` to capture a fresh fixture into `tests/fixtures_generated/`.
-8. Add a scenario in `scenarios.py` and tests here.
-9. If `resource.py` now imports a name the released SDK lacks, raise the `rocky-sdk>=` floor in `pyproject.toml`.
+**Adding a new Rocky command:** follow the `rocky-new-cli-command` skill (`.agents/skills/rocky-new-cli-command/SKILL.md`). It is the single checklist; Steps 5 and 6 cover the SDK and this package.
 
 ## Git Hooks
 

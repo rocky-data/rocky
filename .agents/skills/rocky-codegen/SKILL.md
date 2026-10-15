@@ -59,7 +59,7 @@ Three recipes in `justfile`, runnable individually:
 
 | Recipe | What it does |
 |---|---|
-| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (run `ls schemas/*.schema.json | wc -l` to count). |
+| `just codegen-rust` | `cargo run --bin rocky -- export-schemas ../schemas` (from `engine/`) — builds the engine in the dev profile (the output is byte-identical to release; the debug binary is shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (run `ls schemas/*.schema.json | wc -l` to count). |
 | `just codegen-sdk` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `sdk/python/src/rocky_sdk/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
 | `just codegen-vscode` | Runs `json2ts` per schema into `editors/vscode/src/types/generated/`. Self-heals the curated `index.ts` barrel via `git checkout`. |
 
@@ -74,7 +74,7 @@ Both `codegen-sdk` and `codegen-vscode` intentionally overwrite the output direc
    ```
 2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
 3. Run `just codegen`.
-4. For the **dagster** consumer: re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` (in the re-export section near the bottom), then add a dispatch entry in `parse_rocky_output()`, add a `RockyResource` method in `resource.py`, and a fixture + test (see `integrations/dagster/AGENTS.md` for the 9-step checklist).
+4. For the **SDK and dagster** consumers: re-export the type and add a `parse_rocky_output()` route in `sdk/python/src/rocky_sdk/types.py`, add a `RockyClient` method, then a delegating `RockyResource` method and tests. `dagster_rocky.types` re-exports the SDK wholesale. The full checklist is the `rocky-new-cli-command` skill (Steps 5 and 6).
 5. For the **vscode** consumer: no extra wiring — `src/types/rockyJson.ts` is already a 100% type-alias shim over `src/types/generated/index.ts`.
 
 ## Fixture drift (related but distinct)
@@ -85,7 +85,7 @@ When to regen fixtures:
 - After a schema change that affects the shape of an output (new fields, renamed fields, changed types).
 - Before committing, run `just regen-fixtures` and check that `test_generated_fixtures.py` still passes. If it doesn't, the captured shape no longer matches the Pydantic models — usually means the codegen step was skipped.
 
-Prerequisite: the release binary at `engine/target/release/rocky` must exist (`just codegen` already builds it).
+Prerequisite: a `rocky` binary. `scripts/regen_fixtures.sh` uses `$ROCKY_BIN`, then `engine/target/debug/rocky` (what `just codegen` builds), then the release binary.
 
 ## Common pitfalls
 
@@ -117,7 +117,7 @@ Note on `core.hooksPath`: it's a repo-wide setting (stored in `.git/config`, so 
 ## Reference files
 
 - `engine/AGENTS.md` — "JSON Output Schema" section lists all command output structs.
-- `integrations/dagster/AGENTS.md` — "Adding support for a new Rocky CLI command" 9-step checklist.
+- The `rocky-new-cli-command` skill — the full engine → SDK → dagster → vscode checklist.
 - `.github/workflows/codegen-drift.yml` — the CI check that enforces this.
 - `.git-hooks/pre-commit` — the local mirror of the CI check.
 - `justfile` — the `codegen*` recipes (lines ~63-126) + `install-hooks`.

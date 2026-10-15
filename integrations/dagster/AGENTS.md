@@ -15,9 +15,7 @@ Four layers, each independently usable:
    re-exports the full surface so existing `from dagster_rocky import RunResult`
    / `parse_rocky_output` imports keep working. `dagster_rocky.types_generated`
    is likewise a shim over `rocky_sdk.types_generated`. To add support for a new
-   command, edit the Rust output struct in `engine/crates/rocky-cli/src/output.rs`,
-   run `just codegen-sdk` from the monorepo root, then add a dispatch entry in
-   `rocky_sdk`'s `parse_rocky_output()`.
+   command, follow the `rocky-new-cli-command` skill.
 2. **Resource** (`resource.py`) — `RockyResource`, a `ConfigurableResource` that
    builds a `rocky_sdk.RockyClient` from its config (`_get_client()`) and
    delegates each command method to it inside a `_translating()` boundary that
@@ -84,32 +82,11 @@ tests/
 ├── conftest.py                  # Pytest fixtures — json.dumps over scenarios.py dicts
 ├── scenarios.py                 # Hand-crafted test data as Python dicts (source of truth for tests)
 ├── fixtures_generated/          # Live-binary fixtures from `just regen-fixtures` (parsed by test_generated_fixtures.py)
-├── test_automation.py
-├── test_branch_approval.py
-├── test_branch_deploy.py
-├── test_checks.py
-├── test_column_lineage.py
-├── test_component.py
-├── test_contracts.py
-├── test_dag_assets.py
-├── test_derived_models.py
-├── test_emit_results_dedup.py
-├── test_execution.py
-├── test_freshness.py
+├── fixtures/pipes_wire/          # Recorded Dagster Pipes wire captures (*.jsonl) read by test_pipes_mode.py
 ├── test_generated_fixtures.py   # Validates live-binary fixtures parse correctly
-├── test_health.py
-├── test_observability.py
-├── test_partitions.py
-├── test_pipes_mode.py
-├── test_resolvers.py
 ├── test_resource.py             # Subprocess + HTTP plumbing tests
-├── test_scaffold.py
-├── test_schedules.py
-├── test_sensor.py
-├── test_state_health.py
-├── test_strict_doctor.py
-├── test_translator.py
-└── test_types.py                # Pydantic model parsing
+├── test_types.py                # Pydantic model parsing
+└── test_<area>.py               # One file per feature area; run `ls tests/` for the full list
 ```
 
 ## Coding Standards
@@ -155,7 +132,7 @@ uv build                                      # Build wheel + sdist
 
 ## Testing
 
-All tests run without the Rocky binary or credentials — they use hand-crafted Python dicts defined in `tests/scenarios.py` (exposed as `*_json` pytest fixtures via `conftest.py`, which `json.dumps` each scenario). The legacy `tests/fixtures/*.json` directory was removed when scenarios.py became the test source of truth — see `conftest.py` for the migration notes. Live-binary captures under `tests/fixtures_generated/` (refreshed via `just regen-fixtures`) are parsed by `test_generated_fixtures.py` for drift detection but are not loaded by other tests.
+All tests run without the Rocky binary or credentials — they use hand-crafted Python dicts defined in `tests/scenarios.py` (exposed as `*_json` pytest fixtures via `conftest.py`, which `json.dumps` each scenario). The legacy `tests/fixtures/*.json` command-output files were removed when scenarios.py became the test source of truth — see `conftest.py` for the migration notes. `tests/fixtures/pipes_wire/` remains: it holds recorded Pipes wire captures, not command output. Live-binary captures under `tests/fixtures_generated/` (refreshed via `just regen-fixtures`) are parsed by `test_generated_fixtures.py` for drift detection but are not loaded by other tests.
 
 **Translator scenario coverage.** The default `RockyDagsterTranslator` is deliberately generic — it has no awareness of any specific source type or component hierarchy. `tests/test_translator.py` exercises it against a parametrized matrix of source shapes to prove the genericity and pin down edge-case behavior:
 
@@ -167,15 +144,7 @@ All tests run without the Rocky binary or credentials — they use hand-crafted 
 Plus two edge-case tests: the all-lists fallback path for `get_group_name` (falls back to `source_type`) and a pinning test for the dict-iteration-order dependency of the "first string component" default. When adding support for a new source type or hierarchy shape that materially differs from the above, add a new entry to `SCENARIOS` in `test_translator.py` rather than writing a bespoke test — parametrization keeps the matrix honest and visible. The multi-source-type parsing surface is additionally covered by `DISCOVER_MULTI_SOURCE_TYPE` in `scenarios.py` / `test_parse_discover_multi_source_type` in `test_types.py`.
 
 **Adding support for a new Rocky CLI command (codegen-driven):**
-1. Add the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/<name>.rs`) deriving `JsonSchema`.
-2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
-3. From the monorepo root, run `just codegen-sdk`. This regenerates `types_generated/<command>_schema.py` and refreshes the `__init__.py` barrel.
-4. Re-export the new type from `types.py` (in the re-export section near the bottom).
-5. Add a route in `parse_rocky_output()` to dispatch the new command.
-6. Add a scenario entry in `tests/scenarios.py` (a Python dict with the expected output shape) and a matching `*_json` fixture in `conftest.py`.
-7. Add parsing tests in `test_types.py`.
-8. Add a method to `RockyResource` in `resource.py`.
-9. Optionally extend `scripts/regen_fixtures.sh` with a `capture` call so the playground POC contributes a live-binary sample under `tests/fixtures_generated/`.
+The full checklist is the `rocky-new-cli-command` skill (`.agents/skills/rocky-new-cli-command/SKILL.md`); it is the single copy. The parsing and the typed method live in `rocky-sdk` (its "Step 5"). The Dagster part is its "Step 6": add a delegating `RockyResource` method, a `tests/scenarios.py` dict with a `*_json` fixture in `conftest.py`, tests, and optionally a live-binary capture via `scripts/regen_fixtures.sh`.
 
 ## Git Conventions
 

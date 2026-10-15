@@ -286,13 +286,7 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 Rocky's CLI output is the interface contract with orchestrators (e.g., Dagster). Every command's `--output json` payload is backed by a typed Rust struct in `crates/rocky-cli/src/output.rs` (or `crates/rocky-cli/src/commands/doctor.rs` for doctor) that derives `JsonSchema` via the `schemars` crate. JSON Schemas are exported to `../schemas/` and used to autogenerate Pydantic models for the dagster integration and TypeScript interfaces for the VS Code extension.
 
-To change a CLI output:
-1. Edit the relevant `*Output` struct in `crates/rocky-cli/src/output.rs`.
-2. From the monorepo root, run `just codegen` (or `cd .. && cargo run --bin rocky -- export-schemas schemas/` if `just` isn't installed). This regenerates `../schemas/<command>.schema.json`, the Pydantic models in `../sdk/python/src/rocky_sdk/types_generated/` (re-exported by `dagster_rocky.types`), and the TypeScript interfaces in `../editors/vscode/src/types/generated/`.
-3. Commit the schema and regenerated bindings together with the Rust change.
-4. The `codegen-drift` CI workflow fails any PR where the committed bindings don't match what the engine produces locally — see `../.github/workflows/codegen-drift.yml`.
-
-To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
+To change a CLI output, follow the steps in the root `../AGENTS.md` ("When modifying the CLI's JSON output schema"); the `rocky-codegen` skill has the detail and pitfalls. In short: edit the struct, run `just codegen` from the monorepo root, and commit the schema and bindings with the Rust change, or `codegen-drift.yml` fails the PR. A new command also registers its type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`; the full checklist is the `rocky-new-cli-command` skill.
 
 Every `--output json` payload has a typed output struct. To find one, open `../schemas/<command>.schema.json` (its `title` is the struct name) or grep `output.rs`. The registry of exported types is `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`. Full workflow and pitfalls: the `rocky-codegen` skill.
 
