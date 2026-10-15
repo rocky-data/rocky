@@ -74,6 +74,8 @@ timestamp_column = "_fivetran_synced"
 
 The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Rocky does not detect that case today. Run a full refresh to pick them up.
 
+The filter is a strict `>`. A row that arrives after a run, with a timestamp equal to the stored watermark, is also skipped. Replication has no `lookback` setting for this case, and Rocky does not warn about it. A transformation model can set `lookback`; the compiler warns (`W056`) when it does not.
+
 ### Recovering an interrupted replication
 
 For DuckDB, Databricks, Snowflake, and BigQuery, Rocky records recovery intent
