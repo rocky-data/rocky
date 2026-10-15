@@ -127,6 +127,7 @@ jobs:
           $root = 'C:\probe-share'
           $spool = Join-Path $root '.rocky\pending-demands'
           $password = [guid]::NewGuid().ToString('N') + 'Aa1!'
+          Write-Host "::add-mask::$password"
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
           try {
             New-LocalUser -Name $user -Password $secure -PasswordNeverExpires | Out-Null

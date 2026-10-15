@@ -853,6 +853,10 @@ fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(5)
         .connect_timeout(Duration::from_secs(5))
+        // A webhook is delivered to the URL it names. Following a redirect
+        // would also make reqwest log both URLs at debug level, outside the
+        // `${NAME}` masking (#2383).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to create HTTP client for webhooks")
 }
@@ -2122,5 +2126,40 @@ url = "https://example.com/hook"
             !text.contains("T2383-status-3b8c"),
             "a log line leaks: {text}"
         );
+        // The log names the webhook, not just omits it.
+        assert!(text.contains(placeholder), "{text}");
+    }
+
+    /// A webhook is delivered only to the URL it names: a `3xx` reply is a
+    /// failed delivery, and the redirect target is never requested.
+    #[tokio::test]
+    async fn a_webhook_does_not_follow_a_redirect() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let url = format!("{}/services/T2383-redirect", server.uri());
+        Mock::given(wiremock::matchers::path("/services/T2383-redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/elsewhere", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wiremock::matchers::path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = webhook_hooks_config(&url, "on_failure = \"abort\"");
+        let registry = HookRegistry::from_config(&config);
+        let ctx = HookContext::pipeline_start("run-2383-redirect", "p");
+        let result = registry.fire(&ctx).await.unwrap();
+        assert!(
+            matches!(result, HookResult::Abort { .. }),
+            "a 302 must count as a failed delivery: {result:?}"
+        );
+        server.verify().await;
     }
 }

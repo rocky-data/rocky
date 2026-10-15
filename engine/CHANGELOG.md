@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A webhook URL set with `${VAR}` no longer prints in plain text (#2383). A Slack webhook URL is a secret. Before, logs, the abort reason and webhook errors showed the full URL. Now they show `${VAR}`. Header values set with `${VAR}` are masked the same way. As for every masked value, a value shorter than 8 bytes still prints as itself. The request still goes to the real URL.
+- A webhook URL set with `${VAR}` no longer prints in plain text (#2383). A Slack webhook URL is a secret. Before, logs, the abort reason and webhook errors showed the full URL. Now they show `${VAR}`. Header values set with `${VAR}` are masked the same way. `rocky plan` snapshots and serialized config show `${VAR}` too. As for every masked value, a value shorter than 8 bytes still prints as itself, and a `${VAR:-default}` default prints as written. The request still goes to the real URL. Webhooks no longer follow HTTP redirects: a `3xx` reply now counts as a failed delivery.
 
 ## [1.82.1] — 2026-10-15
 
