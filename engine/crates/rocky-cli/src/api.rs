@@ -3333,6 +3333,7 @@ async fn submit_job(
     validate_job_plan_id(kind, &request)?;
     validate_freeze_fields(kind, &request)?;
     validate_preview_fields(kind, &request)?;
+    validate_apply_digest(kind, &request)?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3543,6 +3544,37 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
                 "invalid base: at most {PREVIEW_BASE_MAX_CHARS} characters"
             )));
         }
+    }
+    Ok(())
+}
+
+/// The most characters an `expect_spec_digest` may carry.
+const SPEC_DIGEST_MAX_CHARS: usize = 200;
+
+/// Refuse an `apply` `expect_spec_digest` the CLI could not take as a value,
+/// before the permit is taken or an argv is built. The digest is opaque to the
+/// engine (it compares equality only), so this checks shape, not content: not
+/// empty, no whitespace or control characters, no leading `-` (clap would read
+/// it as a flag), and a length cap. Other kinds ignore the field.
+fn validate_apply_digest(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Apply {
+        return Ok(());
+    }
+    let Some(digest) = request.expect_spec_digest.as_deref() else {
+        return Ok(());
+    };
+    if digest.is_empty()
+        || digest.starts_with('-')
+        || digest.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(ApiError::bad_request(
+            "invalid expect_spec_digest: it must be the spec digest as one word, with no spaces or control characters, not starting with '-'",
+        ));
+    }
+    if digest.chars().count() > SPEC_DIGEST_MAX_CHARS {
+        return Err(ApiError::bad_request(format!(
+            "invalid expect_spec_digest: at most {SPEC_DIGEST_MAX_CHARS} characters"
+        )));
     }
     Ok(())
 }
@@ -10382,6 +10414,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 409, "freeze ignores name and base");
+        drop(held);
+    }
+
+    /// An `apply` body whose `expect_spec_digest` the CLI could not take is a
+    /// `400` before the permit; a good one reaches the permit (`409`). Other
+    /// kinds ignore the field.
+    #[tokio::test]
+    async fn apply_validates_its_spec_digest_before_the_permit() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/apply");
+        let plan_id = "a".repeat(64);
+        let long = "d".repeat(201);
+        let bad = [
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "-x" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "--help" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:ab cd" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": " sha256:abcd" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:abcd\n" }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": long }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        for body in [
+            serde_json::json!({ "plan_id": plan_id }),
+            serde_json::json!({ "plan_id": plan_id, "expect_spec_digest": "sha256:abcd" }),
+        ] {
+            let resp = client.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(resp.status(), 409, "{body}");
+        }
+        // Another kind ignores the field.
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "expect_spec_digest": "-x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores expect_spec_digest");
         drop(held);
     }
 

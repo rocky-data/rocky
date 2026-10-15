@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueOutput } from "@rocky-types/review_queue";
+import type { ProductStatusOutput } from "@rocky-types/product_status";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import { ApiError } from "./api";
 import type { ProjectOutput } from "@rocky-types/project";
@@ -309,27 +310,151 @@ describe("Approve and Apply on the plan page", () => {
     ]);
   });
 
-  it("has no Apply button for a product-bound plan, and never reads its digest", async () => {
-    const loaders = planLoaders(async () => ({
-      ...STATUS,
-      reviewed: true,
-      product_id: "product:revenue_daily",
-      spec_digest: "sha256:from-the-plan",
-      approver: { email: "dev@example.com", host: "box", source: "local" },
-    }));
-    const { client, submitted } = fakeJobs();
-    render(
-      <WriteAccessProvider value={OPERATOR}>
-        <PlanDetail planId={PLAN} loaders={loaders} jobs={client} />
-      </WriteAccessProvider>,
-    );
-    const section = await screen.findByRole("region", { name: "Approval" });
-    expect(within(section).queryByRole("button", { name: "Apply" })).toBeNull();
-    expect(section).toHaveTextContent("apply in a terminal");
-    expect(section).toHaveTextContent(/must come from you, not from the plan/);
-    // The command names a placeholder, never the plan's own digest.
-    expect(section.textContent).not.toContain("sha256:from-the-plan");
-    expect(submitted).toEqual([]);
+  describe("a product-bound plan", () => {
+    // Every place a digest could be read from carries a different value, so a
+    // pre-fill from any of them shows up in the input.
+    const FROM_PLAN = "sha256:from-the-plan";
+    const FROM_PRODUCT = "sha256:from-the-product";
+    const FROM_COMMITTED = "sha256:from-the-committed-manifest";
+    const bound = (extra: Partial<ReviewStatusOutput> = {}): PlanLoaders => ({
+      ...planLoaders(async () => ({
+        ...STATUS,
+        reviewed: true,
+        product_id: "product:revenue_daily",
+        spec_digest: FROM_PLAN,
+        approver: { email: "dev@example.com", host: "box", source: "local" },
+        ...extra,
+      })),
+      product: vi.fn(
+        async () =>
+          ({
+            version: "1.78.0",
+            command: "product_status",
+            name: "revenue_daily",
+            spec_present: true,
+            spec_digest: FROM_PRODUCT,
+            committed_spec_digest: FROM_COMMITTED,
+            output_model: "revenue_daily",
+          }) as unknown as ProductStatusOutput,
+      ),
+    });
+    const open = async (
+      loaders: PlanLoaders,
+      access: WriteAccess = OPERATOR,
+      statuses?: JobStatus[],
+      settleProduct = true,
+    ) => {
+      const { client, submitted } = fakeJobs(statuses);
+      render(
+        <WriteAccessProvider value={access}>
+          <PlanDetail planId={PLAN} loaders={loaders} jobs={client} />
+        </WriteAccessProvider>,
+      );
+      const section = await screen.findByRole("region", { name: "Approval" });
+      // Let the product read settle, so a pre-fill from it would have landed.
+      // (A plan with no product id has no product to read.)
+      if (settleProduct) await waitFor(() => expect(loaders.product).toHaveBeenCalled());
+      const input = within(section).getByLabelText("Spec digest you approved") as HTMLInputElement;
+      return { section, input, submitted };
+    };
+
+    it("starts with an empty digest input, whatever the plan, the product or the status holds", async () => {
+      const { section, input, submitted } = await open(bound());
+      expect(input.value).toBe("");
+      expect(input).toHaveAttribute("placeholder", "sha256:…");
+      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+      expect(within(section).getByText("Type the spec digest you approved.")).toBeTruthy();
+      // The terminal hint names a placeholder, never a digest.
+      expect(section).toHaveTextContent("--expect-spec-digest <the spec digest you approved>");
+      for (const digest of [FROM_PLAN, FROM_PRODUCT, FROM_COMMITTED]) {
+        expect(section.textContent).not.toContain(digest);
+      }
+      expect(submitted).toEqual([]);
+    });
+
+    it("sends exactly the typed digest as expect_spec_digest, after a confirm step", async () => {
+      const { section, input, submitted } = await open(bound(), OPERATOR, [job("apply", "succeeded")]);
+      fireEvent.change(input, { target: { value: "sha256:typed-by-hand" } });
+      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      // The first press only asks, and the question repeats the typed digest.
+      expect(submitted).toEqual([]);
+      const question = within(section).getByRole("group");
+      expect(question).toHaveTextContent("sha256:typed-by-hand");
+      fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
+      await within(section).findByText("Apply: done.");
+      expect(submitted).toEqual([
+        { kind: "apply", body: { plan_id: PLAN, expect_spec_digest: "sha256:typed-by-hand" } },
+      ]);
+    });
+
+    it("drops the spaces a paste adds and never sends a blank digest", async () => {
+      const { section, input, submitted } = await open(bound());
+      fireEvent.change(input, { target: { value: "   " } });
+      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+      fireEvent.change(input, { target: { value: "  sha256:pasted " } });
+      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0].body).toEqual({ plan_id: PLAN, expect_spec_digest: "sha256:pasted" });
+    });
+
+    it("treats a plan with only a spec digest as bound, and offers no bare Apply", async () => {
+      const loaders = bound({ product_id: undefined });
+      const { section, input } = await open(loaders, OPERATOR, undefined, false);
+      expect(input.value).toBe("");
+      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+    });
+
+    it("keeps Apply off until the plan is approved, even with a digest typed", async () => {
+      const { section, input, submitted } = await open(bound({ reviewed: false, approver: undefined }));
+      fireEvent.change(input, { target: { value: "sha256:typed" } });
+      const apply = within(section).getByRole("button", { name: "Apply" });
+      expect(apply).toBeDisabled();
+      fireEvent.click(apply);
+      expect(within(section).getByText("Approve the plan first.")).toBeTruthy();
+      expect(submitted).toEqual([]);
+    });
+
+    it("draws Apply disabled on a read-only page", async () => {
+      const { section, input, submitted } = await open(bound(), READ_ONLY);
+      fireEvent.change(input, { target: { value: "sha256:typed" } });
+      const apply = within(section).getByRole("button", { name: "Apply" });
+      expect(apply).toBeDisabled();
+      expect(apply).toHaveAttribute("title", READ_ONLY_REASON);
+      expect(submitted).toEqual([]);
+    });
+
+    it("shows a wrong digest as the cleaned failure only", async () => {
+      const refusal = job("apply", "failed", {
+        error: [
+          '{"level":"INFO","fields":{"message":"opening /Users/ops/proj/.rocky/state.redb"}}',
+          "Error: spec digest mismatch for plan 'x': the plan was authored against 'sha256:aaaa' but the applier expected 'sha256:bbbb'.",
+        ].join("\n"),
+      });
+      const { section, input } = await open(bound(), OPERATOR, [refusal]);
+      fireEvent.change(input, { target: { value: "sha256:bbbb" } });
+      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
+      const alert = await within(section).findByRole("alert");
+      expect(alert).toHaveTextContent("Apply: failed. Error: spec digest mismatch for plan 'x'");
+      expect(alert.textContent).not.toContain("/Users/ops");
+      expect(alert.textContent).not.toContain("state.redb");
+    });
+
+    it("sends no digest for a plan that is not product-bound", async () => {
+      const loaders = planLoaders(async () => ({ ...STATUS, reviewed: true }));
+      const { client, submitted } = fakeJobs([job("apply", "succeeded")]);
+      render(
+        <WriteAccessProvider value={OPERATOR}>
+          <PlanDetail planId={PLAN} loaders={loaders} jobs={client} />
+        </WriteAccessProvider>,
+      );
+      const section = await screen.findByRole("region", { name: "Approval" });
+      expect(within(section).queryByLabelText("Spec digest you approved")).toBeNull();
+      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      await within(section).findByText("Apply: done.");
+      expect(submitted).toEqual([{ kind: "apply", body: { plan_id: PLAN } }]);
+    });
   });
 
   it("draws Approve disabled with the reason on a read-only page", async () => {

@@ -10,6 +10,7 @@ import { type Resource, useResource } from "../estate/useResource";
 import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
 import {
+  ConfirmedWrite,
   JobLine,
   WriteButton,
   defaultJobClient,
@@ -17,6 +18,7 @@ import {
   useJob,
   useWriteAccess,
   type JobClient,
+  type JobView,
 } from "../operator";
 import { navigateTo } from "../router";
 import { reviewPath } from "./paths";
@@ -363,9 +365,10 @@ function productApplyCommand(planId: string): string {
  * In operator mode the buttons submit `POST /api/v1/jobs/approve` and
  * `/jobs/apply` and follow the job. The terminal command stays visible as a
  * secondary hint. A read-only page draws the buttons disabled with the
- * reason. A plan bound to a data product has no Apply button at all: its
- * apply needs the spec digest the reader approved, and the page must never
- * read that digest back from the plan it is checking.
+ * reason. A plan bound to a data product asks the reader to TYPE the spec
+ * digest they approved (`ProductApply`). The page never reads that digest
+ * from the plan it is checking, nor from the product status, nor from any
+ * response: the input starts empty, always.
  */
 function Approval({
   status,
@@ -382,7 +385,11 @@ function Approval({
   const approve = useJob("approve", jobs, onChanged);
   const apply = useJob("apply", jobs, onChanged);
   const planId = status.plan_id;
-  const productBound = status.product_id !== null && status.product_id !== undefined;
+  // Either key marks the plan as bound. The engine refuses a lone key, and
+  // the page treats it as bound too, so it never offers a bare Apply.
+  const productBound =
+    (status.product_id !== null && status.product_id !== undefined) ||
+    (status.spec_digest !== null && status.spec_digest !== undefined);
   // Every row of one plan carries the same command: approval is per plan.
   const command = entries[0]?.approve_command ?? `rocky review ${planId} --approve`;
 
@@ -407,12 +414,8 @@ function Approval({
             // After approval it is unknown, not "next": a plan applied in a
             // terminal, or before a reload, looks exactly the same here.
             state: applied ? "done" : status.reviewed ? "unknown" : "later",
-            // A product-bound plan is applied in a terminal, never here.
-            note: productBound
-              ? "Apply this plan in a terminal."
-              : applied || !status.reviewed
-                ? undefined
-                : "The plan status does not record apply.",
+            note:
+              applied || !status.reviewed ? undefined : "The plan status does not record apply.",
           },
         ]}
       />
@@ -448,17 +451,7 @@ function Approval({
       )}
 
       {productBound ? (
-        <StatusCard
-          label="apply"
-          value="apply in a terminal"
-          sub={
-            <>
-              This plan is bound to a data product. Its apply must carry the spec digest you
-              approved, and that digest must come from you, not from the plan. Run{" "}
-              <code className="break-all">{productApplyCommand(planId)}</code>.
-            </>
-          }
-        />
+        <ProductApply planId={planId} reviewed={status.reviewed} apply={apply.view} cancel={apply.cancel} start={apply.start} />
       ) : (
         <div className="space-y-2">
           <WriteButton
@@ -486,6 +479,74 @@ function Approval({
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Apply for a plan bound to a data product. The engine refuses the apply
+ * unless the caller states the spec digest it expects, and the digest must
+ * come from the person: a digest read from the plan would only prove the plan
+ * equals itself. So the input starts empty, takes only what is typed, and
+ * nothing on this page writes to it. What is typed goes out as
+ * `expect_spec_digest`, trimmed of the spaces a paste adds. A wrong digest is
+ * refused by the engine, and the job line shows the cleaned failure.
+ */
+function ProductApply({
+  planId,
+  reviewed,
+  apply,
+  cancel,
+  start,
+}: {
+  planId: string;
+  reviewed: boolean;
+  apply: JobView;
+  cancel: ReturnType<typeof useJob>["cancel"];
+  start: (body?: Record<string, unknown>) => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const digest = typed.trim();
+  const busy = jobBusy(apply);
+  const inputId = "product-apply-digest";
+  const blocked = !reviewed ? "Approve the plan first." : digest === "" ? "Type the spec digest you approved." : null;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        This plan is bound to a data product. To apply it, type the spec digest you approved.
+        It must come from you, not from the plan.
+      </p>
+      <label htmlFor={inputId} className="block text-xs font-medium text-zinc-700 dark:text-zinc-200">
+        Spec digest you approved
+      </label>
+      <input
+        id={inputId}
+        type="text"
+        value={typed}
+        onChange={(event) => setTyped(event.target.value)}
+        placeholder="sha256:…"
+        autoComplete="off"
+        spellCheck={false}
+        disabled={busy}
+        className="block w-full rounded-md border border-zinc-300 bg-white px-2 py-1.5 font-mono text-xs text-zinc-900 focus-visible:outline-2 focus-visible:outline-orange-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
+      />
+      {blocked === null ? (
+        <ConfirmedWrite
+          label="Apply"
+          question={`Apply this plan to the warehouse, stating that you approved spec digest ${digest}?`}
+          confirmLabel="Yes, apply"
+          busy={busy}
+          onConfirm={() => start({ plan_id: planId, expect_spec_digest: digest })}
+        />
+      ) : (
+        <WriteButton label="Apply" busy={busy} disabledReason={blocked} onClick={() => undefined} />
+      )}
+      <JobLine label="Apply" view={apply} cancel={cancel} />
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+        The engine compares your digest with the one the plan carries and refuses the apply if
+        they differ. Or in a terminal:
+      </p>
+      <CommandLine command={productApplyCommand(planId)} />
+    </div>
   );
 }
 

@@ -125,7 +125,11 @@ In operator mode, the plan screen can approve and apply the plan. With a read-on
 rocky review <plan-id> --approve
 ```
 
-A plan bound to a data product shows no Apply button. Apply it in a terminal. The spec digest must come from you, not from the plan.
+A plan bound to a data product shows a **Spec digest you approved** box instead. It is always empty when the page opens, and the page never fills it in from the plan, the product status or any other response. Type the digest of the spec you approved. Apply stays off until the plan is approved and the box holds a digest. The page then asks you to confirm, and repeats the digest you typed. It sends exactly that digest (without any spaces around it). The engine compares it with the digest the plan carries and refuses the apply if they differ. A refused apply shows the engine's last `Error:` lines, with paths and secrets removed. The engine's mismatch message names both digests, so a wrong guess shows the plan's digest. Check the digest against the spec you approved before you type it again. The same apply works in a terminal:
+
+```bash
+rocky apply <plan-id> --expect-spec-digest <the spec digest you approved>
+```
 
 The plan status records approval, not apply. So the Applied step shows as done only after an apply from this page succeeds. Otherwise, once the plan is approved, Applied shows as not known. The page cannot tell an applied plan from one that waits. The run itself is on Estate.
 
@@ -244,7 +248,7 @@ An approval from the UI records the approver source `http_api` and the server's 
 ## What the UI cannot do
 
 - **With a read-only token, it cannot write.** A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write.
-- **It cannot apply a product-bound plan.** Apply it in a terminal.
+- **It cannot know the spec digest for you.** A product-bound plan applies only with a digest you type. The page never reads it from the plan.
 - **It cannot change policy.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules themselves live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
 
 ## How the server protects the page

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The browser UI can apply a plan that is bound to a data product (#2323). Before, the plan screen showed no Apply button for it. Now it shows a **Spec digest you approved** box. The box is empty when the page opens, and nothing on the page fills it in: not the plan, not the product status, not any response. Apply stays off until the plan is approved and the box holds a digest. The page asks you to confirm, repeats the digest, and sends exactly what you typed (without surrounding spaces) as `expect_spec_digest`. The engine still refuses a product-bound apply with a missing or different digest. Its mismatch message names both digests, so a wrong guess shows the plan's digest. `POST /api/v1/jobs/apply` now answers `400 bad_request`, before it takes the lock, for an `expect_spec_digest` that is empty, holds a space or control character, starts with `-`, or is over 200 characters. A real digest such as `sha256:<hex>` is unaffected.
+
 ## [1.83.0] — 2026-10-15
 
 ### Added
