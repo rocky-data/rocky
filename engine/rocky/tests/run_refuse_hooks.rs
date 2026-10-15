@@ -98,8 +98,10 @@ fn assert_refused(out: &Output) {
 }
 
 fn show(out: &Output) -> String {
+    // `ExitStatus`'s Display names the signal when a signal killed the run.
     format!(
-        "stdout:\n{}\nstderr:\n{}",
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )

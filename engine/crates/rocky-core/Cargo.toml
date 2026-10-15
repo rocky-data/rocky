@@ -47,16 +47,16 @@ libc = { workspace = true }
 # implements it today). The default impl just errors, but the symbol is
 # referenced in the trait signature so the dep stays unconditional.
 arrow = { workspace = true }
-# Only compiled under the `test-support` feature (used by the cross-pod state
-# test harness). Release builds of the `rocky` binary never enable it.
-tempfile = { version = "3", optional = true }
+# A hook's stdin is an anonymous temp file, not a pipe (#2360). The cross-pod
+# state test harness uses it too.
+tempfile = "3"
 
 [features]
 # Deterministic remote-state test rig: the fault-injecting object store
 # (`fault_store`), the cross-pod harness (`test_harness`), and the public
 # provider-override seam (`state_sync::remote_testing`). Test-target-only —
 # the `rocky` binary never enables it, so release artifacts are unchanged.
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dev-dependencies]
 # `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
