@@ -148,6 +148,12 @@ cd examples/playground
 ./scripts/run-all-duckdb.sh       # All credential-free POCs, 60s timeout each
 ```
 
+After you add or remove a POC, refresh the hand-typed counts and commit the result. `poc-counts-drift.yml` fails the PR otherwise:
+
+```bash
+bash scripts/update-poc-counts.sh   # from the monorepo root; rewrites examples/playground/README.md and pocs/README.md
+```
+
 ## README structure
 
 Five sections, in this order:

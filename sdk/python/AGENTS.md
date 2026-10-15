@@ -57,7 +57,7 @@ tests/
 - Python 3.11+, `from __future__ import annotations` in all modules.
 - Pydantic `BaseModel` for data structures. Line length 100.
 - Ruff rules: E, F, I, N, UP, B, SIM. `types_generated/` is excluded from lint/format.
-- Runtime dependency: `pydantic>=2.0` only — keep the SDK free of heavy deps.
+- Runtime dependency: `pydantic` only (floor in `pyproject.toml`, currently `>=2.10`) — keep the SDK free of heavy deps.
 
 ## Common commands
 

@@ -37,8 +37,8 @@ If this is your first pull request from a fork, CI waits for a maintainer to app
 - [ ] If this is a CLI JSON schema or DSL syntax change, all consumers (`sdk/python/`, `integrations/dagster/`, `engine/ui/`, `editors/vscode/`) are updated in this same PR
 
 ### Engine (`engine/`)
-- [ ] `cargo test --all-targets` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` is clean
+- [ ] `cargo nextest run --all-features` (what CI runs) or `cargo test --all-features` passes
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` is clean
 - [ ] `cargo fmt --check` passes
 - [ ] Behaviour change: added an `engine/CHANGELOG.md` entry under `[Unreleased]`, or, if none is needed, said why in this body with a line shaped like "Changelog: none - test-only refactor, no behaviour change" (10+ character reason, `because` also accepted)
 

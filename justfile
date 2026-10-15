@@ -34,8 +34,11 @@ build-vscode:
 # Run all test suites
 test: test-engine test-sdk test-dagster test-vscode test-ui
 
+# --all-features matches CI (engine-ci.yml runs `cargo nextest run --all-features`).
+# Some adapter code sits behind a feature; a default-feature run can pass while CI fails.
+# Needs cmake on PATH, as in CI.
 test-engine:
-    cd engine && cargo test
+    cd engine && cargo test --all-features
 
 test-sdk:
     cd sdk/python && uv run pytest
@@ -71,7 +74,7 @@ evals-selftest:
 lint: lint-engine lint-sdk lint-dagster lint-vscode lint-ui
 
 lint-engine:
-    cd engine && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    cd engine && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --check
 
 lint-sdk:
     cd sdk/python && uv run ruff check && uv run ruff format --check

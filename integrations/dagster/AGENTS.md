@@ -122,7 +122,11 @@ tests/
 - Ruff rules: E, F, I, N, UP, B, SIM
 
 ### Dependencies
-- `dagster>=1.13.0` — Orchestration framework
+
+The floors below are a snapshot. `pyproject.toml` is the source of truth; check it before you quote one.
+
+- `rocky-sdk>=0.18.0` — the typed client this package wraps (release it first when the floor rises)
+- `dagster>=1.13.8` — Orchestration framework
 - `pydantic>=2.0` — Data validation
 - `pygments>=2.20.0` — Syntax highlighting for error display
 - Dev: `pytest>=8.0`, `ruff>=0.4`

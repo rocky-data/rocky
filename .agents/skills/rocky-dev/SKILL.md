@@ -11,7 +11,7 @@ Rocky is a monorepo with four shipping subprojects + a playground catalog. Most 
 
 | Path | Language | Ships as | Build | Test |
 |---|---|---|---|---|
-| `engine/` | Rust | `rocky` + `rocky-lsp` binaries | `cargo build --release` | `cargo test` |
+| `engine/` | Rust | `rocky` + `rocky-lsp` binaries | `cargo build --release` | `cargo nextest run --all-features` (what CI runs; plain `cargo test` skips feature-gated code) |
 | `sdk/python/` | Python | `rocky-sdk` wheel | `uv build` | `uv run pytest` |
 | `integrations/dagster/` | Python | `dagster-rocky` wheel | `uv build --wheel` | `uv run pytest` |
 | `editors/vscode/` | TypeScript | Rocky VSIX | `npm run compile` | `npm run test:unit` |
@@ -23,7 +23,7 @@ Each has its own `AGENTS.md` with subproject-specific coding standards and comma
 
 ```bash
 just build       # cargo build --release + uv build --wheel + npm compile
-just test        # cargo test + pytest + vitest (vscode unit tests only)
+just test        # cargo test --all-features + pytest + vitest + engine/ui tests
 just lint        # cargo clippy/fmt + ruff + eslint
 just codegen     # Rust → JSON schemas → Pydantic + TypeScript
 just --list      # all recipes
@@ -69,7 +69,7 @@ When a change touches X, what else moves?
 | `engine/crates/rocky-cli/src/output.rs` (any `*Output` struct) | Run `just codegen` — auto-regenerates `schemas/`, `sdk/python/src/rocky_sdk/types_generated/`, `editors/vscode/src/types/generated/`. Then in `sdk/python/src/rocky_sdk/types.py`: re-export the new type and add a `parse_rocky_output()` dispatch entry (the hand-written runtime models there are gated by `test_schema_parity.py`, not codegen); `dagster_rocky.types` re-exports from `rocky_sdk`. |
 | A `.rocky` keyword or operator | `engine/crates/rocky-lang/src/{token,parser,lower}.rs`, `engine/crates/rocky-compiler/src/`, `editors/vscode/syntaxes/rocky.tmLanguage.json`, `editors/vscode/snippets/rocky.json`, `docs/src/content/docs/concepts/rocky-dsl.md`, `docs/rocky-lang-spec.md` |
 | A new CLI command | Engine impl + `rocky-cli/src/output.rs` struct + `rocky-cli/src/commands/export_schemas.rs` registration + `just codegen` + dagster `resource.py` method + vscode `src/commands/<group>.ts` + `package.json` contribution |
-| A new adapter | New crate in `engine/crates/` + `engine/Cargo.toml` members + conformance test hookup + factory registration in `rocky-core/src/config.rs` |
+| A new adapter | New crate in `engine/crates/` + `engine/Cargo.toml` members + conformance test hookup + append the type string to `KNOWN_ADAPTER_TYPES` and add its dispatch arm in `rocky-cli/src/registry.rs` + its connection locators in `AdapterConfig::endpoint_identity` (`rocky-core/src/config.rs`; a missing arm falls to a generic `_ =>`) |
 | `rocky.toml` config schema | `engine/crates/rocky-core/src/config.rs` + `editors/vscode/schemas/rocky-config.schema.json` (for IDE autocompletion) |
 | Test fixture for dagster | `just regen-fixtures` (writes to `integrations/dagster/tests/fixtures_generated/` for drift detection) or `./scripts/regen_fixtures.sh --in-place` to promote to `fixtures/` (destructive) |
 
@@ -79,12 +79,13 @@ When a change touches X, what else moves?
 just install-hooks
 ```
 
-This sets `core.hooksPath` to `.git-hooks/`. The pre-commit hook runs `just codegen` and fails the commit if `engine/crates/rocky-cli/src/output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` is staged and the regenerated bindings differ from what's staged — same invariant as the CI drift check, caught locally. Skip with `ROCKY_SKIP_CODEGEN_HOOK=1 git commit …` in emergencies.
+This sets `core.hooksPath` to `.git-hooks/`. The pre-commit hook runs `just codegen` and fails the commit if `engine/crates/rocky-cli/src/output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` is staged and the regenerated bindings differ from what's staged — same invariant as the CI drift check, caught locally. It also checks formatting (`cargo fmt --check`, `ruff format --check`); it does not rewrite files. Skip only codegen with `ROCKY_SKIP_CODEGEN_HOOK=1 git commit …`, or every hook with `ROCKY_SKIP_HOOKS=1`, in emergencies.
 
 ## Key invariants
 
 - **Never** commit a Rust `*Output` change without the regenerated bindings — `codegen-drift.yml` will fail the PR.
 - **Never** include `Co-Authored-By` trailers in commit messages. Use conventional commits (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`), scoped by crate or subproject.
+- **Every PR that touches `engine/`** needs an `engine/CHANGELOG.md` entry under `[Unreleased]`, or a PR-body line `Changelog: none - <reason of 10+ characters>`. `changelog-gate.yml` fails the PR otherwise.
 - **Never** `format!()` untrusted input into SQL — use `rocky-sql/validation.rs` to validate identifiers first.
 - **Never** hand-edit files under `*/types_generated/` or `*/types/generated/` except the curated `__init__.py` / `index.ts` barrels (those are protected by `git checkout` in the codegen recipes).
 - **Never** skip hooks (`--no-verify`). The dagster integration has git hooks under `integrations/dagster/.git-hooks/` for ruff + conventional commit validation + pytest.

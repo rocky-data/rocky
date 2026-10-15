@@ -8,11 +8,14 @@ Canonical agent guidance lives in [`AGENTS.md`](AGENTS.md) (shared across agent 
 
 The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive analyses and plans is chosen in this order. Take the first one that is available:
 
-1. **Codex**, if the plugin is installed (the `codex:codex-rescue` agent). It is not installed as of 2026-10-04.
+1. **Codex**, if the `codex:codex-rescue` agent is in your list of agent types. Check the list each session; do not assume either way.
 2. **Claude Sonnet**, as a separate read-only agent (`Agent` with `model: "sonnet"`), when Opus authored the change.
 3. **Claude Opus**, as a fresh read-only agent that did not author the change (`model: "opus"`), when Sonnet authored it or Sonnet is unavailable.
+4. **Any other author model** (for example Fable): use a Claude model other than the author's, in a fresh read-only agent.
 
-Give the reviewer the diff, the two `AGENTS.md` answers and `AGENT_REVIEW.md`, never the author's reasoning. Name the reviewer and its model in the PR or report. `/code-review` run by the authoring agent does not count as the red team.
+Check which model you are before you choose. The session's model can change mid-session.
+
+Give the reviewer the diff, the two `AGENTS.md` answers and `AGENT_REVIEW.md`, never the author's reasoning. For an analysis or plan with no diff, give it the findings or the plan and the files they rest on instead of the diff. Name the reviewer and its model in the PR or report. `/code-review` run by the authoring agent does not count as the red team.
 
 ## Claude Code skills
 
@@ -31,6 +34,6 @@ This repo ships a set of task-specific skills in `.claude/skills/` that should b
 | [`rocky-poc`](.claude/skills/rocky-poc/SKILL.md) | Scaffolding a new POC under `examples/playground/` |
 | [`rocky-release`](.claude/skills/rocky-release/SKILL.md) | Cutting a tag-namespaced release (`engine-v*`, `sdk-v*`, `dagster-v*`, `vscode-v*`) |
 
-Engine-local skills also live at `engine/.claude/skills/` (12 skills) and activate when working inside `engine/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, plus 9 Rust convention skills (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`).
+Engine-local skills also live at `engine/.claude/skills/` and load when you first read or edit a file inside `engine/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, plus the Rust convention skills (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`).
 
 VS Code-local skills live at `editors/vscode/.claude/skills/` and activate when working inside `editors/vscode/`: `tailwind-plus-elements` (using `@tailwindplus/elements` headless web components in the React webviews).
