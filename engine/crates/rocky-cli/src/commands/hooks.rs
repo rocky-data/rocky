@@ -131,9 +131,9 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
                 async_summary.succeeded, async_summary.total, async_summary.failed,
             );
             for (url, err) in &async_summary.failures {
+                // `url` is an `EnvString`: `Display` prints `${NAME}` (#2383).
                 println!(
-                    "  ! {} — {}",
-                    rocky_core::secret_registry::render_placeholders(url),
+                    "  ! {url} — {}",
                     rocky_core::secret_registry::render_placeholders(err)
                 );
             }

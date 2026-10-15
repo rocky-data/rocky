@@ -556,8 +556,9 @@ pub struct AsyncWebhookSummary {
     pub succeeded: usize,
     pub failed: usize,
     /// `(url, error message)` pairs for failed deliveries, in the order they
-    /// were spawned.
-    pub failures: Vec<(String, String)>,
+    /// were spawned. The URL is an [`crate::env_string::EnvString`], so it
+    /// prints a resolved `${VAR}` value as `${NAME}` (#2383).
+    pub failures: Vec<(crate::env_string::EnvString, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1516,7 +1517,7 @@ command = "echo done"
         webhooks.insert(
             "on_pipeline_error".to_string(),
             WebhookConfigOrList::Single(WebhookConfig {
-                url: "https://hooks.slack.com/test".to_string(),
+                url: "https://hooks.slack.com/test".into(),
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: Some(r#"{"text": "{{error}}"}"#.to_string()),
@@ -1559,7 +1560,7 @@ command = "echo done"
         webhooks.insert(
             "on_pipeline_start".to_string(),
             WebhookConfigOrList::Single(WebhookConfig {
-                url: "https://example.com/hook".to_string(),
+                url: "https://example.com/hook".into(),
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
@@ -1591,7 +1592,7 @@ command = "echo done"
             "on_pipeline_complete".to_string(),
             WebhookConfigOrList::Multiple(vec![
                 WebhookConfig {
-                    url: "https://slack.example.com".to_string(),
+                    url: "https://slack.example.com".into(),
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
@@ -1604,7 +1605,7 @@ command = "echo done"
                     preset: None,
                 },
                 WebhookConfig {
-                    url: "https://api.company.com/complete".to_string(),
+                    url: "https://api.company.com/complete".into(),
                     method: "POST".to_string(),
                     headers: HashMap::new(),
                     body_template: None,
@@ -1635,7 +1636,7 @@ command = "echo done"
         webhooks.insert(
             "on_nonexistent".to_string(),
             WebhookConfigOrList::Single(WebhookConfig {
-                url: "https://example.com".to_string(),
+                url: "https://example.com".into(),
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
@@ -1820,7 +1821,7 @@ url = "https://example.com/hook"
         webhooks.insert(
             "on_pipeline_start".to_string(),
             WebhookConfigOrList::Single(WebhookConfig {
-                url: "https://example.com/hook".to_string(),
+                url: "https://example.com/hook".into(),
                 method: "PØST".to_string(), // invalid token — reqwest rejects non-ASCII
                 headers: HashMap::new(),
                 body_template: None,
@@ -1865,7 +1866,7 @@ url = "https://example.com/hook"
         webhooks.insert(
             "on_pipeline_start".to_string(),
             WebhookConfigOrList::Single(WebhookConfig {
-                url: "https://127.0.0.1:1/nope".to_string(),
+                url: "https://127.0.0.1:1/nope".into(),
                 method: "POST".to_string(),
                 headers: HashMap::new(),
                 body_template: None,
@@ -1896,7 +1897,7 @@ url = "https://example.com/hook"
         assert_eq!(summary.succeeded, 0);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.failures.len(), 1);
-        assert!(summary.failures[0].0.contains("127.0.0.1:1"));
+        assert!(summary.failures[0].0.expose().contains("127.0.0.1:1"));
     }
 
     #[tokio::test]
@@ -1908,5 +1909,178 @@ url = "https://example.com/hook"
         assert_eq!(first.total, 0);
         let second = registry.wait_async_webhooks().await;
         assert_eq!(second.total, 0);
+    }
+
+    // -- #2383: a webhook URL set with `${VAR}` never prints --
+
+    /// Every `tracing` event emitted on this thread, as text.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        /// A TRACE-level subscriber that writes here. `set_default` is
+        /// thread-local, so the caller runs on a current-thread runtime and
+        /// every spawned task stays on this thread.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A loopback URL with nothing listening on its port.
+    fn unreachable_base() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The `[webhooks.on_pipeline_start]` table, parsed the way `rocky.toml`
+    /// is: from text that already holds the expanded `${VAR}` value.
+    fn webhook_hooks_config(url: &str, extra: &str) -> HooksConfig {
+        toml::from_str(&format!(
+            "[webhooks.on_pipeline_start]\nurl = \"{url}\"\n{extra}\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failing_sync_webhook_prints_its_resolved_url_only_as_its_name() {
+        let url = format!("{}/services/T2383-sync-a91f/B0/xyzzy", unreachable_base());
+        crate::secret_registry::register_substitution("ROCKY_T2383_SYNC_URL", &url);
+        let placeholder = "${ROCKY_T2383_SYNC_URL}";
+
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        tracing::info!("capture is live");
+
+        let config = webhook_hooks_config(
+            &url,
+            "on_failure = \"abort\"\nretry_count = 1\nretry_delay_ms = 1\ntimeout_ms = 2000",
+        );
+        let registry = HookRegistry::from_config(&config);
+        let ctx = HookContext::pipeline_start("run-2383", "p");
+
+        let HookResult::Abort { reason } = registry.fire(&ctx).await.unwrap() else {
+            panic!("an unreachable abort webhook must abort");
+        };
+        assert!(!reason.contains(&url), "abort reason leaks: {reason}");
+        assert!(reason.contains(placeholder), "{reason}");
+
+        let wh = &registry.webhooks_for(&HookEvent::PipelineStart)[0];
+        assert_eq!(
+            wh.url.expose(),
+            url,
+            "PRECONDITION: the request uses the value"
+        );
+        assert!(!wh.to_string().contains(&url), "Display leaks: {wh}");
+        let err = webhook::fire_webhook(wh, &ctx, &reqwest::Client::new())
+            .await
+            .expect_err("nothing listens on the port");
+        for printed in [err.to_string(), format!("{err:?}")] {
+            assert!(!printed.contains(&url), "error leaks: {printed}");
+            assert!(printed.contains(placeholder), "{printed}");
+        }
+
+        let text = logs.text();
+        assert!(
+            text.contains("webhook failed, retrying"),
+            "PRECONDITION: the retry line was captured: {text}"
+        );
+        assert!(text.contains("webhook failed, aborting"), "{text}");
+        assert!(
+            !text.contains("T2383-sync-a91f"),
+            "a log line leaks: {text}"
+        );
+        assert!(text.contains(placeholder), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_async_webhook_prints_its_resolved_url_only_as_its_name() {
+        let url = format!("{}/services/T2383-async-6d0e/B1/plugh", unreachable_base());
+        crate::secret_registry::register_substitution("ROCKY_T2383_ASYNC_URL", &url);
+        let placeholder = "${ROCKY_T2383_ASYNC_URL}";
+
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+
+        let config = webhook_hooks_config(&url, "async = true\ntimeout_ms = 2000");
+        let registry = HookRegistry::from_config(&config);
+        let ctx = HookContext::pipeline_start("run-2383", "p");
+        assert_eq!(registry.fire(&ctx).await.unwrap(), HookResult::Continue);
+
+        let summary = registry.wait_async_webhooks().await;
+        assert_eq!(summary.failed, 1, "PRECONDITION: the delivery failed");
+        let (failed_url, err) = &summary.failures[0];
+        assert_eq!(failed_url.expose(), url);
+        assert_eq!(failed_url.to_string(), placeholder);
+        assert!(!err.contains(&url), "error leaks: {err}");
+        assert!(err.contains(placeholder), "{err}");
+
+        let text = logs.text();
+        assert!(
+            text.contains("async webhook failed"),
+            "PRECONDITION: {text}"
+        );
+        assert!(
+            !text.contains("T2383-async-6d0e"),
+            "a log line leaks: {text}"
+        );
+        assert!(text.contains(placeholder), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_webhook_set_with_env_vars_is_sent_to_the_resolved_url_and_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let secret_path = "/services/T2383-deliver-5c71/B2/quux";
+        let url = format!("{}{secret_path}", server.uri());
+        let auth = "Bearer t2383-header-secret-9e4d";
+        crate::secret_registry::register_substitution("ROCKY_T2383_DELIVER_URL", &url);
+        crate::secret_registry::register_substitution("ROCKY_T2383_AUTH", auth);
+        Mock::given(method("POST"))
+            .and(path(secret_path))
+            .and(header("Authorization", auth))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = webhook_hooks_config(
+            &url,
+            &format!("[webhooks.on_pipeline_start.headers]\nAuthorization = \"{auth}\""),
+        );
+        let registry = HookRegistry::from_config(&config);
+        let wh = &registry.webhooks_for(&HookEvent::PipelineStart)[0];
+        assert_eq!(
+            wh.headers["Authorization"].to_string(),
+            "${ROCKY_T2383_AUTH}"
+        );
+        assert!(!format!("{wh:?}").contains(auth), "Debug leaks a header");
+
+        let ctx = HookContext::pipeline_start("run-2383", "p");
+        assert_eq!(registry.fire(&ctx).await.unwrap(), HookResult::Continue);
+        server.verify().await;
     }
 }

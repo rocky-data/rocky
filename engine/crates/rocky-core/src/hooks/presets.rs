@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::webhook::WebhookConfig;
+use crate::env_string::EnvString;
 
 // ---------------------------------------------------------------------------
 // WebhookPreset
@@ -164,10 +165,10 @@ pub fn resolve_preset(
     }
 
     // Headers: preset defaults, user overrides on conflict
-    let mut merged_headers: HashMap<String, String> = preset
+    let mut merged_headers: HashMap<String, EnvString> = preset
         .default_headers
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (k.to_string(), EnvString::from(*v)))
         .collect();
     merged_headers.extend(resolved.headers.drain());
     resolved.headers = merged_headers;
@@ -186,7 +187,7 @@ mod tests {
 
     fn base_config() -> WebhookConfig {
         WebhookConfig {
-            url: "https://hooks.slack.com/services/T/B/x".to_string(),
+            url: "https://hooks.slack.com/services/T/B/x".into(),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -271,7 +272,7 @@ mod tests {
         let mut config = base_config();
         config
             .headers
-            .insert("Content-Type".to_string(), "text/plain".to_string());
+            .insert("Content-Type".to_string(), "text/plain".into());
         let resolved = resolve_preset("slack", &config).unwrap();
         assert_eq!(resolved.headers.get("Content-Type").unwrap(), "text/plain");
     }

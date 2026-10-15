@@ -84,6 +84,9 @@ jsonschema = { version = "0.58", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Used by `tests/state_sync_timeout_test.rs` to front-end a hung S3 endpoint.
 wiremock = { workspace = true }
+# Captures `tracing` output in the hooks tests, to assert a webhook URL set
+# with `${VAR}` never reaches a log line (#2383).
+tracing-subscriber = { workspace = true }
 
 # The remote-state rig tests need the `test-support` seams. The feature is
 # already on for all test targets via the self-referential dev-dependency;

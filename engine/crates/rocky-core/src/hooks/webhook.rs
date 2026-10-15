@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::template::{self, TemplateError};
 use super::{FailureAction, HookContext, HookResult};
+use crate::env_string::EnvString;
 use crate::redacted::RedactedString;
 
 /// Hard cap on total time spent firing a single webhook (retries + delays
@@ -24,20 +25,22 @@ pub(crate) const WEBHOOK_GLOBAL_TIMEOUT_MS: u64 = 120_000;
 // Errors
 // ---------------------------------------------------------------------------
 
+/// The `url` fields are [`EnvString`], so the error text prints a resolved
+/// `${VAR}` URL as `${NAME}` (#2383). A Slack webhook URL is a secret.
 #[derive(thiserror::Error)]
 pub enum WebhookError {
     #[error("webhook request failed: {url} — {message}")]
-    RequestFailed { url: String, message: String },
+    RequestFailed { url: EnvString, message: String },
 
     #[error("webhook timed out: {url} after {timeout_ms}ms")]
-    Timeout { url: String, timeout_ms: u64 },
+    Timeout { url: EnvString, timeout_ms: u64 },
 
     #[error("webhook exceeded global timeout: {url} after {timeout_ms}ms")]
-    GlobalTimeout { url: String, timeout_ms: u64 },
+    GlobalTimeout { url: EnvString, timeout_ms: u64 },
 
     #[error("webhook HTTP error: {url} — status {status}")]
     HttpError {
-        url: String,
+        url: EnvString,
         status: u16,
         body: String,
     },
@@ -46,7 +49,15 @@ pub enum WebhookError {
     Template(#[from] TemplateError),
 
     #[error("webhook HTTP client error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
+}
+
+/// Strips the URL: `reqwest::Error`'s `Display` appends ` for url (<url>)`,
+/// which would print the webhook URL in plaintext (#2383).
+impl From<reqwest::Error> for WebhookError {
+    fn from(e: reqwest::Error) -> Self {
+        WebhookError::Http(e.without_url())
+    }
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -77,16 +88,21 @@ fn default_retry_delay_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
+    // An `EnvString`: every printer sees a resolved `${VAR}` value as
+    // `${NAME}`. Only the request reads the plaintext, through `expose`
+    // (#2383). A `//` comment, so the exported schema text is unchanged.
     /// Target URL for the webhook request.
-    pub url: String,
+    pub url: EnvString,
 
     /// HTTP method (default: POST).
     #[serde(default = "default_method")]
     pub method: String,
 
+    // The values are `EnvString`, as for `url`, so an `Authorization` value
+    // set with `${VAR}` never prints (#2383).
     /// Additional HTTP headers.
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, EnvString>,
 
     /// Mustache-style body template. If None, the full HookContext is serialized as JSON.
     pub body_template: Option<String>,
@@ -204,7 +220,7 @@ mod hex {
 /// don't fail silently.
 #[derive(Debug)]
 pub struct AsyncWebhookHandle {
-    pub url: String,
+    pub url: EnvString,
     handle: JoinHandle<Result<(), WebhookError>>,
 }
 
@@ -213,7 +229,7 @@ impl AsyncWebhookHandle {
     pub async fn join(
         self,
     ) -> (
-        String,
+        EnvString,
         Result<Result<(), WebhookError>, tokio::task::JoinError>,
     ) {
         let result = self.handle.await;
@@ -347,14 +363,14 @@ async fn send_request(
     let method: reqwest::Method = config.method.parse().unwrap_or(reqwest::Method::POST);
 
     let mut builder = http
-        .request(method, &config.url)
+        .request(method, config.url.expose())
         .timeout(Duration::from_millis(config.timeout_ms))
         .header("Content-Type", "application/json")
         .body(body.to_string());
 
     // Add custom headers
     for (key, value) in &config.headers {
-        builder = builder.header(key.as_str(), value.as_str());
+        builder = builder.header(key.as_str(), value.expose());
     }
 
     // Add HMAC signature if secret is configured
@@ -372,7 +388,9 @@ async fn send_request(
         } else {
             WebhookError::RequestFailed {
                 url: config.url.clone(),
-                message: e.to_string(),
+                // `without_url`: the `Display` of a `reqwest::Error` holds
+                // the plaintext URL (#2383).
+                message: e.without_url().to_string(),
             }
         }
     })?;
@@ -404,7 +422,7 @@ mod tests {
         const SECRET: &str = "hooks-token-1919-b8e4";
         crate::secret_registry::register_substitution("RV_WEBHOOK_DBG", SECRET);
         let err = WebhookError::HttpError {
-            url: format!("https://hooks.example.com/services/{SECRET}"),
+            url: format!("https://hooks.example.com/services/{SECRET}").into(),
             status: 500,
             body: String::new(),
         };
@@ -535,7 +553,7 @@ retry_delay_ms = 2000
     #[test]
     fn test_webhook_display() {
         let config = WebhookConfig {
-            url: "https://example.com/hook".to_string(),
+            url: "https://example.com/hook".into(),
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: None,
@@ -567,7 +585,7 @@ retry_delay_ms = 2000
         // Async mode should return Continue immediately without awaiting the real
         // request; the AsyncWebhookHandle is returned so the caller can track it.
         let config = WebhookConfig {
-            url: "https://127.0.0.1:1/never-connects".to_string(), // intentionally unroutable
+            url: "https://127.0.0.1:1/never-connects".into(), // intentionally unroutable
             method: "POST".to_string(),
             headers: HashMap::new(),
             body_template: Some(r#"{"test": true}"#.to_string()),
@@ -606,7 +624,7 @@ retry_delay_ms = 2000
         // (it's a const). Instead we verify that GlobalTimeout is a distinct
         // WebhookError variant via a constructed value.
         let err = WebhookError::GlobalTimeout {
-            url: "https://example.com".to_string(),
+            url: "https://example.com".into(),
             timeout_ms: WEBHOOK_GLOBAL_TIMEOUT_MS,
         };
         let msg = err.to_string();
