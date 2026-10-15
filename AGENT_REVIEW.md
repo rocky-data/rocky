@@ -136,7 +136,8 @@ it. That is the property to **preserve**, and it means the finding to look for i
   fresh — other pipeline types, `--all`/`--models`, `--model`, `--dag`, and non-authoritative remote
   state. A resume that silently becomes a fresh run is the #1543 defect, not a convenience.
 - **Incremental-watermark soundness.** The runner reads the prior `MAX(ts)` from the redb state store,
-  filters `WHERE ts > <watermark>`, then re-queries source to record the next watermark. For this
+  filters `WHERE ts > <watermark>`, then, for incremental and microbatch strategies, records `MAX(ts)` over the **target** as the next watermark
+  (`run.rs::resolve_new_watermark`; reading the target closes a source-append race). For this
   SQL-executed path the **warehouse owns the data-write transaction**; Rocky owns only redb. Scrutinize the
   ordering: **a crash between committing rows and advancing the watermark, or advancing it past what
   actually committed, silently drops or duplicates data.**

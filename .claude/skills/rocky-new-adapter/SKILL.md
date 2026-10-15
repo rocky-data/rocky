@@ -72,7 +72,7 @@ Test pattern: add an integration test file in your crate that instantiates the a
 
 ## Factory registration
 
-The CLI + config parser needs to know your adapter type string. Search for where existing adapter types are registered (typically in `rocky-core/src/config.rs` or the CLI's adapter dispatch) and add yours. The config block in `rocky.toml` will then accept:
+The CLI + config parser needs to know your adapter type string. Append it to `KNOWN_ADAPTER_TYPES` in `engine/crates/rocky-cli/src/registry.rs` (the single source of truth for known types, `rocky validate` V017 and "did you mean?" hints) and add the matching dispatch arm in `from_config` there. The config block in `rocky.toml` will then accept:
 
 ```toml
 [adapter]

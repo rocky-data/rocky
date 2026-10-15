@@ -122,6 +122,10 @@ engine/                         # this directory, inside the rocky monorepo
 │   │       └── auth.rs         # GCP Service Account / ADC authentication
 │   ├── rocky-trino/            # Trino warehouse adapter (REST /v1/statement polling, Basic + JWT auth)
 │   │   └── src/                # Adapter trait impl + Docker-backed conformance harness behind `trino-conformance`
+│   ├── rocky-postgres/         # PostgreSQL + Amazon Redshift warehouse adapters
+│   ├── rocky-clickhouse/       # ClickHouse warehouse adapter (beta)
+│   ├── rocky-sqlserver/        # SQL Server, Azure SQL and Fabric Warehouse adapter
+│   ├── rocky-spark/            # Apache Spark adapter over Spark Connect (beta)
 │   ├── rocky-airbyte/          # Airbyte source adapter
 │   │   └── src/                # Airbyte protocol integration
 │   ├── rocky-iceberg/          # Apache Iceberg table format adapter
@@ -137,9 +141,13 @@ engine/                         # this directory, inside the rocky monorepo
 │   │       ├── metrics.rs      # In-process counters + histograms
 │   │       ├── events.rs       # Event bus (tokio::broadcast) for pipeline lifecycle events
 │   │       └── tracing_setup.rs # Structured JSON logging
+│   ├── rocky-fulfill/          # Fulfillment reconciler behind `rocky fulfill`
+│   ├── rocky-verify/           # Standalone offline verifier for rocky-manifest v0.1 attestations
+│   ├── rocky-core-compiletest/ # trybuild compile-fail guards for rocky-core's #[must_use] boundaries
+│   ├── rocky-cli-compiletest/  # Compile-fail proof that rocky-cli's plan writers stay pub(crate)
 │   └── rocky-cli/              # CLI framework
 │       └── src/
-│           ├── commands/       # init, validate, discover, plan, run, state, doctor, + ~50 more (one .rs file per subcommand)
+│           ├── commands/       # init, validate, discover, plan, run, state, doctor, + the rest (about 100 files, one per subcommand or helper; the clap `Command` enum is in `rocky/src/main.rs`)
 │           │   └── doctor.rs   # Aggregate health checks (config, state, adapters, pipelines)
 │           ├── pipes.rs        # Dagster Pipes protocol emitter — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
 │           └── output.rs       # JSON / table formatters (incl. MaterializationMetadata + sql_fingerprint helper)
@@ -304,7 +312,7 @@ Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `
 
 - **Never** include `Co-Authored-By` trailers in commit messages
 - Use conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`
-- Scope by crate when relevant: `feat(rocky-databricks): add OAuth M2M auth`
+- Scope by subproject and crate, as the root `AGENTS.md` says: `feat(engine/rocky-databricks): add OAuth M2M auth`
 
 ## Rocky DSL (.rocky files)
 
@@ -345,9 +353,9 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 ## SQL Patterns Rocky Generates
 
-**Incremental copy (the core operation):** watermark-filtered INSERT via `WHERE _fivetran_synced > TIMESTAMP '<prior>'` — the runner reads the previous run's `MAX(ts) FROM source` from the state store, threads it into SQL gen as a literal, and re-queries source post-execute to record the next watermark. See `sql_gen.rs` and `commands/run.rs::query_source_max_timestamp`.
+**Incremental copy (the core operation):** watermark-filtered INSERT via `WHERE _fivetran_synced > TIMESTAMP '<prior>'` — the runner reads the prior watermark from the redb state store, threads it into SQL gen as a literal, and after the write records `MAX(ts)` over the **target** as the next watermark (incremental and microbatch; other strategies record the run time). It reads the target, not the source, so a row appended to the source mid-run is never skipped. See `sql_gen.rs` and `commands/run.rs::resolve_new_watermark` / `query_target_max_timestamp`.
 
-**Schema drift:** `DESCRIBE TABLE` source vs target → safe type widening (`ALTER COLUMN TYPE`) or full refresh. See `drift.rs:is_safe_type_widening()`.
+**Schema drift:** `DESCRIBE TABLE` source vs target → safe type widening (`ALTER COLUMN TYPE`) or full refresh. See `drift.rs` and the per-dialect `SqlDialect::is_safe_type_widening()` (trait in `rocky-core/src/traits.rs`).
 
 **Materialized views / dynamic tables:** `CREATE OR REPLACE MATERIALIZED VIEW` (Databricks) or `DYNAMIC TABLE ... TARGET_LAG` (Snowflake).
 
