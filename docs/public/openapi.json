@@ -10557,6 +10557,20 @@
               "ci"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: it opens the state store for write, as `run` does.",
+            "enum": [
+              "freeze"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.",
+            "enum": [
+              "unfreeze"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10598,6 +10612,30 @@
           "plan_id": {
             "default": null,
             "description": "The positional `<plan_id>` for `apply` and `approve`: required there, and exactly 64 lowercase hex characters. Ignored by `run` and `plan`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal": {
+            "default": null,
+            "description": "`--principal <agent|human>` for `freeze` and `unfreeze`. Absent means both principals. Ignored by every other kind.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "default": null,
+            "description": "`--reason <text>` for `freeze` and `unfreeze`, recorded with the decision. Ignored by every other kind.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "description": "`--scope <selector>` for `freeze` and `unfreeze`: `any` (the default), `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`. Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -26019,7 +26057,7 @@
     },
     "/api/v1/jobs/approve": {
       "post": {
-        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply or approve holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
+        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply, approve, freeze or unfreeze holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
         "operationId": "submitApproveJob",
         "parameters": [
           {
@@ -26146,6 +26184,78 @@
           }
         },
         "summary": "Submit a ci job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/freeze": {
+      "post": {
+        "description": "Submit a mutating `freeze` job: `rocky policy freeze`, the kill switch. Records a freeze decision in the policy ledger. Takes the mutating permit. The optional `principal` (`agent` or `human`; both when absent), `scope` (a selector; every model when absent) and `reason` fields are validated before the job starts.",
+        "operationId": "submitFreezeJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit a freeze job",
         "tags": [
           "jobs"
         ]
@@ -26342,6 +26452,78 @@
           }
         },
         "summary": "Submit a test job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/unfreeze": {
+      "post": {
+        "description": "Submit a mutating `unfreeze` job: `rocky policy unfreeze`. Lifts a freeze; `principal` and `scope` must match the freeze being lifted. Takes the mutating permit.",
+        "operationId": "submitUnfreezeJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit an unfreeze job",
         "tags": [
           "jobs"
         ]

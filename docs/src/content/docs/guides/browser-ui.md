@@ -172,7 +172,13 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+
+### Freeze and unfreeze
+
+The **Needs you** screen has a **Freeze** form below the autonomy section. Pick a principal (`agent`, `human` or both) and a scope (`any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`), and add a reason if you want one. The page asks you to confirm before it freezes. Each freeze in force has an **Unfreeze** button that asks the same way and lifts exactly that principal and scope.
+
+The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server. They write the policy ledger in the state store, so they take the same single write slot as a run: while a run, apply or approve holds it, they answer `409 mutation_in_progress`. The ledger row names the server's principal id (`ROCKY_PRINCIPAL_ID`, else `unnamed`), not the person at the page.
 
 ### Cancel a running job
 

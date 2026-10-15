@@ -113,6 +113,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
        /api/v1/jobs/approve             │
        /api/v1/jobs/test                │
        /api/v1/jobs/ci                  │
+       /api/v1/jobs/freeze              │
+       /api/v1/jobs/unfreeze            │
         ┌───────────────────────────────┘
         ▼
   GET /api/v1/jobs/{id} ──► running ───► poll again
@@ -125,6 +127,8 @@ A mutating route does not block. You submit the work, get an id back, and poll f
 The polled result is the same payload the CLI would have produced.
 
 `POST /api/v1/jobs/test` runs `rocky test` in local DuckDB. The optional body `{"model": "<name>"}` tests one model. `POST /api/v1/jobs/ci` runs `rocky ci` (compile and test, no warehouse credentials) and ignores the body. Neither takes the single-mutation lock, so a `test` or `ci` job is never blocked by a run. Both sit behind the same write gate as `run`. A read-only token gets `403`.
+
+`POST /api/v1/jobs/freeze` and `POST /api/v1/jobs/unfreeze` run `rocky policy freeze` and `rocky policy unfreeze`. The optional body is `{"principal": "agent" | "human", "scope": "<selector>", "reason": "<text>"}`. With no `principal`, both are named. With no `scope`, every model is. The server checks the fields first and answers `400 bad_request` for a principal that is not `agent` or `human`, a scope `rocky policy` does not recognise (or one padded with spaces), or a reason that is empty, starts with `-`, holds control characters or is over 500 characters. To lift a freeze, send the `principal` and `scope` it was made with. Both jobs write the policy ledger, so they take the same single-mutation lock as `run`, and answer `409 mutation_in_progress` while it is held. They sit behind the same write gate as `run`. The ledger row names the server's principal id, not the caller.
 
 `POST /api/v1/jobs/approve` takes `{"plan_id": "<64 lowercase hex>"}`. It runs `rocky review <plan_id> --approve` as a subprocess and takes the same single-mutation lock as `run` and `apply`. While one of them runs, it answers `409 mutation_in_progress`. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`. The approval records the approver source `http_api` and the server's git identity. If `git config user.email` cannot be resolved, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`, so run records show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
 

@@ -28,6 +28,8 @@
 //! POST /api/v1/jobs/approve                     → approve a plan (= rocky review --approve) → 202 {job_id}
 //! POST /api/v1/jobs/test                        → submit a test job   → 202 {job_id}
 //! POST /api/v1/jobs/ci                          → submit a ci job     → 202 {job_id}
+//! POST /api/v1/jobs/freeze                      → submit a freeze job → 202 {job_id}
+//! POST /api/v1/jobs/unfreeze                    → submit an unfreeze  → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -194,6 +196,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/approve", post(submit_approve))
         .route("/api/v1/jobs/test", post(submit_test))
         .route("/api/v1/jobs/ci", post(submit_ci))
+        .route("/api/v1/jobs/freeze", post(submit_freeze))
+        .route("/api/v1/jobs/unfreeze", post(submit_unfreeze))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
@@ -622,7 +626,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply or approve job is already in progress on this project",
+            "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -964,6 +968,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/approve",
         "POST /api/v1/jobs/test",
         "POST /api/v1/jobs/ci",
+        "POST /api/v1/jobs/freeze",
+        "POST /api/v1/jobs/unfreeze",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
@@ -2792,6 +2798,16 @@ pub(crate) struct JobRequest {
     /// must come from the caller's independently approved product-spec
     /// snapshot, never read back from the plan itself.
     expect_spec_digest: Option<String>,
+    /// `--principal <agent|human>` for `freeze` and `unfreeze`. Absent means
+    /// both principals. Ignored by every other kind.
+    principal: Option<String>,
+    /// `--scope <selector>` for `freeze` and `unfreeze`: `any` (the default),
+    /// `layer=<n>`, `model=<glob>`, `classification=<v>` or
+    /// `tag=<key>[=<value>]`. Ignored by every other kind.
+    scope: Option<String>,
+    /// `--reason <text>` for `freeze` and `unfreeze`, recorded with the
+    /// decision. Ignored by every other kind.
+    reason: Option<String>,
 }
 
 /// Mint an opaque, collision-resistant job id for this sidecar.
@@ -3248,6 +3264,29 @@ async fn submit_ci(
     submit_job(JobKind::Ci, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/freeze` — submit a freeze job: `rocky policy freeze`,
+/// the kill switch (mutating; takes the permit). Body
+/// `{"principal": "agent"|"human", "scope": "<selector>", "reason": "<text>"}`,
+/// every field optional: no principal freezes both, no scope freezes every model.
+async fn submit_freeze(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Freeze, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/unfreeze` — submit an unfreeze job: `rocky policy
+/// unfreeze` (mutating; takes the permit). Same body as freeze; the principal
+/// and scope must match the freeze being lifted.
+async fn submit_unfreeze(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Unfreeze, state, &headers, &body).await
+}
+
 /// Shared submission path for all job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
@@ -3269,6 +3308,7 @@ async fn submit_job(
             .map_err(|e| ApiError::bad_request(format!("invalid job request body: {e}")))?
     };
     validate_job_plan_id(kind, &request)?;
+    validate_freeze_fields(kind, &request)?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3372,12 +3412,74 @@ async fn submit_job(
 /// ignore the field, as before.
 fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
     match kind {
-        JobKind::Run | JobKind::Plan | JobKind::Test | JobKind::Ci => Ok(()),
+        JobKind::Run
+        | JobKind::Plan
+        | JobKind::Test
+        | JobKind::Ci
+        | JobKind::Freeze
+        | JobKind::Unfreeze => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
         },
     }
+}
+
+/// The most characters a freeze `scope` or `reason` may carry.
+const FREEZE_SCOPE_MAX_CHARS: usize = 200;
+const FREEZE_REASON_MAX_CHARS: usize = 500;
+
+/// Refuse a `freeze` or `unfreeze` body the CLI would not take, before the
+/// permit is taken or an argv is built. The fields become argv entries, so
+/// each is checked against what its flag accepts: a principal is `agent` or
+/// `human`, a scope is a selector `rocky policy` recognises (no surrounding
+/// space, so an unfreeze can name it again exactly), and a reason is plain text
+/// that does not start with `-`, which the CLI would read as a flag. Other
+/// kinds ignore these fields.
+fn validate_freeze_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if !matches!(kind, JobKind::Freeze | JobKind::Unfreeze) {
+        return Ok(());
+    }
+    if let Some(principal) = request.principal.as_deref()
+        && !matches!(principal, "agent" | "human")
+    {
+        return Err(ApiError::bad_request(
+            "invalid principal: expected \"agent\" or \"human\", or omit it for both",
+        ));
+    }
+    if let Some(scope) = request.scope.as_deref() {
+        if scope.is_empty() || scope != scope.trim() || scope.chars().any(char::is_control) {
+            return Err(ApiError::bad_request(
+                "invalid scope: it must not be empty, padded with spaces or hold control characters",
+            ));
+        }
+        if scope.chars().count() > FREEZE_SCOPE_MAX_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "invalid scope: at most {FREEZE_SCOPE_MAX_CHARS} characters"
+            )));
+        }
+        if rocky_core::policy::validate_scope_selector(scope).is_err() {
+            return Err(ApiError::bad_request(
+                "invalid scope: use 'any', 'layer=<n>', 'model=<glob>', 'classification=<v>', or 'tag=<key>[=<value>]'",
+            ));
+        }
+    }
+    if let Some(reason) = request.reason.as_deref() {
+        if reason.trim().is_empty()
+            || reason.starts_with('-')
+            || reason.chars().any(char::is_control)
+        {
+            return Err(ApiError::bad_request(
+                "invalid reason: it must be plain text that does not start with '-'",
+            ));
+        }
+        if reason.chars().count() > FREEZE_REASON_MAX_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "invalid reason: at most {FREEZE_REASON_MAX_CHARS} characters"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn finish_job<P>(
@@ -3501,6 +3603,23 @@ fn job_subprocess_args(
                 args.push(plan_id.into());
             }
             args.push("--approve".into());
+        }
+        JobKind::Freeze | JobKind::Unfreeze => {
+            // `rocky policy <freeze|unfreeze>`: the verb follows `policy`.
+            // Each value is its own entry, so it can never read as a flag.
+            args.push(kind.verb().into());
+            if let Some(principal) = &request.principal {
+                args.push("--principal".into());
+                args.push(principal.into());
+            }
+            if let Some(scope) = &request.scope {
+                args.push("--scope".into());
+                args.push(scope.into());
+            }
+            if let Some(reason) = &request.reason {
+                args.push("--reason".into());
+                args.push(reason.into());
+            }
         }
         JobKind::Test | JobKind::Ci => {
             if let Some(models) = &dirs.models {
@@ -9839,6 +9958,14 @@ mod tests {
         assert!(!JobKind::Plan.mutates());
         assert!(!JobKind::Test.mutates());
         assert!(!JobKind::Ci.mutates());
+        // A freeze writes the policy ledger in the state store, so it takes the
+        // permit like a run: a freeze cannot land while a run holds the store.
+        assert!(JobKind::Freeze.mutates());
+        assert!(JobKind::Unfreeze.mutates());
+        assert_eq!(JobKind::Freeze.verb(), "freeze");
+        assert_eq!(JobKind::Unfreeze.verb(), "unfreeze");
+        assert_eq!(JobKind::Freeze.subcommand(), "policy");
+        assert_eq!(JobKind::Unfreeze.subcommand(), "policy");
         assert_eq!(JobKind::Test.verb(), "test");
         assert_eq!(JobKind::Ci.verb(), "ci");
         assert_eq!(JobKind::Test.subcommand(), "test");
@@ -9855,6 +9982,8 @@ mod tests {
             JobKind::Approve,
             JobKind::Test,
             JobKind::Ci,
+            JobKind::Freeze,
+            JobKind::Unfreeze,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
@@ -9883,6 +10012,127 @@ mod tests {
         let mut ci = head.to_vec();
         ci.push("ci");
         assert_eq!(argv(JobKind::Ci), ci);
+    }
+
+    /// `freeze` and `unfreeze` spawn `rocky policy <verb>`; each validated
+    /// field is its own `--flag value` pair, an absent field adds nothing, and
+    /// no run/plan flag or project dir rides along. The same request under
+    /// another kind adds none of the freeze flags.
+    #[test]
+    fn freeze_and_unfreeze_job_argv() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let full = JobRequest {
+            principal: Some("agent".to_string()),
+            scope: Some("model=orders_*".to_string()),
+            reason: Some("incident 42: stop the agents".to_string()),
+            model: Some("ignored".to_string()),
+            filter: Some("client=acme".to_string()),
+            ..JobRequest::default()
+        };
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind, request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(kind, None, &dirs, state, request)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--state-path",
+            "/tmp/state.redb",
+            "policy",
+        ];
+        for verb in ["freeze", "unfreeze"] {
+            let kind = JobKind::parse(verb).unwrap();
+            let mut expected = head.to_vec();
+            expected.push(verb);
+            expected.extend([
+                "--principal",
+                "agent",
+                "--scope",
+                "model=orders_*",
+                "--reason",
+                "incident 42: stop the agents",
+            ]);
+            assert_eq!(argv(kind, &full), expected, "{verb}");
+            let mut bare = head.to_vec();
+            bare.push(verb);
+            assert_eq!(
+                argv(kind, &JobRequest::default()),
+                bare,
+                "{verb}: no fields"
+            );
+        }
+        for kind in [JobKind::Run, JobKind::Plan, JobKind::Test, JobKind::Ci] {
+            let args = argv(kind, &full);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "--principal" || a == "--scope" || a == "--reason"),
+                "{kind:?} must not carry the freeze flags: {args:?}"
+            );
+        }
+    }
+
+    /// The freeze fields are checked before the permit and the argv: a bad
+    /// principal, scope or reason is a `400` that never spawns a child, and a
+    /// good body takes the permit like a run (`409` while one is held).
+    #[tokio::test]
+    async fn freeze_routes_validate_their_fields_and_take_the_permit() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let long_scope = format!("model={}", "x".repeat(300));
+        let long_reason = "r".repeat(501);
+        let bad = [
+            serde_json::json!({ "principal": "root" }),
+            serde_json::json!({ "principal": "Agent" }),
+            serde_json::json!({ "scope": "" }),
+            serde_json::json!({ "scope": " any" }),
+            serde_json::json!({ "scope": "any " }),
+            serde_json::json!({ "scope": "everything" }),
+            serde_json::json!({ "scope": "model=" }),
+            serde_json::json!({ "scope": "-any" }),
+            serde_json::json!({ "scope": "model=a\nb" }),
+            serde_json::json!({ "scope": long_scope }),
+            serde_json::json!({ "reason": "" }),
+            serde_json::json!({ "reason": "   " }),
+            serde_json::json!({ "reason": "--principal human" }),
+            serde_json::json!({ "reason": "line\nbreak" }),
+            serde_json::json!({ "reason": long_reason }),
+        ];
+        let good = [
+            serde_json::json!({}),
+            serde_json::json!({ "principal": "human", "scope": "any", "reason": "freeze" }),
+            serde_json::json!({ "scope": "tag=tier=gold" }),
+            serde_json::json!({ "scope": "layer=gold", "reason": "a reason, with: punctuation" }),
+        ];
+        for route in ["freeze", "unfreeze"] {
+            let url = format!("{base}/api/v1/jobs/{route}");
+            for body in &bad {
+                let resp = client.post(&url).json(body).send().await.unwrap();
+                assert_eq!(resp.status(), 400, "{route}: {body}");
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(envelope.code, "bad_request", "{route}: {body}");
+            }
+            // Valid bodies pass validation and reach the permit, which is held.
+            for body in &good {
+                let resp = client.post(&url).json(body).send().await.unwrap();
+                assert_eq!(resp.status(), 409, "{route}: {body}");
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(envelope.code, "mutation_in_progress", "{route}: {body}");
+                assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+            }
+        }
+        drop(held);
     }
 
     /// A `test` or `ci` child reads the project from its flags, so it gets
@@ -9923,6 +10173,8 @@ mod tests {
             JobKind::Plan,
             JobKind::Apply,
             JobKind::Approve,
+            JobKind::Freeze,
+            JobKind::Unfreeze,
         ] {
             let args = argv(kind);
             assert!(
@@ -12467,7 +12719,19 @@ adapter = "db"
     /// spawns a child.
     #[tokio::test]
     async fn test_and_ci_routes_are_behind_the_write_gate() {
-        for route in ["test", "ci"] {
+        assert_routes_behind_the_write_gate(&["test", "ci"]).await;
+    }
+
+    /// `freeze` and `unfreeze` change policy, so they sit behind the same gate
+    /// as `run`. Same probes as `test` and `ci`; the bad-body `400` also proves
+    /// a request that passes the gate reaches the handler and spawns nothing.
+    #[tokio::test]
+    async fn freeze_and_unfreeze_routes_are_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["freeze", "unfreeze"]).await;
+    }
+
+    async fn assert_routes_behind_the_write_gate(routes: &[&str]) {
+        for route in routes {
             let url = |base: &str| format!("{base}/api/v1/jobs/{route}");
             let client = no_redirect_client();
 

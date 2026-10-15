@@ -7,6 +7,8 @@ import { useResource } from "../estate/useResource";
 import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded } from "../format";
 import { reviewPath } from "../review/paths";
 import { navigateTo } from "../router";
+import { defaultJobClient, type JobClient } from "../operator";
+import { FreezeControls } from "./FreezeControls";
 import { CustodyLink } from "./links";
 import { Rows, SectionCard } from "./SectionCard";
 
@@ -45,7 +47,15 @@ function percent(value: number | null | undefined): string {
  * line citing a ledger id, each section rendered by its availability.
  * Escalations first: "what needs me" is the question the digest answers.
  */
-export function BriefScreen({ load = defaultBriefLoader, now }: { load?: BriefLoader; now?: number }) {
+export function BriefScreen({
+  load = defaultBriefLoader,
+  now,
+  jobs = defaultJobClient,
+}: {
+  load?: BriefLoader;
+  now?: number;
+  jobs?: JobClient;
+}) {
   const [since, setSince] = useState<BriefSinceMode>("7d");
   const loader = useCallback(() => load(since), [load, since]);
   const brief = useResource(loader, [loader]);
@@ -92,12 +102,22 @@ export function BriefScreen({ load = defaultBriefLoader, now }: { load?: BriefLo
       {brief.kind === "unreachable" && (
         <StatusCard label="engine" value="unreachable" tone="risk" sub={brief.message} />
       )}
-      {brief.kind === "ready" && <BriefBody brief={brief.value} now={now} />}
+      {brief.kind === "ready" && <BriefBody brief={brief.value} now={now} jobs={jobs} onChanged={brief.reload} />}
     </div>
   );
 }
 
-function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
+function BriefBody({
+  brief,
+  now,
+  jobs,
+  onChanged,
+}: {
+  brief: BriefOutput;
+  now?: number;
+  jobs: JobClient;
+  onChanged: () => void;
+}) {
   const {
     escalations,
     agent_activity: activity,
@@ -263,6 +283,12 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
           />
         </div>
       </SectionCard>
+
+      <FreezeControls
+        freezes={autonomy.availability === "available" ? autonomy.active_freezes : []}
+        jobs={jobs}
+        onChanged={onChanged}
+      />
 
       <SectionCard
         title="Cost"
