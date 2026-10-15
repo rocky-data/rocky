@@ -8,6 +8,11 @@
 //! `RD` (list directory) on a spool directory with `icacls` and PRINTS what
 //! each entry point returns.
 //!
+//! A second test, `spool_probe_smb_share`, covers the case the first cannot:
+//! a share with access-based enumeration (ABE). It reads the spool directory
+//! from `ROCKY_PROBE_SMB_DIR` and prints the same entry points. The weekly job
+//! builds a loopback share for it; the setup is in `engine-weekly.yml`.
+//!
 //! Evidence only: nothing is asserted about the classification. The test fails
 //! only if `icacls` itself fails. Run by the weekly `windows-check` job:
 //!
@@ -20,7 +25,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use rocky_core::path_presence::{PathPresence, classify_not_found, entry_is_present};
+use rocky_core::path_presence::{
+    FsProbe, PathPresence, RealFs, classify_not_found, entry_is_present,
+};
 use rocky_core::schedule::spool::{
     SENTINEL_NAME, classify_missing_spool, count_corrupt, list_pending_files, spool_dir,
 };
@@ -143,4 +150,57 @@ fn spool_probe_deny_list_directory() {
     );
     eprintln!("list_pending_files = {:?}", list_pending_files(&rocky_dir));
     eprintln!("count_corrupt = {:?}", count_corrupt(&rocky_dir));
+}
+
+/// Prints what each spool entry point returns for a spool directory that the
+/// caller prepared outside this test, for example on an SMB share with
+/// access-based enumeration (ABE).
+///
+/// `ROCKY_PROBE_SMB_DIR` is the spool directory itself, for example
+/// `\\localhost\share\.rocky\pending-demands`. Its parent is the `.rocky`
+/// directory the spool readers take. Evidence only: nothing is asserted.
+#[test]
+#[ignore = "evidence probe for #1903; needs ROCKY_PROBE_SMB_DIR on Windows"]
+fn spool_probe_smb_share() {
+    let Some(dir) = std::env::var_os("ROCKY_PROBE_SMB_DIR") else {
+        eprintln!("ROCKY_PROBE_SMB_DIR is not set; nothing to probe");
+        return;
+    };
+    let spool_path = std::path::PathBuf::from(dir);
+    let Some(rocky_dir) = spool_path.parent() else {
+        eprintln!("ROCKY_PROBE_SMB_DIR has no parent directory: {spool_path:?}");
+        return;
+    };
+    let spool = spool_dir(rocky_dir);
+    if spool.as_path() != spool_path {
+        eprintln!(
+            "warning: the spool readers look at {:?}, not at ROCKY_PROBE_SMB_DIR; \
+             name the directory `pending-demands`",
+            spool.as_path()
+        );
+    }
+    let sentinel = spool.join(SENTINEL_NAME);
+
+    match std::fs::read_dir(spool.as_path()) {
+        Ok(entries) => {
+            let names: Vec<_> = entries
+                .map(|e| e.map(|e| e.file_name()).map_err(|e| e.to_string()))
+                .collect();
+            eprintln!(
+                "std::fs::read_dir(spool dir) = Ok, {} entries: {names:?}",
+                names.len()
+            );
+        }
+        Err(e) => eprintln!(
+            "std::fs::read_dir(spool dir) = {}",
+            describe_io::<()>(&Err(e))
+        ),
+    }
+    eprintln!(
+        "classify_missing_spool(spool) = {}",
+        describe(&classify_missing_spool(&spool))
+    );
+    eprintln!("list_pending_files = {:?}", list_pending_files(rocky_dir));
+    eprintln!("count_corrupt = {:?}", count_corrupt(rocky_dir));
+    eprintln!("entry_kind(sentinel) = {:?}", RealFs.entry_kind(&sentinel));
 }
