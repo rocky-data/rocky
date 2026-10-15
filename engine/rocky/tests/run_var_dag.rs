@@ -94,9 +94,18 @@ fn run_dag_without_a_required_var_still_fails() {
         .current_dir(root)
         .output()
         .expect("rocky must launch");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         !out.status.success(),
-        "a required @var with no --var must not run\nstdout:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        "a required @var with no --var must not run\n{output}"
+    );
+    // The failure must be the missing variable, not some other error.
+    assert!(
+        output.contains("E028") || output.contains("region"),
+        "the failure must name the missing variable\n{output}"
     );
 }

@@ -104,9 +104,11 @@ impl StateTurnstile {
     }
 }
 
-/// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
-/// with the DAG sub-run's fixed arguments (no `--defer`, the outer `--var` map, config-derived
-/// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
+/// The [`SubRunner`] tests use: drives one pipeline through [`super::run::run`]
+/// with the DAG sub-run's fixed arguments (no `--defer`, an empty `--var` map,
+/// config-derived TTL, no idempotency key). Only `run_with_dag_and_contracts`
+/// threads the outer `--var` map; `run_with_dag`, which `rocky apply` uses,
+/// passes none. Only `config`, `loaded`, `state`, `pipeline`,
 /// `model_name`, `partition_opts`, and `skip_opts` vary per node — `loaded` is
 /// always a clone of the ONE snapshot `run_with_dag` captured, never a per-node
 /// reload, and transformation nodes supply their model name so each node
