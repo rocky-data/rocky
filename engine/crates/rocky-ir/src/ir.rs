@@ -47,8 +47,9 @@ pub enum MaterializationStrategy {
     /// execute the runner queries `MAX(ts) FROM target` (what was actually
     /// loaded) and persists that as the next watermark. The filter is a
     /// strict `>`, so a row that arrives later with a timestamp equal to
-    /// that watermark is skipped; replication has no lookback for it. Keeping the field off the strategy
-    /// means recipe-hash inputs are runtime-state-free.
+    /// that watermark is skipped; replication has no lookback for it.
+    /// Keeping the field off the strategy means recipe-hash inputs are
+    /// runtime-state-free.
     ///
     /// On a **transformation** model the watermark is read from the target
     /// instead: the model SQL's `@incremental_filter` placeholder (or, when
