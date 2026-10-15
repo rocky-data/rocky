@@ -44,8 +44,10 @@ pub enum MaterializationStrategy {
     /// generation. The SQL generator threads it into the dialect's
     /// `watermark_where` as a literal — `WHERE ts > TIMESTAMP '<prior>'`
     /// — so the WHERE clause references source only. After a successful
-    /// execute the runner re-queries `MAX(ts) FROM source` and persists
-    /// that as the next watermark. Keeping the field off the strategy
+    /// execute the runner queries `MAX(ts) FROM target` (what was actually
+    /// loaded) and persists that as the next watermark. The filter is a
+    /// strict `>`, so a row that arrives later with a timestamp equal to
+    /// that watermark is skipped; replication has no lookback for it. Keeping the field off the strategy
     /// means recipe-hash inputs are runtime-state-free.
     ///
     /// On a **transformation** model the watermark is read from the target
