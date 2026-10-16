@@ -14,6 +14,9 @@
         "orders",
         "orders"
       ],
+      "notes": [
+        "1 row with the newest `_updated_at` (2026-04-01T01:40:00Z) held back until a later run"
+      ],
       "rows_copied": null,
       "duration_ms": 0,
       "started_at": "2000-01-01T00:00:00Z",
