@@ -1706,6 +1706,37 @@ fn build_replay_renames(
     Ok(renames)
 }
 
+/// The upstream renames for one replay node, and the case rules they were
+/// keyed with, both taken from `dialect`.
+///
+/// The node calls this, not [`build_replay_renames`] directly, so the quote
+/// style always comes from the warehouse (#2405). A test through this helper
+/// therefore covers what the node runs.
+///
+/// # Errors
+///
+/// Returns the operator-facing reason, as [`build_replay_renames`] does, or
+/// when the dialect has no case rules or quote style.
+fn replay_renames_for(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    upstreams: &[String],
+    replay_schema: &str,
+) -> std::result::Result<
+    (
+        std::collections::HashMap<rocky_sql::defer::TargetIdentity, rocky_sql::defer::DeferTarget>,
+        rocky_sql::defer::IdentifierCaseRules,
+    ),
+    String,
+> {
+    let unredirectable = |e: anyhow::Error| {
+        format!("cannot redirect upstream references into the replay namespace: {e:#}")
+    };
+    let case_rules = crate::commands::run::dialect_case_rules(dialect).map_err(unredirectable)?;
+    let quote_style = crate::commands::run::rewrite_quote_style(dialect).map_err(unredirectable)?;
+    let renames = build_replay_renames(upstreams, replay_schema, case_rules, quote_style)?;
+    Ok((renames, case_rules))
+}
+
 /// `{catalog}.{replay_schema}`, each part quoted through `dialect`.
 ///
 /// The create, the CTAS target and the teardown drop all start from this, so
@@ -1850,41 +1881,17 @@ async fn replay_execute_warehouse_node(
         // DIFFERENT object's replay table. On duckdb / databricks / trino these
         // rules are field-identical to `all_insensitive()`, so those three
         // dialects see no change at all.
-        let case_rules = match crate::commands::run::dialect_case_rules(warehouse.dialect()) {
-            Ok(rules) => rules,
-            Err(e) => {
-                return non_replayable_exec(
-                    &cand.model_name,
-                    cand.nondeterministic,
-                    vec![format!(
-                        "cannot redirect upstream references into the replay namespace: {e:#}"
-                    )],
-                );
-            }
-        };
-        let quote_style = match crate::commands::run::rewrite_quote_style(warehouse.dialect()) {
-            Ok(style) => style,
-            Err(e) => {
-                return non_replayable_exec(
-                    &cand.model_name,
-                    cand.nondeterministic,
-                    vec![format!(
-                        "cannot redirect upstream references into the replay namespace: {e:#}"
-                    )],
-                );
-            }
-        };
-        let renames = match build_replay_renames(
-            &cand.in_run_upstreams,
-            replay_schema,
-            case_rules,
-            quote_style,
-        ) {
-            Ok(renames) => renames,
-            Err(reason) => {
-                return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
-            }
-        };
+        let (renames, case_rules) =
+            match replay_renames_for(warehouse.dialect(), &cand.in_run_upstreams, replay_schema) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    return non_replayable_exec(
+                        &cand.model_name,
+                        cand.nondeterministic,
+                        vec![reason],
+                    );
+                }
+            };
         let outcome = match rocky_sql::defer::rewrite_upstream_refs(
             &cand.ir.sql,
             &renames,
@@ -2657,7 +2664,8 @@ mod tests {
     /// Each is quoted as written, so none is folded to `ROCKY_REPLAY_*`.
     ///
     /// Mutation: drop the `quote_identifier` calls in `replay_schema_ref`, or
-    /// pass `None` as the quote style. Either half then fails.
+    /// pass `None` as the quote style in `replay_renames_for`. Either half then
+    /// fails.
     #[test]
     fn snowflake_replay_create_write_read_and_drop_name_one_schema() {
         use rocky_core::traits::SqlDialect;
@@ -2669,15 +2677,10 @@ mod tests {
         // The CTAS target of the upstream `db.marts.up`, as the node builds it.
         let upstream_table = format!("{schema_ref}.{}", dialect.quote_identifier("marts__up"));
 
-        let rules = crate::commands::run::dialect_case_rules(&dialect).unwrap();
-        let quote_style = crate::commands::run::rewrite_quote_style(&dialect).unwrap();
-        let renames = super::build_replay_renames(
-            &["db.marts.up".to_string()],
-            &replay_schema,
-            rules,
-            quote_style,
-        )
-        .unwrap();
+        // Through the helper the node calls, so the node's quote style is covered.
+        let (renames, rules) =
+            super::replay_renames_for(&dialect, &["db.marts.up".to_string()], &replay_schema)
+                .unwrap();
         let recorded = format!(
             "SELECT * FROM {}",
             dialect.format_table_ref("db", "marts", "up").unwrap()

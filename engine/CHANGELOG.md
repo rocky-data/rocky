@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Upper-case configs (`MARTS`) behave as before.
   - A lowercase config that relied on the unquoted create gets a new `"marts"` schema on the next `auto_create_schemas` run. The old `MARTS` schema and its grants stay behind. Drop them when you no longer need them.
   - If you want the old unquoted behaviour, write the names in upper case.
-  - The database name in config must match how Snowflake stores it, usually upper case. The writes already required this; now the creates and grants do too.
+  - The database name in config must match how Snowflake stores it, usually upper case. With `auto_create_catalogs`, a lowercase database name now creates a new `"acme"` database next to `ACME`. The writes already required this; now the creates and grants do too.
+  - If the account sets `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`, quoted names match case-insensitively, and no new schema or database is created.
+  - Still unquoted: `rocky load` and the `information_schema` reads (column describe, table listing). A lowercase database created as `"acme"` is missed by them (#2413).
   - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/governance_live.rs` (`#[ignore]`, needs credentials).
 
 ## [1.85.0] — 2026-10-16
