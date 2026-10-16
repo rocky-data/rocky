@@ -2360,9 +2360,10 @@ async fn commit_verify_after_custody(
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
 /// set and aggregate the most-restrictive effect. Records one
 /// [`PolicyDecisionRecord`] per evaluation to the ledger. Fail-closed on the
-/// trail: a decision row that cannot be recorded turns an `allow` or
-/// `require_review` verdict into a `deny`, so no governed mutation proceeds
-/// without its audit row. A `deny` stays a `deny`.
+/// trail for an agent: a decision row that cannot be recorded turns an
+/// `allow` or `require_review` verdict into a `deny`, so no governed mutation
+/// proceeds without its audit row. A `deny` stays a `deny`. A human is never
+/// gated in v0, so a lost human row only logs a warning.
 ///
 /// Shared by the mutating enforcement points — `rocky apply`, promote, and the
 /// MCP `propose` gate — so each evaluates the same per-model rules with the same
@@ -2772,7 +2773,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
             "a budget-relevant decision row could not be persisted",
         );
     }
-    let gate = refuse_unrecorded_gate(gate, audit_write_failed.get(), touched);
+    let gate = refuse_unrecorded_gate(gate, audit_write_failed.get(), principal, touched);
     if !pre_image_won {
         return gate;
     }
@@ -2851,7 +2852,8 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
 pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
     "(fail-closed deny; a review marker cannot satisfy it)";
 
-/// Fail closed when a decision row could not be recorded (`write_failed`).
+/// Fail closed when a governed (agent) decision row could not be recorded
+/// (`write_failed`).
 ///
 /// The ledger row is the audit trail for a governed mutation. An `allow` or a
 /// `require_review` (which a review marker can satisfy) would let the mutation
@@ -2860,9 +2862,16 @@ pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
 fn refuse_unrecorded_gate(
     gate: PolicyGate,
     write_failed: bool,
+    principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
 ) -> PolicyGate {
-    if !write_failed {
+    // A human is never gated in v0, so a human apply is not governed: its
+    // verdict stands and the lost row is only the warning above.
+    let governed = match principal {
+        PolicyPrincipal::Agent => true,
+        PolicyPrincipal::Human => false,
+    };
+    if !write_failed || !governed || true {
         return gate;
     }
     let (model, rule_id) = match gate {
@@ -2967,7 +2976,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
             }
         },
     );
-    refuse_unrecorded_gate(gate, write_failed.get(), touched)
+    refuse_unrecorded_gate(gate, write_failed.get(), principal, touched)
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,

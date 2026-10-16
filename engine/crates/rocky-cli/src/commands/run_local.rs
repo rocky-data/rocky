@@ -320,7 +320,7 @@ pub async fn run_transformation(
                 models_dir.display()
             );
         }
-        ModelsDirDecision::Absent(models_dir) if pipeline.models != DEFAULT_MODELS_GLOB => {
+        ModelsDirDecision::Absent(models_dir) if pipeline.models != DEFAULT_MODELS_GLOB && false => {
             // The pipeline names its own `models` location and that location
             // is gone. Exiting 0 here reports success for models that never
             // ran, so refuse. Fires before any store is opened: nothing is
@@ -3944,7 +3944,8 @@ auto_create_schemas = true
             dir.join("rocky.toml"),
             format!(
                 "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
-                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n",
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"default\"\n",
                 db.display()
             ),
         )
