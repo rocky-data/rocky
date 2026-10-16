@@ -86,6 +86,8 @@ WHERE _fivetran_synced > TIMESTAMP '<last watermark>'
 
 Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal. There is no correlated subquery against the target table. Just before the copy, Rocky reads `MAX(_fivetran_synced)` over the source and writes it in as the second literal. The newest batch waits for a later run, so a late row with the same timestamp is not skipped. `rocky plan` shows the statement without the second bound. See [Incremental Processing](/concepts/incremental/#how-rocky-advances-the-watermark).
 
+On DuckDB, each literal is a string with a UTC offset and no `TIMESTAMP` keyword: `'2026-03-02 10:00:00.123456789+00:00'`. DuckDB converts it to the column's type. So it keeps all nine digits on a `TIMESTAMP_NS` column, and it means the same instant on a `TIMESTAMPTZ` column in any session time zone.
+
 ## Full Refresh
 
 Rocky rebuilds the whole table when it finds drift it cannot fix in place, and when you configure a full refresh:

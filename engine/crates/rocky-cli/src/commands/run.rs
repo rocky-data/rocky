@@ -32414,10 +32414,13 @@ backend = "local"
         assert_eq!(target_ids(&adapter).await, ["1", "2", "3", "4"]);
     }
 
-    /// #2376 on a DuckDB `TIMESTAMP_NS` column whose maximum has non-zero
-    /// nanosecond digits. The `TIMESTAMP '…'` literal is microsecond
-    /// precision, so DuckDB truncates the 9-digit literal; truncation sits at
-    /// or below the true maximum, so the maximum row is still held back.
+    /// #2376 and #2396 on a DuckDB `TIMESTAMP_NS` column whose maximum has
+    /// non-zero nanosecond digits.
+    ///
+    /// Run 1 holds back the max row. Run 2 lands it, and its nine digits
+    /// become the watermark. Run 3 must not copy it again. A microsecond
+    /// `TIMESTAMP '…'` literal truncated the watermark, so the row passed
+    /// `>` again and was duplicated (#2396).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn hold_back_holds_the_max_row_of_a_nanosecond_column() {
@@ -32439,8 +32442,7 @@ backend = "local"
         let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
         let run1 = hold_back_copy(&adapter, &state).await;
         assert!(run1.hold_back.is_some());
-        // The parsed maximum keeps all nine digits, so the literal carries
-        // them too; it is DuckDB that truncates the literal to microseconds.
+        // The parsed maximum keeps all nine digits, and so does the literal.
         {
             use chrono::Timelike;
             assert_eq!(
@@ -32465,6 +32467,98 @@ backend = "local"
             "the held-back count sees the max row: {:?}",
             run1.materialization.notes
         );
+
+        // Run 2: a newer row arrives, so the old max row lands.
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES \
+                 (3, '2026-03-03 10:00:00.000000005'::TIMESTAMP_NS)",
+            )
+            .await
+            .unwrap();
+        let run2 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(target_ids(&adapter).await, ["1", "2"]);
+        {
+            use chrono::Timelike;
+            assert_eq!(
+                run2.deferred_watermark
+                    .as_ref()
+                    .unwrap()
+                    .timestamp
+                    .nanosecond(),
+                123_456_789,
+                "the watermark keeps the nine digits of row 2"
+            );
+        }
+
+        // Run 3: row 2 sits AT the watermark, so `>` must not copy it again.
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES \
+                 (4, '2026-03-04 10:00:00.000000005'::TIMESTAMP_NS)",
+            )
+            .await
+            .unwrap();
+        hold_back_copy(&adapter, &state).await;
+        assert_eq!(
+            target_ids(&adapter).await,
+            ["1", "2", "3"],
+            "row 2 must not be copied twice (#2396)"
+        );
+    }
+
+    /// #2395 on a DuckDB `TIMESTAMPTZ` column with the session zone west of
+    /// UTC.
+    ///
+    /// The watermark is a UTC instant. A bare `TIMESTAMP '<UTC wall clock>'`
+    /// literal was read in the session zone, five hours later in New York.
+    /// Run 1 then let the newest row through the hold-back bound, and run 2
+    /// skipped every row in the five hours after the watermark.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn watermark_bounds_skip_and_duplicate_nothing_on_a_zone_column_west_of_utc() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "SET TimeZone = 'America/New_York'",
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMPTZ)",
+            "INSERT INTO src.events VALUES \
+                (1, '2026-03-02 09:00:00+00:00'), \
+                (2, '2026-03-02 10:00:00+00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-03-02T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t2 = chrono::DateTime::parse_from_rfc3339("2026-03-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Run 1: the newest row (`t2`) is held back.
+        let run1 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(run1.hold_back.as_ref().unwrap().held_max, t2);
+        assert_eq!(target_ids(&adapter).await, ["1"], "row 2 is held back");
+        assert_eq!(run1.deferred_watermark.as_ref().unwrap().timestamp, t1);
+
+        // Run 2: one hour later. Row 2 lands once, row 3 is held back.
+        adapter
+            .execute_statement("INSERT INTO src.events VALUES (3, '2026-03-02 11:00:00+00:00')")
+            .await
+            .unwrap();
+        let run2 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(
+            target_ids(&adapter).await,
+            ["1", "2"],
+            "row 2 must land exactly once and row 3 must wait"
+        );
+        assert_eq!(run2.deferred_watermark.as_ref().unwrap().timestamp, t2);
     }
 
     /// #2376: an empty or all-NULL source has no maximum, so it gets no

@@ -23,13 +23,33 @@ fn watermark_column(timestamp_col: &str) -> AdapterResult<&str> {
     Ok(timestamp_col)
 }
 
-/// The `TIMESTAMP '...'` literal both watermark bounds share. `%.f` keeps the
-/// fractional second (#2004); `None` is the `1970-01-01` sentinel.
+/// The literal both watermark bounds share: an untyped string with an
+/// explicit UTC offset, `'2026-09-15 10:00:00.250+00:00'`.
+///
+/// It has no `TIMESTAMP` keyword on purpose. DuckDB casts an untyped string
+/// to the type of the column it is compared with, so the literal compares
+/// at the column's own precision and zone:
+///
+/// - `TIMESTAMP_NS`: all nine digits count. A `TIMESTAMP '…'` literal is
+///   microsecond precision and truncated them, so `>` copied the newest row
+///   again on every run (#2396).
+/// - `TIMESTAMPTZ`: the `+00:00` fixes the instant. A bare `TIMESTAMP '…'`
+///   was read in the session `TimeZone`, which skipped rows when that zone
+///   was west of UTC (#2395).
+/// - `TIMESTAMP`: the cast applies the `+00:00` and keeps the UTC wall
+///   clock, as before.
+///
+/// The cast lands on the constant, not the column, so min/max pruning still
+/// works. A cast to a coarser type (`TIMESTAMP_MS`, `TIMESTAMP_S`) rounds,
+/// which could lift the `<` bound above the true maximum. That cannot happen
+/// here: both values come from `MAX(ts)` of the column itself, and `%.f`
+/// prints no more digits than the value has. `%.f` keeps the fractional
+/// second (#2004); `None` is the `1970-01-01` sentinel.
 fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
     let literal = t
         .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
         .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-    format!("TIMESTAMP '{literal}'")
+    format!("'{literal}+00:00'")
 }
 
 /// DuckDB SQL dialect.
@@ -204,9 +224,8 @@ impl SqlDialect for DuckDbSqlDialect {
         timestamp_col: &str,
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {
-        // DuckDB accepts the ANSI `TIMESTAMP '...'` literal form with
-        // sub-second precision. The 1970-01-01 sentinel keeps the WHERE
-        // permissive on first runs.
+        // See `watermark_literal` for why the literal is an untyped string.
+        // The 1970-01-01 sentinel keeps the WHERE permissive on first runs.
         let column = watermark_column(timestamp_col)?;
         Ok(format!(
             "WHERE {column} > {}",
@@ -461,12 +480,12 @@ mod tests {
         assert_eq!(
             d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
                 .unwrap(),
-            "_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250'"
+            "_loaded_at < '2026-09-15 10:00:00.250+00:00'"
         );
         assert_eq!(
             d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Keep)
                 .unwrap(),
-            "(_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250' OR _loaded_at IS NULL)"
+            "(_loaded_at < '2026-09-15 10:00:00.250+00:00' OR _loaded_at IS NULL)"
         );
         assert!(
             d.watermark_hold_back("'; DROP", &held, NullTimestamps::Exclude)
@@ -692,10 +711,7 @@ mod tests {
     fn test_watermark_where_no_prior_uses_sentinel() {
         let d = dialect();
         let sql = d.watermark_where("_fivetran_synced", None).unwrap();
-        assert_eq!(
-            sql,
-            "WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
-        );
+        assert_eq!(sql, "WHERE _fivetran_synced > '1970-01-01 00:00:00+00:00'");
     }
 
     #[test]
@@ -705,10 +721,7 @@ mod tests {
         let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
         let sql = d.watermark_where("_fivetran_synced", Some(&prior)).unwrap();
         // Source-side semantics: literal substitution, no correlated subquery.
-        assert_eq!(
-            sql,
-            "WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'"
-        );
+        assert_eq!(sql, "WHERE _fivetran_synced > '2026-04-17 09:30:00+00:00'");
     }
 
     #[test]
@@ -720,10 +733,7 @@ mod tests {
         let sql = d.watermark_where("_loaded_at", Some(&prior)).unwrap();
         // #2004: a fractional-second watermark must render its fraction, or
         // the row it was read from re-passes the next run's `>` filter.
-        assert_eq!(
-            sql,
-            "WHERE _loaded_at > TIMESTAMP '2026-09-15 10:00:00.250'"
-        );
+        assert_eq!(sql, "WHERE _loaded_at > '2026-09-15 10:00:00.250+00:00'");
     }
 
     #[test]
