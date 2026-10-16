@@ -2252,10 +2252,18 @@ fn branch_schema_statement(
     if catalog.is_empty() || !dialect.branch_clone_uses_catalog() {
         return branch_schema_create_sql(dialect, branch_schema);
     }
-    if let Some(check) = dialect.create_schema_sql(catalog, branch_schema) {
-        check.map_err(|e| {
-            anyhow::anyhow!("branch schema '{branch_schema}' in catalog '{catalog}': {e}")
-        })?;
+    // The dialect's own schema statement is the name check; a dialect that
+    // clones into the catalog but has no such statement cannot vouch for the
+    // names, so refuse rather than interpolate them unchecked.
+    match dialect.create_schema_sql(catalog, branch_schema) {
+        Some(check) => {
+            check.map_err(|e| {
+                anyhow::anyhow!("branch schema '{branch_schema}' in catalog '{catalog}': {e}")
+            })?;
+        }
+        None => anyhow::bail!(
+            "branch schema '{branch_schema}' in catalog '{catalog}': this warehouse clones into the catalog but has no schema statement to validate the names"
+        ),
     }
     Ok(format!(
         "CREATE SCHEMA IF NOT EXISTS {}.{}",
