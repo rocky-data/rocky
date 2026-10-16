@@ -5746,10 +5746,14 @@ pub async fn run_with_explicit_contracts(
 
             if governance.auto_create_schemas {
                 // Create schema via generic dialect SQL
-                if let Some(sql_result) = dialect.create_schema_sql(&target_catalog, &target_schema)
-                {
+                if let Some(sql) = auto_create_schema_statement(
+                    dialect,
+                    shadow_config,
+                    &target_catalog,
+                    &target_schema,
+                )? {
                     warehouse_adapter
-                        .execute_statement(&sql_result?)
+                        .execute_statement(&sql)
                         .await
                         .map_err(anyhow::Error::from)?;
                 }
@@ -11708,6 +11712,35 @@ pub fn resolve_run_selection(
     )
 }
 
+/// The `CREATE SCHEMA` for one auto-create target.
+///
+/// A `--branch` run writes its models to `{catalog}.{branch_schema}.{table}`
+/// through `format_table_ref`, which on Snowflake double-quotes every part
+/// (an exact, case-preserving name). Snowflake's own `create_schema_sql` is
+/// unquoted and folds `branch__x` to `BRANCH__X`, so the schema it makes is not
+/// the one the writes name (#2402). For the branch schema, on a dialect that
+/// clones into the catalog, build the statement with the same quoting as the
+/// writes (the helper `rocky preview` uses). Every other target keeps the
+/// dialect's `create_schema_sql`, which other code (grants, tags) relies on.
+fn auto_create_schema_statement(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    catalog: &str,
+    schema: &str,
+) -> Result<Option<String>> {
+    let is_branch_schema = shadow_config
+        .filter(|config| config.branch.is_some())
+        .and_then(|config| config.schema_override.as_deref())
+        .is_some_and(|branch_schema| branch_schema == schema);
+    if is_branch_schema && !catalog.is_empty() && dialect.branch_clone_uses_catalog() {
+        return super::preview::branch_schema_statement(dialect, schema, catalog).map(Some);
+    }
+    dialect
+        .create_schema_sql(catalog, schema)
+        .transpose()
+        .map_err(anyhow::Error::from)
+}
+
 /// The (catalog, schema) pairs an invocation may pre-create under
 /// `auto_create_schemas` — the models the selection will attempt to build.
 /// (Runtime exclusions decided later — containment poisoning, skip gates —
@@ -13422,8 +13455,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             &compile_excluded_models,
         );
         for (catalog, schema) in &targets {
-            if let Some(sql_result) = dialect.create_schema_sql(catalog, schema) {
-                let sql = sql_result.map_err(anyhow::Error::from)?;
+            if let Some(sql) =
+                auto_create_schema_statement(dialect, shadow_config, catalog, schema)?
+            {
                 warehouse
                     .execute_statement(&sql)
                     .await
@@ -19680,6 +19714,68 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    fn branch_shadow(schema: &str) -> rocky_core::shadow::ShadowConfig {
+        rocky_core::shadow::ShadowConfig {
+            schema_override: Some(schema.to_string()),
+            branch: Some("x".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// #2402: on Snowflake the branch schema is created with the same quoting
+    /// the writes use, so the schema made is the schema written to.
+    #[test]
+    fn snowflake_branch_schema_create_names_the_schema_the_writes_use() {
+        use rocky_core::traits::SqlDialect;
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let shadow = branch_shadow("branch__x");
+        let create = auto_create_schema_statement(&dialect, Some(&shadow), "DB", "branch__x")
+            .unwrap()
+            .unwrap();
+        let write = dialect.format_table_ref("DB", "branch__x", "t").unwrap();
+        assert_eq!(create, r#"CREATE SCHEMA IF NOT EXISTS "DB"."branch__x""#);
+        assert_eq!(write, r#""DB"."branch__x"."t""#);
+        // The create's `"DB"."branch__x"` is the write's prefix.
+        assert!(write.starts_with(create.trim_start_matches("CREATE SCHEMA IF NOT EXISTS ")));
+    }
+
+    /// Only the branch schema changes. A non-branch run and a non-branch
+    /// target in a branch run keep the dialect's own statement.
+    #[test]
+    fn snowflake_non_branch_schema_keeps_the_dialect_create() {
+        use rocky_core::traits::SqlDialect;
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let plain = dialect.create_schema_sql("DB", "marts").unwrap().unwrap();
+        assert_eq!(plain, "CREATE SCHEMA IF NOT EXISTS DB.marts");
+        assert_eq!(
+            auto_create_schema_statement(&dialect, None, "DB", "marts")
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        let shadow = branch_shadow("branch__x");
+        assert_eq!(
+            auto_create_schema_statement(&dialect, Some(&shadow), "DB", "marts")
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        // A one-off `--shadow-schema` run is not a branch run.
+        let one_off = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("shadow_x".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_create_schema_statement(&dialect, Some(&one_off), "DB", "shadow_x")
+                .unwrap()
+                .unwrap(),
+            dialect
+                .create_schema_sql("DB", "shadow_x")
+                .unwrap()
+                .unwrap()
+        );
+    }
 
     /// B3: the run note reports the predicate the SQL applied — the
     /// `filter_column` and the lookback-adjusted bound — not a bare

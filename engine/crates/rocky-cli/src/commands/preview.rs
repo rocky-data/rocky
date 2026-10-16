@@ -2244,7 +2244,7 @@ async fn copy_step(
 /// validated by the dialect's own `create_schema_sql`, which for BigQuery
 /// accepts hyphenated project IDs. An empty catalog gets the unqualified
 /// statement.
-fn branch_schema_statement(
+pub(crate) fn branch_schema_statement(
     dialect: &dyn rocky_core::traits::SqlDialect,
     branch_schema: &str,
     catalog: &str,

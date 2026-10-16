@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky run --branch` on Snowflake now creates the branch schema under the name the writes use (#2402). Before, `auto_create_schemas` ran an unquoted `CREATE SCHEMA DB.branch__x`, which Snowflake folds to `BRANCH__X`, and the models then wrote to the quoted `"DB"."branch__x"`, so the run failed with "schema not found". The branch schema is now created with both names quoted, the way `rocky preview create` does it. This covers transformation and replication pipelines. Other schemas keep the old statement. Not run against a live Snowflake account.
+
 ## [1.84.1] — 2026-10-16
 
 ### Fixed
