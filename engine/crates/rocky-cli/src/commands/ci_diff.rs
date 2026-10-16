@@ -980,7 +980,7 @@ pub(crate) enum BaseCompileError {
     /// There is no git history to compare against: the project is not inside
     /// a git work tree, `git` is not installed, or the repository has no
     /// commits yet.
-    #[error("no git history to read base ref '{base_ref}' from: {detail}")]
+    #[error("nothing in git to compare against for base ref '{base_ref}': {detail}")]
     NoHistory { base_ref: String, detail: String },
     /// The ref does not name a commit in this repository, for example a typo.
     #[error("base ref '{base_ref}' does not name a commit in this repository")]
