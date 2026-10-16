@@ -423,7 +423,9 @@ fn sigterm_on_a_stalled_model_exits_130_within_the_grace() {
 
     let signalled = Instant::now();
     sigterm(child.id());
-    // Grace (5 s) plus `main`'s blocking-pool wait (5 s), plus margin.
+    // The listener exits the process itself, so `main`'s blocking-pool wait
+    // does not apply: the bound is the 5 s grace. 15 s is only the give-up
+    // point; the latency is pinned below.
     let status = wait_exit(&mut child, Duration::from_secs(15));
     let latency = signalled.elapsed();
     if status.is_none() {
@@ -442,6 +444,10 @@ fn sigterm_on_a_stalled_model_exits_130_within_the_grace() {
         transcript.contains("did not settle within"),
         "the exit must come from the bounded grace.\nstderr:\n{transcript}"
     );
-    eprintln!("sigterm_on_a_stalled_model_exits_130_within_the_grace: exited {latency:?}");
+    assert!(
+        latency >= Duration::from_millis(4500) && latency < Duration::from_secs(9),
+        "the exit must come from the 5 s grace, not before it and not much after; got \
+         {latency:?}.\nstderr:\n{transcript}"
+    );
     drop(write_end);
 }

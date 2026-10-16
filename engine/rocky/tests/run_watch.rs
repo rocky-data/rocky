@@ -1048,6 +1048,16 @@ fn run_watch_signal_lets_the_iteration_settle_within_the_grace() {
 /// again" must still cut it short, as it always has.
 #[test]
 fn run_watch_second_sigint_during_the_settle_grace_terminates() {
+    second_signal_during_the_watch_grace(sigint);
+}
+
+/// A second SIGTERM gets the same treatment as a second SIGINT (#1606).
+#[test]
+fn run_watch_second_sigterm_during_the_settle_grace_terminates() {
+    second_signal_during_the_watch_grace(sigterm);
+}
+
+fn second_signal_during_the_watch_grace(second_signal: fn(u32)) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let source_path = dir.join(BLOCKING_SOURCE_FILE);
@@ -1118,7 +1128,7 @@ fn run_watch_second_sigint_during_the_settle_grace_terminates() {
         panic!("no settle notice after SIGTERM.\nstderr:\n{transcript}");
     }
     let second = Instant::now();
-    sigint(pid);
+    second_signal(pid);
     // Well under the five-second grace: the exit must come from the second
     // SIGINT, not from the grace running out.
     let outcome = wait_with_timeout(&mut child, Duration::from_secs(4));

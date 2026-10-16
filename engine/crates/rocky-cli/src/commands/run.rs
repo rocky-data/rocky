@@ -4059,6 +4059,11 @@ pub async fn run_with_explicit_contracts(
             print_json(&output)?;
             capture_run_output_for_test(&run_id, &output);
         }
+        // An interrupted run (#1606) exits 130 even with a hard `[budget]`
+        // breach: the cancel is what ended it.
+        if output.interrupted {
+            return Err(anyhow::Error::new(Interrupted));
+        }
         budget_result?;
         // Same run-status exit contract as the transformation path: a
         // model-only run (`rocky run --model <X>`) whose target failed to
@@ -6503,7 +6508,10 @@ pub async fn run_with_explicit_contracts(
     // settle grace (`run_cancel::SIGNAL_SETTLE_GRACE`): every committed
     // table's watermark is written only in that one batch, so cutting the
     // drain would make the next run re-append those deltas. The hold lives
-    // until the flush below (normal path) or the interrupted return.
+    // until the batch watermark flush, on the normal and the interrupted path
+    // alike. Under `--watch` it has no effect: the watch loop's own grace
+    // bounds the iteration, as it bounded nothing before #1606 (it dropped
+    // the iteration at once).
     let fan_out_hold = run_cancel.hold_unbounded();
     let mut interrupted = false;
 
@@ -6920,6 +6928,9 @@ pub async fn run_with_explicit_contracts(
                 );
             }
         }
+        // Watermarks are on disk; the rest of this settle (record, claim,
+        // checkpoint upload, hooks) is bounded by the settle grace again.
+        drop(fan_out_hold);
 
         // Diff: plan \ {Success|Failed|Skipped} → mark as Interrupted. Uses
         // the state store as source of truth for what already committed.

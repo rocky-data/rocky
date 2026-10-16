@@ -592,9 +592,39 @@ async fn stop_interrupted_iteration<F: std::future::Future>(
         "[watch] settling the interrupted run's state upload; press Ctrl-C again to terminate \
          without it"
     );
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("\n[watch] second SIGINT — terminating without the state upload");
+    // Either kind of signal escapes, as in `stop_iteration` (#1606). Streams
+    // registered now see only later signals.
+    #[cfg(unix)]
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let sigint = async {
+                match sigint.as_mut() {
+                    Some(stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let sigterm = async {
+                match sigterm.as_mut() {
+                    Some(stream) => stream.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                Some(()) = sigint => {}
+                Some(()) = sigterm => {}
+                else => std::future::pending::<()>().await,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        eprintln!("\n[watch] second signal — terminating without the state upload");
         std::process::exit(130);
     });
     sink.settle_all().await.context(
