@@ -5714,6 +5714,62 @@ mod tests {
         )
     }
 
+    /// The server's own store gate, taken for a test's DIRECT read of the
+    /// state file.
+    ///
+    /// `ServerState::with_auth` spawns an initial `recompile()`, which opens
+    /// the state file for the schema cache under `store_access`. A test that
+    /// opens the same file straight after a route answers races that
+    /// background open for redb's exclusive lock and can lose with `is busy`
+    /// (#2409). Taking the gate the server itself takes serialises the two.
+    ///
+    /// Hold it only around the direct read, and never across a request: a
+    /// request takes the same gate, so waiting on one while holding it
+    /// deadlocks.
+    async fn store_gate(state: &ServerState) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&state.store_access)
+            .acquire_owned()
+            .await
+            .expect("the store gate is open")
+    }
+
+    /// Pins [`store_gate`] to the gate the background compile takes (#2409).
+    ///
+    /// The race itself has a microsecond window and cannot be forced, so this
+    /// pins the mechanism that closes it. The initial `recompile()` reads the
+    /// state file under `store_access` BEFORE it publishes a compile result.
+    /// So while a test holds the gate, no result may appear (the compile is
+    /// queued, not holding the file) and a direct open of the file cannot
+    /// meet the server's. Once the gate is released, the compile finishes.
+    /// A `store_gate` that did not take the server's permit fails the first
+    /// assertion, because the compile would run and publish while it was
+    /// "held".
+    #[tokio::test]
+    async fn store_gate_holds_the_background_compile_off_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+
+        let state = pinned_server(simple_project_models(), None, &state_path);
+        let gate = store_gate(&state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            state.compile_result.read().await.is_none(),
+            "the background compile read the state file while the gate was held"
+        );
+        // Nothing else holds the file, so the direct open succeeds.
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        drop(gate);
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the compile finishes once the gate is released");
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let base = spawn_router(test_state()).await;
@@ -5997,19 +6053,18 @@ mod tests {
         // Approve once so the store holds records beside the spec file.
         crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
             .expect("approves");
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/products"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = product_list_in(&root, Some(&state_path)).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            product_list_in(&root, Some(&state_path)).unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
         let list: ProductListOutput = serde_json::from_str(&text).unwrap();
         assert_eq!(list.count, 1);
@@ -6024,7 +6079,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = product_status_in(&root, Some(&state_path), "revenue_daily").unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            product_status_in(&root, Some(&state_path), "revenue_daily").unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
 
         let resp = reqwest::get(format!("{base}/api/v1/products/nope"))
@@ -6222,12 +6280,8 @@ mod tests {
     async fn review_queue_matches_the_cli_modulo_the_clock() {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, [a, b, c]) = review_fixture(dir.path());
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config.clone()),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/review/queue"))
             .await
@@ -6251,8 +6305,10 @@ mod tests {
         // Pretty-printed with a trailing newline, like every canonical route.
         assert!(text.ends_with("}\n"), "{text}");
 
-        let expected =
-            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap()
+        };
         let (served_json, served_stale) = without_clock(served);
         let (expected_json, expected_stale) =
             without_clock(serde_json::to_value(&expected).unwrap());
@@ -6461,21 +6517,20 @@ mod tests {
             &serde_json::json!({ "models": ["orders"] }),
         )
         .expect("plan written");
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config.clone()),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/review/{gated}"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = crate::commands::compute_review(&root, &config, &gated, "HEAD", false)
-            .await
-            .expect("the core computes the same diff");
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_review(&root, &config, &gated, "HEAD", false)
+                .await
+                .expect("the core computes the same diff")
+        };
         assert_eq!(text, reference_bytes(&expected));
         let diff: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(diff["approved"], false, "the route must never approve");
@@ -6844,12 +6899,8 @@ mod tests {
     async fn brief_matches_the_cli_modulo_the_clock_and_never_moves_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, _) = governor_fixture(dir.path());
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config.clone()),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         for (since, mode) in [
             ("last", BriefSince::Last),
@@ -6869,8 +6920,10 @@ mod tests {
                 served["escalations"]["availability"], "available",
                 "{since}"
             );
-            let expected =
-                compute_brief(&root, &state_path, &config, mode, chrono::Utc::now()).unwrap();
+            let expected = {
+                let _gate = store_gate(&state).await;
+                compute_brief(&root, &state_path, &config, mode, chrono::Utc::now()).unwrap()
+            };
             let (served_json, served_at) = brief_without_clock(served);
             let (expected_json, expected_at) =
                 brief_without_clock(serde_json::to_value(&expected).unwrap());
@@ -6891,10 +6944,13 @@ mod tests {
         assert_eq!(served["since_mode"], "7d");
 
         // Three reads, one of them `last`: the cursor is still unset.
-        let cursor = rocky_core::state::StateStore::open_read_only(&state_path)
-            .unwrap()
-            .get_last_brief_at()
-            .unwrap();
+        let cursor = {
+            let _gate = store_gate(&state).await;
+            let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+            let cursor = store.get_last_brief_at().unwrap();
+            drop(store);
+            cursor
+        };
         assert!(
             cursor.is_none(),
             "a read must never advance the brief cursor: {cursor:?}"
@@ -6917,12 +6973,8 @@ mod tests {
     async fn scorecard_matches_the_cli_bytes_and_refuses_bad_queries() {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, _) = governor_fixture(dir.path());
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         for (by, dimension) in [
             ("principal", ScorecardDimension::Principal),
@@ -6934,7 +6986,10 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 200, "{by}");
             let text = resp.text().await.unwrap();
-            let expected = compute_audit_scorecard(&state_path, dimension, Some("all")).unwrap();
+            let expected = {
+                let _gate = store_gate(&state).await;
+                compute_audit_scorecard(&state_path, dimension, Some("all")).unwrap()
+            };
             assert_eq!(text, reference_bytes(&expected), "{by}");
             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(json["by"], by);
@@ -6947,8 +7002,10 @@ mod tests {
             .text()
             .await
             .unwrap();
-        let expected =
-            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
 
         let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?window=30d"))
@@ -6956,11 +7013,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let mut served: serde_json::Value = resp.json().await.unwrap();
-        let mut expected = serde_json::to_value(
+        let thirty_days = {
+            let _gate = store_gate(&state).await;
             compute_audit_scorecard(&state_path, ScorecardDimension::Principal, Some("30d"))
-                .unwrap(),
-        )
-        .unwrap();
+                .unwrap()
+        };
+        let mut expected = serde_json::to_value(thirty_days).unwrap();
         let served_start = served
             .as_object_mut()
             .unwrap()
@@ -7006,12 +7064,8 @@ mod tests {
     async fn custody_matches_the_cli_bytes_for_every_subject_kind() {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, [a, _b, _c]) = governor_fixture(dir.path());
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config.clone()),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
         let models = root.join("models");
 
         for (subject, kind, resolved) in [
@@ -7030,8 +7084,10 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 200, "{subject}");
             let text = resp.text().await.unwrap();
-            let expected =
-                compute_audit_for(&root, &config, &state_path, &models, subject).unwrap();
+            let expected = {
+                let _gate = store_gate(&state).await;
+                compute_audit_for(&root, &config, &state_path, &models, subject).unwrap()
+            };
             assert_eq!(text, reference_bytes(&expected), "{subject}");
             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(json["subject_kind"], kind, "{subject}");
@@ -7095,27 +7151,22 @@ mod tests {
             .unwrap();
         // A spec the loader rejects, beside the fixture's valid one.
         std::fs::write(root.join("products/broken.toml"), b"not = [toml").unwrap();
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        assert_eq!(
-            text,
-            reference_bytes(
-                &compute_audit(
-                    &state_path,
-                    None,
-                    &crate::commands::audit::AuditQuery::default()
-                )
-                .unwrap()
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit(
+                &state_path,
+                None,
+                &crate::commands::audit::AuditQuery::default(),
             )
-        );
+            .unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
         let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(whole.get("product").is_none(), "{text}");
         assert!(whole["decisions"].as_array().unwrap().len() >= 6, "{text}");
@@ -7126,17 +7177,16 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         let scope = resolve_product_scope(&root, "revenue_daily").unwrap();
-        assert_eq!(
-            text,
-            reference_bytes(
-                &compute_audit(
-                    &state_path,
-                    Some(scope),
-                    &crate::commands::audit::AuditQuery::default()
-                )
-                .unwrap()
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit(
+                &state_path,
+                Some(scope),
+                &crate::commands::audit::AuditQuery::default(),
             )
-        );
+            .unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
         let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(scoped["product"]["output_model"], "revenue_daily");
         assert_eq!(scoped["decisions"].as_array().unwrap().len(), 1, "{text}");
@@ -7207,12 +7257,8 @@ mod tests {
                 store.record_policy_decision(&r).unwrap();
             }
         }
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/audit?actor=alice&since=2026-10-01"))
             .await
@@ -7225,10 +7271,11 @@ mod tests {
             chrono::Utc::now(),
         )
         .unwrap();
-        assert_eq!(
-            text,
-            reference_bytes(&compute_audit(&state_path, None, &query).unwrap())
-        );
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit(&state_path, None, &query).unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
         let out: serde_json::Value = serde_json::from_str(&text).unwrap();
         let plans: Vec<&str> = out["decisions"]
             .as_array()
@@ -7260,37 +7307,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path) =
             crate::commands::product::tests::api_fixture_project(dir.path());
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
-            .unwrap()
-            .expect("known by its spec");
+        let expected = {
+            let _gate = store_gate(&state).await;
+            product_journal_in(&root, Some(&state_path), "revenue_daily")
+                .unwrap()
+                .expect("known by its spec")
+        };
         assert_eq!(text, reference_bytes(&expected));
         let empty: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(empty["count"], 0, "{text}");
         assert_eq!(empty["product_id"], "product:revenue_daily");
 
         // One approval appends one row, which the route shows byte for byte.
-        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
-            .expect("approved");
+        {
+            let _gate = store_gate(&state).await;
+            crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+                .expect("approved");
+        }
         let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
-            .unwrap()
-            .expect("known");
+        let expected = {
+            let _gate = store_gate(&state).await;
+            product_journal_in(&root, Some(&state_path), "revenue_daily")
+                .unwrap()
+                .expect("known")
+        };
         assert_eq!(text, reference_bytes(&expected));
         let one: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(one["count"], 1, "{text}");
@@ -7336,21 +7388,22 @@ mod tests {
     async fn audit_ledger_needs_a_bound_config_only_for_a_product() {
         let dir = tempfile::tempdir().unwrap();
         let (root, _config, state_path, _) = governor_fixture(dir.path());
-        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+        let state = pinned_server(root.join("models"), None, &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.text().await.unwrap(),
-            reference_bytes(
-                &compute_audit(
-                    &state_path,
-                    None,
-                    &crate::commands::audit::AuditQuery::default()
-                )
-                .unwrap()
+        let text = resp.text().await.unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit(
+                &state_path,
+                None,
+                &crate::commands::audit::AuditQuery::default(),
             )
-        );
+            .unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
 
         let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
             .await
@@ -7366,7 +7419,8 @@ mod tests {
     async fn governor_routes_need_a_bound_config_except_the_scorecard() {
         let dir = tempfile::tempdir().unwrap();
         let (root, _config, state_path, _) = governor_fixture(dir.path());
-        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+        let state = pinned_server(root.join("models"), None, &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
 
         for path in ["/api/v1/brief", "/api/v1/custody/orders"] {
             let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
@@ -7380,8 +7434,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected =
-            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
     }
 
@@ -9198,15 +9254,17 @@ mod tests {
     async fn schedule_status_matches_the_backing_output() {
         let (_dir, config_path, state) = scheduled_project();
         let state_path = state_path_for(&state);
-        let base = spawn_router(state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule")).await;
         let api = resp.json::<ScheduleStatusOutput>().await.unwrap();
 
         let rocky_dir = config_path.parent().unwrap().join(".rocky");
-        let reference =
+        let reference = {
+            let _gate = store_gate(&state).await;
             schedule_status_output(&config_path, &state_path, &rocky_dir, chrono::Utc::now())
-                .unwrap();
+                .unwrap()
+        };
         // `now` differs by the request latency; compare the stable parts.
         assert_eq!(api.timezone, reference.timezone);
         assert_eq!(api.counts.scheduled, reference.counts.scheduled);
@@ -10059,19 +10117,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (models_dir, config_path, state_path) = policy_project(dir.path());
         let state = pinned_server(models_dir, Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = get_retrying_on_busy(&format!("{base}/api/v1/policy")).await;
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
-        assert_eq!(
-            body,
-            reference_bytes(
-                &crate::commands::compute_policy_show(&config_path, &state_path)
-                    .await
-                    .unwrap()
-            )
-        );
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_policy_show(&config_path, &state_path)
+                .await
+                .unwrap()
+        };
+        assert_eq!(body, reference_bytes(&expected));
         assert!(body.contains("\"source\": \"ledger\""), "{body}");
         assert!(body.contains("incident 42"), "{body}");
         assert!(body.contains("\"id\": 0"), "{body}");
@@ -10099,19 +10156,18 @@ mod tests {
         std::fs::write(&config_path, &no_policy).unwrap();
 
         let state = pinned_server(models_dir, Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = get_retrying_on_busy(&format!("{base}/api/v1/policy")).await;
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
-        assert_eq!(
-            body,
-            reference_bytes(
-                &crate::commands::compute_policy_show(&config_path, &state_path)
-                    .await
-                    .unwrap()
-            )
-        );
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_policy_show(&config_path, &state_path)
+                .await
+                .unwrap()
+        };
+        assert_eq!(body, reference_bytes(&expected));
         assert!(
             body.contains("\"not_consulted\""),
             "neither source is consulted without a [policy] block: {body}"
@@ -10305,12 +10361,8 @@ mod tests {
             .expect("a snapshot without the tombstones table");
         std::fs::rename(&older, &state_path).expect("replace the store with the older shape");
 
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
         let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -10336,8 +10388,14 @@ mod tests {
         // `api::serve` runs before the router — a read-write open. This test
         // drives the router directly, so it calls the sweep itself; a server
         // started on this store would have migrated it before its first read.
-        let swept = sweep_interrupted_jobs(&state_path)
-            .expect("the startup sweep opens the store read-write and migrates it");
+        let swept = {
+            // The gate only orders this open after the server's background
+            // read-only open; the recompile never migrates, so the 409 -> 200
+            // transition below is still the sweep's doing.
+            let _gate = store_gate(&state).await;
+            sweep_interrupted_jobs(&state_path)
+                .expect("the startup sweep opens the store read-write and migrates it")
+        };
         assert_eq!(swept, 0, "nothing to sweep, but the open migrated");
         let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
         assert_eq!(resp.status(), 200, "after the migration the read answers");
@@ -11302,11 +11360,13 @@ mod tests {
         )
         .await;
         let cached = state.jobs.get("finished-scrub").await.unwrap();
-        let durable = rocky_core::state::StateStore::open(&path)
-            .unwrap()
-            .get_job("finished-scrub")
-            .unwrap()
-            .unwrap();
+        let durable = {
+            let _gate = store_gate(&state).await;
+            let store = rocky_core::state::StateStore::open(&path).unwrap();
+            let durable = store.get_job("finished-scrub").unwrap().unwrap();
+            drop(store);
+            durable
+        };
         assert_eq!(
             cached, durable,
             "cache and restart must serve the same record"
@@ -11551,10 +11611,12 @@ mod tests {
         let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
         cache_job(&state, record.clone()).await;
-        StateStore::open(&state_path)
-            .unwrap()
-            .record_job(&record)
-            .unwrap();
+        {
+            let _gate = store_gate(&state).await;
+            let store = StateStore::open(&state_path).unwrap();
+            store.record_job(&record).unwrap();
+            drop(store);
+        }
 
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/jobs/job_live"))
@@ -14399,18 +14461,17 @@ adapter = "db"
                     .unwrap();
             }
         }
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
         let resp = reqwest::get(format!("{base}/api/v1/branches"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = crate::commands::compute_branch_list(&state_path).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_branch_list(&state_path).unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
         let served: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(served["total"], 2, "{text}");

@@ -117,14 +117,24 @@ fn the_scaffold_refuses_to_compile_until_literal_escape_is_chosen_and_compiles_a
          for the adapter author instead of refusing (#1605)"
     );
     let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
-    assert!(
-        refusal_stderr.contains("pick LiteralEscape::Standard or LiteralEscape::Backslash"),
-        "the scaffold must fail with its OWN `compile_error!` message, not some \
-         other error. If this is a crate-loading error (E0460 / E0461 / E0463 / \
-         E0464 / E0514) the rlibs in {} are inconsistent — an environment \
-         problem, not a scaffold problem.\n--- rustc stderr ---\n{refusal_stderr}",
-        deps.display(),
-    );
+    if !refusal_stderr.contains("pick LiteralEscape::Standard or LiteralEscape::Backslash") {
+        assert!(
+            !is_crate_loading_failure(&refusal_stderr)
+                && !is_duplicate_crate_failure(&refusal_stderr),
+            "rustc could not build against a self-consistent set of rlibs from {}. \
+             That is an environment problem, not a scaffold problem: the directory \
+             holds rlibs from more than one build (a crate-loading error such as \
+             E0460 / E0461 / E0463 / E0464 / E0514, or a type that exists twice, \
+             such as E0053 \"found a different `T`\"). Re-run after a full \
+             `cargo build --tests`, or clear the stale artifacts.\n\
+             --- rustc stderr ---\n{refusal_stderr}",
+            deps.display(),
+        );
+        panic!(
+            "the scaffold must fail with its OWN `compile_error!` message, not some \
+             other error.\n--- rustc stderr ---\n{refusal_stderr}"
+        );
+    }
 
     // 3. Positive half — substitute exactly one variant and compile.
     //
@@ -258,17 +268,23 @@ fn is_duplicate_crate_failure(stderr: &str) -> bool {
     if stderr.contains("found a different `") {
         return true;
     }
-    // The other spelling, when the two instances are reached by different
-    // paths: "expected `rocky_ir::ir::ColumnSelection`, found
-    // `ColumnSelection`". One type named twice, so the last path segment
-    // agrees while the paths do not. A template naming a genuinely wrong type
-    // produces two DIFFERENT last segments, which is why the comparison is on
-    // the segment and not on the whole path.
+    // rustc's own note, when it knows the cause.
+    // The wording is in rustc's own binary (checked against 1.96).
+    if stderr.contains("there are multiple different versions of crate `") {
+        return true;
+    }
+    // The other spellings, when rustc omits "a different": the two instances
+    // are reached by different paths ("expected `rocky_ir::ir::ColumnSelection`,
+    // found `ColumnSelection`", or "expected `dep::DateTime<dep::Utc>`, found
+    // `DateTime<Utc>`"), or print identically. It is one type named twice, so
+    // the two agree once their path qualifiers are dropped. A template naming
+    // a genuinely wrong type produces two DIFFERENT types, which is why the
+    // comparison is on the unqualified type and not on the whole path.
     stderr.lines().any(|line| {
         let Some((expected, found)) = expected_and_found(line) else {
             return false;
         };
-        expected != found && last_path_segment(expected) == last_path_segment(found)
+        strip_paths(expected) == strip_paths(found)
     })
 }
 
@@ -281,11 +297,30 @@ fn expected_and_found(line: &str) -> Option<(&str, &str)> {
     Some((expected, found))
 }
 
-/// `rocky_ir::ir::ColumnSelection` -> `ColumnSelection`. Generic arguments are
-/// left alone: they carry the same ambiguity and comparing them whole is the
-/// conservative choice.
-fn last_path_segment(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
+/// Drops every `path::` qualifier from a rustc type, generic arguments
+/// included: `dep::DateTime<dep::Utc>` -> `DateTime<Utc>`.
+///
+/// Comparing only the last `::` segment of the whole string is wrong for a
+/// generic type, because the last segment of `dep::DateTime<dep::Utc>` is
+/// `Utc>`. Stripping the qualifier from every identifier avoids that.
+fn strip_paths(ty: &str) -> String {
+    let mut out = String::new();
+    let mut word = String::new();
+    let mut chars = ty.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+        } else if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            word.clear();
+        } else {
+            out.push_str(&word);
+            word.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(&word);
+    out
 }
 
 /// The directory holding this test binary — and every rlib the `rocky` binary
@@ -401,7 +436,7 @@ fn workspace_edition() -> &'static str {
 
 #[cfg(test)]
 mod classifier_tests {
-    use super::{is_crate_loading_failure, is_duplicate_crate_failure};
+    use super::{is_crate_loading_failure, is_duplicate_crate_failure, strip_paths};
 
     /// Real rustc output from a `deps/` holding two `chrono` rlibs — captured
     /// from the failure #1833 reports, which this test binary produced against
@@ -434,10 +469,56 @@ error[E0053]: method `literal_escape` has an incompatible type for trait
    |                                 ^^^^^^ expected `LiteralEscape`, found `String`
 ";
 
+    /// Real rustc output (a trait impl compiled against a second build of the
+    /// crate that defines its parameter type): a generic type whose two
+    /// instances print with and without the crate path. The old last-`::`
+    /// comparison read `Utc>` against `DateTime<Utc>` and called it a scaffold
+    /// bug (#2406).
+    const DUPLICATE_GENERIC_PATHS: &str = "\
+error[E0053]: method `f` has an incompatible type for trait
+ --> user.rs:1:52
+  |
+1 | struct S; impl mid::Dialect for S { fn f(&self, x: Option<&dep::DateTime<dep::Utc>>) {} }
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `dep::DateTime<dep::Utc>`, found `DateTime<Utc>`
+";
+
+    /// The same type printed identically on both sides.
+    const DUPLICATE_IDENTICAL: &str = "\
+error[E0053]: method `f` has an incompatible type for trait
+  |
+5 |     fn f(&self, x: &DateTime<Utc>) {}
+  |                    ^^^^^^^^^^^^^^ expected `DateTime<Utc>`, found `DateTime<Utc>`
+";
+
+    /// A genuine break in a generic signature: the types really differ.
+    const REAL_GENERIC_DRIFT: &str = "\
+error[E0053]: method `f` has an incompatible type for trait
+  |
+5 |     fn f(&self, x: Option<&String>) {}
+  |                    ^^^^^^^^^^^^^^^ expected `Option<&DateTime<Utc>>`, found `Option<&String>`
+";
+
     #[test]
-    fn a_duplicate_crate_is_recognised_in_both_spellings() {
+    fn a_duplicate_crate_is_recognised_in_every_spelling() {
         assert!(is_duplicate_crate_failure(DUPLICATE_CHRONO));
         assert!(is_duplicate_crate_failure(DUPLICATE_ROCKY_IR));
+        assert!(is_duplicate_crate_failure(DUPLICATE_GENERIC_PATHS));
+        assert!(is_duplicate_crate_failure(DUPLICATE_IDENTICAL));
+        assert!(is_duplicate_crate_failure(
+            "  = help: there are multiple different versions of crate `chrono` in the dependency graph"
+        ));
+    }
+
+    #[test]
+    fn a_real_generic_drift_is_not_blamed_on_the_environment() {
+        assert!(!is_duplicate_crate_failure(REAL_GENERIC_DRIFT));
+    }
+
+    #[test]
+    fn strip_paths_drops_qualifiers_inside_generics() {
+        assert_eq!(strip_paths("dep::DateTime<dep::Utc>"), "DateTime<Utc>");
+        assert_eq!(strip_paths("Option<&a::b::C>"), "Option<&C>");
+        assert_eq!(strip_paths("LiteralEscape"), "LiteralEscape");
     }
 
     #[test]
