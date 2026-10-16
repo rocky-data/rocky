@@ -218,7 +218,6 @@ fn latest_history_version(result: &QueryResult) -> AdapterResult<u64> {
     })
 }
 
-#[async_trait]
 /// `Ok` when `zone` (from `current_timezone()`) names UTC, else an error that
 /// tells the operator how to fix the SQL warehouse.
 fn watermark_zone_is_utc(zone: &str) -> AdapterResult<()> {
@@ -251,6 +250,7 @@ fn watermark_zone_is_utc(zone: &str) -> AdapterResult<()> {
     )))
 }
 
+#[async_trait]
 impl WarehouseAdapter for DatabricksWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
         &self.dialect
