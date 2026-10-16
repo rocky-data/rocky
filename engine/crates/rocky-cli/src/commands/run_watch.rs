@@ -439,19 +439,13 @@ pub async fn run_watch(
     }
 }
 
-/// How long a signalled iteration may take to stop and settle on its own
-/// before the watch loop drops it (#1606).
-///
-/// The iteration's run observes the cancellation token: it starts no new
-/// warehouse work and settles its run record, claim and state session. It
-/// cannot stop a statement already in flight, and nothing can cancel a
-/// `spawn_blocking` statement. So the wait is bounded, and a stalled iteration
-/// is then dropped exactly as before — crash parity, settled by
-/// [`stop_interrupted_iteration`]. Five seconds is well clear of a local
-/// settle, and with `main`'s five-second blocking-pool grace after it a stalled
-/// iteration still exits within ten — well inside Kubernetes' default
-/// 30-second termination grace.
-const SIGNAL_SETTLE_GRACE: Duration = Duration::from_secs(5);
+/// The grace a signalled iteration gets to stop and settle on its own before
+/// the loop drops it (#1606). The same constant as plain `rocky run`; see it
+/// for why the wait is bounded. Past it the iteration is dropped as before —
+/// crash parity, settled by [`stop_interrupted_iteration`] — and `main`'s
+/// five-second blocking-pool grace follows, so a stalled iteration exits
+/// within ten seconds.
+use super::run_cancel::SIGNAL_SETTLE_GRACE;
 
 /// What ended the wait on one watch iteration.
 enum IterStop {
@@ -467,7 +461,7 @@ enum IterStop {
 ///
 /// On a signal, cancel the iteration's token and give it
 /// [`SIGNAL_SETTLE_GRACE`] to stop and settle through its own terminal path
-/// (#1606). Past the grace, drop it as before. A second SIGINT during the
+/// (#1606). Past the grace, drop it as before. A second signal during the
 /// grace exits 130 at once.
 ///
 /// ```text
@@ -494,6 +488,9 @@ async fn stop_iteration<F: std::future::Future>(
             #[cfg(unix)]
             let mut second_sigint =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+            #[cfg(unix)]
+            let mut second_sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
             cancel.cancel();
             eprintln!(
                 "\n[watch] shutdown signal received — letting the run settle (up to {}s); press \
@@ -501,11 +498,25 @@ async fn stop_iteration<F: std::future::Future>(
                 SIGNAL_SETTLE_GRACE.as_secs()
             );
             let second = async {
+                // Either kind of signal counts as the second one.
                 #[cfg(unix)]
                 {
-                    match second_sigint.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
+                    let sigint = async {
+                        match second_sigint.as_mut() {
+                            Some(stream) => stream.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let sigterm = async {
+                        match second_sigterm.as_mut() {
+                            Some(stream) => stream.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        Some(()) = sigint => Some(()),
+                        Some(()) = sigterm => Some(()),
+                        else => None,
                     }
                 }
                 #[cfg(not(unix))]
@@ -523,7 +534,7 @@ async fn stop_iteration<F: std::future::Future>(
                     }
                 }
                 Some(()) = second => {
-                    eprintln!("\n[watch] second SIGINT — terminating");
+                    eprintln!("\n[watch] second signal — terminating");
                     std::process::exit(130);
                 }
             }

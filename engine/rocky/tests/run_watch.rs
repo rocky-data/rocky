@@ -1138,7 +1138,7 @@ fn run_watch_second_sigint_during_the_settle_grace_terminates() {
     };
     assert_eq!(status.code(), Some(130), "stderr:\n{transcript}");
     assert!(
-        transcript.contains("second SIGINT"),
+        transcript.contains("second signal"),
         "stderr:\n{transcript}"
     );
     drop(write_end);

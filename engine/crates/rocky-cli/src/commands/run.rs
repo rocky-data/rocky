@@ -6498,6 +6498,13 @@ pub async fn run_with_explicit_contracts(
     // `interrupted` and stop issuing new work. In-flight tasks drain naturally
     // so state updates remain consistent; anything not yet `Success` or
     // `Failed` in the state store after drain is marked `Interrupted`.
+    //
+    // The drain and the batch watermark flush after it are NOT bounded by the
+    // settle grace (`run_cancel::SIGNAL_SETTLE_GRACE`): every committed
+    // table's watermark is written only in that one batch, so cutting the
+    // drain would make the next run re-append those deltas. The hold lives
+    // until the flush below (normal path) or the interrupted return.
+    let fan_out_hold = run_cancel.hold_unbounded();
     let mut interrupted = false;
 
     // Freeze fence — ONE fresh LIST bounding the gate-to-copy window (the
@@ -7260,6 +7267,9 @@ pub async fn run_with_explicit_contracts(
             true
         }
     };
+    // The deferred watermarks are on disk: from here a cancel is bounded by
+    // the settle grace again.
+    drop(fan_out_hold);
 
     // --- Batch table tagging (concurrent, outside the main processing loop) ---
     // Tagging is dispatched through the GovernanceAdapter trait, so it works

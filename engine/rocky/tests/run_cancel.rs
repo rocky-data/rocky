@@ -367,12 +367,12 @@ fn sigterm_during_a_transformation_model_settles_the_run() {
     assert!(table_exists(&fx.dir, "after"));
 }
 
-/// The settle waits for the in-flight statement, so a second SIGINT must still
-/// be the operator's way out, as before #1606.
-#[test]
-fn a_second_sigint_still_terminates_a_cancelled_run_at_once() {
+/// Send `second` to a run that is settling with its statement stalled, and
+/// require exit 130 from that second signal, well before the settle grace
+/// (5 s) could end the wait on its own.
+fn second_signal_terminates(idempotency_key: &str, second: fn(u32)) {
     let fx = Fixture::new();
-    let (mut child, stderr, _stdout, write_end) = fx.spawn_run_blocked_on_the_fifo("k-1606-b");
+    let (mut child, stderr, _stdout, write_end) = fx.spawn_run_blocked_on_the_fifo(idempotency_key);
 
     sigterm(child.id());
     if let Err(t) = wait_for_line(&stderr, "shutdown signal received") {
@@ -381,19 +381,67 @@ fn a_second_sigint_still_terminates_a_cancelled_run_at_once() {
         panic!("no shutdown notice after SIGTERM (child: {status:?}).\nstderr:\n{t}");
     }
     // The statement stays in flight: `write_end` is held to the end.
-    sigint(child.id());
-    let status = wait_exit(&mut child, Duration::from_secs(30));
+    second(child.id());
+    let status = wait_exit(&mut child, Duration::from_secs(3));
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();
     }
     let transcript = drain(&stderr);
-    let status = status
-        .unwrap_or_else(|| panic!("a second SIGINT did not terminate.\nstderr:\n{transcript}"));
+    let status = status.unwrap_or_else(|| {
+        panic!("a second signal did not terminate within 3s.\nstderr:\n{transcript}")
+    });
     assert_eq!(status.code(), Some(130), "stderr:\n{transcript}");
     assert!(
-        transcript.contains("second SIGINT"),
-        "stderr:\n{transcript}"
+        transcript.contains("second signal"),
+        "the exit must come from the second signal, not the grace.\nstderr:\n{transcript}"
     );
+    drop(write_end);
+}
+
+/// The settle waits for the in-flight statement, so a second SIGINT must still
+/// be the operator's way out, as before #1606.
+#[test]
+fn a_second_sigint_still_terminates_a_cancelled_run_at_once() {
+    second_signal_terminates("k-1606-b", sigint);
+}
+
+/// A second SIGTERM is treated like a second SIGINT (#1606).
+#[test]
+fn a_second_sigterm_terminates_a_cancelled_run_at_once() {
+    second_signal_terminates("k-1606-c", sigterm);
+}
+
+/// SIGTERM stays prompt on a stalled model (#1606). Before, a transformation
+/// run had no listener and died at once. Now it gets the settle grace (5 s)
+/// to finish its statement and settle; a statement that never returns must
+/// not hold the exit past it.
+#[test]
+fn sigterm_on_a_stalled_model_exits_130_within_the_grace() {
+    let fx = Fixture::new();
+    let (mut child, stderr, _stdout, write_end) = fx.spawn_run_blocked_on_the_fifo("k-1606-d");
+
+    let signalled = Instant::now();
+    sigterm(child.id());
+    // Grace (5 s) plus `main`'s blocking-pool wait (5 s), plus margin.
+    let status = wait_exit(&mut child, Duration::from_secs(15));
+    let latency = signalled.elapsed();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let transcript = drain(&stderr);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "rocky run ignored SIGTERM for 15s with a stalled statement; the settle wait \
+             must be bounded.\nstderr:\n{transcript}"
+        )
+    });
+    assert_eq!(status.code(), Some(130), "stderr:\n{transcript}");
+    assert!(
+        transcript.contains("did not settle within"),
+        "the exit must come from the bounded grace.\nstderr:\n{transcript}"
+    );
+    eprintln!("sigterm_on_a_stalled_model_exits_130_within_the_grace: exited {latency:?}");
     drop(write_end);
 }
