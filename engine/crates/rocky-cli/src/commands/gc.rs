@@ -3316,6 +3316,116 @@ auto_create_schemas = true
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
     }
 
+    /// A configured `[policy]` block that ALLOWS gc still needs the review
+    /// marker. The test above runs with no config, so it never sees a
+    /// configured `allow`. Policy may only make the gc gate stricter: an
+    /// `allow` must not skip review before a deletion.
+    #[tokio::test]
+    async fn policy_allow_does_not_bypass_the_gc_review_marker() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+
+        // A compilable model, so a refusal below cannot come from the
+        // evaluator failing closed on a missing model.
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "name = \"orders\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+
+        // Allow gc for both principals: a gc plan is gated as `agent`
+        // (#2284), and the runtime principal here is `human`.
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "gc"
+scope = { any = true }
+effect = "allow"
+
+[[policy.rules]]
+principal = "human"
+capability = "gc"
+scope = { any = true }
+effect = "allow"
+"#,
+        )
+        .unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        }; // drop the store so the apply path can open its own write handle
+
+        let oracle: std::sync::Arc<dyn LivenessOracle> =
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable());
+
+        // Policy says `allow`, and the apply is still refused without a marker.
+        let err = run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+            oracle.clone(),
+        )
+        .await
+        .expect_err("a policy `allow` must not skip the gc review marker");
+        assert!(err.to_string().contains("not been reviewed"), "got: {err}");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            assert!(
+                store.list_tombstones().unwrap().is_empty(),
+                "nothing may be evicted under `allow` without a review marker"
+            );
+        }
+
+        // With the marker, the same plan applies. So the refusal above was
+        // the review gate, not a policy deny (a deny refuses a reviewed plan).
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
+        run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+            oracle,
+        )
+        .await
+        .expect("a reviewed plan under a policy `allow` must apply");
+
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(store.list_tombstones().unwrap().len(), 1);
+    }
+
     /// #2284: a `deny agent gc` rule refuses a gc plan even when nobody set
     /// `ROCKY_PRINCIPAL` (an unattended cron or daemon gc). The runtime
     /// principal here is `Human`, the floor; the plan KIND forces `agent`.

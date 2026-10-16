@@ -168,8 +168,8 @@ impl Default for ServeConfig {
 ///    `every_declared_route_is_registered_on_the_router` fails when the two
 ///    drift.
 ///
-/// A route registered with a non-safe method (`post`/`put`/`patch`/`delete`)
-/// is additionally counted by `router_registers_no_undeclared_mutating_route`,
+/// A route registered with any method is additionally counted by
+/// `router_registers_no_undeclared_route`,
 /// so it cannot land without appearing in [`api_v1_routes`] — which is what
 /// the read-scope test enumerates. The read-scope *guarantee* does not depend
 /// on either table: `rocky_server::auth` refuses on the HTTP method before
@@ -12039,7 +12039,7 @@ mod tests {
     ///
     /// - table → router: `every_declared_route_is_registered_on_the_router`
     ///   proves each declared entry is really served.
-    /// - router → table: `router_registers_no_undeclared_mutating_route`
+    /// - router → table: `router_registers_no_undeclared_route`
     ///   (below) narrows the other direction with a source-text count. It is
     ///   a heuristic, not a proof — its own doc lists what it cannot see.
     ///
@@ -12100,16 +12100,16 @@ mod tests {
         );
     }
 
-    /// **Bar item 1, router→table direction.** No mutating route may be
+    /// **Bar item 1, router→table direction.** No route of any method may be
     /// registered on `router()` without appearing in `api_v1_routes()` — the
-    /// table the test above enumerates.
+    /// table the test above enumerates. Until this guard counted `get(` too, a
+    /// new `GET` left out of the table failed no test.
     ///
     /// This is a **source-text guard, not a programmatic enumeration**: axum's
     /// `Router` has no public route iterator, so the honest thing to say is
     /// that this reads `router()`'s own source and counts. It fails when a new
-    /// `post`/`put`/`patch`/`delete` registration lands without a matching
-    /// declared entry, which is exactly "a new non-safe-method route appeared
-    /// without being considered".
+    /// registration of any method lands without a matching declared entry,
+    /// and separately when a new `post`/`put`/`patch`/`delete` does.
     ///
     /// It is deliberately count-based rather than a path parser: rustfmt is
     /// free to reflow `.route("...", post(handler))` across lines, which would
@@ -12130,7 +12130,7 @@ mod tests {
     /// The real enforcement is `rocky_server::auth`, which never reads this
     /// table or this file.
     #[test]
-    fn router_registers_no_undeclared_mutating_route() {
+    fn router_registers_no_undeclared_route() {
         let source = include_str!("api.rs");
         let start = source
             .find("pub fn router(state: Arc<ServerState>) -> Router {")
@@ -12233,9 +12233,28 @@ mod tests {
             unique.len(),
             all.len(),
             "api_v1_routes() must not repeat an entry — a duplicate would let \
-             an undeclared mutating route hide inside the count"
+             an undeclared route hide inside the count"
         );
 
+        // Every method, GET included. The read-scope test, the OpenAPI drift
+        // test and the declared→served probe all walk `api_v1_routes()`, so
+        // a GET registered here and not declared there is reached by none.
+        let registered_any: usize = ["get(", "post(", "put(", "patch(", "delete("]
+            .iter()
+            .map(|verb| body.matches(verb).count())
+            .sum();
+        assert_eq!(
+            registered_any,
+            all.len(),
+            "router() registers {registered_any} route(s) of any method but \
+             api_v1_routes() declares {}. An undeclared route is one no probe \
+             reaches — add it to api_v1_routes().",
+            all.len()
+        );
+
+        // The mutating count stays separate: the all-method count would still
+        // balance if a `get(` were swapped for a `post(` on the same path, and
+        // that swap changes what a read-scoped token may reach.
         // `declared_mutating_routes()` drops the webhook route, which IS a
         // registered `post(`, so add it back for the comparison.
         let declared = declared_mutating_routes().len() + 1;
