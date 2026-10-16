@@ -925,6 +925,10 @@ export interface FivetranStampedeConfig {
  */
 export interface AiSection {
   /**
+   * Base URL of the Anthropic-compatible API. Default `https://api.anthropic.com`; the request goes to `{base_url}/v1/messages`. Must be `https`, except for loopback hosts (`localhost`, `127.0.0.1`, `::1`). The `ROCKY_AI_BASE_URL` environment variable is the fallback when this key is unset.
+   */
+  base_url?: string | null;
+  /**
    * Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
    */
   max_tokens?: number;
