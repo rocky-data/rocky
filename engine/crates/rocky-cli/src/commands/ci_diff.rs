@@ -1219,6 +1219,10 @@ pub(crate) struct CiDiffData {
     /// distinguish "PR is empty" from "PR is non-empty but only touches
     /// non-model files".
     pub(crate) changed_file_count: usize,
+    /// Whether the diff reached the compile step. When it did, a `None`
+    /// `head_compile` means HEAD failed to compile, even if no model row
+    /// changed (a shared config edit can feed every model).
+    pub(crate) compiled: bool,
     /// Which snapshot was compared against the base.
     pub(crate) mode: CiDiffMode,
     /// The commit the base side was read from (the merge base of `base_ref`
@@ -1231,6 +1235,9 @@ impl CiDiffData {
     /// The incomplete-lineage list for this diff (#2397). See
     /// [`diff_incomplete_lineage`].
     pub(crate) fn incomplete_lineage(&self) -> Option<Vec<IncompleteLineageRecord>> {
+        if self.compiled && self.head_compile.is_none() {
+            return None;
+        }
         diff_incomplete_lineage(
             &self.results,
             self.head_compile.as_ref().map(|c| &c.semantic_graph),
@@ -1245,8 +1252,9 @@ impl CiDiffData {
 ///
 /// A removed model has no HEAD schema, so the models downstream of it are
 /// read from the base graph and then looked up on HEAD. `Some([])` when no
-/// model changed. `None` when models changed but HEAD did not compile: the
-/// answer is unknown, not "complete".
+/// model changed. `None` when models changed but HEAD did not compile, or a
+/// model was removed and the base side did not compile: the answer is
+/// unknown, not "complete".
 pub(crate) fn diff_incomplete_lineage(
     results: &[DiffResult],
     head: Option<&rocky_compiler::semantic::SemanticGraph>,
@@ -1262,9 +1270,10 @@ pub(crate) fn diff_incomplete_lineage(
     let head = head?;
     let mut models: HashSet<String> = HashSet::new();
     for result in changed {
-        let graph = match (result.status, base) {
-            (ModelDiffStatus::Removed, Some(base)) => base,
-            _ => head,
+        let graph = match result.status {
+            // Its downstream models are known only on the base side.
+            ModelDiffStatus::Removed => base?,
+            ModelDiffStatus::Added | ModelDiffStatus::Modified | ModelDiffStatus::Unchanged => head,
         };
         models.extend(super::lineage::reachable_models(
             graph,
@@ -1353,6 +1362,7 @@ pub(crate) fn compute_ci_diff_in(
             head_compile: None,
             base_compile: None,
             changed_file_count,
+            compiled: false,
             mode,
             base_commit,
         });
@@ -1388,6 +1398,7 @@ pub(crate) fn compute_ci_diff_in(
             head_compile: None,
             base_compile: None,
             changed_file_count,
+            compiled: false,
             mode,
             base_commit,
         });
@@ -1450,6 +1461,7 @@ pub(crate) fn compute_ci_diff_in(
         head_compile,
         base_compile,
         changed_file_count,
+        compiled: true,
         mode,
         base_commit,
     })
@@ -2410,6 +2422,39 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(diff_incomplete_lineage(&results, None, None), None);
+        // A removed model with no base compile: its downstream is unknown.
+        assert_eq!(
+            diff_incomplete_lineage(
+                &[diff_row("gone", ModelDiffStatus::Removed)],
+                Some(&head_compile.semantic_graph),
+                None
+            ),
+            None
+        );
+    }
+
+    /// #2397: a shared config edit reaches the compile step with no model
+    /// row. When HEAD then fails to compile, the list is unknown (`None`),
+    /// not "none" (`[]`).
+    #[test]
+    fn e2e_incomplete_lineage_is_unknown_when_head_does_not_compile() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("a.sql", "SELECT 1 AS id\n"),
+                ("a.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        fs::write(models_dir.join("_defaults.toml"), "this is not = = toml\n").unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-q", "-m", "break defaults"]);
+
+        let data = compute_in(dir, &models_dir);
+        assert!(data.compiled, "a models-root change compiles");
+        assert!(data.head_compile.is_none(), "HEAD must fail to compile");
+        assert_eq!(data.incomplete_lineage(), None);
     }
 
     fn write_model_with_identity(
