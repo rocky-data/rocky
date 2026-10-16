@@ -379,21 +379,14 @@ pub fn run_lineage(
     Ok(())
 }
 
-/// The models a model view of `model_name` shows: itself and the models it
-/// reads or that read it directly.
+/// The models a model view of `model_name` reads through: the same scope as
+/// a column trace (itself, every model upstream and downstream of it), so it
+/// covers the transitive `consumers` the view also lists.
 fn model_view_models(
     graph: &rocky_compiler::semantic::SemanticGraph,
     model_name: &str,
 ) -> Vec<IncompleteLineageRecord> {
-    let Some(schema) = graph.model_schema(model_name) else {
-        return Vec::new();
-    };
-    incomplete_lineage(
-        graph,
-        std::iter::once(model_name)
-            .chain(schema.upstream.iter().map(String::as_str))
-            .chain(schema.downstream.iter().map(String::as_str)),
-    )
+    column_view_models(graph, model_name)
 }
 
 /// Side-effect-free core producing the model-level [`LineageOutput`] (the
@@ -685,11 +678,18 @@ mod tests {
             "{json:#}"
         );
 
-        // The model view of c names c; of a, nothing (its direct neighbours
-        // are clean). Both are written, so `[]` is distinct from absent.
-        let view = lineage_output(&result, "c").unwrap();
-        assert_eq!(view.incomplete_lineage.as_deref().map(<[_]>::len), Some(1));
+        // The model view of a covers c two hops downstream, as its
+        // `consumers` list does.
         let view = lineage_output(&result, "a").unwrap();
+        assert_eq!(view.incomplete_lineage.as_deref().map(<[_]>::len), Some(1));
+        // A clean chain is written as `[]`, distinct from an absent field.
+        let clean = TempDir::new().unwrap();
+        let clean_dir = clean.path().join("models");
+        std::fs::create_dir_all(&clean_dir).unwrap();
+        write_model(&clean_dir, "a", "SELECT id FROM source.raw.users");
+        write_model(&clean_dir, "b", "SELECT id FROM a");
+        let clean_result = compile_chain(&clean_dir);
+        let view = lineage_output(&clean_result, "a").unwrap();
         assert_eq!(view.incomplete_lineage, Some(Vec::new()));
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["incomplete_lineage"], serde_json::json!([]));

@@ -3907,8 +3907,8 @@ pub struct LineageOutput {
     /// models, so they are not part of `downstream`. Omitted when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<LineageConsumerRecord>,
-    /// Models in this view (the focal model and the models it reads or that
-    /// read it) whose lineage is known to be incomplete, sorted by name
+    /// Models in this view (the focal model and every model upstream and
+    /// downstream of it) whose lineage is known to be incomplete, sorted by name
     /// (#2377). Impact through them may be under-reported. `[]` means none.
     ///
     /// Always written. A payload with no such field comes from an older

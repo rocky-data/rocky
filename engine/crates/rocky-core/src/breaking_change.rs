@@ -929,6 +929,11 @@ fn is_type_narrowing(old: &RockyType, new: &RockyType) -> bool {
             true
         }
         (Timestamp | TimestampNtz, Date) => true,
+        // A decimal with unclaimed digits (#2356) may hold values a sized
+        // decimal, an integer or a 32-bit float cannot. The reverse, a sized
+        // decimal becoming unsized, keeps every value a decimal.
+        (DecimalUnsized, Decimal { .. } | Int32 | Int64 | Float32) => true,
+        (Decimal { .. }, DecimalUnsized) => false,
         (Array(_) | Map(..) | Struct(_) | Variant, _) if !matches!(new, Variant) => true,
         _ => false,
     }
@@ -946,6 +951,26 @@ mod tests {
         SourceRef, TargetRef, TypedColumn,
     };
     use std::sync::Arc;
+
+    /// #2356: a decimal with unclaimed digits becoming sized (or an
+    /// integer) can lose values; a sized decimal becoming unsized cannot.
+    #[test]
+    fn decimal_unsized_narrowing_is_one_way() {
+        let sized = RockyType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        assert!(is_type_narrowing(&RockyType::DecimalUnsized, &sized));
+        assert!(is_type_narrowing(
+            &RockyType::DecimalUnsized,
+            &RockyType::Int64
+        ));
+        assert!(!is_type_narrowing(&sized, &RockyType::DecimalUnsized));
+        assert!(!is_type_narrowing(
+            &RockyType::DecimalUnsized,
+            &RockyType::Float64
+        ));
+    }
 
     fn typed_col(name: &str, ty: RockyType, nullable: bool) -> TypedColumn {
         TypedColumn {

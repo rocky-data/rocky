@@ -173,4 +173,18 @@ fn plan_and_run_report_the_same_override_match_counts() {
     let expected = vec![(0, 0), (1, 0), (2, 0)];
     assert_eq!(counts(&json(&plan, "plan --filter")), expected);
     assert_eq!(counts(&json(&run, "run --filter")), expected);
+
+    // `--filter table=` keeps one table: only it counts, still before the
+    // missing-from-source exclusion.
+    let plan = rocky(
+        dir.path(),
+        &["-o", "json", "plan", "--filter", "table=order_items"],
+    );
+    let run = rocky(
+        dir.path(),
+        &["-o", "json", "run", "--filter", "table=order_items"],
+    );
+    let expected = vec![(0, 1), (1, 1), (2, 0)];
+    assert_eq!(counts(&json(&plan, "plan --filter table=")), expected);
+    assert_eq!(counts(&json(&run, "run --filter table=")), expected);
 }

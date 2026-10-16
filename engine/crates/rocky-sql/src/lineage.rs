@@ -182,7 +182,8 @@ pub enum LineageGap {
     /// A window named after another named window. Its keys are not resolved.
     NestedNamedWindow,
     /// A relation the extractor does not read: `PIVOT`, `UNNEST`, a table
-    /// function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.
+    /// function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a
+    /// `VALUES` body.
     UnmodelledRelation,
     /// A column whose table cannot be determined statically (an unqualified
     /// column in a multi-table query). Its edge is dropped.
@@ -557,6 +558,11 @@ fn select_gaps(select: &Select, role: QueryRole, gaps: &mut BTreeSet<LineageGap>
 
     for table in &select.from {
         table_with_joins_gaps(table, gaps);
+    }
+    // `LATERAL VIEW explode(...)` (Databricks, Hive) and `CONNECT BY`: the
+    // extractor reads neither, so their columns and keys have no edge.
+    if !select.lateral_views.is_empty() || !select.connect_by.is_empty() {
+        gaps.insert(LineageGap::UnmodelledRelation);
     }
 
     // Subquery expressions anywhere in this SELECT except its FROM, which
@@ -2148,6 +2154,10 @@ mod tests {
             ),
             (
                 "SELECT id FROM range(10) AS r",
+                LineageGap::UnmodelledRelation,
+            ),
+            (
+                "SELECT id, tag FROM raw.t LATERAL VIEW EXPLODE(tags) x AS tag",
                 LineageGap::UnmodelledRelation,
             ),
             (

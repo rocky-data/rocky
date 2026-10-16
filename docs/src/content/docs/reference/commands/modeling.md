@@ -446,8 +446,9 @@ When a model uses one of the constructs above, its lineage is missing edges, and
 ]
 ```
 
-- For a model view, the list covers the model and the models it reads or that read it directly.
-- For a column trace (upstream or `--downstream`), it covers the model and every model upstream and downstream of it. It follows model dependencies, not column edges, so a reader that joins with `NATURAL JOIN` is listed even though no column edge reaches it.
+- It covers the model and every model upstream and downstream of it, for a model view and for a column trace (upstream or `--downstream`).
+- It follows model dependencies, not column edges, so a reader that joins with `NATURAL JOIN` is listed even though no column edge reaches it.
+- `rocky lineage-diff` and `rocky ci-diff` do not read this signal yet.
 - The table output prints the same models under a `Lineage incomplete` heading.
 
 `gaps` names each construct: `natural_join`, `group_by_all`, `set_operation`, `cte_body_row_selection`, `derived_table_row_selection`, `subquery_expression`, `nested_named_window`, `unmodelled_relation` (`PIVOT`, `UNNEST`, a table function, `VALUES`), `unattributed_column` (an unqualified column in a multi-table query), `unresolved_projection`, and `unresolved_star` (a `SELECT *` over a relation with unknown columns). An empty list (`[]`) means no model in scope has a known gap. A missing field, or `gaps: null`, means Rocky did not compute it: treat that as possibly incomplete, never as complete.
