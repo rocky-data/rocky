@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.84.1] — 2026-10-16
+
 ### Fixed
 
 - `rocky preview create` now creates the branch schema in every catalog the branch writes to (#2389). Before, it created the schema only in the connection's default catalog, so a model in another catalog failed with `copy_strategy: "failed"`. On Databricks, Snowflake, BigQuery and Spark it now runs one `CREATE SCHEMA IF NOT EXISTS <catalog>.<branch schema>` per distinct model catalog (copy set and prune set), before any copy, with both names quoted the way the clone quotes them. The role needs `CREATE SCHEMA` in every model catalog. If one catalog refuses, only its models are `failed`; the others still copy. Warehouses whose clone ignores the catalog (DuckDB, Postgres, Trino and others) behave as before. A catalog used only by pruned models that refuses the create is logged as a warning; the JSON output has no field for it.
