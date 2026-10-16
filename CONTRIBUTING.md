@@ -243,6 +243,7 @@ CI is path-filtered. The paths your PR touches decide which workflows run. Every
 | `.agents/skills/**` or `.claude/skills/**` (root, `engine/`, `editors/vscode/`) | `skills-mirror-drift.yml` | diffs each `.agents/skills` tree against its `.claude/skills` twin and fails unless every pair is byte-identical |
 | `engine/**`, `schemas/**`, `justfile`, `examples/playground/pocs/**`, or a generated binding | `codegen-drift.yml` | re-runs `just codegen` and `just regen-fixtures`, then fails on any diff |
 | `examples/playground/pocs/**` | `poc-counts-drift.yml` | recounts the POCs and fails on any diff |
+| every PR to `main` | `attribution-gate.yml` | fails if the PR title, body or a commit message carries an agent attribution line, an agent session trailer, or an agent session link |
 | `engine/evals/**` or `engine/crates/rocky-mcp/**` | `engine-evals.yml` | the eval harness self-test and the structured-error contract |
 | the recipe-manifest surface (`rocky-verify`, `recipe_identity.rs`, `history.rs`, `examples/audit-sample/**`) | `manifest-conformance.yml` | builds `rocky` and `rocky-verify`, then runs the conformance script |
 

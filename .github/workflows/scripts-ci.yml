@@ -23,6 +23,7 @@ on:
       # accidentally satisfy the gate), should still run the test that
       # guards it (#1938).
       - ".github/workflows/changelog-gate.yml"
+      - ".github/workflows/attribution-gate.yml"
       - ".github/PULL_REQUEST_TEMPLATE.md"
   push:
     branches: [main]
@@ -106,6 +107,19 @@ jobs:
         # GitHub Actions runner.
         run: bash scripts/tests/changelog-gate.test.sh
 
+  attribution-gate-decision:
+    name: Attribution-gate decision logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin which PR titles, bodies and commits the attribution gate refuses
+        # attribution-gate.yml is PR-triggered and cannot run locally, so
+        # this exercises the script it calls against fixture text.
+        run: bash scripts/tests/attribution-gate.test.sh
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
@@ -117,7 +131,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).

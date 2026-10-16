@@ -1,0 +1,53 @@
+name: attribution-gate
+
+# Fails a pull request whose title, body or commit messages carry agent
+# attribution: a "Generated with/by" agent line, an agent session trailer,
+# an agent co-author trailer, or a link to an agent session site. The repo is
+# public, and a squash merge copies commit messages onto main, where a leaked
+# line cannot be removed without rewriting history. Some agent tools append
+# these lines on their own, so the written rule in AGENTS.md ("Git
+# conventions") needs this backstop. Logic: scripts/attribution_gate.sh,
+# pinned by scripts/tests/attribution-gate.test.sh.
+
+on:
+  # `edited` re-runs the gate when the title or body is fixed, without a new
+  # commit. No `paths:` filter: every PR is checked, so the check is never
+  # absent (an absent required check blocks a merge forever, #1563).
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Check for agent attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the PR's own commits are HEAD^1..HEAD^2 of the
+          # test-merge commit `pull_request` checks out, and a shallow clone
+          # cannot resolve that range. No token is used (credential
+          # containment policy: a candidate job consumes no GitHub token).
+          fetch-depth: 0
+
+      - name: Check the PR title, body and commit messages
+        env:
+          # Read via env vars, never interpolated into the script: the title
+          # and body are attacker-controlled text.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          COMMITS_FILE="$(mktemp)"
+          export COMMITS_FILE
+          git log --format=%B HEAD^1..HEAD^2 > "$COMMITS_FILE"
+          bash scripts/attribution_gate.sh
