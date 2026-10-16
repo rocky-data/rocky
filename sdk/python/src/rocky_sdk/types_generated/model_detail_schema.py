@@ -72,14 +72,24 @@ class RockyType2(BaseModel):
     Decimal_1: Decimal = Field(..., alias="Decimal")
 
 
-class RockyType3(StrEnum):
+class DecimalUnsized(BaseModel):
+    scale: conint(ge=0, le=255) | None = None
     """
-    A decimal whose precision and scale Rocky cannot bound (#2356).
-
-    The value is an exact decimal, but its digits depend on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. Rocky keeps the type family so a bare `Decimal` contract is still checked, and does not claim digits it cannot prove, so a `Decimal(p,s)` contract is reported as not checked.
+    The scale, when every warehouse agrees on it. `None` when it differs by warehouse too, as for a bare `CAST(x AS DECIMAL)`.
     """
 
-    DecimalUnsized = "DecimalUnsized"
+
+class RockyType3(BaseModel):
+    """
+    A decimal whose precision Rocky cannot bound (#2356), and whose scale it may know (#2398).
+
+    The value is an exact decimal, but its precision depends on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. The scale is the same on both, so it is kept. Rocky keeps the type family so a bare `Decimal` contract is still checked, and a `Decimal(p,s)` contract with another scale is a mismatch. The precision it does not claim, so a `Decimal(p,s)` contract with the same scale is reported as not checked.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    DecimalUnsized_1: DecimalUnsized = Field(..., alias="DecimalUnsized")
 
 
 class RockyType4(StrEnum):

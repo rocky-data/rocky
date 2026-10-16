@@ -63,11 +63,29 @@
           "type": "object"
         },
         {
-          "description": "A decimal whose precision and scale Rocky cannot bound (#2356).\n\nThe value is an exact decimal, but its digits depend on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. Rocky keeps the type family so a bare `Decimal` contract is still checked, and does not claim digits it cannot prove, so a `Decimal(p,s)` contract is reported as not checked.",
-          "enum": [
+          "additionalProperties": false,
+          "description": "A decimal whose precision Rocky cannot bound (#2356), and whose scale it may know (#2398).\n\nThe value is an exact decimal, but its precision depends on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. The scale is the same on both, so it is kept. Rocky keeps the type family so a bare `Decimal` contract is still checked, and a `Decimal(p,s)` contract with another scale is a mismatch. The precision it does not claim, so a `Decimal(p,s)` contract with the same scale is reported as not checked.",
+          "properties": {
+            "DecimalUnsized": {
+              "properties": {
+                "scale": {
+                  "description": "The scale, when every warehouse agrees on it. `None` when it differs by warehouse too, as for a bare `CAST(x AS DECIMAL)`.",
+                  "format": "uint8",
+                  "maximum": 255.0,
+                  "minimum": 0.0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
             "DecimalUnsized"
           ],
-          "type": "string"
+          "type": "object"
         },
         {
           "description": "Timestamp with timezone.",

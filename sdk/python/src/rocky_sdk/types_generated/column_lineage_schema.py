@@ -8,7 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
-class LineageGap1(StrEnum):
+class LineageGap12(StrEnum):
     """
     A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.
     """
@@ -16,7 +16,7 @@ class LineageGap1(StrEnum):
     natural_join = "natural_join"
 
 
-class LineageGap2(StrEnum):
+class LineageGap13(StrEnum):
     """
     `GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.
     """
@@ -24,7 +24,7 @@ class LineageGap2(StrEnum):
     group_by_all = "group_by_all"
 
 
-class LineageGap3(StrEnum):
+class LineageGap14(StrEnum):
     """
     A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.
     """
@@ -32,7 +32,7 @@ class LineageGap3(StrEnum):
     set_operation = "set_operation"
 
 
-class LineageGap4(StrEnum):
+class LineageGap15(StrEnum):
     """
     A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.
     """
@@ -40,7 +40,7 @@ class LineageGap4(StrEnum):
     cte_body_row_selection = "cte_body_row_selection"
 
 
-class LineageGap5(StrEnum):
+class LineageGap16(StrEnum):
     """
     A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).
     """
@@ -48,7 +48,7 @@ class LineageGap5(StrEnum):
     derived_table_row_selection = "derived_table_row_selection"
 
 
-class LineageGap6(StrEnum):
+class LineageGap17(StrEnum):
     """
     A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.
     """
@@ -56,7 +56,7 @@ class LineageGap6(StrEnum):
     subquery_expression = "subquery_expression"
 
 
-class LineageGap7(StrEnum):
+class LineageGap18(StrEnum):
     """
     A window named after another named window. Its keys are not resolved.
     """
@@ -64,7 +64,7 @@ class LineageGap7(StrEnum):
     nested_named_window = "nested_named_window"
 
 
-class LineageGap8(StrEnum):
+class LineageGap19(StrEnum):
     """
     A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a `VALUES` body.
     """
@@ -72,7 +72,7 @@ class LineageGap8(StrEnum):
     unmodelled_relation = "unmodelled_relation"
 
 
-class LineageGap9(StrEnum):
+class LineageGap20(StrEnum):
     """
     A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.
     """
@@ -80,7 +80,7 @@ class LineageGap9(StrEnum):
     unattributed_column = "unattributed_column"
 
 
-class LineageGap10(StrEnum):
+class LineageGap21(StrEnum):
     """
     A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).
     """
@@ -88,7 +88,7 @@ class LineageGap10(StrEnum):
     unresolved_projection = "unresolved_projection"
 
 
-class LineageGap11(StrEnum):
+class LineageGap22(StrEnum):
     """
     A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.
     """
@@ -131,17 +131,17 @@ class IncompleteLineageRecord(BaseModel):
 
     gaps: (
         list[
-            LineageGap1
-            | LineageGap2
-            | LineageGap3
-            | LineageGap4
-            | LineageGap5
-            | LineageGap6
-            | LineageGap7
-            | LineageGap8
-            | LineageGap9
-            | LineageGap10
-            | LineageGap11
+            LineageGap12
+            | LineageGap13
+            | LineageGap14
+            | LineageGap15
+            | LineageGap16
+            | LineageGap17
+            | LineageGap18
+            | LineageGap19
+            | LineageGap20
+            | LineageGap21
+            | LineageGap22
         ]
         | None
     ) = None

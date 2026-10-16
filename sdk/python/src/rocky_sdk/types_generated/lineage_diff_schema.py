@@ -124,6 +124,94 @@ class LineageConsumerImpact(BaseModel):
     """
 
 
+class LineageGap34(StrEnum):
+    """
+    A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.
+    """
+
+    natural_join = "natural_join"
+
+
+class LineageGap35(StrEnum):
+    """
+    `GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.
+    """
+
+    group_by_all = "group_by_all"
+
+
+class LineageGap36(StrEnum):
+    """
+    A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.
+    """
+
+    set_operation = "set_operation"
+
+
+class LineageGap37(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.
+    """
+
+    cte_body_row_selection = "cte_body_row_selection"
+
+
+class LineageGap38(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).
+    """
+
+    derived_table_row_selection = "derived_table_row_selection"
+
+
+class LineageGap39(StrEnum):
+    """
+    A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.
+    """
+
+    subquery_expression = "subquery_expression"
+
+
+class LineageGap40(StrEnum):
+    """
+    A window named after another named window. Its keys are not resolved.
+    """
+
+    nested_named_window = "nested_named_window"
+
+
+class LineageGap41(StrEnum):
+    """
+    A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a `VALUES` body.
+    """
+
+    unmodelled_relation = "unmodelled_relation"
+
+
+class LineageGap42(StrEnum):
+    """
+    A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.
+    """
+
+    unattributed_column = "unattributed_column"
+
+
+class LineageGap43(StrEnum):
+    """
+    A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).
+    """
+
+    unresolved_projection = "unresolved_projection"
+
+
+class LineageGap44(StrEnum):
+    """
+    A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.
+    """
+
+    unresolved_star = "unresolved_star"
+
+
 class LineageQualifiedColumn(BaseModel):
     column: str
     model: str
@@ -159,6 +247,36 @@ class ModelDiffStatus8(StrEnum):
     """
 
     removed = "removed"
+
+
+class IncompleteLineageRecord(BaseModel):
+    """
+    A model whose column lineage is known to be incomplete (#2377).
+    """
+
+    gaps: (
+        list[
+            LineageGap34
+            | LineageGap35
+            | LineageGap36
+            | LineageGap37
+            | LineageGap38
+            | LineageGap39
+            | LineageGap40
+            | LineageGap41
+            | LineageGap42
+            | LineageGap43
+            | LineageGap44
+        ]
+        | None
+    ) = None
+    """
+    The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).
+    """
+    model: str
+    """
+    The model.
+    """
 
 
 class LineageColumnChange(BaseModel):
@@ -219,6 +337,12 @@ class LineageDiffOutput(BaseModel):
     head_ref: str
     """
     Git ref for the incoming changes (typically `HEAD`).
+    """
+    incomplete_lineage: list[IncompleteLineageRecord] | None = None
+    """
+    Models whose lineage is known to be incomplete (#2377), among the changed models and every model downstream of them on HEAD, sorted by name (#2397). Impact through them may be under-reported. A removed model's downstream is read from the base side. `[]` means none.
+
+    `None` (`null`) when it is not known: models changed but the HEAD side did not compile. A payload with no such field comes from an older build: read it as unknown, never as complete.
     """
     markdown: str
     """

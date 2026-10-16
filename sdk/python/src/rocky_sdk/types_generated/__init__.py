@@ -223,6 +223,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ImportDbtHookKind": ("import_dbt_schema", "ImportDbtHookKind"),
     "ImportDbtOutput": ("import_dbt_schema", "ImportDbtOutput"),
     "ImportDbtWarning": ("import_dbt_schema", "ImportDbtWarning"),
+    "IncompleteLineageRecord": ("lineage_schema", "IncompleteLineageRecord"),
     "JobStatus": ("job_status_schema", "JobStatus"),
     "LineageColumnChange": ("lineage_diff_schema", "LineageColumnChange"),
     "LineageColumnDef": ("lineage_schema", "LineageColumnDef"),
@@ -522,6 +523,7 @@ if TYPE_CHECKING:
         RecipeHistoryOutput,
     )
     from .lineage_schema import (
+        IncompleteLineageRecord,
         LineageColumnDef,
         LineageEdgeRecord,
         LineageOutput,
@@ -1141,6 +1143,7 @@ __all__ = [
     "LineageColumnChange",
     "LineageDiffOutput",
     "LineageDiffResult",
+    "IncompleteLineageRecord",
     "CollisionCandidateOutput",
     "ResolvedCheckNameOutput",
     "BudgetBreachOutput",

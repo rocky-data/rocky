@@ -120,6 +120,7 @@ export type {
   LineageColumnDef,
   LineageEdgeRecord,
   LineageQualifiedColumn,
+  IncompleteLineageRecord,
 } from "./lineage";
 
 // Compile (canonical source for Diagnostic, Severity, SourceSpan, PhaseTimings,

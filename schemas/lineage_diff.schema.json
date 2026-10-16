@@ -117,6 +117,29 @@
       ],
       "type": "object"
     },
+    "IncompleteLineageRecord": {
+      "description": "A model whose column lineage is known to be incomplete (#2377).",
+      "properties": {
+        "gaps": {
+          "description": "The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).",
+          "items": {
+            "$ref": "#/definitions/LineageGap"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
     "LineageColumnChange": {
       "description": "Per-column structural change augmented with downstream consumers.",
       "properties": {
@@ -218,6 +241,88 @@
       ],
       "type": "object"
     },
+    "LineageGap": {
+      "description": "A construct whose lineage Rocky does not record, so a model that uses it has known-incomplete lineage (#2377).\n\nImpact analysis (`rocky lineage --downstream`, the blast radius) can then under-report: an edge the construct implies is missing. The list is what the extractor knows it skips. It is not a proof that everything else is traced.",
+      "oneOf": [
+        {
+          "description": "A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.",
+          "enum": [
+            "natural_join"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.",
+          "enum": [
+            "group_by_all"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.",
+          "enum": [
+            "set_operation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.",
+          "enum": [
+            "cte_body_row_selection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).",
+          "enum": [
+            "derived_table_row_selection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.",
+          "enum": [
+            "subquery_expression"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A window named after another named window. Its keys are not resolved.",
+          "enum": [
+            "nested_named_window"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a `VALUES` body.",
+          "enum": [
+            "unmodelled_relation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.",
+          "enum": [
+            "unattributed_column"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).",
+          "enum": [
+            "unresolved_projection"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.",
+          "enum": [
+            "unresolved_star"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "LineageQualifiedColumn": {
       "properties": {
         "column": {
@@ -286,6 +391,17 @@
     "head_ref": {
       "description": "Git ref for the incoming changes (typically `HEAD`).",
       "type": "string"
+    },
+    "incomplete_lineage": {
+      "default": null,
+      "description": "Models whose lineage is known to be incomplete (#2377), among the changed models and every model downstream of them on HEAD, sorted by name (#2397). Impact through them may be under-reported. A removed model's downstream is read from the base side. `[]` means none.\n\n`None` (`null`) when it is not known: models changed but the HEAD side did not compile. A payload with no such field comes from an older build: read it as unknown, never as complete.",
+      "items": {
+        "$ref": "#/definitions/IncompleteLineageRecord"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "markdown": {
       "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",

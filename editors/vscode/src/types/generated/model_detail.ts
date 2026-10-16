@@ -27,7 +27,15 @@ export type RockyType =
         [k: string]: unknown;
       };
     }
-  | "DecimalUnsized"
+  | {
+      DecimalUnsized: {
+        /**
+         * The scale, when every warehouse agrees on it. `None` when it differs by warehouse too, as for a bare `CAST(x AS DECIMAL)`.
+         */
+        scale?: number | null;
+        [k: string]: unknown;
+      };
+    }
   | "Timestamp"
   | "TimestampNtz"
   | {

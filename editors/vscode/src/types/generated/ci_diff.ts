@@ -135,6 +135,23 @@ export type BreakingChange =
  */
 export type BreakingSeverity = "breaking" | "warning" | "info";
 /**
+ * A construct whose lineage Rocky does not record, so a model that uses it has known-incomplete lineage (#2377).
+ *
+ * Impact analysis (`rocky lineage --downstream`, the blast radius) can then under-report: an edge the construct implies is missing. The list is what the extractor knows it skips. It is not a proof that everything else is traced.
+ */
+export type LineageGap =
+  | "natural_join"
+  | "group_by_all"
+  | "set_operation"
+  | "cte_body_row_selection"
+  | "derived_table_row_selection"
+  | "subquery_expression"
+  | "nested_named_window"
+  | "unmodelled_relation"
+  | "unattributed_column"
+  | "unresolved_projection"
+  | "unresolved_star";
+/**
  * Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares against the base.
  *
  * Selection (which files changed) and compilation (what those files contain) always read the same snapshot, so the report never mixes a committed file list with uncommitted contents.
@@ -173,6 +190,12 @@ export interface CiDiffOutput {
    */
   head_ref: string;
   /**
+   * Models whose lineage is known to be incomplete (#2377), among the changed models and every model downstream of them on HEAD, sorted by name (#2397). Impact through them may be under-reported. A removed model's downstream is read from the base side. `[]` means none.
+   *
+   * `None` (`null`) when it is not known: models changed but the HEAD side did not compile. A payload with no such field comes from an older build: read it as unknown, never as complete.
+   */
+  incomplete_lineage?: IncompleteLineageRecord[] | null;
+  /**
    * Pre-rendered Markdown suitable for posting as a GitHub PR comment.
    */
   markdown: string;
@@ -197,6 +220,20 @@ export interface CiDiffOutput {
 export interface BreakingFinding {
   change: BreakingChange;
   severity: BreakingSeverity;
+  [k: string]: unknown;
+}
+/**
+ * A model whose column lineage is known to be incomplete (#2377).
+ */
+export interface IncompleteLineageRecord {
+  /**
+   * The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).
+   */
+  gaps?: LineageGap[] | null;
+  /**
+   * The model.
+   */
+  model: string;
   [k: string]: unknown;
 }
 /**
