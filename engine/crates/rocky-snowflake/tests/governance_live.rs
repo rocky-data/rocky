@@ -11,16 +11,20 @@
 //! schema-valid privilege, that the role name must be double-quoted, or that
 //! the `SHOW GRANTS` column layout matches what `get_grants` indexes into.
 //!
+//! It also pins the #2405 contract: the schema is created with the dialect's
+//! quoted `create_schema_sql`, and the quoted governance SQL must find it.
+//!
 //! Schemas use the `hc_gov_*` prefix per Hugo's Snowflake convention; the
 //! per-run microsecond suffix isolates parallel runs.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rocky_core::config::RetryConfig;
-use rocky_core::traits::GovernanceAdapter;
+use rocky_core::traits::{GovernanceAdapter, SqlDialect};
 use rocky_ir::{Grant, GrantTarget, Permission};
 use rocky_snowflake::auth::{Auth, AuthConfig};
 use rocky_snowflake::connector::{ConnectorConfig, SnowflakeConnector};
+use rocky_snowflake::dialect::SnowflakeSqlDialect;
 use rocky_snowflake::governance::SnowflakeGovernanceAdapter;
 
 fn connector_from_env() -> Option<(SnowflakeConnector, String)> {
@@ -89,13 +93,19 @@ async fn live_grant_apply_show_revoke_roundtrip() {
     let suffix = schema_suffix();
     let schema = format!("hc_gov_{suffix}");
 
-    // Create the schema UNQUOTED, matching the dialect's `create_schema_sql`
-    // (and `format_grant_target`/`format_show_grants_sql`) — the governance
-    // adapter interpolates schema identifiers unquoted, relying on Snowflake's
-    // uppercase folding. A quoted (case-sensitive lowercase) schema here would
-    // not be found by the unquoted GRANT/SHOW GRANTS that follow.
+    // Create the schema with the dialect's own `create_schema_sql`. Since
+    // #2405 it quotes the names as written, like `format_table_ref`, and the
+    // governance SQL quotes them the same way. So the lowercase `hc_gov_*`
+    // schema is created as `"hc_gov_*"`, not folded to `HC_GOV_*`, and the
+    // GRANT / SHOW GRANTS / REVOKE that follow must find that exact schema.
+    // `SNOWFLAKE_TEST_DATABASE` must be spelled the way the database is
+    // stored (usually upper case), because it is quoted too.
+    let create = SnowflakeSqlDialect
+        .create_schema_sql(&database, &schema)
+        .expect("Snowflake has a schema statement")
+        .expect("valid schema names");
     connector
-        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {database}.{schema}"))
+        .execute_statement(&create)
         .await
         .expect("create schema");
 
@@ -118,7 +128,7 @@ async fn live_grant_apply_show_revoke_roundtrip() {
     // Drop before asserting so a failed assertion leaves no orphan schema.
     let _ = connector
         .execute_statement(&format!(
-            "DROP SCHEMA IF EXISTS {database}.{schema} CASCADE"
+            "DROP SCHEMA IF EXISTS \"{database}\".\"{schema}\" CASCADE"
         ))
         .await;
 

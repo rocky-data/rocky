@@ -268,20 +268,33 @@ impl SqlDialect for SnowflakeSqlDialect {
         format!("DROP TABLE IF EXISTS {table_ref}")
     }
 
+    /// Snowflake uses databases instead of catalogs. The name is quoted as
+    /// written, like [`Self::format_table_ref`], so the database created is
+    /// the one the writes name. Unquoted, Snowflake folds `db` to `DB` (#2405).
     fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
-        // Snowflake uses databases instead of catalogs
         Some(
             validation::validate_identifier(name)
-                .map(|_| format!("CREATE DATABASE IF NOT EXISTS {name}"))
+                .map(|_| {
+                    format!(
+                        "CREATE DATABASE IF NOT EXISTS {}",
+                        self.quote_identifier(name)
+                    )
+                })
                 .map_err(AdapterError::new),
         )
     }
 
+    /// Both parts are quoted as written, like [`Self::format_table_ref`], so
+    /// the schema created is the one the writes name (#2405).
     fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
         Some((|| {
             validation::validate_identifier(catalog).map_err(AdapterError::new)?;
             validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            Ok(format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"))
+            Ok(format!(
+                "CREATE SCHEMA IF NOT EXISTS {}.{}",
+                self.quote_identifier(catalog),
+                self.quote_identifier(schema)
+            ))
         })())
     }
 
@@ -664,7 +677,7 @@ mod tests {
     fn test_create_catalog_is_create_database() {
         let d = dialect();
         let sql = d.create_catalog_sql("my_warehouse").unwrap().unwrap();
-        assert_eq!(sql, "CREATE DATABASE IF NOT EXISTS my_warehouse");
+        assert_eq!(sql, r#"CREATE DATABASE IF NOT EXISTS "my_warehouse""#);
     }
 
     #[test]
@@ -826,7 +839,40 @@ mod tests {
     fn test_create_schema() {
         let d = dialect();
         let sql = d.create_schema_sql("mydb", "staging").unwrap().unwrap();
-        assert_eq!(sql, "CREATE SCHEMA IF NOT EXISTS mydb.staging");
+        assert_eq!(sql, r#"CREATE SCHEMA IF NOT EXISTS "mydb"."staging""#);
+    }
+
+    /// #2405: the schema and database a create makes are exactly the ones
+    /// `format_table_ref` names, for a lowercase and an upper-case config.
+    /// Nothing is folded: `marts` stays `"marts"` and `MARTS` stays `"MARTS"`.
+    #[test]
+    fn creates_name_the_objects_format_table_ref_names() {
+        let d = dialect();
+        for (db, schema) in [("db", "marts"), ("DB", "MARTS")] {
+            let write = d.format_table_ref(db, schema, "t").unwrap();
+            let create_schema = d.create_schema_sql(db, schema).unwrap().unwrap();
+            let schema_part = create_schema
+                .strip_prefix("CREATE SCHEMA IF NOT EXISTS ")
+                .unwrap();
+            assert_eq!(format!("{schema_part}.\"t\""), write, "{create_schema}");
+
+            let create_db = d.create_catalog_sql(db).unwrap().unwrap();
+            let db_part = create_db
+                .strip_prefix("CREATE DATABASE IF NOT EXISTS ")
+                .unwrap();
+            assert!(
+                write.starts_with(&format!("{db_part}.")),
+                "{create_db} vs {write}"
+            );
+        }
+        assert_eq!(
+            d.create_schema_sql("db", "marts").unwrap().unwrap(),
+            r#"CREATE SCHEMA IF NOT EXISTS "db"."marts""#
+        );
+        assert_eq!(
+            d.create_schema_sql("DB", "MARTS").unwrap().unwrap(),
+            r#"CREATE SCHEMA IF NOT EXISTS "DB"."MARTS""#
+        );
     }
 
     #[test]

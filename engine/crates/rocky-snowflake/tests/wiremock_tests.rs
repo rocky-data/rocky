@@ -960,7 +960,8 @@ async fn test_apply_retention_policy_emits_alter_table() {
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
         .and(body_string_contains(
-            "ALTER TABLE TEST_DB.RAW.EVENTS SET DATA_RETENTION_TIME_IN_DAYS = 90",
+            // The SQL sits in a JSON string, so each quote is `\"` in the body.
+            r#"ALTER TABLE \"TEST_DB\".\"RAW\".\"EVENTS\" SET DATA_RETENTION_TIME_IN_DAYS = 90"#,
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "statementHandle": "sf-retention",
@@ -1079,7 +1080,7 @@ async fn test_read_retention_days_parses_show_parameters() {
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
         .and(body_string_contains(
-            "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE TEST_DB.RAW.EVENTS",
+            r#"SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE \"TEST_DB\".\"RAW\".\"EVENTS\""#,
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "statementHandle": "sf-retention-probe",

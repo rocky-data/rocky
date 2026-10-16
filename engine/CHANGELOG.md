@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On Snowflake, Rocky now quotes database, schema and table names as written in every create and governance statement, the way the writes already do (#2405). This covers `CREATE DATABASE`, `CREATE SCHEMA` (`auto_create_catalogs`, `auto_create_schemas`, `rocky seed`, `rocky snapshot`), grants, revokes, `SHOW GRANTS`, tags, retention, and the `rocky replay --warehouse` schema. Before, these were unquoted, so Snowflake folded `marts` to `MARTS` and they named a different object than the writes (`"marts"`). Grants and tags on a `--branch` schema now land too, which closes the gap #2402 left open. Nothing is folded. Role names and tag names are unchanged.
+  - Upper-case configs (`MARTS`) behave as before.
+  - A lowercase config that relied on the unquoted create gets a new `"marts"` schema on the next `auto_create_schemas` run. The old `MARTS` schema and its grants stay behind. Drop them when you no longer need them.
+  - If you want the old unquoted behaviour, write the names in upper case.
+  - The database name in config must match how Snowflake stores it, usually upper case. The writes already required this; now the creates and grants do too.
+  - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/governance_live.rs` (`#[ignore]`, needs credentials).
+
 ## [1.85.0] — 2026-10-16
 
 ### Added

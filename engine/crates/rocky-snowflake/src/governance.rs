@@ -24,7 +24,7 @@ use tracing::debug;
 
 use rocky_core::retention::RetentionPolicy;
 use rocky_core::sql_gen::string_literal;
-use rocky_core::traits::{AdapterError, AdapterResult, GovernanceAdapter, TagTarget};
+use rocky_core::traits::{AdapterError, AdapterResult, GovernanceAdapter, SqlDialect, TagTarget};
 use rocky_ir::{Grant, GrantTarget, Permission, TableRef};
 use rocky_sql::validation;
 
@@ -89,30 +89,7 @@ impl GovernanceAdapter for SnowflakeGovernanceAdapter {
             .execute_sql(&sql)
             .await
             .map_err(AdapterError::new)?;
-
-        let mut grants = Vec::new();
-        for row in &result.rows {
-            // Snowflake SHOW GRANTS ON DATABASE/SCHEMA returns rows with columns:
-            //   created_on, privilege, granted_on, name, granted_to, grantee_name, ...
-            // We need privilege (col 1) and grantee_name (col 5).
-            let privilege = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
-
-            let grantee = row.get(5).and_then(|v| v.as_str()).unwrap_or_default();
-
-            if grantee.is_empty() {
-                continue;
-            }
-
-            if let Some(permission) = parse_snowflake_privilege(privilege) {
-                grants.push(Grant {
-                    principal: grantee.to_string(),
-                    permission,
-                    target: target.clone(),
-                });
-            }
-        }
-
-        Ok(grants)
+        Ok(parse_show_grants_rows(&result.rows, target))
     }
 
     async fn apply_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
@@ -241,6 +218,62 @@ impl GovernanceAdapter for SnowflakeGovernanceAdapter {
 // SQL generation helpers
 // ---------------------------------------------------------------------------
 
+/// Parses `SHOW GRANTS ON DATABASE/SCHEMA` rows into grants on `target`.
+///
+/// Snowflake returns the columns `created_on, privilege, granted_on, name,
+/// granted_to, grantee_name, ...`. Only `privilege` (col 1) and
+/// `grantee_name` (col 5) are read. Each grant keeps the requested `target`,
+/// never Snowflake's `name` column, so how the statement quotes the target
+/// does not change how a grant compares with config.
+fn parse_show_grants_rows(rows: &[Vec<serde_json::Value>], target: &GrantTarget) -> Vec<Grant> {
+    let mut grants = Vec::new();
+    for row in rows {
+        let privilege = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+        let grantee = row.get(5).and_then(|v| v.as_str()).unwrap_or_default();
+        if grantee.is_empty() {
+            continue;
+        }
+        if let Some(permission) = parse_snowflake_privilege(privilege) {
+            grants.push(Grant {
+                principal: grantee.to_string(),
+                permission,
+                target: target.clone(),
+            });
+        }
+    }
+    grants
+}
+
+/// Validates one database, schema or table name and quotes it as written.
+///
+/// Every object name below goes through this, the same quoting
+/// `SnowflakeSqlDialect::format_table_ref` gives the writes. Unquoted,
+/// Snowflake folds `marts` to `MARTS`, and a grant or tag lands on a
+/// different object than the one Rocky writes to (#2405). The validation
+/// runs first, and it rejects `"`, so the quoted form cannot be broken out of.
+fn object_name(name: &str) -> AdapterResult<String> {
+    validation::validate_identifier(name).map_err(AdapterError::new)?;
+    Ok(SnowflakeSqlDialect.quote_identifier(name))
+}
+
+/// `"db"."schema"`, each part through [`object_name`].
+fn schema_name(catalog: &str, schema: &str) -> AdapterResult<String> {
+    Ok(format!(
+        "{}.{}",
+        object_name(catalog)?,
+        object_name(schema)?
+    ))
+}
+
+/// `"db"."schema"."table"`, each part through [`object_name`].
+fn table_name(catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
+    Ok(format!(
+        "{}.{}",
+        schema_name(catalog, schema)?,
+        object_name(table)?
+    ))
+}
+
 /// Generates `ALTER DATABASE/SCHEMA/TABLE ... SET TAG k1 = 'v1', k2 = 'v2'`.
 fn format_set_tags_sql(
     target: &TagTarget,
@@ -261,29 +294,22 @@ fn format_set_tags_sql(
     let tag_clause = tag_pairs.join(", ");
 
     match target {
-        TagTarget::Catalog(database) => {
-            validation::validate_identifier(database).map_err(AdapterError::new)?;
-            Ok(format!("ALTER DATABASE {database} SET TAG {tag_clause}"))
-        }
-        TagTarget::Schema { catalog, schema } => {
-            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
-            validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            Ok(format!(
-                "ALTER SCHEMA {catalog}.{schema} SET TAG {tag_clause}"
-            ))
-        }
+        TagTarget::Catalog(database) => Ok(format!(
+            "ALTER DATABASE {} SET TAG {tag_clause}",
+            object_name(database)?
+        )),
+        TagTarget::Schema { catalog, schema } => Ok(format!(
+            "ALTER SCHEMA {} SET TAG {tag_clause}",
+            schema_name(catalog, schema)?
+        )),
         TagTarget::Table {
             catalog,
             schema,
             table,
-        } => {
-            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
-            validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            validation::validate_identifier(table).map_err(AdapterError::new)?;
-            Ok(format!(
-                "ALTER TABLE {catalog}.{schema}.{table} SET TAG {tag_clause}"
-            ))
-        }
+        } => Ok(format!(
+            "ALTER TABLE {} SET TAG {tag_clause}",
+            table_name(catalog, schema, table)?
+        )),
         TagTarget::View { .. } => Err(AdapterError::msg(
             "ALTER VIEW SET TAG is not supported by the Snowflake adapter",
         )),
@@ -293,15 +319,14 @@ fn format_set_tags_sql(
 /// Generates `SHOW GRANTS ON DATABASE/SCHEMA ...`.
 fn format_show_grants_sql(target: &GrantTarget) -> AdapterResult<String> {
     match target {
-        GrantTarget::Catalog(database) => {
-            validation::validate_identifier(database).map_err(AdapterError::new)?;
-            Ok(format!("SHOW GRANTS ON DATABASE {database}"))
-        }
-        GrantTarget::Schema { catalog, schema } => {
-            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
-            validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            Ok(format!("SHOW GRANTS ON SCHEMA {catalog}.{schema}"))
-        }
+        GrantTarget::Catalog(database) => Ok(format!(
+            "SHOW GRANTS ON DATABASE {}",
+            object_name(database)?
+        )),
+        GrantTarget::Schema { catalog, schema } => Ok(format!(
+            "SHOW GRANTS ON SCHEMA {}",
+            schema_name(catalog, schema)?
+        )),
     }
 }
 
@@ -326,14 +351,9 @@ fn format_revoke_sql(grant: &Grant) -> AdapterResult<String> {
 /// Formats a `GrantTarget` as `DATABASE <name>` or `SCHEMA <db>.<schema>`.
 fn format_grant_target(target: &GrantTarget) -> AdapterResult<String> {
     match target {
-        GrantTarget::Catalog(database) => {
-            validation::validate_identifier(database).map_err(AdapterError::new)?;
-            Ok(format!("DATABASE {database}"))
-        }
+        GrantTarget::Catalog(database) => Ok(format!("DATABASE {}", object_name(database)?)),
         GrantTarget::Schema { catalog, schema } => {
-            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
-            validation::validate_identifier(schema).map_err(AdapterError::new)?;
-            Ok(format!("SCHEMA {catalog}.{schema}"))
+            Ok(format!("SCHEMA {}", schema_name(catalog, schema)?))
         }
     }
 }
@@ -346,19 +366,20 @@ fn format_role(name: &str) -> AdapterResult<String> {
     Ok(format!("\"{name}\""))
 }
 
-/// Formats `ALTER TABLE <db>.<schema>.<table> SET DATA_RETENTION_TIME_IN_DAYS = <N>`.
+/// Formats `ALTER TABLE "<db>"."<schema>"."<table>" SET DATA_RETENTION_TIME_IN_DAYS = <N>`.
 ///
 /// Identifiers are validated against Rocky's SQL identifier allowlist before
-/// interpolation — never `format!` on unvalidated input.
-fn format_set_retention_sql(table: &TableRef, duration_days: u32) -> AdapterResult<String> {
-    validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
-    validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
-    validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+/// interpolation — never `format!` on unvalidated input — and quoted as
+/// written. `rocky plan` renders its retention preview through this
+/// function, so the preview is the statement the run issues.
+///
+/// # Errors
+///
+/// Returns an error when a part of `table` is not a valid identifier.
+pub fn format_set_retention_sql(table: &TableRef, duration_days: u32) -> AdapterResult<String> {
     Ok(format!(
-        "ALTER TABLE {cat}.{sch}.{tbl} SET DATA_RETENTION_TIME_IN_DAYS = {duration_days}",
-        cat = table.catalog,
-        sch = table.schema,
-        tbl = table.table,
+        "ALTER TABLE {} SET DATA_RETENTION_TIME_IN_DAYS = {duration_days}",
+        table_name(&table.catalog, &table.schema, &table.table)?
     ))
 }
 
@@ -370,14 +391,9 @@ fn format_set_retention_sql(table: &TableRef, duration_days: u32) -> AdapterResu
 /// interpolation. The parameter-name literal is hard-coded, not interpolated,
 /// so there's nothing to validate on that side.
 fn format_show_retention_sql(table: &TableRef) -> AdapterResult<String> {
-    validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
-    validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
-    validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
     Ok(format!(
-        "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE {cat}.{sch}.{tbl}",
-        cat = table.catalog,
-        sch = table.schema,
-        tbl = table.table,
+        "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE {}",
+        table_name(&table.catalog, &table.schema, &table.table)?
     ))
 }
 
@@ -465,7 +481,7 @@ mod tests {
         let sql = format_set_tags_sql(&TagTarget::Catalog("my_database".into()), &tags).unwrap();
         assert_eq!(
             sql,
-            "ALTER DATABASE my_database SET TAG managed_by = 'rocky'"
+            r#"ALTER DATABASE "my_database" SET TAG managed_by = 'rocky'"#
         );
     }
 
@@ -480,7 +496,7 @@ mod tests {
         let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
         assert_eq!(
             sql,
-            r"ALTER DATABASE db SET TAG note = '\\\'; DROP TABLE x; --'"
+            r#"ALTER DATABASE "db" SET TAG note = '\\\'; DROP TABLE x; --'"#
         );
     }
 
@@ -489,7 +505,7 @@ mod tests {
         let mut tags = BTreeMap::new();
         tags.insert("path".into(), r"C:\data\".into());
         let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
-        assert_eq!(sql, r"ALTER DATABASE db SET TAG path = 'C:\\data\\'");
+        assert_eq!(sql, r#"ALTER DATABASE "db" SET TAG path = 'C:\\data\\'"#);
     }
 
     #[test]
@@ -504,7 +520,10 @@ mod tests {
             &tags,
         )
         .unwrap();
-        assert_eq!(sql, "ALTER SCHEMA my_db.staging SET TAG env = 'production'");
+        assert_eq!(
+            sql,
+            r#"ALTER SCHEMA "my_db"."staging" SET TAG env = 'production'"#
+        );
     }
 
     #[test]
@@ -520,7 +539,10 @@ mod tests {
             &tags,
         )
         .unwrap();
-        assert_eq!(sql, "ALTER TABLE db.raw.users SET TAG pii = 'true'");
+        assert_eq!(
+            sql,
+            r#"ALTER TABLE "db"."raw"."users" SET TAG pii = 'true'"#
+        );
     }
 
     #[test]
@@ -532,7 +554,7 @@ mod tests {
         // BTreeMap is sorted by key, so env comes before managed_by
         assert_eq!(
             sql,
-            "ALTER DATABASE warehouse SET TAG env = 'dev', managed_by = 'rocky'"
+            r#"ALTER DATABASE "warehouse" SET TAG env = 'dev', managed_by = 'rocky'"#
         );
     }
 
@@ -541,7 +563,10 @@ mod tests {
         let mut tags = BTreeMap::new();
         tags.insert("desc".into(), "Hugo's pipeline".into());
         let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
-        assert_eq!(sql, r"ALTER DATABASE db SET TAG desc = 'Hugo\'s pipeline'");
+        assert_eq!(
+            sql,
+            r#"ALTER DATABASE "db" SET TAG desc = 'Hugo\'s pipeline'"#
+        );
     }
 
     // ---- Grant SQL generation ----
@@ -556,7 +581,7 @@ mod tests {
         let sql = format_grant_sql(&grant).unwrap();
         assert_eq!(
             sql,
-            "GRANT SELECT ON DATABASE analytics TO ROLE \"DATA_READERS\""
+            r#"GRANT SELECT ON DATABASE "analytics" TO ROLE "DATA_READERS""#
         );
     }
 
@@ -573,7 +598,7 @@ mod tests {
         let sql = format_grant_sql(&grant).unwrap();
         assert_eq!(
             sql,
-            "GRANT USAGE ON SCHEMA analytics.raw_na_fb_ads TO ROLE \"ANALYSTS\""
+            r#"GRANT USAGE ON SCHEMA "analytics"."raw_na_fb_ads" TO ROLE "ANALYSTS""#
         );
     }
 
@@ -585,7 +610,7 @@ mod tests {
             target: GrantTarget::Catalog("warehouse".into()),
         };
         let sql = format_grant_sql(&grant).unwrap();
-        assert!(sql.starts_with("GRANT MONITOR ON DATABASE warehouse"));
+        assert!(sql.starts_with(r#"GRANT MONITOR ON DATABASE "warehouse""#));
     }
 
     #[test]
@@ -596,7 +621,7 @@ mod tests {
             target: GrantTarget::Catalog("warehouse".into()),
         };
         let sql = format_grant_sql(&grant).unwrap();
-        assert!(sql.starts_with("GRANT MANAGE GRANTS ON DATABASE warehouse"));
+        assert!(sql.starts_with(r#"GRANT MANAGE GRANTS ON DATABASE "warehouse""#));
     }
 
     // ---- Revoke SQL generation ----
@@ -611,7 +636,7 @@ mod tests {
         let sql = format_revoke_sql(&grant).unwrap();
         assert_eq!(
             sql,
-            "REVOKE SELECT ON DATABASE analytics FROM ROLE \"OLD_ROLE\""
+            r#"REVOKE SELECT ON DATABASE "analytics" FROM ROLE "OLD_ROLE""#
         );
     }
 
@@ -628,7 +653,7 @@ mod tests {
         let sql = format_revoke_sql(&grant).unwrap();
         assert_eq!(
             sql,
-            "REVOKE USAGE ON SCHEMA db.staging FROM ROLE \"STALE_ROLE\""
+            r#"REVOKE USAGE ON SCHEMA "db"."staging" FROM ROLE "STALE_ROLE""#
         );
     }
 
@@ -637,7 +662,7 @@ mod tests {
     #[test]
     fn test_show_grants_database() {
         let sql = format_show_grants_sql(&GrantTarget::Catalog("my_warehouse".into())).unwrap();
-        assert_eq!(sql, "SHOW GRANTS ON DATABASE my_warehouse");
+        assert_eq!(sql, r#"SHOW GRANTS ON DATABASE "my_warehouse""#);
     }
 
     #[test]
@@ -647,7 +672,120 @@ mod tests {
             schema: "raw".into(),
         })
         .unwrap();
-        assert_eq!(sql, "SHOW GRANTS ON SCHEMA db.raw");
+        assert_eq!(sql, r#"SHOW GRANTS ON SCHEMA "db"."raw""#);
+    }
+
+    /// #2405: every grant, `SHOW GRANTS`, tag and retention statement names
+    /// exactly the object `format_table_ref` names, for a lowercase config
+    /// (`marts`) and an upper-case one (`MARTS`). Nothing is folded.
+    #[test]
+    fn governance_names_the_objects_format_table_ref_names() {
+        let dialect = SnowflakeSqlDialect;
+        let mut tags = BTreeMap::new();
+        tags.insert("env".into(), "prod".into());
+        for (db, schema) in [("db", "marts"), ("DB", "MARTS")] {
+            let table_ref = dialect.format_table_ref(db, schema, "t").unwrap();
+            let schema_ref = table_ref.strip_suffix(r#"."t""#).unwrap();
+            let db_ref = schema_ref.strip_suffix(&format!(".\"{schema}\"")).unwrap();
+            assert_eq!(db_ref, format!("\"{db}\""));
+
+            let schema_target = GrantTarget::Schema {
+                catalog: db.into(),
+                schema: schema.into(),
+            };
+            let grant = |target: GrantTarget| Grant {
+                principal: "ANALYSTS".into(),
+                permission: Permission::UseSchema,
+                target,
+            };
+            assert_eq!(
+                format_grant_sql(&grant(schema_target.clone())).unwrap(),
+                format!(r#"GRANT USAGE ON SCHEMA {schema_ref} TO ROLE "ANALYSTS""#)
+            );
+            assert_eq!(
+                format_revoke_sql(&grant(schema_target.clone())).unwrap(),
+                format!(r#"REVOKE USAGE ON SCHEMA {schema_ref} FROM ROLE "ANALYSTS""#)
+            );
+            assert_eq!(
+                format_grant_sql(&grant(GrantTarget::Catalog(db.into()))).unwrap(),
+                format!(r#"GRANT USAGE ON DATABASE {db_ref} TO ROLE "ANALYSTS""#)
+            );
+            assert_eq!(
+                format_show_grants_sql(&schema_target).unwrap(),
+                format!("SHOW GRANTS ON SCHEMA {schema_ref}")
+            );
+            assert_eq!(
+                format_show_grants_sql(&GrantTarget::Catalog(db.into())).unwrap(),
+                format!("SHOW GRANTS ON DATABASE {db_ref}")
+            );
+            assert_eq!(
+                format_set_tags_sql(&TagTarget::Catalog(db.into()), &tags).unwrap(),
+                format!("ALTER DATABASE {db_ref} SET TAG env = 'prod'")
+            );
+            assert_eq!(
+                format_set_tags_sql(
+                    &TagTarget::Schema {
+                        catalog: db.into(),
+                        schema: schema.into(),
+                    },
+                    &tags
+                )
+                .unwrap(),
+                format!("ALTER SCHEMA {schema_ref} SET TAG env = 'prod'")
+            );
+            assert_eq!(
+                format_set_tags_sql(
+                    &TagTarget::Table {
+                        catalog: db.into(),
+                        schema: schema.into(),
+                        table: "t".into(),
+                    },
+                    &tags
+                )
+                .unwrap(),
+                format!("ALTER TABLE {table_ref} SET TAG env = 'prod'")
+            );
+            let t = TableRef {
+                catalog: db.into(),
+                schema: schema.into(),
+                table: "t".into(),
+            };
+            assert_eq!(
+                format_set_retention_sql(&t, 7).unwrap(),
+                format!("ALTER TABLE {table_ref} SET DATA_RETENTION_TIME_IN_DAYS = 7")
+            );
+            assert_eq!(
+                format_show_retention_sql(&t).unwrap(),
+                format!("SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE {table_ref}")
+            );
+        }
+    }
+
+    /// `get_grants` reads only the privilege and grantee columns and keeps
+    /// the requested target, so the quoted statement changes nothing in how
+    /// a returned grant compares with config: a lowercase target and an
+    /// upper-case one each come back as asked.
+    #[test]
+    fn show_grants_parse_keeps_the_requested_target() {
+        for (db, schema) in [("db", "marts"), ("DB", "MARTS")] {
+            let target = GrantTarget::Schema {
+                catalog: db.into(),
+                schema: schema.into(),
+            };
+            let rows = vec![vec![
+                serde_json::json!("2026-10-16"),
+                serde_json::json!("USAGE"),
+                serde_json::json!("SCHEMA"),
+                // Snowflake's own `name` column; never read.
+                serde_json::json!("DB.MARTS"),
+                serde_json::json!("ROLE"),
+                serde_json::json!("ANALYSTS"),
+            ]];
+            let grants = parse_show_grants_rows(&rows, &target);
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].target, target);
+            assert_eq!(grants[0].principal, "ANALYSTS");
+        }
     }
 
     // ---- Privilege mapping ----
@@ -740,7 +878,7 @@ mod tests {
         let sql = format_set_retention_sql(&t, 90).unwrap();
         assert_eq!(
             sql,
-            "ALTER TABLE warehouse.raw.events SET DATA_RETENTION_TIME_IN_DAYS = 90"
+            r#"ALTER TABLE "warehouse"."raw"."events" SET DATA_RETENTION_TIME_IN_DAYS = 90"#
         );
     }
 
@@ -756,7 +894,7 @@ mod tests {
         let sql = format_set_retention_sql(&t, 365).unwrap();
         assert_eq!(
             sql,
-            "ALTER TABLE wh.raw.t SET DATA_RETENTION_TIME_IN_DAYS = 365"
+            r#"ALTER TABLE "wh"."raw"."t" SET DATA_RETENTION_TIME_IN_DAYS = 365"#
         );
     }
 
@@ -797,7 +935,7 @@ mod tests {
         let sql = format_set_retention_sql(&t, 1000).unwrap();
         assert_eq!(
             sql,
-            "ALTER TABLE w.s.t SET DATA_RETENTION_TIME_IN_DAYS = 1000"
+            r#"ALTER TABLE "w"."s"."t" SET DATA_RETENTION_TIME_IN_DAYS = 1000"#
         );
     }
 
@@ -813,7 +951,7 @@ mod tests {
         let sql = format_show_retention_sql(&t).unwrap();
         assert_eq!(
             sql,
-            "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE TEST_DB.RAW.EVENTS"
+            r#"SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE "TEST_DB"."RAW"."EVENTS""#
         );
     }
 

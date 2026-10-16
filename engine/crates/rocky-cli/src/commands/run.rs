@@ -11715,14 +11715,16 @@ pub fn resolve_run_selection(
 /// The `CREATE SCHEMA` for one auto-create target.
 ///
 /// A `--branch` or `--shadow-schema` run writes its models to
-/// `{catalog}.{routed_schema}.{table}` through `format_table_ref`, which on
-/// Snowflake double-quotes every part (an exact, case-preserving name).
-/// Snowflake's own `create_schema_sql` is unquoted and folds `branch__x` to
-/// `BRANCH__X`, so the schema it makes is not the one the writes name (#2402).
-/// For the routed schema (`schema_override`), on a dialect that
-/// clones into the catalog, build the statement with the same quoting as the
-/// writes (the helper `rocky preview` uses). Every other target keeps the
-/// dialect's `create_schema_sql`, which other code (grants, tags) relies on.
+/// `{catalog}.{routed_schema}.{table}` through `format_table_ref`. For the
+/// routed schema (`schema_override`), on a dialect that clones into the
+/// catalog, the statement is built by the helper `rocky preview` uses, with
+/// the dialect's `quote_identifier` on both parts (#2402). Every other target
+/// uses the dialect's `create_schema_sql`.
+///
+/// On Snowflake both paths now give the same string: since #2405
+/// `create_schema_sql` quotes as written too, like `format_table_ref`. The
+/// routed path stays because on Databricks, BigQuery and Spark the two
+/// strings still differ (backticks against bare names).
 fn auto_create_schema_statement(
     dialect: &dyn rocky_core::traits::SqlDialect,
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
@@ -19740,14 +19742,15 @@ mod tests {
         assert!(write.starts_with(create.trim_start_matches("CREATE SCHEMA IF NOT EXISTS ")));
     }
 
-    /// Only the branch schema changes. A non-branch run and a non-branch
-    /// target in a branch run keep the dialect's own statement.
+    /// A non-branch run and a non-branch target in a branch run use the
+    /// dialect's own statement. Since #2405 that statement quotes as written,
+    /// so it names the schema the writes name too.
     #[test]
     fn snowflake_non_branch_schema_keeps_the_dialect_create() {
         use rocky_core::traits::SqlDialect;
         let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
         let plain = dialect.create_schema_sql("DB", "marts").unwrap().unwrap();
-        assert_eq!(plain, "CREATE SCHEMA IF NOT EXISTS DB.marts");
+        assert_eq!(plain, r#"CREATE SCHEMA IF NOT EXISTS "DB"."marts""#);
         assert_eq!(
             auto_create_schema_statement(&dialect, None, "DB", "marts")
                 .unwrap()
@@ -34793,11 +34796,49 @@ backend = "local"
 
     /// #2402 call site: a `--branch` transformation run on the Snowflake
     /// dialect creates the branch schema with the quoted statement the writes
-    /// name. The adapter records statements and fails on the first one that is
-    /// not a `CREATE SCHEMA`, so the run stops right after the create.
+    /// name.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn branch_run_on_snowflake_creates_the_quoted_branch_schema() {
+        let shadow = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("branch__x".to_string()),
+            branch: Some("x".to_string()),
+            ..Default::default()
+        };
+        let statements = snowflake_auto_create_statements("marts", Some(&shadow)).await;
+        assert_eq!(
+            statements.first().map(String::as_str),
+            Some(r#"CREATE SCHEMA IF NOT EXISTS "DB"."branch__x""#),
+            "recorded: {statements:?}"
+        );
+    }
+
+    /// #2405 call site: an ordinary run (no branch) on the Snowflake dialect
+    /// creates the target schema quoted as written, the schema the writes
+    /// name. Before #2405 it was the unquoted `DB.marts`, which Snowflake
+    /// folds to `DB.MARTS`. An upper-case config keeps its upper-case name.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plain_run_on_snowflake_creates_the_schema_quoted_as_written() {
+        for schema in ["marts", "MARTS"] {
+            let statements = snowflake_auto_create_statements(schema, None).await;
+            assert_eq!(
+                statements.first().cloned(),
+                Some(format!(r#"CREATE SCHEMA IF NOT EXISTS "DB"."{schema}""#)),
+                "recorded: {statements:?}"
+            );
+        }
+    }
+
+    /// Runs one `auto_create_schemas` transformation model with target
+    /// `DB.{schema}` on the Snowflake dialect and returns the statements it
+    /// issued. The adapter records statements and fails on the first one that
+    /// is not a `CREATE SCHEMA`, so the run stops right after the create.
+    #[cfg(feature = "duckdb")]
+    async fn snowflake_auto_create_statements(
+        schema: &str,
+        shadow: Option<&rocky_core::shadow::ShadowConfig>,
+    ) -> Vec<String> {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -34838,7 +34879,9 @@ backend = "local"
         std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n").expect("sql");
         std::fs::write(
             models.join("m.toml"),
-            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"DB\"\nschema = \"marts\"\n",
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"DB\"\nschema = \"{schema}\"\n"
+            ),
         )
         .expect("toml");
         let inner = DuckDbWarehouseAdapter::open(&dir.path().join("t.duckdb")).expect("open");
@@ -34846,11 +34889,6 @@ backend = "local"
             inner: &inner,
             dialect: rocky_snowflake::dialect::SnowflakeSqlDialect,
             statements: std::sync::Mutex::new(Vec::new()),
-        };
-        let shadow = rocky_core::shadow::ShadowConfig {
-            schema_override: Some("branch__x".to_string()),
-            branch: Some("x".to_string()),
-            ..Default::default()
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
         let _ = super::execute_models_with_explicit_contracts(
@@ -34867,7 +34905,7 @@ backend = "local"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
-            Some(&shadow),
+            shadow,
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -34884,12 +34922,7 @@ backend = "local"
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
-        let statements = adapter.statements.lock().unwrap().clone();
-        assert_eq!(
-            statements.first().map(String::as_str),
-            Some(r#"CREATE SCHEMA IF NOT EXISTS "DB"."branch__x""#),
-            "recorded: {statements:?}"
-        );
+        adapter.statements.lock().unwrap().clone()
     }
 
     /// A project `contracts/` directory beside the models directory is read

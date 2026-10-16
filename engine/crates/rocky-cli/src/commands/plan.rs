@@ -3092,17 +3092,17 @@ fn render_retention_preview(
             duration_days,
         )
         .ok(),
-        "snowflake" => {
-            // Mirror `rocky-snowflake::governance::format_set_retention_sql`.
-            // Inlined here to avoid a cross-crate dep just for a preview
-            // string; the governance adapter runs validation before
-            // issuing the real statement. Identifiers are the same ones
-            // rocky_core sidecars accept, so validation drift is a
-            // non-issue in practice.
-            Some(format!(
-                "ALTER TABLE {catalog}.{schema}.{table} SET DATA_RETENTION_TIME_IN_DAYS = {duration_days}"
-            ))
-        }
+        // The same function the governance adapter issues, so the preview
+        // carries the run's quoting (#2405).
+        "snowflake" => rocky_snowflake::governance::format_set_retention_sql(
+            &rocky_ir::TableRef {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: table.to_string(),
+            },
+            duration_days,
+        )
+        .ok(),
         _ => None,
     }
 }
@@ -4354,7 +4354,7 @@ schema_template = "s__{source}"
         let got = render_retention_preview("snowflake", "db", "sch", "tbl", 365).expect("some");
         assert_eq!(
             got,
-            "ALTER TABLE db.sch.tbl SET DATA_RETENTION_TIME_IN_DAYS = 365"
+            r#"ALTER TABLE "db"."sch"."tbl" SET DATA_RETENTION_TIME_IN_DAYS = 365"#
         );
     }
 

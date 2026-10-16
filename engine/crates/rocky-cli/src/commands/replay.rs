@@ -1589,7 +1589,8 @@ async fn replay_execute_warehouse(
         schema_dropped = created_catalogs.is_empty();
     } else {
         for catalog in &created_catalogs {
-            let drop_sql = format!("DROP SCHEMA IF EXISTS {catalog}.{replay_schema} CASCADE");
+            let schema_ref = replay_schema_ref(warehouse.dialect(), catalog, &replay_schema);
+            let drop_sql = format!("DROP SCHEMA IF EXISTS {schema_ref} CASCADE");
             if let Err(e) = warehouse.execute_statement(&drop_sql).await {
                 tracing::warn!(
                     catalog = catalog.as_str(),
@@ -1654,6 +1655,10 @@ async fn replay_execute_warehouse(
 ///
 /// Extracted from the caller so that property is directly testable.
 ///
+/// `quote_style` renders the redirected references. It must match how
+/// [`replay_schema_ref`] quotes the replay tables, or a downstream read on
+/// Snowflake folds `rocky_replay_x` to `ROCKY_REPLAY_X` and misses the table.
+///
 /// # Errors
 ///
 /// Returns the operator-facing reason when a recorded key is not a
@@ -1663,6 +1668,7 @@ fn build_replay_renames(
     upstreams: &[String],
     replay_schema: &str,
     case_rules: rocky_sql::defer::IdentifierCaseRules,
+    quote_style: Option<char>,
 ) -> std::result::Result<
     std::collections::HashMap<rocky_sql::defer::TargetIdentity, rocky_sql::defer::DeferTarget>,
     String,
@@ -1693,11 +1699,29 @@ fn build_replay_renames(
                 catalog: (*up_catalog).to_string(),
                 schema: replay_schema.to_string(),
                 table: format!("{up_schema}__{up_table}"),
-                quote_style: None,
+                quote_style,
             },
         );
     }
     Ok(renames)
+}
+
+/// `{catalog}.{replay_schema}`, each part quoted through `dialect`.
+///
+/// The create, the CTAS target and the teardown drop all start from this, so
+/// they name one schema. On Snowflake each part is quoted as written (#2405);
+/// unquoted, Snowflake folds it to upper case. On Databricks the backticks
+/// name the same object as bare names. Callers validate every part first.
+fn replay_schema_ref(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    catalog: &str,
+    replay_schema: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        dialect.quote_identifier(catalog),
+        dialect.quote_identifier(replay_schema)
+    )
 }
 
 /// Why an upstream redirection into the replay namespace cannot be trusted,
@@ -1838,8 +1862,24 @@ async fn replay_execute_warehouse_node(
                 );
             }
         };
-        let renames = match build_replay_renames(&cand.in_run_upstreams, replay_schema, case_rules)
-        {
+        let quote_style = match crate::commands::run::rewrite_quote_style(warehouse.dialect()) {
+            Ok(style) => style,
+            Err(e) => {
+                return non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "cannot redirect upstream references into the replay namespace: {e:#}"
+                    )],
+                );
+            }
+        };
+        let renames = match build_replay_renames(
+            &cand.in_run_upstreams,
+            replay_schema,
+            case_rules,
+            quote_style,
+        ) {
             Ok(renames) => renames,
             Err(reason) => {
                 return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
@@ -1870,8 +1910,9 @@ async fn replay_execute_warehouse_node(
     };
 
     // Ensure the isolated replay schema exists in this node's catalog.
+    let schema_ref = replay_schema_ref(warehouse.dialect(), catalog, replay_schema);
     if !created_catalogs.contains(catalog) {
-        let create_sql = format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{replay_schema}");
+        let create_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema_ref}");
         if let Err(e) = warehouse.execute_statement(&create_sql).await {
             return non_replayable_exec(
                 &cand.model_name,
@@ -1907,7 +1948,10 @@ async fn replay_execute_warehouse_node(
     // operator inspection under `--keep`). A second evaluation of the same
     // recipe, exactly like the local DAG path; a failure creates no table,
     // so the fail-closed cascade denies dependents.
-    let ctas = format!("CREATE OR REPLACE TABLE {catalog}.{replay_schema}.{replay_table} AS {sql}");
+    let ctas = format!(
+        "CREATE OR REPLACE TABLE {schema_ref}.{} AS {sql}",
+        warehouse.dialect().quote_identifier(&replay_table)
+    );
     if let Err(e) = warehouse.execute_statement(&ctas).await {
         return non_replayable_exec(
             &cand.model_name,
@@ -2533,6 +2577,7 @@ mod tests {
             &upstreams,
             "replay_ns",
             IdentifierCaseRules::uniform(true),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2553,6 +2598,7 @@ mod tests {
             &upstreams,
             "replay_ns",
             IdentifierCaseRules::all_insensitive(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2574,7 +2620,7 @@ mod tests {
     fn replay_refuses_a_setting_dependent_cte_binding() {
         let rules = rocky_sql::defer::IdentifierCaseRules::uniform_uppercasing(true);
         let renames =
-            super::build_replay_renames(&["DB.MAIN.ORDERS".to_string()], "replay_ns", rules)
+            super::build_replay_renames(&["DB.MAIN.ORDERS".to_string()], "replay_ns", rules, None)
                 .unwrap();
         let refusal = |sql: &str| {
             let outcome = rocky_sql::defer::rewrite_upstream_refs(
@@ -2606,6 +2652,46 @@ mod tests {
         }
     }
 
+    /// #2405: on Snowflake the replay schema the create and drop name, the
+    /// CTAS target, and a downstream node's redirected read are one object.
+    /// Each is quoted as written, so none is folded to `ROCKY_REPLAY_*`.
+    ///
+    /// Mutation: drop the `quote_identifier` calls in `replay_schema_ref`, or
+    /// pass `None` as the quote style. Either half then fails.
+    #[test]
+    fn snowflake_replay_create_write_read_and_drop_name_one_schema() {
+        use rocky_core::traits::SqlDialect;
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let replay_schema = replay_schema_name("run-1");
+        let schema_ref = super::replay_schema_ref(&dialect, "db", &replay_schema);
+        assert_eq!(schema_ref, format!(r#""db"."{replay_schema}""#));
+
+        // The CTAS target of the upstream `db.marts.up`, as the node builds it.
+        let upstream_table = format!("{schema_ref}.{}", dialect.quote_identifier("marts__up"));
+
+        let rules = crate::commands::run::dialect_case_rules(&dialect).unwrap();
+        let quote_style = crate::commands::run::rewrite_quote_style(&dialect).unwrap();
+        let renames = super::build_replay_renames(
+            &["db.marts.up".to_string()],
+            &replay_schema,
+            rules,
+            quote_style,
+        )
+        .unwrap();
+        let recorded = format!(
+            "SELECT * FROM {}",
+            dialect.format_table_ref("db", "marts", "up").unwrap()
+        );
+        let outcome = rocky_sql::defer::rewrite_upstream_refs(
+            &recorded,
+            &renames,
+            rules,
+            crate::commands::run::dialect_recursive_cte_visibility(&dialect),
+        )
+        .unwrap();
+        assert_eq!(outcome.sql, format!("SELECT * FROM {upstream_table}"));
+    }
+
     /// The extracted helper keeps the caller's two fail-closed validations.
     #[test]
     fn replay_renames_reject_malformed_upstream_keys() {
@@ -2613,6 +2699,7 @@ mod tests {
             &["cat.s".to_string()],
             "ns",
             rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("catalog.schema.table"), "{err}");
@@ -2620,6 +2707,7 @@ mod tests {
             &["cat.s.bad-name".to_string()],
             "ns",
             rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("not a valid SQL identifier"), "{err}");
