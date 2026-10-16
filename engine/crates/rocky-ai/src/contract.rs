@@ -95,7 +95,7 @@ pub fn contract_type_name(typed_col: &TypedColumn) -> String {
         RockyType::Int64 => "Int64".to_string(),
         RockyType::Float32 => "Float32".to_string(),
         RockyType::Float64 => "Float64".to_string(),
-        RockyType::Decimal { .. } => "Decimal".to_string(),
+        RockyType::Decimal { .. } | RockyType::DecimalUnsized => "Decimal".to_string(),
         RockyType::String => "String".to_string(),
         RockyType::Binary => "Binary".to_string(),
         RockyType::Date => "Date".to_string(),

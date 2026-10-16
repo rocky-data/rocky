@@ -100,7 +100,7 @@ A check can also fail because nothing was checked. Both cases fail at `WARN`, be
 
 Both cases report **every** check the contract declares, in the same order as an evaluated contract, so a declared check never vanishes.
 
-A passing check can also carry `rocky/unverified_<i>` entries, with `rocky/unverified_count`. Those come from `I003`, where the column's inferred type is `Unknown` and the declared type was compared against nothing. They never fail the check; they stop a pass from claiming a constraint was tested when it was not.
+A passing check can also carry `rocky/unverified_<i>` entries, with `rocky/unverified_count`. Those come from `I003`, where the column's inferred type is `Unknown` and the declared type was compared against nothing, or where the column is a decimal with unknown digits and the contract names digits. They never fail the check; they stop a pass from claiming a constraint was tested when it was not.
 
 ## Standalone helpers
 

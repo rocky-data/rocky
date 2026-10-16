@@ -263,7 +263,21 @@ pub fn validate_contract_with(
                 // decides anything, and `type_name_matches` no longer treats
                 // it as a match.
                 if let Some(ref expected_type) = contract_col.type_name {
-                    if col.data_type == RockyType::Unknown
+                    if col.data_type == RockyType::DecimalUnsized
+                        && declares_decimal_digits(expected_type)
+                    {
+                        // Rocky knows the column is a decimal, so a bare
+                        // `Decimal` contract is checked (it matches below)
+                        // and a `String` one is a plain `E011`. Only the
+                        // digits a `Decimal(p,s)` contract names cannot be
+                        // checked (#2356).
+                        diagnostics.push(unsized_decimal_unchecked(
+                            model_name,
+                            &contract_col.name,
+                            expected_type,
+                            strict_reason.is_some(),
+                        ));
+                    } else if col.data_type == RockyType::Unknown
                         && let Some(reason) = strict_reason
                     {
                         diagnostics.push(
@@ -457,6 +471,37 @@ pub fn validate_contract_with(
     diagnostics
 }
 
+/// Whether a contract type names decimal digits: `Decimal(p)` or
+/// `Decimal(p,s)`, as opposed to a bare `Decimal`.
+fn declares_decimal_digits(type_name: &str) -> bool {
+    type_name.starts_with("Decimal(")
+}
+
+/// The diagnostic for a `Decimal(p,s)` contract over a column Rocky types
+/// [`RockyType::DecimalUnsized`]: `I003`, or `E059` under strict contracts.
+fn unsized_decimal_unchecked(
+    model_name: &str,
+    column: &str,
+    expected_type: &str,
+    strict: bool,
+) -> Diagnostic {
+    let message = format!(
+        "column '{column}' of model '{model_name}': the contract declares type {expected_type}. \
+         Rocky knows the column is a decimal, but its precision and scale depend on the \
+         warehouse (for example SUM over a DECIMAL), so it did not check the declared digits"
+    );
+    let suggestion = format!(
+        "cast `{column}` in the SELECT to the DECIMAL(p, s) the contract names (the cast's \
+         target is then checked against {expected_type}), or declare the contract type as a \
+         bare `Decimal`, which Rocky does check"
+    );
+    if strict {
+        Diagnostic::error(E059, model_name, message).with_suggestion(suggestion)
+    } else {
+        Diagnostic::info(I003, model_name, message).with_suggestion(suggestion)
+    }
+}
+
 /// Check if a RockyType matches a type name string from a contract.
 ///
 /// Callers must handle [`RockyType::Unknown`] before calling: an inferred type
@@ -472,6 +517,9 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Decimal { precision, scale } => {
             decimal_type_matches(*precision, *scale, type_name)
         }
+        // Only a bare `Decimal` matches. `validate_contract_with` reports a
+        // `Decimal(p,s)` contract as unchecked before reaching here.
+        RockyType::DecimalUnsized => type_name == "Decimal",
         RockyType::String => type_name == "String",
         RockyType::Binary => type_name == "Binary",
         RockyType::Date => type_name == "Date",
@@ -909,6 +957,66 @@ mod tests {
             i003.suggestion.is_some(),
             "I003 must say how to make the check run: {i003:?}"
         );
+    }
+
+    /// #2356: a decimal whose digits Rocky does not claim (`SUM` over a
+    /// DECIMAL) still checks the type family. A bare `Decimal` contract
+    /// passes, a non-decimal one is `E011`, and only the digits of a
+    /// `Decimal(p,s)` contract go unchecked: `I003`, or `E059` when strict.
+    /// `nullable = false` is still checked (`E012`).
+    #[test]
+    fn an_unsized_decimal_checks_the_family_and_reports_unchecked_digits() {
+        let contract = |type_name: &str, nullable: Option<bool>| CompilerContract {
+            columns: vec![ContractColumn {
+                name: "total".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let schema = vec![typed_col("total", RockyType::DecimalUnsized, true)];
+        let why = |_: &str| "unused".to_string();
+        let codes = |diags: &[Diagnostic]| -> Vec<String> {
+            diags.iter().map(|d| d.code.to_string()).collect()
+        };
+
+        // Bare `Decimal`: checked, and it matches.
+        let diags = validate_contract("m", &schema, &contract("Decimal", None));
+        assert!(diags.is_empty(), "{diags:?}");
+        let diags = validate_contract_with("m", &schema, &contract("Decimal", None), Some(&why));
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // Another family: a real mismatch, strict or not.
+        for type_name in ["String", "Int64", "Float64"] {
+            let diags = validate_contract("m", &schema, &contract(type_name, None));
+            assert_eq!(codes(&diags), ["E011"], "{type_name}");
+        }
+
+        // Named digits: not checked, and said so.
+        for type_name in ["Decimal(38,2)", "Decimal(10,2)", "Decimal(18)"] {
+            let diags = validate_contract("m", &schema, &contract(type_name, None));
+            assert_eq!(codes(&diags), ["I003"], "{type_name}");
+            let i003 = &diags[0];
+            assert_eq!(i003.severity, Severity::Info);
+            assert!(
+                i003.message.contains("'total'")
+                    && i003.message.contains(type_name)
+                    && i003.message.contains("precision and scale"),
+                "{i003:?}"
+            );
+            let fix = i003.suggestion.as_deref().unwrap();
+            assert!(fix.contains("bare `Decimal`"), "{fix}");
+
+            let diags =
+                validate_contract_with("m", &schema, &contract(type_name, None), Some(&why));
+            assert_eq!(codes(&diags), ["E059"], "{type_name}");
+            assert_eq!(diags[0].severity, Severity::Error);
+        }
+
+        // Nullability is still checked.
+        let diags = validate_contract("m", &schema, &contract("Decimal", Some(false)));
+        assert_eq!(codes(&diags), ["E012"]);
     }
 
     /// Strict contracts: the same unchecked type is the `E059` error, with the

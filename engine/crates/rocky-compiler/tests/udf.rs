@@ -245,3 +245,58 @@ fn nested_calls_in_udf_arguments_type_check() {
         result.diagnostics
     );
 }
+
+/// #2356: a `SUM` over a DECIMAL has digits Rocky does not claim, so passing
+/// it to a `DECIMAL(p,s)` parameter cannot be verified: `W051`, not a silent
+/// pass on the input's digits and not an `E051`.
+#[test]
+fn an_unsized_decimal_argument_to_a_sized_parameter_is_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("models")).unwrap();
+    fs::create_dir_all(root.join("functions")).unwrap();
+    write_function(
+        root,
+        "add_tax",
+        "returns = \"DECIMAL(12,2)\"\n\n[[arguments]]\nname = \"amount\"\ntype = \"DECIMAL(10,2)\"\n",
+        "amount * 1.2",
+    );
+    write_model(
+        root,
+        "fct_totals",
+        "SELECT order_id, add_tax(SUM(amount)) AS taxed FROM raw.orders GROUP BY order_id",
+    );
+    let mut cfg = config(root, false);
+    cfg.source_schemas.insert(
+        "raw.orders".to_string(),
+        vec![
+            TypedColumn {
+                name: "order_id".to_string(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "amount".to_string(),
+                data_type: RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+        ],
+    );
+
+    let result = compile(&cfg).unwrap();
+    assert!(!result.has_errors, "{:#?}", result.diagnostics);
+    let w051: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "W051")
+        .collect();
+    assert_eq!(w051.len(), 1, "{:#?}", result.diagnostics);
+    assert!(
+        w051[0].message.contains("cannot verify argument 1"),
+        "{:#?}",
+        w051[0]
+    );
+}

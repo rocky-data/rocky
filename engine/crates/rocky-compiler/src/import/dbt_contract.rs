@@ -130,7 +130,7 @@ fn contract_type_name(data_type: &str, adapter: Option<&str>) -> Option<String> 
         RockyType::Int64 => "Int64",
         RockyType::Float32 => "Float32",
         RockyType::Float64 => "Float64",
-        RockyType::Decimal { .. } => "Decimal",
+        RockyType::Decimal { .. } | RockyType::DecimalUnsized => "Decimal",
         RockyType::String => "String",
         RockyType::Binary => "Binary",
         RockyType::Date => "Date",

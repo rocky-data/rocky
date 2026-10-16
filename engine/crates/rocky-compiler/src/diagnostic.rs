@@ -743,6 +743,13 @@ pub const I002: &str = "I002";
 /// even with source schemas, because the result type is not knowable at this
 /// layer.
 ///
+/// The same code reports a contract that names decimal digits
+/// (`Decimal(p,s)`) over a [`RockyType::DecimalUnsized`] column, such as
+/// `SUM` over a `DECIMAL` (#2356). Rocky knows the column is a decimal, so
+/// a bare `Decimal` contract is checked; only the digits are not.
+///
+/// [`RockyType::DecimalUnsized`]: crate::types::RockyType::DecimalUnsized
+///
 /// `--strict-contracts` (or `[contracts] strict = true`) turns this code into
 /// the [`E059`] error.
 pub const I003: &str = "I003";

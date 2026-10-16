@@ -4232,11 +4232,12 @@ effect = "require_review"
         // `revenue_eur` is NOT NULL in the contract. A bare `CAST(SUM(..))`
         // is nullable (SUM over no rows is NULL), so the worker states the
         // default; before #2295 lineage wrongly read the cast as NOT NULL.
-        // `COALESCE(DECIMAL(18,2), 0)` widens to DECIMAL(19,2), and a cast
-        // back to DECIMAL(18,2) could overflow and return NULL on some
-        // warehouses (#2299), so the default is cast to the column's type.
+        // A SUM over DECIMAL(18,2) has warehouse-dependent digits (#2356),
+        // so a cast of it to DECIMAL(18,2) can overflow and return NULL on
+        // some warehouses (#2299). The cast goes inside the COALESCE, whose
+        // non-null default then replaces that NULL: provably NOT NULL.
         const WORKER_SQL: &str = "SELECT\n    client_id,\n    charged_on AS date,\n    \
-             CAST(COALESCE(SUM(amount_eur), CAST(0 AS DECIMAL(18,2))) AS DECIMAL(18,2)) AS revenue_eur\n\
+             COALESCE(CAST(SUM(amount_eur) AS DECIMAL(18,2)), CAST(0 AS DECIMAL(18,2))) AS revenue_eur\n\
              FROM raw.stripe_charges\n\
              WHERE NOT refunded\nGROUP BY client_id, charged_on\n";
         const DRAFT_SIDECAR: &str = "name = \"revenue_daily\"\nintent = \"Daily gross revenue \

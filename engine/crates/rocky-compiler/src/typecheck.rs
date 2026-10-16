@@ -2704,9 +2704,14 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
     match func {
         "COUNT" => (RockyType::Int64, false), // COUNT is never null
         "SUM" => {
-            // SUM preserves numeric type, nullable (empty group → NULL)
+            // Nullable: an empty group sums to NULL. A DECIMAL sum is wider
+            // than its input by a warehouse-dependent amount (DuckDB
+            // `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`), so it is a
+            // decimal whose digits Rocky does not claim (#2356).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
+            } else if input_type.is_decimal() {
+                RockyType::DecimalUnsized
             } else {
                 input_type.clone()
             };
@@ -2719,7 +2724,7 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             // `Decimal` degrades to `Unknown` (#1238) — every other input keeps
             // `Float64`, so an argument Rocky simply failed to resolve does not
             // silently drop out of contract validation.
-            let ty = if matches!(input_type, RockyType::Decimal { .. }) {
+            let ty = if input_type.is_decimal() {
                 RockyType::Unknown
             } else {
                 RockyType::Float64
@@ -3231,12 +3236,7 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            let result = if arg_type.is_integer() {
-                RockyType::Int64
-            } else {
-                arg_type
-            };
-            (result, true)
+            infer_aggregation_type("SUM", &arg_type)
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
@@ -3466,7 +3466,7 @@ fn cast_can_fail(
         (T::Int32, T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int64, T::Float32 | T::Float64) => false,
         (T::Float32, T::Float64) => false,
-        (T::Decimal { .. }, T::Float32 | T::Float64) => false,
+        (T::Decimal { .. } | T::DecimalUnsized, T::Float32 | T::Float64) => false,
         (T::Date, T::Timestamp | T::TimestampNtz) => false,
         (T::Timestamp | T::TimestampNtz, T::Date | T::Timestamp | T::TimestampNtz) => false,
         _ => true,
@@ -3811,12 +3811,10 @@ impl SelectInference {
     fn push_expression(&mut self, name: String, expr: &Expr, scope: &TypeScope) {
         let (data_type, nullable) = infer_expr_type(expr, scope);
         let function = function_name(expr);
-        // `SUM` / `AVG` of a DECIMAL widens the precision by a
-        // dialect-dependent amount (DuckDB DECIMAL(38, s), Databricks
-        // DECIMAL(p + 10, s)), so the argument's DECIMAL is not the result.
-        let widened_decimal = matches!(function.as_deref(), Some("SUM" | "AVG"))
-            && matches!(data_type, RockyType::Decimal { .. });
-        if has_exact_type(expr, scope) && !widened_decimal {
+        // `SUM` of a DECIMAL is `DecimalUnsized` and `AVG` of one is
+        // `Unknown` ([`infer_aggregation_type`]), so neither claims the
+        // input's digits and both may be exact (#2356).
+        if has_exact_type(expr, scope) {
             self.exact_type_outputs.insert(self.columns.len());
         } else {
             self.relation_inexact.insert(self.columns.len());
@@ -4013,7 +4011,12 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
         } else if !has_exact_type(branch, scope) {
             return false;
         }
-        if infer_expr_type(branch, scope).0 != *result {
+        let branch_type = infer_expr_type(branch, scope).0;
+        // A decimal branch agrees with a decimal result whose digits are
+        // unknown: `COALESCE(SUM(d), CAST(0 AS DECIMAL(10,2)))` is a decimal,
+        // and `DecimalUnsized` claims no digits for it (#2356).
+        let decimal_into_unsized = *result == RockyType::DecimalUnsized && branch_type.is_decimal();
+        if branch_type != *result && !decimal_into_unsized {
             return false;
         }
         typed_branch = true;
@@ -5763,10 +5766,121 @@ mod tests {
                 // old: (Int32, true) — y's type, not the cast target
                 ("h".to_string(), RockyType::Int64, true),
                 // old: (Int64, true) — y's integer type. SUM widens a
-                // DECIMAL by a dialect-dependent amount: Unknown.
-                ("i".to_string(), RockyType::Unknown, true),
+                // DECIMAL by a dialect-dependent amount: a decimal with no
+                // digits claimed (#2356; Unknown before it).
+                ("i".to_string(), RockyType::DecimalUnsized, true),
             ];
             assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
+        }
+    }
+
+    /// Typecheck `sql` as model `m` over a source `t` with `d DECIMAL(10,2)
+    /// NOT NULL`, `x INT NOT NULL` and `n STRING NOT NULL`.
+    fn typecheck_over_decimal_t(sql: &str) -> Vec<(String, RockyType, bool)> {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                (
+                    "d",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
+        result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    }
+
+    /// #2356: `SUM` over a DECIMAL is a decimal whose digits Rocky does not
+    /// claim (DuckDB `DECIMAL(38,2)`, Databricks `DECIMAL(20,2)` for a
+    /// `DECIMAL(10,2)` input). Before, it was the input's `Decimal(10,2)`
+    /// (too narrow) at the top level and `Unknown` once wrapped. Each row
+    /// goes through the full typecheck: the lineage `Aggregation` edge, and
+    /// expression inference for the nested forms.
+    #[test]
+    fn sum_over_a_decimal_is_an_unsized_decimal() {
+        let d10_2 = RockyType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        for (sql, expected) in [
+            // The bare aggregate (lineage `Aggregation` edge).
+            (
+                "SELECT SUM(d) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized, true)],
+            ),
+            // Windowed and qualified forms.
+            (
+                "SELECT SUM(t.d) OVER (PARTITION BY n) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized, true)],
+            ),
+            // Through a CTE: the CTE column is exact, so the read keeps it.
+            (
+                "WITH c AS (SELECT n, SUM(d) AS s FROM t GROUP BY n) SELECT s FROM c",
+                vec![("s", RockyType::DecimalUnsized, true)],
+            ),
+            // COALESCE over an integer literal: still a decimal, now NOT NULL.
+            (
+                "SELECT COALESCE(SUM(d), 0) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized, false)],
+            ),
+            // COALESCE with a sized decimal branch: the sum's digits are
+            // still unknown, so the result is unsized, not Decimal(10,2).
+            (
+                "SELECT COALESCE(SUM(d), CAST(0 AS DECIMAL(10,2))) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized, false)],
+            ),
+            // A cast back to DECIMAL(10,2) can overflow, and a non-ANSI cast
+            // returns NULL: nullable (#2299), unchanged.
+            (
+                "SELECT CAST(COALESCE(SUM(d), 0) AS DECIMAL(10,2)) AS s FROM t",
+                vec![("s", d10_2.clone(), true)],
+            ),
+            // The same with a sized default: NOT NULL before (the sum was
+            // read as Decimal(10,2), so the cast looked safe), nullable now.
+            (
+                "SELECT CAST(COALESCE(SUM(d), CAST(0 AS DECIMAL(10,2))) AS DECIMAL(10,2)) AS s \
+                 FROM t",
+                vec![("s", d10_2.clone(), true)],
+            ),
+            // The remedy the issue names stays typed and NOT NULL.
+            (
+                "SELECT COALESCE(CAST(SUM(d) AS DECIMAL(10,2)), CAST(0 AS DECIMAL(10,2))) AS s \
+                 FROM t",
+                vec![("s", d10_2.clone(), false)],
+            ),
+            // Integer and non-decimal sums keep their rules.
+            (
+                "SELECT SUM(x) AS s FROM t",
+                vec![("s", RockyType::Int64, true)],
+            ),
+            // AVG over a decimal stays Unknown (#1238): DuckDB returns DOUBLE.
+            (
+                "SELECT AVG(d) AS a FROM t",
+                vec![("a", RockyType::Unknown, true)],
+            ),
+        ] {
+            let expected: Vec<(String, RockyType, bool)> = expected
+                .into_iter()
+                .map(|(name, ty, nullable)| (name.to_string(), ty, nullable))
+                .collect();
+            assert_eq!(typecheck_over_decimal_t(sql), expected, "{sql}");
         }
     }
 

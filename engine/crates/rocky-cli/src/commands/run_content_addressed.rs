@@ -563,6 +563,16 @@ pub(crate) fn query_result_to_record_batch(
                     Arc::new(arr) as ArrayRef,
                 )
             }
+            // A Decimal128 column needs a precision and scale, and Rocky
+            // does not claim them for this decimal (#2356): never guess one.
+            RockyType::DecimalUnsized => {
+                return Err(anyhow!(
+                    "column {:?} is a decimal whose precision and scale depend on the warehouse \
+                     (for example SUM over a DECIMAL); the content-addressed writer needs them, \
+                     so CAST the column to DECIMAL(p, s) in the model's SELECT",
+                    tc.name
+                ));
+            }
             other => {
                 return Err(anyhow!(
                     "column {:?} has type {other:?}; the content-addressed writer supports \
@@ -1828,6 +1838,24 @@ mod tests {
         assert_eq!(arr.value(1), -9999_i128);
         assert_eq!(arr.value(2), 1_i128);
         assert_eq!(arr.value(3), 10000_i128);
+    }
+
+    /// #2356: a decimal with no claimed digits is refused, never written
+    /// with guessed digits.
+    #[test]
+    fn convert_unsized_decimal_is_refused_with_a_cast_hint() {
+        let typed_cols = vec![col("total", RockyType::DecimalUnsized, true)];
+        let result = QueryResult {
+            columns: vec!["total".into()],
+            rows: vec![vec![serde_json::json!("123.45")]],
+        };
+        let err = query_result_to_record_batch(&typed_cols, &result)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"total\"") && err.contains("CAST") && err.contains("DECIMAL(p, s)"),
+            "{err}"
+        );
     }
 
     #[test]

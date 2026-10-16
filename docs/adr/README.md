@@ -36,4 +36,4 @@ These three ADRs were authored under adversarial review (Codex, 10 findings disp
 
 | ADR | Status | Closes |
 |---|---|---|
-| [`ADR-TYPES.md`](ADR-TYPES.md) | Accepted (ratified 2026-10-08) | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |
+| [`ADR-TYPES.md`](ADR-TYPES.md) | Accepted (ratified 2026-10-08; amended 2026-10-16) | RD-010 (decimal arithmetic, literal typing, digit validation), the inference half of RD-028. Defines the sound-bound rule, `Unknown` in inference, nullability rules, cross-dialect mapping classes, and inference versioning. Decides the unmerged WP-03 decimal branch (Open question F). |
