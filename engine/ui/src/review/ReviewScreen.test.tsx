@@ -42,6 +42,7 @@ const PLAN_LOADERS: PlanLoaders = {
     }),
   ),
   queue: vi.fn(async () => QUEUE),
+  project: vi.fn(async () => { throw new Error("no project read in these tests"); }),
   product: vi.fn(async () => ({}) as ProductStatusOutput),
 };
 
@@ -126,6 +127,7 @@ describe("ReviewScreen", () => {
         };
       }),
       queue: vi.fn(async () => queueWithEscalation),
+      project: vi.fn(async () => { throw new Error("no project read in these tests"); }),
       product: vi.fn(async () => ({}) as ProductStatusOutput),
     };
 

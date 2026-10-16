@@ -1449,7 +1449,26 @@ pub(crate) fn product_approve_in(
     state_path: &Path,
     product_name: &str,
 ) -> Result<ProductApproveOutput> {
-    product_approve_with(root, state_path, product_name, &approver_string)
+    product_approve_with(root, state_path, product_name, None, &approver_string)
+}
+
+/// [`product_approve_in`] that approves only the spec whose digest is
+/// `expect_digest`. A different working spec refuses with
+/// `approval-digest-mismatch` before the state store is opened and before
+/// anything is written.
+pub(crate) fn product_approve_expecting(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+    expect_digest: Option<&str>,
+) -> Result<ProductApproveOutput> {
+    product_approve_with(
+        root,
+        state_path,
+        product_name,
+        expect_digest,
+        &approver_string,
+    )
 }
 
 /// [`product_approve_in`] with the approver resolved by `approver`, so a test
@@ -1460,9 +1479,22 @@ fn product_approve_with(
     root: &Path,
     state_path: &Path,
     product_name: &str,
+    expect_digest: Option<&str>,
     approver: &dyn Fn() -> Result<String>,
 ) -> Result<ProductApproveOutput> {
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    // The digest the caller confirmed must be the spec on disk now. This is
+    // checked before the store is opened, so a mismatch writes nothing.
+    if let Some(expected) = expect_digest
+        && expected != parsed.digest
+    {
+        bail!(
+            "[approval-digest-mismatch] the working spec of product '{product_name}' has digest \
+             {}, not the expected {expected}; the spec changed since you read it. Nothing was \
+             written. Read the spec again and approve the digest you mean",
+            parsed.digest
+        );
+    }
     let store = open_state_store(state_path)?;
 
     let observed_approval = store.product_approval_get(product_name)?;
@@ -1621,10 +1653,11 @@ pub fn run_product_approve(
     _config_path: &Path,
     product_name: &str,
     state_path: &Path,
+    expect_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
-    let output = product_approve_in(&root, state_path, product_name)?;
+    let output = product_approve_expecting(&root, state_path, product_name, expect_digest)?;
     if output_json {
         print_json(&output)?;
     } else if output.already_approved {
@@ -3233,7 +3266,7 @@ effect = "require_review"
                     Ok(identity(crate::output::ApproverSource::Local)),
                 )?))
             };
-            let output = product_approve_with(&root, &state_path, "revenue_daily", &approver)
+            let output = product_approve_with(&root, &state_path, "revenue_daily", None, &approver)
                 .expect("approves");
             let stored = StateStore::open(&state_path)
                 .expect("opens")
@@ -3282,7 +3315,7 @@ effect = "require_review"
                     identity,
                 )?))
             };
-            let error = product_approve_with(&root, &state_path, "revenue_daily", &approver)
+            let error = product_approve_with(&root, &state_path, "revenue_daily", None, &approver)
                 .expect_err("refuses");
             assert!(
                 format!("{error:#}").contains(APPROVER_IDENTITY_UNRESOLVED),
@@ -3296,6 +3329,72 @@ effect = "require_review"
                 .expect("reads");
             assert!(recorded.is_none(), "no approval was recorded");
         }
+    }
+
+    /// `--expect-digest`: the approval covers exactly the spec the caller
+    /// confirmed. A different working spec refuses BEFORE anything is written
+    /// (no store, no snapshot), naming both digests; the matching digest
+    /// approves; no digest approves what is on disk, as before.
+    #[test]
+    fn an_expected_digest_that_does_not_match_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let digest = parsed_d3().digest;
+        let wrong = format!("sha256:{}", "0".repeat(64));
+
+        let error = product_approve_expecting(&root, &state_path, "revenue_daily", Some(&wrong))
+            .expect_err("a different digest refuses");
+        let message = format!("{error:#}");
+        assert!(message.contains("approval-digest-mismatch"), "{message}");
+        assert!(
+            message.contains(&digest) && message.contains(&wrong),
+            "{message}"
+        );
+        assert!(!state_path.exists(), "no store was opened");
+        assert!(
+            !root
+                .join(approval_snapshot_rel("revenue_daily", &digest))
+                .exists(),
+            "no snapshot was written"
+        );
+    }
+
+    #[test]
+    fn an_expected_digest_that_matches_approves_that_spec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let digest = parsed_d3().digest;
+
+        let output = product_approve_expecting(&root, &state_path, "revenue_daily", Some(&digest))
+            .expect("the matching digest approves");
+        assert_eq!(output.spec_digest, digest);
+        assert!(!output.already_approved);
+        let stored = StateStore::open(&state_path)
+            .expect("opens")
+            .product_approval_get("revenue_daily")
+            .expect("reads")
+            .expect("recorded");
+        assert_eq!(stored.spec_digest, digest);
+        // No flag: the spec on disk is approved, as before (here a no-op).
+        let again = product_approve_expecting(&root, &state_path, "revenue_daily", None)
+            .expect("no flag still approves");
+        assert!(again.already_approved);
+    }
+
+    /// The digest is compared before the "already approved" short-cut too: a
+    /// stale digest never reports success.
+    #[test]
+    fn a_stale_expected_digest_is_refused_even_when_the_spec_is_already_approved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        let wrong = format!("sha256:{}", "1".repeat(64));
+        let error = product_approve_expecting(&root, &state_path, "revenue_daily", Some(&wrong))
+            .expect_err("refuses");
+        assert!(format!("{error:#}").contains("approval-digest-mismatch"));
     }
 
     #[test]

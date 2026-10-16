@@ -223,13 +223,15 @@ Plan promote ──▶ plan written, tables listed ──▶ Promote (confirm) �
 
 The server enforces the same rule, so a call that skips the page is checked too. `POST /api/v1/jobs/promote` and an apply of a promote plan answer `409 branch_approval_not_required` unless the config sets `required = true`. An apply of a promote plan that was built without the approval gate answers `409 promote_plan_not_approved`. That covers a plan built while `required` was off, a plan built with the gate bypassed, and a plan that holds fewer approvals than `min_approvers`. The promote job runs without `ROCKY_BRANCH_APPROVAL_SKIP`, whatever the server's environment holds.
 
+The plan screen mirrors the key. For a promote plan it shows Apply disabled, with the reason and the terminal command, unless the project requires a branch approval. The server stays the authority and also checks the plan's approvals.
+
 The page has no **Approve** button for a branch. A browser click would record the approval as `local`, although it came over the network, and one session could then approve and promote its own branch.
 
 ### Approve a product spec
 
-A product's page on the **Products** screen shows **Approve spec** when the working spec has no approval yet, or differs from the approved one. The page asks you to confirm. The question names the product, the spec digest the page read and the output model. It also names the approval it replaces, when there is one. After you confirm, the server runs `rocky product approve <name>`.
+A product's page on the **Products** screen shows **Approve spec** when the working spec has no approval yet, or differs from the approved one. The page asks you to confirm. The question names the product, the spec digest the page read and the output model. It also names the approval it replaces, when there is one. After you confirm, the server runs `rocky product approve <name> --expect-digest <digest>`, with the digest the page showed in the question.
 
-The command approves the spec as it is on disk when the job runs, not the one the page read. So the page compares the digest in the result with the one you confirmed. If they differ, it shows a warning that names both digests, not a plain "done". The result also says when the spec was already approved and nothing was written. The engine refuses a new spec revision while fulfillment work is in flight. The page shows that refusal.
+The approval covers exactly that spec. If the spec on disk changed after the page read it, the command refuses with `approval-digest-mismatch`, names both digests, and writes nothing. Read the spec again and approve the digest you mean. The result also says when the spec was already approved and nothing was written. The engine refuses a new spec revision while fulfillment work is in flight. The page shows that refusal.
 
 The approver is recorded with its channel, as `rocky review --approve` records it. The approval stores `<server git email> (http_api)`. A terminal approval stores the bare email, as before. The label names the channel and the server's git identity. It does not prove who was at the page, and nothing proves that a browser made the call. If the server cannot read `git config user.email`, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Nothing is written in that case: the snapshot file is not created either.
 

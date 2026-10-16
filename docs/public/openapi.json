@@ -10627,7 +10627,7 @@
           },
           "expect_spec_digest": {
             "default": null,
-            "description": "`--expect-spec-digest <hex>` for `apply` — the approved-spec digest the caller expects the plan to be bound to. The engine's gate is fail-closed both ways: a product-bound plan REFUSES an apply without this, and passing it against an unbound plan refuses too. The value must come from the caller's independently approved product-spec snapshot, never read back from the plan itself.",
+            "description": "`--expect-spec-digest <hex>` for `apply` — the approved-spec digest the caller expects the plan to be bound to. The engine's gate is fail-closed both ways: a product-bound plan REFUSES an apply without this, and passing it against an unbound plan refuses too. The value must come from the caller's independently approved product-spec snapshot, never read back from the plan itself. For `product_approve` it is required: `--expect-digest <digest>`, the digest of the working spec the caller confirmed. The command refuses, writing nothing, when the spec on disk has a different digest.",
             "type": [
               "string",
               "null"
@@ -26572,7 +26572,7 @@
     },
     "/api/v1/jobs/product_approve": {
       "post": {
-        "description": "Submit a mutating `product_approve` job: `rocky product approve <name>`. Approves the product's working spec as it is on disk when the job runs: it writes an immutable snapshot file and records the approval, the loop state and a journal row in one state-store transaction. The record names the server's git identity with the channel, `<email> (http_api)`; with no usable git identity the job fails with `approver_identity_unresolved` and writes nothing. It refuses a new spec revision while fulfillment work is in flight. Takes the mutating permit (409 `mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or product approval holds it). `name` is required: a bare product name (an ASCII letter or `_`, then letters, digits or `_`), validated before the job starts.",
+        "description": "Submit a mutating `product_approve` job: `rocky product approve <name> --expect-digest <digest>`. Approves the product's working spec, but only if its digest is exactly `expect_spec_digest` (required; 400 without it). If the spec on disk has changed, the job fails with `approval-digest-mismatch` and writes nothing. When it matches, it writes an immutable snapshot file and records the approval, the loop state and a journal row in one state-store transaction. The record names the server's git identity with the channel, `<email> (http_api)`; with no usable git identity the job fails with `approver_identity_unresolved` and writes nothing. It refuses a new spec revision while fulfillment work is in flight. Takes the mutating permit (409 `mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or product approval holds it). `name` is required: a bare product name (an ASCII letter or `_`, then letters, digits or `_`), validated before the job starts.",
         "operationId": "submitProductApproveJob",
         "parameters": [
           {

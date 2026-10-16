@@ -214,6 +214,7 @@ function planLoaders(status: () => Promise<ReviewStatusOutput>): PlanLoaders {
     status: vi.fn(status),
     diff: vi.fn(async () => DIFF),
     queue: vi.fn(async () => EMPTY_QUEUE),
+    project: vi.fn(async () => { throw new Error("no project read in these tests"); }),
     product: vi.fn(async () => {
       throw new Error("no product read in these tests");
     }),
@@ -325,6 +326,7 @@ describe("Approve and Apply on the plan page", () => {
         approver: { email: "dev@example.com", host: "box", source: "local" },
         ...extra,
       })),
+      project: vi.fn(async () => { throw new Error("no project read in these tests"); }),
       product: vi.fn(
         async () =>
           ({

@@ -957,8 +957,10 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit a product approve job",
             description: "Submit a mutating `product_approve` job: `rocky product approve \
-                 <name>`. Approves the product's working spec as it is on disk when the job \
-                 runs: it writes an immutable snapshot file and records the approval, the \
+                 <name> --expect-digest <digest>`. Approves the product's working spec, but \
+                 only if its digest is exactly `expect_spec_digest` (required; 400 without \
+                 it). If the spec on disk has changed, the job fails with \
+                 `approval-digest-mismatch` and writes nothing. When it matches, it writes an immutable snapshot file and records the approval, the \
                  loop state and a journal row in one state-store transaction. The record \
                  names the server's git identity with the channel, `<email> (http_api)`; \
                  with no usable git identity the job fails with \

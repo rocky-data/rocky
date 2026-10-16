@@ -4,6 +4,7 @@ import type { ProductStatusOutput } from "@rocky-types/product_status";
 import type { BreakingFinding, ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ApproverIdentity, ReviewStatusOutput } from "@rocky-types/review_status";
+import type { ProjectOutput } from "@rocky-types/project";
 import { apiGet } from "../api";
 import { Clip, StatusCard, ToneDot, type Tone } from "../components";
 import { type Resource, useResource } from "../estate/useResource";
@@ -30,6 +31,8 @@ export interface PlanLoaders {
   diff: (planId: string) => Promise<ReviewOutput>;
   queue: () => Promise<ReviewQueueOutput>;
   product: (name: string) => Promise<ProductStatusOutput>;
+  /** The project, read only for a promote plan: it says whether promote is allowed here. */
+  project: () => Promise<ProjectOutput>;
 }
 
 export const defaultPlanLoaders: PlanLoaders = {
@@ -37,6 +40,7 @@ export const defaultPlanLoaders: PlanLoaders = {
   diff: (planId) => apiGet<ReviewOutput>(`review/${encodeURIComponent(planId)}`),
   queue: () => apiGet<ReviewQueueOutput>("review/queue"),
   product: (name) => apiGet<ProductStatusOutput>(`products/${encodeURIComponent(name)}`),
+  project: () => apiGet<ProjectOutput>("project"),
 };
 
 /** A `product:<name>` identity reduced to the name the products route takes. */
@@ -371,6 +375,48 @@ export function approverLine(approver: ApproverIdentity | null | undefined): str
 /** The plan kind the server never applies over the HTTP API. */
 export const ARCHIVE_PLAN_KIND = "archive";
 
+/** The plan kind the server applies only when `[branch.approval] required = true`. */
+export const PROMOTE_PLAN_KIND = "promote";
+
+/**
+ * What the project says about applying a promote plan from here: `true` when
+ * `[branch.approval] required = true`, `false` when it is off, `null` when the
+ * config could not be read, `"loading"` before the project answers.
+ */
+export type PromoteGate = boolean | null | "loading";
+
+/**
+ * A promote plan replaces production tables, so the server applies one only
+ * when the config requires a branch approval, and only when the plan holds the
+ * approvals it needs. The page mirrors the first rule; the server stays the
+ * authority on both, and a plan without approvals is refused with
+ * `promote_plan_not_approved`.
+ */
+function PromoteBlocked({ planId, gate }: { planId: string; gate: PromoteGate }) {
+  return (
+    <div className="space-y-2">
+      <WriteButton
+        label="Apply"
+        disabledReason={
+          gate === "loading"
+            ? "Reading the project config."
+            : "A promote plan is applied here only when rocky.toml sets [branch.approval] required = true."
+        }
+        onClick={() => undefined}
+      />
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        {gate === null
+          ? "The project config could not be read, so the page cannot say whether promote is allowed here. "
+          : "Promote replaces production tables. This page applies a promote plan only when rocky.toml sets "}
+        <code>[branch.approval] required = true</code>
+        {gate === null ? "." : ", and the server also checks that the plan holds the approvals the config needs."}{" "}
+        Apply it in a terminal:
+      </p>
+      <CommandLine command={`rocky apply ${planId}`} />
+    </div>
+  );
+}
+
 /**
  * An archive plan deletes rows and then vacuums with no retention window,
  * which cannot be undone. The server refuses to apply one over the HTTP API
@@ -414,11 +460,13 @@ function Approval({
   status,
   entries,
   jobs,
+  promoteGate,
   onChanged,
 }: {
   status: ReviewStatusOutput;
   entries: ReviewQueueEntry[];
   jobs: JobClient;
+  promoteGate: PromoteGate;
   onChanged: () => void;
 }) {
   const access = useWriteAccess();
@@ -492,6 +540,8 @@ function Approval({
 
       {status.kind === ARCHIVE_PLAN_KIND ? (
         <ArchiveTerminalOnly planId={planId} />
+      ) : status.kind === PROMOTE_PLAN_KIND && promoteGate !== true ? (
+        <PromoteBlocked planId={planId} gate={promoteGate} />
       ) : productBound ? (
         <ProductApply planId={planId} reviewed={status.reviewed} apply={apply.view} cancel={apply.cancel} start={apply.start} />
       ) : (
@@ -786,6 +836,20 @@ export function PlanDetail({
   );
   const product = useResource(loadProduct, [loadProduct]);
 
+  // The project is read only for a promote plan.
+  const isPromote = status.kind === "ready" && status.value.kind === PROMOTE_PLAN_KIND;
+  const loadProject = useCallback(
+    () => (isPromote ? loaders.project() : Promise.reject(new Error("not a promote plan"))),
+    [loaders, isPromote],
+  );
+  const project = useResource(loadProject, [loadProject]);
+  const promoteGate: PromoteGate =
+    project.kind === "loading"
+      ? "loading"
+      : project.kind === "ready"
+        ? (project.value.branch_approval_required ?? null)
+        : null;
+
   if (status.kind !== "ready") {
     return (
       <section aria-label="The plan" className="space-y-3">
@@ -900,6 +964,7 @@ export function PlanDetail({
             status={status.value}
             entries={entries}
             jobs={jobs}
+            promoteGate={promoteGate}
             onChanged={() => {
               status.reload();
               queue.reload();

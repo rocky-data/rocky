@@ -87,7 +87,10 @@ Record a human's approval of the current spec revision.
 
 ```bash
 rocky product approve revenue_daily
+rocky product approve revenue_daily --expect-digest sha256:<hex>
 ```
+
+With `--expect-digest`, the command approves the working spec only if its digest is exactly the one given (as `rocky product status` prints it). A different digest refuses with `approval-digest-mismatch` before the store is opened, and nothing is written. Use it to approve exactly the spec you read. Without the flag, the spec on disk when the command runs is approved. The browser UI always passes it.
 
 Approval is one authority transition, in a fixed order:
 

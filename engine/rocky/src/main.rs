@@ -2956,6 +2956,12 @@ enum ProductSubcommand {
     Approve {
         /// Product name (`products/<name>.toml`).
         product: String,
+        /// Refuse unless the working spec's digest is exactly this
+        /// (`sha256:<hex>`, as `rocky product status` prints it). Nothing is
+        /// written on a mismatch. Without it, the spec on disk when the
+        /// command runs is approved.
+        #[arg(long)]
+        expect_digest: Option<String>,
     },
 }
 
@@ -4202,9 +4208,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             ProductSubcommand::Journal { product } => {
                 rocky_cli::commands::run_product_journal(&cli.config, &product, &state_path, json)
             }
-            ProductSubcommand::Approve { product } => {
-                rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
-            }
+            ProductSubcommand::Approve {
+                product,
+                expect_digest,
+            } => rocky_cli::commands::run_product_approve(
+                &cli.config,
+                &product,
+                &state_path,
+                expect_digest.as_deref(),
+                json,
+            ),
         },
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {
@@ -6882,6 +6895,41 @@ mod tests {
                 expect_spec_digest, ..
             } => assert_eq!(expect_spec_digest, None),
             _ => panic!("expected Apply subcommand"),
+        }
+    }
+
+    /// The browser UI and the server shell out with the LITERAL flag
+    /// `--expect-digest`; a field rename would silently rename it. Pin it, and
+    /// pin that it stays optional for a terminal approval.
+    #[test]
+    fn product_approve_expect_digest_flag_parses_by_its_literal_name() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "product",
+            "approve",
+            "revenue_daily",
+            "--expect-digest",
+            "sha256:feed",
+        ]);
+        match cli.command {
+            Command::Product {
+                subcommand:
+                    ProductSubcommand::Approve {
+                        product,
+                        expect_digest,
+                    },
+            } => {
+                assert_eq!(product, "revenue_daily");
+                assert_eq!(expect_digest.as_deref(), Some("sha256:feed"));
+            }
+            _ => panic!("expected product approve"),
+        }
+        let cli = try_parse_with_big_stack(&["rocky", "product", "approve", "revenue_daily"]);
+        match cli.command {
+            Command::Product {
+                subcommand: ProductSubcommand::Approve { expect_digest, .. },
+            } => assert_eq!(expect_digest, None),
+            _ => panic!("expected product approve"),
         }
     }
 

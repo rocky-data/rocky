@@ -2815,7 +2815,10 @@ pub(crate) struct JobRequest {
     /// fail-closed both ways: a product-bound plan REFUSES an apply without
     /// this, and passing it against an unbound plan refuses too. The value
     /// must come from the caller's independently approved product-spec
-    /// snapshot, never read back from the plan itself.
+    /// snapshot, never read back from the plan itself. For `product_approve`
+    /// it is required: `--expect-digest <digest>`, the digest of the working
+    /// spec the caller confirmed. The command refuses, writing nothing, when
+    /// the spec on disk has a different digest.
     expect_spec_digest: Option<String>,
     /// `--principal <agent|human>` for `freeze` and `unfreeze`. Absent means
     /// both principals. Ignored by every other kind.
@@ -3978,13 +3981,23 @@ const SPEC_DIGEST_MAX_CHARS: usize = 200;
 /// before the permit is taken or an argv is built. The digest is opaque to the
 /// engine (it compares equality only), so this checks shape, not content: not
 /// empty, no whitespace or control characters, no leading `-` (clap would read
-/// it as a flag), and a length cap. Other kinds ignore the field.
+/// it as a flag), and a length cap. A `product_approve` job must carry one
+/// (`400` without), because the approval has to cover exactly the spec the
+/// person confirmed. Other kinds ignore the field.
 fn validate_apply_digest(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
-    if kind != JobKind::Apply {
+    if !matches!(kind, JobKind::Apply | JobKind::ProductApprove) {
         return Ok(());
     }
     let Some(digest) = request.expect_spec_digest.as_deref() else {
-        return Ok(());
+        // An apply may go without one (the engine decides). A product approval
+        // may not: it must say which spec it covers.
+        return if kind == JobKind::ProductApprove {
+            Err(ApiError::bad_request(
+                "a product_approve job needs `expect_spec_digest`: the digest of the spec you confirmed",
+            ))
+        } else {
+            Ok(())
+        };
     };
     if digest.is_empty()
         || digest.starts_with('-')
@@ -4192,6 +4205,12 @@ fn job_subprocess_args(
             args.push("approve".into());
             if let Some(name) = &request.name {
                 args.push(name.into());
+            }
+            // The approval covers exactly the spec the person confirmed; the
+            // command refuses, writing nothing, if the spec on disk differs.
+            if let Some(digest) = &request.expect_spec_digest {
+                args.push("--expect-digest".into());
+                args.push(digest.into());
             }
         }
         JobKind::Compact => {
@@ -14447,6 +14466,7 @@ adapter = "db"
         let request = JobRequest {
             name: Some("revenue_daily".to_string()),
             base: Some("ignored".to_string()),
+            expect_spec_digest: Some("sha256:abc".to_string()),
             ..JobRequest::default()
         };
         let dirs = JobProjectDirs {
@@ -14477,6 +14497,8 @@ adapter = "db"
                 "product",
                 "approve",
                 "revenue_daily",
+                "--expect-digest",
+                "sha256:abc",
             ]
         );
         for kind in [
@@ -14517,17 +14539,27 @@ adapter = "db"
         let base = spawn_router(state).await;
         let client = reqwest::Client::new();
         let url = format!("{base}/api/v1/jobs/product_approve");
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let named = |name: &str| serde_json::json!({ "name": name, "expect_spec_digest": digest });
         let bad = [
             serde_json::json!({}),
-            serde_json::json!({ "name": "" }),
-            serde_json::json!({ "name": "-x" }),
-            serde_json::json!({ "name": "1abc" }),
-            serde_json::json!({ "name": "a-b" }),
-            serde_json::json!({ "name": "a b" }),
-            serde_json::json!({ "name": "../x" }),
-            serde_json::json!({ "name": "a/b" }),
-            serde_json::json!({ "name": "x\n" }),
-            serde_json::json!({ "name": "é" }),
+            serde_json::json!({ "expect_spec_digest": digest }),
+            named(""),
+            named("-x"),
+            named("1abc"),
+            named("a-b"),
+            named("a b"),
+            named("../x"),
+            named("a/b"),
+            named("x\n"),
+            named("é"),
+            // The digest is required, and held to the apply digest's shape.
+            serde_json::json!({ "name": "revenue_daily" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "--force" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "a b" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "a\nb" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "d".repeat(201) }),
         ];
         for body in &bad {
             let resp = client.post(&url).json(body).send().await.unwrap();
@@ -14536,12 +14568,7 @@ adapter = "db"
             assert_eq!(envelope.code, "bad_request", "{body}");
         }
         for name in ["revenue_daily", "_x", "A1"] {
-            let resp = client
-                .post(&url)
-                .json(&serde_json::json!({ "name": name }))
-                .send()
-                .await
-                .unwrap();
+            let resp = client.post(&url).json(&named(name)).send().await.unwrap();
             assert_eq!(resp.status(), 409, "{name}");
             let envelope: ErrorEnvelope = resp.json().await.unwrap();
             assert_eq!(envelope.code, "mutation_in_progress", "{name}");

@@ -81,12 +81,13 @@ function ApproveResult({ summary, shown }: { summary: ProductApproveSummary; sho
 
 /**
  * Approve a product's working spec from the browser: `rocky product approve
- * <name>` on this server. The page offers it when the spec is not approved or
- * has changed since the approval, and asks first, naming the product and the
- * spec digest it read.
+ * <name> --expect-digest <digest>` on this server. The page offers it when the
+ * spec is not approved or has changed since the approval, and asks first,
+ * naming the product and the spec digest it read.
  *
- * The command approves the spec as it is on disk when the job runs, so the
- * result is compared with the digest the person confirmed. The recorded
+ * The digest the person confirmed is sent with the job, and the command
+ * refuses, writing nothing, when the spec on disk has a different digest. The
+ * result is still compared with the confirmed digest, as a second check. The recorded
  * approver is the server's git identity with the channel, `<email>
  * (http_api)`; the server refuses the approval when it has no usable
  * identity. The engine also refuses a new revision while fulfillment work is
@@ -129,12 +130,14 @@ export function ProductApprove({
               output === null ? "" : `, output model ${output}`
             })?${
               replaces === null ? "" : ` This replaces the approval of ${replaces}.`
-            } The approval covers the spec as it is on disk when the job runs, and records this server's git identity with the channel http_api. The engine refuses it while fulfillment work is in flight.`}
+            } Only this exact digest is approved: if the spec changed since the page read it, the approval is refused and nothing is written. It records this server's git identity with the channel http_api. The engine also refuses it while fulfillment work is in flight.`}
             confirmLabel="Yes, approve this spec"
             busy={jobBusy(approve.view)}
             onConfirm={() => {
               setConfirmed(digest);
-              approve.start({ name });
+              // The digest the person confirmed rides along. The command
+              // refuses, writing nothing, if the spec on disk now differs.
+              approve.start({ name, expect_spec_digest: digest });
             }}
           />
         </>

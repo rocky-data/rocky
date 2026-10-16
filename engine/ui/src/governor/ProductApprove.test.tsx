@@ -106,7 +106,11 @@ describe("Approve the spec", () => {
     expect(submitted).toEqual([]);
     fireEvent.click(screen.getByRole("button", { name: "Approve spec" }));
     fireEvent.click(screen.getByRole("button", { name: "Yes, approve this spec" }));
-    await waitFor(() => expect(submitted).toEqual([{ kind: "product_approve", body: { name: "revenue_daily" } }]));
+    await waitFor(() =>
+      expect(submitted).toEqual([
+        { kind: "product_approve", body: { name: "revenue_daily", expect_spec_digest: DIGEST } },
+      ]),
+    );
   });
 
   it("says the approval it replaces when the spec changed since it was approved", () => {
@@ -155,6 +159,21 @@ describe("Approve the spec", () => {
     fireEvent.click(screen.getByRole("button", { name: "Yes, approve this spec" }));
     await screen.findByText(`Approve: ${DIGEST} was already approved. Nothing was written.`, {}, { timeout: 3000 });
     expect(screen.queryByText(/Recorded approver/)).toBeNull();
+  });
+
+  it("shows the refusal, and says nothing was approved, when the spec changed since the page read it", async () => {
+    const { client } = fakeJobs(
+      job("failed", {
+        error: `Error: [approval-digest-mismatch] the working spec of product 'revenue_daily' has digest sha256:${"3".repeat(64)}, not the expected ${DIGEST}; the spec changed since you read it. Nothing was written.`,
+      }),
+    );
+    renderApprove(client);
+    fireEvent.click(screen.getByRole("button", { name: "Approve spec" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, approve this spec" }));
+    const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
+    expect(alert.textContent).toContain("approval-digest-mismatch");
+    expect(alert.textContent).toContain("Nothing was written");
+    expect(screen.queryByText(/approved sha256/)).toBeNull();
   });
 
   it("shows the cleaned reason when the engine refuses, such as work in flight or no git identity", async () => {
@@ -222,7 +241,11 @@ describe("The product page", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Approve spec" }));
     fireEvent.click(screen.getByRole("button", { name: "Yes, approve this spec" }));
-    await waitFor(() => expect(submitted).toEqual([{ kind: "product_approve", body: { name: "revenue_daily" } }]));
+    await waitFor(() =>
+      expect(submitted).toEqual([
+        { kind: "product_approve", body: { name: "revenue_daily", expect_spec_digest: DIGEST } },
+      ]),
+    );
     await waitFor(() => expect(reads.status).toBeGreaterThan(1), { timeout: 3000 });
   });
 });
