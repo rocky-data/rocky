@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The lazy `rocky --version` check no longer marks itself done after a timeout, an `OSError`, or an unparseable version. The next call retries the check. The client logs one warning.
+- The lazy `rocky --version` check no longer marks itself done after a timeout, an `OSError`, or an unparseable version. The next call retries the check, up to three attempts in all. Then the client stops checking. A hanging `rocky --version` costs at most three probes. The client logs one warning.
 
 ## [0.25.0] — 2026-10-16
 

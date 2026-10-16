@@ -424,6 +424,18 @@ impl RockyLsp {
         models_dir.parent().map(|root| root.join("rocky.toml"))
     }
 
+    /// The AI base URL for this project: `[ai] base_url`, else
+    /// `ROCKY_AI_BASE_URL`, else `None` (the default endpoint). Resolves the
+    /// same way as `rocky ai`. Fails when `rocky.toml` exists but does not
+    /// load, so the key is never sent to the default host by mistake.
+    async fn ai_base_url(&self) -> std::result::Result<Option<String>, String> {
+        let models_dir = self.models_dir.read().await;
+        let toml_path = models_dir
+            .as_deref()
+            .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)));
+        rocky_ai::client::resolve_project_base_url(toml_path.as_deref()).map_err(|e| e.to_string())
+    }
+
     /// The project-level compiler inputs, read from `rocky.toml`.
     ///
     /// One derivation for both compile paths — the initial
@@ -2610,6 +2622,15 @@ impl LanguageServer for RockyLsp {
             .unwrap_or("")
             .to_string();
 
+        let base_url = match self.ai_base_url().await {
+            Ok(url) => url,
+            Err(message) => {
+                tracing::warn!(error = %message, "code_action_resolve: AI base URL unresolved");
+                action.data = Some(data);
+                return Ok(action);
+            }
+        };
+
         match kind.as_str() {
             AI_CONTRACT_FIX_KIND => {
                 let resolved_data: AiContractActionData = match serde_json::from_value(data.clone())
@@ -2635,7 +2656,8 @@ impl LanguageServer for RockyLsp {
                     .unwrap_or_default();
                 drop(lock);
 
-                let outcome = resolve_ai_contract_action(&resolved_data, &typed_models).await;
+                let outcome =
+                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_CLASSIFICATION_FIX_KIND => {
@@ -2649,7 +2671,7 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_classification_action(&resolved_data).await;
+                let outcome = resolve_ai_classification_action(&resolved_data, base_url).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
             }
             AI_DSL_FIX_KIND => {
@@ -2661,7 +2683,7 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_dsl_action(&resolved_data).await;
+                let outcome = resolve_ai_dsl_action(&resolved_data, base_url).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_FRESHNESS_FIX_KIND => {
@@ -2675,7 +2697,7 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_freshness_action(&resolved_data).await;
+                let outcome = resolve_ai_freshness_action(&resolved_data, base_url).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
             }
             _ => {
@@ -3474,6 +3496,7 @@ fn parse_contract_column<'a>(code: &str, message: &'a str) -> Option<&'a str> {
 async fn resolve_ai_contract_action(
     data: &AiContractActionData,
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    base_url: Option<String>,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3510,7 +3533,7 @@ async fn resolve_ai_contract_action(
         default_format: "sql".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
-        base_url: None,
+        base_url,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -3714,7 +3737,10 @@ pub(crate) fn build_ai_classification_action(
 /// `rocky.toml`. Appending (rather than splicing into an existing
 /// `[mask]` table) keeps the edit logic predictable when the project
 /// has no `[mask]` section at all.
-async fn resolve_ai_classification_action(data: &AiClassificationActionData) -> AiResolveOutcome {
+async fn resolve_ai_classification_action(
+    data: &AiClassificationActionData,
+    base_url: Option<String>,
+) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
         _ => {
@@ -3738,7 +3764,7 @@ async fn resolve_ai_classification_action(data: &AiClassificationActionData) -> 
         default_format: "toml".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
-        base_url: None,
+        base_url,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -3900,7 +3926,10 @@ pub(crate) fn build_ai_freshness_action(
 /// existing block) keeps the edit logic predictable when the sidecar has
 /// no `[freshness]` section at all — including the empty-file case where
 /// the sidecar didn't previously exist.
-async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveOutcome {
+async fn resolve_ai_freshness_action(
+    data: &AiFreshnessActionData,
+    base_url: Option<String>,
+) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
         _ => {
@@ -3923,7 +3952,7 @@ async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveO
         default_format: "toml".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
-        base_url: None,
+        base_url,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -4014,7 +4043,10 @@ pub(crate) fn build_ai_dsl_action(
 
 /// Resolve a DSL AI action — call the LLM, extract a corrected `.rocky`
 /// pipeline, and emit a `TextEdit` that replaces the entire file body.
-async fn resolve_ai_dsl_action(data: &AiDslActionData) -> AiResolveOutcome {
+async fn resolve_ai_dsl_action(
+    data: &AiDslActionData,
+    base_url: Option<String>,
+) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
         _ => {
@@ -4034,7 +4066,7 @@ async fn resolve_ai_dsl_action(data: &AiDslActionData) -> AiResolveOutcome {
         default_format: "rocky".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
-        base_url: None,
+        base_url,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -7549,7 +7581,7 @@ mod tests {
             upstream_models: vec!["upstream".into()],
         };
         let typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
-        let outcome = resolve_ai_contract_action(&data, &typed).await;
+        let outcome = resolve_ai_contract_action(&data, &typed, None).await;
         match outcome {
             AiResolveOutcome::Disabled(reason) => {
                 assert!(
@@ -7656,7 +7688,7 @@ mod tests {
             rocky_toml_uri: tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap(),
             rocky_toml_text: "[adapter]\ntype = \"duckdb\"\n".into(),
         };
-        match resolve_ai_classification_action(&data).await {
+        match resolve_ai_classification_action(&data, None).await {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"
@@ -7761,7 +7793,7 @@ mod tests {
             rocky_source: "from upstream\nselct { id }\n".into(),
             uri: tower_lsp::lsp_types::Url::parse("file:///tmp/m/broken.rocky").unwrap(),
         };
-        match resolve_ai_dsl_action(&data).await {
+        match resolve_ai_dsl_action(&data, None).await {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"

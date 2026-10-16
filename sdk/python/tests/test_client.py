@@ -398,6 +398,37 @@ def test_verify_version_refuses_the_last_engine_without_a_replication_plan_id():
     assert exc.value.min_version == "1.35.0"
 
 
+def test_verify_version_stops_retrying_after_three_transient_failures(caplog):
+    """A hanging `rocky --version` costs at most three probes, not one per call."""
+    client = RockyClient(binary_path="rocky")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch(
+            "rocky_sdk.client.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("rocky", 10),
+        ) as run,
+        caplog.at_level("WARNING", logger="rocky_sdk"),
+    ):
+        for _ in range(6):
+            client._verify_engine_version()
+    assert run.call_count == 3
+    assert client._version_checked is False
+    assert len([r for r in caplog.records if "minimum-version" in r.message]) == 1
+
+
+def test_verify_version_still_refuses_old_binary_on_every_call():
+    """The attempt cap counts transient failures only, never a real version error."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.2.0\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+    ):
+        for _ in range(5):
+            with pytest.raises(RockyVersionError):
+                client._verify_engine_version()
+
+
 def test_verify_version_missing_binary():
     client = RockyClient(binary_path="rocky")
     with (

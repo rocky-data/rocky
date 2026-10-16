@@ -990,11 +990,12 @@ pub(crate) fn run_approval_gate(
 /// - `Ok(Some(findings))` — the gate ran; the caller filters on
 ///   [`BreakingFinding::is_breaking`];
 /// - `Ok(None)` — the gate was SKIPPED (no models directory, no models at
-///   the base ref, or git could not read the base ref), with a
+///   the base ref, or there is no git history), with a
 ///   `BreakingChangesGateSkipped` audit event carrying the reason. The
 ///   caller lets the promote proceed;
-/// - `Err(_)` — the gate could not read the project (#1702), or HEAD or the
-///   base ref does not compile. That is NOT a skip: skipping would let the
+/// - `Err(_)` — the gate could not read the project (#1702), HEAD or the
+///   base ref does not compile, the base ref names no commit, or git could
+///   not read the base ref. That is NOT a skip: skipping would let the
 ///   promote through past a gate that examined nothing.
 pub(crate) fn run_breaking_change_gate_for_plan(
     config_path: &Path,
@@ -2227,12 +2228,13 @@ fn breaking_block_output(
 ///   ran. `findings` is the full classified list, including `Info`-severity
 ///   entries — the caller filters on [`BreakingFinding::is_breaking`].
 /// - `None` when the gate was skipped: the models directory is missing or
-///   empty, the base ref has no models, or git could not read the base ref.
-///   A `BreakingChangesGateSkipped` audit event is appended to `audit`
-///   carrying the human-readable reason.
+///   empty, the base ref has no models, or there is no git history (no
+///   repository, or no commits yet). A `BreakingChangesGateSkipped` audit event is appended to
+///   `audit` carrying the human-readable reason.
 /// - `Err` when the gate cannot run and must refuse: the config is present
-///   and unreadable (#1702), HEAD does not compile, or the base ref's models
-///   do not compile. No audit event is recorded for a refusal.
+///   and unreadable (#1702), HEAD does not compile, the base ref names no
+///   commit, git could not read the base ref, or the base ref's models do
+///   not compile. No audit event is recorded for a refusal.
 fn evaluate_breaking_change_gate(
     config_path: &Path,
     models_dir: &Path,
@@ -2333,67 +2335,63 @@ fn evaluate_breaking_change_gate(
         }
     };
 
-    let base_compile =
-        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
-            Ok(r) => r,
-            Err(reason) => match classify_base_compile_failure(&reason) {
-                // The base models exist and do not compile. That is the same
-                // "examined nothing" case as a HEAD compile failure, so it
-                // refuses too. `--base-ref` can name a ref that compiles.
-                BaseCompileFailure::DidNotCompile => {
-                    return Err(anyhow::anyhow!(
-                        "cannot evaluate the breaking-change gate: {reason}. A promote past a \
-                         gate that could not compile the base would let a breaking change \
-                         through unexamined. Fix the models at '{base_ref}', or pass a \
-                         `--base-ref` that compiles, then re-run the promote"
-                    ));
-                }
-                // No models at the base ref, or the ref could not be read
-                // from git. These still skip, with an audit event naming the
-                // reason.
-                BaseCompileFailure::NoModelsAtBase | BaseCompileFailure::Unavailable => {
-                    push_skip(audit, format!("{reason} — gate skipped"));
-                    return Ok(None);
-                }
-            },
-        };
+    let base_compile = match super::ci_diff::extract_base_compile_typed_in(
+        base_ref,
+        models_dir,
+        source_schemas,
+        None,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(error) => match base_compile_gate_action(&error) {
+            BaseCompileGateAction::Skip => {
+                push_skip(audit, format!("{error} — gate skipped"));
+                return Ok(None);
+            }
+            // The gate could not look at the base: a mistyped ref, a read
+            // failure, or models that do not compile. A skip here would let
+            // a breaking change through unexamined.
+            BaseCompileGateAction::Refuse => {
+                return Err(anyhow::anyhow!(
+                    "cannot evaluate the breaking-change gate: {error}. A promote past a \
+                     gate that could not read or compile the base would let a breaking \
+                     change through unexamined. Fix the models at '{base_ref}', or pass a \
+                     `--base-ref` that names a commit whose models compile, then re-run \
+                     the promote"
+                ));
+            }
+        },
+    };
 
     let base_ir = compile_result_to_project_ir(&base_compile);
     let head_ir = compile_result_to_project_ir(&head_compile);
     Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
 }
 
-/// Why the base-ref compile in [`super::ci_diff::extract_base_compile`]
-/// failed. The breaking-change gates (branch promote and `rocky review`)
-/// refuse on [`Self::DidNotCompile`] and skip on the other two.
+/// What a breaking-change gate (branch promote and `rocky review`) does when
+/// the base-ref compile fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BaseCompileFailure {
-    /// The models at the base ref were read and do not compile.
-    DidNotCompile,
-    /// The base ref exists in git and holds no model files under the models
-    /// directory, for example before the first model was committed.
-    NoModelsAtBase,
-    /// Git could not read the base ref, or the models directory could not be
-    /// placed in the repository.
-    Unavailable,
+pub(crate) enum BaseCompileGateAction {
+    /// There is nothing at the base to compare: the base ref holds no models,
+    /// or there is no git history (no repository, or no commits yet).
+    Skip,
+    /// The gate could not look at the base. It must not pass.
+    Refuse,
 }
 
-/// Classify the error string from [`super::ci_diff::extract_base_compile`].
-///
-/// That function reports failures as a `String`, so this matches its
-/// message prefixes. The tests `gate_refuses_when_base_ref_does_not_compile`
-/// and `gate_fails_open_when_base_ref_missing_models` pin both messages: a
-/// reworded message there fails them instead of silently reopening the gate.
-pub(crate) fn classify_base_compile_failure(reason: &str) -> BaseCompileFailure {
-    if reason.starts_with("no model files found at base ref '")
-        || (reason.starts_with("base ref '")
-            && reason.contains("' did not compile: no models found"))
-    {
-        BaseCompileFailure::NoModelsAtBase
-    } else if reason.starts_with("base ref '") && reason.contains("' did not compile: ") {
-        BaseCompileFailure::DidNotCompile
-    } else {
-        BaseCompileFailure::Unavailable
+/// Map a base-ref compile failure to the gate's action. Only "nothing to
+/// compare" skips; a bad ref or a read failure refuses.
+pub(crate) fn base_compile_gate_action(
+    error: &super::ci_diff::BaseCompileError,
+) -> BaseCompileGateAction {
+    use super::ci_diff::BaseCompileError;
+    match error {
+        BaseCompileError::NoModelsAtBase(_) | BaseCompileError::NoHistory { .. } => {
+            BaseCompileGateAction::Skip
+        }
+        BaseCompileError::BadRef { .. }
+        | BaseCompileError::DidNotCompile { .. }
+        | BaseCompileError::Unreadable(_) => BaseCompileGateAction::Refuse,
     }
 }
 
@@ -4215,8 +4213,6 @@ mod tests {
     }
 
     /// A base ref whose models do not compile REFUSES the promote too.
-    /// This also pins the `ci_diff` message that
-    /// [`classify_base_compile_failure`] matches.
     #[test]
     fn gate_refuses_when_base_ref_does_not_compile() {
         let _cwd_guard = cwd_lock();
@@ -4246,27 +4242,83 @@ mod tests {
         assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
     }
 
+    /// A `--base-ref` that names no commit (a typo such as `mian`) REFUSES
+    /// the promote. Before, git's failure read as "no models at base" and
+    /// the gate skipped, letting a breaking change through.
     #[test]
-    fn classify_base_compile_failure_matches_each_ci_diff_message() {
-        assert_eq!(
-            classify_base_compile_failure("base ref 'main' did not compile: boom"),
-            BaseCompileFailure::DidNotCompile
+    fn gate_refuses_when_base_ref_does_not_exist() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+        write_two_model_chain(&models_dir, "id, name, qty");
+
+        let mut audit = Vec::new();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = evaluate_breaking_change_gate(
+            &dir.join("rocky.toml"),
+            &models_dir,
+            "mian",
+            &mut audit,
+            &dummy_actor(),
+            &sample_record("fix_price"),
+            "branch-state-hash",
         );
-        assert_eq!(
-            classify_base_compile_failure("no model files found at base ref 'main'"),
-            BaseCompileFailure::NoModelsAtBase
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err = result.expect_err("a ref that names no commit must refuse, not skip");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base ref 'mian' does not name a commit"),
+            "names the cause: {msg}"
         );
-        assert_eq!(
-            classify_base_compile_failure(
-                "base ref 'main' did not compile: no models found in /tmp/x"
-            ),
-            BaseCompileFailure::NoModelsAtBase
+        assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
+    }
+
+    /// A project outside any git repository still SKIPS the gate: there is
+    /// no history to compare against. This is the one read failure that
+    /// skips.
+    #[test]
+    fn gate_skips_when_not_a_git_repository() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("rocky.toml"),
+            "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n",
+        )
+        .unwrap();
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_two_model_chain(&models_dir, "id, name, qty");
+
+        // The case needs a temp dir outside any repository. A machine whose
+        // temp dir sits inside one cannot test it.
+        let inside_repo = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if inside_repo {
+            return;
+        }
+        let mut audit = Vec::new();
+        let result = run_gate_in(dir, &models_dir, &mut audit);
+        assert!(
+            result
+                .expect("no git repository skips the gate; it does not refuse")
+                .is_none()
         );
-        assert_eq!(
-            classify_base_compile_failure(
-                "git ls-tree failed for base ref 'nope' — models directory missing at that ref?"
-            ),
-            BaseCompileFailure::Unavailable
+        assert_eq!(audit.len(), 1, "one skip event: {audit:?}");
+        assert!(
+            audit[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not a git repository")),
+            "skip reason names the cause: {:?}",
+            audit[0].reason
         );
     }
 

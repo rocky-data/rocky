@@ -126,6 +126,11 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 # ``plan_id`` in engine 1.35.0 (#1984).
 MIN_ROCKY_VERSION = "1.35.0"
 
+# Transient `rocky --version` failures (timeout, OSError, unparseable output)
+# allowed before the gate is skipped for the client's lifetime. Bounds the cost
+# of a hanging binary to a few probes instead of one per command.
+_MAX_VERSION_CHECK_ATTEMPTS = 3
+
 
 class _Unset:
     """Sentinel distinguishing "argument omitted" from an explicit ``None``.
@@ -384,6 +389,7 @@ class RockyClient:
         self._resolved_binary: str | None = None
         self._version_checked = False
         self._version_warned = False
+        self._version_attempts = 0
         # Parsed engine version, when it could be determined. Kept so a
         # per-feature floor can be checked without re-running ``--version``.
         self._engine_version: tuple[int, int, int] | None = None
@@ -414,17 +420,21 @@ class RockyClient:
         return binary
 
     def _warn_version_check_skipped(self, reason: str) -> None:
-        """Log (once per client) that the version gate was skipped, without caching it.
+        """Log (once per client) that the version gate was skipped.
 
-        ``_version_checked`` stays ``False`` so the next call retries the check.
+        ``_version_checked`` stays ``False`` so the next call retries the check,
+        up to :data:`_MAX_VERSION_CHECK_ATTEMPTS` attempts in all.
         """
+        self._version_attempts += 1
         if self._version_warned:
             return
         self._version_warned = True
         self._logger.warning(
-            "%s; skipping the minimum-version (%s) check for this call and retrying on the next",
+            "%s; skipping the minimum-version (%s) check for this call. "
+            "The check is retried up to %d times in all, then skipped for this client",
             reason,
             MIN_ROCKY_VERSION,
+            _MAX_VERSION_CHECK_ATTEMPTS,
         )
 
     def _verify_engine_version(self) -> None:
@@ -434,7 +444,7 @@ class RockyClient:
             RockyBinaryNotFoundError: The binary is missing.
             RockyVersionError: The binary is older than the minimum.
         """
-        if self._version_checked:
+        if self._version_checked or self._version_attempts >= _MAX_VERSION_CHECK_ATTEMPTS:
             return
 
         binary = self._resolve_binary()

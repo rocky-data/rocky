@@ -2660,7 +2660,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                 // ordinary audit-row hiccup never blocks the apply. So an
                 // UNRELATED budget rule for a different target no longer forces a
                 // false-deny.
-                owned_ledger = open_ledger_with_retry(state_path).ok();
+                owned_ledger = open_ledger_for_gate(state_path, principal).ok();
 
                 // Rare fallback: the read-only open lost a transient redb open
                 // race but a write handle succeeded — snapshot through it rather
@@ -2808,15 +2808,68 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     }
 }
 
+/// How long an agent's policy gate waits for the ledger writer lock before it
+/// gives up and the gate denies. A `rocky run` holds that lock for seconds to
+/// minutes, so the short default wait would deny almost every agent apply
+/// made during a run.
+#[cfg(not(test))]
+const AGENT_LEDGER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shorter under test, so the tests that hold the writer lock on purpose do
+/// not each wait the full production bound.
+#[cfg(test)]
+const AGENT_LEDGER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// The longest single sleep between ledger open attempts under
+/// [`AGENT_LEDGER_LOCK_WAIT`].
+const AGENT_LEDGER_RETRY_MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Open the decision ledger for writing with a bounded retry on transient
 /// advisory-lock contention (a concurrent run briefly holding the writer lock).
 /// Mirrors the download-publish lock retry. Fail-closed: propagates the last
 /// error after the retries are exhausted.
 fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::state::StateError> {
+    open_ledger_with_retry_schedule(state_path, |attempt, _elapsed| {
+        // Five attempts, sleeping 20, 40, 60 and 80 ms between them.
+        (attempt < 5).then(|| std::time::Duration::from_millis(20 * u64::from(attempt)))
+    })
+}
+
+/// [`open_ledger_with_retry`] with the wait the policy gate gives
+/// `principal`. An agent waits up to [`AGENT_LEDGER_LOCK_WAIT`], with
+/// doubling sleeps, because a lost decision row denies its apply. A human
+/// keeps the short wait: a lost human row only logs a warning.
+fn open_ledger_for_gate(
+    state_path: &Path,
+    principal: PolicyPrincipal,
+) -> Result<StateStore, rocky_core::state::StateError> {
+    match principal {
+        PolicyPrincipal::Human => open_ledger_with_retry(state_path),
+        PolicyPrincipal::Agent => {
+            open_ledger_with_retry_schedule(state_path, |attempt, elapsed| {
+                let remaining = AGENT_LEDGER_LOCK_WAIT.checked_sub(elapsed)?;
+                if remaining.is_zero() {
+                    return None;
+                }
+                let backoff = std::time::Duration::from_millis(50)
+                    .saturating_mul(1 << attempt.min(5))
+                    .min(AGENT_LEDGER_RETRY_MAX_SLEEP);
+                Some(backoff.min(remaining))
+            })
+        }
+    }
+}
+
+/// The retry loop behind [`open_ledger_with_retry`] and
+/// [`open_ledger_for_gate`]. `next_sleep(attempt, elapsed)` returns the sleep
+/// before the next attempt, or `None` to stop. `attempt` counts from 1.
+fn open_ledger_with_retry_schedule(
+    state_path: &Path,
+    next_sleep: impl Fn(u32, std::time::Duration) -> Option<std::time::Duration>,
+) -> Result<StateStore, rocky_core::state::StateError> {
     use rocky_core::state::StateError;
-    const MAX_ATTEMPTS: u32 = 5;
-    let mut last: Option<StateError> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    let started = std::time::Instant::now();
+    let mut attempt: u32 = 1;
+    loop {
         match StateStore::open(state_path) {
             Ok(store) => return Ok(store),
             Err(e) => {
@@ -2829,15 +2882,17 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
                     e,
                     StateError::LockHeldByOther { .. } | StateError::Busy { .. }
                 );
-                last = Some(e);
-                if !transient || attempt == MAX_ATTEMPTS {
-                    break;
+                if !transient {
+                    return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+                let Some(sleep) = next_sleep(attempt, started.elapsed()) else {
+                    return Err(e);
+                };
+                std::thread::sleep(sleep);
+                attempt = attempt.saturating_add(1);
             }
         }
     }
-    Err(last.expect("retry loop runs at least once"))
 }
 
 /// A fail-closed `Deny` for a budget-relevant decision whose ledger row could
@@ -11200,6 +11255,64 @@ autonomy_budget = { failures = 3, window = "7d" }
                 if reason.contains("fail-closed") && reason.contains("budget")),
             "a budget-relevant decision whose row can't be persisted must fail closed with a \
              budget-pair reason; got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// An agent's gate waits out a writer lock that a concurrent run holds
+    /// for longer than the short human retry. Before, the gate gave up after
+    /// about a second and the agent apply was denied.
+    #[test]
+    fn agent_gate_waits_for_a_briefly_held_writer_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        drop(StateStore::open(&state)?);
+        let lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drop(lock);
+        });
+
+        let started = std::time::Instant::now();
+        let opened = super::open_ledger_for_gate(&state, PolicyPrincipal::Agent);
+        let waited = started.elapsed();
+        release
+            .join()
+            .expect("the lock holder thread must not panic");
+
+        assert!(
+            opened.is_ok(),
+            "the agent gate must wait out a lock held for 1.5 s: {:?}",
+            opened.err()
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(1400),
+            "the open must have waited for the holder: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// The agent wait is bounded: a lock that is never released still ends
+    /// in an error, after about [`AGENT_LEDGER_LOCK_WAIT`].
+    #[test]
+    fn agent_gate_wait_is_bounded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        drop(StateStore::open(&state)?);
+        let _lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+
+        let started = std::time::Instant::now();
+        let opened = super::open_ledger_for_gate(&state, PolicyPrincipal::Agent);
+        let waited = started.elapsed();
+
+        assert!(opened.is_err(), "a lock that is never released must fail");
+        assert!(
+            waited >= super::AGENT_LEDGER_LOCK_WAIT,
+            "the agent waits the full bound: {waited:?}"
+        );
+        assert!(
+            waited < super::AGENT_LEDGER_LOCK_WAIT + std::time::Duration::from_secs(2),
+            "the wait stays bounded: {waited:?}"
         );
         Ok(())
     }

@@ -132,6 +132,36 @@ pub fn resolve_base_url(configured: Option<String>) -> Option<String> {
     })
 }
 
+/// Resolve the base URL for a project the way `rocky ai` does: the project's
+/// `[ai] base_url`, else `ROCKY_AI_BASE_URL`, else `None` (the default).
+///
+/// A missing `rocky.toml` falls back to the environment variable. A
+/// `rocky.toml` that exists but does not load is an error, so a project that
+/// pins a private endpoint never sends its key to the default host because of
+/// a config fault.
+pub fn resolve_project_base_url(
+    config_path: Option<&std::path::Path>,
+) -> Result<Option<String>, rocky_core::config::ConfigError> {
+    let configured = rocky_core::config::load_optional_project_config(config_path)?
+        .and_then(|cfg| cfg.ai.base_url);
+    Ok(resolve_base_url(configured))
+}
+
+/// The host of `base_url` when it differs from the default endpoint, else
+/// `None`. Names where the API key will be sent.
+fn custom_base_url_host(base_url: Option<&str>) -> Option<String> {
+    let raw = base_url?;
+    if raw.trim_end_matches('/') == DEFAULT_BASE_URL {
+        return None;
+    }
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    if host.eq_ignore_ascii_case("api.anthropic.com") {
+        return None;
+    }
+    Some(host.to_string())
+}
+
 /// Validate `base_url` (or the default) and build the Messages endpoint URL.
 ///
 /// Requires `https`; plain `http` is allowed only for loopback hosts so a
@@ -202,6 +232,12 @@ impl LlmClient {
             });
         }
         let messages_url = messages_url(config.base_url.as_deref())?;
+        if let Some(host) = custom_base_url_host(config.base_url.as_deref()) {
+            tracing::warn!(
+                host = %host,
+                "AI requests, including the API key, go to a custom base URL instead of {DEFAULT_BASE_URL}"
+            );
+        }
         // Match the per-adapter timeout pair used elsewhere in the
         // engine (Databricks/Snowflake/BigQuery/Trino/Fivetran/Airbyte).
         // Without these, a stalled Anthropic connection would pin
@@ -323,6 +359,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.max_tokens, 8192);
+    }
+
+    #[test]
+    fn custom_base_url_host_names_non_default_hosts_only() {
+        assert_eq!(custom_base_url_host(None), None);
+        assert_eq!(
+            custom_base_url_host(Some("https://api.anthropic.com/")),
+            None
+        );
+        assert_eq!(
+            custom_base_url_host(Some("https://llm.internal.example:8443/x")).as_deref(),
+            Some("llm.internal.example")
+        );
+        assert_eq!(
+            custom_base_url_host(Some("http://localhost:8080")).as_deref(),
+            Some("localhost")
+        );
+    }
+
+    #[test]
+    fn resolve_project_base_url_reads_the_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, "[ai]\nbase_url = \"https://llm.example.com\"\n").unwrap();
+        assert_eq!(
+            resolve_project_base_url(Some(&path)).unwrap().as_deref(),
+            Some("https://llm.example.com")
+        );
+    }
+
+    #[test]
+    fn resolve_project_base_url_refuses_a_broken_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, "[ai\nbase_url = ").unwrap();
+        assert!(resolve_project_base_url(Some(&path)).is_err());
     }
 
     #[test]

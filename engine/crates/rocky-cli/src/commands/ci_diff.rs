@@ -929,6 +929,45 @@ pub(crate) fn extract_base_compile_in(
     repo_dir: Option<&Path>,
 ) -> Result<rocky_compiler::compile::CompileResult, String> {
     compile_models_at_ref(base_ref, models_dir, source_schemas, models_glob, repo_dir)
+        .map_err(|e| e.to_string())
+}
+
+/// [`extract_base_compile_in`], with the failure kept typed so a gate can
+/// tell "nothing to compare" apart from "could not look".
+pub(crate) fn extract_base_compile_typed_in(
+    base_ref: &str,
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    models_glob: Option<&str>,
+    repo_dir: Option<&Path>,
+) -> Result<rocky_compiler::compile::CompileResult, BaseCompileError> {
+    compile_models_at_ref(base_ref, models_dir, source_schemas, models_glob, repo_dir)
+}
+
+/// Why the models at a base ref could not be compiled.
+///
+/// The breaking-change gates (branch promote and `rocky review`) skip only on
+/// [`Self::NoHistory`] and [`Self::NoModelsAtBase`]. Every other variant
+/// means the gate could not look, so it refuses.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BaseCompileError {
+    /// There is no git history to compare against: the project is not inside
+    /// a git work tree, `git` is not installed, or the repository has no
+    /// commits yet.
+    #[error("no git history to read base ref '{base_ref}' from: {detail}")]
+    NoHistory { base_ref: String, detail: String },
+    /// The ref does not name a commit in this repository, for example a typo.
+    #[error("base ref '{base_ref}' does not name a commit in this repository")]
+    BadRef { base_ref: String },
+    /// The ref exists and holds no model files under the models directory.
+    #[error("{0}")]
+    NoModelsAtBase(String),
+    /// The models at the ref were read and do not compile.
+    #[error("base ref '{base_ref}' did not compile: {message}")]
+    DidNotCompile { base_ref: String, message: String },
+    /// The ref exists, but its models could not be read out of git.
+    #[error("{0}")]
+    Unreadable(String),
 }
 
 /// Compile the models directory as committed at `base_ref` (any commit-ish,
@@ -940,32 +979,31 @@ fn compile_models_at_ref(
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     models_glob: Option<&str>,
     repo_dir: Option<&Path>,
-) -> Result<rocky_compiler::compile::CompileResult, String> {
-    let models_rel = match find_models_relative_path(models_dir, repo_dir) {
-        Some(p) => p,
-        None => {
-            return Err("could not determine models directory relative to repo root".to_string());
-        }
-    };
+) -> Result<rocky_compiler::compile::CompileResult, BaseCompileError> {
+    let models_rel = find_models_relative_path(base_ref, models_dir, repo_dir)?;
+    verify_commit_ref(base_ref, repo_dir)?;
 
-    let tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(format!(
-                "failed to create temp dir for base extraction: {e}"
-            ));
-        }
-    };
+    let tmp = tempfile::tempdir().map_err(|e| {
+        BaseCompileError::Unreadable(format!(
+            "failed to create temp dir for base extraction: {e}"
+        ))
+    })?;
 
     let ls_output = git_in(repo_dir)
         .args(["ls-tree", "-r", "--name-only", base_ref, &models_rel])
         .output();
     let ls_output = match ls_output {
         Ok(o) if o.status.success() => o,
-        _ => {
-            return Err(format!(
-                "git ls-tree failed for base ref '{base_ref}' — models directory missing at that ref?"
-            ));
+        Ok(o) => {
+            return Err(BaseCompileError::Unreadable(format!(
+                "git ls-tree failed for base ref '{base_ref}': {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )));
+        }
+        Err(e) => {
+            return Err(BaseCompileError::Unreadable(format!(
+                "git ls-tree failed for base ref '{base_ref}': {e}"
+            )));
         }
     };
 
@@ -981,21 +1019,34 @@ fn compile_models_at_ref(
             None => continue,
         };
         let dest = tmp.path().join(rel);
+        // A file listed at the ref that cannot be read out is a partial
+        // base. A compile of a partial base can hide a breaking change.
+        let unreadable = |detail: String| {
+            BaseCompileError::Unreadable(format!(
+                "could not read '{file_path}' at base ref '{base_ref}': {detail}"
+            ))
+        };
         if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| unreadable(e.to_string()))?;
         }
         let show_output = git_in(repo_dir)
             .args(["show", &format!("{base_ref}:{file_path}")])
-            .output();
-        if let Ok(o) = show_output
-            && o.status.success()
-            && std::fs::write(&dest, &o.stdout).is_ok()
-        {
-            wrote_any = true;
+            .output()
+            .map_err(|e| unreadable(e.to_string()))?;
+        if !show_output.status.success() {
+            return Err(unreadable(
+                String::from_utf8_lossy(&show_output.stderr)
+                    .trim()
+                    .to_string(),
+            ));
         }
+        std::fs::write(&dest, &show_output.stdout).map_err(|e| unreadable(e.to_string()))?;
+        wrote_any = true;
     }
     if !wrote_any {
-        return Err(format!("no model files found at base ref '{base_ref}'"));
+        return Err(BaseCompileError::NoModelsAtBase(format!(
+            "no model files found at base ref '{base_ref}'"
+        )));
     }
 
     let config = CompilerConfig {
@@ -1007,40 +1058,151 @@ fn compile_models_at_ref(
 
     let base_glob = models_glob
         .map(|glob| {
-            let relative = Path::new(glob)
-                .strip_prefix(models_dir)
-                .map_err(|_| format!("models glob '{glob}' is outside {}", models_dir.display()))?;
-            Ok::<_, String>(tmp.path().join(relative).to_string_lossy().into_owned())
+            let relative = Path::new(glob).strip_prefix(models_dir).map_err(|_| {
+                BaseCompileError::Unreadable(format!(
+                    "models glob '{glob}' is outside {}",
+                    models_dir.display()
+                ))
+            })?;
+            Ok::<_, BaseCompileError>(tmp.path().join(relative).to_string_lossy().into_owned())
         })
         .transpose()?;
     match base_glob.as_deref() {
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     }
-    .map_err(|e| format!("base ref '{base_ref}' did not compile: {e}"))
+    .map_err(|e| {
+        let no_models = matches!(
+            e,
+            compile::CompileError::Project(rocky_compiler::project::ProjectError::NoModels { .. })
+        );
+        let message = format!("base ref '{base_ref}' did not compile: {e}");
+        if no_models {
+            BaseCompileError::NoModelsAtBase(message)
+        } else {
+            BaseCompileError::DidNotCompile {
+                base_ref: base_ref.to_string(),
+                message: e.to_string(),
+            }
+        }
+    })
+}
+
+/// Check that `base_ref` names a commit. A typo in `--base-ref` must not read
+/// as "the base has no models".
+fn verify_commit_ref(base_ref: &str, repo_dir: Option<&Path>) -> Result<(), BaseCompileError> {
+    let bad_ref = || BaseCompileError::BadRef {
+        base_ref: base_ref.to_string(),
+    };
+    // A leading `-` would be read as an option, not a ref.
+    if base_ref.is_empty() || base_ref.starts_with('-') {
+        return Err(bad_ref());
+    }
+    let resolves = |rev: &str| -> Result<bool, BaseCompileError> {
+        git_in(repo_dir)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{rev}^{{commit}}"),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .map_err(|e| {
+                BaseCompileError::Unreadable(format!(
+                    "git rev-parse failed for base ref '{base_ref}': {e}"
+                ))
+            })
+    };
+    if resolves(base_ref)? {
+        return Ok(());
+    }
+    // A repository with no commits at all has no base to compare against,
+    // whatever ref is named. That is the same case as no repository.
+    if !resolves("HEAD")? {
+        return Err(BaseCompileError::NoHistory {
+            base_ref: base_ref.to_string(),
+            detail: "the repository has no commits".to_string(),
+        });
+    }
+    Err(bad_ref())
 }
 
 /// Find the models directory path relative to the git repo root.
-fn find_models_relative_path(models_dir: &Path, repo_dir: Option<&Path>) -> Option<String> {
-    let abs_models = std::fs::canonicalize(models_dir).ok()?;
+///
+/// Returns [`BaseCompileError::NoHistory`] only when git reports that the
+/// directory is not in a work tree, or when `git` is not installed. Any other
+/// failure is [`BaseCompileError::Unreadable`].
+fn find_models_relative_path(
+    base_ref: &str,
+    models_dir: &Path,
+    repo_dir: Option<&Path>,
+) -> Result<String, BaseCompileError> {
+    let unreadable = |detail: String| {
+        BaseCompileError::Unreadable(format!(
+            "could not determine models directory relative to repo root: {detail}"
+        ))
+    };
+    let abs_models = std::fs::canonicalize(models_dir)
+        .map_err(|e| unreadable(format!("{}: {e}", models_dir.display())))?;
 
+    // `LC_ALL=C` keeps git's "not a git repository" text in English, so the
+    // check below does not depend on the user's locale.
     let output = git_in(repo_dir)
+        .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BaseCompileError::NoHistory {
+                base_ref: base_ref.to_string(),
+                detail: "git is not installed".to_string(),
+            });
+        }
+        Err(e) => return Err(unreadable(format!("git rev-parse failed: {e}"))),
+    };
 
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("not a git repository") {
+            return Err(BaseCompileError::NoHistory {
+                base_ref: base_ref.to_string(),
+                detail: stderr,
+            });
+        }
+        return Err(unreadable(format!("git rev-parse failed: {stderr}")));
     }
 
     let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let repo_root = PathBuf::from(&repo_root);
-    let repo_root = std::fs::canonicalize(&repo_root).ok()?;
+    let repo_root = std::fs::canonicalize(PathBuf::from(&repo_root))
+        .map_err(|e| unreadable(format!("{repo_root}: {e}")))?;
 
-    abs_models
-        .strip_prefix(&repo_root)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+    if let Ok(rel) = abs_models.strip_prefix(&repo_root) {
+        return Ok(rel.to_string_lossy().into_owned());
+    }
+    // The models sit outside the repository git was asked about. When no
+    // repository holds them at all, they have no history: skip. When another
+    // repository holds them, the base would be read from the wrong history.
+    let models_repo = git_in(Some(&abs_models))
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| unreadable(format!("git rev-parse failed: {e}")))?;
+    let stderr = String::from_utf8_lossy(&models_repo.stderr)
+        .trim()
+        .to_string();
+    if !models_repo.status.success() && stderr.contains("not a git repository") {
+        return Err(BaseCompileError::NoHistory {
+            base_ref: base_ref.to_string(),
+            detail: stderr,
+        });
+    }
+    Err(unreadable(format!(
+        "{} is outside the repository at {}",
+        abs_models.display(),
+        repo_root.display()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,7 +1530,7 @@ pub(crate) fn compute_ci_diff_in(
         });
     }
 
-    let models_rel = find_models_relative_path(models_dir, repo_dir);
+    let models_rel = find_models_relative_path(base_side, models_dir, repo_dir).ok();
     // Skipping the compiles also skips the `--semantic` breaking-change
     // classifier, so an empty structural classification must not be the sole
     // reason to bail. Shared config that feeds the compiler without being a

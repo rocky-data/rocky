@@ -21,12 +21,13 @@
 //! reported break is allowed.
 //!
 //! The classifier may skip for a missing models directory, a base ref with no
-//! models, or a base ref git cannot read. The marker can still be written then,
-//! when the selected models compile for conditional DROP review. A failed DROP
-//! compile refuses approval. A marker count of zero does not prove that a base
-//! delta was computed. `--approve` refuses, and writes no marker, when HEAD or
-//! the base ref's models do not compile: the count would read as zero breaking
-//! changes for a compare that never ran. On
+//! models, or no git history (no repository, or no commits). The marker can still be
+//! written then, when the selected models compile for conditional DROP review.
+//! A failed DROP compile refuses approval. A marker count of zero does not
+//! prove that a base delta was computed. `--approve` refuses, and writes no
+//! marker, when HEAD or the base ref's models do not compile, when the base
+//! ref names no commit, or when git cannot read it: the count would read as
+//! zero breaking changes for a compare that never ran. On
 //! the CLI the approver identity falls back to `unknown` when git identity
 //! cannot be read. Under `ROCKY_SESSION_SOURCE=http_api` (a job the HTTP API
 //! started) the marker records `ApproverSource::HttpApi`, and an unreadable
@@ -861,16 +862,18 @@ fn review_state_path(models_dir: &Path) -> PathBuf {
 ///
 /// `--approve` refuses on [`Self::NotComputed`]. It still approves on
 /// [`Self::Skipped`], where there is nothing at HEAD or at the base to
-/// compare, or git cannot read the base ref.
+/// compare, or there is no git history.
 #[derive(Debug)]
 enum ReviewFindings {
     /// Both sides compiled and the classifier ran.
     Computed(Vec<BreakingFinding>),
     /// Nothing to compare: the models directory is missing or holds no
-    /// models, the base ref holds no models, or git cannot read the base ref.
+    /// models, the base ref holds no models, or there is no git
+    /// history.
     Skipped,
-    /// The compare could not run because HEAD or the base ref does not
-    /// compile. The string names the compile failure.
+    /// The compare could not run: HEAD or the base ref does not compile, the
+    /// base ref names no commit, or git cannot read it. The string names the
+    /// failure.
     NotComputed(String),
 }
 
@@ -894,10 +897,11 @@ impl ReviewFindings {
 ///   ran. `findings` is the full classified list including `Info`-severity
 ///   entries; callers filter on [`BreakingFinding::is_breaking`].
 /// - `Ok(Skipped)` when there is nothing to compare: the models directory is
-///   missing or holds no models, the base ref holds no models, or git cannot
-///   read the base ref.
+///   missing or holds no models, the base ref holds no models, or there is no
+///   git history.
 ///   Approval still requires a successful conditional DROP calculation.
-/// - `Ok(NotComputed(reason))` when HEAD or the base ref does not compile.
+/// - `Ok(NotComputed(reason))` when HEAD or the base ref does not compile,
+///   the base ref names no commit, or git cannot read the base ref.
 ///   `--approve` refuses on it, before any marker is written.
 /// - `Err` when a `rocky.toml` is PRESENT and does not load (#1680). That is
 ///   not a skip: the schema cache the classifier types against is gated on the
@@ -991,7 +995,7 @@ fn compute_review_findings(
         }
     };
 
-    let base_compile = match super::ci_diff::extract_base_compile_in(
+    let base_compile = match super::ci_diff::extract_base_compile_typed_in(
         base_ref,
         models_dir,
         source_schemas,
@@ -999,17 +1003,26 @@ fn compute_review_findings(
         repo_dir,
     ) {
         Ok(r) => r,
-        Err(reason) => {
-            use crate::commands::branch::{BaseCompileFailure, classify_base_compile_failure};
-            tracing::warn!(
-                target: "rocky::review",
-                reason = %reason,
-                "base compile failed — breaking-change gate skipped"
-            );
-            return Ok(match classify_base_compile_failure(&reason) {
-                BaseCompileFailure::DidNotCompile => ReviewFindings::NotComputed(reason),
-                BaseCompileFailure::NoModelsAtBase | BaseCompileFailure::Unavailable => {
+        Err(error) => {
+            use crate::commands::branch::{BaseCompileGateAction, base_compile_gate_action};
+            return Ok(match base_compile_gate_action(&error) {
+                BaseCompileGateAction::Skip => {
+                    tracing::warn!(
+                        target: "rocky::review",
+                        reason = %error,
+                        "nothing to compare at the base — breaking-change gate skipped"
+                    );
                     ReviewFindings::Skipped
+                }
+                // A mistyped ref or a git read failure is not "no models at
+                // the base". `--approve` refuses on it.
+                BaseCompileGateAction::Refuse => {
+                    tracing::warn!(
+                        target: "rocky::review",
+                        reason = %error,
+                        "base compile failed — breaking-change findings not computed"
+                    );
+                    ReviewFindings::NotComputed(error.to_string())
                 }
             });
         }
@@ -2536,6 +2549,37 @@ mod tests {
         assert!(
             msg.contains("could not be computed") && msg.contains("do not compile"),
             "the refusal names the compile failure: {msg}"
+        );
+        assert!(!review_marker_path(root, &plan_id).exists());
+        Ok(())
+    }
+
+    /// A `--base-ref` that names no commit (a typo such as `mian`) refuses
+    /// `--approve`. Before, git's failure read as "no models at base", the
+    /// compare was skipped, and the marker recorded zero breaking changes.
+    #[tokio::test]
+    async fn approve_refuses_when_the_base_ref_does_not_exist() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id = rd048_project(root, &sidecar("m"), &sidecar("m"))?;
+
+        let err = compute_review_with_disclosure_and_seam(
+            root,
+            Path::new("rocky.toml"),
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "mian",
+            true,
+            |_, _| Ok(()),
+            || Ok(()),
+            Some(root),
+        )
+        .await
+        .expect_err("an approval against a ref that names no commit must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base ref 'mian' does not name a commit"),
+            "the refusal names the bad ref: {msg}"
         );
         assert!(!review_marker_path(root, &plan_id).exists());
         Ok(())

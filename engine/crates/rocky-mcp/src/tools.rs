@@ -3348,6 +3348,9 @@ impl RockyMcpServer {
             &sidecar_text,
         );
 
+        let base_url = self
+            .ai_base_url()
+            .map_err(|e| ToolError::ai_error(format!("{e:#}")))?;
         // Mirror the LSP's AiConfig: anthropic / sonnet / TOML / single attempt.
         let ai_config = rocky_ai::client::AiConfig {
             provider: "anthropic".to_string(),
@@ -3356,7 +3359,7 @@ impl RockyMcpServer {
             default_format: "toml".to_string(),
             max_attempts: 1,
             max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
-            base_url: None,
+            base_url,
         };
         let client = rocky_ai::client::LlmClient::new(ai_config)
             .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
@@ -3573,6 +3576,16 @@ impl RockyMcpServer {
         )
     }
 
+    /// The AI base URL for this project: `[ai] base_url`, else
+    /// `ROCKY_AI_BASE_URL`, else `None` (the default endpoint). Resolves the
+    /// same way as `rocky ai`. A `rocky.toml` that exists but does not load is
+    /// an error, naming the file.
+    fn ai_base_url(&self) -> anyhow::Result<Option<String>> {
+        use anyhow::Context;
+        rocky_ai::client::resolve_project_base_url(Some(&self.config_path))
+            .with_context(|| format!("failed to load config from {}", self.config_path.display()))
+    }
+
     /// Build an [`LlmClient`](rocky_ai::client::LlmClient) for the generator
     /// tools, BYOK via `ANTHROPIC_API_KEY`. Returns `Ok(None)` when the key is
     /// unset so each tool degrades to a null draft + explanatory message (the
@@ -3617,6 +3630,7 @@ impl RockyMcpServer {
             return Ok(None);
         };
         let max_tokens = self.ai_max_tokens()?;
+        let base_url = self.ai_base_url()?;
         let ai_config = rocky_ai::client::AiConfig {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-6".to_string(),
@@ -3624,7 +3638,7 @@ impl RockyMcpServer {
             default_format: "rocky".to_string(),
             max_attempts: 3,
             max_tokens,
-            base_url: None,
+            base_url,
         };
         rocky_ai::client::LlmClient::new(ai_config)
             .map(Some)
