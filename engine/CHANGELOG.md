@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Still unquoted: the database name in two `information_schema` reads (the batch column describe and the table listing). #2413 stays open for them.
   - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/load_create_live.rs` (`#[ignore]`, needs credentials).
 
+- `rocky branch promote` and `rocky plan promote` now refuse when HEAD's models or the base ref's models do not compile. Before, the breaking-change gate recorded `BreakingChangesGateSkipped` and the promote went ahead. A missing or empty models directory, or a base ref with no models, still skips. `--allow-breaking` does not bypass a compile refusal; pass a `--base-ref` that compiles.
+- `rocky review --approve` now refuses, and writes no review marker, when HEAD's or the base ref's models do not compile. Before, it wrote a marker with a breaking-change count of 0 for a compare that never ran.
+- The post-run `verify_after` check for auto-applied drift now fails the run when it cannot read the policy-decision ledger, unless no policy rule requires checks.
+- An agent apply whose policy decision cannot be recorded is now refused (`deny`) before it changes anything. Before, it went ahead with a warning. Human applies are not affected.
+- State, lock, staging, quarantine, upload and snapshot scratch, object-store download and JSONL trace files that Rocky creates are now owner-only (0600) on Unix. The directories it creates for them are 0700. Temporary files use random names created with `O_EXCL` instead of process-id names. Existing files and directories keep their permissions.
+
+### Added
+
+- `[ai] base_url`, with a `ROCKY_AI_BASE_URL` fallback, sets the Anthropic-compatible API endpoint for `rocky ai*`. The default stays `https://api.anthropic.com`. The URL must use https, except for a loopback host, so a local model server works.
+
+### Changed
+
+- The AI client now refuses a provider other than `anthropic` with an explicit error when it starts. Before, an unbuilt provider failed only at the first request.
+
 ## [1.85.1] — 2026-10-16
 
 ### Fixed
