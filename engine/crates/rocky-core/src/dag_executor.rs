@@ -16,6 +16,13 @@
 //! ancestor set contains N is marked `Skipped` rather than executed. The
 //! overall run is reported as failed but every layer still runs to completion
 //! so unrelated branches finish.
+//!
+//! # Cancellation
+//!
+//! [`DagExecutor::execute_until`] takes a stop check. Once it reports true,
+//! the executor dispatches no further node: each node not yet dispatched is
+//! marked `Skipped` with [`INTERRUPTED_REASON`]. Nodes already in flight run
+//! to their own end; a token cannot stop work that has already started.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -112,6 +119,10 @@ impl DagExecutionResult {
     }
 }
 
+/// The error a node carries when the run was cancelled before the node
+/// started (#1606). Its status is `Skipped`.
+pub const INTERRUPTED_REASON: &str = "interrupted by a shutdown signal before it started";
+
 /// Errors specific to DAG execution (vs. errors *within* a node).
 #[derive(Debug, thiserror::Error)]
 pub enum DagExecutorError {
@@ -162,6 +173,23 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
     /// dependencies, so the `failed_nodes` snapshot captured on layer entry
     /// is correct for the whole layer's skip decisions.
     pub async fn execute(&self, dag: &UnifiedDag) -> Result<DagExecutionResult, DagExecutorError> {
+        self.execute_until(dag, &|| false).await
+    }
+
+    /// [`Self::execute`], but stop dispatching once `stop` reports true
+    /// (#1606).
+    ///
+    /// `stop` is checked right before each node is dispatched, so also at the
+    /// start of every layer. A node not dispatched is marked `Skipped` with
+    /// [`INTERRUPTED_REASON`]. The check comes before the upstream-failure
+    /// skip, so a node is reported as interrupted even when an ancestor also
+    /// failed. Nodes already dispatched in the current layer are awaited: the
+    /// caller bounds that wait, not the executor.
+    pub async fn execute_until(
+        &self,
+        dag: &UnifiedDag,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DagExecutionResult, DagExecutorError> {
         let start = Instant::now();
         let layers = execution_phases(dag)?;
         let total_layers = layers.len();
@@ -197,6 +225,19 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
                 let id = node.id.clone();
                 let kind = node.kind;
                 let label = node.label.clone();
+
+                if stop() {
+                    results.push(NodeResult {
+                        id: id.0.clone(),
+                        kind: kind.to_string(),
+                        label,
+                        status: NodeStatus::Skipped,
+                        layer: layer_idx,
+                        duration_ms: 0,
+                        error: Some(INTERRUPTED_REASON.into()),
+                    });
+                    continue;
+                }
 
                 let ancestors_for_node = ancestors.get(&id).cloned().unwrap_or_default();
                 if ancestors_for_node
@@ -589,6 +630,133 @@ mod tests {
         assert_eq!(result.failed, 1); // a
         assert_eq!(result.completed, 2); // c, d
         assert_eq!(result.skipped, 1); // b
+    }
+
+    /// Dispatcher that flips `stop` while its first node runs, standing in
+    /// for a signal that lands mid-run.
+    struct StopAfterFirstDispatcher {
+        dispatched: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl NodeDispatcher for StopAfterFirstDispatcher {
+        fn dispatch(&self, id: &NodeId, _kind: NodeKind, label: &str) -> Option<NodeFuture> {
+            self.dispatched
+                .lock()
+                .expect("dispatched poisoned")
+                .push(id.0.clone());
+            let stop = Arc::clone(&self.stop);
+            let label = label.to_string();
+            Some(Box::pin(async move {
+                stop.store(true, Ordering::SeqCst);
+                if label == "boom" {
+                    Err("boom failed".into())
+                } else {
+                    Ok(())
+                }
+            }))
+        }
+    }
+
+    async fn execute_with_stop_after_first(dag: &UnifiedDag) -> (DagExecutionResult, Vec<String>) {
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = DagExecutor::new(
+            StopAfterFirstDispatcher {
+                dispatched: Arc::clone(&dispatched),
+                stop: Arc::clone(&stop),
+            },
+            None,
+        );
+        let result = executor
+            .execute_until(dag, &|| stop.load(Ordering::SeqCst))
+            .await
+            .expect("execute");
+        let dispatched = dispatched.lock().expect("dispatched poisoned").clone();
+        (result, dispatched)
+    }
+
+    fn node<'r>(result: &'r DagExecutionResult, id: &str) -> &'r NodeResult {
+        result
+            .nodes
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no result for {id}: {result:?}"))
+    }
+
+    /// #1606: a stop raised while layer 0 runs lets that node finish and
+    /// dispatches nothing in the later layers. Each of them is reported as
+    /// interrupted, not as completed and not as an upstream failure.
+    #[tokio::test]
+    async fn a_stop_during_a_layer_dispatches_no_later_layer() {
+        let dag = UnifiedDag {
+            nodes: vec![
+                n("a", NodeKind::Transformation),
+                n("b", NodeKind::Transformation),
+                n("c", NodeKind::Transformation),
+            ],
+            edges: vec![e("a", "b"), e("b", "c")],
+        };
+        let (result, dispatched) = execute_with_stop_after_first(&dag).await;
+
+        assert_eq!(dispatched, vec!["a".to_string()], "{result:?}");
+        assert_eq!(node(&result, "a").status, NodeStatus::Completed);
+        for id in ["b", "c"] {
+            let r = node(&result, id);
+            assert_eq!(r.status, NodeStatus::Skipped, "{r:?}");
+            assert_eq!(r.error.as_deref(), Some(INTERRUPTED_REASON), "{r:?}");
+        }
+        assert_eq!((result.completed, result.failed, result.skipped), (1, 0, 2));
+        assert_eq!(result.total_nodes, 3);
+    }
+
+    /// #1606: the stop check comes before the upstream-failure skip, so a
+    /// descendant of a node that failed during the cancel reads as
+    /// interrupted, the true reason it did not run.
+    #[tokio::test]
+    async fn a_stop_outranks_the_upstream_failure_skip() {
+        let dag = UnifiedDag {
+            nodes: vec![
+                UnifiedNode {
+                    id: NodeId("a".into()),
+                    kind: NodeKind::Transformation,
+                    label: "boom".into(),
+                    pipeline: None,
+                },
+                n("b", NodeKind::Transformation),
+            ],
+            edges: vec![e("a", "b")],
+        };
+        let (result, dispatched) = execute_with_stop_after_first(&dag).await;
+
+        assert_eq!(dispatched, vec!["a".to_string()]);
+        assert_eq!(node(&result, "a").status, NodeStatus::Failed);
+        assert_eq!(
+            node(&result, "b").error.as_deref(),
+            Some(INTERRUPTED_REASON),
+            "{result:?}"
+        );
+    }
+
+    /// A stop raised before the run starts dispatches nothing at all: a
+    /// signal during planning still leaves every node interrupted.
+    #[tokio::test]
+    async fn a_stop_that_is_already_true_dispatches_nothing() {
+        let dag = UnifiedDag {
+            nodes: vec![n("a", NodeKind::Transformation)],
+            edges: vec![],
+        };
+        let counter = Arc::new(AtomicUsize::new(0));
+        let executor = DagExecutor::new(
+            CountingDispatcher {
+                dispatched: Arc::clone(&counter),
+            },
+            None,
+        );
+        let result = executor.execute_until(&dag, &|| true).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.nodes[0].error.as_deref(), Some(INTERRUPTED_REASON));
     }
 
     #[test]

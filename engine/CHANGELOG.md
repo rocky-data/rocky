@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Upper-case configs (`ACME`) behave as before.
   - A lowercase `catalog = "acme"` whose database exists only as `ACME` now fails in `rocky discover`, the same way `rocky run` already failed for it. Write the name in upper case to keep it.
   - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/batch_describe_live.rs` (`#[ignore]`, needs credentials).
+- `rocky run --dag` now stops starting models on a shutdown signal (Ctrl-C, or SIGTERM) and reports the run as interrupted (#1606). Before, a signal dropped the whole DAG at once and the run exited 1. Now the DAG has one cancellation token, shared with every sub-run. On a signal, the DAG starts no new node. This covers later layers, nodes waiting for a `--parallel` slot, and nodes waiting for their turn on the state file. The node in flight gets the same 5-second settle as `rocky run`. Its sub-run records itself as interrupted and releases its own claim. That node reads `failed`, with the error `run was interrupted by a shutdown signal`. A replication node in flight keeps its unbounded wait for the watermark flush, as in `rocky run`. Each node that did not start is reported as `skipped`, with the error `interrupted by a shutdown signal before it started`. The run then exits 130. A signal that lands after the last node finished changes nothing: the DAG reports its normal outcome. A real node failure before the signal still exits 130, not 1; the JSON keeps the failure. While a replication node holds its unbounded wait, a stalled statement in a sibling node waits too, until the hold ends or a second signal.
+  - `--dag` still writes no run record of its own. A node whose sub-run had finished before the signal keeps its normal record.
+  - The JSON output has no new field. Interrupted nodes count under `skipped`. Read the exit code, or the node `error`.
+  - #1606 stays open for `time_interval` partitions and backfill, and for the watermark loss when a `--watch` replication iteration is cut after 5 seconds.
 
 ## [1.85.1] — 2026-10-16
 

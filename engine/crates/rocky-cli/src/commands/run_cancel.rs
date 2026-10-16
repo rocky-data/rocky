@@ -28,6 +28,10 @@
 //!   arms. [`for_run`] sees the ambient token and spawns no listener. The watch
 //!   loop keeps its bounded wait (`run_watch.rs`), so a stalled statement
 //!   cannot hold SIGTERM forever.
+//! - **`rocky run --dag`.** The DAG calls [`for_run`] once and owns the
+//!   listener. Each sub-run runs inside [`Shared::scope`], so it adopts the
+//!   DAG's token and its [`RunCancel::hold_unbounded`] suspends the DAG
+//!   listener's deadline, as it would its own.
 //!
 //! A token cannot stop a statement that has already started. So the wait is
 //! bounded: past [`SIGNAL_SETTLE_GRACE`] the listener exits 130 without the
@@ -42,20 +46,73 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+/// What a caller that owns the signals hands to the run it drives.
+#[derive(Clone)]
+struct Ambient {
+    token: CancellationToken,
+    /// The hold counter of the deadline the caller's listener watches, when
+    /// the caller has one. `None` under `--watch`, whose loop owns the
+    /// deadline itself.
+    unbounded: Option<Arc<AtomicUsize>>,
+}
+
 tokio::task_local! {
-    /// The token a caller that owns the signals hands to the run it drives.
-    static AMBIENT: CancellationToken;
+    static AMBIENT: Ambient;
 }
 
 /// Run `fut` with `token` as the cancellation token every [`for_run`] inside
 /// it adopts.
 pub(crate) async fn scope<F: Future>(token: CancellationToken, fut: F) -> F::Output {
-    AMBIENT.scope(token, fut).await
+    AMBIENT
+        .scope(
+            Ambient {
+                token,
+                unbounded: None,
+            },
+            fut,
+        )
+        .await
 }
 
 /// The token of the enclosing [`scope`], if there is one.
 pub(crate) fn ambient() -> Option<CancellationToken> {
-    AMBIENT.try_with(CancellationToken::clone).ok()
+    AMBIENT.try_with(|ambient| ambient.token.clone()).ok()
+}
+
+/// A run's token and settle deadline, handed to the sub-runs it drives
+/// (`rocky run --dag`).
+///
+/// Cheap to clone. The default is a fresh token and deadline that nothing
+/// listens to, for tests.
+#[derive(Clone, Default)]
+pub(crate) struct Shared {
+    token: CancellationToken,
+    unbounded: Arc<AtomicUsize>,
+}
+
+impl Shared {
+    /// The token the owning run observes.
+    pub(crate) fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// Run `fut` as part of the owning run: every [`for_run`] inside it adopts
+    /// the run's token, and its [`RunCancel::hold_unbounded`] suspends the
+    /// owning run's settle deadline.
+    ///
+    /// A task-local does not cross `tokio::spawn`, so call this inside the
+    /// spawned task, around the sub-run itself.
+    pub(crate) async fn scope<F: Future>(&self, fut: F) -> F::Output {
+        AMBIENT
+            .scope(
+                Ambient {
+                    token: self.token.clone(),
+                    unbounded: Some(Arc::clone(&self.unbounded)),
+                },
+                fut,
+            )
+            .await
+    }
 }
 
 /// The cancellation token of one run, plus the signal listener it owns.
@@ -83,6 +140,14 @@ impl RunCancel {
     pub(crate) fn hold_unbounded(&self) -> UnboundedHold {
         self.unbounded.fetch_add(1, Ordering::SeqCst);
         UnboundedHold(Arc::clone(&self.unbounded))
+    }
+
+    /// This run's token and deadline, for the sub-runs it drives.
+    pub(crate) fn shared(&self) -> Shared {
+        Shared {
+            token: self.token.clone(),
+            unbounded: Arc::clone(&self.unbounded),
+        }
     }
 }
 
@@ -152,14 +217,14 @@ impl Drop for RunCancel {
 /// of either kind or once [`SIGNAL_SETTLE_GRACE`] passes outside any
 /// [`RunCancel::hold_unbounded`].
 pub(crate) fn for_run() -> RunCancel {
-    let unbounded = Arc::new(AtomicUsize::new(0));
-    if let Some(token) = ambient() {
+    if let Ok(ambient) = AMBIENT.try_with(Ambient::clone) {
         return RunCancel {
-            token,
-            unbounded,
+            token: ambient.token,
+            unbounded: ambient.unbounded.unwrap_or_default(),
             listener: None,
         };
     }
+    let unbounded = Arc::new(AtomicUsize::new(0));
     let token = CancellationToken::new();
     let listener = spawn_signal_listener(token.clone(), Arc::clone(&unbounded));
     RunCancel {
@@ -258,6 +323,46 @@ mod tests {
             adopted.token().is_cancelled(),
             "the run must observe the cancel its scope owner issues"
         );
+    }
+
+    /// `rocky run --dag` (#1606): a sub-run inside the DAG's shared scope
+    /// adopts the DAG's token, spawns no listener, and its replication hold
+    /// suspends the DAG listener's deadline. Without the shared counter the
+    /// DAG listener would cut a replication drain after the grace and lose
+    /// the watermarks of every table already copied.
+    #[tokio::test]
+    async fn a_sub_run_in_a_shared_scope_holds_the_owning_run_deadline() {
+        let owner = for_run();
+        let shared = owner.shared();
+        shared
+            .scope(async {
+                let sub_run = for_run();
+                assert!(sub_run.listener.is_none(), "the owning run listens");
+                let hold = sub_run.hold_unbounded();
+                assert_eq!(
+                    owner.unbounded.load(Ordering::SeqCst),
+                    1,
+                    "the sub-run's hold must reach the owning run's deadline"
+                );
+                drop(hold);
+                owner.token().cancel();
+                assert!(sub_run.token().is_cancelled());
+            })
+            .await;
+        assert_eq!(owner.unbounded.load(Ordering::SeqCst), 0);
+    }
+
+    /// `--watch` hands over only a token: a hold inside its scope stays local,
+    /// because the watch loop owns the deadline.
+    #[tokio::test]
+    async fn a_run_in_a_plain_scope_keeps_its_own_hold_counter() {
+        let token = CancellationToken::new();
+        scope(token, async {
+            let run = for_run();
+            let _hold = run.hold_unbounded();
+            assert_eq!(run.unbounded.load(Ordering::SeqCst), 1);
+        })
+        .await;
     }
 
     #[tokio::test]

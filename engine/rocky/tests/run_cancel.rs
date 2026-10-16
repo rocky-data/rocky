@@ -142,6 +142,20 @@ impl Fixture {
         thread::JoinHandle<String>,
         fs::File,
     ) {
+        self.spawn_blocked_on_the_fifo(&["run", "--idempotency-key", idempotency_key])
+    }
+
+    /// [`Self::spawn_run_blocked_on_the_fifo`] with the subcommand arguments
+    /// given in full.
+    fn spawn_blocked_on_the_fifo(
+        &self,
+        args: &[&str],
+    ) -> (
+        Child,
+        Receiver<String>,
+        thread::JoinHandle<String>,
+        fs::File,
+    ) {
         self.make_source_a_fifo();
         let (open_tx, open_rx) = channel::<fs::File>();
         let fifo = self.source.clone();
@@ -152,9 +166,7 @@ impl Fixture {
         });
         let mut child = self
             .rocky()
-            .arg("run")
-            .arg("--idempotency-key")
-            .arg(idempotency_key)
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -450,4 +462,142 @@ fn sigterm_on_a_stalled_model_exits_130_within_the_grace() {
          {latency:?}.\nstderr:\n{transcript}"
     );
     drop(write_end);
+}
+
+/// A third model, downstream of `after`, so the `--dag` test spans three
+/// layers: one in flight at the signal and two that must never start.
+const LAST_SQL: &str = "SELECT id FROM staging.after\n";
+const LAST_TOML: &str = r#"
+depends_on = ["after"]
+
+[target]
+catalog = "fixture"
+schema = "staging"
+"#;
+
+/// SIGINT while the first layer of `rocky run --dag` is in flight (#1606).
+///
+/// Before, `main` dropped the DAG future on a signal: no settle, exit 1. Now
+/// the DAG owns the run's token, and its sub-runs adopt it. The model in
+/// flight finishes. Its sub-run sees the cancel, settles as interrupted and
+/// writes an interrupted record. No later layer starts. Each model not started
+/// is reported as interrupted, and the run exits 130 like a plain `rocky run`.
+#[test]
+fn sigint_during_a_dag_layer_starts_no_further_model_and_exits_130() {
+    let fx = Fixture::new();
+    let models = fx.dir.join("models");
+    fs::write(models.join("last.sql"), LAST_SQL).expect("write model");
+    fs::write(models.join("last.toml"), LAST_TOML).expect("write sidecar");
+
+    let (mut child, stderr, stdout, mut write_end) =
+        fx.spawn_blocked_on_the_fifo(&["run", "--dag"]);
+
+    sigint(child.id());
+    // The DAG's listener notice: the token is cancelled. Before #1606 the
+    // outer `select!` dropped the run here and exited 1.
+    let mut transcript = match wait_for_line(&stderr, "shutdown signal received") {
+        Ok(t) => t,
+        Err(t) => {
+            let _ = child.kill();
+            let status = child.wait();
+            panic!("no shutdown notice after SIGINT (child: {status:?}).\nstderr:\n{t}");
+        }
+    };
+
+    // Release the in-flight statement inside the grace: one row, then EOF.
+    write_end.write_all(b"1\n").expect("write fifo");
+    drop(write_end);
+
+    let status = wait_exit(&mut child, STEP_BUDGET);
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    transcript.push_str(&drain(&stderr));
+    let stdout = stdout.join().expect("stdout reader");
+    let status = status.unwrap_or_else(|| {
+        panic!("rocky run --dag did not exit after its statement finished.\nstderr:\n{transcript}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "a cancelled DAG run exits 130.\nstderr:\n{transcript}\nstdout:\n{stdout}"
+    );
+    assert!(
+        !transcript.contains("did not settle within"),
+        "the statement was released inside the grace; the run must settle on its own, not \
+         be cut by the grace.\nstderr:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("DAG run interrupted"),
+        "stderr:\n{transcript}"
+    );
+
+    // The model in flight finished; no later layer started.
+    assert!(table_exists(&fx.dir, "blocking"), "stderr:\n{transcript}");
+    for table in ["after", "last"] {
+        assert!(
+            !table_exists(&fx.dir, table),
+            "a cancelled DAG must start no further model, but `{table}` was built.\n\
+             stderr:\n{transcript}"
+        );
+    }
+
+    // The payload is the DAG output, with every model not started reported as
+    // interrupted.
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is one JSON DagRunOutput ({e}):\n{stdout}"));
+    let nodes = payload["nodes"].as_array().expect("nodes array");
+    let by_label = |label: &str| {
+        nodes
+            .iter()
+            .find(|n| n["label"] == label)
+            .unwrap_or_else(|| panic!("no node `{label}`: {payload}"))
+    };
+    // The node in flight built its model, but its sub-run settled as
+    // interrupted, so the node did not complete. The executor has no status
+    // for that, so it reads `failed` with the sub-run's interrupted error.
+    let blocking = by_label("blocking");
+    assert_eq!(blocking["status"], "failed", "{payload}");
+    assert_eq!(
+        blocking["error"], "run was interrupted by a shutdown signal",
+        "{payload}"
+    );
+    for label in ["after", "last"] {
+        let node = by_label(label);
+        assert_eq!(node["status"], "skipped", "{payload}");
+        assert_eq!(
+            node["error"], "interrupted by a shutdown signal before it started",
+            "{payload}"
+        );
+    }
+    assert_eq!(payload["failed"], 1, "{payload}");
+    assert_eq!(payload["skipped"], 2, "{payload}");
+
+    // The sub-run in flight wrote its interrupted record; no model that never
+    // started has one. `--dag` keeps no record of its own: each sub-run
+    // records itself.
+    let history = fx
+        .rocky()
+        .arg("history")
+        .output()
+        .expect("run rocky history");
+    let history: serde_json::Value =
+        serde_json::from_slice(&history.stdout).expect("history is JSON");
+    let runs = history["runs"].as_array().expect("runs array");
+    assert_eq!(
+        runs.len(),
+        1,
+        "exactly the in-flight sub-run must leave a record: {history}"
+    );
+    assert_eq!(
+        runs[0]["status"], "PartialFailure",
+        "an interrupted run with progress records as PartialFailure: {history}"
+    );
+    let recorded = runs[0].to_string();
+    assert!(recorded.contains("blocking"), "{history}");
+    assert!(
+        !recorded.contains("\"after\"") && !recorded.contains("\"last\""),
+        "no model that never started may appear in a record: {history}"
+    );
 }
