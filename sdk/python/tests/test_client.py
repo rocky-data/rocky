@@ -80,7 +80,7 @@ def _client(**kwargs) -> RockyClient:
 # --------------------------------------------------------------------------- #
 
 
-def test_build_cmd_uses_state_path_by_default():
+def test_build_cmd_passes_an_explicit_state_path():
     client = _client(config_path="r.toml", state_path="s.redb")
     with patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"):
         cmd = client._build_cmd(["discover"])

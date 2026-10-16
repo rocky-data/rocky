@@ -934,6 +934,12 @@ pub(crate) fn extract_base_compile_in(
 
 /// [`extract_base_compile_in`], with the failure kept typed so a gate can
 /// tell "nothing to compare" apart from "could not look".
+///
+/// With no `repo_dir`, git runs at the root of the repository that holds
+/// the models, not in the process working directory. Run from outside that
+/// repository, git would report "not a git repository" and the gate would
+/// skip, though the project has history. When no repository holds the
+/// models, git runs in the models directory and reports exactly that.
 pub(crate) fn extract_base_compile_typed_in(
     base_ref: &str,
     models_dir: &Path,
@@ -941,7 +947,27 @@ pub(crate) fn extract_base_compile_typed_in(
     models_glob: Option<&str>,
     repo_dir: Option<&Path>,
 ) -> Result<rocky_compiler::compile::CompileResult, BaseCompileError> {
+    let models_repo = match repo_dir {
+        Some(_) => None,
+        None => models_repository_dir(models_dir),
+    };
+    let repo_dir = repo_dir.or(models_repo.as_deref());
     compile_models_at_ref(base_ref, models_dir, source_schemas, models_glob, repo_dir)
+}
+
+/// The directory git should run in to read the history of `models_dir`: the
+/// root of the repository that holds it, else the models directory itself.
+/// `None` when the models directory cannot be resolved; the caller then
+/// reports that failure itself.
+fn models_repository_dir(models_dir: &Path) -> Option<PathBuf> {
+    let abs_models = std::fs::canonicalize(models_dir).ok()?;
+    let root = git_in(Some(&abs_models))
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    Some(root.unwrap_or(abs_models))
 }
 
 /// Why the models at a base ref could not be compiled.
@@ -1118,8 +1144,18 @@ fn verify_commit_ref(base_ref: &str, repo_dir: Option<&Path>) -> Result<(), Base
         return Ok(());
     }
     // A repository with no commits at all has no base to compare against,
-    // whatever ref is named. That is the same case as no repository.
-    if !resolves("HEAD")? {
+    // whatever ref is named. That is the same case as no repository. Look at
+    // every ref, not only HEAD: on a fresh orphan branch HEAD names no commit
+    // while other branches do, and a mistyped ref there must still refuse.
+    let any_commit = git_in(repo_dir)
+        .args(["rev-list", "-n", "1", "--all"])
+        .output()
+        .map_err(|e| {
+            BaseCompileError::Unreadable(format!(
+                "git rev-list failed for base ref '{base_ref}': {e}"
+            ))
+        })?;
+    if !any_commit.status.success() || any_commit.stdout.trim_ascii().is_empty() {
         return Err(BaseCompileError::NoHistory {
             base_ref: base_ref.to_string(),
             detail: "the repository has no commits".to_string(),

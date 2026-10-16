@@ -4277,6 +4277,103 @@ mod tests {
         assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
     }
 
+    /// The gate reads the history of the repository that holds the models,
+    /// whatever the process working directory is. Run from a directory
+    /// outside every repository, git used to report "not a git repository"
+    /// and the gate skipped, though the project itself has history.
+    #[test]
+    fn gate_reads_the_models_repository_when_cwd_is_outside_it() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let models_dir = init_git_repo_with_models(
+            dir,
+            rocky_toml,
+            &[
+                ("widgets.sql", "SELECT 1 AS id"),
+                ("widgets.toml", "[strategy\n"),
+            ],
+        );
+        std::fs::remove_file(models_dir.join("widgets.toml")).unwrap();
+        write_two_model_chain(&models_dir, "id, name, qty");
+
+        // The case needs a working directory outside any repository. A
+        // machine whose temp dir sits inside one cannot test it.
+        let elsewhere = TempDir::new().unwrap();
+        let elsewhere_in_repo = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(elsewhere.path())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if elsewhere_in_repo {
+            return;
+        }
+
+        let mut audit = Vec::new();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let result = evaluate_breaking_change_gate(
+            &dir.join("rocky.toml"),
+            &models_dir,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &sample_record("fix_price"),
+            "branch-state-hash",
+        );
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err = result.expect_err("the base is read from the models' repository, not skipped");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base ref 'main' did not compile"),
+            "names the cause: {msg}"
+        );
+        assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
+    }
+
+    /// On a fresh orphan branch HEAD names no commit, but the repository has
+    /// history. A mistyped `--base-ref` there REFUSES; it does not read as
+    /// "no commits" and skip.
+    #[test]
+    fn gate_refuses_a_bad_base_ref_on_an_orphan_branch() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+        write_two_model_chain(&models_dir, "id, name, qty");
+        let out = std::process::Command::new("git")
+            .args(["checkout", "-q", "--orphan", "fresh"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git checkout --orphan failed");
+
+        let mut audit = Vec::new();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = evaluate_breaking_change_gate(
+            &dir.join("rocky.toml"),
+            &models_dir,
+            "mian",
+            &mut audit,
+            &dummy_actor(),
+            &sample_record("fix_price"),
+            "branch-state-hash",
+        );
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err = result.expect_err("a ref that names no commit must refuse, not skip");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base ref 'mian' does not name a commit"),
+            "names the cause: {msg}"
+        );
+        assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
+    }
+
     /// A project outside any git repository still SKIPS the gate: there is
     /// no history to compare against. This is the one read failure that
     /// skips.
