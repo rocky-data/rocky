@@ -32364,6 +32364,59 @@ backend = "local"
         assert_eq!(target_ids(&adapter).await, ["1", "2", "3", "4"]);
     }
 
+    /// #2376 on a DuckDB `TIMESTAMP_NS` column whose maximum has non-zero
+    /// nanosecond digits. The `TIMESTAMP '…'` literal is microsecond
+    /// precision, so DuckDB truncates the 9-digit literal; truncation sits at
+    /// or below the true maximum, so the maximum row is still held back.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn hold_back_holds_the_max_row_of_a_nanosecond_column() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP_NS)",
+            "INSERT INTO src.events VALUES \
+                (1, '2026-03-01 10:00:00.000000001'::TIMESTAMP_NS), \
+                (2, '2026-03-02 10:00:00.123456789'::TIMESTAMP_NS)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let run1 = hold_back_copy(&adapter, &state).await;
+        assert!(run1.hold_back.is_some());
+        // The parsed maximum keeps all nine digits, so the literal carries
+        // them too; it is DuckDB that truncates the literal to microseconds.
+        {
+            use chrono::Timelike;
+            assert_eq!(
+                run1.hold_back.as_ref().unwrap().held_max.nanosecond(),
+                123_456_789
+            );
+        }
+        assert_eq!(
+            target_ids(&adapter).await,
+            ["1"],
+            "the max row must be held back: {:?}",
+            run1.hold_back
+        );
+        assert_eq!(
+            run1.materialization.notes.len(),
+            1,
+            "{:?}",
+            run1.materialization.notes
+        );
+        assert!(
+            run1.materialization.notes[0].starts_with("1 row "),
+            "the held-back count sees the max row: {:?}",
+            run1.materialization.notes
+        );
+    }
+
     /// #2376: an empty or all-NULL source has no maximum, so it gets no
     /// cutoff and no note, as before.
     #[cfg(feature = "duckdb")]

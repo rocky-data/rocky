@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each incremental table costs one to three more queries per run: the source `MAX`, a count of the held-back rows, and a source count for `row_count` when that check is on. This matters on per-query billing such as BigQuery.
   - An empty or all-NULL source has no maximum and is copied as before. `microbatch`, `merge` and transformation models are unchanged. `rocky plan` still shows the SQL without the second bound.
 
-  `SqlDialect` gains a required method, `watermark_hold_back`. A custom dialect must implement it, with the same column reference and literal as its `watermark_where`. `rocky init-adapter` scaffolds it.
+  `SqlDialect` gains a required method, `watermark_hold_back`. A custom dialect must implement it, with the same column reference and literal as its `watermark_where`. `rocky init-adapter` scaffolds it. To migrate an out-of-tree dialect, add `fn watermark_hold_back(&self, timestamp_col: &str, held_max: &DateTime<Utc>, nulls: NullTimestamps) -> AdapterResult<String>` and return `rocky_core::traits::hold_back_predicate(<column>, <literal for held_max>, nulls)`, with the column and literal your `watermark_where` renders. If your literal is coarser than the column, round it down.
 
 ## [1.83.0] — 2026-10-15
 
