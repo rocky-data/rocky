@@ -188,7 +188,7 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | Function | Input | Result | Nullable |
 |---|---|---|---|
 | `COUNT`, `COUNT(DISTINCT …)` | any | `Int64` | no |
-| `SUM` | `Decimal(p, s)` or `DecimalUnsized { scale }` | `DecimalUnsized` with the input's scale (amended 2026-10-16) | yes |
+| `SUM` | `Decimal(p, s)` or `DecimalUnsized { scale }` | `DecimalUnsized`, with the input's scale when no target warehouse is BigQuery or unknown (amended 2026-10-16) | yes |
 | `SUM` | `Int32`, `Int64` | Open question A | yes |
 | `SUM` | `Float32`, `Float64` | `Float64` (today `Float32` stays `Float32`) | yes |
 | `AVG` | `Decimal` | `Unknown` (unchanged, #1238) | yes |
@@ -196,7 +196,7 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | `MIN`, `MAX` | `T` | `T` | yes |
 | any other | any | `Unknown` | yes |
 
-`SUM` over a decimal is `DecimalUnsized`. **Amended 2026-10-16 (#2356).** The ratified rule was `Decimal(38, s)` for `p ≤ 38` and `Unknown` above. It is replaced for two reasons. First, warehouses do not agree on the digits: DuckDB returns `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`, and Postgres `NUMERIC` has no precision cap. So `Decimal(38, s)` would fail `E011` on a contract that declares Databricks' real `DECIMAL(20,2)`, and would not be a proven bound on Postgres. Second, `Unknown` would stop a bare `Decimal` contract on a sum from being checked (`I003`). `DecimalUnsized` is a sound bound on every warehouse and keeps the family check. A contract that declares `Decimal(p, s)` for `SUM(amount)` is now reported as not checked; to check the digits, cast the sum to `DECIMAL(p, s)`. **Amended again (#2398):** the sum keeps the input's scale `s`, which DuckDB, Databricks, Snowflake, Trino, Redshift, SQL Server and ClickHouse all keep. So a contract with another scale is `E011`, and only the precision goes unchecked. Two warehouses do not state the scale in the result type: PostgreSQL's `SUM` is an unconstrained `NUMERIC`, and BigQuery drops the parameters of a parameterized `NUMERIC(p, s)` column in an expression, so the sum is a plain `NUMERIC`. Dialect-aware inference (Open question A, Option 3) can later give exact digits where the dialect is known.
+`SUM` over a decimal is `DecimalUnsized`. **Amended 2026-10-16 (#2356).** The ratified rule was `Decimal(38, s)` for `p ≤ 38` and `Unknown` above. It is replaced for two reasons. First, warehouses do not agree on the digits: DuckDB returns `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`, and Postgres `NUMERIC` has no precision cap. So `Decimal(38, s)` would fail `E011` on a contract that declares Databricks' real `DECIMAL(20,2)`, and would not be a proven bound on Postgres. Second, `Unknown` would stop a bare `Decimal` contract on a sum from being checked (`I003`). `DecimalUnsized` is a sound bound on every warehouse and keeps the family check. A contract that declares `Decimal(p, s)` for `SUM(amount)` is now reported as not checked; to check the digits, cast the sum to `DECIMAL(p, s)`. **Amended again (#2398):** the sum keeps the input's scale `s`, which DuckDB, Databricks, Snowflake, Trino, Redshift, SQL Server and ClickHouse all keep. So a contract with another scale is `E011`, and only the precision goes unchecked. BigQuery does not keep it: it drops the parameters of a parameterized `NUMERIC(p, s)` column in an expression, so the sum is a plain `NUMERIC` (scale 9). So the scale is kept only when every warehouse the model runs on is known and none is BigQuery (`sum_keeps_decimal_scale`); otherwise the sum is `DecimalUnsized { scale: None }` and a `Decimal(p, s)` contract stays `I003`, never a false `E011`. PostgreSQL's `SUM` is an unconstrained `NUMERIC` whose values keep scale `s`, so it keeps the scale. Dialect-aware inference (Open question A, Option 3) can later give exact digits where the dialect is known.
 
 **Casts.** A cast's type is its target type, read by one shared parser:
 
@@ -452,7 +452,7 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - Unification: `Decimal(10,0)` with `Decimal(10,10)` ⇒ `Decimal(20,10)`. `Int32` with `Decimal(5,2)` ⇒ `Decimal(12,2)`. Over the cap ⇒ `Unknown`. Every permutation of a three-branch `COALESCE` gives the same result.
 - An upper-bound property test: for random operands, the exact result of the operation fits the inferred type.
 - A live cross-check on DuckDB: the value DuckDB writes fits the inferred type for each operator. It also checks nullability: `x / 0` and `x % 0` on a non-null `x`.
-- `SUM` over `Decimal(60, 2)` ⇒ `DecimalUnsized { scale: Some(2) }`, not `Decimal(38,2)` (amended 2026-10-16).
+- `SUM` over `Decimal(60, 2)` ⇒ `DecimalUnsized { scale: Some(2) }` on DuckDB, `DecimalUnsized { scale: None }` on BigQuery or with no known warehouse, never `Decimal(38,2)` (amended 2026-10-16).
 
 **Declarations and literals (§3, §7)**
 - `DECIMAL(300,2)`, `DECIMAL(10,-2)`, `DECIMAL(5,10)`, `DECIMAL(0,0)` ⇒ the new error, in a cast, a source schema and a contract.
@@ -464,7 +464,7 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - `CAST(NULLIF(x, 0) AS INT)` with non-null `x` ⇒ nullable. `CAST(x AS BIGINT)` with non-null `x` ⇒ the rule chosen in Open question B.
 
 **Aggregates (§3, Open question A)**
-- `SUM` over `Decimal(10,2)` reaches the model's typed columns as `DecimalUnsized { scale: Some(2) }`, nullable (amended 2026-10-16). A bare `Decimal` contract over it passes; `Decimal(38,2)` is `I003`; `Decimal(10,4)` and `String` are `E011`.
+- `SUM` over `Decimal(10,2)` on DuckDB reaches the model's typed columns as `DecimalUnsized { scale: Some(2) }`, nullable (amended 2026-10-16). A bare `Decimal` contract over it passes; `Decimal(38,2)` is `I003`; `Decimal(10,4)` and `String` are `E011`. On BigQuery or with no known warehouse, `Decimal(38,9)` is `I003`.
 - Whichever option A takes: an asserted pair for `SUM` and `AVG` over `Int32`, `Int64`, `Float32`.
 
 **Nullability (§4, Open question B)**

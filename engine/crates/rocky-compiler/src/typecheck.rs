@@ -553,7 +553,7 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::TryCast => (RockyType::Unknown, true),
                 rocky_sql::lineage::TransformKind::Aggregation(func) => {
                     let func_upper = func.to_uppercase();
-                    infer_aggregation_type(&func_upper, &upstream_type.0)
+                    infer_aggregation_type(&func_upper, &upstream_type.0, target)
                 }
                 rocky_sql::lineage::TransformKind::Expression => (RockyType::Unknown, true),
             }
@@ -2699,8 +2699,37 @@ fn collect_refs_from_expr(expr: &Expr, file_path: &str, ref_map: &mut ReferenceM
     }
 }
 
-/// Infer the result type of an aggregate function.
-fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, bool) {
+/// Whether `SUM` over `DECIMAL(p,s)` is a decimal of scale `s` on every
+/// warehouse the model runs on (#2398).
+///
+/// DuckDB, Snowflake, Databricks, Trino, SQL Server, PostgreSQL and Redshift
+/// keep the input's scale. BigQuery does not: it drops the digits of a
+/// parameterized `NUMERIC(p,s)` column in an expression, so the sum is a plain
+/// `NUMERIC` (scale 9). With no known warehouse the model may run on BigQuery,
+/// so the scale is not claimed: a claimed scale turns a contract mismatch into
+/// `E011`, and a false `E011` on a correct contract is worse than `I003`.
+fn sum_keeps_decimal_scale(target: &OperandTarget) -> bool {
+    let dialects = target.known_dialects();
+    !dialects.is_empty()
+        && dialects.iter().all(|dialect| match dialect {
+            OperandDialect::BigQuery => false,
+            OperandDialect::DuckDb
+            | OperandDialect::Snowflake
+            | OperandDialect::Databricks
+            | OperandDialect::Trino
+            | OperandDialect::SqlServer
+            | OperandDialect::Postgres
+            | OperandDialect::Redshift => true,
+        })
+}
+
+/// Infer the result type of an aggregate function on the warehouses of
+/// `target`.
+fn infer_aggregation_type(
+    func: &str,
+    input_type: &RockyType,
+    target: &OperandTarget,
+) -> (RockyType, bool) {
     match func {
         "COUNT" => (RockyType::Int64, false), // COUNT is never null
         "SUM" => {
@@ -2708,12 +2737,14 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             // than its input by a warehouse-dependent amount (DuckDB
             // `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`), so it is a
             // decimal whose precision Rocky does not claim (#2356). The scale
-            // `s` is the input's on every warehouse, so it is kept (#2398).
+            // `s` is kept only where every target warehouse keeps it (#2398).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
             } else if input_type.is_decimal() {
                 RockyType::DecimalUnsized {
-                    scale: input_type.decimal_scale(),
+                    scale: input_type
+                        .decimal_scale()
+                        .filter(|_| sum_keeps_decimal_scale(target)),
                 }
             } else {
                 input_type.clone()
@@ -3239,11 +3270,11 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("SUM", &arg_type)
+            infer_aggregation_type("SUM", &arg_type, &scope.target)
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("AVG", &arg_type)
+            infer_aggregation_type("AVG", &arg_type, &scope.target)
         }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);

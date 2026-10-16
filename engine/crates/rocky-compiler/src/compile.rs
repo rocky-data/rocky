@@ -2186,9 +2186,9 @@ mod tests {
         }
     }
 
-    /// #2398 end to end: `SUM` over `DECIMAL(10,2)` keeps scale 2, so a
-    /// contract with another scale is a real `E011`, and one with scale 2 is
-    /// still unchecked (`I003`) because the precision is not claimed. A bare
+    /// #2398 end to end: on DuckDB `SUM` over `DECIMAL(10,2)` keeps scale 2,
+    /// so a contract with another scale is a real `E011`, and one with scale 2
+    /// is still unchecked (`I003`) because the precision is not claimed. A bare
     /// `CAST(x AS DECIMAL)` is a decimal with no digits claimed: a bare
     /// `Decimal` contract passes, any `Decimal(p,s)` one is unchecked, and a
     /// non-decimal one is `E011`.
@@ -2220,6 +2220,9 @@ mod tests {
                     },
                 ],
             )]),
+            target_dialects: crate::operand_check::TargetDialects::uniform(
+                Some(crate::operand_check::OperandDialect::DuckDb).into(),
+            ),
             ..Default::default()
         };
         let cases = [
@@ -2258,6 +2261,98 @@ mod tests {
                 "{expr} vs {contract_type}: {:?}",
                 result.diagnostics
             );
+        }
+    }
+
+    /// #2398: BigQuery's `SUM` over a `NUMERIC(10,2)` column is a plain
+    /// `NUMERIC` (scale 9), and with no known warehouse the model may run on
+    /// BigQuery. Either way the scale is not claimed, so a contract with
+    /// another scale, such as BigQuery's real `Decimal(38,9)`, is `I003`, never
+    /// a false `E011`. A non-decimal contract is still `E011`.
+    #[test]
+    fn a_sum_claims_no_scale_where_bigquery_may_run_it() {
+        use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("totals.toml"),
+            "name = \"totals\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"totals\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("totals.sql"),
+            "SELECT o.id, SUM(o.amount) AS total FROM raw.orders o GROUP BY o.id",
+        )
+        .unwrap();
+        let source_schemas = HashMap::from([(
+            "raw.orders".to_string(),
+            vec![
+                TypedColumn {
+                    name: "id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                },
+                TypedColumn {
+                    name: "amount".to_string(),
+                    data_type: RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    nullable: false,
+                },
+            ],
+        )]);
+        let targets = [
+            ("unconfigured", OperandTarget::Unconfigured, None),
+            ("bigquery", Some(OperandDialect::BigQuery).into(), None),
+            (
+                "duckdb and bigquery",
+                OperandTarget::Targets {
+                    dialects: vec![OperandDialect::DuckDb, OperandDialect::BigQuery],
+                    unruled: Vec::new(),
+                },
+                None,
+            ),
+            ("snowflake", Some(OperandDialect::Snowflake).into(), Some(2)),
+        ];
+        for (label, target, want_scale) in targets {
+            let config = CompilerConfig {
+                models_dir: dir.path().to_path_buf(),
+                source_schemas: source_schemas.clone(),
+                target_dialects: TargetDialects::uniform(target),
+                ..Default::default()
+            };
+            let mismatch = if want_scale.is_some() { "E011" } else { "I003" };
+            for (contract_type, want) in [
+                ("Decimal(38,9)", Some(mismatch)),
+                ("Decimal(38,2)", Some("I003")),
+                ("Decimal", None),
+                ("String", Some("E011")),
+            ] {
+                std::fs::write(
+                    dir.path().join("totals.contract.toml"),
+                    format!("[[columns]]\nname = \"total\"\ntype = \"{contract_type}\"\n"),
+                )
+                .unwrap();
+                let result = compile(&config).unwrap();
+                let total = &result.type_check.typed_models["totals"][1];
+                assert_eq!(
+                    total.data_type,
+                    RockyType::DecimalUnsized { scale: want_scale },
+                    "{label}"
+                );
+                let codes: Vec<&str> = result
+                    .diagnostics
+                    .iter()
+                    .filter(|d| matches!(&*d.code, "E011" | "I003" | "E059"))
+                    .map(|d| &*d.code)
+                    .collect();
+                assert_eq!(
+                    codes,
+                    want.into_iter().collect::<Vec<_>>(),
+                    "{label}: {contract_type}"
+                );
+            }
         }
     }
 
