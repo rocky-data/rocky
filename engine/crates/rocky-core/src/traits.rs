@@ -1813,6 +1813,18 @@ pub trait SqlDialect: Send + Sync {
         format!("\"{name}\"")
     }
 
+    /// Whether this warehouse's `clone_table_for_branch` writes to
+    /// `{source.catalog}.{branch_schema}.{table}`.
+    ///
+    /// `true` for Databricks, Snowflake, BigQuery and Spark. The default is
+    /// `false`: the portable clone writes `{branch_schema}.{table}` and
+    /// ignores the catalog (DuckDB, Postgres, Trino, ClickHouse, SQL Server
+    /// and others). `rocky preview create` uses this to create the branch
+    /// schema where the clone writes.
+    fn branch_clone_uses_catalog(&self) -> bool {
+        false
+    }
+
     /// A select-list `*` that leaves out the named columns, or `None` when
     /// the warehouse has no form for it.
     ///

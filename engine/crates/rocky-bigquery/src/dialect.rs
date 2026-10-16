@@ -366,6 +366,10 @@ impl SqlDialect for BigQueryDialect {
         }
     }
 
+    fn branch_clone_uses_catalog(&self) -> bool {
+        true
+    }
+
     fn quote_identifier(&self, name: &str) -> String {
         // BigQuery uses backticks for identifiers; double quotes denote
         // STRING literals. The default `"name"` quoting from the trait

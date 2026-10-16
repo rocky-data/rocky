@@ -64,6 +64,12 @@ The copy step dispatches per adapter through the `WarehouseAdapter::clone_table_
 
 On Databricks, BigQuery, and Snowflake, `clone_table_for_branch` uses a metadata-only copy. DuckDB uses CTAS to copy the table data.
 
+### Where the branch schema is created
+
+Databricks, Snowflake, BigQuery, and Spark write each copy into the model's own catalog. For those warehouses, `rocky preview create` creates the branch schema once per distinct model catalog, for the copied and the changed models, before any copy. Your role needs `CREATE SCHEMA` in every one of those catalogs. If one catalog refuses, only its models report `copy_strategy: "failed"`, and the rest still copy. If the refusing catalog holds only changed models, the JSON output shows nothing. Rocky logs a warning, and `rocky run --branch` fails for those models.
+
+Other warehouses (DuckDB, Postgres, Trino, ClickHouse, SQL Server) ignore the catalog, so Rocky creates the schema once in the connection's default catalog.
+
 ## How diff and cost pair the runs
 
 `preview diff` and `preview cost` pair a branch run with a base run. They find both in run history in the state store. Each run record holds two branch fields, and only one of them finds the branch run.

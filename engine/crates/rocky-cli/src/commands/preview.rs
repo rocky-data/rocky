@@ -155,32 +155,14 @@ pub async fn run_preview_create(
     // partial failure (model didn't exist in base, schema mismatch),
     // the per-model `copy_strategy = "failed"` and the rest of the
     // copy set still runs.
-    let prune_model_names: Vec<String> = prune_set.iter().map(|m| m.model_name.clone()).collect();
-    let copy_set = execute_copy_from_base(
+    let copy_set = copy_step(
         config_path,
         models_dir,
         &branch_schema,
         &copy_names,
-        &prune_model_names,
+        &prune_set,
     )
-    .await
-    .unwrap_or_else(|e| {
-        // A registry-build failure means we never even tried — surface
-        // the plan with `copy_strategy = "planning_only"` so the
-        // PR-comment surface still ships the prune-set decision.
-        tracing::warn!(
-            "preview create: copy-from-base step skipped — {e}. Falling back to planning-only output."
-        );
-        copy_names
-            .iter()
-            .map(|name| PreviewCopiedModel {
-                model_name: name.clone(),
-                source_schema: "<unresolved>".to_string(),
-                target_schema: branch_schema.clone(),
-                copy_strategy: "planning_only".to_string(),
-            })
-            .collect()
-    });
+    .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -2214,28 +2196,67 @@ fn branch_schema_create_sql(
     ))
 }
 
+/// Run the copy-from-base step, falling back to planning-only entries when
+/// it cannot start (a config or registry failure). The prune set goes along
+/// so its models' catalogs get the branch schema too.
+async fn copy_step(
+    config_path: &Path,
+    models_dir: &Path,
+    branch_schema: &str,
+    copy_names: &[String],
+    prune_set: &[PreviewPrunedModel],
+) -> Vec<PreviewCopiedModel> {
+    let prune_names: Vec<String> = prune_set.iter().map(|m| m.model_name.clone()).collect();
+    execute_copy_from_base(config_path, models_dir, branch_schema, copy_names, &prune_names)
+        .await
+        .unwrap_or_else(|e| {
+            // A registry-build failure means we never even tried — surface
+            // the plan with `copy_strategy = "planning_only"` so the
+            // PR-comment surface still ships the prune-set decision.
+            tracing::warn!(
+                "preview create: copy-from-base step skipped — {e}. Falling back to planning-only output."
+            );
+            copy_names
+                .iter()
+                .map(|name| PreviewCopiedModel {
+                    model_name: name.clone(),
+                    source_schema: "<unresolved>".to_string(),
+                    target_schema: branch_schema.to_string(),
+                    copy_strategy: "planning_only".to_string(),
+                })
+                .collect()
+        })
+}
+
 /// The `CREATE SCHEMA` for the branch schema in one target catalog.
 ///
-/// Warehouses with catalogs (Databricks, Snowflake: the dialects with a
-/// `create_catalog_sql`) get `CREATE SCHEMA IF NOT EXISTS
-/// <catalog>.<schema>`, both parts quoted through the dialect. That matches
-/// how their native clones quote the target, so the schema exists under the
-/// exact name the clone writes to. An empty catalog, or a dialect without
-/// catalogs (DuckDB, Postgres, Trino and others, whose clone path ignores
-/// `source.catalog`), gets the unqualified statement against the
-/// connection default.
+/// Which dialects write the clone into the model's catalog
+/// ([`SqlDialect::branch_clone_uses_catalog`](rocky_core::traits::SqlDialect::branch_clone_uses_catalog)):
+///
+/// | Warehouse | Clone target | Schema created |
+/// |---|---|---|
+/// | Databricks, Snowflake, BigQuery, Spark | `{catalog}.{branch}.{table}` | `{catalog}.{branch}`, both parts quoted through the dialect |
+/// | DuckDB, Postgres, Trino, ClickHouse, SQL Server | `{branch}.{table}`, catalog ignored | `{branch}` in the connection default |
+///
+/// Quoting through the dialect matches how the clones quote their target,
+/// so the schema exists under the exact name the clone writes to
+/// (Snowflake folds an unquoted name to upper case). The catalog is
+/// validated by the dialect's own `create_schema_sql`, which for BigQuery
+/// accepts hyphenated project IDs. An empty catalog gets the unqualified
+/// statement.
 fn branch_schema_statement(
     dialect: &dyn rocky_core::traits::SqlDialect,
     branch_schema: &str,
     catalog: &str,
 ) -> Result<String> {
-    if catalog.is_empty() || dialect.create_catalog_sql(catalog).is_none() {
+    if catalog.is_empty() || !dialect.branch_clone_uses_catalog() {
         return branch_schema_create_sql(dialect, branch_schema);
     }
-    rocky_sql::validation::validate_identifier(branch_schema)
-        .map_err(|e| anyhow::anyhow!("invalid branch schema '{branch_schema}': {e}"))?;
-    rocky_sql::validation::validate_identifier(catalog)
-        .map_err(|e| anyhow::anyhow!("invalid catalog '{catalog}': {e}"))?;
+    if let Some(check) = dialect.create_schema_sql(catalog, branch_schema) {
+        check.map_err(|e| {
+            anyhow::anyhow!("branch schema '{branch_schema}' in catalog '{catalog}': {e}")
+        })?;
+    }
     Ok(format!(
         "CREATE SCHEMA IF NOT EXISTS {}.{}",
         dialect.quote_identifier(catalog),
@@ -2302,6 +2323,22 @@ async fn copy_into_branch(
         .map(|m| m.config.target.catalog.as_str())
         .collect();
     let failed_catalogs = create_branch_schemas(adapter, branch_schema, &catalogs).await;
+    // A catalog used only by the prune set has no copy entry to mark
+    // `failed`. The output has no warnings field, so log it.
+    let copy_catalogs: BTreeSet<&str> = copy_names
+        .iter()
+        .filter_map(|n| model_by_name.get(n))
+        .map(|m| m.config.target.catalog.as_str())
+        .collect();
+    for (catalog, err) in &failed_catalogs {
+        if !copy_catalogs.contains(catalog.as_str()) {
+            tracing::warn!(
+                "preview create: branch schema '{branch_schema}' could not be created in \
+                 catalog '{catalog}', which only the prune set writes to; \
+                 `rocky run --branch` will fail for those models: {err}"
+            );
+        }
+    }
 
     let mut results = Vec::with_capacity(copy_names.len());
     for model_name in copy_names {
@@ -4242,6 +4279,92 @@ mod tests {
             adapter.log()[0],
             "CREATE SCHEMA IF NOT EXISTS \"analytics\".\"branch__x\""
         );
+    }
+
+    /// BigQuery and Spark clones write into the model's catalog, so the
+    /// schema is created there. BigQuery project IDs may contain hyphens.
+    #[tokio::test]
+    async fn branch_schema_is_created_in_the_catalog_for_bigquery_and_spark() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", "my-project-1"), ("b", "lake")],
+        );
+        let by_name = index_by_name(&models);
+
+        let bq = Recorder::new(rocky_bigquery::dialect::BigQueryDialect);
+        let out = copy_into_branch(&bq, &by_name, "branch__x", &names(&["a"]), &[]).await;
+        assert_eq!(out[0].copy_strategy, "ctas");
+        assert_eq!(
+            bq.log()[0],
+            "CREATE SCHEMA IF NOT EXISTS `my-project-1`.`branch__x`"
+        );
+
+        let spark = Recorder::new(rocky_spark::dialect::SparkDialect::default());
+        copy_into_branch(&spark, &by_name, "branch__x", &names(&["b"]), &[]).await;
+        assert_eq!(
+            spark.log()[0],
+            "CREATE SCHEMA IF NOT EXISTS `lake`.`branch__x`"
+        );
+    }
+
+    /// Dialects whose clone ignores the catalog get one unqualified create.
+    #[tokio::test]
+    async fn branch_schema_ignores_the_catalog_when_the_clone_does() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", "cat_one"), ("b", "cat_two")],
+        );
+        let by_name = index_by_name(&models);
+        let pg = Recorder::new(rocky_postgres::dialect::PostgresDialect::default());
+        copy_into_branch(&pg, &by_name, "branch__x", &names(&["a", "b"]), &[]).await;
+        let creates: Vec<_> = pg
+            .log()
+            .into_iter()
+            .filter(|l| l.starts_with("CREATE SCHEMA"))
+            .collect();
+        assert_eq!(creates.len(), 1);
+        assert!(!creates[0].contains("cat_"), "{creates:?}");
+    }
+
+    /// `copy_step` must hand the prune set to the copy step: with an empty
+    /// copy set, a pruned model's branch schema is still created.
+    #[tokio::test]
+    async fn copy_step_creates_the_schema_for_the_prune_set() {
+        use rocky_duckdb::DuckDbConnector;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("preview.duckdb");
+        let models_dir = tmp.path().join("models");
+        load_models_in(&models_dir, &[("p", "poc")]);
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.default]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.demo]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.demo.target]\nadapter = \"default\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let prune = vec![PreviewPrunedModel {
+            model_name: "p".into(),
+            reason: "changed".into(),
+            changed_columns: vec![],
+        }];
+
+        let out = copy_step(&config_path, &models_dir, "branch__pr9", &[], &prune).await;
+        assert!(out.is_empty());
+
+        let conn = DuckDbConnector::open(&db_path).unwrap();
+        let q = conn
+            .execute_sql(
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE schema_name = 'branch__pr9'",
+            )
+            .unwrap();
+        assert_eq!(q.rows.len(), 1, "prune-set schema must exist");
     }
 
     /// Models with no catalog get the old unqualified statement, once. A

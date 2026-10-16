@@ -289,6 +289,10 @@ impl SqlDialect for DatabricksSqlDialect {
         Ok(format!("{column} RLIKE '{pattern}'"))
     }
 
+    fn branch_clone_uses_catalog(&self) -> bool {
+        true
+    }
+
     fn quote_identifier(&self, name: &str) -> String {
         // Backticks are the universally-safe Databricks identifier
         // quote — they work in both `ANSI_MODE = on` (the default since

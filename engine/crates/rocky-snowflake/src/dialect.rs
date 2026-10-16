@@ -336,6 +336,10 @@ impl SqlDialect for SnowflakeSqlDialect {
         Ok(format!("REGEXP_LIKE({column}, '{pattern}')"))
     }
 
+    fn branch_clone_uses_catalog(&self) -> bool {
+        true
+    }
+
     fn quote_identifier(&self, name: &str) -> String {
         // Snowflake folds *unquoted* identifiers to UPPER (`id` becomes
         // `ID`); double-quoted identifiers are taken verbatim and
