@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `rocky run --branch` on Snowflake now creates the branch schema under the name the writes use (#2402). Before, `auto_create_schemas` ran an unquoted `CREATE SCHEMA DB.branch__x`, which Snowflake folds to `BRANCH__X`, and the models then wrote to the quoted `"DB"."branch__x"`, so the run failed with "schema not found". The branch schema is now created with both names quoted, the way `rocky preview create` does it. This covers transformation and replication pipelines. Other schemas keep the old statement. Not run against a live Snowflake account.
+- `rocky run --branch` and `--shadow --shadow-schema` on Snowflake now create the routed schema under the name the writes use (#2402). Before, `auto_create_schemas` ran an unquoted `CREATE SCHEMA DB.branch__x`, which Snowflake folds to `BRANCH__X`, and the models then wrote to the quoted `"DB"."branch__x"`, so the run failed with "schema not found". The schema is now created with both names quoted, the way `rocky preview create` does it. This covers transformation and replication pipelines. Other schemas keep the old statement. Not run against a live Snowflake account. Known gap: the Snowflake governance SQL (tags, grants, retention) is still unquoted, so it folds to `BRANCH__X`. The schema the writes use gets no grants or tags, and that step logs a warning. An account that ran `--branch` before this fix may hold a stale, empty `BRANCH__X` schema, and any grants landed on it silently. Drop it.
 
 ## [1.84.1] — 2026-10-16
 

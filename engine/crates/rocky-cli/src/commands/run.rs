@@ -11714,11 +11714,12 @@ pub fn resolve_run_selection(
 
 /// The `CREATE SCHEMA` for one auto-create target.
 ///
-/// A `--branch` run writes its models to `{catalog}.{branch_schema}.{table}`
-/// through `format_table_ref`, which on Snowflake double-quotes every part
-/// (an exact, case-preserving name). Snowflake's own `create_schema_sql` is
-/// unquoted and folds `branch__x` to `BRANCH__X`, so the schema it makes is not
-/// the one the writes name (#2402). For the branch schema, on a dialect that
+/// A `--branch` or `--shadow-schema` run writes its models to
+/// `{catalog}.{routed_schema}.{table}` through `format_table_ref`, which on
+/// Snowflake double-quotes every part (an exact, case-preserving name).
+/// Snowflake's own `create_schema_sql` is unquoted and folds `branch__x` to
+/// `BRANCH__X`, so the schema it makes is not the one the writes name (#2402).
+/// For the routed schema (`schema_override`), on a dialect that
 /// clones into the catalog, build the statement with the same quoting as the
 /// writes (the helper `rocky preview` uses). Every other target keeps the
 /// dialect's `create_schema_sql`, which other code (grants, tags) relies on.
@@ -11728,11 +11729,10 @@ fn auto_create_schema_statement(
     catalog: &str,
     schema: &str,
 ) -> Result<Option<String>> {
-    let is_branch_schema = shadow_config
-        .filter(|config| config.branch.is_some())
+    let is_routed_schema = shadow_config
         .and_then(|config| config.schema_override.as_deref())
-        .is_some_and(|branch_schema| branch_schema == schema);
-    if is_branch_schema && !catalog.is_empty() && dialect.branch_clone_uses_catalog() {
+        .is_some_and(|routed_schema| routed_schema == schema);
+    if is_routed_schema && !catalog.is_empty() && dialect.branch_clone_uses_catalog() {
         return super::preview::branch_schema_statement(dialect, schema, catalog).map(Some);
     }
     dialect
@@ -19761,7 +19761,22 @@ mod tests {
                 .unwrap(),
             plain
         );
-        // A one-off `--shadow-schema` run is not a branch run.
+        // A suffix-mode `--shadow` run routes no schema, so it keeps the
+        // dialect's statement.
+        let suffix_only = rocky_core::shadow::ShadowConfig::default();
+        assert_eq!(
+            auto_create_schema_statement(&dialect, Some(&suffix_only), "DB", "marts")
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+    }
+
+    /// A one-off `--shadow --shadow-schema` run writes through the same
+    /// quoted references as a branch run, so it gets the quoted create too.
+    #[test]
+    fn snowflake_shadow_schema_create_is_quoted_like_the_writes() {
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
         let one_off = rocky_core::shadow::ShadowConfig {
             schema_override: Some("shadow_x".to_string()),
             ..Default::default()
@@ -19770,10 +19785,7 @@ mod tests {
             auto_create_schema_statement(&dialect, Some(&one_off), "DB", "shadow_x")
                 .unwrap()
                 .unwrap(),
-            dialect
-                .create_schema_sql("DB", "shadow_x")
-                .unwrap()
-                .unwrap()
+            r#"CREATE SCHEMA IF NOT EXISTS "DB"."shadow_x""#
         );
     }
 
@@ -34777,6 +34789,107 @@ backend = "local"
             .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
             .expect("original table must still have amount");
         assert_eq!(rows.rows.len(), 1, "the original row must survive");
+    }
+
+    /// #2402 call site: a `--branch` transformation run on the Snowflake
+    /// dialect creates the branch schema with the quoted statement the writes
+    /// name. The adapter records statements and fails on the first one that is
+    /// not a `CREATE SCHEMA`, so the run stops right after the create.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn branch_run_on_snowflake_creates_the_quoted_branch_schema() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct SnowflakeRecorder<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            dialect: rocky_snowflake::dialect::SnowflakeSqlDialect,
+            statements: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for SnowflakeRecorder<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &self.dialect
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.statements.lock().unwrap().push(sql.to_string());
+                if sql.starts_with("CREATE SCHEMA") {
+                    Ok(())
+                } else {
+                    Err(AdapterError::msg("recorder stops at the first write"))
+                }
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n").expect("sql");
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"DB\"\nschema = \"marts\"\n",
+        )
+        .expect("toml");
+        let inner = DuckDbWarehouseAdapter::open(&dir.path().join("t.duckdb")).expect("open");
+        let adapter = SnowflakeRecorder {
+            inner: &inner,
+            dialect: rocky_snowflake::dialect::SnowflakeSqlDialect,
+            statements: std::sync::Mutex::new(Vec::new()),
+        };
+        let shadow = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("branch__x".to_string()),
+            branch: Some("x".to_string()),
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let _ = super::execute_models_with_explicit_contracts(
+            &models,
+            None,
+            &adapter,
+            None,
+            &PartitionRunOptions::default(),
+            "branch-create-test",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            Some(&shadow),
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            None,
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let statements = adapter.statements.lock().unwrap().clone();
+        assert_eq!(
+            statements.first().map(String::as_str),
+            Some(r#"CREATE SCHEMA IF NOT EXISTS "DB"."branch__x""#),
+            "recorded: {statements:?}"
+        );
     }
 
     /// A project `contracts/` directory beside the models directory is read
