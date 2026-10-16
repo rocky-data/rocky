@@ -45,38 +45,51 @@ pub fn run_lineage_diff(
         mode,
     )?;
 
-    let mode = data.mode;
-    // Build the per-model, per-column lineage-augmented results.
+    let output = lineage_diff_output(base_ref, data);
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!(
+            "Rocky Lineage Diff ({base_ref}...{})\n",
+            output.mode.head_label()
+        );
+        if output.summary.is_clean() && output.results.is_empty() {
+            println!("No changed model files detected.");
+        } else {
+            print!("{}", output.markdown);
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the `rocky lineage-diff` output from a computed CI diff: the
+/// per-column downstream traces, the consumer classification of removed
+/// columns, and the incomplete-lineage list (#2397), all folded into the
+/// Markdown that both the JSON and the table output carry.
+fn lineage_diff_output(base_ref: &str, data: super::ci_diff::CiDiffData) -> LineageDiffOutput {
     let results = enrich_with_downstream(
         &data.results,
         data.head_compile.as_ref(),
         data.base_compile.as_ref(),
     );
-    let markdown = format_lineage_diff_markdown(&results, &data.summary);
-
-    if output_json {
-        let output = LineageDiffOutput {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            command: "lineage-diff".to_string(),
-            base_ref: base_ref.to_string(),
-            head_ref: mode.head_label().to_string(),
-            summary: data.summary,
-            results,
-            markdown,
-            mode,
-            base_commit: data.base_commit,
-        };
-        print_json(&output)?;
-    } else {
-        println!("Rocky Lineage Diff ({base_ref}...{})\n", mode.head_label());
-        if data.summary.is_clean() && results.is_empty() {
-            println!("No changed model files detected.");
-        } else {
-            print!("{markdown}");
-        }
+    let incomplete_lineage = data.incomplete_lineage();
+    let mut markdown = format_lineage_diff_markdown(&results, &data.summary);
+    markdown.push_str(&crate::output::incomplete_lineage_markdown(
+        incomplete_lineage.as_deref(),
+    ));
+    LineageDiffOutput {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        command: "lineage-diff".to_string(),
+        base_ref: base_ref.to_string(),
+        head_ref: data.mode.head_label().to_string(),
+        summary: data.summary,
+        results,
+        markdown,
+        mode: data.mode,
+        base_commit: data.base_commit,
+        incomplete_lineage,
     }
-
-    Ok(())
 }
 
 /// For each model's column changes, walk HEAD's `semantic_graph` to collect
@@ -853,6 +866,37 @@ mod tests {
         assert!(
             md.contains("`fct_deleted` (`deleted_amount`) | deleted |"),
             "{md}"
+        );
+
+        // #2397: the output names the downstream model whose lineage is
+        // incomplete (`fct_ambiguous` reads an unqualified column over a
+        // join), in JSON and in the Markdown the table output prints.
+        let output = lineage_diff_output("HEAD~1", data);
+        let incomplete = output.incomplete_lineage.as_deref().expect("HEAD compiled");
+        assert!(
+            incomplete.iter().any(|r| r.model == "fct_ambiguous"),
+            "{incomplete:?}"
+        );
+        assert!(
+            incomplete
+                .iter()
+                .all(|r| r.model != "fct_other_source" && r.model != "fct_repaired"),
+            "{incomplete:?}"
+        );
+        assert!(
+            output.markdown.contains("**Lineage incomplete**")
+                && output.markdown.contains("- `fct_ambiguous`: "),
+            "{}",
+            output.markdown
+        );
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(
+            json["incomplete_lineage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["model"] == "fct_ambiguous"),
+            "{json:#}"
         );
     }
 }

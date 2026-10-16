@@ -113,7 +113,7 @@ pub(crate) fn incomplete_lineage<'a>(
 /// dependency graph, in one direction. Model edges, not column edges: a
 /// reader joined through `NATURAL JOIN` has no traced column edge, and it is
 /// exactly the reader that must not drop out of the list.
-fn reachable_models(
+pub(crate) fn reachable_models(
     graph: &rocky_compiler::semantic::SemanticGraph,
     model_name: &str,
     downstream: bool,
@@ -154,22 +154,14 @@ fn column_view_models(
     )
 }
 
-fn print_incomplete_lineage(records: &[IncompleteLineageRecord]) {
+pub(crate) fn print_incomplete_lineage(records: &[IncompleteLineageRecord]) {
     if records.is_empty() {
         return;
     }
     println!();
     println!("Lineage incomplete (impact may be under-reported):");
     for record in records {
-        let why = match &record.gaps {
-            Some(gaps) => gaps
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; "),
-            None => "not computed".to_string(),
-        };
-        println!("  {}: {why}", record.model);
+        println!("  {}: {}", record.model, record.gaps_label());
     }
 }
 

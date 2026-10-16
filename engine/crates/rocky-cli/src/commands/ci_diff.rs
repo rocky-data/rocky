@@ -34,7 +34,7 @@ use rocky_core::models::Model;
 use rocky_sql::defer::CollisionIdentity;
 
 pub use crate::output::CiDiffMode;
-use crate::output::{CiDiffOutput, print_json};
+use crate::output::{CiDiffOutput, IncompleteLineageRecord, print_json};
 
 // ---------------------------------------------------------------------------
 // Git integration
@@ -1227,6 +1227,58 @@ pub(crate) struct CiDiffData {
     pub(crate) base_commit: Option<String>,
 }
 
+impl CiDiffData {
+    /// The incomplete-lineage list for this diff (#2397). See
+    /// [`diff_incomplete_lineage`].
+    pub(crate) fn incomplete_lineage(&self) -> Option<Vec<IncompleteLineageRecord>> {
+        diff_incomplete_lineage(
+            &self.results,
+            self.head_compile.as_ref().map(|c| &c.semantic_graph),
+            self.base_compile.as_ref().map(|c| &c.semantic_graph),
+        )
+    }
+}
+
+/// The models whose lineage is known to be incomplete (#2377) among the
+/// changed models and every model downstream of them, read from HEAD's
+/// graph (#2397). Impact traced through them may be under-reported.
+///
+/// A removed model has no HEAD schema, so the models downstream of it are
+/// read from the base graph and then looked up on HEAD. `Some([])` when no
+/// model changed. `None` when models changed but HEAD did not compile: the
+/// answer is unknown, not "complete".
+pub(crate) fn diff_incomplete_lineage(
+    results: &[DiffResult],
+    head: Option<&rocky_compiler::semantic::SemanticGraph>,
+    base: Option<&rocky_compiler::semantic::SemanticGraph>,
+) -> Option<Vec<IncompleteLineageRecord>> {
+    let changed: Vec<&DiffResult> = results
+        .iter()
+        .filter(|r| r.status != ModelDiffStatus::Unchanged)
+        .collect();
+    if changed.is_empty() {
+        return Some(Vec::new());
+    }
+    let head = head?;
+    let mut models: HashSet<String> = HashSet::new();
+    for result in changed {
+        let graph = match (result.status, base) {
+            (ModelDiffStatus::Removed, Some(base)) => base,
+            _ => head,
+        };
+        models.extend(super::lineage::reachable_models(
+            graph,
+            &result.model_name,
+            true,
+        ));
+        models.insert(result.model_name.clone());
+    }
+    Some(super::lineage::incomplete_lineage(
+        head,
+        models.iter().map(String::as_str),
+    ))
+}
+
 /// Compute the CI diff between `base_ref` and HEAD without printing.
 ///
 /// Shared between `run_ci_diff` and `run_lineage_diff` so the lineage-diff
@@ -1510,15 +1562,7 @@ pub fn run_ci_diff(
         // non-model files only" the same way `rocky ci-diff` did before
         // the `compute_ci_diff` extraction.
         if output_json {
-            let output = CiDiffOutput::new(
-                base_ref.to_string(),
-                mode.head_label().to_string(),
-                data.summary,
-                vec![],
-            )
-            .with_snapshot(mode, data.base_commit.clone())
-            .with_breaking_findings(findings);
-            print_json(&output)?;
+            print_json(&ci_diff_output(base_ref, data, findings))?;
         } else if data.changed_file_count == 0 {
             println!("{header}");
             println!("No changed model files detected.");
@@ -1534,34 +1578,54 @@ pub fn run_ci_diff(
     }
 
     if output_json {
-        let output = CiDiffOutput::new(
-            base_ref.to_string(),
-            mode.head_label().to_string(),
-            data.summary,
-            data.results,
-        )
-        .with_snapshot(mode, data.base_commit.clone())
-        .with_breaking_findings(findings);
-        print_json(&output)?;
+        print_json(&ci_diff_output(base_ref, data, findings))?;
     } else {
+        let incomplete = data.incomplete_lineage();
         println!("{header}");
         print!("{}", format_diff_table(&data.results));
+        match &incomplete {
+            Some(records) => super::lineage::print_incomplete_lineage(records),
+            None => {
+                println!();
+                println!("Lineage completeness is not known: the HEAD side did not compile.");
+            }
+        }
         println!();
         println!("--- Markdown (for PR comment) ---\n");
         // Render the same Markdown the JSON `markdown` field carries. This
         // block is what a human copies into the PR, so it is exactly the
         // surface that must not omit a breaking finding.
+        let mut markdown = format_diff_markdown(&data.results);
+        markdown.push_str(&crate::output::incomplete_lineage_markdown(
+            incomplete.as_deref(),
+        ));
         print!(
             "{}",
-            crate::output::markdown_with_findings(
-                &format_diff_markdown(&data.results),
-                data.summary.is_clean(),
-                &findings,
-            )
+            crate::output::markdown_with_findings(&markdown, data.summary.is_clean(), &findings)
         );
     }
 
     Ok(())
+}
+
+/// Build the `rocky ci-diff` JSON output from a computed diff: the structural
+/// rows, the snapshot, the incomplete-lineage list (#2397) and the semantic
+/// findings, each folded into the pre-rendered Markdown.
+fn ci_diff_output(
+    base_ref: &str,
+    data: CiDiffData,
+    findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+) -> CiDiffOutput {
+    let incomplete = data.incomplete_lineage();
+    CiDiffOutput::new(
+        base_ref.to_string(),
+        data.mode.head_label().to_string(),
+        data.summary,
+        data.results,
+    )
+    .with_snapshot(data.mode, data.base_commit)
+    .with_incomplete_lineage(incomplete)
+    .with_breaking_findings(findings)
 }
 
 /// Print the semantic breaking-change findings in the human-readable output.
@@ -2235,6 +2299,117 @@ mod tests {
 
     fn write_model(dir: &Path, name: &str, sql: &str) {
         write_model_with_identity(dir, name, name, name, sql);
+    }
+
+    fn diff_row(model: &str, status: ModelDiffStatus) -> DiffResult {
+        DiffResult {
+            model_name: model.to_string(),
+            resolved_target: None,
+            status,
+            row_count_before: None,
+            row_count_after: None,
+            column_changes: vec![],
+            sample_changed_rows: None,
+        }
+    }
+
+    /// #2397: the diff lists the incomplete lineage of the changed models and
+    /// of every model downstream of them, and nothing else. A removed model's
+    /// downstream comes from the base graph. No HEAD compile is unknown
+    /// (`None`), and no changed model is "none" (`Some([])`).
+    #[test]
+    fn diff_incomplete_lineage_covers_changed_and_downstream_models() {
+        use rocky_sql::lineage::LineageGap;
+
+        let sources = source_schema(
+            "src_orders",
+            &[
+                ("id", rocky_ir::RockyType::Int64),
+                ("region", rocky_ir::RockyType::String),
+            ],
+        );
+        let head_dir = TempDir::new().unwrap();
+        let head = head_dir.path();
+        // `a` changed and is clean; `b` reads it through NATURAL JOIN, two
+        // hops down through `mid`. `elsewhere` has a gap but reads nothing
+        // that changed. `reader` read the removed model `gone`.
+        write_model(head, "a", "SELECT id, region FROM src_orders");
+        write_model(head, "mid", "SELECT id, region FROM a");
+        write_model(
+            head,
+            "b",
+            "SELECT mid.region, z.id FROM mid NATURAL JOIN src_orders z",
+        );
+        write_model(
+            head,
+            "elsewhere",
+            "SELECT o.id FROM src_orders o NATURAL JOIN src_orders p",
+        );
+        write_model(
+            head,
+            "reader",
+            "SELECT id FROM src_orders UNION ALL SELECT id FROM src_orders",
+        );
+        let head_compile = compile_head(head, sources.clone()).expect("head compile");
+
+        let base_dir = TempDir::new().unwrap();
+        let base = base_dir.path();
+        write_model(base, "a", "SELECT id FROM src_orders");
+        write_model(base, "gone", "SELECT id FROM src_orders");
+        write_model(
+            base,
+            "reader",
+            "SELECT id FROM gone UNION ALL SELECT id FROM src_orders",
+        );
+        let base_compile = compile_head(base, sources).expect("base compile");
+
+        let results = vec![
+            diff_row("a", ModelDiffStatus::Modified),
+            diff_row("gone", ModelDiffStatus::Removed),
+            diff_row("elsewhere", ModelDiffStatus::Unchanged),
+        ];
+        let got = diff_incomplete_lineage(
+            &results,
+            Some(&head_compile.semantic_graph),
+            Some(&base_compile.semantic_graph),
+        )
+        .expect("HEAD compiled");
+        assert_eq!(
+            got,
+            vec![
+                IncompleteLineageRecord {
+                    model: "b".to_string(),
+                    gaps: Some(vec![LineageGap::NaturalJoin]),
+                },
+                IncompleteLineageRecord {
+                    model: "reader".to_string(),
+                    gaps: Some(vec![LineageGap::SetOperation]),
+                },
+            ]
+        );
+
+        // A changed model with a gap lists itself.
+        let got = diff_incomplete_lineage(
+            &[diff_row("elsewhere", ModelDiffStatus::Added)],
+            Some(&head_compile.semantic_graph),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(),
+            ["elsewhere"]
+        );
+
+        // Nothing changed: none. Changed with no HEAD compile: unknown.
+        assert_eq!(
+            diff_incomplete_lineage(
+                &[diff_row("a", ModelDiffStatus::Unchanged)],
+                Some(&head_compile.semantic_graph),
+                None
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(diff_incomplete_lineage(&results, None, None), None);
     }
 
     fn write_model_with_identity(
@@ -3224,6 +3399,47 @@ mod tests {
             .iter()
             .find(|r| r.model_name == model)
             .map(|r| r.status)
+    }
+
+    /// #2397 end to end: the JSON output and its Markdown name the model
+    /// downstream of a changed one whose lineage is incomplete.
+    #[test]
+    fn e2e_ci_diff_output_lists_incomplete_downstream_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("a.sql", "SELECT 1 AS id\n"),
+                ("a.toml", &inferred_sidecar("marts")),
+                (
+                    "b.sql",
+                    "SELECT a.id, z.score FROM a NATURAL JOIN raw.scores z\n",
+                ),
+                ("b.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        fs::write(models_dir.join("a.sql"), "SELECT 1 AS id, 2 AS extra\n").unwrap();
+        run_git(dir, &["commit", "-q", "-am", "change a"]);
+
+        let data = compute_in(dir, &models_dir);
+        assert_eq!(status_of(&data, "a"), Some(ModelDiffStatus::Modified));
+        let output = ci_diff_output("HEAD~1", data, Vec::new());
+        let names: Vec<&str> = output
+            .incomplete_lineage
+            .as_deref()
+            .expect("HEAD compiled")
+            .iter()
+            .map(|r| r.model.as_str())
+            .collect();
+        assert_eq!(names, ["b"]);
+        assert!(
+            output.markdown.contains("- `b`: NATURAL join"),
+            "{}",
+            output.markdown
+        );
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["incomplete_lineage"][0]["gaps"][0], "natural_join");
     }
 
     /// G7: the default mode reads the HEAD commit for both selection and

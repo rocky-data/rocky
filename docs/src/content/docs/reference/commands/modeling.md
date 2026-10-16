@@ -448,7 +448,7 @@ When a model uses one of the constructs above, its lineage is missing edges, and
 
 - It covers the model and every model upstream and downstream of it, for a model view and for a column trace (upstream or `--downstream`).
 - It follows model dependencies, not column edges, so a reader that joins with `NATURAL JOIN` is listed even though no column edge reaches it.
-- `rocky lineage-diff` and `rocky ci-diff` do not read this signal yet.
+- `rocky lineage-diff` and `rocky ci-diff` report it too, for the changed models and the models downstream of them (see [incomplete lineage in a diff](#incomplete-lineage-in-a-diff)).
 - The table output prints the same models under a `Lineage incomplete` heading.
 
 `gaps` names each construct: `natural_join`, `group_by_all`, `set_operation`, `cte_body_row_selection`, `derived_table_row_selection`, `subquery_expression`, `nested_named_window`, `unmodelled_relation` (`PIVOT`, `UNNEST`, a table function, `VALUES`), `unattributed_column` (an unqualified column in a multi-table query), `unresolved_projection`, and `unresolved_star` (a `SELECT *` over a relation with unknown columns). An empty list (`[]`) means no model in scope has a known gap. A missing field, or `gaps: null`, means Rocky did not compute it: treat that as possibly incomplete, never as complete.
@@ -602,6 +602,17 @@ A read counts through either edge kind: a value read, or a row-selection read su
 ```
 
 The Markdown report adds a **Consumers of removed columns** table to each model with a classified removal. `unknown` is the conservative answer: Rocky never reports `repaired` unless HEAD's lineage proves it. A model that reads the upstream with `SELECT *`, while HEAD cannot list the upstream's columns, is `unknown`. So is an unqualified column name in a join.
+
+#### Incomplete lineage in a diff
+
+The impact report reads the same edges as `rocky lineage`, so a model whose lineage is incomplete can hide impact. Both `rocky lineage-diff` and `rocky ci-diff` have an `incomplete_lineage` list, with the same shape as in [`rocky lineage`](#incomplete-lineage):
+
+- It covers every changed model (added, modified or removed) and every model downstream of one on HEAD. A removed model's downstream models are found on the base side.
+- `[]` means none of them has a known gap.
+- `null` means Rocky does not know: models changed, but the HEAD side did not compile. A payload with no field comes from an older build. Treat both as possibly incomplete, never as complete.
+- The Markdown report, and so the table output, adds a **Lineage incomplete** list, or one line when it is not known.
+
+Rocky reports the list as it is. A filter inside a `WITH` body marks a model incomplete, so the list can be long on CTE-heavy models.
 
 `rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
 
@@ -1241,6 +1252,8 @@ rocky ci-diff release/2026-04 --models src/models
 ```
 
 The `markdown` field holds a ready-to-post report; in a GitHub Actions workflow you can `jq -r .markdown` the JSON output and feed it into `gh pr comment`.
+
+The output also has an `incomplete_lineage` list: the changed models, and the models downstream of them, whose lineage is known to be incomplete. Impact through them may be under-reported. It is the same list as in [`rocky lineage-diff`](#incomplete-lineage-in-a-diff), and the table output prints it under a `Lineage incomplete` heading.
 
 Run with `--semantic` to surface classified breaking-change findings alongside the structural diff:
 

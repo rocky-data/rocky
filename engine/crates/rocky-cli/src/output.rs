@@ -2753,6 +2753,16 @@ pub struct CiDiffOutput {
     /// was used (e.g. a shallow clone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Models whose lineage is known to be incomplete (#2377), among the
+    /// changed models and every model downstream of them on HEAD, sorted by
+    /// name (#2397). Impact through them may be under-reported. A removed
+    /// model's downstream is read from the base side. `[]` means none.
+    ///
+    /// `None` (`null`) when it is not known: models changed but the HEAD side
+    /// did not compile. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    #[serde(default)]
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
 }
 
 /// Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares
@@ -2802,7 +2812,22 @@ impl CiDiffOutput {
             breaking_findings: Vec::new(),
             mode: CiDiffMode::Head,
             base_commit: None,
+            incomplete_lineage: None,
         }
+    }
+
+    /// Attach the incomplete-lineage list (#2397) and fold it into
+    /// [`Self::markdown`], the pre-rendered PR comment, so a reader sees that
+    /// impact may be under-reported.
+    #[must_use]
+    pub fn with_incomplete_lineage(
+        mut self,
+        records: Option<Vec<IncompleteLineageRecord>>,
+    ) -> Self {
+        self.markdown
+            .push_str(&incomplete_lineage_markdown(records.as_deref()));
+        self.incomplete_lineage = records;
+        self
     }
 
     /// Record which snapshot was compared and the base commit it was read
@@ -3796,6 +3821,16 @@ pub struct LineageDiffOutput {
     /// HEAD). Omitted when it could not be computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Models whose lineage is known to be incomplete (#2377), among the
+    /// changed models and every model downstream of them on HEAD, sorted by
+    /// name (#2397). Impact through them may be under-reported. A removed
+    /// model's downstream is read from the base side. `[]` means none.
+    ///
+    /// `None` (`null`) when it is not known: models changed but the HEAD side
+    /// did not compile. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    #[serde(default)]
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
 }
 
 /// One model's worth of structural + lineage diff.
@@ -3916,6 +3951,29 @@ pub struct LineageOutput {
     pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
 }
 
+/// The Markdown section that reports incomplete lineage in a diff's PR
+/// comment (#2397). Empty for `Some([])`; one line saying it is not known
+/// for `None`.
+pub(crate) fn incomplete_lineage_markdown(records: Option<&[IncompleteLineageRecord]>) -> String {
+    let Some(records) = records else {
+        return "\n_Lineage completeness is not known: the HEAD side did not compile._\n"
+            .to_string();
+    };
+    if records.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n**Lineage incomplete** (impact may be under-reported):\n\n");
+    for record in records {
+        // A model name can hold a backtick; it would end the code span.
+        out.push_str(&format!(
+            "- `{}`: {}\n",
+            record.model.replace('`', "'"),
+            record.gaps_label()
+        ));
+    }
+    out
+}
+
 /// A model whose column lineage is known to be incomplete (#2377).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct IncompleteLineageRecord {
@@ -3925,6 +3983,20 @@ pub struct IncompleteLineageRecord {
     /// `natural_join` or `set_operation`. `None` when they were never
     /// computed (unknown).
     pub gaps: Option<Vec<rocky_sql::lineage::LineageGap>>,
+}
+
+impl IncompleteLineageRecord {
+    /// The gaps as one human-readable line, `not computed` when unknown.
+    pub(crate) fn gaps_label(&self) -> String {
+        match &self.gaps {
+            Some(gaps) => gaps
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+            None => "not computed".to_string(),
+        }
+    }
 }
 
 /// One downstream consumer in a `rocky lineage` view.
@@ -12997,6 +13069,62 @@ mod ci_diff_markdown_tests {
             },
             vec![],
         )
+    }
+
+    /// #2397: the list reaches JSON and the PR-comment Markdown. `None` is
+    /// written as `null` and said in the Markdown; `[]` adds nothing. The
+    /// schema does not require the field, so an older payload without it
+    /// reads as unknown.
+    #[test]
+    fn incomplete_lineage_reaches_json_and_markdown() {
+        let record = IncompleteLineageRecord {
+            model: "b".to_string(),
+            gaps: Some(vec![rocky_sql::lineage::LineageGap::NaturalJoin]),
+        };
+        let out = empty_output().with_incomplete_lineage(Some(vec![record]));
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["incomplete_lineage"][0]["model"], "b", "{json:#}");
+        assert_eq!(json["incomplete_lineage"][0]["gaps"][0], "natural_join");
+        assert!(
+            out.markdown.contains("**Lineage incomplete**")
+                && out.markdown.contains("- `b`: NATURAL join"),
+            "{}",
+            out.markdown
+        );
+
+        let unknown = empty_output().with_incomplete_lineage(None);
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json["incomplete_lineage"].is_null(), "{json:#}");
+        assert!(
+            json.as_object().unwrap().contains_key("incomplete_lineage"),
+            "always written"
+        );
+        assert!(
+            unknown
+                .markdown
+                .contains("Lineage completeness is not known"),
+            "{}",
+            unknown.markdown
+        );
+
+        let none = empty_output().with_incomplete_lineage(Some(Vec::new()));
+        assert_eq!(none.markdown, empty_output().markdown);
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["incomplete_lineage"],
+            serde_json::json!([])
+        );
+
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(CiDiffOutput)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(LineageDiffOutput)).unwrap(),
+        ] {
+            let required = schema["required"].as_array().unwrap();
+            assert!(
+                !required.iter().any(|r| r == "incomplete_lineage"),
+                "{required:?}"
+            );
+            assert!(schema["properties"]["incomplete_lineage"].is_object());
+        }
     }
 
     fn model_removed() -> BreakingFinding {
