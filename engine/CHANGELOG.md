@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.85.0] — 2026-10-16
+
 ### Added
 
 - `rocky lineage-diff` and `rocky ci-diff` now say when lineage is incomplete (#2397). Both JSON outputs (`LineageDiffOutput`, `CiDiffOutput`) have a new `incomplete_lineage` list of `{ model, gaps }`, the same records `rocky lineage` gives (#2377). It covers the changed models and every model downstream of them on HEAD; a removed model's downstream is read from the base side. `[]` means none. `null` means not known: the HEAD side did not compile, or a model was removed and the base side did not compile. A payload without the field comes from an older build and means unknown, not complete. The Markdown report and the table output add a `Lineage incomplete` list.

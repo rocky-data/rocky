@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-10-16
+
 ### Added
 
 - `CiDiffOutput.incomplete_lineage` and `LineageDiffOutput.incomplete_lineage`: the changed models, and the models downstream of them, whose lineage is known to be incomplete. `None` (HEAD did not compile, or an older engine) means unknown, not complete. `IncompleteLineageRecord` is now exported from `rocky_sdk.types_generated`.
