@@ -269,9 +269,8 @@ fn is_duplicate_crate_failure(stderr: &str) -> bool {
         return true;
     }
     // rustc's own note, when it knows the cause.
-    if stderr.contains("perhaps two different versions of crate")
-        || stderr.contains("two types come from two different crates")
-    {
+    // The wording is in rustc's own binary (checked against 1.96).
+    if stderr.contains("there are multiple different versions of crate `") {
         return true;
     }
     // The other spellings, when rustc omits "a different": the two instances
@@ -506,7 +505,7 @@ error[E0053]: method `f` has an incompatible type for trait
         assert!(is_duplicate_crate_failure(DUPLICATE_GENERIC_PATHS));
         assert!(is_duplicate_crate_failure(DUPLICATE_IDENTICAL));
         assert!(is_duplicate_crate_failure(
-            "  = note: perhaps two different versions of crate `chrono` are being used?"
+            "  = help: there are multiple different versions of crate `chrono` in the dependency graph"
         ));
     }
 

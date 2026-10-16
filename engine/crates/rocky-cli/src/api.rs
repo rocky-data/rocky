@@ -5733,6 +5733,43 @@ mod tests {
             .expect("the store gate is open")
     }
 
+    /// Pins [`store_gate`] to the gate the background compile takes (#2409).
+    ///
+    /// The race itself has a microsecond window and cannot be forced, so this
+    /// pins the mechanism that closes it. The initial `recompile()` reads the
+    /// state file under `store_access` BEFORE it publishes a compile result.
+    /// So while a test holds the gate, no result may appear (the compile is
+    /// queued, not holding the file) and a direct open of the file cannot
+    /// meet the server's. Once the gate is released, the compile finishes.
+    /// A `store_gate` that did not take the server's permit fails the first
+    /// assertion, because the compile would run and publish while it was
+    /// "held".
+    #[tokio::test]
+    async fn store_gate_holds_the_background_compile_off_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+
+        let state = pinned_server(simple_project_models(), None, &state_path);
+        let gate = store_gate(&state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            state.compile_result.read().await.is_none(),
+            "the background compile read the state file while the gate was held"
+        );
+        // Nothing else holds the file, so the direct open succeeds.
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        drop(gate);
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the compile finishes once the gate is released");
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let base = spawn_router(test_state()).await;
@@ -10324,12 +10361,8 @@ mod tests {
             .expect("a snapshot without the tombstones table");
         std::fs::rename(&older, &state_path).expect("replace the store with the older shape");
 
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
         let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -10355,8 +10388,14 @@ mod tests {
         // `api::serve` runs before the router — a read-write open. This test
         // drives the router directly, so it calls the sweep itself; a server
         // started on this store would have migrated it before its first read.
-        let swept = sweep_interrupted_jobs(&state_path)
-            .expect("the startup sweep opens the store read-write and migrates it");
+        let swept = {
+            // The gate only orders this open after the server's background
+            // read-only open; the recompile never migrates, so the 409 -> 200
+            // transition below is still the sweep's doing.
+            let _gate = store_gate(&state).await;
+            sweep_interrupted_jobs(&state_path)
+                .expect("the startup sweep opens the store read-write and migrates it")
+        };
         assert_eq!(swept, 0, "nothing to sweep, but the open migrated");
         let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
         assert_eq!(resp.status(), 200, "after the migration the read answers");
@@ -11572,10 +11611,12 @@ mod tests {
         let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
         cache_job(&state, record.clone()).await;
-        StateStore::open(&state_path)
-            .unwrap()
-            .record_job(&record)
-            .unwrap();
+        {
+            let _gate = store_gate(&state).await;
+            let store = StateStore::open(&state_path).unwrap();
+            store.record_job(&record).unwrap();
+            drop(store);
+        }
 
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/jobs/job_live"))
@@ -14420,18 +14461,17 @@ adapter = "db"
                     .unwrap();
             }
         }
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config),
-            &state_path,
-        ))
-        .await;
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
         let resp = reqwest::get(format!("{base}/api/v1/branches"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let expected = crate::commands::compute_branch_list(&state_path).unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_branch_list(&state_path).unwrap()
+        };
         assert_eq!(text, reference_bytes(&expected));
         let served: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(served["total"], 2, "{text}");
