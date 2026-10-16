@@ -18311,6 +18311,16 @@ async fn process_table(
         .unwrap_or(pipeline.timestamp_column.as_str())
         .to_string();
 
+    // #2395: a watermark filter renders a bare UTC literal. An adapter that
+    // cannot pin its session to UTC refuses here when the session zone would
+    // read that literal wrong. Microbatch falls back to the same filter.
+    if matches!(
+        strategy,
+        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
+    ) {
+        warehouse.check_watermark_time_zone().await?;
+    }
+
     // #2376: hold back the newest source timestamp. The next watermark is
     // `MAX(ts)` over the target, and the copy filters `ts > watermark`, so a
     // row that lands later with a timestamp equal to the watermark would be

@@ -14,12 +14,13 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, BatchCheckAdapter, FreshnessResult, RowCountResult,
+    AdapterError, AdapterResult, BatchCheckAdapter, FreshnessResult, RowCountResult, SqlDialect,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::connector::{ConnectorError, QueryResult, SnowflakeConnector};
+use crate::dialect::SnowflakeSqlDialect;
 use crate::types::{InformationSchemaType, canonical_type};
 
 #[derive(Debug, Error)]
@@ -46,8 +47,10 @@ impl SnowflakeBatchCheckAdapter {
 /// every table in a single schema in one round trip.
 ///
 /// Snowflake exposes `INFORMATION_SCHEMA.COLUMNS` per database; the query
-/// scopes to `<database>.information_schema.columns`. `table_schema` values
-/// are stored uppercase in Snowflake, so we use case-insensitive match.
+/// scopes to `"<database>".information_schema.columns`. The database name is
+/// quoted as written, the same as the writes, so a lowercase database that
+/// Rocky created as `"acme"` is found (#2413). `table_schema` is matched
+/// case-insensitively.
 ///
 /// `data_type` is the bare type name. The length, precision and scale
 /// columns are read too, so [`parse_batch_describe_rows`] can rebuild the
@@ -55,11 +58,12 @@ impl SnowflakeBatchCheckAdapter {
 fn generate_batch_describe_sql(catalog: &str, schema: &str) -> Result<String, BatchError> {
     validation::validate_identifier(catalog)?;
     validation::validate_identifier(schema)?;
+    let database = SnowflakeSqlDialect.quote_identifier(catalog);
 
     Ok(format!(
         "SELECT LOWER(table_name), LOWER(column_name), data_type, is_nullable,\n\
          character_maximum_length, numeric_precision, numeric_scale, datetime_precision\n\
-         FROM {catalog}.information_schema.columns\n\
+         FROM {database}.information_schema.columns\n\
          WHERE UPPER(table_schema) = UPPER('{schema}')\n\
          ORDER BY table_name, ordinal_position"
     ))
@@ -186,9 +190,19 @@ mod tests {
     #[test]
     fn batch_describe_sql_scopes_to_database_and_schema() {
         let sql = generate_batch_describe_sql("MY_DB", "analytics").unwrap();
-        assert!(sql.contains("MY_DB.information_schema.columns"));
+        assert!(sql.contains("FROM \"MY_DB\".information_schema.columns"));
         assert!(sql.contains("UPPER('analytics')"));
         assert!(sql.contains("ORDER BY table_name, ordinal_position"));
+    }
+
+    /// #2413: a lowercase database is read as written, not folded to upper.
+    #[test]
+    fn batch_describe_sql_quotes_a_lowercase_database_as_written() {
+        let sql = generate_batch_describe_sql("acme", "marts").unwrap();
+        assert!(
+            sql.contains("FROM \"acme\".information_schema.columns"),
+            "{sql}"
+        );
     }
 
     fn query_result(headers: &[&str], rows: Vec<Vec<serde_json::Value>>) -> QueryResult {

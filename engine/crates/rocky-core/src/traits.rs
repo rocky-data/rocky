@@ -659,6 +659,22 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Refuse a watermark filter the session would read in a zone other than
+    /// UTC (#2395).
+    ///
+    /// [`SqlDialect::watermark_where`] renders the stored UTC watermark as a
+    /// bare `TIMESTAMP '…'` literal. On a time-zone timestamp column the
+    /// warehouse reads it in the session zone, so a zone west of UTC skips
+    /// rows. The runner calls this before it builds a watermark filter.
+    ///
+    /// Default: nothing to check. An adapter either pins its session to UTC
+    /// (Postgres, Trino, Spark) or renders a zone-explicit literal (DuckDB).
+    /// An adapter that can do neither checks the zone here and errors when it
+    /// is not UTC.
+    async fn check_watermark_time_zone(&self) -> AdapterResult<()> {
+        Ok(())
+    }
+
     /// Cheap connectivity check. Exercises the auth path and verifies
     /// the warehouse is reachable without doing real work.
     ///

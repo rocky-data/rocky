@@ -42,6 +42,10 @@ required-features = ["test-support"]
 name = "catalog_first_delegation"
 required-features = ["test-support"]
 
+[[test]]
+name = "watermark_time_zone_wiremock"
+required-features = ["test-support"]
+
 [dev-dependencies]
 rocky-core = { path = "../rocky-core" }
 # `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
