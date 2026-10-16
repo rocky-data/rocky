@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -138,6 +138,82 @@ impl fmt::Display for RowSelectionKind {
     }
 }
 
+/// A construct whose lineage Rocky does not record, so a model that uses it
+/// has known-incomplete lineage (#2377).
+///
+/// Impact analysis (`rocky lineage --downstream`, the blast radius) can then
+/// under-report: an edge the construct implies is missing. The list is what
+/// the extractor knows it skips. It is not a proof that everything else is
+/// traced.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageGap {
+    /// A `NATURAL` join. Its key columns are known only to the warehouse
+    /// catalog, so no `join_key` edge is recorded.
+    NaturalJoin,
+    /// `GROUP BY ALL`. Its group keys are not resolved, so no `group_by`
+    /// edge is recorded.
+    GroupByAll,
+    /// A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first
+    /// branch only; the other branches' columns are not mapped.
+    SetOperation,
+    /// A filter, join, group, window or limit key inside a `WITH` body. Only
+    /// the top-level query's row selection is recorded.
+    CteBodyRowSelection,
+    /// A filter, join, group, window or limit key inside a derived table
+    /// (`FROM (SELECT …)`).
+    DerivedTableRowSelection,
+    /// A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery).
+    /// Its columns and predicates, and any correlated reference, record no
+    /// edge.
+    SubqueryExpression,
+    /// A window named after another named window. Its keys are not resolved.
+    NestedNamedWindow,
+    /// A relation the extractor does not read: `PIVOT`, `UNNEST`, a table
+    /// function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.
+    UnmodelledRelation,
+    /// A column whose table cannot be determined statically (an unqualified
+    /// column in a multi-table query). Its edge is dropped.
+    UnattributedColumn,
+    /// A projection item whose output column lineage could not name
+    /// (`SELECT (x)`, `SELECT 1`).
+    UnresolvedProjection,
+    /// A `SELECT *` over a relation whose columns Rocky does not know, so the
+    /// expanded columns have no edges.
+    UnresolvedStar,
+}
+
+impl fmt::Display for LineageGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            LineageGap::NaturalJoin => "NATURAL join (no join key recorded)",
+            LineageGap::GroupByAll => "GROUP BY ALL (no group key recorded)",
+            LineageGap::SetOperation => "set operation (only the first branch is mapped)",
+            LineageGap::CteBodyRowSelection => "filter or key inside a WITH body",
+            LineageGap::DerivedTableRowSelection => "filter or key inside a derived table",
+            LineageGap::SubqueryExpression => "subquery expression (IN, EXISTS, scalar)",
+            LineageGap::NestedNamedWindow => "window named after another window",
+            LineageGap::UnmodelledRelation => "relation Rocky does not read (PIVOT, UNNEST, ...)",
+            LineageGap::UnattributedColumn => "column whose table is ambiguous",
+            LineageGap::UnresolvedProjection => "projection item with no traced column",
+            LineageGap::UnresolvedStar => "SELECT * over a relation with unknown columns",
+        };
+        f.write_str(label)
+    }
+}
+
 /// A row-selection edge: `source_table.source_column` decides which rows or
 /// groups the query produces. See [`RowSelectionKind`].
 ///
@@ -231,6 +307,16 @@ pub struct LineageResult {
     /// `#[serde(default)]` keeps a cache written by an older build loadable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_selection: Vec<RowSelectionLineage>,
+    /// Constructs in the statement whose lineage is not recorded, sorted and
+    /// deduplicated (#2377). `Some(vec![])` means none was found.
+    ///
+    /// `None` means **unknown**, never "complete": a result serialized by a
+    /// build that did not compute this field deserializes to `None`, and a
+    /// consumer must treat it as possibly incomplete. Only
+    /// [`extract_lineage`] fills it; the per-body results it builds on the
+    /// way leave it `None`.
+    #[serde(default)]
+    pub lineage_gaps: Option<Vec<LineageGap>>,
     /// Where each entry of [`Self::columns`] really comes from, by position:
     /// a physical table and column, or `None` when unknown. Built during
     /// extraction to resolve reads through a CTE (#2307); not serialized.
@@ -341,8 +427,208 @@ pub fn extract_lineage(sql: &str) -> Result<LineageResult, String> {
     let stmt = statements.first().ok_or_else(|| "empty SQL".to_string())?;
 
     match stmt {
-        Statement::Query(query) => extract_query_lineage(query, &CteScope::new()),
+        Statement::Query(query) => {
+            let mut result = extract_query_lineage(query, &CteScope::new())?;
+            let mut gaps = BTreeSet::new();
+            query_gaps(query, QueryRole::Root, &mut gaps);
+            // A column with no source at all (`COUNT(*)`, a literal) is not a
+            // gap: it reads nothing. One that names a column but no table is.
+            let unattributed = result
+                .columns
+                .iter()
+                .any(|c| c.source_table.is_none() && !c.source_column.is_empty())
+                || result
+                    .row_selection
+                    .iter()
+                    .any(|r| r.source_table.is_none());
+            if unattributed {
+                gaps.insert(LineageGap::UnattributedColumn);
+            }
+            if result.unresolved_projections > 0 {
+                gaps.insert(LineageGap::UnresolvedProjection);
+            }
+            result.lineage_gaps = Some(gaps.into_iter().collect());
+            Ok(result)
+        }
         _ => Err("lineage extraction only supports SELECT statements".to_string()),
+    }
+}
+
+/// Where a query sits in the statement, for [`query_gaps`]. Only the
+/// [`QueryRole::Root`] query's row selection is recorded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryRole {
+    Root,
+    CteBody,
+    DerivedTable,
+    Subquery,
+}
+
+/// Every [`LineageGap`] in `query` and the queries nested in it.
+///
+/// A separate walk from the extractor on purpose: it reads the AST for the
+/// constructs the extractor skips, so a skip cannot also hide itself here.
+fn query_gaps(query: &Query, role: QueryRole, gaps: &mut BTreeSet<LineageGap>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            query_gaps(&cte.query, QueryRole::CteBody, gaps);
+        }
+    }
+    let cuts = query.limit_clause.is_some() || query.fetch.is_some();
+    if cuts && query.order_by.is_some() {
+        nested_row_selection(role, gaps);
+    }
+    if let Some(order_by) = &query.order_by {
+        for inner in immediate_subqueries(order_by) {
+            gaps.insert(LineageGap::SubqueryExpression);
+            query_gaps(&inner, QueryRole::Subquery, gaps);
+        }
+    }
+    set_expr_gaps(&query.body, role, gaps);
+}
+
+/// The row selection of a non-root query is not recorded: name the gap for
+/// where the query sits.
+fn nested_row_selection(role: QueryRole, gaps: &mut BTreeSet<LineageGap>) {
+    match role {
+        QueryRole::Root => {}
+        QueryRole::CteBody => {
+            gaps.insert(LineageGap::CteBodyRowSelection);
+        }
+        QueryRole::DerivedTable => {
+            gaps.insert(LineageGap::DerivedTableRowSelection);
+        }
+        // The subquery itself is already a `SubqueryExpression` gap.
+        QueryRole::Subquery => {}
+    }
+}
+
+fn set_expr_gaps(body: &SetExpr, role: QueryRole, gaps: &mut BTreeSet<LineageGap>) {
+    match body {
+        SetExpr::Select(select) => select_gaps(select, role, gaps),
+        SetExpr::Query(inner) => query_gaps(inner, role, gaps),
+        SetExpr::SetOperation { left, right, .. } => {
+            gaps.insert(LineageGap::SetOperation);
+            set_expr_gaps(left, role, gaps);
+            set_expr_gaps(right, role, gaps);
+        }
+        // `VALUES`, `TABLE t` and the DML forms: nothing is traced.
+        _ => {
+            gaps.insert(LineageGap::UnmodelledRelation);
+        }
+    }
+}
+
+fn select_gaps(select: &Select, role: QueryRole, gaps: &mut BTreeSet<LineageGap>) {
+    // Row selection of this SELECT: recorded only at the root.
+    let mut selects_rows = select.selection.is_some()
+        || select.prewhere.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || matches!(select.distinct, Some(Distinct::On(_)))
+        || select.top.is_some()
+        || select.from.iter().any(|t| !t.joins.is_empty());
+    match &select.group_by {
+        GroupByExpr::All(_) => {
+            gaps.insert(LineageGap::GroupByAll);
+            selects_rows = true;
+        }
+        GroupByExpr::Expressions(exprs, _) => selects_rows |= !exprs.is_empty(),
+    }
+    // Windows: a key is row selection, and a window named after another
+    // named window is not resolved.
+    for item in &select.projection {
+        let mut collector = WindowCollector::default();
+        let _ = item.visit(&mut collector);
+        for window in &collector.windows {
+            selects_rows = true;
+            // `OVER w2` with `w2 AS (w1 ORDER BY ts)`, or `OVER (w1 ...)`:
+            // the keys `w1` adds are not read.
+            let unresolved = resolve_window(window, &select.named_window)
+                .is_none_or(|spec| spec.window_name.is_some());
+            if unresolved {
+                gaps.insert(LineageGap::NestedNamedWindow);
+            }
+        }
+    }
+    if selects_rows {
+        nested_row_selection(role, gaps);
+    }
+
+    for table in &select.from {
+        table_with_joins_gaps(table, gaps);
+    }
+
+    // Subquery expressions anywhere in this SELECT except its FROM, which
+    // `table_with_joins_gaps` reads.
+    let mut inner_queries = immediate_subqueries(&select.projection);
+    inner_queries.extend(immediate_subqueries(&select.selection));
+    inner_queries.extend(immediate_subqueries(&select.prewhere));
+    inner_queries.extend(immediate_subqueries(&select.having));
+    inner_queries.extend(immediate_subqueries(&select.qualify));
+    inner_queries.extend(immediate_subqueries(&select.group_by));
+    for table in &select.from {
+        join_condition_subqueries(table, &mut inner_queries);
+    }
+    for inner in &inner_queries {
+        gaps.insert(LineageGap::SubqueryExpression);
+        query_gaps(inner, QueryRole::Subquery, gaps);
+    }
+}
+
+fn join_condition_subqueries(table: &TableWithJoins, out: &mut Vec<Query>) {
+    if let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = &table.relation
+    {
+        join_condition_subqueries(table_with_joins, out);
+    }
+    for join in &table.joins {
+        out.extend(immediate_subqueries(&join.join_operator));
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = &join.relation
+        {
+            join_condition_subqueries(table_with_joins, out);
+        }
+    }
+}
+
+fn table_with_joins_gaps(table: &TableWithJoins, gaps: &mut BTreeSet<LineageGap>) {
+    table_factor_gaps(&table.relation, gaps);
+    for join in &table.joins {
+        table_factor_gaps(&join.relation, gaps);
+        match &join.join_operator {
+            JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::ArrayJoin
+            | JoinOperator::LeftArrayJoin
+            | JoinOperator::InnerArrayJoin => {
+                gaps.insert(LineageGap::UnmodelledRelation);
+            }
+            other => {
+                if let (Some(JoinConstraint::Natural), _) = join_parts(other) {
+                    gaps.insert(LineageGap::NaturalJoin);
+                }
+            }
+        }
+    }
+}
+
+fn table_factor_gaps(factor: &TableFactor, gaps: &mut BTreeSet<LineageGap>) {
+    match factor {
+        TableFactor::Table { args: None, .. } => {}
+        TableFactor::Derived { subquery, .. } => {
+            query_gaps(subquery, QueryRole::DerivedTable, gaps);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_with_joins_gaps(table_with_joins, gaps),
+        // A table function (`FROM t(1)`), `PIVOT`, `UNNEST`, JSON tables and
+        // every other factor: the extractor reads none of them.
+        _ => {
+            gaps.insert(LineageGap::UnmodelledRelation);
+        }
     }
 }
 
@@ -881,6 +1167,7 @@ fn extract_set_expr_lineage(
                 unresolved_projections,
                 nested_sources,
                 row_selection,
+                lineage_gaps: None,
                 column_origins: Vec::new(),
             };
             resolve_through_ctes(&mut result, ctes);
@@ -1791,6 +2078,125 @@ fn extract_row_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gaps(sql: &str) -> Vec<LineageGap> {
+        extract_lineage(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .lineage_gaps
+            .unwrap_or_else(|| panic!("{sql}: extract_lineage must fill lineage_gaps"))
+    }
+
+    /// #2377: a query the extractor fully traces says so: `Some(vec![])`,
+    /// not `None`. Root-level filters, joins, group and window keys are
+    /// recorded, so they are not gaps.
+    #[test]
+    fn a_fully_traced_query_has_no_lineage_gaps() {
+        for sql in [
+            "SELECT id, name FROM raw.users",
+            "SELECT o.id, c.name FROM raw.orders o JOIN raw.customers c ON o.cid = c.id \
+             WHERE o.status = 'paid'",
+            "SELECT region, SUM(amount) AS total FROM raw.sales GROUP BY region HAVING SUM(amount) > 0",
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY ts) AS rn FROM raw.t",
+            "SELECT a.id FROM raw.a a JOIN raw.b b USING (id)",
+            "WITH c AS (SELECT id, amount FROM raw.t) SELECT id, amount FROM c",
+            "SELECT id FROM (SELECT id FROM raw.t) AS d",
+        ] {
+            assert_eq!(gaps(sql), Vec::<LineageGap>::new(), "{sql}");
+        }
+    }
+
+    /// One construct per row: each is reported, and only it.
+    #[test]
+    fn each_untraced_construct_is_a_lineage_gap() {
+        for (sql, expected) in [
+            (
+                "SELECT a.id, b.name FROM raw.a a NATURAL JOIN raw.b b",
+                LineageGap::NaturalJoin,
+            ),
+            (
+                "SELECT region, SUM(amount) AS total FROM raw.sales GROUP BY ALL",
+                LineageGap::GroupByAll,
+            ),
+            (
+                "SELECT id FROM raw.a UNION ALL SELECT id FROM raw.b",
+                LineageGap::SetOperation,
+            ),
+            (
+                "WITH paid AS (SELECT id FROM raw.t WHERE status = 'paid') SELECT id FROM paid",
+                LineageGap::CteBodyRowSelection,
+            ),
+            (
+                "SELECT id FROM (SELECT id FROM raw.t WHERE status = 'paid') AS d",
+                LineageGap::DerivedTableRowSelection,
+            ),
+            (
+                "SELECT id FROM raw.t WHERE id IN (SELECT id FROM raw.allow)",
+                LineageGap::SubqueryExpression,
+            ),
+            (
+                "SELECT id FROM raw.t WHERE EXISTS (SELECT 1 AS one FROM raw.u WHERE u.id = t.id)",
+                LineageGap::SubqueryExpression,
+            ),
+            (
+                "SELECT id, SUM(x) OVER w2 AS s FROM raw.t \
+                 WINDOW w1 AS (PARTITION BY region), w2 AS (w1 ORDER BY ts)",
+                LineageGap::NestedNamedWindow,
+            ),
+            (
+                "SELECT id FROM raw.t, (VALUES (1), (2)) AS v(n)",
+                LineageGap::UnmodelledRelation,
+            ),
+            (
+                "SELECT id FROM range(10) AS r",
+                LineageGap::UnmodelledRelation,
+            ),
+            (
+                "SELECT name FROM raw.a a JOIN raw.b b ON a.id = b.id",
+                LineageGap::UnattributedColumn,
+            ),
+            ("SELECT (id) FROM raw.t", LineageGap::UnresolvedProjection),
+        ] {
+            let found = gaps(sql);
+            assert!(found.contains(&expected), "{sql}: {found:?}");
+        }
+    }
+
+    /// A row-selection gap is named for where the query sits, and a root
+    /// predicate is never one.
+    #[test]
+    fn a_nested_predicate_gap_names_its_place() {
+        assert_eq!(
+            gaps("WITH paid AS (SELECT id FROM raw.t WHERE status = 'paid') SELECT id FROM paid"),
+            vec![LineageGap::CteBodyRowSelection]
+        );
+        assert_eq!(
+            gaps("SELECT id FROM (SELECT id FROM raw.t GROUP BY id) AS d"),
+            vec![LineageGap::DerivedTableRowSelection]
+        );
+        assert_eq!(
+            gaps("WITH c AS (SELECT id FROM raw.t ORDER BY id LIMIT 5) SELECT id FROM c"),
+            vec![LineageGap::CteBodyRowSelection]
+        );
+        // A NATURAL join inside a CTE body is still a NATURAL join.
+        assert!(
+            gaps("WITH c AS (SELECT a.id FROM raw.a a NATURAL JOIN raw.b b) SELECT id FROM c")
+                .contains(&LineageGap::NaturalJoin)
+        );
+    }
+
+    /// HARD RULE (#2377): a `LineageResult` serialized before the field
+    /// existed reads as unknown (`None`), never as complete (`Some([])`).
+    #[test]
+    fn an_old_cached_result_without_lineage_gaps_reads_as_unknown() {
+        let old = r#"{"source_tables":[],"columns":[],"has_star":false}"#;
+        let result: LineageResult = serde_json::from_str(old).unwrap();
+        assert_eq!(result.lineage_gaps, None);
+
+        let fresh = extract_lineage("SELECT id FROM raw.t").unwrap();
+        let round_trip: LineageResult =
+            serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(round_trip.lineage_gaps, Some(Vec::new()));
+    }
 
     #[test]
     fn test_simple_select() {

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use rocky_ir::ColumnInfo;
+pub use rocky_sql::lineage::LineageGap;
 use rocky_sql::lineage::{self, RowSelectionKind, TransformKind};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,17 @@ pub struct ModelSchema {
     /// they deserialize as "fully understood", matching how they behaved then.
     #[serde(default)]
     pub unresolved_projections: usize,
+    /// Constructs in this model whose lineage Rocky does not record, sorted
+    /// (#2377): the extractor's [`rocky_sql::lineage::LineageResult::lineage_gaps`]
+    /// plus [`LineageGap::UnresolvedStar`] when a `SELECT *` expanded columns
+    /// with no edges. `Some(vec![])` means none was found.
+    ///
+    /// `None` means **unknown**, never "complete". A graph serialized by a
+    /// build that did not compute it deserializes to `None` (unlike
+    /// [`Self::unresolved_projections`], whose `0` default reads an old graph
+    /// as fully understood). Read it through [`Self::lineage_is_incomplete`].
+    #[serde(default)]
+    pub lineage_gaps: Option<Vec<LineageGap>>,
     /// Models this model depends on.
     pub upstream: Vec<String>,
     /// Models that depend on this model.
@@ -113,6 +125,16 @@ impl ModelSchema {
     #[must_use]
     pub fn schema_is_complete(&self) -> bool {
         !self.has_star && self.unresolved_projections == 0
+    }
+
+    /// Whether this model's lineage may be missing edges: a known gap, or
+    /// gaps that were never computed (`None`). Only `Some(vec![])` is
+    /// complete.
+    #[must_use]
+    pub fn lineage_is_incomplete(&self) -> bool {
+        self.lineage_gaps
+            .as_ref()
+            .is_none_or(|gaps| !gaps.is_empty())
     }
 }
 
@@ -475,6 +497,9 @@ pub fn build_semantic_graph(
             }
         }
 
+        // A `SELECT *` whose columns come with no edge (a raw table with no
+        // schema, a derived table) is a lineage gap (#2377).
+        let mut star_unresolved = false;
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star {
             for table_ref in &lineage_result.source_tables {
@@ -531,6 +556,7 @@ pub fn build_semantic_graph(
                         } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
                             source_cols.iter().map(|c| c.name.as_str()).collect()
                         } else {
+                            star_unresolved = true;
                             Vec::new()
                         };
                         let inner_arc: Arc<str> = Arc::from(inner_name.as_str());
@@ -607,6 +633,7 @@ pub fn build_semantic_graph(
                     // source), so their types stay Unknown — that's enough for
                     // the column to exist in the output schema (e.g. the E020
                     // time_column check) without weakening any type-shape check.
+                    star_unresolved = true;
                     for col_name in derived_cols {
                         if output_names.insert(col_name.clone()) {
                             output_columns.push(ColumnDef {
@@ -624,6 +651,7 @@ pub fn build_semantic_graph(
                     // Columns carry no cross-model edge (their types stay
                     // Unknown), which is enough for presence checks like E020
                     // without weakening any type-shape diagnostic.
+                    star_unresolved = true;
                     for inner_name in &table_ref.derived_sources {
                         if let Some(upstream_schema) = models.get(inner_name.as_str()) {
                             for col in &upstream_schema.columns {
@@ -664,9 +692,19 @@ pub fn build_semantic_graph(
                             });
                         }
                     }
+                } else {
+                    // A raw table with no known schema: nothing to expand.
+                    star_unresolved = true;
                 }
             }
         }
+        let lineage_gaps = lineage_result.lineage_gaps.clone().map(|mut gaps| {
+            if star_unresolved && !gaps.contains(&LineageGap::UnresolvedStar) {
+                gaps.push(LineageGap::UnresolvedStar);
+                gaps.sort();
+            }
+            gaps
+        });
 
         models.insert(
             model_name.clone(),
@@ -674,6 +712,7 @@ pub fn build_semantic_graph(
                 columns: output_columns,
                 has_star: lineage_result.has_star,
                 unresolved_projections: lineage_result.unresolved_projections,
+                lineage_gaps,
                 upstream: upstream_map
                     .get(model_name.as_str())
                     .map(|deps| deps.iter().map(std::string::ToString::to_string).collect())
@@ -727,6 +766,49 @@ mod tests {
             file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
+    }
+
+    /// #2377: the graph carries each model's lineage gaps. A star over a
+    /// raw table with no schema adds `UnresolvedStar`; a star over a model
+    /// does not.
+    #[test]
+    fn model_schema_carries_lineage_gaps() {
+        let models = vec![
+            make_model("up", "SELECT id, v FROM raw.t"),
+            make_model("star_model", "SELECT * FROM up"),
+            make_model("star_raw", "SELECT * FROM raw.undescribed"),
+            make_model(
+                "unioned",
+                "SELECT id FROM up UNION ALL SELECT id FROM raw.t",
+            ),
+        ];
+        let mut models = models;
+        models[1].config.depends_on = vec!["up".to_string()];
+        models[3].config.depends_on = vec!["up".to_string()];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let gaps = |name: &str| graph.model_schema(name).unwrap().lineage_gaps.clone();
+        assert_eq!(gaps("up"), Some(Vec::new()));
+        assert_eq!(gaps("star_model"), Some(Vec::new()));
+        assert_eq!(gaps("star_raw"), Some(vec![LineageGap::UnresolvedStar]));
+        assert_eq!(gaps("unioned"), Some(vec![LineageGap::SetOperation]));
+        assert!(!graph.model_schema("up").unwrap().lineage_is_incomplete());
+        assert!(
+            graph
+                .model_schema("unioned")
+                .unwrap()
+                .lineage_is_incomplete()
+        );
+    }
+
+    /// HARD RULE (#2377): a `ModelSchema` serialized before the field
+    /// existed reads as unknown, and unknown counts as incomplete.
+    #[test]
+    fn an_old_cached_model_schema_reads_as_unknown_lineage() {
+        let old = r#"{"columns":[],"has_star":false,"upstream":[],"downstream":[],"intent":null}"#;
+        let schema: ModelSchema = serde_json::from_str(old).unwrap();
+        assert_eq!(schema.lineage_gaps, None);
+        assert!(schema.lineage_is_incomplete());
     }
 
     #[test]

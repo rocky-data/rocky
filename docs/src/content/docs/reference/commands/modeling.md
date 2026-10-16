@@ -436,6 +436,22 @@ Row selection is read from the model's top-level `SELECT`. These constructs prod
 
 `GROUP BY 1` and `GROUP BY <alias>` resolve to the projected expression's source columns.
 
+#### Incomplete lineage
+
+When a model uses one of the constructs above, its lineage is missing edges, and impact through it can be under-reported. `rocky lineage` says so. JSON output has an `incomplete_lineage` list, sorted by model name:
+
+```json
+"incomplete_lineage": [
+  { "model": "mart_scores", "gaps": ["natural_join"] }
+]
+```
+
+- For a model view, the list covers the model and the models it reads or that read it directly.
+- For a column trace (upstream or `--downstream`), it covers the model and every model upstream and downstream of it. It follows model dependencies, not column edges, so a reader that joins with `NATURAL JOIN` is listed even though no column edge reaches it.
+- The table output prints the same models under a `Lineage incomplete` heading.
+
+`gaps` names each construct: `natural_join`, `group_by_all`, `set_operation`, `cte_body_row_selection`, `derived_table_row_selection`, `subquery_expression`, `nested_named_window`, `unmodelled_relation` (`PIVOT`, `UNNEST`, a table function, `VALUES`), `unattributed_column` (an unqualified column in a multi-table query), `unresolved_projection`, and `unresolved_star` (a `SELECT *` over a relation with unknown columns). An empty list (`[]`) means no model in scope has a known gap. A missing field, or `gaps: null`, means Rocky did not compute it: treat that as possibly incomplete, never as complete.
+
 ### Related Commands
 
 - [`rocky compile`](#rocky-compile) -- build the semantic graph that lineage reads

@@ -3849,6 +3849,24 @@ pub struct LineageOutput {
     /// models, so they are not part of `downstream`. Omitted when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<LineageConsumerRecord>,
+    /// Models in this view (the focal model and the models it reads or that
+    /// read it) whose lineage is known to be incomplete, sorted by name
+    /// (#2377). Impact through them may be under-reported. `[]` means none.
+    ///
+    /// Always written. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
+}
+
+/// A model whose column lineage is known to be incomplete (#2377).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct IncompleteLineageRecord {
+    /// The model.
+    pub model: String,
+    /// The constructs in it that Rocky does not trace, such as
+    /// `natural_join` or `set_operation`. `None` when they were never
+    /// computed (unknown).
+    pub gaps: Option<Vec<rocky_sql::lineage::LineageGap>>,
 }
 
 /// One downstream consumer in a `rocky lineage` view.
@@ -3903,6 +3921,15 @@ pub struct ColumnLineageOutput {
     /// partitions. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_selection: Vec<RowSelectionEdgeRecord>,
+    /// Models whose lineage is known to be incomplete, sorted by name
+    /// (#2377): the focal model, every model upstream of it, and every model
+    /// downstream of it (by model dependency, so a reader with no traced
+    /// column edge is included). `trace`, `downstream_consumers` and
+    /// `row_selection` may be under-reported through them. `[]` means none.
+    ///
+    /// Always written. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
 }
 
 /// One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.

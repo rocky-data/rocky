@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig};
 
 use crate::output::{
-    ColumnLineageOutput, LineageColumnDef, LineageConsumerRecord, LineageEdgeRecord,
-    LineageNodeDef, LineageOutput, LineageQualifiedColumn, RowSelectionEdgeRecord, print_json,
+    ColumnLineageOutput, IncompleteLineageRecord, LineageColumnDef, LineageConsumerRecord,
+    LineageEdgeRecord, LineageNodeDef, LineageOutput, LineageQualifiedColumn,
+    RowSelectionEdgeRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,6 +87,92 @@ pub(crate) fn row_selection_for_trace(
 }
 
 /// Print the labelled row-selection section of the human column view.
+/// The models among `models` whose lineage is known to be incomplete
+/// (#2377), sorted by name, without duplicates. Names that are not models of
+/// the graph (external sources) are skipped: Rocky reads no SQL for them.
+pub(crate) fn incomplete_lineage<'a>(
+    graph: &rocky_compiler::semantic::SemanticGraph,
+    models: impl IntoIterator<Item = &'a str>,
+) -> Vec<IncompleteLineageRecord> {
+    let names: std::collections::BTreeSet<&str> = models.into_iter().collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let schema = graph.model_schema(name)?;
+            schema
+                .lineage_is_incomplete()
+                .then(|| IncompleteLineageRecord {
+                    model: name.to_string(),
+                    gaps: schema.lineage_gaps.clone(),
+                })
+        })
+        .collect()
+}
+
+/// Every model reachable from `model_name` through the model-level
+/// dependency graph, in one direction. Model edges, not column edges: a
+/// reader joined through `NATURAL JOIN` has no traced column edge, and it is
+/// exactly the reader that must not drop out of the list.
+fn reachable_models(
+    graph: &rocky_compiler::semantic::SemanticGraph,
+    model_name: &str,
+    downstream: bool,
+) -> std::collections::BTreeSet<String> {
+    let mut reached = std::collections::BTreeSet::new();
+    let mut queue = vec![model_name.to_string()];
+    while let Some(name) = queue.pop() {
+        let Some(schema) = graph.model_schema(&name) else {
+            continue;
+        };
+        let next = if downstream {
+            &schema.downstream
+        } else {
+            &schema.upstream
+        };
+        for model in next {
+            if reached.insert(model.clone()) {
+                queue.push(model.clone());
+            }
+        }
+    }
+    reached
+}
+
+/// The models a column trace of `model_name` reads through: itself, every
+/// model upstream and every model downstream of it.
+fn column_view_models(
+    graph: &rocky_compiler::semantic::SemanticGraph,
+    model_name: &str,
+) -> Vec<IncompleteLineageRecord> {
+    let upstream = reachable_models(graph, model_name, false);
+    let downstream = reachable_models(graph, model_name, true);
+    incomplete_lineage(
+        graph,
+        std::iter::once(model_name)
+            .chain(upstream.iter().map(String::as_str))
+            .chain(downstream.iter().map(String::as_str)),
+    )
+}
+
+fn print_incomplete_lineage(records: &[IncompleteLineageRecord]) {
+    if records.is_empty() {
+        return;
+    }
+    println!();
+    println!("Lineage incomplete (impact may be under-reported):");
+    for record in records {
+        let why = match &record.gaps {
+            Some(gaps) => gaps
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+            None => "not computed".to_string(),
+        };
+        println!("  {}: {why}", record.model);
+    }
+}
+
 fn print_row_selection(records: &[RowSelectionEdgeRecord]) {
     if records.is_empty() {
         return;
@@ -265,6 +352,7 @@ pub fn run_lineage(
                 col,
                 downstream,
             ));
+            print_incomplete_lineage(&column_view_models(&result.semantic_graph, model_name));
         } else {
             println!("Columns:");
             for col_def in &schema.columns {
@@ -284,10 +372,28 @@ pub fn run_lineage(
                     println!("  {} (no lineage)", col_def.name);
                 }
             }
+            print_incomplete_lineage(&model_view_models(&result.semantic_graph, model_name));
         }
     }
 
     Ok(())
+}
+
+/// The models a model view of `model_name` shows: itself and the models it
+/// reads or that read it directly.
+fn model_view_models(
+    graph: &rocky_compiler::semantic::SemanticGraph,
+    model_name: &str,
+) -> Vec<IncompleteLineageRecord> {
+    let Some(schema) = graph.model_schema(model_name) else {
+        return Vec::new();
+    };
+    incomplete_lineage(
+        graph,
+        std::iter::once(model_name)
+            .chain(schema.upstream.iter().map(String::as_str))
+            .chain(schema.downstream.iter().map(String::as_str)),
+    )
 }
 
 /// Side-effect-free core producing the model-level [`LineageOutput`] (the
@@ -385,6 +491,7 @@ pub fn lineage_output(result: &compile::CompileResult, model_name: &str) -> Resu
         edges,
         nodes,
         consumers: consumers_downstream_of(result, model_name),
+        incomplete_lineage: Some(model_view_models(&result.semantic_graph, model_name)),
     })
 }
 
@@ -501,6 +608,7 @@ pub fn column_lineage_output(
             column,
             downstream,
         ),
+        incomplete_lineage: Some(column_view_models(&result.semantic_graph, model_name)),
     })
 }
 
@@ -536,6 +644,66 @@ mod tests {
             ..Default::default()
         };
         compile::compile(&config).expect("chain compiles")
+    }
+
+    /// #2377: a downstream reader that joins the focal model with `NATURAL
+    /// JOIN` has no traced column edge from the joined key, yet it is listed
+    /// as incomplete, so `--downstream` says impact may be under-reported.
+    /// A clean chain says `Some([])`, which is "complete", not "unknown".
+    #[test]
+    fn lineage_flags_a_natural_join_reader_downstream() {
+        use rocky_sql::lineage::LineageGap;
+
+        let root = TempDir::new().unwrap();
+        let models_dir = root.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "a", "SELECT id, region FROM source.raw.users");
+        write_model(&models_dir, "b", "SELECT id, region FROM a");
+        write_model(
+            &models_dir,
+            "c",
+            "SELECT b.region, z.score FROM b NATURAL JOIN source.raw.scores z",
+        );
+        let result = compile_chain(&models_dir);
+
+        let out = column_lineage_output(&result, "a", "id", true).unwrap();
+        assert!(
+            out.downstream_consumers.iter().all(|c| c.model != "c"),
+            "c reads no traced column edge from a.id: {:?}",
+            out.downstream_consumers
+        );
+        assert_eq!(
+            out.incomplete_lineage,
+            Some(vec![IncompleteLineageRecord {
+                model: "c".to_string(),
+                gaps: Some(vec![LineageGap::NaturalJoin]),
+            }])
+        );
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            json["incomplete_lineage"][0]["gaps"][0], "natural_join",
+            "{json:#}"
+        );
+
+        // The model view of c names c; of a, nothing (its direct neighbours
+        // are clean). Both are written, so `[]` is distinct from absent.
+        let view = lineage_output(&result, "c").unwrap();
+        assert_eq!(view.incomplete_lineage.as_deref().map(|r| r.len()), Some(1));
+        let view = lineage_output(&result, "a").unwrap();
+        assert_eq!(view.incomplete_lineage, Some(Vec::new()));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["incomplete_lineage"], serde_json::json!([]));
+
+        // Upstream from b: a and b are clean, c is downstream of b.
+        let out = column_lineage_output(&result, "b", "id", false).unwrap();
+        assert_eq!(
+            out.incomplete_lineage
+                .unwrap()
+                .iter()
+                .map(|r| r.model.as_str())
+                .collect::<Vec<_>>(),
+            ["c"]
+        );
     }
 
     /// A model's lineage lists the consumers that read it directly or through
