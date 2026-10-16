@@ -24,10 +24,12 @@ fi
 # Extended regexes, matched case-insensitively. Built from pieces so this
 # file does not itself look like an attribution line to a naive scan.
 readonly CLAUDE="claude"
+# Any mention of the agent's session site counts, link or bare host: the
+# rule is strict on purpose, so prose that names the host fails too.
 readonly PATTERNS=(
-    "${CLAUDE}\\.ai/"
+    "${CLAUDE}\\.ai([^[:alnum:]-]|$)"
     "${CLAUDE}\\.com/${CLAUDE}-code"
-    "generated (with|by) \\[?${CLAUDE} code"
+    "generated[[:space:]]+(with|by)[[:space:]]+\\[?${CLAUDE}"
     "^${CLAUDE}-session:"
     "^co-authored-by:.*(${CLAUDE}|anthropic)"
 )
@@ -53,6 +55,7 @@ if [[ "$found" -ne 0 ]]; then
     echo ""
     echo "Remove agent attribution lines and agent session links from the PR"
     echo "title, body and commit messages (AGENTS.md, Git conventions)."
+    echo "The rule is strict: naming the session host in prose fails too."
     echo "Edit the PR body, or reword the commits, then push."
     exit 1
 fi
