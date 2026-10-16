@@ -20,10 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rocky review --approve` now refuses, and writes no review marker, when HEAD's or the base ref's models do not compile. Before, it wrote a marker with a breaking-change count of 0 for a compare that never ran.
 - The post-run `verify_after` check for auto-applied drift now fails the run when it cannot read the policy-decision ledger, unless no policy rule requires checks.
 - An agent apply whose policy decision cannot be recorded is now refused (`deny`) before it changes anything. Before, it went ahead with a warning. Before it denies, an agent apply waits up to 10 seconds for a concurrent writer to release the state store lock. Human applies are not affected.
+- The LSP AI code actions and the MCP AI tools now honor `[ai] base_url` and `ROCKY_AI_BASE_URL`, the same as the CLI. A `rocky.toml` that exists but does not load now stops those actions, instead of falling back to the default host.
 - State, lock, staging, quarantine, upload and snapshot scratch, object-store download and JSONL trace files that Rocky creates are now owner-only (0600) on Unix. The directories it creates for them are 0700. Temporary files use random names created with `O_EXCL` instead of process-id names. Existing files and directories keep their permissions, except a state file that a remote download replaces: the new copy is 0600. A service account that reads state through a shared group loses that access after the first download. Set the mode again, or read state as the owner.
 
 ### Added
 
+- The AI client logs one warning that names the host when the AI base URL is not `api.anthropic.com`. A `rocky.toml` from a cloned repository can redirect the API key, so this makes the redirect visible.
 - `[ai] base_url`, with a `ROCKY_AI_BASE_URL` fallback, sets the Anthropic-compatible API endpoint for `rocky ai*`. The default stays `https://api.anthropic.com`. The URL must use https, except for a loopback host, so a local model server works.
 
 ### Changed
