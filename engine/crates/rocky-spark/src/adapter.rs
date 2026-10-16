@@ -40,6 +40,10 @@ impl SparkWarehouseAdapter {
     }
 
     /// Run [`session_statements`] once, before the first statement.
+    ///
+    /// A failed `SET` leaves the cell empty, so the next call re-runs both;
+    /// both are idempotent. A replaced server session is refused by the
+    /// connector rather than run without them.
     async fn prepare_session(&self) -> AdapterResult<()> {
         self.session_ready
             .get_or_try_init(|| async {
