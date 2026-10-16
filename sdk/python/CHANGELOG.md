@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-10-16
+
 ### Added
 
 - `PlanResult.override_match_counts` and `RunResult.override_match_counts`: how many tables each `[[table_overrides]]` rule matches. `rocky plan` and `rocky run` report the same numbers.

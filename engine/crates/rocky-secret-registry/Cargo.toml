@@ -1,6 +1,6 @@
 [package]
 name = "rocky-secret-registry"
-version = "1.83.0"
+version = "1.84.0"
 description = "Process-wide registry of resolved ${VAR} values, and the helpers that print them as ${NAME}"
 edition.workspace = true
 license.workspace = true

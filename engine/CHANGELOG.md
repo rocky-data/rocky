@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.84.0] — 2026-10-16
+
 ### Added
 
 - The browser UI can compact tables (#2323). The Estate screen has a **Compact** panel. **Plan compact** runs `rocky compact <table>` (or `--catalog <name>`), which writes a plan and runs no statement, and lists the statement count, the table count and every table. **Compact** then asks you to confirm, names every table, and applies that exact plan by its id through the existing apply. It is not planned again. The page never passes `--dry-run`: the command's dry run still writes a plan that apply can run. Archive stays in a terminal. New route: `POST /api/v1/jobs/compact` (`JobKind` gains `compact`). The server checks the table or catalog name before the job starts.
