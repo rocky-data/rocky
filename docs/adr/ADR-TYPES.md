@@ -1,6 +1,6 @@
 # ADR-TYPES — What an inferred type promises, how decimals are sized, and how a type crosses a warehouse
 
-**Status:** Accepted (ratified 2026-10-08). Amended 2026-10-16 (#2356): §2 adds `DecimalUnsized`, and §3 types `SUM` over a decimal with it.
+**Status:** Accepted (ratified 2026-10-08). Amended 2026-10-16 (#2356): §2 adds `DecimalUnsized`, and §3 types `SUM` over a decimal with it. Amended again 2026-10-16 (#2398): `DecimalUnsized` carries the scale when it is known, and a bare `DECIMAL` cast is `DecimalUnsized`.
 
 **Work package:** WP-03 (compiler and contract soundness)
 **Closes (once ratified and implemented):** audit findings **RD-010** (decimal arithmetic and numeric literal inference are unsound) and the inference half of **RD-028** (some expression and function types come from incomplete rules). Decides the fate of the unmerged branch `feat/wp03-pr1-decimal-inference` (Open question F).
@@ -92,7 +92,7 @@ The unmerged WP-03 branch states the same fact in its own doc comment ("arithmet
 
 ### What is already closed — do not re-do
 
-- **Bare decimal names no longer invent digits (#1646, #1721).** `sql_type_to_rocky` maps a bare `DECIMAL`/`NUMERIC` cast target to `Unknown`. Both `decimal_family_type` functions map a bare `DECIMAL`/`NUMERIC` to `Unknown`. `DECIMAL(p)` reads as `DECIMAL(p,0)` in all three parsers.
+- **Bare decimal names no longer invent digits (#1646, #1721).** `sql_type_to_rocky` maps a bare `DECIMAL`/`NUMERIC` cast target to `Unknown` (since 2026-10-16, #2398, to `DecimalUnsized { scale: None }`, which claims no digits). Both `decimal_family_type` functions map a bare `DECIMAL`/`NUMERIC` to `Unknown`. `DECIMAL(p)` reads as `DECIMAL(p,0)` in all three parsers.
 - **Dialect-aware reading at the load gate (#1856).** `rocky-core/src/contracts.rs::gate_type_to_rocky` reads a bare BigQuery `NUMERIC` as `NUMERIC(38,9)`, on both sides, only when `GateDialect::BigQuery`. A bare Snowflake `NUMBER` is `NUMBER(38,0)` in `rocky-core`'s `decimal_family_type` (the load gate). The compiler's `default_type_mapper` does not know `NUMBER` and maps it to `Unknown`.
 - **Decimal `AVG` is `Unknown` (#1238).** `infer_aggregation_type` returns `Unknown` for `AVG` over a decimal. Other inputs give `Float64`.
 - **Decimal capacity in assignment (#1342).** `is_assignable` compares scale and integer digits (`precision - scale`) separately, with `Int32` as 10 integer digits and `Int64` as 19.
@@ -134,7 +134,7 @@ An over-wide type can make a correct model fail a contract. That is visible and 
 
 | Group | Variants | Notes |
 |---|---|---|
-| Exact numeric | `Int32`, `Int64`, `Decimal { precision, scale }`, `DecimalUnsized` | `Int32` holds 10 integer digits, `Int64` holds 19 (as `is_assignable` already assumes). `DecimalUnsized` is a decimal whose precision and scale Rocky does not claim. |
+| Exact numeric | `Int32`, `Int64`, `Decimal { precision, scale }`, `DecimalUnsized { scale }` | `Int32` holds 10 integer digits, `Int64` holds 19 (as `is_assignable` already assumes). `DecimalUnsized` is a decimal whose precision Rocky does not claim. `scale` is `Some(s)` when the scale is known, `None` when it is not (#2398). |
 | Approximate numeric | `Float32`, `Float64` | |
 | Other scalar | `Boolean`, `String`, `Binary`, `Date`, `Timestamp`, `TimestampNtz` | `Timestamp` is an instant. `TimestampNtz` is a wall-clock reading. |
 | Nested | `Array(T)`, `Map(K, V)`, `Struct(fields)` | Only struct fields carry nullability. |
@@ -146,10 +146,10 @@ An over-wide type can make a correct model fail a contract. That is visible and 
 - **In inference, `Unknown` absorbs.** Any operator or function with an `Unknown` operand that the result depends on returns `Unknown`. A branch set (`COALESCE`, `CASE`, `IF`, `GREATEST`, `LEAST`) with any `Unknown` branch returns `Unknown`. A `NULL` literal is the one exception: it adds only nullability, not a type. This replaces today's rule, where `common_supertype` treats `Unknown` as the identity and lets the other branch win. An `Unknown` branch makes `common_supertype` return `Some(Unknown)`, not `None`. `None` still means "incompatible", which `check_join_keys` reports.
 - **At a gate, `Unknown` is "not verified".** That rule is ADR-CONTRACTS §3. This ADR does not restate or change it.
 
-**What `DecimalUnsized` means.** "An exact decimal, but Rocky does not know its digits." It sits between `Decimal { p, s }` and `Unknown`: it keeps the type family and claims no digits. It exists for results whose digits differ by warehouse, today only `SUM` over a decimal (§3).
+**What `DecimalUnsized` means.** "An exact decimal, but Rocky does not know its precision." It sits between `Decimal { p, s }` and `Unknown`: it keeps the type family and claims no precision. It keeps the scale when Rocky knows it (#2398). It exists for results whose digits differ by warehouse: `SUM` over a decimal (§3), which keeps the input's scale, and a cast to a bare `DECIMAL` (§3), whose scale is not known either.
 
-- **In inference:** unifying it with an integer, a sized decimal or another `DecimalUnsized` gives `DecimalUnsized`. Unifying it with any other type gives `None`, the same as a sized decimal. A sized decimal or an integer is assignable to it. It is not assignable to a sized decimal or an integer, because its digits may exceed theirs. A plain `CAST` of it to a sized decimal or an integer can fail (§4).
-- **At the model contract gate:** a bare `Decimal` contract matches it. A non-decimal contract is `E011`. A `Decimal(p, s)` contract is reported as not checked (`I003`, or `E059` under strict contracts), as for `Unknown`.
+- **In inference:** unifying it with an integer, a sized decimal or another `DecimalUnsized` gives `DecimalUnsized`. Unifying it with any other type gives `None`, the same as a sized decimal. The result keeps a known scale only when the other side is an integer or a decimal with the same known scale. With two different scales, a warehouse that caps the precision at 38 may also cut the scale, so the result's scale is `None`. A sized decimal or an integer is assignable to it when a known target scale holds the source's fraction digits. It is not assignable to a sized decimal or an integer, because its digits may exceed theirs. A plain `CAST` of it to a sized decimal or an integer can fail (§4), and so can any cast to a bare `DECIMAL`.
+- **At the model contract gate:** a bare `Decimal` contract matches it. A non-decimal contract is `E011`. A `Decimal(p, s)` contract whose scale is not the column's known scale is `E011` (#2398). Any other `Decimal(p, s)` contract is reported as not checked (`I003`, or `E059` under strict contracts), as for `Unknown`.
 - **At writers that need digits** (the content-addressed Parquet writer): refused, with a hint to cast. Rocky never guesses the digits.
 
 `is_assignable` keeps answering `true` for `Unknown`. It is an inference helper. Gates do not call it on `Unknown`; they branch first (`landed_type_conforms`, `validate_contract`).
@@ -188,7 +188,7 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | Function | Input | Result | Nullable |
 |---|---|---|---|
 | `COUNT`, `COUNT(DISTINCT …)` | any | `Int64` | no |
-| `SUM` | `Decimal(p, s)` or `DecimalUnsized` | `DecimalUnsized` (amended 2026-10-16) | yes |
+| `SUM` | `Decimal(p, s)` or `DecimalUnsized { scale }` | `DecimalUnsized` with the input's scale (amended 2026-10-16) | yes |
 | `SUM` | `Int32`, `Int64` | Open question A | yes |
 | `SUM` | `Float32`, `Float64` | `Float64` (today `Float32` stays `Float32`) | yes |
 | `AVG` | `Decimal` | `Unknown` (unchanged, #1238) | yes |
@@ -196,12 +196,12 @@ A float operand on either side gives `Float64`. A non-numeric operand gives `Unk
 | `MIN`, `MAX` | `T` | `T` | yes |
 | any other | any | `Unknown` | yes |
 
-`SUM` over a decimal is `DecimalUnsized`. **Amended 2026-10-16 (#2356).** The ratified rule was `Decimal(38, s)` for `p ≤ 38` and `Unknown` above. It is replaced for two reasons. First, warehouses do not agree on the digits: DuckDB returns `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`, and Postgres `NUMERIC` has no precision cap. So `Decimal(38, s)` would fail `E011` on a contract that declares Databricks' real `DECIMAL(20,2)`, and would not be a proven bound on Postgres. Second, `Unknown` would stop a bare `Decimal` contract on a sum from being checked (`I003`). `DecimalUnsized` is a sound bound on every warehouse and keeps the family check. A contract that declares `Decimal(p, s)` for `SUM(amount)` is now reported as not checked; to check the digits, cast the sum to `DECIMAL(p, s)`. Dialect-aware inference (Open question A, Option 3) can later give exact digits where the dialect is known.
+`SUM` over a decimal is `DecimalUnsized`. **Amended 2026-10-16 (#2356).** The ratified rule was `Decimal(38, s)` for `p ≤ 38` and `Unknown` above. It is replaced for two reasons. First, warehouses do not agree on the digits: DuckDB returns `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`, and Postgres `NUMERIC` has no precision cap. So `Decimal(38, s)` would fail `E011` on a contract that declares Databricks' real `DECIMAL(20,2)`, and would not be a proven bound on Postgres. Second, `Unknown` would stop a bare `Decimal` contract on a sum from being checked (`I003`). `DecimalUnsized` is a sound bound on every warehouse and keeps the family check. A contract that declares `Decimal(p, s)` for `SUM(amount)` is now reported as not checked; to check the digits, cast the sum to `DECIMAL(p, s)`. **Amended again (#2398):** the sum keeps the input's scale `s`, which DuckDB, Databricks, Snowflake, Trino, Redshift, SQL Server and ClickHouse all keep. So a contract with another scale is `E011`, and only the precision goes unchecked. Two warehouses do not state the scale in the result type: PostgreSQL's `SUM` is an unconstrained `NUMERIC`, and BigQuery drops the parameters of a parameterized `NUMERIC(p, s)` column in an expression, so the sum is a plain `NUMERIC`. Dialect-aware inference (Open question A, Option 3) can later give exact digits where the dialect is known.
 
 **Casts.** A cast's type is its target type, read by one shared parser:
 
 - `DECIMAL(p, s)` and `DECIMAL(p)` (= scale 0) are checked against the declared range first. Out of range is an error, never a wrapped value.
-- A bare `DECIMAL` / `NUMERIC` / `NUMBER` target follows §5: `Unknown` unless the dialect pins its digits.
+- A bare `DECIMAL` / `NUMERIC` target is `DecimalUnsized { scale: None }` (amended 2026-10-16, #2398): it is a decimal on every warehouse, and its default digits differ (DuckDB `DECIMAL(18,3)`, Databricks `DECIMAL(10,0)`, Snowflake `NUMBER(38,0)`). A bare `NUMBER` target follows §5. The source-type string readers (`default_type_mapper`, `warehouse_type_to_rocky`) still read a bare `DECIMAL` as `Unknown`; `warehouse_type_to_rocky` also reads the type a person wrote in a `.contract.toml`.
 - `DEC`, `BIGNUMERIC` and `BIGDECIMAL` are decimal-family names. A bare `BIGNUMERIC` is `Unknown`, because its default (`BIGNUMERIC(76.76, 38)`) has a fractional precision that `RockyType` cannot hold.
 
 **Numeric literals.** Typed from their written form:
@@ -410,7 +410,7 @@ Options:
 ### Migration and compatibility
 
 - **No back-compat shim before 2.0.** Each change has a changelog entry naming what now fails and how to fix it.
-- **Codegen cascade for the 2026-10-16 amendment.** `DecimalUnsized` is a new `RockyType` variant, so the `model_detail` schema and its bindings change. It is additive under the `RockyType` wire contract. If Open question E rewrites `TypeMapper`, check whether any output struct changes.
+- **Codegen cascade for the 2026-10-16 amendment.** `DecimalUnsized` is a new `RockyType` variant, so the `model_detail` schema and its bindings change. It is additive under the `RockyType` wire contract. The #2398 amendment changes its payload from a bare tag to `{"DecimalUnsized": {"scale": …}}`, which the wire contract counts as breaking. If Open question E rewrites `TypeMapper`, check whether any output struct changes.
 - **Dagster fixtures.** A changed inferred type changes `rocky compile` JSON. Run `just regen-fixtures` after the engine change.
 
 ### What it does and does NOT close
@@ -452,7 +452,7 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - Unification: `Decimal(10,0)` with `Decimal(10,10)` ⇒ `Decimal(20,10)`. `Int32` with `Decimal(5,2)` ⇒ `Decimal(12,2)`. Over the cap ⇒ `Unknown`. Every permutation of a three-branch `COALESCE` gives the same result.
 - An upper-bound property test: for random operands, the exact result of the operation fits the inferred type.
 - A live cross-check on DuckDB: the value DuckDB writes fits the inferred type for each operator. It also checks nullability: `x / 0` and `x % 0` on a non-null `x`.
-- `SUM` over `Decimal(60, 2)` ⇒ `DecimalUnsized`, not `Decimal(38,2)` (amended 2026-10-16).
+- `SUM` over `Decimal(60, 2)` ⇒ `DecimalUnsized { scale: Some(2) }`, not `Decimal(38,2)` (amended 2026-10-16).
 
 **Declarations and literals (§3, §7)**
 - `DECIMAL(300,2)`, `DECIMAL(10,-2)`, `DECIMAL(5,10)`, `DECIMAL(0,0)` ⇒ the new error, in a cast, a source schema and a contract.
@@ -464,7 +464,7 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - `CAST(NULLIF(x, 0) AS INT)` with non-null `x` ⇒ nullable. `CAST(x AS BIGINT)` with non-null `x` ⇒ the rule chosen in Open question B.
 
 **Aggregates (§3, Open question A)**
-- `SUM` over `Decimal(10,2)` reaches the model's typed columns as `DecimalUnsized`, nullable (amended 2026-10-16). A bare `Decimal` contract over it passes; `Decimal(38,2)` is `I003`; `String` is `E011`.
+- `SUM` over `Decimal(10,2)` reaches the model's typed columns as `DecimalUnsized { scale: Some(2) }`, nullable (amended 2026-10-16). A bare `Decimal` contract over it passes; `Decimal(38,2)` is `I003`; `Decimal(10,4)` and `String` are `E011`.
 - Whichever option A takes: an asserted pair for `SUM` and `AVG` over `Int32`, `Int64`, `Float32`.
 
 **Nullability (§4, Open question B)**

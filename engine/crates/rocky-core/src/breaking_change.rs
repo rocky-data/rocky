@@ -929,11 +929,16 @@ fn is_type_narrowing(old: &RockyType, new: &RockyType) -> bool {
             true
         }
         (Timestamp | TimestampNtz, Date) => true,
-        // A decimal with unclaimed digits (#2356) may hold values a sized
-        // decimal, an integer or a 32-bit float cannot. The reverse, a sized
-        // decimal becoming unsized, keeps every value a decimal.
-        (DecimalUnsized, Decimal { .. } | Int32 | Int64 | Float32) => true,
-        (Decimal { .. }, DecimalUnsized) => false,
+        // A decimal with an unclaimed precision (#2356) may hold values a
+        // sized decimal, an integer or a 32-bit float cannot. The reverse, a
+        // sized decimal becoming unsized, keeps every value a decimal unless
+        // the known scale shrinks, which drops fraction digits (#2398).
+        (DecimalUnsized { .. }, Decimal { .. } | Int32 | Int64 | Float32) => true,
+        (
+            Decimal { scale: os, .. } | DecimalUnsized { scale: Some(os) },
+            DecimalUnsized { scale: Some(ns) },
+        ) => ns < os,
+        (Decimal { .. } | DecimalUnsized { .. }, DecimalUnsized { .. }) => false,
         (Array(_) | Map(..) | Struct(_) | Variant, _) if !matches!(new, Variant) => true,
         _ => false,
     }
@@ -952,23 +957,43 @@ mod tests {
     };
     use std::sync::Arc;
 
-    /// #2356: a decimal with unclaimed digits becoming sized (or an
-    /// integer) can lose values; a sized decimal becoming unsized cannot.
+    /// #2356: a decimal with an unclaimed precision becoming sized (or an
+    /// integer) can lose values; a sized decimal becoming unsized cannot,
+    /// unless its known scale shrinks (#2398).
     #[test]
     fn decimal_unsized_narrowing_is_one_way() {
+        let unsized_decimal = |scale| RockyType::DecimalUnsized { scale };
         let sized = RockyType::Decimal {
             precision: 38,
             scale: 2,
         };
-        assert!(is_type_narrowing(&RockyType::DecimalUnsized, &sized));
-        assert!(is_type_narrowing(
-            &RockyType::DecimalUnsized,
-            &RockyType::Int64
-        ));
-        assert!(!is_type_narrowing(&sized, &RockyType::DecimalUnsized));
+        assert!(is_type_narrowing(&unsized_decimal(Some(2)), &sized));
+        assert!(is_type_narrowing(&unsized_decimal(None), &RockyType::Int64));
+        assert!(!is_type_narrowing(&sized, &unsized_decimal(Some(2))));
+        assert!(!is_type_narrowing(&sized, &unsized_decimal(Some(4))));
+        assert!(!is_type_narrowing(&sized, &unsized_decimal(None)));
         assert!(!is_type_narrowing(
-            &RockyType::DecimalUnsized,
+            &unsized_decimal(None),
             &RockyType::Float64
+        ));
+
+        // A known scale that shrinks drops fraction digits.
+        assert!(is_type_narrowing(&sized, &unsized_decimal(Some(1))));
+        assert!(is_type_narrowing(
+            &unsized_decimal(Some(4)),
+            &unsized_decimal(Some(2))
+        ));
+        assert!(!is_type_narrowing(
+            &unsized_decimal(Some(2)),
+            &unsized_decimal(Some(4))
+        ));
+        assert!(!is_type_narrowing(
+            &unsized_decimal(Some(2)),
+            &unsized_decimal(None)
+        ));
+        assert!(!is_type_narrowing(
+            &unsized_decimal(None),
+            &unsized_decimal(Some(2))
         ));
     }
 

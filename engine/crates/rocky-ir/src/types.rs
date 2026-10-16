@@ -47,15 +47,21 @@ pub enum RockyType {
         precision: u8,
         scale: u8,
     },
-    /// A decimal whose precision and scale Rocky cannot bound (#2356).
+    /// A decimal whose precision Rocky cannot bound (#2356), and whose
+    /// scale it may know (#2398).
     ///
-    /// The value is an exact decimal, but its digits depend on the
+    /// The value is an exact decimal, but its precision depends on the
     /// warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB
-    /// and `DECIMAL(20,2)` on Databricks. Rocky keeps the type family so a
-    /// bare `Decimal` contract is still checked, and does not claim digits
-    /// it cannot prove, so a `Decimal(p,s)` contract is reported as not
-    /// checked.
-    DecimalUnsized,
+    /// and `DECIMAL(20,2)` on Databricks. The scale is the same on both, so
+    /// it is kept. Rocky keeps the type family so a bare `Decimal` contract
+    /// is still checked, and a `Decimal(p,s)` contract with another scale is
+    /// a mismatch. The precision it does not claim, so a `Decimal(p,s)`
+    /// contract with the same scale is reported as not checked.
+    DecimalUnsized {
+        /// The scale, when every warehouse agrees on it. `None` when it
+        /// differs by warehouse too, as for a bare `CAST(x AS DECIMAL)`.
+        scale: Option<u8>,
+    },
 
     // String
     String,
@@ -109,7 +115,8 @@ impl std::fmt::Display for RockyType {
             RockyType::Decimal { precision, scale } => write!(f, "DECIMAL({precision},{scale})"),
             // Not `DECIMAL`: a bare `DECIMAL` is a SQL spelling with
             // dialect-dependent digits, and this is a label, not SQL.
-            RockyType::DecimalUnsized => f.write_str("DECIMAL(?,?)"),
+            RockyType::DecimalUnsized { scale: Some(scale) } => write!(f, "DECIMAL(?,{scale})"),
+            RockyType::DecimalUnsized { scale: None } => f.write_str("DECIMAL(?,?)"),
             RockyType::String => f.write_str("STRING"),
             RockyType::Date => f.write_str("DATE"),
             RockyType::Timestamp => f.write_str("TIMESTAMP"),
@@ -143,13 +150,40 @@ impl RockyType {
                 | RockyType::Float32
                 | RockyType::Float64
                 | RockyType::Decimal { .. }
-                | RockyType::DecimalUnsized
+                | RockyType::DecimalUnsized { .. }
         )
     }
 
     /// Returns true if this is a decimal type, sized or not.
     pub fn is_decimal(&self) -> bool {
-        matches!(self, RockyType::Decimal { .. } | RockyType::DecimalUnsized)
+        matches!(
+            self,
+            RockyType::Decimal { .. } | RockyType::DecimalUnsized { .. }
+        )
+    }
+
+    /// The scale of a decimal type: `Some(s)` for `Decimal { s, .. }` and for
+    /// a `DecimalUnsized` whose scale is known, `None` for anything else.
+    pub fn decimal_scale(&self) -> Option<u8> {
+        match self {
+            RockyType::Decimal { scale, .. } => Some(*scale),
+            RockyType::DecimalUnsized { scale } => *scale,
+            RockyType::Boolean
+            | RockyType::Int32
+            | RockyType::Int64
+            | RockyType::Float32
+            | RockyType::Float64
+            | RockyType::String
+            | RockyType::Date
+            | RockyType::Timestamp
+            | RockyType::TimestampNtz
+            | RockyType::Binary
+            | RockyType::Array(_)
+            | RockyType::Map(_, _)
+            | RockyType::Struct(_)
+            | RockyType::Variant
+            | RockyType::Unknown => None,
+        }
     }
 
     /// Returns true if this is an integer type.
@@ -229,13 +263,22 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
             precision: (*p1).max(*p2),
             scale: (*s1).max(*s2),
         }),
-        // A decimal with unknown digits absorbs every exact numeric: the
-        // result is a decimal, but its digits are as unknown as the
-        // unsized side's (#2356).
-        (RockyType::DecimalUnsized, other) | (other, RockyType::DecimalUnsized)
+        // A decimal with unknown precision absorbs every exact numeric: the
+        // result is a decimal, but its precision is as unknown as the
+        // unsized side's (#2356). An integer keeps the decimal's scale. Two
+        // decimals keep a scale only when both know it and it is the same:
+        // with different scales a warehouse that caps the precision at 38
+        // may also cut the scale, so Rocky does not claim one (#2398).
+        (RockyType::DecimalUnsized { scale }, other)
+        | (other, RockyType::DecimalUnsized { scale })
             if other.is_integer() || other.is_decimal() =>
         {
-            Some(RockyType::DecimalUnsized)
+            let scale = if other.is_integer() {
+                *scale
+            } else {
+                scale.filter(|s| other.decimal_scale() == Some(*s))
+            };
+            Some(RockyType::DecimalUnsized { scale })
         }
         // Timestamp variants
         (RockyType::Timestamp, RockyType::TimestampNtz)
@@ -281,9 +324,18 @@ pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
         }
         // A sized decimal or an integer fits "some decimal". The reverse is
         // not proven: the unsized value's digits may exceed the target's
-        // (#2356).
-        (from, RockyType::DecimalUnsized) => from.is_integer() || from.is_decimal(),
-        (RockyType::DecimalUnsized, _) => false,
+        // (#2356). A known target scale must hold the source's fraction
+        // digits: an integer has none, and a source of unknown scale is not
+        // proven to fit (#2398).
+        (from, RockyType::DecimalUnsized { scale: to_scale }) => {
+            let fraction_fits = match (from.is_integer(), from.decimal_scale(), to_scale) {
+                (true, _, _) | (false, _, None) => true,
+                (false, Some(from_scale), Some(to_scale)) => from_scale <= *to_scale,
+                (false, None, Some(_)) => false,
+            };
+            (from.is_integer() || from.is_decimal()) && fraction_fits
+        }
+        (RockyType::DecimalUnsized { .. }, _) => false,
         _ => common_supertype(from, to).is_some_and(|sup| sup == *to),
     }
 }
@@ -447,13 +499,13 @@ mod tests {
         assert_eq!(RockyType::Unknown.to_string(), "?");
     }
 
-    /// #2356: `DecimalUnsized` is a decimal with digits Rocky does not
-    /// claim. It absorbs exact numerics in unification, takes sized
+    /// #2356: `DecimalUnsized` is a decimal with a precision Rocky does
+    /// not claim. It absorbs exact numerics in unification, takes sized
     /// decimals and integers on assignment, and is never assignable to a
     /// sized decimal, whose digits it may exceed.
     #[test]
     fn decimal_unsized_unifies_and_assigns_soundly() {
-        let unsized_decimal = RockyType::DecimalUnsized;
+        let unsized_decimal = RockyType::DecimalUnsized { scale: None };
         let d10_2 = RockyType::Decimal {
             precision: 10,
             scale: 2,
@@ -467,12 +519,12 @@ mod tests {
         ] {
             assert_eq!(
                 common_supertype(&unsized_decimal, &other),
-                Some(RockyType::DecimalUnsized),
+                Some(unsized_decimal.clone()),
                 "{other:?}"
             );
             assert_eq!(
                 common_supertype(&other, &unsized_decimal),
-                Some(RockyType::DecimalUnsized),
+                Some(unsized_decimal.clone()),
                 "{other:?}"
             );
         }
@@ -504,13 +556,63 @@ mod tests {
         assert_eq!(unsized_decimal.to_string(), "DECIMAL(?,?)");
     }
 
-    /// The wire tag is part of the model-detail contract.
+    /// #2398: a known scale survives unification with an integer and with
+    /// a decimal of the same scale. Any other decimal drops it, because a
+    /// warehouse that caps the precision may cut the scale too.
     #[test]
-    fn decimal_unsized_serializes_as_a_bare_tag() {
-        let json = serde_json::to_string(&RockyType::DecimalUnsized).unwrap();
-        assert_eq!(json, "\"DecimalUnsized\"");
-        let back: RockyType = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, RockyType::DecimalUnsized);
+    fn decimal_unsized_keeps_a_scale_only_when_it_is_shared() {
+        let scale = |s: Option<u8>| RockyType::DecimalUnsized { scale: s };
+        let d = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+        let cases = [
+            (scale(Some(2)), RockyType::Int32, scale(Some(2))),
+            (scale(Some(2)), RockyType::Int64, scale(Some(2))),
+            (scale(Some(2)), d(10, 2), scale(Some(2))),
+            (scale(Some(2)), d(10, 4), scale(None)),
+            (scale(Some(2)), d(10, 0), scale(None)),
+            (scale(Some(2)), scale(Some(4)), scale(None)),
+            (scale(Some(2)), scale(None), scale(None)),
+            (scale(None), RockyType::Int64, scale(None)),
+            (scale(None), d(10, 2), scale(None)),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(common_supertype(&a, &b), Some(want.clone()), "{a:?} {b:?}");
+            assert_eq!(common_supertype(&b, &a), Some(want), "{b:?} {a:?}");
+        }
+
+        assert_eq!(scale(Some(2)).to_string(), "DECIMAL(?,2)");
+        assert_eq!(scale(Some(2)).decimal_scale(), Some(2));
+        assert_eq!(scale(None).decimal_scale(), None);
+        assert_eq!(d(10, 3).decimal_scale(), Some(3));
+        assert_eq!(RockyType::Int64.decimal_scale(), None);
+
+        // A known target scale must hold the source's fraction digits.
+        assert!(is_assignable(&d(10, 2), &scale(Some(2))));
+        assert!(is_assignable(&d(10, 1), &scale(Some(2))));
+        assert!(!is_assignable(&d(10, 4), &scale(Some(2))));
+        assert!(is_assignable(&RockyType::Int64, &scale(Some(2))));
+        assert!(!is_assignable(&scale(None), &scale(Some(2))));
+        assert!(is_assignable(&scale(Some(2)), &scale(None)));
+        assert!(!is_assignable(&scale(Some(2)), &d(38, 2)));
+    }
+
+    /// The wire shape is part of the model-detail contract.
+    #[test]
+    fn decimal_unsized_serializes_with_its_scale() {
+        for (ty, want) in [
+            (
+                RockyType::DecimalUnsized { scale: Some(2) },
+                r#"{"DecimalUnsized":{"scale":2}}"#,
+            ),
+            (
+                RockyType::DecimalUnsized { scale: None },
+                r#"{"DecimalUnsized":{"scale":null}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&ty).unwrap();
+            assert_eq!(json, want);
+            let back: RockyType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ty);
+        }
     }
 
     #[test]

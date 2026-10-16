@@ -855,7 +855,7 @@ fn is_numeric(ty: &RockyType) -> bool {
             | RockyType::Float32
             | RockyType::Float64
             | RockyType::Decimal { .. }
-            | RockyType::DecimalUnsized
+            | RockyType::DecimalUnsized { .. }
     )
 }
 
@@ -923,9 +923,9 @@ pub(crate) fn infer_active_call(
         }
         let (arg_ty, _) = arg_type(arg);
         let position = index + 1;
-        // A decimal whose digits Rocky cannot bound may or may not fit a
+        // A decimal whose precision Rocky cannot bound may or may not fit a
         // sized `DECIMAL(p,s)` parameter: unverified, like `Unknown` (#2356).
-        let unsized_into_sized = arg_ty == RockyType::DecimalUnsized
+        let unsized_into_sized = matches!(arg_ty, RockyType::DecimalUnsized { .. })
             && matches!(param.data_type, RockyType::Decimal { .. });
         if arg_ty == RockyType::Unknown
             || param.data_type == RockyType::Unknown

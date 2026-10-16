@@ -1065,8 +1065,7 @@ fn load_contract_map(
 /// Why a `CAST` target has no type, for the `E059` message. The width names
 /// matter only when the model's warehouse is not known (#2333).
 fn cast_target_reason(target: &crate::operand_check::OperandTarget) -> String {
-    const DIGITS: &str = "a bare DECIMAL names no digits, DECIMAL digits must satisfy \
-                          1 <= p <= 38 and 0 <= s <= p";
+    const DIGITS: &str = "DECIMAL digits must satisfy 1 <= p <= 38 and 0 <= s <= p";
     let dialects = target.known_dialects();
     if dialects.is_empty() {
         format!(
@@ -2184,6 +2183,81 @@ mod tests {
             let total = &result.type_check.typed_models["totals"][1];
             assert_eq!(total.data_type, RockyType::Int64);
             assert!(total.nullable, "{join}");
+        }
+    }
+
+    /// #2398 end to end: `SUM` over `DECIMAL(10,2)` keeps scale 2, so a
+    /// contract with another scale is a real `E011`, and one with scale 2 is
+    /// still unchecked (`I003`) because the precision is not claimed. A bare
+    /// `CAST(x AS DECIMAL)` is a decimal with no digits claimed: a bare
+    /// `Decimal` contract passes, any `Decimal(p,s)` one is unchecked, and a
+    /// non-decimal one is `E011`.
+    #[test]
+    fn a_decimal_contract_checks_the_scale_a_sum_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("totals.toml"),
+            "name = \"totals\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"totals\"\n",
+        )
+        .unwrap();
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([(
+                "raw.orders".to_string(),
+                vec![
+                    TypedColumn {
+                        name: "id".to_string(),
+                        data_type: RockyType::Int64,
+                        nullable: false,
+                    },
+                    TypedColumn {
+                        name: "amount".to_string(),
+                        data_type: RockyType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                        nullable: false,
+                    },
+                ],
+            )]),
+            ..Default::default()
+        };
+        let cases = [
+            ("SUM(o.amount)", "Decimal(10,4)", Some("E011")),
+            ("SUM(o.amount)", "Decimal(18)", Some("E011")),
+            ("SUM(o.amount)", "Decimal(38,2)", Some("I003")),
+            ("SUM(o.amount)", "Decimal(20,2)", Some("I003")),
+            ("SUM(o.amount)", "Decimal", None),
+            ("SUM(o.amount)", "String", Some("E011")),
+            ("CAST(o.amount AS DECIMAL)", "Decimal", None),
+            ("CAST(o.amount AS DECIMAL)", "Decimal(18,3)", Some("I003")),
+            ("CAST(o.amount AS DECIMAL)", "Decimal(10,0)", Some("I003")),
+            ("CAST(o.amount AS DECIMAL)", "String", Some("E011")),
+        ];
+        for (expr, contract_type, want) in cases {
+            std::fs::write(
+                dir.path().join("totals.sql"),
+                format!("SELECT o.id, {expr} AS total FROM raw.orders o GROUP BY o.id"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("totals.contract.toml"),
+                format!("[[columns]]\nname = \"total\"\ntype = \"{contract_type}\"\n"),
+            )
+            .unwrap();
+            let result = compile(&config).unwrap();
+            let codes: Vec<&str> = result
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(&*d.code, "E011" | "I003" | "E059"))
+                .map(|d| &*d.code)
+                .collect();
+            assert_eq!(
+                codes,
+                want.into_iter().collect::<Vec<_>>(),
+                "{expr} vs {contract_type}: {:?}",
+                result.diagnostics
+            );
         }
     }
 

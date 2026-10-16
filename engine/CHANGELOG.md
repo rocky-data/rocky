@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RockyType::DecimalUnsized` now carries the scale when Rocky knows it (#2398). The wire shape changes from the bare tag `"DecimalUnsized"` to `{"DecimalUnsized": {"scale": 2}}`, or `{"DecimalUnsized": {"scale": null}}` when the scale is not known. The `model_detail` schema and its bindings change with it. It shows as `DECIMAL(?,2)`, or `DECIMAL(?,?)`.
+- `SUM` over `DECIMAL(p,s)` now keeps the scale `s` (#2398). Only the precision differs by warehouse. What this changes for a contract on such a column:
+  - `type = "Decimal(p,s2)"` with another scale `s2` used to be `I003` (not checked). It is now `E011`.
+  - `type = "Decimal(p,s)"` with the same scale is still `I003`, or `E059` under strict contracts. The message now says only the precision is not checked.
+  - A bare `type = "Decimal"` still passes, and a non-decimal type is still `E011`.
+  - A `COALESCE` or `CASE` that mixes the sum with a decimal of another scale keeps no scale, because a warehouse that caps the precision at 38 may cut the scale too.
+  - PostgreSQL's `SUM` over `NUMERIC(p,s)` is an unconstrained `NUMERIC`, and BigQuery's over a `NUMERIC(p,s)` column is a plain `NUMERIC`. Rocky still reads the scale as `s` there.
+- A bare `CAST(x AS DECIMAL)` or `CAST(x AS NUMERIC)` is now typed as a decimal with no digits claimed, `DecimalUnsized` with an unknown scale (#2398). Before, it was `Unknown`. Its default digits differ by warehouse (DuckDB `DECIMAL(18,3)`, Databricks `DECIMAL(10,0)`). For a contract on such a column, a bare `type = "Decimal"` is now checked and passes (it was `I003`), and a non-decimal type is now `E011` (it was `I003`). A `Decimal(p,s)` contract stays `I003`, or `E059` under strict contracts. The cast is nullable, because a value may overflow the warehouse's default digits.
+
 ### Fixed
 
 - `rocky run --branch` and `--shadow --shadow-schema` on Snowflake now create the routed schema under the name the writes use (#2402). Before, `auto_create_schemas` ran an unquoted `CREATE SCHEMA DB.branch__x`, which Snowflake folds to `BRANCH__X`, and the models then wrote to the quoted `"DB"."branch__x"`, so the run failed with "schema not found". The schema is now created with both names quoted, the way `rocky preview create` does it. This covers transformation and replication pipelines. Other schemas keep the old statement. Not run against a live Snowflake account. Known gap: the Snowflake governance SQL (tags, grants, retention) is still unquoted, so it folds to `BRANCH__X`. The schema the writes use gets no grants or tags, and that step logs a warning. An account that ran `--branch` before this fix may hold a stale, empty `BRANCH__X` schema, and any grants landed on it silently. Drop it.

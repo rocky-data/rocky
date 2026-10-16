@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The generated `RockyType` models change the `DecimalUnsized` tag to an object that carries the scale: `{"DecimalUnsized": {"scale": 2}}`, with `scale` `None` when the engine does not know it. Before, it was the bare string `"DecimalUnsized"`.
+
 ## [0.24.0] — 2026-10-16
 
 ### Added

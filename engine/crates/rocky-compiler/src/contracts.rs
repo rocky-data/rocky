@@ -263,18 +263,22 @@ pub fn validate_contract_with(
                 // decides anything, and `type_name_matches` no longer treats
                 // it as a match.
                 if let Some(ref expected_type) = contract_col.type_name {
-                    if col.data_type == RockyType::DecimalUnsized
+                    if let RockyType::DecimalUnsized { scale } = col.data_type
                         && declares_decimal_digits(expected_type)
+                        && !unsized_scale_mismatches(scale, expected_type)
                     {
                         // Rocky knows the column is a decimal, so a bare
                         // `Decimal` contract is checked (it matches below)
-                        // and a `String` one is a plain `E011`. Only the
-                        // digits a `Decimal(p,s)` contract names cannot be
-                        // checked (#2356).
+                        // and a `String` one is a plain `E011`. A
+                        // `Decimal(p,s)` contract whose scale is not the
+                        // column's known scale is an `E011` too (#2398).
+                        // Only the precision it names cannot be checked
+                        // (#2356).
                         diagnostics.push(unsized_decimal_unchecked(
                             model_name,
                             &contract_col.name,
                             expected_type,
+                            scale,
                             strict_reason.is_some(),
                         ));
                     } else if col.data_type == RockyType::Unknown
@@ -296,8 +300,8 @@ pub fn validate_contract_with(
                                 "cast `{0}` in the SELECT to BOOLEAN, DOUBLE, DATE, a text or binary type, or \
                                  DECIMAL(p, s) with 1 <= p <= 38 and 0 <= s <= p (TINYINT, SMALLINT, INT, \
                                  INTEGER, BIGINT, FLOAT, REAL and TIMESTAMP stay unknown when the model's \
-                                 warehouse is not known, because their width differs by warehouse, and a \
-                                 bare DECIMAL always does; the cast is then checked against the contract's {1}), or give the compiler source \
+                                 warehouse is not known, because their width differs by warehouse; a bare \
+                                 DECIMAL checks only a bare `Decimal`; the cast is then checked against the contract's {1}), or give the compiler source \
                                  schemas so the type resolves (`data/seed.sql`, or \
                                  `rocky discover --with-schemas`), or drop the type from the \
                                  contract. `--strict-contracts` refuses a declared type Rocky \
@@ -323,7 +327,8 @@ pub fn validate_contract_with(
                             // the column's type whatever the input is. INT,
                             // BIGINT, FLOAT, TIMESTAMP stay Unknown with no
                             // known warehouse (#2333), and a bare DECIMAL
-                            // always (#1721), so the advice names the list.
+                            // checks only a bare `Decimal` contract (#1721,
+                            // #2398), so the advice names the list.
                             .with_suggestion(format!(
                                 "give the compiler source schemas so `{0}`'s type resolves — \
                                  `rocky compile`, `rocky test` and `rocky ci` read them from \
@@ -333,8 +338,8 @@ pub fn validate_contract_with(
                                  `{0}` in the SELECT to BOOLEAN, DOUBLE, DATE, a text or binary type, or \
                                  DECIMAL(p, s) with 1 <= p <= 38 and 0 <= s <= p (TINYINT, SMALLINT, INT, \
                                  INTEGER, BIGINT, FLOAT, REAL and TIMESTAMP stay unknown when the model's \
-                                 warehouse is not known, because their width differs by warehouse, and a \
-                                 bare DECIMAL always does): the cast's target is then checked against {1}",
+                                 warehouse is not known, because their width differs by warehouse; a bare \
+                                 DECIMAL checks only a bare `Decimal`): the cast's target is then checked against {1}",
                                 contract_col.name, expected_type
                             )),
                         );
@@ -477,18 +482,51 @@ fn declares_decimal_digits(type_name: &str) -> bool {
     type_name.starts_with("Decimal(")
 }
 
+/// The `(precision, scale)` a `Decimal(p)` / `Decimal(p,s)` contract type
+/// names, or `None` for any other type name or digits that do not parse.
+/// `Decimal(p)` is scale 0.
+fn declared_decimal_digits(type_name: &str) -> Option<(u8, u8)> {
+    let args = type_name
+        .strip_prefix("Decimal(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let (precision, scale) = match args.split_once(',') {
+        Some((precision, scale)) => (precision.trim(), scale.trim()),
+        None => (args.trim(), "0"),
+    };
+    Some((precision.parse().ok()?, scale.parse().ok()?))
+}
+
+/// Whether a `Decimal(p,s)` contract names a scale other than the one Rocky
+/// knows a [`RockyType::DecimalUnsized`] column has (#2398). `false` when the
+/// column's scale is unknown or the declared digits do not parse.
+fn unsized_scale_mismatches(scale: Option<u8>, type_name: &str) -> bool {
+    match (scale, declared_decimal_digits(type_name)) {
+        (Some(scale), Some((_, declared_scale))) => scale != declared_scale,
+        (Some(_) | None, None) | (None, Some(_)) => false,
+    }
+}
+
 /// The diagnostic for a `Decimal(p,s)` contract over a column Rocky types
 /// [`RockyType::DecimalUnsized`]: `I003`, or `E059` under strict contracts.
 fn unsized_decimal_unchecked(
     model_name: &str,
     column: &str,
     expected_type: &str,
+    scale: Option<u8>,
     strict: bool,
 ) -> Diagnostic {
+    let unknown = match scale {
+        Some(scale) => format!(
+            "with scale {scale}, but its precision depends on the warehouse (for example \
+             SUM over a DECIMAL), so it did not check the declared precision"
+        ),
+        None => "but its precision and scale depend on the warehouse (for example `CAST(x \
+                 AS DECIMAL)`), so it did not check the declared digits"
+            .to_string(),
+    };
     let message = format!(
         "column '{column}' of model '{model_name}': the contract declares type {expected_type}. \
-         Rocky knows the column is a decimal, but its precision and scale depend on the \
-         warehouse (for example SUM over a DECIMAL), so it did not check the declared digits"
+         Rocky knows the column is a decimal {unknown}"
     );
     let suggestion = format!(
         "cast `{column}` in the SELECT to the DECIMAL(p, s) the contract names (the cast's \
@@ -518,8 +556,9 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
             decimal_type_matches(*precision, *scale, type_name)
         }
         // Only a bare `Decimal` matches. `validate_contract_with` reports a
-        // `Decimal(p,s)` contract as unchecked before reaching here.
-        RockyType::DecimalUnsized => type_name == "Decimal",
+        // `Decimal(p,s)` contract with no other scale as unchecked before
+        // reaching here, so one that reaches here names another scale.
+        RockyType::DecimalUnsized { .. } => type_name == "Decimal",
         RockyType::String => type_name == "String",
         RockyType::Binary => type_name == "Binary",
         RockyType::Date => type_name == "Date",
@@ -562,27 +601,7 @@ fn decimal_type_matches(precision: u8, scale: u8, type_name: &str) -> bool {
     if type_name == "Decimal" {
         return true;
     }
-
-    let Some(args) = type_name
-        .strip_prefix("Decimal(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    else {
-        return false;
-    };
-
-    let (declared_precision, declared_scale) = match args.split_once(',') {
-        Some((declared_precision, declared_scale)) => {
-            (declared_precision.trim(), declared_scale.trim())
-        }
-        None => (args.trim(), "0"),
-    };
-
-    declared_precision
-        .parse::<u8>()
-        .is_ok_and(|declared| declared == precision)
-        && declared_scale
-            .parse::<u8>()
-            .is_ok_and(|declared| declared == scale)
+    declared_decimal_digits(type_name) == Some((precision, scale))
 }
 
 #[cfg(test)]
@@ -975,7 +994,11 @@ mod tests {
             }],
             rules: ContractRules::default(),
         };
-        let schema = vec![typed_col("total", RockyType::DecimalUnsized, true)];
+        let schema = vec![typed_col(
+            "total",
+            RockyType::DecimalUnsized { scale: None },
+            true,
+        )];
         let why = |_: &str| "unused".to_string();
         let codes = |diags: &[Diagnostic]| -> Vec<String> {
             diags.iter().map(|d| d.code.to_string()).collect()
@@ -1017,6 +1040,71 @@ mod tests {
         // Nullability is still checked.
         let diags = validate_contract("m", &schema, &contract("Decimal", Some(false)));
         assert_eq!(codes(&diags), ["E012"]);
+    }
+
+    /// #2398: an unsized decimal whose scale Rocky knows (`SUM` over a
+    /// `DECIMAL(p,2)`) checks the scale. A `Decimal(p,s)` contract with
+    /// another scale is `E011`; with the same scale only the precision is
+    /// unchecked: `I003`, or `E059` when strict. With the scale unknown,
+    /// every `Decimal(p,s)` contract stays unchecked.
+    #[test]
+    fn an_unsized_decimal_with_a_known_scale_checks_the_scale() {
+        let contract = |type_name: &str| CompilerContract {
+            columns: vec![ContractColumn {
+                name: "total".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let why = |_: &str| "unused".to_string();
+        let codes = |diags: &[Diagnostic]| -> Vec<String> {
+            diags.iter().map(|d| d.code.to_string()).collect()
+        };
+        let scaled = vec![typed_col(
+            "total",
+            RockyType::DecimalUnsized { scale: Some(2) },
+            true,
+        )];
+
+        // Another scale: a real mismatch, strict or not.
+        for type_name in ["Decimal(10,4)", "Decimal(38,0)", "Decimal(18)"] {
+            let diags = validate_contract("m", &scaled, &contract(type_name));
+            assert_eq!(codes(&diags), ["E011"], "{type_name}");
+            let diags = validate_contract_with("m", &scaled, &contract(type_name), Some(&why));
+            assert_eq!(codes(&diags), ["E011"], "{type_name} strict");
+        }
+
+        // The same scale: only the precision is unchecked, and the message
+        // says so.
+        for type_name in ["Decimal(38,2)", "Decimal(20,2)", "Decimal( 10 , 2 )"] {
+            let diags = validate_contract("m", &scaled, &contract(type_name));
+            assert_eq!(codes(&diags), ["I003"], "{type_name}");
+            let message = &diags[0].message;
+            assert!(
+                message.contains("with scale 2") && message.contains("declared precision"),
+                "{message}"
+            );
+            let diags = validate_contract_with("m", &scaled, &contract(type_name), Some(&why));
+            assert_eq!(codes(&diags), ["E059"], "{type_name} strict");
+        }
+
+        // A bare `Decimal` matches; another family does not.
+        assert!(validate_contract("m", &scaled, &contract("Decimal")).is_empty());
+        let diags = validate_contract("m", &scaled, &contract("Int64"));
+        assert_eq!(codes(&diags), ["E011"]);
+
+        // Unknown scale: no scale to compare, so never `E011` on digits.
+        let unscaled = vec![typed_col(
+            "total",
+            RockyType::DecimalUnsized { scale: None },
+            true,
+        )];
+        for type_name in ["Decimal(10,4)", "Decimal(38,0)", "Decimal(18)"] {
+            let diags = validate_contract("m", &unscaled, &contract(type_name));
+            assert_eq!(codes(&diags), ["I003"], "{type_name}");
+        }
     }
 
     /// Strict contracts: the same unchecked type is the `E059` error, with the

@@ -738,7 +738,8 @@ pub const I002: &str = "I002";
 /// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` is `Int64` with no
 /// schema for `source.raw.users`. The contract is then compared with the
 /// target, which the warehouse enforces. A bare `DECIMAL` or `NUMERIC` names
-/// no digits, so such a cast stays `Unknown`. A warehouse-dependent
+/// no digits, so such a cast is a decimal that claims none, and only a bare
+/// `Decimal` contract over it is checked. A warehouse-dependent
 /// expression — `AVG` over a `DECIMAL` input (#1238) — also stays `Unknown`
 /// even with source schemas, because the result type is not knowable at this
 /// layer.
@@ -746,7 +747,9 @@ pub const I002: &str = "I002";
 /// The same code reports a contract that names decimal digits
 /// (`Decimal(p,s)`) over a [`RockyType::DecimalUnsized`] column, such as
 /// `SUM` over a `DECIMAL` (#2356). Rocky knows the column is a decimal, so
-/// a bare `Decimal` contract is checked; only the digits are not.
+/// a bare `Decimal` contract is checked; only the digits are not. When Rocky
+/// knows the column's scale, a contract with another scale is `E011` and
+/// only the precision goes unchecked (#2398).
 ///
 /// [`RockyType::DecimalUnsized`]: crate::types::RockyType::DecimalUnsized
 ///

@@ -564,11 +564,12 @@ pub(crate) fn query_result_to_record_batch(
                 )
             }
             // A Decimal128 column needs a precision and scale, and Rocky
-            // does not claim them for this decimal (#2356): never guess one.
-            RockyType::DecimalUnsized => {
+            // does not claim the precision for this decimal (#2356): never
+            // guess one, even when the scale is known (#2398).
+            RockyType::DecimalUnsized { .. } => {
                 return Err(anyhow!(
-                    "column {:?} is a decimal whose precision and scale depend on the warehouse \
-                     (for example SUM over a DECIMAL); the content-addressed writer needs them, \
+                    "column {:?} is a decimal whose precision depends on the warehouse \
+                     (for example SUM over a DECIMAL); the content-addressed writer needs it, \
                      so CAST the column to DECIMAL(p, s) in the model's SELECT",
                     tc.name
                 ));
@@ -1844,7 +1845,11 @@ mod tests {
     /// with guessed digits.
     #[test]
     fn convert_unsized_decimal_is_refused_with_a_cast_hint() {
-        let typed_cols = vec![col("total", RockyType::DecimalUnsized, true)];
+        let typed_cols = vec![col(
+            "total",
+            RockyType::DecimalUnsized { scale: Some(2) },
+            true,
+        )];
         let result = QueryResult {
             columns: vec!["total".into()],
             rows: vec![vec![serde_json::json!("123.45")]],
