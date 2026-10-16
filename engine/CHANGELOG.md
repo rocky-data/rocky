@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky preview create` now creates the branch schema in every catalog the copies write to (#2389). Before, it created the schema only in the connection's default catalog, so a model in another catalog failed with `copy_strategy: "failed"`. It now runs one `CREATE SCHEMA IF NOT EXISTS <catalog>.<branch schema>` per distinct model catalog, before any copy. A model with no catalog (DuckDB, Postgres) behaves as before.
+
 ## [1.84.0] — 2026-10-16
 
 ### Added

@@ -2212,13 +2212,63 @@ fn branch_schema_create_sql(
     ))
 }
 
+/// Create the branch schema once per distinct target catalog of the copy set.
+///
+/// A model with an empty catalog (DuckDB, Postgres) keeps the unqualified
+/// `CREATE SCHEMA` against the connection default. Otherwise the dialect's
+/// `create_schema_sql(catalog, schema)` runs, so the schema lands where
+/// the copy's `{catalog}.{branch_schema}.{table}` writes. A dialect with no
+/// schema-create form falls back to the unqualified statement. Callers
+/// run this before any copy.
+async fn create_branch_schemas(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    branch_schema: &str,
+    copy_names: &[String],
+    model_by_name: &BTreeMap<String, &rocky_core::models::Model>,
+) -> Result<()> {
+    let catalogs: BTreeSet<&str> = copy_names
+        .iter()
+        .filter_map(|n| model_by_name.get(n))
+        .map(|m| m.config.target.catalog.as_str())
+        .collect();
+    let dialect = adapter.dialect();
+    let mut statements: Vec<String> = Vec::new();
+    for catalog in catalogs {
+        let qualified = if catalog.is_empty() {
+            None
+        } else {
+            dialect.create_schema_sql(catalog, branch_schema)
+        };
+        let sql = match qualified {
+            Some(sql) => sql.map_err(|e| {
+                anyhow::anyhow!("branch schema '{branch_schema}' in catalog '{catalog}': {e}")
+            })?,
+            None => branch_schema_create_sql(dialect, branch_schema)?,
+        };
+        if !statements.contains(&sql) {
+            statements.push(sql);
+        }
+    }
+    if statements.is_empty() {
+        statements.push(branch_schema_create_sql(dialect, branch_schema)?);
+    }
+    for sql in &statements {
+        adapter
+            .execute_statement(sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("{sql}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Execute the copy-from-base step against the configured adapter.
 ///
 /// Builds the adapter registry from `rocky.toml`, resolves each
 /// copy-set model's source schema from its sidecar (`target.schema`),
 /// then issues:
 ///
-/// 1. `CREATE SCHEMA IF NOT EXISTS branch_schema` (once per distinct schema).
+/// 1. `CREATE SCHEMA IF NOT EXISTS branch_schema` once per distinct target
+///    catalog.
 /// 2. For each model, `CREATE OR REPLACE TABLE branch_schema.<model> AS
 ///    SELECT * FROM <source_schema>.<model>`.
 ///
@@ -2275,10 +2325,11 @@ async fn execute_copy_from_base(
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
 
-    // Create the branch schema once (idempotent across both DuckDB and
-    // cloud warehouses).
-    let create_schema_sql = branch_schema_create_sql(adapter.dialect(), branch_schema)?;
-    if let Err(e) = adapter.execute_statement(&create_schema_sql).await {
+    // The adapter's default catalog is not enough: each copy targets
+    // `{model catalog}.{branch_schema}`, so create it there first.
+    if let Err(e) =
+        create_branch_schemas(&*adapter, branch_schema, copy_names, &model_by_name).await
+    {
         // A schema-create failure on a writeable adapter is unrecoverable
         // for the copy step — bail to planning-only.
         return Err(anyhow::anyhow!(
@@ -3997,6 +4048,72 @@ mod tests {
         let md = render_preview_diff_markdown("feature_x", "main", None, &summary, &[]);
         assert!(md.contains("No paired runs"));
         assert!(md.contains("rocky run --branch feature_x"));
+    }
+
+    /// The branch schema must be created in every catalog the copies write
+    /// to, before any copy (#2389). Databricks dialect, so the catalog shows
+    /// up in the SQL.
+    #[tokio::test]
+    async fn branch_schema_is_created_in_each_target_catalog() {
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use std::sync::Mutex;
+
+        struct Recorder {
+            dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for Recorder {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &self.dialect
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.seen.lock().unwrap().push(sql.to_string());
+                Ok(())
+            }
+            async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+                unimplemented!("schema creation never queries")
+            }
+            async fn describe_table(
+                &self,
+                _t: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                unimplemented!("schema creation never describes")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, catalog) in [("a", "cat_one"), ("b", "cat_two"), ("c", "cat_two")] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"{catalog}\"\nschema = \"demo\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let models = crate::models_loader::load_project_models(&models_dir, None).unwrap();
+        let by_name: BTreeMap<String, &rocky_core::models::Model> =
+            models.iter().map(|m| (m.config.name.clone(), m)).collect();
+        let copy_names: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+
+        let adapter = Recorder {
+            dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+            seen: Mutex::new(Vec::new()),
+        };
+        create_branch_schemas(&adapter, "branch__x", &copy_names, &by_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            *adapter.seen.lock().unwrap(),
+            vec![
+                "CREATE SCHEMA IF NOT EXISTS cat_one.branch__x".to_string(),
+                "CREATE SCHEMA IF NOT EXISTS cat_two.branch__x".to_string(),
+            ]
+        );
     }
 
     // ---------------------- Phase 1.5 — copy-step execution ----------------------
