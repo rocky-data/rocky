@@ -315,6 +315,15 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }
@@ -1068,6 +1077,15 @@ mod tests {
     struct NonSparkDialect;
 
     impl SqlDialect for NonSparkDialect {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }

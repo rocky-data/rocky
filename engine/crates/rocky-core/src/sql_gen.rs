@@ -210,6 +210,197 @@ fn generate_replication_create_table_as_sql(
     })
 }
 
+/// The pieces every held-back replication statement shares (#2376): the
+/// SELECT list, the formatted source and target, and the timestamp column.
+struct HeldBackParts<'a> {
+    select_clause: String,
+    source_ref: String,
+    target_ref: String,
+    timestamp_column: &'a str,
+}
+
+fn held_back_parts<'a>(
+    model_ir: &'a ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<HeldBackParts<'a>, SqlGenError> {
+    if model_ir.variant() != ModelIrVariant::Replication {
+        return Err(variant_mismatch(model_ir, "Replication"));
+    }
+    let MaterializationStrategy::Incremental {
+        timestamp_column, ..
+    } = &model_ir.materialization
+    else {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "the newest-timestamp hold-back applies only to incremental replication; \
+             `{}` is {:?}",
+            model_ir.name, model_ir.materialization
+        )));
+    };
+    let columns = model_ir
+        .columns
+        .as_ref()
+        .expect("Replication variant guarantees `columns` is Some");
+    let source = model_ir
+        .source
+        .as_ref()
+        .expect("Replication variant guarantees `source` is Some");
+    Ok(HeldBackParts {
+        select_clause: dialect.select_clause(columns, &model_ir.metadata_columns)?,
+        source_ref: dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?,
+        target_ref: dialect.format_table_ref(
+            &model_ir.target.catalog,
+            &model_ir.target.schema,
+            &model_ir.target.table,
+        )?,
+        timestamp_column,
+    })
+}
+
+/// The incremental replication INSERT with the newest source timestamp held
+/// back (#2376): `INSERT INTO <target> SELECT ... FROM <source> WHERE ts >
+/// <watermark> AND ts < <held_max>`.
+///
+/// `held_max` is `MAX(ts)` over the source, read once by the runner before
+/// the copy. The rows AT that maximum wait for the next run, so a row that
+/// lands later with the same timestamp is still copied: the next watermark
+/// sits below it. [`generate_insert_sql`] stays the unbounded form that
+/// `rocky plan` previews and that an empty or all-NULL source still runs.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] unless `model_ir` is a
+/// replication [`ModelIr`] with the `Incremental` strategy.
+pub fn generate_held_back_insert_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    held_max: &chrono::DateTime<chrono::Utc>,
+) -> Result<String, SqlGenError> {
+    let parts = held_back_parts(model_ir, dialect)?;
+    let where_clause = dialect.watermark_where(parts.timestamp_column, last_watermark)?;
+    let bound = dialect.watermark_hold_back(
+        parts.timestamp_column,
+        held_max,
+        crate::traits::NullTimestamps::Exclude,
+    )?;
+    let select = format!(
+        "{}\nFROM {}\n{where_clause} AND {bound}",
+        parts.select_clause, parts.source_ref
+    );
+    Ok(dialect.insert_into(&parts.target_ref, &select))
+}
+
+/// The replacing full copy of an incremental replication table with the
+/// newest source timestamp held back (#2376): `CREATE OR REPLACE TABLE ...
+/// WHERE (ts < <held_max> OR ts IS NULL)`.
+///
+/// For a target that exists but must be rebuilt: a drift drop-and-recreate,
+/// or a missing watermark. The bound is required here too. Without it the
+/// rebuild copies the newest batch, the next watermark equals its timestamp,
+/// and a late row tied with it is skipped one run earlier. NULL-timestamp
+/// rows are kept, as the unbounded copy keeps them.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] unless `model_ir` is a
+/// replication [`ModelIr`] with the `Incremental` strategy.
+pub fn generate_held_back_create_table_as_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    held_max: &chrono::DateTime<chrono::Utc>,
+) -> Result<String, SqlGenError> {
+    held_back_create_table_as(model_ir, dialect, held_max, true)
+}
+
+/// The non-replacing first-run copy of an incremental replication table
+/// with the newest source timestamp held back (#2376). Same bound as
+/// [`generate_held_back_create_table_as_sql`]; the first run holds back the
+/// newest batch too.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] unless `model_ir` is a
+/// replication [`ModelIr`] with the `Incremental` strategy.
+pub fn generate_held_back_bootstrap_create_table_as_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    held_max: &chrono::DateTime<chrono::Utc>,
+) -> Result<String, SqlGenError> {
+    held_back_create_table_as(model_ir, dialect, held_max, false)
+}
+
+fn held_back_create_table_as(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    held_max: &chrono::DateTime<chrono::Utc>,
+    replace: bool,
+) -> Result<String, SqlGenError> {
+    let parts = held_back_parts(model_ir, dialect)?;
+    let bound = dialect.watermark_hold_back(
+        parts.timestamp_column,
+        held_max,
+        crate::traits::NullTimestamps::Keep,
+    )?;
+    let select = format!(
+        "{}\nFROM {}\nWHERE {bound}",
+        parts.select_clause, parts.source_ref
+    );
+    Ok(if replace {
+        dialect.create_table_as(&parts.target_ref, &select)
+    } else {
+        dialect.create_table_as_new(&parts.target_ref, &select)
+    })
+}
+
+/// `SELECT COUNT(*) FROM <source> WHERE NOT (ts < <held_max>)`: the source
+/// rows a held-back copy left for a later run (#2376). NULL-timestamp rows
+/// are not counted; the held-back copy does not hold them back.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] unless `model_ir` is a
+/// replication [`ModelIr`] with the `Incremental` strategy.
+pub fn generate_held_back_count_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    held_max: &chrono::DateTime<chrono::Utc>,
+) -> Result<String, SqlGenError> {
+    let parts = held_back_parts(model_ir, dialect)?;
+    let bound = dialect.watermark_hold_back(
+        parts.timestamp_column,
+        held_max,
+        crate::traits::NullTimestamps::Exclude,
+    )?;
+    Ok(format!(
+        "SELECT COUNT(*) FROM {} WHERE NOT ({bound})",
+        parts.source_ref
+    ))
+}
+
+/// `SELECT COUNT(*) FROM <source> WHERE (ts < <held_max> OR ts IS NULL)`:
+/// the source side of the `row_count` check for a table copied with the
+/// newest timestamp held back (#2376). It counts exactly the rows a
+/// held-back copy lands, so the check stays strict.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::Dialect`] when the dialect rejects the table
+/// reference or the column.
+pub fn generate_held_back_source_row_count_sql(
+    dialect: &dyn SqlDialect,
+    source: &rocky_ir::TableRef,
+    timestamp_column: &str,
+    held_max: &chrono::DateTime<chrono::Utc>,
+) -> Result<String, SqlGenError> {
+    let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+    let bound = dialect.watermark_hold_back(
+        timestamp_column,
+        held_max,
+        crate::traits::NullTimestamps::Keep,
+    )?;
+    Ok(format!("SELECT COUNT(*) FROM {source_ref} WHERE {bound}"))
+}
+
 /// Generates a MERGE INTO statement using the given dialect.
 ///
 /// # Errors
@@ -1517,6 +1708,21 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn watermark_hold_back(
+            &self,
+            timestamp_col: &str,
+            held_max: &chrono::DateTime<chrono::Utc>,
+            nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            rocky_sql::validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
+            let literal = format!("TIMESTAMP '{}'", held_max.format("%Y-%m-%d %H:%M:%S%.f"));
+            Ok(crate::traits::hold_back_predicate(
+                timestamp_col,
+                &literal,
+                nulls,
+            ))
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }
@@ -1823,6 +2029,109 @@ mod tests {
         ));
         assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         assert!(!sql.contains("WHERE"));
+    }
+
+    fn held_max() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap()
+    }
+
+    /// #2376: the incremental INSERT copies `ts > watermark AND ts < held_max`.
+    #[test]
+    fn test_held_back_insert_bounds_both_sides() {
+        use chrono::TimeZone;
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap();
+        let sql = generate_held_back_insert_sql(
+            &sample_incremental_ir(),
+            &dialect(),
+            Some(&prior),
+            &held_max(),
+        )
+        .unwrap();
+        assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
+        assert!(
+            sql.ends_with(
+                "FROM source_catalog.src__acme__us_west__shopify.orders\n\
+                 WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00' \
+                 AND _fivetran_synced < TIMESTAMP '2026-04-17 10:00:00'"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// #2376: the first-run and rebuild copies hold back the newest batch too,
+    /// and keep NULL-timestamp rows as the unbounded copy does.
+    #[test]
+    fn test_held_back_create_table_as_bounds_the_copy_and_keeps_nulls() {
+        let bounded_tail = "FROM source_catalog.src__acme__us_west__shopify.orders\n\
+                            WHERE (_fivetran_synced < TIMESTAMP '2026-04-17 10:00:00' \
+                            OR _fivetran_synced IS NULL)";
+        let replacing = generate_held_back_create_table_as_sql(
+            &sample_incremental_ir(),
+            &dialect(),
+            &held_max(),
+        )
+        .unwrap();
+        let unbounded = generate_create_table_as_sql(&sample_incremental_ir(), &dialect()).unwrap();
+        assert!(replacing.ends_with(bounded_tail), "{replacing}");
+        assert!(replacing.starts_with(unbounded.as_str()), "{replacing}");
+
+        let bootstrap = generate_held_back_bootstrap_create_table_as_sql(
+            &sample_incremental_ir(),
+            &dialect(),
+            &held_max(),
+        )
+        .unwrap();
+        let unbounded =
+            generate_bootstrap_create_table_as_sql(&sample_incremental_ir(), &dialect()).unwrap();
+        assert!(bootstrap.ends_with(bounded_tail), "{bootstrap}");
+        assert!(bootstrap.starts_with(unbounded.as_str()), "{bootstrap}");
+    }
+
+    /// #2376: the held-back count negates only the hold-back predicate, and
+    /// the row-count source side counts exactly what a held-back copy lands.
+    #[test]
+    fn test_held_back_count_and_source_row_count_sql() {
+        assert_eq!(
+            generate_held_back_count_sql(&sample_incremental_ir(), &dialect(), &held_max())
+                .unwrap(),
+            "SELECT COUNT(*) FROM source_catalog.src__acme__us_west__shopify.orders \
+             WHERE NOT (_fivetran_synced < TIMESTAMP '2026-04-17 10:00:00')"
+        );
+        let source = rocky_ir::TableRef {
+            catalog: "source_catalog".into(),
+            schema: "src__acme__us_west__shopify".into(),
+            table: "orders".into(),
+        };
+        assert_eq!(
+            generate_held_back_source_row_count_sql(
+                &dialect(),
+                &source,
+                "_fivetran_synced",
+                &held_max()
+            )
+            .unwrap(),
+            "SELECT COUNT(*) FROM source_catalog.src__acme__us_west__shopify.orders \
+             WHERE (_fivetran_synced < TIMESTAMP '2026-04-17 10:00:00' \
+             OR _fivetran_synced IS NULL)"
+        );
+    }
+
+    /// #2376: the hold-back is for incremental replication only.
+    #[test]
+    fn test_held_back_sql_refuses_other_strategies() {
+        let err =
+            generate_held_back_insert_sql(&sample_full_refresh_ir(), &dialect(), None, &held_max())
+                .unwrap_err();
+        assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{err}");
+        assert!(
+            generate_held_back_create_table_as_sql(
+                &sample_full_refresh_ir(),
+                &dialect(),
+                &held_max()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3316,6 +3625,15 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct MaintenanceDialect(TestDialect);
 
     impl SqlDialect for MaintenanceDialect {
+        fn watermark_hold_back(
+            &self,
+            ts: &str,
+            held_max: &chrono::DateTime<chrono::Utc>,
+            nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            self.0.watermark_hold_back(ts, held_max, nulls)
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }
@@ -3440,6 +3758,15 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct PredropDialect(TestDialect);
 
     impl SqlDialect for PredropDialect {
+        fn watermark_hold_back(
+            &self,
+            ts: &str,
+            held_max: &chrono::DateTime<chrono::Utc>,
+            nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            self.0.watermark_hold_back(ts, held_max, nulls)
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }

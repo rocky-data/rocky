@@ -26,7 +26,9 @@
 
 use std::sync::Arc;
 
-use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -136,6 +138,16 @@ fn is_datetime_text(s: &str) -> bool {
             13 | 16 => c == ':',
             _ => c.is_ascii_digit(),
         })
+}
+
+/// The `toDateTime64('…', 6, 'UTC')` literal both watermark bounds share: an
+/// explicit UTC instant with microseconds. `None` is the `1970-01-01`
+/// sentinel.
+fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+    let literal = t
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00:00.000000".to_string());
+    format!("toDateTime64('{literal}', 6, 'UTC')")
 }
 
 impl SqlDialect for ClickHouseDialect {
@@ -263,11 +275,26 @@ impl SqlDialect for ClickHouseDialect {
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {
         check_identifier(timestamp_col)?;
-        let literal = last_watermark
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-            .unwrap_or_else(|| "1970-01-01 00:00:00.000000".to_string());
         Ok(format!(
-            "WHERE {timestamp_col} > toDateTime64('{literal}', 6, 'UTC')"
+            "WHERE {timestamp_col} > {}",
+            watermark_literal(last_watermark)
+        ))
+    }
+
+    /// `col < toDateTime64('…', 6, 'UTC')`, the same literal as
+    /// [`Self::watermark_where`]. `%.6f` truncates to the microsecond, which
+    /// rounds DOWN, the safe side for `<`.
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {
+        check_identifier(timestamp_col)?;
+        Ok(hold_back_predicate(
+            timestamp_col,
+            &watermark_literal(Some(held_max)),
+            nulls,
         ))
     }
 
@@ -485,6 +512,31 @@ fn nullable_type(data_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2376: the hold-back bound reuses `watermark_where`'s column and
+    /// literal, so the two bounds compare the same way.
+    #[test]
+    fn watermark_hold_back_matches_the_watermark_literal() {
+        use chrono::TimeZone;
+        use rocky_core::traits::NullTimestamps;
+        let d = d();
+        let held = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
+                .unwrap(),
+            "_loaded_at < toDateTime64('2026-09-15 10:00:00.250000', 6, 'UTC')"
+        );
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Keep)
+                .unwrap(),
+            "(_loaded_at < toDateTime64('2026-09-15 10:00:00.250000', 6, 'UTC') OR _loaded_at IS NULL)"
+        );
+        assert!(
+            d.watermark_hold_back("ts; DROP", &held, NullTimestamps::Exclude)
+                .is_err()
+        );
+    }
 
     fn d() -> ClickHouseDialect {
         ClickHouseDialect::new()

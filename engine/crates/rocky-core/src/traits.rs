@@ -345,6 +345,34 @@ pub enum CaseSignificance {
     Insignificant,
 }
 
+/// What a [`SqlDialect::watermark_hold_back`] predicate does with a row whose
+/// timestamp column is NULL (#2376).
+///
+/// A NULL timestamp is neither below nor at the held-back maximum, so the
+/// predicate has to say which side it lands on. Each call site picks the
+/// variant that keeps its own NULL behaviour unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullTimestamps {
+    /// Leave NULL-timestamp rows out: `ts < held_max`. The incremental
+    /// INSERT already drops them with `ts > watermark`.
+    Exclude,
+    /// Keep NULL-timestamp rows: `(ts < held_max OR ts IS NULL)`. A full
+    /// copy has no watermark filter and copies them today.
+    Keep,
+}
+
+/// Render the [`SqlDialect::watermark_hold_back`] predicate from a column
+/// reference and a timestamp literal the dialect has already rendered.
+///
+/// Shared so every dialect builds the same shape around its own quoting and
+/// literal form.
+pub fn hold_back_predicate(column: &str, literal: &str, nulls: NullTimestamps) -> String {
+    match nulls {
+        NullTimestamps::Exclude => format!("{column} < {literal}"),
+        NullTimestamps::Keep => format!("({column} < {literal} OR {column} IS NULL)"),
+    }
+}
+
 /// The warehouse-visible kind of an object already occupying a target, as
 /// reported by [`WarehouseAdapter::object_kind`] (#2037).
 ///
@@ -1318,6 +1346,32 @@ pub trait SqlDialect: Send + Sync {
         &self,
         timestamp_col: &str,
         last_watermark: Option<&DateTime<Utc>>,
+    ) -> AdapterResult<String>;
+
+    /// Predicate that holds back the newest source timestamp (#2376).
+    ///
+    /// Incremental replication copies `ts > watermark`, and the next
+    /// watermark is `MAX(ts)` over the target. A row that lands in the source
+    /// later with a timestamp EQUAL to that maximum would fail the strict `>`
+    /// forever. So the runner reads `MAX(ts)` over the source once, before the
+    /// copy, and copies only the rows strictly below it. The newest batch
+    /// waits one run, until a newer timestamp arrives.
+    ///
+    /// Returns the bare predicate with no `WHERE` keyword: `ts < <held_max>`
+    /// for [`NullTimestamps::Exclude`], `(ts < <held_max> OR ts IS NULL)`
+    /// for [`NullTimestamps::Keep`]. Callers combine it with
+    /// [`Self::watermark_where`] (`AND`) or negate it (`NOT (...)`).
+    ///
+    /// The column reference and the literal must use the same quoting and
+    /// cast as [`Self::watermark_where`], so the two bounds compare the same
+    /// way. A dialect whose literal is coarser than the column must round the
+    /// literal DOWN here: a literal above the true maximum would let the
+    /// newest row through the `<`.
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &DateTime<Utc>,
+        nulls: NullTimestamps,
     ) -> AdapterResult<String>;
 
     /// SQL to describe a table's schema (column names and types).
@@ -3286,6 +3340,15 @@ pub(crate) mod test_dialects {
     pub(crate) struct StubDialect(pub(crate) LiteralEscape);
 
     impl SqlDialect for StubDialect {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn literal_escape(&self) -> LiteralEscape {
             self.0
         }

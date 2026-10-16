@@ -3597,6 +3597,13 @@ pub struct TableProgress {
     pub duration_ms: u64,
     /// When this table completed.
     pub completed_at: chrono::DateTime<chrono::Utc>,
+    /// The source `MAX(timestamp_column)` an incremental copy held back
+    /// (#2376): the copy took only rows below it, plus NULL-timestamp rows.
+    /// A resume that skips this table runs its `row_count` check against
+    /// the same cutoff. `None` means the copy had no cutoff, which is also
+    /// how a row written before this field existed reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_max: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The replication execution identity a checkpoint belongs to (#1549).
@@ -13706,6 +13713,7 @@ mod tests {
             error: None,
             duration_ms: 120,
             completed_at: Utc::now(),
+            held_max: None,
         };
         let p2 = TableProgress {
             index: 1,
@@ -13715,6 +13723,7 @@ mod tests {
             error: Some("connection timeout".to_string()),
             duration_ms: 5000,
             completed_at: Utc::now(),
+            held_max: None,
         };
         let p3 = TableProgress {
             index: 2,
@@ -13724,6 +13733,7 @@ mod tests {
             error: None,
             duration_ms: 85,
             completed_at: Utc::now(),
+            held_max: None,
         };
 
         store.record_table_progress("run-001", &p1).unwrap();
@@ -13739,6 +13749,45 @@ mod tests {
         assert!(progress.tables[1].error.is_some());
         assert_eq!(progress.tables[2].table_key, "cat.sch.tbl_c");
         assert_eq!(progress.tables[2].status, TableStatus::Success);
+    }
+
+    /// #2376: the hold-back cutoff round-trips through the checkpoint row,
+    /// and a row written before the field existed reads as "no cutoff".
+    #[test]
+    fn test_table_progress_held_max_round_trips_and_defaults_to_none() {
+        use chrono::TimeZone;
+        let (store, _dir) = temp_store();
+        store
+            .init_run_progress("run-001", &planned_keys(1), None)
+            .unwrap();
+        let held = Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        store
+            .record_table_progress(
+                "run-001",
+                &TableProgress {
+                    index: 0,
+                    table_key: "cat.sch.tbl_a".to_string(),
+                    asset_key: vec!["tbl_a".into()],
+                    status: TableStatus::Success,
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: Utc::now(),
+                    held_max: Some(held),
+                },
+            )
+            .unwrap();
+        let progress = store.get_run_progress("run-001").unwrap().unwrap();
+        assert_eq!(progress.tables[0].held_max, Some(held));
+
+        let old_row = r#"{"index":0,"table_key":"c.s.t","asset_key":["t"],"status":"Success","error":null,"duration_ms":1,"completed_at":"2026-09-15T10:00:00Z"}"#;
+        let parsed: TableProgress = serde_json::from_str(old_row).unwrap();
+        assert_eq!(parsed.held_max, None);
+        let none_row = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            none_row.get("held_max").is_none(),
+            "a row with no cutoff keeps today's shape: {none_row}"
+        );
     }
 
     #[test]
@@ -13829,6 +13878,7 @@ mod tests {
                     error: None,
                     duration_ms: 1,
                     completed_at: chrono::Utc::now(),
+                    held_max: None,
                 },
             )
             .unwrap();
@@ -14455,6 +14505,7 @@ mod tests {
                         },
                         duration_ms: 100,
                         completed_at: Utc::now(),
+                        held_max: None,
                     },
                 )
                 .unwrap();
@@ -14489,6 +14540,7 @@ mod tests {
             error: None,
             duration_ms: 100,
             completed_at: Utc::now(),
+            held_max: None,
         }
     }
 

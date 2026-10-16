@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The browser UI can apply a plan that is bound to a data product (#2323). Before, the plan screen showed no Apply button for it. Now it shows a **Spec digest you approved** box. The box is empty when the page opens, and nothing on the page fills it in: not the plan, not the product status, not any response. Apply stays off until the plan is approved and the box holds a digest. The page asks you to confirm, repeats the digest, and sends exactly what you typed (without surrounding spaces) as `expect_spec_digest`. The engine still refuses a product-bound apply with a missing or different digest. Its mismatch message names both digests. The plan's digest is not a secret; the check only works when the digest you type comes from the approval (`approval.spec_digest` in `rocky product status`). The page says so under the box. The spec-drift card now compares the plan with the approved digest, and says when no approval is recorded. `POST /api/v1/jobs/apply` now answers `400 bad_request`, before it takes the lock, for an `expect_spec_digest` that is empty, holds a space or control character, starts with `-`, or is over 200 characters. A real digest such as `sha256:<hex>` is unaffected.
 
+### Fixed
+
+- Incremental replication no longer skips a late row whose timestamp equals the watermark (#2376). Before, a run copied `ts > watermark` and the next watermark was the target's `MAX(ts)`. A row that landed later with that same timestamp failed the strict `>` forever. Now, for `strategy = "incremental"`, Rocky reads `MAX(ts)` over the source once before the copy and copies only rows below it: `ts > watermark AND ts < <source max>`. What changes:
+  - The newest batch lands one run later. This includes the first run and a rebuild after schema drift.
+  - A source that stops changing keeps its last batch until a row with a newer timestamp arrives. The materialization's `notes` say how many rows were held back, and a run that copied nothing says `N rows held back until newer data arrives`.
+  - `row_count` counts the source rows below the cutoff, plus the rows with a NULL timestamp. A real mismatch still fails it. A resumed run checks a skipped table against the cutoff its checkpoint stored. A skipped table that was pruned as unchanged has no stored cutoff, so the resume reads the source `MAX` for it.
+  - NULL timestamps behave as before: a full copy keeps them, an incremental copy skips them.
+  - `freshness` and `row_count_anomaly` lag one run, because the target does not have the newest batch yet.
+  - Each incremental table costs one to three more queries per run: the source `MAX`, a count of the held-back rows, and a source count for `row_count` when that check is on. This matters on per-query billing such as BigQuery.
+  - An empty or all-NULL source has no maximum and is copied as before. `microbatch`, `merge` and transformation models are unchanged. `rocky plan` still shows the SQL without the second bound.
+
+  `SqlDialect` gains a required method, `watermark_hold_back`. A custom dialect must implement it, with the same column reference and literal as its `watermark_where`. `rocky init-adapter` scaffolds it.
+
 ## [1.83.0] — 2026-10-15
 
 ### Added

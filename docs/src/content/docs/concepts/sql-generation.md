@@ -74,16 +74,17 @@ ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
 
 ## Incremental Copy
 
-This is the core replication statement. It copies only the rows newer than the last watermark Rocky recorded for the table. The `_loaded_by` column appears only when the pipeline declares it in `metadata_columns`:
+This is the core replication statement. It copies the rows newer than the last watermark Rocky recorded for the table, and older than the newest source timestamp. The `_loaded_by` column appears only when the pipeline declares it in `metadata_columns`:
 
 ```sql
 INSERT INTO <target_catalog>.<target_schema>.<table>
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM <source_catalog>.<source_schema>.<table>
 WHERE _fivetran_synced > TIMESTAMP '<last watermark>'
+  AND _fivetran_synced < TIMESTAMP '<newest source timestamp>'
 ```
 
-Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal. There is no correlated subquery against the target table.
+Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal. There is no correlated subquery against the target table. Just before the copy, Rocky reads `MAX(_fivetran_synced)` over the source and writes it in as the second literal. The newest batch waits for a later run, so a late row with the same timestamp is not skipped. `rocky plan` shows the statement without the second bound. See [Incremental Processing](/concepts/incremental/#how-rocky-advances-the-watermark).
 
 ## Full Refresh
 

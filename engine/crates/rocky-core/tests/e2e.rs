@@ -21,6 +21,15 @@ use tempfile::TempDir;
 struct TestDialect;
 
 impl SqlDialect for TestDialect {
+    fn watermark_hold_back(
+        &self,
+        _timestamp_col: &str,
+        _held_max: &chrono::DateTime<chrono::Utc>,
+        _nulls: rocky_core::traits::NullTimestamps,
+    ) -> AdapterResult<String> {
+        unimplemented!("not used by this test dialect")
+    }
+
     fn literal_escape(&self) -> rocky_core::traits::LiteralEscape {
         rocky_core::traits::LiteralEscape::Standard
     }

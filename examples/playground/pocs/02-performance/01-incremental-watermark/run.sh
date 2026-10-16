@@ -16,7 +16,9 @@ echo "=== Run 1 (initial) ==="
 rocky -c rocky.toml -o json run --filter source=events > expected/run1.json
 run1_rows=$(target_rows)
 echo "    target rows: $run1_rows"
-[ "$run1_rows" = "500" ] || { echo "FAIL: expected 500 target rows after the initial run, got $run1_rows" >&2; exit 1; }
+# The newest source row (one per timestamp here) is held back until a newer
+# timestamp arrives (#2376), so the first run lands 499 of the 500 rows.
+[ "$run1_rows" = "499" ] || { echo "FAIL: expected 499 target rows after the initial run, got $run1_rows" >&2; exit 1; }
 
 echo "=== State after run 1 ==="
 rocky state 2>&1 | tail -10
@@ -36,9 +38,10 @@ echo "=== State after run 2 ==="
 rocky state 2>&1 | tail -10
 
 echo
-# The incremental run must append the 25 delta rows to the 500 already loaded.
+# The incremental run lands the row run 1 held back plus 24 of the 25 delta
+# rows; the newest delta row waits for a later run (#2376).
 # Asserted, not just echoed: a bootstrap watermark of wall-clock time would
-# filter the delta out and leave this at 500 silently. This POC now fails loudly
+# filter the delta out and leave this at 499 silently. This POC now fails loudly
 # if that regresses.
-[ "$run2_rows" = "525" ] || { echo "FAIL: expected 525 target rows after the incremental run, got $run2_rows (delta not copied)" >&2; exit 1; }
-echo "POC complete: incremental appended the 25 delta rows (target now 525)."
+[ "$run2_rows" = "524" ] || { echo "FAIL: expected 524 target rows after the incremental run, got $run2_rows (delta not copied)" >&2; exit 1; }
+echo "POC complete: incremental appended the held-back row and 24 delta rows (target now 524); the newest row waits for newer data."

@@ -759,6 +759,15 @@ mod tests {
 
     struct D;
     impl SqlDialect for D {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn name(&self) -> &'static str {
             "test"
         }

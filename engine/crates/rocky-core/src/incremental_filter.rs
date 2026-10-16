@@ -358,6 +358,15 @@ mod tests {
 
     struct Ansi;
     impl SqlDialect for Ansi {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,

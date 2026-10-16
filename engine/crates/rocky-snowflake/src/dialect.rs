@@ -10,13 +10,40 @@
 
 use std::fmt::Write;
 
-use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
 /// Snowflake SQL dialect.
 #[derive(Debug, Clone, Default)]
 pub struct SnowflakeSqlDialect;
+
+/// The column reference both watermark bounds share.
+///
+/// Double-quoted to match Rocky's quoted-identifier convention
+/// (`format_table_ref` / `merge_into`), which reference columns quoted
+/// (case-sensitive, lowercase-preserving). An *unquoted* reference folds to
+/// UPPER and raises `invalid identifier` against a column stored lowercase —
+/// which the quoted-create / bisection-seed path produces. (Trade-off: this
+/// is a fixed-case reference, so it will not match a column stored UPPER from
+/// an unquoted create — Rocky's own tables are quoted lowercase, so that's
+/// the case we target.)
+fn watermark_column(dialect: &SnowflakeSqlDialect, timestamp_col: &str) -> AdapterResult<String> {
+    validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
+    Ok(dialect.quote_identifier(timestamp_col))
+}
+
+/// The literal both watermark bounds share. Snowflake casts the string to
+/// `TIMESTAMP_NTZ` explicitly so the type matches the column under the
+/// default `TIMESTAMP_TYPE_MAPPING`; `%.f` keeps the fractional second.
+fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+    let literal = t
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+    format!("'{literal}'::TIMESTAMP_NTZ")
+}
 
 impl SqlDialect for SnowflakeSqlDialect {
     fn name(&self) -> &'static str {
@@ -213,25 +240,24 @@ impl SqlDialect for SnowflakeSqlDialect {
         timestamp_col: &str,
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {
-        validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-        // Snowflake casts string literals to TIMESTAMP_NTZ explicitly so the
-        // result type matches the column under the default
-        // `TIMESTAMP_TYPE_MAPPING` setting. Sub-second precision is
-        // preserved by chrono's `%.f` directive.
-        let literal = last_watermark
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
-            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-        // Double-quote the column to match Rocky's quoted-identifier
-        // convention (`format_table_ref` / `merge_into`), which reference
-        // columns quoted (case-sensitive, lowercase-preserving). An
-        // *unquoted* reference here folds to UPPER and raises `invalid
-        // identifier` against a column stored lowercase — which the
-        // quoted-create / bisection-seed path produces. Quoting fixes that
-        // case. (Trade-off: this is a fixed-case reference, so it will not
-        // match a column stored UPPER from an unquoted create — Rocky's own
-        // tables are quoted lowercase, so that's the case we target.)
-        let col_q = self.quote_identifier(timestamp_col);
-        Ok(format!("WHERE {col_q} > '{literal}'::TIMESTAMP_NTZ"))
+        let col_q = watermark_column(self, timestamp_col)?;
+        Ok(format!(
+            "WHERE {col_q} > {}",
+            watermark_literal(last_watermark)
+        ))
+    }
+
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {
+        Ok(hold_back_predicate(
+            &watermark_column(self, timestamp_col)?,
+            &watermark_literal(Some(held_max)),
+            nulls,
+        ))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -509,6 +535,31 @@ fn is_safe_snowflake_varchar_widening(target: &str, source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2376: the hold-back bound reuses `watermark_where`'s column and
+    /// literal, so the two bounds compare the same way.
+    #[test]
+    fn watermark_hold_back_matches_the_watermark_literal() {
+        use chrono::TimeZone;
+        use rocky_core::traits::NullTimestamps;
+        let d = dialect();
+        let held = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
+                .unwrap(),
+            "\"_loaded_at\" < '2026-09-15 10:00:00.250'::TIMESTAMP_NTZ"
+        );
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Keep)
+                .unwrap(),
+            "(\"_loaded_at\" < '2026-09-15 10:00:00.250'::TIMESTAMP_NTZ OR \"_loaded_at\" IS NULL)"
+        );
+        assert!(
+            d.watermark_hold_back("'; DROP", &held, NullTimestamps::Exclude)
+                .is_err()
+        );
+    }
 
     fn dialect() -> SnowflakeSqlDialect {
         SnowflakeSqlDialect

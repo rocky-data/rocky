@@ -12,7 +12,10 @@ fn missing_incremental_timestamp_fails_only_its_table_before_copy() {
         "CREATE SCHEMA raw__demo;
          CREATE TABLE raw__demo.orders AS SELECT 1 AS id, 'one' AS name;
          CREATE TABLE raw__demo.events AS
-             SELECT 2 AS id, TIMESTAMP '2026-09-01 00:00:00' AS TS;",
+             SELECT 2 AS id, TIMESTAMP '2026-09-01 00:00:00' AS TS;
+         -- A newer row: the #2376 hold-back keeps the newest batch back, so
+         -- without it the row above would not copy on this first run.
+         INSERT INTO raw__demo.events VALUES (3, TIMESTAMP '2026-09-02 00:00:00');",
     )
     .expect("seed source tables");
     drop(conn);

@@ -14,7 +14,7 @@
 //! `SqlDialect`, or this case starts failing for the wrong reason.
 
 use chrono::{DateTime, Utc};
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, NullTimestamps, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 
 struct NoLexerFact;
@@ -54,6 +54,15 @@ impl SqlDialect for NoLexerFact {
         &self,
         _timestamp_col: &str,
         _last_watermark: Option<&DateTime<Utc>>,
+    ) -> AdapterResult<String> {
+        Ok(String::new())
+    }
+
+    fn watermark_hold_back(
+        &self,
+        _timestamp_col: &str,
+        _held_max: &DateTime<Utc>,
+        _nulls: NullTimestamps,
     ) -> AdapterResult<String> {
         Ok(String::new())
     }

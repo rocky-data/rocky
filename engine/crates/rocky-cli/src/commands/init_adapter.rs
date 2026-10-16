@@ -194,6 +194,7 @@ fn render_dialect_rs(name: &str, name_pascal: &str) -> String {
 
 use rocky_ir::{{ColumnSelection, MetadataColumn}};
 use rocky_core::traits::{{AdapterError, AdapterResult, LiteralEscape, SqlDialect}};
+use rocky_core::traits::{{NullTimestamps, hold_back_predicate}};
 
 /// {name} SQL dialect.
 #[derive(Debug, Clone, Default)]
@@ -298,6 +299,21 @@ impl SqlDialect for {name_pascal}SqlDialect {{
             .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         Ok(format!("WHERE {{timestamp_col}} > TIMESTAMP '{{literal}}'"))
+    }}
+
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {{
+        // Holds back the newest source timestamp: incremental replication
+        // copies only rows strictly below the source MAX read before the
+        // copy, so a late row tied with the watermark is not skipped. Use
+        // the same column reference and literal as `watermark_where`. If
+        // your literal is coarser than the column, round it DOWN here.
+        let literal = format!("TIMESTAMP '{{}}'", held_max.format("%Y-%m-%d %H:%M:%S%.f"));
+        Ok(hold_back_predicate(timestamp_col, &literal, nulls))
     }}
 
     fn describe_table_sql(&self, table_ref: &str) -> String {{
@@ -432,6 +448,7 @@ mod tests {
             "fn merge_into(",
             "fn select_clause(",
             "fn watermark_where(",
+            "fn watermark_hold_back(",
             "fn describe_table_sql(",
             "fn drop_table_sql(",
             "fn create_catalog_sql(",

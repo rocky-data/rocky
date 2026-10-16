@@ -187,6 +187,21 @@ impl WarehouseAdapter for RecordingWarehouseAdapter {
 struct RecordingDialect;
 
 impl SqlDialect for RecordingDialect {
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: rocky_core::traits::NullTimestamps,
+    ) -> AdapterResult<String> {
+        rocky_sql::validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
+        let literal = format!("TIMESTAMP '{}'", held_max.format("%Y-%m-%d %H:%M:%S%.f"));
+        Ok(rocky_core::traits::hold_back_predicate(
+            timestamp_col,
+            &literal,
+            nulls,
+        ))
+    }
+
     fn literal_escape(&self) -> LiteralEscape {
         LiteralEscape::Standard
     }

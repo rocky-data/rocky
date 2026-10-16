@@ -826,6 +826,15 @@ mod unit_tests {
 
     struct SnowflakeNamed;
     impl crate::traits::SqlDialect for SnowflakeNamed {
+        fn watermark_hold_back(
+            &self,
+            _timestamp_col: &str,
+            _held_max: &chrono::DateTime<chrono::Utc>,
+            _nulls: crate::traits::NullTimestamps,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!("not used by this test dialect")
+        }
+
         fn name(&self) -> &'static str {
             "snowflake"
         }

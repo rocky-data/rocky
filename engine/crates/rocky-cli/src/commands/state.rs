@@ -648,6 +648,7 @@ table = "other"
                     error: None,
                     duration_ms: 1,
                     completed_at: Utc::now(),
+                    held_max: None,
                 },
             )
             .unwrap();

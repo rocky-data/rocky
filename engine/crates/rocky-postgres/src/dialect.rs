@@ -32,7 +32,9 @@
 
 use std::sync::Arc;
 
-use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -209,12 +211,35 @@ fn watermark_where(
     last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> AdapterResult<String> {
     validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
-    // `%.f` keeps a fractional second so the row the watermark was read from
-    // does not re-pass the next run's `>` filter (#2004).
-    let literal = last_watermark
+    Ok(format!(
+        "WHERE {timestamp_col} > {}",
+        watermark_literal(last_watermark)
+    ))
+}
+
+/// [`SqlDialect::watermark_hold_back`] for PostgreSQL and Redshift: the same
+/// column and literal as [`watermark_where`] (#2376).
+fn watermark_hold_back(
+    timestamp_col: &str,
+    held_max: &chrono::DateTime<chrono::Utc>,
+    nulls: NullTimestamps,
+) -> AdapterResult<String> {
+    validation::validate_identifier(timestamp_col).map_err(AdapterError::new)?;
+    Ok(hold_back_predicate(
+        timestamp_col,
+        &watermark_literal(Some(held_max)),
+        nulls,
+    ))
+}
+
+/// The `TIMESTAMP '...'` literal both watermark bounds share. `%.f` keeps a
+/// fractional second so the row the watermark was read from does not re-pass
+/// the next run's `>` filter (#2004).
+fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+    let literal = t
         .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
         .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-    Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
+    format!("TIMESTAMP '{literal}'")
 }
 
 /// Split a bare `[catalog.]schema.table` reference this dialect rendered.
@@ -488,6 +513,15 @@ impl SqlDialect for PostgresDialect {
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {
         watermark_where(timestamp_col, last_watermark)
+    }
+
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {
+        watermark_hold_back(timestamp_col, held_max, nulls)
     }
 
     /// PostgreSQL has no `DESCRIBE`; this is the `information_schema` query
@@ -792,6 +826,15 @@ impl SqlDialect for RedshiftDialect {
         watermark_where(timestamp_col, last_watermark)
     }
 
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {
+        watermark_hold_back(timestamp_col, held_max, nulls)
+    }
+
     /// `svv_columns`, which the adapter's `describe_table` also reads:
     /// `information_schema.columns` leaves out late-binding views and
     /// external (Spectrum) tables.
@@ -925,6 +968,56 @@ impl SqlDialect for RedshiftDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2376: the hold-back bound reuses `watermark_where`'s column and
+    /// literal, so the two bounds compare the same way.
+    #[test]
+    fn watermark_hold_back_matches_the_watermark_literal() {
+        use chrono::TimeZone;
+        use rocky_core::traits::NullTimestamps;
+        let d = PostgresDialect::new();
+        let held = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
+                .unwrap(),
+            "_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250'"
+        );
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Keep)
+                .unwrap(),
+            "(_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250' OR _loaded_at IS NULL)"
+        );
+        assert!(
+            d.watermark_hold_back("'; DROP", &held, NullTimestamps::Exclude)
+                .is_err()
+        );
+    }
+
+    /// #2376: the hold-back bound reuses `watermark_where`'s column and
+    /// literal, so the two bounds compare the same way.
+    #[test]
+    fn redshift_watermark_hold_back_matches_the_watermark_literal() {
+        use chrono::TimeZone;
+        use rocky_core::traits::NullTimestamps;
+        let d = RedshiftDialect::new();
+        let held = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
+                .unwrap(),
+            "_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250'"
+        );
+        assert_eq!(
+            d.watermark_hold_back("_loaded_at", &held, NullTimestamps::Keep)
+                .unwrap(),
+            "(_loaded_at < TIMESTAMP '2026-09-15 10:00:00.250' OR _loaded_at IS NULL)"
+        );
+        assert!(
+            d.watermark_hold_back("'; DROP", &held, NullTimestamps::Exclude)
+                .is_err()
+        );
+    }
 
     fn keys(k: &[&str]) -> Vec<Arc<str>> {
         k.iter().map(|s| Arc::from(*s)).collect()

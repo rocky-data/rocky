@@ -183,14 +183,17 @@ Value: [
 
 At the start of each table's replication, Rocky reads the watermark from the state store.
 
-1. **No watermark (first run).** Rocky performs a full refresh, copying all rows from the source.
-2. **Watermark exists (incremental run).** Rocky generates an incremental query that copies only rows newer than the stored watermark:
+1. **No watermark (first run).** Rocky performs a full refresh. It copies every source row except the newest batch, which waits for a later run.
+2. **Watermark exists (incremental run).** Rocky generates an incremental query that copies only rows newer than the stored watermark and older than the newest source timestamp:
 
    ```sql
    SELECT *, CAST(NULL AS STRING) AS _loaded_by
    FROM fivetran_catalog.src__acme__us_west__shopify.orders
-   WHERE _fivetran_synced > TIMESTAMP '2025-03-15T14:30:00Z'
+   WHERE _fivetran_synced > TIMESTAMP '2025-03-15 14:30:00'
+     AND _fivetran_synced < TIMESTAMP '2025-03-15 15:00:00'
    ```
+
+   [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes) explains why Rocky holds back the newest batch.
 3. **Update.** After a successful copy, Rocky reads `MAX(<timestamp_column>)` from the target and stores it as the new watermark. The next run picks up from there.
 
 ## Inspecting state

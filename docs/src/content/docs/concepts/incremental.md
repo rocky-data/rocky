@@ -31,35 +31,57 @@ The strategy needs a timestamp column whose values only ever increase, typically
 
 ### How Rocky advances the watermark
 
+Each run copies the rows above the watermark and below the newest source timestamp. Before the copy, Rocky reads `MAX(<timestamp_column>)` over the source once. The rows at that maximum, the newest batch, wait for a later run.
+
 ```
  source rows, by their _fivetran_synced timestamp
    r1     r2     r3     r4       r5     r6       r7     r8
   08:00  08:30  09:10  09:45    10:20  10:55    11:30  11:55
  ───┴──────┴──────┴──────┴────────┴──────┴────────┴──────┴──────►
 
-  run 1 at 09:50      run 2 at 11:00      run 3 at 12:00
-  no watermark yet    WHERE ts > 09:45    WHERE ts > 10:55
-  full refresh:       copies r5, r6       copies r7, r8
-  copies r1..r4
-        │                    │                    │
-        ▼                    ▼                    ▼
-  watermark = 09:45    watermark = 10:55    watermark = 11:55
+  run 1 at 09:50       run 2 at 11:00         run 3 at 12:00
+  no watermark yet     ts > 09:10             ts > 10:20
+  ts < 09:45           AND ts < 10:55         AND ts < 11:55
+  copies r1..r3        copies r4, r5          copies r6, r7
+  holds back r4        holds back r6          holds back r8
+        │                     │                      │
+        ▼                     ▼                      ▼
+  watermark = 09:10    watermark = 10:20      watermark = 11:30
 
   Rocky flushes watermarks after copying. A committed copy whose
   watermark flush fails leaves recovery intent for the next attempt.
 ```
 
-Rocky keys the watermark by the fully qualified table name (`catalog.schema.table`), and stores the maximum timestamp it saw in the batch.
+Rocky keys the watermark by the fully qualified table name (`catalog.schema.table`). After the copy, it stores `MAX(<timestamp_column>)` over the target, the newest row it loaded.
 
-The first run has no watermark, so it copies every row and establishes the baseline. When the model declares a lakehouse `format` (`delta_table` / `iceberg_table`) with `[format_options]`, that format is applied on this first materialization. The baseline table is created in the requested Delta or Iceberg shape rather than as a plain table. The same holds for the `delete_insert`, `microbatch`, and `time_interval` strategies. See [Lakehouse formats](/reference/model-format/) in the model format reference.
+Rocky holds back the newest batch because a sync can land in parts. Say a sync writes some rows stamped `09:45` before run 1 and the rest after it. If run 1 copied the first part, the watermark would become `09:45`, and the strict `>` would skip the rest forever. Held back, the whole `09:45` batch lands on run 2.
 
-Every later run filters on the stored watermark:
+The first run has no watermark. It copies every row below the newest source timestamp, plus the rows whose timestamp is NULL, and establishes the baseline. When the model declares a lakehouse `format` (`delta_table` / `iceberg_table`) with `[format_options]`, that format is applied on this first materialization. The baseline table is created in the requested Delta or Iceberg shape rather than as a plain table. The same holds for the `delete_insert`, `microbatch`, and `time_interval` strategies. See [Lakehouse formats](/reference/model-format/) in the model format reference.
+
+Every later run filters on the stored watermark and the newest source timestamp:
 
 ```sql
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM source_catalog.source_schema.orders
-WHERE _fivetran_synced > TIMESTAMP '2025-03-15T14:30:00Z'
+WHERE _fivetran_synced > TIMESTAMP '2025-03-15 14:30:00'
+  AND _fivetran_synced < TIMESTAMP '2025-03-15 15:00:00'
 ```
+
+`rocky plan` shows this query without the second bound. Rocky reads the newest source timestamp only when the copy runs.
+
+### What the hold-back changes
+
+The hold-back applies to `strategy = "incremental"` on a replication pipeline. `microbatch`, `merge` and transformation models do not use it. What it changes:
+
+- **The newest batch lands one run later.** This includes the first run, and a rebuild after schema drift.
+- **A source that stops changing keeps its last batch.** The batch lands when a row with a newer timestamp arrives. A run that copied nothing says so in its materialization note: `N rows held back until newer data arrives`.
+- **`row_count` counts the source rows below the cutoff,** plus the rows whose timestamp is NULL. Those are the rows the copy could land, so a real mismatch still fails the check.
+- **NULL timestamps behave as before.** A full copy keeps them. An incremental copy skips them, because `ts > watermark` is not true for NULL.
+- **`freshness` and `row_count_anomaly` lag one run.** Both read the target, which does not have the newest batch yet.
+- **Each incremental table costs one to three more queries per run:** the source `MAX`, a count of the held-back rows for the note, and a source count for `row_count` when that check is on. This matters on a warehouse that bills per query or per byte scanned, such as BigQuery.
+- **An empty source, or one whose timestamps are all NULL, has no maximum.** Rocky copies it as before, with no bound.
+
+Each copy with a cutoff says how many rows it held back, in the `notes` of its materialization.
 
 ### Configuration
 
@@ -74,7 +96,7 @@ timestamp_column = "_fivetran_synced"
 
 The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Rocky does not detect that case today. Run a full refresh to pick them up.
 
-The filter is a strict `>`. A row that arrives after a run, with a timestamp equal to the stored watermark, is also skipped. Replication has no `lookback` setting for this case, and Rocky does not warn about it. A transformation model can set `lookback`; the compiler warns (`W056`) when it does not.
+The filter is a strict `>`. The hold-back above keeps a late row with the same timestamp as the newest batch from being skipped. A row that arrives with a timestamp at or below the stored watermark, after a newer batch already landed, is still skipped. Replication has no `lookback` setting for this case. A transformation model can set `lookback`; the compiler warns (`W056`) when it does not.
 
 ### Recovering an interrupted replication
 

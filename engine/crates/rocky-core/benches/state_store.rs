@@ -44,6 +44,7 @@ fn sample_progress(index: usize) -> TableProgress {
         error: None,
         duration_ms: 120,
         completed_at: Utc::now(),
+        held_max: None,
     }
 }
 

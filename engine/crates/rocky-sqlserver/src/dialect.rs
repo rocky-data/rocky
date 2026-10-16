@@ -21,7 +21,9 @@
 
 use std::sync::Arc;
 
-use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -155,6 +157,31 @@ impl SqlServerDialect {
         let h = hoist(select_sql);
         format!("{}INSERT INTO {target}\n{}", h.prefix(), h.body.trim())
     }
+}
+
+/// Which way a watermark literal rounds to `DATETIME2(7)`'s 100 ns tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickRounding {
+    /// Ceiling, for the `>` of [`SqlDialect::watermark_where`].
+    Up,
+    /// Floor, for the `<` of [`SqlDialect::watermark_hold_back`].
+    Down,
+}
+
+/// `YYYY-MM-DD hh:mm:ss.fffffff`, exactly the seven fractional digits
+/// `DATETIME2(7)` keeps, rounded to its 100 ns tick in the given direction.
+fn watermark_literal_text(t: &chrono::DateTime<chrono::Utc>, rounding: TickRounding) -> String {
+    use chrono::Timelike;
+    let sub_tick = i64::from(t.nanosecond() % 100);
+    let t = match rounding {
+        TickRounding::Up => *t + chrono::Duration::nanoseconds((100 - sub_tick) % 100),
+        TickRounding::Down => *t - chrono::Duration::nanoseconds(sub_tick),
+    };
+    format!(
+        "{}.{:07}",
+        t.format("%Y-%m-%d %H:%M:%S"),
+        t.nanosecond() % 1_000_000_000 / 100
+    )
 }
 
 impl SqlDialect for SqlServerDialect {
@@ -415,29 +442,41 @@ impl SqlDialect for SqlServerDialect {
         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     ) -> AdapterResult<String> {
         check_identifier(timestamp_col)?;
+        // Round UP to DATETIME2's 100 ns tick. A `DATETIME` value is a
+        // 1/300 s tick that the server compares exactly (`.003` is 3.333… ms)
+        // while it reads back truncated (3_333_333 ns); a truncated or
+        // rounded literal would sit below it and re-admit the row it came
+        // from. No `DATETIME` or `DATETIME2(7)` value lies strictly between
+        // the true value and this ceiling, so no new row is skipped.
         let literal = last_watermark.map_or_else(
             || "1970-01-01 00:00:00.0000000".to_string(),
-            |t| {
-                use chrono::Timelike;
-                // Round UP to DATETIME2's 100 ns tick. A `DATETIME` value is
-                // a 1/300 s tick that the server compares exactly
-                // (`.003` is 3.333… ms) while it reads back truncated
-                // (3_333_333 ns); a truncated or rounded literal would sit
-                // below it and re-admit the row it came from. No `DATETIME`
-                // or `DATETIME2(7)` value lies strictly between the true
-                // value and this ceiling, so no new row is skipped.
-                let t = *t
-                    + chrono::Duration::nanoseconds(i64::from((100 - t.nanosecond() % 100) % 100));
-                format!(
-                    "{}.{:07}",
-                    t.format("%Y-%m-%d %H:%M:%S"),
-                    t.nanosecond() % 1_000_000_000 / 100
-                )
-            },
+            |t| watermark_literal_text(t, TickRounding::Up),
         );
         Ok(format!(
             "WHERE {} > CAST('{literal}' AS DATETIME2(7))",
             quote_ident(timestamp_col)
+        ))
+    }
+
+    /// `[col] < CAST('…' AS DATETIME2(7))`, the column and cast of
+    /// [`Self::watermark_where`] (#2376). The literal rounds DOWN to the
+    /// 100 ns tick: `MAX` over a `DATETIME` column reads back truncated
+    /// (6_666_666 ns for a value the server holds as 6.666… ms), so the
+    /// truncated literal sits just below the true maximum and the newest
+    /// row stays held back. No value of the column lies between them, so no
+    /// older row is held back by mistake.
+    fn watermark_hold_back(
+        &self,
+        timestamp_col: &str,
+        held_max: &chrono::DateTime<chrono::Utc>,
+        nulls: NullTimestamps,
+    ) -> AdapterResult<String> {
+        check_identifier(timestamp_col)?;
+        let literal = watermark_literal_text(held_max, TickRounding::Down);
+        Ok(hold_back_predicate(
+            &quote_ident(timestamp_col),
+            &format!("CAST('{literal}' AS DATETIME2(7))"),
+            nulls,
         ))
     }
 
@@ -800,6 +839,39 @@ fn decimal_parts(t: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2376: the hold-back bound uses `watermark_where`'s column and cast,
+    /// and rounds DOWN to the 100 ns tick where `watermark_where` rounds UP.
+    #[test]
+    fn watermark_hold_back_rounds_down_to_the_tick() {
+        use chrono::TimeZone;
+        use rocky_core::traits::NullTimestamps;
+        let held = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::nanoseconds(123_456_700);
+        assert_eq!(
+            d().watermark_hold_back("_loaded_at", &held, NullTimestamps::Exclude)
+                .unwrap(),
+            "[_loaded_at] < CAST('2026-09-15 10:00:00.1234567' AS DATETIME2(7))"
+        );
+        // A `DATETIME` maximum reads back truncated (6_666_666 ns for a value
+        // held as 6.666... ms). The `<` literal must sit at or below the true
+        // value, so it floors to `.0066666`; the `>` literal ceils to `.0066667`.
+        let datetime_tick = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            + chrono::Duration::nanoseconds(6_666_666);
+        assert_eq!(
+            d().watermark_hold_back("ts", &datetime_tick, NullTimestamps::Keep)
+                .unwrap(),
+            "([ts] < CAST('2026-01-01 00:00:00.0066666' AS DATETIME2(7)) OR [ts] IS NULL)"
+        );
+        assert_eq!(
+            d().watermark_where("ts", Some(&datetime_tick)).unwrap(),
+            "WHERE [ts] > CAST('2026-01-01 00:00:00.0066667' AS DATETIME2(7))"
+        );
+        assert!(
+            d().watermark_hold_back("ts]", &datetime_tick, NullTimestamps::Exclude)
+                .is_err()
+        );
+    }
 
     fn keys(k: &[&str]) -> Vec<Arc<str>> {
         k.iter().map(|s| Arc::from(*s)).collect()
@@ -1244,6 +1316,15 @@ mod tests {
         // The trait defaults keep LIMIT for every other dialect.
         struct Default_;
         impl SqlDialect for Default_ {
+            fn watermark_hold_back(
+                &self,
+                _timestamp_col: &str,
+                _held_max: &chrono::DateTime<chrono::Utc>,
+                _nulls: rocky_core::traits::NullTimestamps,
+            ) -> AdapterResult<String> {
+                unimplemented!("not used by this test dialect")
+            }
+
             fn format_table_ref(&self, _: &str, _: &str, _: &str) -> AdapterResult<String> {
                 unimplemented!()
             }

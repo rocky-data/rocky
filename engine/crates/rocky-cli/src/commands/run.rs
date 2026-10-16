@@ -167,6 +167,20 @@ struct TableResult {
     /// Deferred watermark — written in a single batch after all tables
     /// complete, eliminating Mutex contention during concurrent processing.
     deferred_watermark: Option<DeferredWatermark>,
+    /// The newest-timestamp cutoff this copy held back (#2376). `Some` only
+    /// for an incremental copy of a source with a non-NULL `MAX(ts)`. The
+    /// `row_count` check counts the source below it, and the checkpoint row
+    /// stores it for a resume.
+    hold_back: Option<HoldBackCutoff>,
+}
+
+/// The newest-timestamp cutoff one incremental replication copy applied
+/// (#2376): the copy took only the source rows with `timestamp_column <
+/// held_max`, plus the rows whose timestamp is NULL on a full copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoldBackCutoff {
+    timestamp_column: String,
+    held_max: chrono::DateTime<Utc>,
 }
 
 /// Table tagging deferred to post-run phase.
@@ -5156,6 +5170,9 @@ pub async fn run_with_explicit_contracts(
     // so row-level assertions run regardless of row_count/freshness config.
     let mut assertion_targets: Vec<(TableRef, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
+    // The hold-back cutoff of each row-count-checked source, keyed by the
+    // source full name (#2376).
+    let mut row_count_cutoffs: HashMap<String, HoldBackCutoff> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
     // Resolved target identity -> the source that claimed it. A shadow
     // `--shadow-schema` replaces the resolved schema template outright, so a
@@ -6147,13 +6164,20 @@ pub async fn run_with_explicit_contracts(
         .flat_map(|replacement| replacement.required_targets.iter().cloned())
         .collect();
 
+    // The hold-back cutoff each completed table's copy stored (#2376). Its
+    // owed `row_count` check counts the source below it.
+    let mut resumed_held_max: HashMap<String, chrono::DateTime<Utc>> = HashMap::new();
     let completed_keys: std::collections::HashSet<String> = if let Some(prev) = resume_progress {
-        let keys: std::collections::HashSet<String> = prev
+        let completed = prev
             .tables
             .iter()
-            .filter(|t| t.status == rocky_core::state::TableStatus::Success)
-            .map(|t| t.table_key.clone())
+            .filter(|t| t.status == rocky_core::state::TableStatus::Success);
+        resumed_held_max = completed
+            .clone()
+            .filter_map(|t| t.held_max.map(|held| (t.table_key.clone(), held)))
             .collect();
+        let keys: std::collections::HashSet<String> =
+            completed.map(|t| t.table_key.clone()).collect();
         info!(
             resumed_from = prev.run_id,
             tables_skipped = keys.len(),
@@ -6544,6 +6568,7 @@ pub async fn run_with_explicit_contracts(
                         freshness_batch_refs: &mut freshness_batch_refs,
                         batch_asset_keys: &mut batch_asset_keys,
                         assertion_targets: &mut assertion_targets,
+                        row_count_cutoffs: &mut row_count_cutoffs,
                         deferred_tags: &mut deferred_tags,
                         deferred_watermarks: &mut deferred_watermarks,
                     },
@@ -6704,6 +6729,7 @@ pub async fn run_with_explicit_contracts(
                         freshness_batch_refs: &mut freshness_batch_refs,
                         batch_asset_keys: &mut batch_asset_keys,
                         assertion_targets: &mut assertion_targets,
+                        row_count_cutoffs: &mut row_count_cutoffs,
                         deferred_tags: &mut deferred_tags,
                         deferred_watermarks: &mut deferred_watermarks,
                     },
@@ -6798,6 +6824,7 @@ pub async fn run_with_explicit_contracts(
                             error: Some(msg.clone()),
                             duration_ms: 0,
                             completed_at: Utc::now(),
+                            held_max: None,
                         },
                     )
                     .await;
@@ -6831,6 +6858,7 @@ pub async fn run_with_explicit_contracts(
                         error: Some(msg.clone()),
                         duration_ms: 0,
                         completed_at: Utc::now(),
+                        held_max: None,
                     },
                 )
                 .await;
@@ -6949,6 +6977,7 @@ pub async fn run_with_explicit_contracts(
                             error: None,
                             duration_ms: 0,
                             completed_at: Utc::now(),
+                            held_max: None,
                         },
                     ) {
                         tracing::warn!(error = %e, "failed to record table progress for run ");
@@ -7144,6 +7173,7 @@ pub async fn run_with_explicit_contracts(
                                 freshness_batch_refs: &mut freshness_batch_refs,
                                 batch_asset_keys: &mut batch_asset_keys,
                                 assertion_targets: &mut assertion_targets,
+                                row_count_cutoffs: &mut row_count_cutoffs,
                                 deferred_tags: &mut deferred_tags,
                                 deferred_watermarks: &mut deferred_watermarks,
                             },
@@ -7301,7 +7331,9 @@ pub async fn run_with_explicit_contracts(
     for task in &resumed_tasks {
         collect_resumed_table_checks(
             shared_warehouse.as_ref(),
+            pipeline,
             task,
+            resumed_held_max.get(&table_key(task)).copied(),
             &mut CheckSinks {
                 pending_checks: &mut pending_checks,
                 source_batch_refs: &mut source_batch_refs,
@@ -7309,6 +7341,7 @@ pub async fn run_with_explicit_contracts(
                 freshness_batch_refs: &mut freshness_batch_refs,
                 batch_asset_keys: &mut batch_asset_keys,
                 assertion_targets: &mut assertion_targets,
+                row_count_cutoffs: &mut row_count_cutoffs,
             },
         )
         .await;
@@ -7323,6 +7356,7 @@ pub async fn run_with_explicit_contracts(
         pipeline_name,
         pipeline,
         &source_batch_refs,
+        &row_count_cutoffs,
         &target_batch_refs,
         &freshness_batch_refs,
         &batch_asset_keys,
@@ -8526,6 +8560,7 @@ async fn run_batched_checks(
     pipeline_name: &str,
     pipeline: &ReplicationPipelineConfig,
     source_batch_refs: &[TableRef],
+    row_count_cutoffs: &HashMap<String, HoldBackCutoff>,
     target_batch_refs: &[TableRef],
     freshness_batch_refs: &[TableRef],
     batch_asset_keys: &[(String, Vec<String>)],
@@ -8698,6 +8733,66 @@ async fn run_batched_checks(
         Ok(counts)
     }
 
+    /// One `SELECT COUNT(*) ... WHERE (ts < <held_max> OR ts IS NULL)` per
+    /// source copied with the newest timestamp held back (#2376): exactly
+    /// the rows that copy could land, so a real mismatch still fails. A
+    /// table the query could not answer for is recorded in `failures`, as on
+    /// the per-table path, and contributes no measurement.
+    async fn held_back_source_row_counts(
+        warehouse: &dyn WarehouseAdapter,
+        refs: &[&TableRef],
+        cutoffs: &HashMap<String, HoldBackCutoff>,
+        failures: &mut HashMap<String, String>,
+    ) -> Vec<BatchRowCountResult> {
+        let dialect = warehouse.dialect();
+        let mut counts = Vec::new();
+        for br in refs {
+            let Some(cutoff) = cutoffs.get(&br.full_name()) else {
+                continue;
+            };
+            let sql = match sql_gen::generate_held_back_source_row_count_sql(
+                dialect,
+                br,
+                &cutoff.timestamp_column,
+                &cutoff.held_max,
+            ) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    failures.insert(
+                        br.full_name(),
+                        format!("could not build the held-back row count query: {e}"),
+                    );
+                    continue;
+                }
+            };
+            match warehouse.execute_query(&sql).await {
+                Ok(result) => {
+                    match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                        Some(count) => counts.push(BatchRowCountResult {
+                            table: (*br).clone(),
+                            reading: BatchReading::Readable(count),
+                        }),
+                        None => {
+                            warn!(
+                                table = br.table.as_str(),
+                                "held-back row count returned no readable count"
+                            );
+                            failures.insert(
+                                br.full_name(),
+                                "the row count query returned no readable count".to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(table = br.table.as_str(), error = %e, "held-back row count failed");
+                    failures.insert(br.full_name(), format!("the row count query failed: {e}"));
+                }
+            }
+        }
+        counts
+    }
+
     /// One `SELECT COUNT(*), MAX(<timestamp_column>)` per table, for a
     /// freshness leg nothing batches. A table the query could not answer for
     /// is recorded in `freshness_failures`, in table order, and contributes
@@ -8802,6 +8897,16 @@ async fn run_batched_checks(
     let row_count_batch = batch_check.filter(|bc| bc.supports_row_counts());
     let freshness_batch = batch_check.filter(|bc| bc.supports_freshness());
 
+    // #2376: a source copied with the newest timestamp held back is counted
+    // below its cutoff, one table at a time, so the check compares the rows
+    // the copy could have landed. Every other source stays on the leg above.
+    // `source_batch_refs` itself is untouched: the result loop below pairs it
+    // with `target_batch_refs` by position.
+    let (held_back_sources, whole_sources): (Vec<&TableRef>, Vec<&TableRef>) = source_batch_refs
+        .iter()
+        .partition(|src| row_count_cutoffs.contains_key(&src.full_name()));
+    let whole_sources: Vec<TableRef> = whole_sources.into_iter().cloned().collect();
+
     // `join!`, not `try_join!`. `try_join!` returned the first leg's
     // error, cancelled the other two, and `?` ended the run — after the
     // data had already been written and before any table's checks were
@@ -8811,7 +8916,9 @@ async fn run_batched_checks(
     let (batched_source, batched_target, batched_freshness) = tokio::join!(
         async {
             match row_count_batch.filter(|_| row_count_enabled) {
-                Some(bc) => Some(bc.batch_row_counts(source_batch_refs).await),
+                // Every source is held back: nothing is left for the batch.
+                Some(_) if whole_sources.is_empty() => Some(Ok(Vec::new())),
+                Some(bc) => Some(bc.batch_row_counts(&whole_sources).await),
                 None => None,
             }
         },
@@ -8832,19 +8939,30 @@ async fn run_batched_checks(
         },
     );
 
-    let (source_counts, target_counts) = match (batched_source, batched_target) {
+    let (mut source_counts, target_counts) = match (batched_source, batched_target) {
         (Some(src), Some(tgt)) => (
-            fold_row_count_leg(src, source_batch_refs, "source", &mut source_count_failures),
+            fold_row_count_leg(src, &whole_sources, "source", &mut source_count_failures),
             fold_row_count_leg(tgt, target_batch_refs, "target", &mut target_count_failures),
         ),
         // Source first, then target, the order the per-table path has always
         // queried in.
         _ if row_count_enabled => (
-            per_table_row_counts(warehouse, source_batch_refs, &mut source_count_failures).await?,
+            per_table_row_counts(warehouse, &whole_sources, &mut source_count_failures).await?,
             per_table_row_counts(warehouse, target_batch_refs, &mut target_count_failures).await?,
         ),
         _ => (Vec::new(), Vec::new()),
     };
+    if row_count_enabled {
+        source_counts.extend(
+            held_back_source_row_counts(
+                warehouse,
+                &held_back_sources,
+                row_count_cutoffs,
+                &mut source_count_failures,
+            )
+            .await,
+        );
+    }
 
     let freshness_results: Vec<BatchFreshnessResult> = match batched_freshness {
         // A table the leg answered for but could not read is recorded with
@@ -17133,6 +17251,30 @@ pub(crate) async fn query_target_max_timestamp(
     target: &TableRef,
     timestamp_column: &str,
 ) -> Result<Option<chrono::DateTime<Utc>>> {
+    query_max_timestamp(warehouse, dialect, target, timestamp_column, "target").await
+}
+
+/// `MAX(<timestamp_column>) FROM <source>`: the newest source timestamp an
+/// incremental copy holds back (#2376). Read once per table, after drift
+/// handling and before the copy SQL is generated. `Ok(None)` (an empty or
+/// all-NULL source) means no cutoff. A failed read fails the table: copying
+/// without the cutoff is the tie bug the cutoff exists to prevent.
+async fn query_source_max_timestamp(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    source: &TableRef,
+    timestamp_column: &str,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    query_max_timestamp(warehouse, dialect, source, timestamp_column, "source").await
+}
+
+async fn query_max_timestamp(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    target: &TableRef,
+    timestamp_column: &str,
+    side: &str,
+) -> Result<Option<chrono::DateTime<Utc>>> {
     rocky_sql::validation::validate_identifier(timestamp_column)
         .with_context(|| format!("invalid watermark column '{timestamp_column}'"))?;
     let target_ref = dialect
@@ -17140,7 +17282,7 @@ pub(crate) async fn query_target_max_timestamp(
         .map_err(anyhow::Error::from)
         .with_context(|| {
             format!(
-                "could not format target table {} for watermark query",
+                "could not format {side} table {} for watermark query",
                 target.full_name()
             )
         })?;
@@ -17155,7 +17297,7 @@ pub(crate) async fn query_target_max_timestamp(
         .map_err(anyhow::Error::from)
         .with_context(|| {
             format!(
-                "target-side watermark query failed for {}",
+                "{side}-side watermark query failed for {}",
                 target.full_name()
             )
         })?;
@@ -17166,7 +17308,7 @@ pub(crate) async fn query_target_max_timestamp(
         .and_then(|row| row.first())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "target-side watermark query returned no aggregate value for {}",
+                "{side}-side watermark query returned no aggregate value for {}",
                 target.full_name()
             )
         })?;
@@ -17175,13 +17317,13 @@ pub(crate) async fn query_target_max_timestamp(
     }
     let raw = value.as_str().ok_or_else(|| {
         anyhow::anyhow!(
-            "target-side watermark query returned a non-string value for {}: {value}",
+            "{side}-side watermark query returned a non-string value for {}: {value}",
             target.full_name()
         )
     })?;
     let parsed = parse_timestamp_cell(raw).ok_or_else(|| {
         anyhow::anyhow!(
-            "could not parse target-side watermark for {}: {raw}",
+            "could not parse {side}-side watermark for {}: {raw}",
             target.full_name()
         )
     })?;
@@ -17216,6 +17358,12 @@ pub(crate) async fn query_target_max_timestamp(
 /// the next run re-scans the whole source rather than advancing past unloaded
 /// rows. Query and parse failures propagate: persisting the epoch after a
 /// non-empty refresh would make the next run append the full source again.
+///
+/// # Returns
+///
+/// The watermark, and the `MAX(ts)` read from the target: `None` for an empty
+/// target or a strategy that records the run time. The runner reads the
+/// second value to tell whether a held-back copy landed anything (#2376).
 async fn resolve_new_watermark(
     strategy: &MaterializationStrategy,
     warehouse: &dyn WarehouseAdapter,
@@ -17224,7 +17372,7 @@ async fn resolve_new_watermark(
     timestamp_column: &str,
     prior_watermark: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
-) -> Result<chrono::DateTime<Utc>> {
+) -> Result<(chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> {
     let advances_watermark = matches!(
         strategy,
         MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
@@ -17235,17 +17383,39 @@ async fn resolve_new_watermark(
         // skip rows written to source after this run's snapshot. With no prior
         // either, fall back to the epoch sentinel = no progress. Failures
         // propagate so an epoch cannot certify a non-empty target by mistake.
-        Ok(
-            match query_target_max_timestamp(warehouse, dialect, target_table, timestamp_column)
-                .await?
-            {
-                Some(target_max) => target_max,
-                None => prior_watermark.unwrap_or_else(epoch_watermark_sentinel),
-            },
-        )
+        let target_max =
+            query_target_max_timestamp(warehouse, dialect, target_table, timestamp_column).await?;
+        Ok((
+            target_max.unwrap_or_else(|| prior_watermark.unwrap_or_else(epoch_watermark_sentinel)),
+            target_max,
+        ))
     } else {
-        Ok(now)
+        Ok((now, None))
     }
+}
+
+/// [`resolve_new_watermark`]'s watermark alone, for the tests that pin it.
+#[cfg(test)]
+async fn resolve_new_watermark_value(
+    strategy: &MaterializationStrategy,
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    target_table: &TableRef,
+    timestamp_column: &str,
+    prior_watermark: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Result<chrono::DateTime<Utc>> {
+    Ok(resolve_new_watermark(
+        strategy,
+        warehouse,
+        dialect,
+        target_table,
+        timestamp_column,
+        prior_watermark,
+        now,
+    )
+    .await?
+    .0)
 }
 
 /// The "no progress" watermark sentinel (`1970-01-01T00:00:00Z`). Recorded when
@@ -17718,6 +17888,7 @@ async fn checkpoint_planned_table(
             error: None,
             duration_ms: 0,
             completed_at: Utc::now(),
+            held_max: None,
         },
     )
     .await;
@@ -18042,6 +18213,31 @@ async fn process_table(
         .unwrap_or(pipeline.timestamp_column.as_str())
         .to_string();
 
+    // #2376: hold back the newest source timestamp. The next watermark is
+    // `MAX(ts)` over the target, and the copy filters `ts > watermark`, so a
+    // row that lands later with a timestamp equal to the watermark would be
+    // skipped forever. Read `MAX(ts)` over the source once, after drift
+    // handling and before the SQL is generated, and copy only the rows below
+    // it. The newest batch waits one run. `Incremental` only: microbatch,
+    // merge and the other strategies keep their SQL. An empty or all-NULL
+    // source has no maximum and gets no cutoff. A failed read fails the table.
+    let hold_back = if matches!(strategy, MaterializationStrategy::Incremental { .. }) {
+        query_source_max_timestamp(
+            warehouse,
+            dialect,
+            &source_table,
+            &effective_timestamp_column,
+        )
+        .await?
+        .map(|held_max| HoldBackCutoff {
+            timestamp_column: effective_timestamp_column.clone(),
+            held_max,
+        })
+    } else {
+        None
+    };
+    let held_max = hold_back.as_ref().map(|cutoff| cutoff.held_max);
+
     // For `strategy = "merge"`, resolve `ColumnSelection::All` against the
     // discovered source schema BEFORE handing the IR to SQL-gen. Snowflake's
     // MERGE rejects `UPDATE SET *` (Databricks / BigQuery / DuckDB accept it),
@@ -18064,10 +18260,18 @@ async fn process_table(
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
-        if target_exists {
-            sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
-        } else {
-            sql_gen::generate_bootstrap_create_table_as_sql(&model_ir, dialect)?
+        // The first run and a drift rebuild hold back the newest batch too.
+        // Without the bound, the copy lands it, the next watermark equals its
+        // timestamp, and a late row tied with it is skipped one run earlier.
+        match (target_exists, held_max.as_ref()) {
+            (true, Some(held)) => {
+                sql_gen::generate_held_back_create_table_as_sql(&model_ir, dialect, held)?
+            }
+            (true, None) => sql_gen::generate_create_table_as_sql(&model_ir, dialect)?,
+            (false, Some(held)) => {
+                sql_gen::generate_held_back_bootstrap_create_table_as_sql(&model_ir, dialect, held)?
+            }
+            (false, None) => sql_gen::generate_bootstrap_create_table_as_sql(&model_ir, dialect)?,
         }
     } else {
         match &strategy {
@@ -18077,7 +18281,17 @@ async fn process_table(
             }
             MaterializationStrategy::Incremental { .. } => {
                 strategy_name = "incremental";
-                sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
+                match held_max.as_ref() {
+                    Some(held) => sql_gen::generate_held_back_insert_sql(
+                        &model_ir,
+                        dialect,
+                        prior_watermark.as_ref(),
+                        held,
+                    )?,
+                    None => {
+                        sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
+                    }
+                }
             }
             MaterializationStrategy::Merge { .. } => {
                 strategy_name = "merge";
@@ -18296,7 +18510,7 @@ async fn process_table(
     // the next strict-`>` run. On the replication path the ts column is an
     // identity-mapped passthrough, so target-MAX is in the same value space as
     // source-MAX for the loaded rows. See `resolve_new_watermark`.
-    let new_watermark = resolve_new_watermark(
+    let (new_watermark, target_max) = resolve_new_watermark(
         &strategy,
         warehouse,
         dialect,
@@ -18306,6 +18520,29 @@ async fn process_table(
         now,
     )
     .await?;
+
+    let mut notes = Vec::new();
+    if let Some(cutoff) = &hold_back {
+        // Every row a full copy lands is in the target; every row an
+        // incremental INSERT lands is above the prior watermark. So the copy
+        // landed nothing exactly when the target is empty, or, after an
+        // INSERT, when its maximum did not move.
+        let landed_nothing = match target_max {
+            None => true,
+            Some(max) => !use_full_refresh && Some(max) == prior_watermark,
+        };
+        notes.push(
+            held_back_note(
+                warehouse,
+                dialect,
+                &model_ir,
+                cutoff,
+                landed_nothing,
+                &target_table,
+            )
+            .await,
+        );
+    }
 
     let deferred_watermark = Some(DeferredWatermark {
         state_key: target_table.state_key(),
@@ -18379,7 +18616,7 @@ async fn process_table(
         probe_rate_limited,
         materialization: MaterializationOutput {
             asset_key: asset_key.clone(),
-            notes: vec![],
+            notes,
             attempts: Vec::new(),
             rows_copied: None,
             duration_ms: table_duration,
@@ -18434,7 +18671,83 @@ async fn process_table(
         },
         deferred_tags,
         deferred_watermark,
+        hold_back,
     })))
+}
+
+/// The `MaterializationOutput.notes` line for a held-back copy (#2376).
+///
+/// Counts the source rows the cutoff left for a later run with `WHERE NOT
+/// (<bound>)`. A copy that landed nothing gets its own wording, so an
+/// operator can tell a held-back table from a broken one. A failed count is
+/// a warning, never a table failure: the copy itself already succeeded.
+async fn held_back_note(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    model_ir: &ModelIr,
+    cutoff: &HoldBackCutoff,
+    landed_nothing: bool,
+    target_table: &TableRef,
+) -> String {
+    let HoldBackCutoff {
+        timestamp_column,
+        held_max,
+    } = cutoff;
+    let held = held_max.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let count = match sql_gen::generate_held_back_count_sql(model_ir, dialect, held_max) {
+        Ok(sql) => match warehouse.execute_query(&sql).await {
+            Ok(result) => checks::cell_as_u64(result.rows.first().and_then(|r| r.first()))
+                .ok_or_else(|| "the count query returned no readable count".to_string()),
+            Err(e) => Err(format!("the count query failed: {e}")),
+        },
+        Err(e) => Err(format!("could not build the count query: {e}")),
+    };
+    match count {
+        Ok(n) => {
+            if n == 0 {
+                // The source held a row at `held_max` when it was read, so
+                // none at or above it now means the literal sits ABOVE the
+                // true maximum (a precision or time-zone mismatch in the
+                // parsed MAX), and the newest row was copied after all.
+                warn!(
+                    table = target_table.full_name(),
+                    held_max = held.as_str(),
+                    "no source row is at or above the hold-back cutoff; the cutoff literal \
+                     may not match the column's precision or time zone"
+                );
+            }
+            let rows = if n == 1 { "row" } else { "rows" };
+            if landed_nothing {
+                format!(
+                    "{n} {rows} held back until newer data arrives: every source row not yet \
+                     copied has the newest `{timestamp_column}` ({held})"
+                )
+            } else {
+                format!(
+                    "{n} {rows} with the newest `{timestamp_column}` ({held}) held back until \
+                     a later run"
+                )
+            }
+        }
+        Err(reason) => {
+            warn!(
+                table = target_table.full_name(),
+                reason = reason.as_str(),
+                "could not count the rows held back at the newest timestamp"
+            );
+            if landed_nothing {
+                format!(
+                    "rows held back until newer data arrives: every source row not yet copied \
+                     has the newest `{timestamp_column}` ({held}); counting them failed: {reason}"
+                )
+            } else {
+                format!(
+                    "rows with the newest `{timestamp_column}` ({held}) held back until a later \
+                     run; counting them failed: {reason}"
+                )
+            }
+        }
+    }
 }
 
 /// The check inputs one replication target contributes after its copy.
@@ -18596,6 +18909,9 @@ struct MaterializedSinks<'a> {
     /// freshness toggles: `run_batched_checks` drives assertions, null-rate,
     /// custom checks and cross-source overlap from this list alone.
     assertion_targets: &'a mut Vec<(TableRef, Vec<String>)>,
+    /// The hold-back cutoff of each row-count-checked source, keyed by the
+    /// source's full name (#2376).
+    row_count_cutoffs: &'a mut HashMap<String, HoldBackCutoff>,
     deferred_tags: &'a mut Vec<DeferredTagging>,
     deferred_watermarks: &'a mut Vec<DeferredWatermark>,
 }
@@ -18673,7 +18989,9 @@ async fn collect_materialized_table(
         target_ref,
         deferred_tags,
         deferred_watermark,
+        hold_back,
     } = tr;
+    let held_max = hold_back.as_ref().map(|cutoff| cutoff.held_max);
 
     // Signal the adaptive throttle. The copy succeeded, but a post-copy
     // `column_match` probe that came back rate-limited is still the warehouse
@@ -18742,6 +19060,7 @@ async fn collect_materialized_table(
             freshness_batch_refs: sinks.freshness_batch_refs,
             batch_asset_keys: sinks.batch_asset_keys,
             assertion_targets: sinks.assertion_targets,
+            row_count_cutoffs: sinks.row_count_cutoffs,
         },
         &target_full_name,
         &asset_key,
@@ -18753,6 +19072,7 @@ async fn collect_materialized_table(
             freshness_batch_ref,
         },
         target_ref,
+        hold_back,
     );
 
     if let Some(tags) = deferred_tags {
@@ -18774,6 +19094,9 @@ async fn collect_materialized_table(
             error: None,
             duration_ms,
             completed_at: Utc::now(),
+            // A resume that skips this table checks it against the same
+            // cutoff (#2376).
+            held_max,
         },
     )
     .await;
@@ -18787,6 +19110,10 @@ struct CheckSinks<'a> {
     freshness_batch_refs: &'a mut Vec<TableRef>,
     batch_asset_keys: &'a mut Vec<(String, Vec<String>)>,
     assertion_targets: &'a mut Vec<(TableRef, Vec<String>)>,
+    /// The hold-back cutoff of each row-count-checked source, keyed by the
+    /// source's full name (#2376). `run_batched_checks` counts such a source
+    /// below its cutoff instead of whole.
+    row_count_cutoffs: &'a mut HashMap<String, HoldBackCutoff>,
 }
 
 /// Feed the checks of a table a resume skipped (#2235).
@@ -18796,28 +19123,89 @@ struct CheckSinks<'a> {
 /// checks are still owed. They run on the target as it stands, from the same
 /// inputs [`collect_materialized_table`] takes from a copied table. Nothing
 /// else is recorded: no materialization, watermark or checkpoint row.
+///
+/// `held_max` is the hold-back cutoff the checkpoint row stored (#2376).
+/// The copy held back the source rows at or above it, so `row_count` counts
+/// the source below it, as it would have on the run that copied it. `None`
+/// means that copy had no cutoff.
 async fn collect_resumed_table_checks(
     warehouse: &dyn WarehouseAdapter,
+    pipeline: &ReplicationPipelineConfig,
     task: &TableTask,
+    held_max: Option<chrono::DateTime<Utc>>,
     sinks: &mut CheckSinks<'_>,
 ) {
     let (source_table, target_table) = copy_endpoints(task);
     let inputs = post_copy_check_inputs(warehouse, task, &source_table, &target_table).await;
     let mut asset_key = task.asset_key_prefix.clone();
     asset_key.push(task.target_table_name.clone());
-    feed_check_inputs(sinks, &table_key(task), &asset_key, inputs, target_table);
+    let timestamp_column = task
+        .effective_override
+        .timestamp_column
+        .clone()
+        .unwrap_or_else(|| pipeline.timestamp_column.clone());
+    // A checkpoint row with no cutoff is a table the run pruned as unchanged
+    // (it never read the source MAX), or one whose source had no MAX when it
+    // was copied. A pruned source is unchanged since the held-back copy that
+    // filled the target, so its MAX now is that copy's cutoff. Read it, for an
+    // incremental table with a `row_count` check only. A failed read counts
+    // the whole source, as before.
+    let held_max = match held_max {
+        Some(held_max) => Some(held_max),
+        None if task.check_row_count
+            && matches!(
+                build_replication_strategy_with_override(pipeline, &task.effective_override),
+                Ok(MaterializationStrategy::Incremental { .. })
+            ) =>
+        {
+            match query_source_max_timestamp(
+                warehouse,
+                warehouse.dialect(),
+                &source_table,
+                &timestamp_column,
+            )
+            .await
+            {
+                Ok(max) => max,
+                Err(e) => {
+                    warn!(
+                        table = source_table.full_name(),
+                        error = %e,
+                        "could not read the source MAX for a resumed table's row_count; \
+                         counting the whole source"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let hold_back = held_max.map(|held_max| HoldBackCutoff {
+        timestamp_column,
+        held_max,
+    });
+    feed_check_inputs(
+        sinks,
+        &table_key(task),
+        &asset_key,
+        inputs,
+        target_table,
+        hold_back,
+    );
 }
 
 /// Push one target's check inputs into the run-level sinks.
 ///
 /// The ONE place `assertion_targets` is pushed (#1718), shared by a copied
-/// table and a resume-skipped table (#2235).
+/// table and a resume-skipped table (#2235). Also the one place a hold-back
+/// cutoff reaches the `row_count` check (#2376).
 fn feed_check_inputs(
     sinks: &mut CheckSinks<'_>,
     target_full_name: &str,
     asset_key: &[String],
     inputs: PostCopyCheckInputs,
     target_ref: TableRef,
+    hold_back: Option<HoldBackCutoff>,
 ) {
     let PostCopyCheckInputs {
         column_match_check,
@@ -18838,6 +19226,9 @@ fn feed_check_inputs(
             .push(check);
     }
     if let Some(src_ref) = source_batch_ref {
+        if let Some(cutoff) = hold_back {
+            sinks.row_count_cutoffs.insert(src_ref.full_name(), cutoff);
+        }
         sinks.source_batch_refs.push(src_ref);
     }
     if let Some(tgt_ref) = target_batch_ref {
@@ -19049,6 +19440,7 @@ async fn process_completed_result(
                         error: Some(msg.clone()),
                         duration_ms: 0,
                         completed_at: Utc::now(),
+                        held_max: None,
                     },
                 )
                 .await;
@@ -19079,6 +19471,7 @@ async fn process_completed_result(
                     error: Some(msg.clone()),
                     duration_ms: 0,
                     completed_at: Utc::now(),
+                    held_max: None,
                 },
             )
             .await;
@@ -20629,6 +21022,7 @@ schema_template = "staging"
             error: None,
             duration_ms: 1,
             completed_at: Utc::now(),
+            held_max: None,
         }
     }
 
@@ -22803,6 +23197,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             (Vec::new(), Vec::new(), Vec::new());
         let mut batch_asset_keys = Vec::new();
         let mut assertion_targets = Vec::new();
+        let mut row_count_cutoffs = HashMap::new();
         let mut table_errors = Vec::new();
         let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
         let mut total_completed = 0;
@@ -22842,6 +23237,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                     freshness_batch_refs: &mut freshness_refs,
                     batch_asset_keys: &mut batch_asset_keys,
                     assertion_targets: &mut assertion_targets,
+                    row_count_cutoffs: &mut row_count_cutoffs,
                     deferred_tags: &mut deferred_tags,
                     deferred_watermarks: &mut deferred_watermarks,
                 },
@@ -28119,7 +28515,7 @@ merge_keys = ["id"]
         };
         let now = chrono::Utc::now();
 
-        let watermark = super::resolve_new_watermark(
+        let watermark = super::resolve_new_watermark_value(
             &strategy,
             &adapter as &dyn WarehouseAdapter,
             &dialect as &dyn SqlDialect,
@@ -28146,7 +28542,7 @@ merge_keys = ["id"]
             timestamp_column: "_fivetran_synced".to_string(),
             granularity: rocky_ir::TimeGrain::Hour,
         };
-        let mb_watermark = super::resolve_new_watermark(
+        let mb_watermark = super::resolve_new_watermark_value(
             &microbatch,
             &adapter as &dyn WarehouseAdapter,
             &dialect as &dyn SqlDialect,
@@ -30109,10 +30505,13 @@ table = "fct_events"
             "CREATE SCHEMA src",
             "CREATE SCHEMA tgt",
             "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            // Row 9 is a far-future row, always the newest, so the #2376
+            // hold-back keeps only it back and every other row copies.
             "INSERT INTO src.events VALUES \
                 (1, TIMESTAMP '2026-03-01 10:00:00'), \
-                (2, TIMESTAMP '2026-03-02 12:00:00')",
-            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+                (2, TIMESTAMP '2026-03-02 12:00:00'), \
+                (9, TIMESTAMP '2099-01-01 00:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events WHERE id <= 2",
         ] {
             adapter.execute_statement(sql).await.unwrap();
         }
@@ -31048,6 +31447,7 @@ timestamp_column = "ts"
             (Vec::new(), Vec::new(), Vec::new());
         let mut batch_asset_keys = Vec::new();
         let mut assertion_targets = Vec::new();
+        let mut row_count_cutoffs = HashMap::new();
         let mut table_errors = Vec::new();
         let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
         let mut total_completed = 0;
@@ -31074,6 +31474,7 @@ timestamp_column = "ts"
                 freshness_batch_refs: &mut freshness_refs,
                 batch_asset_keys: &mut batch_asset_keys,
                 assertion_targets: &mut assertion_targets,
+                row_count_cutoffs: &mut row_count_cutoffs,
                 deferred_tags: &mut deferred_tags,
                 deferred_watermarks: &mut deferred_watermarks,
             },
@@ -31143,7 +31544,10 @@ timestamp_column = "ts"
             }
 
             async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-                if sql.trim_start().starts_with("SELECT MAX(") {
+                // Only the TARGET's MAX: the source MAX the #2376 hold-back
+                // reads before the copy must succeed, or the table fails
+                // before the refresh this test is about.
+                if sql.trim_start().starts_with("SELECT MAX(") && sql.contains("FROM tgt.") {
                     return Err(AdapterError::msg("injected target MAX failure"));
                 }
                 self.inner.execute_query(sql).await
@@ -31162,10 +31566,12 @@ timestamp_column = "ts"
             "CREATE SCHEMA src",
             "CREATE SCHEMA tgt",
             "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            // Row 3 is the newest, so the #2376 hold-back keeps only it back.
             "INSERT INTO src.events VALUES \
                 (1, TIMESTAMP '2026-03-01 10:00:00'), \
-                (2, TIMESTAMP '2026-03-02 12:00:00')",
-            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+                (2, TIMESTAMP '2026-03-02 12:00:00'), \
+                (3, TIMESTAMP '2026-03-03 12:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events WHERE id <= 2",
         ] {
             inner.execute_statement(sql).await.unwrap();
         }
@@ -31303,7 +31709,7 @@ timestamp_column = "ts"
             .unwrap();
 
         // Capture the watermark the way the runner does — from the TARGET.
-        let wm1 = super::resolve_new_watermark(
+        let wm1 = super::resolve_new_watermark_value(
             &strategy,
             &adapter as &dyn WarehouseAdapter,
             &dialect as &dyn SqlDialect,
@@ -31412,7 +31818,7 @@ timestamp_column = "ts"
         let expected = chrono::DateTime::parse_from_rfc3339("3000-01-01T00:00:00.000002Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let resolved = super::resolve_new_watermark(
+        let resolved = super::resolve_new_watermark_value(
             &MaterializationStrategy::Incremental {
                 timestamp_column: "ts".into(),
                 unique_key: Vec::new(),
@@ -31538,7 +31944,7 @@ timestamp_column = "ts"
             .execute_statement(&format!("INSERT INTO tgt.t SELECT * FROM src.t {where1}"))
             .await
             .unwrap();
-        let wm1 = super::resolve_new_watermark(
+        let wm1 = super::resolve_new_watermark_value(
             &strategy,
             &adapter as &dyn WarehouseAdapter,
             &dialect as &dyn SqlDialect,
@@ -31699,8 +32105,12 @@ backend = "local"
             for sql in [
                 "CREATE SCHEMA raw__demo",
                 "CREATE TABLE raw__demo.t (id INTEGER, _loaded_at TIMESTAMP)",
-                // The issue's exact repro value.
-                "INSERT INTO raw__demo.t VALUES (1, TIMESTAMP '2026-09-15 10:00:00.250')",
+                // Row 1 carries the issue's exact repro value. Row 2 is newer:
+                // the #2376 hold-back leaves the newest batch for a later
+                // run, so without it row 1 would not land on run 1.
+                "INSERT INTO raw__demo.t VALUES \
+                 (1, TIMESTAMP '2026-09-15 10:00:00.250'), \
+                 (2, TIMESTAMP '2026-09-15 10:00:01.500')",
             ] {
                 db.execute_statement(sql).await.unwrap();
             }
@@ -31710,11 +32120,32 @@ backend = "local"
             .await
             .expect("run 1 must succeed");
 
+        // The recorded watermark is row 1's stamp, fraction kept (#2004).
+        {
+            use chrono::Timelike;
+            let key = rocky_ir::TableRef {
+                catalog: "repro".into(),
+                schema: "staging__demo".into(),
+                table: "t".into(),
+            }
+            .state_key();
+            let watermark = rocky_core::state::StateStore::open(&state_path)
+                .unwrap()
+                .get_watermark(&key)
+                .unwrap()
+                .expect("run 1 records a watermark");
+            assert_eq!(
+                watermark.last_value.nanosecond(),
+                250_000_000,
+                "the watermark must keep row 1's fractional second: {watermark:?}"
+            );
+        }
+
         // Nothing changed in the source between runs — the issue's exact
-        // scenario. Before the fix this returned Err(CheckGateFailure): the
-        // watermark had been recorded as :00, so the .250 row re-passed the
-        // WHERE filter, target grew to 2 rows, and row_count (1 source != 2
-        // target) failed the check gate.
+        // scenario. Before #2004's fix the watermark was recorded as :00, so
+        // the .250 row re-passed `ts > watermark` (and stays below the
+        // hold-back cutoff), the target grew to 2 rows, and row_count (1
+        // source row below the cutoff != 2 target rows) failed the gate.
         run_pipeline(&config_path, &state_path, "run2")
             .await
             .expect(
@@ -31723,19 +32154,523 @@ backend = "local"
             );
 
         let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
-        let count = db
-            .execute_query("SELECT COUNT(*) FROM repro.staging__demo.t")
+        let ids = db
+            .execute_query("SELECT id FROM repro.staging__demo.t ORDER BY id")
             .await
             .unwrap();
-        let n = count.rows[0][0].as_u64().or_else(|| {
-            count.rows[0][0]
-                .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-        });
         assert_eq!(
-            n,
-            Some(1),
-            "run 2 must not re-copy the fractional-second row into the target"
+            ids.rows,
+            vec![vec![serde_json::json!("1")]],
+            "run 2 must not re-copy the fractional-second row; row 2 stays held back"
+        );
+    }
+
+    // ----- #2376: hold back the newest source timestamp -----
+
+    /// A `src.events` → `tgt.events` incremental task with no checks.
+    #[cfg(feature = "duckdb")]
+    fn hold_back_task() -> TableTask {
+        TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            column_match: None,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        }
+    }
+
+    /// `process_table` once, then persist its deferred watermark the way the
+    /// run's flush does. Returns the materialized result.
+    #[cfg(feature = "duckdb")]
+    async fn hold_back_copy(
+        adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        state: &Arc<StateStore>,
+    ) -> Box<TableResult> {
+        let pipeline = parse_pipeline("strategy = \"incremental\"\ntimestamp_column = \"ts\"\n");
+        let outcome = process_table(adapter, state, &pipeline, &hold_back_task(), false)
+            .await
+            .expect("the copy succeeds");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("the table must materialize");
+        };
+        let watermark = result.deferred_watermark.as_ref().expect("a watermark");
+        state
+            .set_watermark(
+                &watermark.state_key,
+                &rocky_ir::WatermarkState {
+                    last_value: watermark.timestamp,
+                    updated_at: watermark.timestamp,
+                },
+            )
+            .unwrap();
+        result
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn target_ids(adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter) -> Vec<String> {
+        use rocky_core::traits::WarehouseAdapter;
+        adapter
+            .execute_query("SELECT id FROM tgt.events ORDER BY id")
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row[0].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #2376, the bug and the fix across three runs.
+    ///
+    /// Run 1 is a first run: it holds back the newest batch (`t2`) and lands
+    /// `t1`. A late row stamped `t2` then arrives with a newer `t3` row. The
+    /// old code would have copied `t2` on run 1, recorded it as the
+    /// watermark, and skipped the late `t2` row forever. Here run 2 lands
+    /// both `t2` rows and holds back `t3`. Run 3 sees no change and copies
+    /// nothing, so nothing is duplicated.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn hold_back_lands_a_late_row_tied_with_the_old_watermark_without_duplicates() {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 10:00:00'), \
+                (3, TIMESTAMP '2026-03-02 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let t1 = Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 3, 3, 10, 0, 0).unwrap();
+
+        // Run 1: the first run holds back the newest batch.
+        let run1 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(run1.materialization.metadata.strategy, "full_refresh");
+        assert_eq!(target_ids(&adapter).await, ["1"]);
+        assert_eq!(
+            run1.hold_back,
+            Some(HoldBackCutoff {
+                timestamp_column: "ts".into(),
+                held_max: t2,
+            })
+        );
+        assert_eq!(run1.deferred_watermark.as_ref().unwrap().timestamp, t1);
+        assert_eq!(
+            run1.materialization.notes,
+            ["2 rows with the newest `ts` (2026-03-02T10:00:00Z) held back until a later run"]
+        );
+
+        // A late row tied with run 1's source maximum, and a newer row.
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES \
+                 (4, TIMESTAMP '2026-03-02 10:00:00'), \
+                 (5, TIMESTAMP '2026-03-03 10:00:00')",
+            )
+            .await
+            .unwrap();
+
+        // Run 2: the `t2` batch lands whole, the late row included.
+        let run2 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(run2.materialization.metadata.strategy, "incremental");
+        assert_eq!(target_ids(&adapter).await, ["1", "2", "3", "4"]);
+        assert_eq!(run2.deferred_watermark.as_ref().unwrap().timestamp, t2);
+        assert_eq!(run2.hold_back.as_ref().unwrap().held_max, t3);
+        assert_eq!(
+            run2.materialization.notes,
+            ["1 row with the newest `ts` (2026-03-03T10:00:00Z) held back until a later run"]
+        );
+
+        // Run 3: nothing changed, so nothing is copied and nothing doubles.
+        let run3 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(target_ids(&adapter).await, ["1", "2", "3", "4"]);
+        assert_eq!(run3.deferred_watermark.as_ref().unwrap().timestamp, t2);
+        assert_eq!(
+            run3.materialization.notes,
+            [
+                "1 row held back until newer data arrives: every source row not yet copied \
+                 has the newest `ts` (2026-03-03T10:00:00Z)"
+            ]
+        );
+    }
+
+    /// #2376: a source whose rows all share one timestamp copies nothing on
+    /// its first run, and the note says why. The watermark stays at the
+    /// epoch sentinel, so the batch lands once a newer row arrives.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn hold_back_of_an_all_same_timestamp_batch_copies_nothing_and_says_so() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-01 10:00:00'), \
+                (3, TIMESTAMP '2026-03-01 10:00:00'), \
+                (4, NULL)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+
+        let run1 = hold_back_copy(&adapter, &state).await;
+        // The NULL-timestamp row lands as it always has on a full copy.
+        assert_eq!(target_ids(&adapter).await, ["4"]);
+        assert_eq!(
+            run1.deferred_watermark.as_ref().unwrap().timestamp,
+            epoch_watermark_sentinel()
+        );
+        assert_eq!(
+            run1.materialization.notes,
+            [
+                "3 rows held back until newer data arrives: every source row not yet copied \
+                 has the newest `ts` (2026-03-01T10:00:00Z)"
+            ]
+        );
+
+        adapter
+            .execute_statement("INSERT INTO src.events VALUES (5, TIMESTAMP '2026-03-02 10:00:00')")
+            .await
+            .unwrap();
+        hold_back_copy(&adapter, &state).await;
+        assert_eq!(target_ids(&adapter).await, ["1", "2", "3", "4"]);
+    }
+
+    /// #2376: an empty or all-NULL source has no maximum, so it gets no
+    /// cutoff and no note, as before.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn hold_back_skips_a_source_with_no_maximum() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, NULL)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let run1 = hold_back_copy(&adapter, &state).await;
+        assert_eq!(run1.hold_back, None);
+        assert!(run1.materialization.notes.is_empty());
+        assert_eq!(target_ids(&adapter).await, ["1"]);
+    }
+
+    /// #2376: a drift rebuild of an existing target holds back the newest
+    /// batch too. Unbounded, it would land that batch, record its timestamp
+    /// as the watermark, and skip a late row tied with it one run early.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn hold_back_bounds_a_drift_rebuild() {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 10:00:00')",
+            // VARCHAR -> INTEGER is not a safe widening: drop and recreate.
+            "CREATE TABLE tgt.events (id VARCHAR, ts TIMESTAMP)",
+            "INSERT INTO tgt.events VALUES ('1', TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let t1 = Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap();
+        let key = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "events".into(),
+        }
+        .state_key();
+        state
+            .set_watermark(
+                &key,
+                &rocky_ir::WatermarkState {
+                    last_value: t1,
+                    updated_at: t1,
+                },
+            )
+            .unwrap();
+
+        let rebuild = hold_back_copy(&adapter, &state).await;
+        assert_eq!(
+            rebuild.drift_detected.as_ref().map(|d| d.action.as_str()),
+            Some("drop_and_recreate")
+        );
+        assert_eq!(rebuild.materialization.metadata.strategy, "full_refresh");
+        assert_eq!(
+            target_ids(&adapter).await,
+            ["1"],
+            "row 2 is the newest batch"
+        );
+        assert_eq!(rebuild.deferred_watermark.as_ref().unwrap().timestamp, t1);
+    }
+
+    /// The `rep` pipeline over `raw__acme.t00` and `t01`, incremental on
+    /// `ts`, with `row_count = true`. Each table holds `(1, t1)` and `(2,
+    /// t2)`, so the hold-back keeps row 2 back. Returns the config path.
+    #[cfg(feature = "duckdb")]
+    async fn write_hold_back_project(dir: &std::path::Path) -> std::path::PathBuf {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let db_path = dir.join("warehouse.duckdb");
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA raw__acme")
+                .await
+                .unwrap();
+            for table in ["t00", "t01"] {
+                warehouse
+                    .execute_statement(&format!(
+                        "CREATE TABLE raw__acme.{table} AS SELECT * FROM (VALUES \
+                         (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                         (2, TIMESTAMP '2026-03-02 10:00:00')) AS v(id, ts)"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{db}"
+
+[state]
+backend = "local"
+
+[pipeline.rep]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "ts"
+
+[pipeline.rep.execution]
+concurrency = 1
+
+[pipeline.rep.source.discovery]
+adapter = "default"
+
+[pipeline.rep.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.rep.target]
+adapter = "default"
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.rep.target.governance]
+auto_create_schemas = true
+
+[pipeline.rep.checks]
+row_count = true
+"#,
+                db = db_path.display(),
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn row_count_outcomes(record: &rocky_core::state::RunRecord) -> Vec<bool> {
+        record
+            .check_outcomes
+            .iter()
+            .filter(|c| c.name == "row_count")
+            .map(|c| c.passed)
+            .collect()
+    }
+
+    /// #2376: `row_count` counts the source rows the copy did not hold back,
+    /// so it passes under the hold-back. It stays strict: a target that
+    /// really lost a row still fails it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_back_row_count_passes_and_still_fails_a_real_mismatch() {
+        use rocky_core::traits::WarehouseAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_hold_back_project(dir.path()).await;
+        let state_path = dir.path().join("state.redb");
+
+        let (result, record) = drive_run_for_record(&config, &state_path, "first").await;
+        result.expect("row_count passes with the newest batch held back");
+        assert_eq!(row_count_outcomes(&record), [true, true]);
+
+        {
+            let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(
+                &dir.path().join("warehouse.duckdb"),
+            )
+            .unwrap();
+            // t00 loses its copied row: a real mismatch.
+            warehouse
+                .execute_statement("DELETE FROM staging__acme.t00")
+                .await
+                .unwrap();
+        }
+        let (result, record) = drive_run_for_record(&config, &state_path, "second").await;
+        assert!(result.is_err(), "the lost row must fail the check gate");
+        let mut outcomes = row_count_outcomes(&record);
+        outcomes.sort();
+        assert_eq!(outcomes, [false, true], "{:?}", record.check_outcomes);
+    }
+
+    /// #2376 with #2235: a resume skips a table its checkpoint copied and
+    /// runs that table's owed `row_count` against the cutoff the checkpoint
+    /// row stored. Without it the whole source (2 rows) is compared with the
+    /// held-back target (1 row) and the check fails.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_checks_row_count_against_the_stored_hold_back_cutoff() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_hold_back_project(dir.path()).await;
+        let state_path = dir.path().join("state.redb");
+        let (result, _) = drive_run_for_record(&config, &state_path, "first-2376").await;
+        result.unwrap();
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let progress = store.get_run_progress("first-2376").unwrap().unwrap();
+            let t00 = progress
+                .tables
+                .iter()
+                .find(|t| t.table_key == "warehouse.staging__acme.t00")
+                .unwrap();
+            assert_eq!(
+                t00.held_max,
+                Some(Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 0).unwrap()),
+                "the checkpoint row stores the cutoff"
+            );
+            store
+                .record_table_progress(
+                    "first-2376",
+                    &table_entry(
+                        1,
+                        "warehouse.staging__acme.t01",
+                        rocky_core::state::TableStatus::Failed,
+                    ),
+                )
+                .unwrap();
+            seed_run_record(&store, "first-2376", "PartialFailure");
+        }
+
+        drive_resume_test_run(&config, &state_path, "rep", None, true)
+            .await
+            .expect("the resumed table's row_count passes under its stored cutoff");
+        let record = latest_record(&state_path);
+        assert_ne!(record.run_id, "first-2376");
+        assert_eq!(
+            row_count_outcomes(&record),
+            [true, true],
+            "both the resumed and the re-copied table are checked: {:?}",
+            record.check_outcomes
+        );
+    }
+
+    /// #2376 with #2235: a resumed table whose checkpoint row has no cutoff
+    /// (the run pruned it as unchanged, so it never read the source MAX)
+    /// reads the source MAX now. A pruned source is unchanged since the
+    /// held-back copy that filled its target, so that MAX is the copy's
+    /// cutoff, and `row_count` does not fail on the held-back rows.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resumed_table_without_a_stored_cutoff_reads_the_source_max() {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 10:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events WHERE id = 1",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let pipeline = parse_pipeline("strategy = \"incremental\"\ntimestamp_column = \"ts\"\n");
+        let mut task = hold_back_task();
+        task.check_row_count = true;
+
+        let mut pending_checks = HashMap::new();
+        let mut source_batch_refs = Vec::new();
+        let mut target_batch_refs = Vec::new();
+        let mut freshness_batch_refs = Vec::new();
+        let mut batch_asset_keys = Vec::new();
+        let mut assertion_targets = Vec::new();
+        let mut row_count_cutoffs = HashMap::new();
+        collect_resumed_table_checks(
+            &adapter,
+            &pipeline,
+            &task,
+            None,
+            &mut CheckSinks {
+                pending_checks: &mut pending_checks,
+                source_batch_refs: &mut source_batch_refs,
+                target_batch_refs: &mut target_batch_refs,
+                freshness_batch_refs: &mut freshness_batch_refs,
+                batch_asset_keys: &mut batch_asset_keys,
+                assertion_targets: &mut assertion_targets,
+                row_count_cutoffs: &mut row_count_cutoffs,
+            },
+        )
+        .await;
+        assert_eq!(
+            row_count_cutoffs.get(".src.events"),
+            Some(&HoldBackCutoff {
+                timestamp_column: "ts".into(),
+                held_max: Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 0).unwrap(),
+            }),
+            "{row_count_cutoffs:?}"
         );
     }
 
@@ -31838,7 +32773,10 @@ backend = "local"
             for sql in [
                 "CREATE SCHEMA raw__orders",
                 "CREATE TABLE raw__orders.a_good (id INTEGER, ts TIMESTAMP)",
-                "INSERT INTO raw__orders.a_good VALUES (1, TIMESTAMP '2026-01-01')",
+                // Row 99 is a far-future row, always the newest, so the #2376
+                // hold-back keeps only it back and rows 1 and 2 copy.
+                "INSERT INTO raw__orders.a_good VALUES (1, TIMESTAMP '2026-01-01'), \
+                 (99, TIMESTAMP '2099-01-01')",
                 "CREATE TABLE raw__orders.z_bad (id INTEGER, ts TIMESTAMP)",
                 "INSERT INTO raw__orders.z_bad VALUES (1, TIMESTAMP '2026-01-01')",
             ] {
@@ -31911,7 +32849,10 @@ backend = "local"
             )
             .await
             .unwrap();
-        assert_eq!(counts.rows[0][0], "2", "recovery must not add a third row");
+        assert_eq!(
+            counts.rows[0][0], "2",
+            "recovery must not add a third row (row 99 is held back)"
+        );
         assert_eq!(counts.rows[0][1], "2", "both ids must remain distinct");
         assert_eq!(counts.rows[0][2], "1", "the delta row must appear once");
     }
@@ -32573,6 +33514,7 @@ backend = "local"
                     error: None,
                     duration_ms: 1,
                     completed_at: now,
+                    held_max: None,
                 },
             )
             .unwrap();
@@ -44445,6 +45387,7 @@ auto_create_schemas = true
         freshness_refs: Vec<TableRef>,
         asset_keys: Vec<(String, Vec<String>)>,
         assertion_targets: Vec<(TableRef, Vec<String>)>,
+        row_count_cutoffs: HashMap<String, HoldBackCutoff>,
     }
 
     #[cfg(feature = "duckdb")]
@@ -44472,6 +45415,7 @@ auto_create_schemas = true
                 freshness_refs: vec![target.clone()],
                 asset_keys: vec![(target.full_name(), asset_key.clone())],
                 assertion_targets: vec![(target, asset_key)],
+                row_count_cutoffs: HashMap::new(),
             }
         }
 
@@ -44538,6 +45482,7 @@ auto_create_schemas = true
                 "bronze",
                 &self.pipeline,
                 &self.source_refs,
+                &self.row_count_cutoffs,
                 &self.target_refs,
                 &self.freshness_refs,
                 &self.asset_keys,
@@ -47448,6 +48393,7 @@ timestamp_column = "ts"
         freshness_refs: Vec<TableRef>,
         batch_asset_keys: Vec<(String, Vec<String>)>,
         assertion_targets: Vec<(TableRef, Vec<String>)>,
+        row_count_cutoffs: HashMap<String, HoldBackCutoff>,
         deferred_tags: Vec<DeferredTagging>,
         deferred_watermarks: Vec<DeferredWatermark>,
     }
@@ -47470,6 +48416,7 @@ timestamp_column = "ts"
                 freshness_batch_refs: &mut self.freshness_refs,
                 batch_asset_keys: &mut self.batch_asset_keys,
                 assertion_targets: &mut self.assertion_targets,
+                row_count_cutoffs: &mut self.row_count_cutoffs,
                 deferred_tags: &mut self.deferred_tags,
                 deferred_watermarks: &mut self.deferred_watermarks,
             }
@@ -47522,6 +48469,7 @@ timestamp_column = "ts"
                 (Vec::new(), Vec::new(), Vec::new());
             let mut batch_asset_keys = Vec::new();
             let mut assertion_targets = Vec::new();
+            let mut row_count_cutoffs = HashMap::new();
             let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
             // Stand in for the failures already collected this run: the rate is
             // errors over completions, so both sides have to be primed.
@@ -47550,6 +48498,7 @@ timestamp_column = "ts"
                     freshness_batch_refs: &mut freshness_refs,
                     batch_asset_keys: &mut batch_asset_keys,
                     assertion_targets: &mut assertion_targets,
+                    row_count_cutoffs: &mut row_count_cutoffs,
                     deferred_tags: &mut deferred_tags,
                     deferred_watermarks: &mut deferred_watermarks,
                 },
@@ -47694,6 +48643,7 @@ timestamp_column = "ts"
             (Vec::new(), Vec::new(), Vec::new());
         let mut batch_asset_keys = Vec::new();
         let mut assertion_targets = Vec::new();
+        let mut row_count_cutoffs = HashMap::new();
         let mut table_errors = Vec::new();
         let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
         let mut total_completed = 0;
@@ -47712,6 +48662,7 @@ timestamp_column = "ts"
                 freshness_batch_refs: &mut freshness_refs,
                 batch_asset_keys: &mut batch_asset_keys,
                 assertion_targets: &mut assertion_targets,
+                row_count_cutoffs: &mut row_count_cutoffs,
                 deferred_tags: &mut deferred_tags,
                 deferred_watermarks: &mut deferred_watermarks,
             },
@@ -48468,9 +49419,13 @@ auto_create_schemas = true
             "CREATE SCHEMA src",
             "CREATE SCHEMA tgt",
             "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            // Row 3 is newer than every row the test copies, so the #2376
+            // hold-back (which leaves the newest batch for a later run) lets
+            // row 2 through and holds back only row 3.
             "INSERT INTO src.events VALUES \
                 (1, TIMESTAMP '2026-03-01 10:00:00'), \
-                (2, TIMESTAMP '2026-03-02 12:00:00')",
+                (2, TIMESTAMP '2026-03-02 12:00:00'), \
+                (3, TIMESTAMP '2026-03-03 00:00:00')",
             "CREATE TABLE tgt.events AS SELECT * FROM src.events WHERE id = 1",
         ] {
             inner.execute_statement(sql).await.unwrap();
@@ -49061,8 +50016,13 @@ timestamp_column = "ts"
 
         // This arrival is newer than the copied data but older than the runner's
         // wall clock. A replacement must not certify it as already loaded.
+        // Row 4 is newer still: the #2376 hold-back leaves the newest batch
+        // for a later run, so without it row 3 would wait.
         warehouse
-            .execute_statement("INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 12:00:00')")
+            .execute_statement(
+                "INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 12:00:00'), \
+                 (4, TIMESTAMP '2026-03-04 12:00:00')",
+            )
             .await
             .unwrap();
         pipeline.strategy = "incremental".into();
@@ -49119,6 +50079,14 @@ timestamp_column = "ts"
                     .unwrap()
                     .is_none()
             );
+            // A newer row, so the #2376 hold-back keeps only it back and the
+            // bootstrap still copies rows 1 and 2.
+            warehouse
+                .execute_statement(
+                    "INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 12:00:00')",
+                )
+                .await
+                .unwrap();
             let TableOutcome::Materialized(result) =
                 process_table(&warehouse, &state, &pipeline, &task, false)
                     .await
@@ -49740,6 +50708,12 @@ timestamp_column = "ts"
         let target = selected;
         let planned = [target.clone()].into_iter().collect();
         assert_eq!(state.owed_check_targets(&scope, &planned).unwrap(), planned);
+        // A newer row, so the #2376 hold-back keeps only it back and the
+        // append re-copies row 2 (the target already holds it).
+        warehouse
+            .execute_statement("INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 12:00:00')")
+            .await
+            .unwrap();
         let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
             &StableMarker(&warehouse),
             &state,
@@ -49758,8 +50732,13 @@ timestamp_column = "ts"
         };
         assert!(result.source_batch_ref.is_some());
         assert!(result.target_batch_ref.is_some());
+        // The source side of `row_count` under the hold-back: rows below the
+        // cutoff, plus NULL timestamps.
         let source_count: u64 = warehouse
-            .execute_query("SELECT COUNT(*) FROM src.events")
+            .execute_query(
+                "SELECT COUNT(*) FROM src.events \
+                 WHERE ts < TIMESTAMP '2026-03-03 12:00:00' OR ts IS NULL",
+            )
             .await
             .unwrap()
             .rows[0][0]
@@ -49943,7 +50922,21 @@ timestamp_column = "ts"
             .execute_statement("UPDATE raw__acme.t00 SET ts = TIMESTAMP '2026-03-01 12:00:00'")
             .await
             .unwrap();
+        hold_back_sentinel_row(&warehouse).await;
         config
+    }
+
+    /// A far-future row that is always the newest source timestamp, so the
+    /// #2376 hold-back keeps only it back and every row a test seeds below
+    /// it copies as before. Its `id` is 99.
+    #[cfg(feature = "duckdb")]
+    async fn hold_back_sentinel_row(warehouse: &rocky_duckdb::adapter::DuckDbWarehouseAdapter) {
+        warehouse
+            .execute_statement(
+                "INSERT INTO raw__acme.t00 VALUES (99, TIMESTAMP '2099-01-01 00:00:00')",
+            )
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "duckdb")]
@@ -50025,6 +51018,7 @@ timestamp_column = "ts"
                 .execute_statement("UPDATE raw__acme.t00 SET ts = TIMESTAMP '2026-03-01 12:00:00'")
                 .await
                 .unwrap();
+            hold_back_sentinel_row(&warehouse).await;
         });
         let run_id = "confirmed-recordless-guidance";
         *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.into());

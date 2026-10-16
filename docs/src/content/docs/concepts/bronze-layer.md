@@ -115,11 +115,15 @@ INSERT INTO warehouse.stage__shopify.orders
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM fivetran_catalog.src__acme__us_west__shopify.orders
 WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
+  AND _fivetran_synced < TIMESTAMP '2026-04-17 10:00:00'
 ```
 
-The literal in that `WHERE` is the previous run's `MAX(_fivetran_synced)`. Rocky
-keeps it in the [state store](/reference/glossary/#state-store) and writes it into
-the query. It does not read the value back from the target with a subquery.
+The first literal in that `WHERE` is the previous run's `MAX(_fivetran_synced)`.
+Rocky keeps it in the [state store](/reference/glossary/#state-store) and writes it
+into the query. It does not read the value back from the target with a subquery.
+The second literal is the newest timestamp in the source, read just before the
+copy. Rocky holds back the newest batch until a later run, the first run
+included. See [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes).
 
 `_fivetran_synced` is Fivetran's built-in column recording when each row was
 synced. Rocky uses it as the watermark column by default. Change it with
