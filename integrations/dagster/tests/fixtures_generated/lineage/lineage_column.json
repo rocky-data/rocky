@@ -56,5 +56,6 @@
       "target_model": "stg_orders",
       "kind": "filter"
     }
-  ]
+  ],
+  "incomplete_lineage": []
 }

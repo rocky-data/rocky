@@ -356,9 +356,32 @@ class ModelDecisionOutput(BaseModel):
     """
 
 
+class OverrideMatchCountOutput(BaseModel):
+    """
+    How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
+    """
+
+    connector: str | None = None
+    """
+    Echo of `match.connector` from the rule.
+    """
+    matched_tables: conint(ge=0)
+    """
+    Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.
+    """
+    rule_index: conint(ge=0)
+    """
+    Position of the rule in `[[table_overrides]]`, 0-based.
+    """
+    table: str | None = None
+    """
+    Echo of `match.table` from the rule.
+    """
+
+
 class OverrideWarningOutput(BaseModel):
     """
-    Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.
+    Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no discovered table this run (after `--filter`, before tables missing from the source are excluded).
 
     Distinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.
     """
@@ -974,6 +997,10 @@ class RunOutput(BaseModel):
     model_decisions: list[ModelDecisionOutput] | None = None
     """
     Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
+    """
+    override_match_counts: list[OverrideMatchCountOutput] | None = None
+    """
+    How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.
     """
     override_warnings: list[OverrideWarningOutput] | None = None
     """

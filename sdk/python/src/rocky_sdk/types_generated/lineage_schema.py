@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel
 
 
@@ -45,6 +47,94 @@ class LineageConsumerRecord(BaseModel):
     """
 
 
+class LineageGap12(StrEnum):
+    """
+    A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.
+    """
+
+    natural_join = "natural_join"
+
+
+class LineageGap13(StrEnum):
+    """
+    `GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.
+    """
+
+    group_by_all = "group_by_all"
+
+
+class LineageGap14(StrEnum):
+    """
+    A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.
+    """
+
+    set_operation = "set_operation"
+
+
+class LineageGap15(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.
+    """
+
+    cte_body_row_selection = "cte_body_row_selection"
+
+
+class LineageGap16(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).
+    """
+
+    derived_table_row_selection = "derived_table_row_selection"
+
+
+class LineageGap17(StrEnum):
+    """
+    A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.
+    """
+
+    subquery_expression = "subquery_expression"
+
+
+class LineageGap18(StrEnum):
+    """
+    A window named after another named window. Its keys are not resolved.
+    """
+
+    nested_named_window = "nested_named_window"
+
+
+class LineageGap19(StrEnum):
+    """
+    A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.
+    """
+
+    unmodelled_relation = "unmodelled_relation"
+
+
+class LineageGap20(StrEnum):
+    """
+    A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.
+    """
+
+    unattributed_column = "unattributed_column"
+
+
+class LineageGap21(StrEnum):
+    """
+    A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).
+    """
+
+    unresolved_projection = "unresolved_projection"
+
+
+class LineageGap22(StrEnum):
+    """
+    A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.
+    """
+
+    unresolved_star = "unresolved_star"
+
+
 class LineageNodeDef(BaseModel):
     """
     Per-node metadata for the lineage graph.
@@ -71,6 +161,36 @@ class LineageQualifiedColumn(BaseModel):
     model: str
 
 
+class IncompleteLineageRecord(BaseModel):
+    """
+    A model whose column lineage is known to be incomplete (#2377).
+    """
+
+    gaps: (
+        list[
+            LineageGap12
+            | LineageGap13
+            | LineageGap14
+            | LineageGap15
+            | LineageGap16
+            | LineageGap17
+            | LineageGap18
+            | LineageGap19
+            | LineageGap20
+            | LineageGap21
+            | LineageGap22
+        ]
+        | None
+    ) = None
+    """
+    The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).
+    """
+    model: str
+    """
+    The model.
+    """
+
+
 class LineageEdgeRecord(BaseModel):
     source: LineageQualifiedColumn
     target: LineageQualifiedColumn
@@ -95,6 +215,12 @@ class LineageOutput(BaseModel):
     """
     downstream: list[str]
     edges: list[LineageEdgeRecord]
+    incomplete_lineage: list[IncompleteLineageRecord] | None = None
+    """
+    Models in this view (the focal model and the models it reads or that read it) whose lineage is known to be incomplete, sorted by name (#2377). Impact through them may be under-reported. `[]` means none.
+
+    Always written. A payload with no such field comes from an older build: read it as unknown, never as complete.
+    """
     model: str
     nodes: list[LineageNodeDef] | None = None
     """

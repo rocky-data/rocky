@@ -187,6 +187,10 @@ export interface RunOutput {
    */
   model_decisions?: ModelDecisionOutput[];
   /**
+   * How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.
+   */
+  override_match_counts?: OverrideMatchCountOutput[];
+  /**
    * Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
    */
   override_warnings?: OverrideWarningOutput[];
@@ -653,7 +657,29 @@ export interface ModelDecisionOutput {
   [k: string]: unknown;
 }
 /**
- * Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.
+ * How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
+ */
+export interface OverrideMatchCountOutput {
+  /**
+   * Echo of `match.connector` from the rule.
+   */
+  connector?: string | null;
+  /**
+   * Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.
+   */
+  matched_tables: number;
+  /**
+   * Position of the rule in `[[table_overrides]]`, 0-based.
+   */
+  rule_index: number;
+  /**
+   * Echo of `match.table` from the rule.
+   */
+  table?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no discovered table this run (after `--filter`, before tables missing from the source are excluded).
  *
  * Distinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.
  */

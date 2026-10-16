@@ -6,6 +6,24 @@
  */
 
 /**
+ * A construct whose lineage Rocky does not record, so a model that uses it has known-incomplete lineage (#2377).
+ *
+ * Impact analysis (`rocky lineage --downstream`, the blast radius) can then under-report: an edge the construct implies is missing. The list is what the extractor knows it skips. It is not a proof that everything else is traced.
+ */
+export type LineageGap =
+  | "natural_join"
+  | "group_by_all"
+  | "set_operation"
+  | "cte_body_row_selection"
+  | "derived_table_row_selection"
+  | "subquery_expression"
+  | "nested_named_window"
+  | "unmodelled_relation"
+  | "unattributed_column"
+  | "unresolved_projection"
+  | "unresolved_star";
+
+/**
  * JSON output for `rocky lineage <model>` (model lineage shape).
  *
  * When invoked with `--column <col>` (or `model.column` syntax), the dispatch returns `ColumnLineageOutput` instead — the two shapes share version/command/model headers but otherwise differ enough to keep separate.
@@ -19,6 +37,12 @@ export interface LineageOutput {
   consumers?: LineageConsumerRecord[];
   downstream: string[];
   edges: LineageEdgeRecord[];
+  /**
+   * Models in this view (the focal model and the models it reads or that read it) whose lineage is known to be incomplete, sorted by name (#2377). Impact through them may be under-reported. `[]` means none.
+   *
+   * Always written. A payload with no such field comes from an older build: read it as unknown, never as complete.
+   */
+  incomplete_lineage?: IncompleteLineageRecord[] | null;
   model: string;
   /**
    * Per-node metadata for every model referenced by this lineage view (the focal model plus each endpoint of `edges`). Lets consumers (e.g. the VS Code subgraph drill-in) cluster nodes by their resolved target schema or source identity instead of parsing the qualified node name. Empty when no nodes were resolved; older JSON payloads cached locally may omit the field entirely.
@@ -77,6 +101,20 @@ export interface LineageEdgeRecord {
 }
 export interface LineageQualifiedColumn {
   column: string;
+  model: string;
+  [k: string]: unknown;
+}
+/**
+ * A model whose column lineage is known to be incomplete (#2377).
+ */
+export interface IncompleteLineageRecord {
+  /**
+   * The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).
+   */
+  gaps?: LineageGap[] | null;
+  /**
+   * The model.
+   */
   model: string;
   [k: string]: unknown;
 }

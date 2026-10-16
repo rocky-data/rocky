@@ -930,6 +930,42 @@
       ],
       "type": "object"
     },
+    "OverrideMatchCountOutput": {
+      "description": "How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].",
+      "properties": {
+        "connector": {
+          "description": "Echo of `match.connector` from the rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matched_tables": {
+          "description": "Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rule_index": {
+          "description": "Position of the rule in `[[table_overrides]]`, 0-based.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "Echo of `match.table` from the rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "matched_tables",
+        "rule_index"
+      ],
+      "type": "object"
+    },
     "PlanCostPreview": {
       "description": "The cost preview on [`PlanOutput::cost_preview`].\n\nEach total is the sum over every model, and is `None` when any model lacks the figure, so a total never covers only part of the plan. A total with `source: mixed` adds adapter and heuristic figures. `cost_delta_usd` compares an adapter estimate with the observed cost of the last successful production run of the same models. It is `None` unless every model has both.",
       "properties": {
@@ -1342,6 +1378,13 @@
       "description": "Qualified model names that will be executed by `rocky apply`. Empty for replication-only plans. Informational — re-derived at apply time.",
       "items": {
         "type": "string"
+      },
+      "type": "array"
+    },
+    "override_match_counts": {
+      "description": "How many discovered tables each `[[table_overrides]]` rule matches, for a replication plan. The same function `rocky run` uses counts them, so the numbers agree with [`RunOutput::override_match_counts`] for the same project and `--filter`. Plan does not ask the warehouse which source tables exist, and run counts before it excludes them. Empty (and omitted) when no rules are declared.",
+      "items": {
+        "$ref": "#/definitions/OverrideMatchCountOutput"
       },
       "type": "array"
     },

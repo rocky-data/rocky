@@ -522,6 +522,29 @@ class ModelIntentVerdict(BaseModel):
     """
 
 
+class OverrideMatchCountOutput(BaseModel):
+    """
+    How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
+    """
+
+    connector: str | None = None
+    """
+    Echo of `match.connector` from the rule.
+    """
+    matched_tables: conint(ge=0)
+    """
+    Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.
+    """
+    rule_index: conint(ge=0)
+    """
+    Position of the rule in `[[table_overrides]]`, 0-based.
+    """
+    table: str | None = None
+    """
+    Echo of `match.table` from the rule.
+    """
+
+
 class PlanFirstRunFill(BaseModel):
     """
     One row of [`PlanOutput::first_run_fills`].
@@ -892,6 +915,10 @@ class PlanOutput(BaseModel):
     models: list[str] | None = None
     """
     Qualified model names that will be executed by `rocky apply`. Empty for replication-only plans. Informational — re-derived at apply time.
+    """
+    override_match_counts: list[OverrideMatchCountOutput] | None = None
+    """
+    How many discovered tables each `[[table_overrides]]` rule matches, for a replication plan. The same function `rocky run` uses counts them, so the numbers agree with [`RunOutput::override_match_counts`] for the same project and `--filter`. Plan does not ask the warehouse which source tables exist, and run counts before it excludes them. Empty (and omitted) when no rules are declared.
     """
     plan_id: str | None = None
     """

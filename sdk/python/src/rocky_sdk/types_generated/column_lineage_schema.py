@@ -3,7 +3,97 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel
+
+
+class LineageGap1(StrEnum):
+    """
+    A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.
+    """
+
+    natural_join = "natural_join"
+
+
+class LineageGap2(StrEnum):
+    """
+    `GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.
+    """
+
+    group_by_all = "group_by_all"
+
+
+class LineageGap3(StrEnum):
+    """
+    A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.
+    """
+
+    set_operation = "set_operation"
+
+
+class LineageGap4(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.
+    """
+
+    cte_body_row_selection = "cte_body_row_selection"
+
+
+class LineageGap5(StrEnum):
+    """
+    A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).
+    """
+
+    derived_table_row_selection = "derived_table_row_selection"
+
+
+class LineageGap6(StrEnum):
+    """
+    A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.
+    """
+
+    subquery_expression = "subquery_expression"
+
+
+class LineageGap7(StrEnum):
+    """
+    A window named after another named window. Its keys are not resolved.
+    """
+
+    nested_named_window = "nested_named_window"
+
+
+class LineageGap8(StrEnum):
+    """
+    A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.
+    """
+
+    unmodelled_relation = "unmodelled_relation"
+
+
+class LineageGap9(StrEnum):
+    """
+    A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.
+    """
+
+    unattributed_column = "unattributed_column"
+
+
+class LineageGap10(StrEnum):
+    """
+    A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).
+    """
+
+    unresolved_projection = "unresolved_projection"
+
+
+class LineageGap11(StrEnum):
+    """
+    A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.
+    """
+
+    unresolved_star = "unresolved_star"
 
 
 class LineageQualifiedColumn(BaseModel):
@@ -34,6 +124,36 @@ class RowSelectionEdgeRecord(BaseModel):
     """
 
 
+class IncompleteLineageRecord(BaseModel):
+    """
+    A model whose column lineage is known to be incomplete (#2377).
+    """
+
+    gaps: (
+        list[
+            LineageGap1
+            | LineageGap2
+            | LineageGap3
+            | LineageGap4
+            | LineageGap5
+            | LineageGap6
+            | LineageGap7
+            | LineageGap8
+            | LineageGap9
+            | LineageGap10
+            | LineageGap11
+        ]
+        | None
+    ) = None
+    """
+    The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).
+    """
+    model: str
+    """
+    The model.
+    """
+
+
 class LineageEdgeRecord(BaseModel):
     source: LineageQualifiedColumn
     target: LineageQualifiedColumn
@@ -57,6 +177,12 @@ class ColumnLineageOutput(BaseModel):
     downstream_consumers: list[LineageQualifiedColumn] | None = None
     """
     Every downstream column that transitively consumes `(model, column)`, deduplicated and deterministically sorted. An author-time "what does changing this column affect" signal, always populated regardless of `direction` so the default (upstream) trace still carries the blast radius. Inspection only — this never feeds a build/skip/reuse decision. Empty when the column has no consumers.
+    """
+    incomplete_lineage: list[IncompleteLineageRecord] | None = None
+    """
+    Models whose lineage is known to be incomplete, sorted by name (#2377): the focal model, every model upstream of it, and every model downstream of it (by model dependency, so a reader with no traced column edge is included). `trace`, `downstream_consumers` and `row_selection` may be under-reported through them. `[]` means none.
+
+    Always written. A payload with no such field comes from an older build: read it as unknown, never as complete.
     """
     model: str
     row_selection: list[RowSelectionEdgeRecord] | None = None

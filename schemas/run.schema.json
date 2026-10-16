@@ -1007,8 +1007,44 @@
       ],
       "type": "object"
     },
+    "OverrideMatchCountOutput": {
+      "description": "How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].",
+      "properties": {
+        "connector": {
+          "description": "Echo of `match.connector` from the rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matched_tables": {
+          "description": "Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rule_index": {
+          "description": "Position of the rule in `[[table_overrides]]`, 0-based.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "Echo of `match.table` from the rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "matched_tables",
+        "rule_index"
+      ],
+      "type": "object"
+    },
     "OverrideWarningOutput": {
-      "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
+      "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no discovered table this run (after `--filter`, before tables missing from the source are excluded).\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
       "properties": {
         "connector": {
           "description": "Echo of `match.connector` from the rule, for cross-reference.",
@@ -1569,6 +1605,13 @@
       "description": "Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.",
       "items": {
         "$ref": "#/definitions/ModelDecisionOutput"
+      },
+      "type": "array"
+    },
+    "override_match_counts": {
+      "description": "How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.",
+      "items": {
+        "$ref": "#/definitions/OverrideMatchCountOutput"
       },
       "type": "array"
     },

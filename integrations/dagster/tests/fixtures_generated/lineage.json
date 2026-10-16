@@ -101,5 +101,6 @@
       "model": "customer_orders",
       "target_schema": "silver"
     }
-  ]
+  ],
+  "incomplete_lineage": []
 }

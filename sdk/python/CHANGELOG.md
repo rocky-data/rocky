@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PlanResult.override_match_counts` and `RunResult.override_match_counts`: how many tables each `[[table_overrides]]` rule matches. `rocky plan` and `rocky run` report the same numbers.
+- `ModelLineageResult.incomplete_lineage` and `ColumnLineageResult.incomplete_lineage`: the models whose lineage is known to be incomplete. `None` (an older engine) means unknown, not complete.
+- The generated `RockyType` models gain the `DecimalUnsized` tag: a decimal whose precision and scale the engine does not claim, such as `SUM` over a decimal.
+
 ## [0.23.0] — 2026-10-15
 
 ### Changed

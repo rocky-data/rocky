@@ -74,13 +74,23 @@ class RockyType2(BaseModel):
 
 class RockyType3(StrEnum):
     """
+    A decimal whose precision and scale Rocky cannot bound (#2356).
+
+    The value is an exact decimal, but its digits depend on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. Rocky keeps the type family so a bare `Decimal` contract is still checked, and does not claim digits it cannot prove, so a `Decimal(p,s)` contract is reported as not checked.
+    """
+
+    DecimalUnsized = "DecimalUnsized"
+
+
+class RockyType4(StrEnum):
+    """
     Timestamp with timezone.
     """
 
     Timestamp = "Timestamp"
 
 
-class RockyType4(StrEnum):
+class RockyType5(StrEnum):
     """
     Timestamp without timezone (common in Databricks).
     """
@@ -135,7 +145,7 @@ class ModelDetailOutput(BaseModel):
     """
 
 
-class RockyType5(BaseModel):
+class RockyType6(BaseModel):
     """
     Rocky's unified column type.
 
@@ -156,7 +166,7 @@ class RockyType5(BaseModel):
     Array: RockyType
 
 
-class RockyType6(BaseModel):
+class RockyType7(BaseModel):
     """
     Rocky's unified column type.
 
@@ -177,7 +187,7 @@ class RockyType6(BaseModel):
     Map: list[RockyType] = Field(..., max_length=2, min_length=2)
 
 
-class RockyType7(BaseModel):
+class RockyType8(BaseModel):
     """
     Rocky's unified column type.
 
@@ -240,6 +250,7 @@ class RockyType(
         | RockyType5
         | RockyType6
         | RockyType7
+        | RockyType8
     ]
 ):
     root: (
@@ -250,6 +261,7 @@ class RockyType(
         | RockyType5
         | RockyType6
         | RockyType7
+        | RockyType8
     )
     """
     Rocky's unified column type.
@@ -267,8 +279,8 @@ class RockyType(
 
 
 ModelDetailOutput.model_rebuild()
-RockyType5.model_rebuild()
 RockyType6.model_rebuild()
 RockyType7.model_rebuild()
+RockyType8.model_rebuild()
 StructField.model_rebuild()
 TypedColumnOutput.model_rebuild()

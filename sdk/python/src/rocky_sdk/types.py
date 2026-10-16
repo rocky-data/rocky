@@ -539,6 +539,13 @@ class RunResult(BaseModel):
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
     override_warnings: list[OverrideWarningOutput] = Field(default_factory=list)
+    #: How many discovered tables each ``[[table_overrides]]`` rule matches,
+    #: counted after ``--filter`` and before the warehouse check for tables
+    #: missing from the source, so ``rocky plan`` reports the same numbers.
+    #: Loose ``dict`` rows (``rule_index``, ``connector``, ``table``,
+    #: ``matched_tables``); the nested shape lives on the generated
+    #: ``RunOutput.override_match_counts``. Empty when no rules are declared.
+    override_match_counts: list[dict] = Field(default_factory=list)
     #: Problems in the project's ``consumers/`` records (``E060``). They never
     #: stop a model from being written and are never counted as a failed
     #: table. Empty when the records are sound.
@@ -672,6 +679,11 @@ class PlanResult(BaseModel):
     #: model fills. Kept as loose ``dict`` rows — the nested shape lives on the
     #: generated ``PlanOutput.first_run_fills``.
     first_run_fills: list[dict] = []
+    #: How many discovered tables each ``[[table_overrides]]`` rule matches,
+    #: counted the same way ``rocky run`` counts them. Loose ``dict`` rows; the
+    #: nested shape lives on the generated ``PlanOutput.override_match_counts``.
+    #: Empty when no rules are declared.
+    override_match_counts: list[dict] = []
     #: Budget diagnostics raised at plan time. Empty when no ``[budget]`` block
     #: is configured.
     budget_diagnostics: list[Diagnostic] = []
@@ -901,6 +913,11 @@ class ModelLineageResult(BaseModel):
     #: ``dict`` entries; the nested shape lives on the generated
     #: ``LineageOutput.consumers``. Empty when none are declared.
     consumers: list[dict] = Field(default_factory=list)
+    #: Models in this view whose lineage is known to be incomplete, each with
+    #: the constructs Rocky does not trace (``gaps``; ``None`` = unknown).
+    #: Impact may be under-reported for them. ``[]`` means none. ``None``
+    #: means unknown (an older binary), never "complete".
+    incomplete_lineage: list[dict] | None = None
 
 
 class RowSelectionEdge(BaseModel):
@@ -935,6 +952,10 @@ class ColumnLineageResult(BaseModel):
     #: window keys). ``trace`` stays value-derivation only. Empty for older
     #: binaries.
     row_selection: list[RowSelectionEdge] = Field(default_factory=list)
+    #: Models on the trace, or downstream of the column, whose lineage is
+    #: known to be incomplete. Same shape and meaning as
+    #: :attr:`ModelLineageResult.incomplete_lineage`: ``None`` is unknown.
+    incomplete_lineage: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------

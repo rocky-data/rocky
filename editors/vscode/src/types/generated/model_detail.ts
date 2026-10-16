@@ -27,6 +27,7 @@ export type RockyType =
         [k: string]: unknown;
       };
     }
+  | "DecimalUnsized"
   | "Timestamp"
   | "TimestampNtz"
   | {

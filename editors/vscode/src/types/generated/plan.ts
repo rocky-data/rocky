@@ -220,6 +220,10 @@ export interface PlanOutput {
    */
   models?: string[];
   /**
+   * How many discovered tables each `[[table_overrides]]` rule matches, for a replication plan. The same function `rocky run` uses counts them, so the numbers agree with [`RunOutput::override_match_counts`] for the same project and `--filter`. Plan does not ask the warehouse which source tables exist, and run counts before it excludes them. Empty (and omitted) when no rules are declared.
+   */
+  override_match_counts?: OverrideMatchCountOutput[];
+  /**
    * Full 64-char blake3 plan identifier. Present when the plan was persisted to `.rocky/plans/<plan_id>.json`. Apply with: `rocky apply <plan_id>`.
    */
   plan_id?: string | null;
@@ -553,6 +557,28 @@ export interface MaskAction {
    * Classification tag the mask is resolved against.
    */
   tag: string;
+  [k: string]: unknown;
+}
+/**
+ * How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
+ */
+export interface OverrideMatchCountOutput {
+  /**
+   * Echo of `match.connector` from the rule.
+   */
+  connector?: string | null;
+  /**
+   * Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.
+   */
+  matched_tables: number;
+  /**
+   * Position of the rule in `[[table_overrides]]`, 0-based.
+   */
+  rule_index: number;
+  /**
+   * Echo of `match.table` from the rule.
+   */
+  table?: string | null;
   [k: string]: unknown;
 }
 /**

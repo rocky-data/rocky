@@ -47,5 +47,6 @@
       "model": "stg_orders",
       "target_schema": "demo"
     }
-  ]
+  ],
+  "incomplete_lineage": []
 }

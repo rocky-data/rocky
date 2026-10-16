@@ -5140,6 +5140,16 @@
             },
             "type": "array"
           },
+          "incomplete_lineage": {
+            "description": "Models whose lineage is known to be incomplete, sorted by name (#2377): the focal model, every model upstream of it, and every model downstream of it (by model dependency, so a reader with no traced column edge is included). `trace`, `downstream_consumers` and `row_selection` may be under-reported through them. `[]` means none.\n\nAlways written. A payload with no such field comes from an older build: read it as unknown, never as complete.",
+            "items": {
+              "$ref": "#/components/schemas/IncompleteLineageRecord"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "model": {
             "type": "string"
           },
@@ -10309,6 +10319,29 @@
         ],
         "type": "object"
       },
+      "IncompleteLineageRecord": {
+        "description": "A model whose column lineage is known to be incomplete (#2377).",
+        "properties": {
+          "gaps": {
+            "description": "The constructs in it that Rocky does not trace, such as `natural_join` or `set_operation`. `None` when they were never computed (unknown).",
+            "items": {
+              "$ref": "#/components/schemas/LineageGap"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The model.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "type": "object"
+      },
       "IncrementalLookback": {
         "type": "string"
       },
@@ -11057,6 +11090,88 @@
         ],
         "type": "object"
       },
+      "LineageGap": {
+        "description": "A construct whose lineage Rocky does not record, so a model that uses it has known-incomplete lineage (#2377).\n\nImpact analysis (`rocky lineage --downstream`, the blast radius) can then under-report: an edge the construct implies is missing. The list is what the extractor knows it skips. It is not a proof that everything else is traced.",
+        "oneOf": [
+          {
+            "description": "A `NATURAL` join. Its key columns are known only to the warehouse catalog, so no `join_key` edge is recorded.",
+            "enum": [
+              "natural_join"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`GROUP BY ALL`. Its group keys are not resolved, so no `group_by` edge is recorded.",
+            "enum": [
+              "group_by_all"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A `UNION`, `INTERSECT` or `EXCEPT`. Value edges come from the first branch only; the other branches' columns are not mapped.",
+            "enum": [
+              "set_operation"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A filter, join, group, window or limit key inside a `WITH` body. Only the top-level query's row selection is recorded.",
+            "enum": [
+              "cte_body_row_selection"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A filter, join, group, window or limit key inside a derived table (`FROM (SELECT …)`).",
+            "enum": [
+              "derived_table_row_selection"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A subquery expression (`IN (SELECT …)`, `EXISTS`, a scalar subquery). Its columns and predicates, and any correlated reference, record no edge.",
+            "enum": [
+              "subquery_expression"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A window named after another named window. Its keys are not resolved.",
+            "enum": [
+              "nested_named_window"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.",
+            "enum": [
+              "unmodelled_relation"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A column whose table cannot be determined statically (an unqualified column in a multi-table query). Its edge is dropped.",
+            "enum": [
+              "unattributed_column"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A projection item whose output column lineage could not name (`SELECT (x)`, `SELECT 1`).",
+            "enum": [
+              "unresolved_projection"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A `SELECT *` over a relation whose columns Rocky does not know, so the expanded columns have no edges.",
+            "enum": [
+              "unresolved_star"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "LineageNodeDef": {
         "description": "Per-node metadata for the lineage graph.\n\nOne entry per distinct model referenced by `LineageOutput.edges` (plus the focal model). Carries cluster keys consumers can use to group nodes without having to parse the qualified node name. Either optional field may be absent — `target_schema` is `None` for nodes that aren't project models, and `source_id` is `None` for nodes that are project models (i.e. the two fields are mutually exclusive in practice).",
         "properties": {
@@ -11114,6 +11229,16 @@
               "$ref": "#/components/schemas/LineageEdgeRecord"
             },
             "type": "array"
+          },
+          "incomplete_lineage": {
+            "description": "Models in this view (the focal model and the models it reads or that read it) whose lineage is known to be incomplete, sorted by name (#2377). Impact through them may be under-reported. `[]` means none.\n\nAlways written. A payload with no such field comes from an older build: read it as unknown, never as complete.",
+            "items": {
+              "$ref": "#/components/schemas/IncompleteLineageRecord"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "model": {
             "type": "string"
@@ -13452,8 +13577,44 @@
         ],
         "type": "object"
       },
+      "OverrideMatchCountOutput": {
+        "description": "How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].",
+        "properties": {
+          "connector": {
+            "description": "Echo of `match.connector` from the rule.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "matched_tables": {
+            "description": "Discovered `(connector, table)` pairs the rule matches, after `--filter` and before tables missing from the source are excluded.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "rule_index": {
+            "description": "Position of the rule in `[[table_overrides]]`, 0-based.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "table": {
+            "description": "Echo of `match.table` from the rule.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "matched_tables",
+          "rule_index"
+        ],
+        "type": "object"
+      },
       "OverrideWarningOutput": {
-        "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
+        "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no discovered table this run (after `--filter`, before tables missing from the source are excluded).\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
         "properties": {
           "connector": {
             "description": "Echo of `match.connector` from the rule, for cross-reference.",
@@ -14806,6 +14967,13 @@
             "description": "Qualified model names that will be executed by `rocky apply`. Empty for replication-only plans. Informational — re-derived at apply time.",
             "items": {
               "type": "string"
+            },
+            "type": "array"
+          },
+          "override_match_counts": {
+            "description": "How many discovered tables each `[[table_overrides]]` rule matches, for a replication plan. The same function `rocky run` uses counts them, so the numbers agree with [`RunOutput::override_match_counts`] for the same project and `--filter`. Plan does not ask the warehouse which source tables exist, and run counts before it excludes them. Empty (and omitted) when no rules are declared.",
+            "items": {
+              "$ref": "#/components/schemas/OverrideMatchCountOutput"
             },
             "type": "array"
           },
@@ -20599,6 +20767,13 @@
             "type": "object"
           },
           {
+            "description": "A decimal whose precision and scale Rocky cannot bound (#2356).\n\nThe value is an exact decimal, but its digits depend on the warehouse: `SUM` over `DECIMAL(10,2)` is `DECIMAL(38,2)` on DuckDB and `DECIMAL(20,2)` on Databricks. Rocky keeps the type family so a bare `Decimal` contract is still checked, and does not claim digits it cannot prove, so a `Decimal(p,s)` contract is reported as not checked.",
+            "enum": [
+              "DecimalUnsized"
+            ],
+            "type": "string"
+          },
+          {
             "description": "Timestamp with timezone.",
             "enum": [
               "Timestamp"
@@ -21188,6 +21363,13 @@
             "description": "Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.",
             "items": {
               "$ref": "#/components/schemas/ModelDecisionOutput"
+            },
+            "type": "array"
+          },
+          "override_match_counts": {
+            "description": "How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.",
+            "items": {
+              "$ref": "#/components/schemas/OverrideMatchCountOutput"
             },
             "type": "array"
           },
