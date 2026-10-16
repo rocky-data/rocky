@@ -4838,7 +4838,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 if refuse_hooks {
                     rocky_cli::commands::refuse_configured_side_effects(&loaded.config.hooks)?;
                 }
-                let run_future = rocky_cli::commands::run_with_dag_and_contracts(
+                // No outer `select!` on a signal here (#1606). Dropping the
+                // DAG future skipped every settle step and exited 1. The DAG
+                // owns its cancellation token now: on a signal it starts no
+                // further node, lets the sub-run in flight settle, and
+                // returns `Interrupted`, which maps to exit 130 below.
+                rocky_cli::commands::run_with_dag_and_contracts(
                     &cli.config,
                     loaded,
                     &state_path,
@@ -4853,14 +4858,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &actor,
                     contracts.as_deref(),
                     &run_vars,
-                );
-                tokio::select! {
-                    result = run_future => result,
-                    _ = shutdown_signal() => {
-                        warn!("received shutdown signal, aborting DAG run");
-                        anyhow::bail!("interrupted by shutdown signal")
-                    }
-                }
+                )
+                .await
             } else {
                 // `rocky run` is the first-class fused plan+apply convenience
                 // for local iteration and automation; it routes through
@@ -6244,26 +6243,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     }
 
     result
-}
-
-/// Waits for SIGTERM (K8s pod termination) or SIGINT (Ctrl+C).
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = sigterm.recv() => {},
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await.ok();
-    }
 }
 
 #[cfg(test)]

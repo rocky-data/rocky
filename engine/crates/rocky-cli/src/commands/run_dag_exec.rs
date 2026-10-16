@@ -19,7 +19,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use rocky_core::dag_executor::{DagExecutor, NodeDispatcher, NodeFuture, NodeStatus};
+use rocky_core::dag_executor::{
+    DagExecutionResult, DagExecutor, INTERRUPTED_REASON, NodeDispatcher, NodeFuture, NodeStatus,
+};
 use rocky_core::unified_dag::{self, NodeId, NodeKind};
 // Moved to `rocky-compiler` so `rocky serve` compiles the same set (#2011).
 pub(super) use rocky_compiler::models_loader::load_transformation_models;
@@ -54,6 +56,104 @@ type SubRunner = Arc<
         + Send
         + Sync,
 >;
+
+/// The cancel side of one `rocky run --dag` (#1606).
+///
+/// `run` is the run's token and settle deadline from
+/// [`super::run_cancel::for_run`]. Every sub-run runs inside its scope, so a
+/// signal reaches the sub-run in flight as well as the executor, and a
+/// replication sub-run's unbounded hold reaches the DAG's listener.
+/// `not_started` collects the nodes whose future saw the cancel before it
+/// began work: a node dispatched
+/// in a layer can still be waiting for a concurrency permit or for its state
+/// turn when the signal lands.
+#[derive(Clone, Default)]
+struct DagCancel {
+    run: super::run_cancel::Shared,
+    not_started: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl DagCancel {
+    fn new(run: super::run_cancel::Shared) -> Self {
+        Self {
+            run,
+            not_started: Arc::default(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.run.token().is_cancelled()
+    }
+
+    /// Call right before a node starts work. `Err` when the run is cancelled:
+    /// the node is recorded as not started and must do nothing.
+    fn may_start(&self, id: &NodeId) -> std::result::Result<(), String> {
+        if !self.is_cancelled() {
+            return Ok(());
+        }
+        self.not_started
+            .lock()
+            .expect("dag cancel set poisoned")
+            .insert(id.0.clone());
+        Err(INTERRUPTED_REASON.to_string())
+    }
+
+    /// Wrap `fut` so it checks [`Self::may_start`] before it runs.
+    fn gated(&self, id: &NodeId, fut: NodeFuture) -> NodeFuture {
+        let cancel = self.clone();
+        let id = id.clone();
+        Box::pin(async move {
+            cancel.may_start(&id)?;
+            fut.await
+        })
+    }
+
+    fn not_started(&self) -> HashSet<String> {
+        self.not_started
+            .lock()
+            .expect("dag cancel set poisoned")
+            .clone()
+    }
+}
+
+/// Whether the signal left a node unfinished: one failed (the sub-run in
+/// flight settles as failed), or one was skipped because of the signal. A
+/// signal that lands after the last node finished leaves none, and the DAG
+/// then reports its normal outcome (#1606).
+fn signal_left_a_node_unfinished(result: &DagExecutionResult) -> bool {
+    result.nodes.iter().any(|n| match n.status {
+        NodeStatus::Failed => true,
+        NodeStatus::Skipped => n.error.as_deref() == Some(INTERRUPTED_REASON),
+        NodeStatus::Pending | NodeStatus::Running | NodeStatus::Completed => false,
+    })
+}
+
+/// Report the nodes in `not_started` as interrupted, then recount (#1606).
+///
+/// The executor saw each of them return an error and counted it as failed.
+/// None of them ran: each saw the cancel before it started. So each becomes
+/// `Skipped` with [`INTERRUPTED_REASON`], the same record the executor writes
+/// for a node it did not dispatch at all.
+fn report_not_started_as_interrupted(
+    result: &mut DagExecutionResult,
+    not_started: &HashSet<String>,
+) {
+    for node in &mut result.nodes {
+        if not_started.contains(&node.id) {
+            node.status = NodeStatus::Skipped;
+            node.error = Some(INTERRUPTED_REASON.to_string());
+        }
+    }
+    let count = |status: NodeStatus| result.nodes.iter().filter(|n| n.status == status).count();
+    let (completed, failed, skipped) = (
+        count(NodeStatus::Completed),
+        count(NodeStatus::Failed),
+        count(NodeStatus::Skipped),
+    );
+    result.completed = completed;
+    result.failed = failed;
+    result.skipped = skipped;
+}
 
 /// Grants each pipeline-bound sub-run an exclusive turn on its state file
 /// (#1312).
@@ -345,6 +445,14 @@ pub async fn run_with_dag_and_contracts(
         crate::output::reserve_stdout_for_json();
     }
 
+    // The run's one cancellation token (#1606), taken before the graph is
+    // planned so a signal during planning is not lost. It owns the signal
+    // listener (or adopts an enclosing scope's token). The executor checks it
+    // before each node, and every sub-run adopts it, so a signal stops new
+    // work and lets the sub-run in flight settle within the grace.
+    let run_cancel = super::run_cancel::for_run();
+    let cancel = DagCancel::new(run_cancel.shared());
+
     // ONE fingerprinted config snapshot for the WHOLE DAG (#1120): the DAG
     // build below and every per-node sub-run execute this same instance
     // (`Arc::clone` per node in the dispatcher), so a `rocky.toml` swap
@@ -482,12 +590,17 @@ pub async fn run_with_dag_and_contracts(
             run_vars.clone(),
         ),
         state_turns: StateTurnstile::new(),
+        cancel: cancel.clone(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
-    let result = executor
-        .execute(&dag)
+    let mut result = executor
+        .execute_until(&dag, &|| cancel.is_cancelled())
         .await
         .context("DAG execution failed")?;
+    let interrupted = cancel.is_cancelled() && signal_left_a_node_unfinished(&result);
+    if interrupted {
+        report_not_started_as_interrupted(&mut result, &cancel.not_started());
+    }
 
     if json {
         let output = DagRunOutput {
@@ -528,6 +641,23 @@ pub async fn run_with_dag_and_contracts(
         );
     }
 
+    // A cancelled DAG (#1606) exits 130 whatever else happened, as a
+    // cancelled `rocky run` does: checked before the failure count, so a node
+    // that failed during the settle still reads as interrupted. Each sub-run
+    // that started has already settled itself: its record is written and its
+    // claim released.
+    if interrupted {
+        let not_started = result
+            .nodes
+            .iter()
+            .filter(|n| n.error.as_deref() == Some(INTERRUPTED_REASON))
+            .count();
+        crate::status_line!(
+            "[rocky] DAG run interrupted: {not_started} of {} node(s) not started",
+            result.total_nodes
+        );
+        return Err(anyhow::Error::new(super::run::Interrupted));
+    }
     if result.had_failures() {
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
@@ -884,6 +1014,9 @@ struct CliDispatcher {
     /// [`StateTurnstile`] (#1312). One turnstile per DAG run, shared by every
     /// node the dispatcher creates.
     state_turns: Arc<StateTurnstile>,
+    /// The run's cancel token and the nodes that saw it before they started
+    /// (#1606). Every node future checks it right before it starts work.
+    cancel: DagCancel,
 }
 
 /// The partition options one DAG sub-run receives: the caller's **selection**,
@@ -1016,10 +1149,13 @@ impl NodeDispatcher for CliDispatcher {
                 // Source nodes represent the extract side of a replication
                 // pipeline — handled by the corresponding load node, so the
                 // source itself is a marker.
-                Some(Box::pin(async move {
-                    info!(label = %label, "DAG: source marker (no-op)");
-                    Ok(())
-                }))
+                Some(self.cancel.gated(
+                    id,
+                    Box::pin(async move {
+                        info!(label = %label, "DAG: source marker (no-op)");
+                        Ok(())
+                    }),
+                ))
             }
             NodeKind::Seed => {
                 // A seed is not a pipeline — driving it through `run()` would
@@ -1044,7 +1180,7 @@ impl NodeDispatcher for CliDispatcher {
                 let seeds_dir = self.seeds_dir.clone();
                 let seed_pipeline = self.seed_pipeline.clone();
                 let seed_pipeline_refusal = self.seed_pipeline_refusal;
-                Some(Box::pin(async move {
+                let seed_future: NodeFuture = Box::pin(async move {
                     // `resolve_pipeline` inside `run_seed` is about to hit the
                     // same "which pipeline" ambiguity standalone `rocky seed`
                     // refuses on — but under `--dag` there is no `--pipeline`
@@ -1103,7 +1239,8 @@ impl NodeDispatcher for CliDispatcher {
                         }
                     });
                     result.map_err(|e| format!("{e:#}"))
-                }))
+                });
+                Some(self.cancel.gated(id, seed_future))
             }
             _ => {
                 // Pipeline-bound nodes (transformation / load / quality /
@@ -1128,6 +1265,8 @@ impl NodeDispatcher for CliDispatcher {
                 // they are honored per sub-run rather than dropped at the DAG
                 // boundary.
                 let state_turns = Arc::clone(&self.state_turns);
+                let cancel = self.cancel.clone();
+                let id = id.clone();
                 Some(Box::pin(async move {
                     // Take the exclusive turn for this state file BEFORE the
                     // sub-run opens the store, and hold it until the sub-run
@@ -1135,17 +1274,26 @@ impl NodeDispatcher for CliDispatcher {
                     // that long (#1312). Waiting here pends the node future;
                     // the executor's other layers of work are unaffected.
                     let _turn = state_turns.turn(&state_path).await;
-                    (sub_runner)(
-                        config_path,
-                        loaded,
-                        state_path,
-                        pipeline_name,
-                        model_name,
-                        partition_opts,
-                        skip_opts,
-                        shadow_config,
-                    )
-                    .await
+                    // The turn can take as long as a sibling's whole sub-run,
+                    // so the cancel check comes after it (#1606).
+                    cancel.may_start(&id)?;
+                    // The executor runs each node on its own task, which does
+                    // not inherit a task-local. So the run's token and
+                    // deadline are handed to the sub-run here: its `for_run`
+                    // adopts them and spawns no listener of its own.
+                    cancel
+                        .run
+                        .scope((sub_runner)(
+                            config_path,
+                            loaded,
+                            state_path,
+                            pipeline_name,
+                            model_name,
+                            partition_opts,
+                            skip_opts,
+                            shadow_config,
+                        ))
+                        .await
                 }))
             }
         }
@@ -1251,6 +1399,7 @@ mod run_opts_threading_tests {
             shadow_config,
             sub_runner: recorder,
             state_turns: StateTurnstile::new(),
+            cancel: super::DagCancel::default(),
         };
         (dispatcher, node_ids)
     }
@@ -1504,6 +1653,221 @@ mod run_opts_threading_tests {
 }
 
 #[cfg(test)]
+mod dag_cancel_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rocky_core::dag_executor::{
+        DagExecutionResult, INTERRUPTED_REASON, NodeDispatcher, NodeResult, NodeStatus,
+    };
+    use rocky_core::unified_dag::NodeKind;
+
+    use super::{DagCancel, StateTurnstile, SubRunner, report_not_started_as_interrupted};
+
+    fn node(id: &str, status: NodeStatus, error: Option<&str>) -> NodeResult {
+        NodeResult {
+            id: id.into(),
+            kind: "transformation".into(),
+            label: id.into(),
+            status,
+            layer: 0,
+            duration_ms: 0,
+            error: error.map(str::to_string),
+        }
+    }
+
+    /// The executor counted a node that saw the cancel before it started as
+    /// failed. It never ran, so it is reported as interrupted and the counts
+    /// follow. A node that genuinely failed stays failed.
+    /// A signal after the last node finished leaves the DAG's normal outcome.
+    /// A plain skip (a Test node) is not the signal's doing.
+    #[test]
+    fn a_signal_after_the_last_node_leaves_no_node_unfinished() {
+        let mut result = DagExecutionResult {
+            nodes: vec![
+                node("built", NodeStatus::Completed, None),
+                node("test", NodeStatus::Skipped, None),
+            ],
+            total_layers: 1,
+            total_nodes: 2,
+            completed: 1,
+            failed: 0,
+            skipped: 1,
+            duration_ms: 0,
+        };
+        assert!(!super::signal_left_a_node_unfinished(&result));
+        result.nodes[1] = node("later", NodeStatus::Skipped, Some(INTERRUPTED_REASON));
+        assert!(super::signal_left_a_node_unfinished(&result));
+        result.nodes[1] = node("in_flight", NodeStatus::Failed, Some("run was interrupted"));
+        assert!(super::signal_left_a_node_unfinished(&result));
+    }
+
+    #[test]
+    fn a_node_that_never_started_is_reported_as_interrupted() {
+        let mut result = DagExecutionResult {
+            nodes: vec![
+                node("done", NodeStatus::Completed, None),
+                node("broke", NodeStatus::Failed, Some("boom")),
+                node("waited", NodeStatus::Failed, Some(INTERRUPTED_REASON)),
+                node("later", NodeStatus::Skipped, Some(INTERRUPTED_REASON)),
+            ],
+            total_layers: 1,
+            total_nodes: 4,
+            completed: 1,
+            failed: 2,
+            skipped: 1,
+            duration_ms: 0,
+        };
+        let not_started: HashSet<String> = ["waited".to_string()].into();
+        report_not_started_as_interrupted(&mut result, &not_started);
+
+        let waited = &result.nodes[2];
+        assert_eq!(waited.status, NodeStatus::Skipped);
+        assert_eq!(waited.error.as_deref(), Some(INTERRUPTED_REASON));
+        assert_eq!(
+            result.nodes[1].status,
+            NodeStatus::Failed,
+            "a real failure stays"
+        );
+        assert_eq!(
+            (result.completed, result.failed, result.skipped),
+            (1, 1, 2),
+            "{result:?}"
+        );
+        assert!(result.had_failures(), "the real failure still counts");
+    }
+
+    fn counting_runner(calls: Arc<AtomicUsize>) -> SubRunner {
+        Arc::new(move |_c, _l, _s, _p, _m, _po, _so, _sh| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    }
+
+    /// A node whose future is polled after the cancel starts no sub-run and is
+    /// recorded as not started (#1606).
+    #[tokio::test]
+    async fn a_cancelled_run_starts_no_sub_run() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loaded = super::run_opts_threading_tests::test_loaded_config();
+        let (mut dispatcher, ids) = super::state_turnstile_tests::dispatcher(
+            loaded,
+            counting_runner(Arc::clone(&calls)),
+            StateTurnstile::new(),
+            ".rocky-state.redb",
+            1,
+        );
+        let shared = super::super::run_cancel::Shared::default();
+        let token = shared.token().clone();
+        dispatcher.cancel = DagCancel::new(shared);
+        let fut = dispatcher
+            .dispatch(&ids[0], NodeKind::Transformation, "m0")
+            .expect("a pipeline node dispatches a future");
+        token.cancel();
+
+        assert_eq!(fut.await, Err(INTERRUPTED_REASON.to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no sub-run may start");
+        assert_eq!(
+            dispatcher.cancel.not_started(),
+            HashSet::from([ids[0].0.clone()])
+        );
+    }
+
+    /// The cancel check comes after the state turn. The second node waits for
+    /// the turn while the first sub-run runs; the signal lands during that
+    /// sub-run; the second node must then not start (#1606).
+    #[tokio::test]
+    async fn a_node_waiting_for_its_state_turn_does_not_start_after_a_cancel() {
+        let shared = super::super::run_cancel::Shared::default();
+        let token = shared.token().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner: SubRunner = {
+            let (token, calls) = (token.clone(), Arc::clone(&calls));
+            Arc::new(move |_c, _l, _s, _p, _m, _po, _so, _sh| {
+                let (token, calls) = (token.clone(), Arc::clone(&calls));
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Let the sibling reach the turnstile and wait on it.
+                    tokio::task::yield_now().await;
+                    token.cancel();
+                    Ok(())
+                })
+            })
+        };
+        let loaded = super::run_opts_threading_tests::test_loaded_config();
+        let (mut dispatcher, ids) = super::state_turnstile_tests::dispatcher(
+            loaded,
+            runner,
+            StateTurnstile::new(),
+            ".rocky-state.redb",
+            2,
+        );
+        dispatcher.cancel = DagCancel::new(shared);
+        let first = dispatcher
+            .dispatch(&ids[0], NodeKind::Transformation, "m0")
+            .expect("future");
+        let second = dispatcher
+            .dispatch(&ids[1], NodeKind::Transformation, "m1")
+            .expect("future");
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first, Ok(()), "the sub-run in flight runs to its end");
+        assert_eq!(second, Err(INTERRUPTED_REASON.to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Each sub-run adopts the DAG's token. The executor runs a node on its
+    /// own task, which inherits no task-local, so without the explicit scope
+    /// the sub-run would make a fresh token and its own signal listener, and
+    /// would not see the DAG's cancel.
+    #[tokio::test]
+    async fn a_sub_run_adopts_the_dag_token() {
+        let shared = super::super::run_cancel::Shared::default();
+        let token = shared.token().clone();
+        let seen = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let runner: SubRunner = {
+            let (token, seen) = (token.clone(), Arc::clone(&seen));
+            Arc::new(move |_c, _l, _s, _p, _m, _po, _so, _sh| {
+                let (token, seen) = (token.clone(), Arc::clone(&seen));
+                Box::pin(async move {
+                    let ambient = super::super::run_cancel::ambient();
+                    token.cancel();
+                    *seen.lock().expect("seen poisoned") =
+                        Some(ambient.is_some_and(|t| t.is_cancelled()));
+                    Ok(())
+                })
+            })
+        };
+        let loaded = super::run_opts_threading_tests::test_loaded_config();
+        let (mut dispatcher, ids) = super::state_turnstile_tests::dispatcher(
+            loaded,
+            runner,
+            StateTurnstile::new(),
+            ".rocky-state.redb",
+            1,
+        );
+        dispatcher.cancel = DagCancel::new(shared);
+        let fut = dispatcher
+            .dispatch(&ids[0], NodeKind::Transformation, "m0")
+            .expect("future");
+        // Run it on its own task, as the executor does.
+        tokio::spawn(fut)
+            .await
+            .expect("node task")
+            .expect("sub-run ok");
+        assert_eq!(
+            *seen.lock().expect("seen poisoned"),
+            Some(true),
+            "the sub-run must see the DAG's token as its ambient token"
+        );
+    }
+}
+
+#[cfg(test)]
 mod state_turnstile_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1519,7 +1883,7 @@ mod state_turnstile_tests {
 
     /// A dispatcher over `n` transformation nodes with an explicit state path
     /// and a caller-supplied turnstile — the two knobs these tests turn.
-    fn dispatcher(
+    pub(super) fn dispatcher(
         loaded: Arc<LoadedConfig>,
         runner: SubRunner,
         state_turns: Arc<StateTurnstile>,
@@ -1548,6 +1912,7 @@ mod state_turnstile_tests {
             shadow_config: None,
             sub_runner: runner,
             state_turns,
+            cancel: super::DagCancel::default(),
         };
         (dispatcher, node_ids)
     }
@@ -1850,6 +2215,7 @@ mod tests {
                 Arc::default(),
             ),
             state_turns: StateTurnstile::new(),
+            cancel: super::DagCancel::default(),
         };
         let id = NodeId::new("seed", "countries");
         let fut = dispatcher
@@ -2535,6 +2901,7 @@ mod tests {
                 Arc::default(),
             ),
             state_turns: StateTurnstile::new(),
+            cancel: super::DagCancel::default(),
         };
         let id = NodeId::new("seed", "orders");
         let fut = dispatcher
@@ -2648,6 +3015,7 @@ mod tests {
                 Arc::default(),
             ),
             state_turns: StateTurnstile::new(),
+            cancel: super::DagCancel::default(),
         };
         let id = NodeId::new("seed", "orders");
         let fut = dispatcher
