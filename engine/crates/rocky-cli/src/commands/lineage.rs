@@ -688,7 +688,7 @@ mod tests {
         // The model view of c names c; of a, nothing (its direct neighbours
         // are clean). Both are written, so `[]` is distinct from absent.
         let view = lineage_output(&result, "c").unwrap();
-        assert_eq!(view.incomplete_lineage.as_deref().map(|r| r.len()), Some(1));
+        assert_eq!(view.incomplete_lineage.as_deref().map(<[_]>::len), Some(1));
         let view = lineage_output(&result, "a").unwrap();
         assert_eq!(view.incomplete_lineage, Some(Vec::new()));
         let json = serde_json::to_value(&view).unwrap();

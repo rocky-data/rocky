@@ -5184,12 +5184,22 @@ pub async fn run_with_explicit_contracts(
         rocky_sql::defer::CollisionIdentity,
         (String, String),
     > = HashMap::new();
-    // PR-B3: count how many `(connector, table)` pairs matched each
-    // `[[table_overrides]]` rule. Rules with zero matches surface as
-    // soft warnings on `RunOutput.override_warnings` (T2) so
-    // orchestrators can flag stale rules without breaking the pipeline
-    // for connectors that come and go.
-    let mut override_rule_match_counts: HashMap<usize, usize> = HashMap::new();
+    // PR-B3 / R8: how many discovered `(connector, table)` pairs each
+    // `[[table_overrides]]` rule matches. Counted ONCE, here, by the same
+    // function `rocky plan` calls, after `--filter` and before the warehouse
+    // check below excludes tables missing from the source, so plan and run
+    // report the same numbers. Rules with zero matches surface as soft
+    // warnings on `RunOutput.override_warnings` (T2) so orchestrators can
+    // flag stale rules without breaking the pipeline for connectors that
+    // come and go.
+    let override_rule_match_counts = super::count_override_rule_matches(
+        &pipeline.table_overrides,
+        &connectors,
+        &pattern,
+        parsed_filter.as_ref(),
+    );
+    output.override_match_counts =
+        OverrideMatchCountOutput::rows(&pipeline.table_overrides, &override_rule_match_counts);
 
     let governance = &pipeline.target.governance;
     let target_catalog_template = &pipeline.target.catalog_template;
@@ -5865,23 +5875,14 @@ pub async fn run_with_explicit_contracts(
                 }
 
                 // PR-B3: resolve per-table override against the
-                // pipeline's `table_overrides` rules. Record per-rule
-                // match counts for the discovery-time zero-match
-                // warning (T2).
+                // pipeline's `table_overrides` rules. The per-rule match
+                // counts were taken once, before this loop (R8).
                 let effective_override = resolve_table_override(
                     &pipeline.table_overrides,
                     &conn.id,
                     &conn.schema,
                     &table.name,
                 );
-                for (idx, rule) in pipeline.table_overrides.iter().enumerate() {
-                    if rule.match_.matches(&conn.id, &conn.schema, &table.name) {
-                        override_rule_match_counts
-                            .entry(idx)
-                            .and_modify(|c| *c += 1usize)
-                            .or_insert(1);
-                    }
-                }
 
                 // `enabled = false` → skip the table with an
                 // explanatory excluded_tables entry. Mirrors the
@@ -6061,7 +6062,7 @@ pub async fn run_with_explicit_contracts(
     // The output struct lets Dagster branch on `kind` without text
     // parsing.
     for (idx, rule) in pipeline.table_overrides.iter().enumerate() {
-        if override_rule_match_counts.get(&idx).copied().unwrap_or(0) > 0 {
+        if override_rule_match_counts.get(idx).copied().unwrap_or(0) > 0 {
             continue;
         }
         let kind = if rule.match_.connector.is_some() && rule.match_.table.is_some() {
@@ -6073,7 +6074,7 @@ pub async fn run_with_explicit_contracts(
         };
         let message = format!(
             "[[table_overrides]] rule index {idx} (connector = {:?}, table = {:?}) \
-             matched no (connector, table) pair in this run",
+             matched no discovered (connector, table) pair in this run",
             rule.match_.connector, rule.match_.table
         );
         warn!(
@@ -25704,6 +25705,7 @@ auto_create_schemas = true
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            override_match_counts: vec![],
             consumer_diagnostics: vec![],
         };
 

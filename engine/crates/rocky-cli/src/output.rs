@@ -428,6 +428,14 @@ pub struct RunOutput {
     /// no overrides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_warnings: Vec<OverrideWarningOutput>,
+    /// How many discovered tables each `[[table_overrides]]` rule matches,
+    /// one row per rule in declaration order. Counted after `--filter` and
+    /// BEFORE the warehouse check that excludes tables missing from the
+    /// source, by the same function `rocky plan` calls, so the two report
+    /// the same numbers for the same project. Empty (and omitted) when no
+    /// rules are declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_match_counts: Vec<OverrideMatchCountOutput>,
     /// Problems in the project's `consumers/` records (`E060`): a file that
     /// does not load, a duplicate name, a `depends_on` entry that names no
     /// model, or an unreadable directory. A consumer is metadata about readers
@@ -438,9 +446,51 @@ pub struct RunOutput {
     pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
+/// How many discovered tables one `[[table_overrides]]` rule matches. See
+/// [`RunOutput::override_match_counts`] and
+/// [`PlanOutput::override_match_counts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct OverrideMatchCountOutput {
+    /// Position of the rule in `[[table_overrides]]`, 0-based.
+    pub rule_index: usize,
+    /// Echo of `match.connector` from the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// Echo of `match.table` from the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    /// Discovered `(connector, table)` pairs the rule matches, after
+    /// `--filter` and before tables missing from the source are excluded.
+    pub matched_tables: usize,
+}
+
+impl OverrideMatchCountOutput {
+    /// One row per rule, in declaration order, from the counts
+    /// [`crate::commands::count_override_rule_matches`] returns.
+    pub fn rows(
+        rules: &[rocky_core::config::TableOverride],
+        counts: &[usize],
+    ) -> Vec<OverrideMatchCountOutput> {
+        rules
+            .iter()
+            .zip(counts)
+            .enumerate()
+            .map(
+                |(rule_index, (rule, &matched_tables))| OverrideMatchCountOutput {
+                    rule_index,
+                    connector: rule.match_.connector.clone(),
+                    table: rule.match_.table.clone(),
+                    matched_tables,
+                },
+            )
+            .collect()
+    }
+}
+
 /// Soft warning surfaced on
 /// [`RunOutput::override_warnings`] when an override rule matched no
-/// tables this run.
+/// discovered table this run (after `--filter`, before tables missing from
+/// the source are excluded).
 ///
 /// Distinct kinds let orchestrators (Dagster) branch on cause without
 /// parsing free-form messages.
@@ -1918,6 +1968,14 @@ pub struct PlanOutput {
     /// its plan did not record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub first_run_fills: Vec<PlanFirstRunFill>,
+    /// How many discovered tables each `[[table_overrides]]` rule matches,
+    /// for a replication plan. The same function `rocky run` uses counts
+    /// them, so the numbers agree with [`RunOutput::override_match_counts`]
+    /// for the same project and `--filter`. Plan does not ask the warehouse
+    /// which source tables exist, and run counts before it excludes them.
+    /// Empty (and omitted) when no rules are declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_match_counts: Vec<OverrideMatchCountOutput>,
 }
 
 /// One row of [`PlanOutput::first_run_fills`].
@@ -6151,6 +6209,7 @@ impl RunOutput {
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            override_match_counts: vec![],
             consumer_diagnostics: vec![],
         }
     }
@@ -6659,6 +6718,7 @@ impl PlanOutput {
             intent_check: None,
             cost_preview: None,
             first_run_fills: vec![],
+            override_match_counts: vec![],
         }
     }
 }

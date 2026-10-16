@@ -273,7 +273,9 @@ Returns a complete summary of the pipeline execution.
 | `cost_summary` | object or absent | Per-run cost rollup: `total_cost_usd` (float or null), `adapter_type` (string), `total_bytes_scanned` (integer or null), `total_duration_ms` (integer), and `per_model` (array of `{asset_key, duration_ms, cost_usd}`). Absent only for unbilled source adapters (`fivetran`/`airbyte`); present otherwise — including DuckDB, which reports `total_cost_usd` `0`, and billed adapters that computed no cost, where `total_cost_usd` is null. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
 | `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
 
-The table above is not every field. `run.schema.json` also defines `verify_after_failed`, `quarantine`, `model_decisions`, `idempotency_key`, `skipped_by_run_id`, `scheduling_warnings`, `override_warnings`, `consumer_diagnostics` and `excluded_tables`.
+The table above is not every field. `run.schema.json` also defines `verify_after_failed`, `quarantine`, `model_decisions`, `idempotency_key`, `skipped_by_run_id`, `scheduling_warnings`, `override_warnings`, `override_match_counts`, `consumer_diagnostics` and `excluded_tables`.
+
+`override_match_counts` has one row per `[[table_overrides]]` rule: `rule_index`, the rule's `connector` and `table`, and `matched_tables`. It counts the discovered tables the rule matches, after `--filter` and before `run` excludes tables missing from the source. `rocky plan` reports the same rows from the same count. A rule with `matched_tables = 0` also gets an `override_warnings` entry on `run`.
 
 A transformation model that fails to compile during a run counts as a failure, not a silent skip. It lands on `tables_failed`, gets an `errors[]` entry with `failure_kind: "compile-error"` carrying the diagnostic, and the run reports `Failure` — or `PartialFailure` when other models succeeded — with exit code `1` or `2`.
 

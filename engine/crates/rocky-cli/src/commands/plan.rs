@@ -143,6 +143,16 @@ pub async fn plan(
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
     output.env = env.map(str::to_string);
+    // R8: the same count `rocky run` reports, from the same function.
+    output.override_match_counts = crate::output::OverrideMatchCountOutput::rows(
+        &pipeline.table_overrides,
+        &super::count_override_rule_matches(
+            &pipeline.table_overrides,
+            &connectors,
+            &pattern,
+            parsed_filter.as_ref(),
+        ),
+    );
 
     // #1941: one (target table name, source_type) pair per table that
     // survives this loop's own skip conditions (filter, disabled override),
