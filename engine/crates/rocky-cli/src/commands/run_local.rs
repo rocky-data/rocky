@@ -417,6 +417,11 @@ pub async fn run_transformation(
     // Propagate a hard `[budget]` breach (`on_breach = "error"`) now that the
     // JSON payload has been emitted, matching the replication / model-only
     // ordering.
+    // An interrupted run (#1606) exits 130 even when it also breached a
+    // hard `[budget]`: the cancel is what ended it.
+    if output.interrupted {
+        return Err(anyhow::Error::new(super::run::Interrupted));
+    }
     budget_result?;
 
     // Honour the run-status exit-code contract. A model that failed to

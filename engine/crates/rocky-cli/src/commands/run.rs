@@ -304,8 +304,9 @@ struct TableError {
 /// maps it to exit code 130 so callers (shell, CI, orchestrators) can
 /// distinguish "interrupted" from a generic run failure. Every phase that
 /// observes the run's cancellation token (`run_cancel`) returns this only
-/// after the run settled: record persisted, claim released, session settled
-/// (#1606). A second SIGINT bypasses this path entirely and calls
+/// after the run settled: record persisted, claim released, state session
+/// finalized or released (#1606; the transformation pipeline releases it
+/// without upload). A second SIGINT bypasses this path entirely and calls
 /// `std::process::exit(130)` directly from the signal listener.
 #[derive(Debug, thiserror::Error)]
 #[error("run was interrupted by a shutdown signal")]

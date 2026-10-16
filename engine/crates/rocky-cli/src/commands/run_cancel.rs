@@ -2,8 +2,11 @@
 //!
 //! A shutdown signal (SIGINT, or SIGTERM on Unix) cancels the token. Each run
 //! phase checks it before it starts new warehouse work, so the run reaches its
-//! own settle step: the run record, the idempotency claim and the remote-state
-//! session are all settled before the process exits 130.
+//! own settle step before the process exits 130: the run record is persisted
+//! and the idempotency claim released. The remote-state session is finalized
+//! (model-only, replication `--all` model phase), checkpointed then released
+//! (replication fan-out), or released without upload (transformation
+//! pipeline).
 //!
 //! ```text
 //!   signal ──▶ token.cancel()
