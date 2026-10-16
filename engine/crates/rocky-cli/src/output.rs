@@ -12675,6 +12675,12 @@ pub enum JobKind {
     /// call.
     #[serde(rename = "product_approve")]
     ProductApprove,
+    /// `rocky compact <table>` or `rocky compact --catalog <name>` — writes a
+    /// compaction plan (`OPTIMIZE` and `VACUUM` per table) to `.rocky/plans/`.
+    /// It writes no warehouse object and runs no statement, so it takes no permit. For a replication pipeline, `--catalog` asks the source adapter to discover tables.
+    /// Applying the plan (`apply`, with the returned `plan_id`) is what runs the
+    /// statements.
+    Compact,
 }
 
 impl JobKind {
@@ -12694,6 +12700,7 @@ impl JobKind {
             JobKind::Preview => "preview",
             JobKind::Promote => "promote",
             JobKind::ProductApprove => "product_approve",
+            JobKind::Compact => "compact",
         }
     }
 
@@ -12702,7 +12709,8 @@ impl JobKind {
     /// run `policy` and `Preview` runs `preview`; the argv builder adds the verb
     /// (`freeze`, `unfreeze`, `create`) after it. `Promote` runs `plan` and the
     /// builder adds `promote`; `ProductApprove` runs `product` and the builder
-    /// adds `approve`.
+    /// adds `approve`; `Compact` runs `compact` and the builder adds the table
+    /// or `--catalog`.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12715,6 +12723,7 @@ impl JobKind {
             JobKind::Preview => "preview",
             JobKind::Promote => "plan",
             JobKind::ProductApprove => "product",
+            JobKind::Compact => "compact",
         }
     }
 
@@ -12733,7 +12742,9 @@ impl JobKind {
             | JobKind::Unfreeze
             | JobKind::Preview
             | JobKind::ProductApprove => true,
-            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote => false,
+            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote | JobKind::Compact => {
+                false
+            }
         }
     }
 
@@ -12751,6 +12762,7 @@ impl JobKind {
             "preview" => Some(JobKind::Preview),
             "promote" => Some(JobKind::Promote),
             "product_approve" => Some(JobKind::ProductApprove),
+            "compact" => Some(JobKind::Compact),
             _ => None,
         }
     }

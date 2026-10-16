@@ -80,6 +80,13 @@
             "product_approve"
           ],
           "type": "string"
+        },
+        {
+          "description": "`rocky compact <table>` or `rocky compact --catalog <name>` — writes a compaction plan (`OPTIMIZE` and `VACUUM` per table) to `.rocky/plans/`. It writes no warehouse object and runs no statement, so it takes no permit. For a replication pipeline, `--catalog` asks the source adapter to discover tables. Applying the plan (`apply`, with the returned `plan_id`) is what runs the statements.",
+          "enum": [
+            "compact"
+          ],
+          "type": "string"
         }
       ]
     },

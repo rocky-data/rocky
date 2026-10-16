@@ -10,6 +10,7 @@ import { apiGet } from "../api";
 import { ArrowPathIcon } from "@heroicons/react/20/solid";
 import { READ_BUTTON, ScreenHeader, StatusCard } from "../components";
 import type { JobClient } from "../operator";
+import { CompactControls } from "./CompactControls";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
@@ -187,6 +188,10 @@ export function EstateScreen({
           jobs={jobs}
           onDone={refreshAll}
         />
+      </Panel>
+
+      <Panel title="Compact" producer="POST /api/v1/jobs/compact">
+        <CompactControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 
       <Panel title="Runs" producer="GET /api/v1/runs">

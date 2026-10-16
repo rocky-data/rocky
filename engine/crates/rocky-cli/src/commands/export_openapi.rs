@@ -976,6 +976,29 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "post",
+            path: "/api/v1/jobs/compact",
+            operation_id: "submitCompactJob",
+            tag: "jobs",
+            summary: "Submit a compact plan job",
+            description: "Submit a `compact` job: `rocky compact <table>` or `rocky compact \
+                 --catalog <name>`. Writes a compaction plan and runs no statement. It \
+                 writes only the plan file and takes no lock; a `catalog` on a replication pipeline asks the source adapter to discover tables. The result is the `compact` \
+                 output: `plan_id` (absent when the plan could not be saved), the \
+                 statements, and for a catalog the `tables` and `totals`. Applying the plan \
+                 is a separate `apply` job with that `plan_id`, which runs `OPTIMIZE` and \
+                 `VACUUM` on Databricks. Give exactly one of `table` \
+                 (`catalog.schema.table`, each part letters, digits or `_`) or `catalog` \
+                 (one such name); both are validated before the job starts. The command's \
+                 `--dry-run` is not offered: it still writes an applicable plan.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST],
+            auth_exempt: false,
+        },
+        Route {
             method: "get",
             path: "/api/v1/branches",
             operation_id: "listBranches",

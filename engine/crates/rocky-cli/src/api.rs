@@ -34,6 +34,7 @@
 //! POST /api/v1/jobs/promote                     → plan a branch promote (= rocky plan promote) → 202 {job_id}
 //! GET  /api/v1/branches                         → the branch list (= rocky branch list)
 //! POST /api/v1/jobs/product_approve             → approve a product spec (= rocky product approve) → 202 {job_id}
+//! POST /api/v1/jobs/compact                     → plan a compaction (= rocky compact) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -206,6 +207,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/preview", post(submit_preview))
         .route("/api/v1/jobs/promote", post(submit_promote))
         .route("/api/v1/jobs/product_approve", post(submit_product_approve))
+        .route("/api/v1/jobs/compact", post(submit_compact))
         .route("/api/v1/branches", get(list_branches))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -982,6 +984,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/preview",
         "POST /api/v1/jobs/promote",
         "POST /api/v1/jobs/product_approve",
+        "POST /api/v1/jobs/compact",
         "GET /api/v1/branches",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
@@ -2830,6 +2833,13 @@ pub(crate) struct JobRequest {
     /// `product_approve`: the product to approve (required). Ignored by every
     /// other kind.
     name: Option<String>,
+    /// `<table>` for `compact`: the table to compact, `catalog.schema.table`.
+    /// Exactly one of `table` and `catalog`. Ignored by every other kind.
+    table: Option<String>,
+    /// `--catalog <name>` for `compact`: compact every Rocky-managed table in
+    /// the catalog. Exactly one of `table` and `catalog`. Ignored by every
+    /// other kind.
+    catalog: Option<String>,
     /// `--base <git ref>` for `preview` and `promote`: the ref the change set
     /// is computed against. Absent means `main`. Ignored by every other kind.
     base: Option<String>,
@@ -3355,6 +3365,19 @@ async fn submit_product_approve(
     submit_job(JobKind::ProductApprove, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/compact` — plan a compaction: `rocky compact <table>` or
+/// `rocky compact --catalog <name>` (non-mutating; no permit). Writes a plan
+/// and runs no statement. Body `{"table": "<catalog.schema.table>"}` or
+/// `{"catalog": "<name>"}`, exactly one. Applying the plan is a separate
+/// `POST /api/v1/jobs/apply` with the returned `plan_id`.
+async fn submit_compact(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Compact, state, &headers, &body).await
+}
+
 /// `GET /api/v1/branches` — canonical [`BranchListOutput`].
 ///
 /// The same bytes as `rocky branch list --output json` against the state
@@ -3397,6 +3420,7 @@ async fn submit_job(
     validate_apply_digest(kind, &request)?;
     validate_promote_fields(kind, &request)?;
     validate_product_approve_fields(kind, &request)?;
+    validate_compact_fields(kind, &request)?;
     // Project-state gates that need a read of the config or the plan: they run
     // before the permit, so a refused job never holds it.
     gate_job_against_project(kind, &state, &request).await?;
@@ -3511,7 +3535,8 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
         | JobKind::Unfreeze
         | JobKind::Preview
         | JobKind::Promote
-        | JobKind::ProductApprove => Ok(()),
+        | JobKind::ProductApprove
+        | JobKind::Compact => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3614,6 +3639,49 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
         }
     }
     Ok(())
+}
+
+/// The most characters a compact `table` or `catalog` may carry.
+const COMPACT_TARGET_MAX_CHARS: usize = 300;
+
+/// Refuse a `compact` body the CLI would not plan, before the argv. Exactly
+/// one of `table` and `catalog` is given. A `table` is `catalog.schema.table`:
+/// three parts, each a SQL identifier (`[A-Za-z0-9_]+`, the rule the SQL
+/// generator applies to every part). A `catalog` is one such identifier. Both
+/// become argv entries, so neither can start with `-`; the identifier rule
+/// already rules that out. Other kinds ignore these fields.
+fn validate_compact_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Compact {
+        return Ok(());
+    }
+    let ident = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    match (request.table.as_deref(), request.catalog.as_deref()) {
+        (Some(table), None) => {
+            let parts: Vec<&str> = table.split('.').collect();
+            if table.chars().count() > COMPACT_TARGET_MAX_CHARS
+                || parts.len() != 3
+                || !parts.iter().all(|part| ident(part))
+            {
+                return Err(ApiError::bad_request(
+                    "invalid table: use the full name catalog.schema.table, each part letters, digits or '_'",
+                ));
+            }
+            Ok(())
+        }
+        (None, Some(catalog)) => {
+            if catalog.chars().count() > COMPACT_TARGET_MAX_CHARS || !ident(catalog) {
+                return Err(ApiError::bad_request(
+                    "invalid catalog: use a catalog name of letters, digits or '_'",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ApiError::bad_request(
+            "a compact job needs exactly one of `table` (catalog.schema.table) or `catalog`",
+        )),
+    }
 }
 
 /// Refuse a `product_approve` body without a product name the CLI would take,
@@ -3898,7 +3966,8 @@ async fn gate_job_against_project(
         | JobKind::Freeze
         | JobKind::Unfreeze
         | JobKind::Preview
-        | JobKind::ProductApprove => Ok(()),
+        | JobKind::ProductApprove
+        | JobKind::Compact => Ok(()),
     }
 }
 
@@ -4123,6 +4192,19 @@ fn job_subprocess_args(
             args.push("approve".into());
             if let Some(name) = &request.name {
                 args.push(name.into());
+            }
+        }
+        JobKind::Compact => {
+            // `rocky compact <table>` or `rocky compact --catalog <name>`. The
+            // plan flags are left out on purpose: the command's `--dry-run`
+            // still writes an applicable plan, and the page offers no size
+            // option. Each value is its own entry, so it can never read as a
+            // flag.
+            if let Some(table) = &request.table {
+                args.push(table.into());
+            } else if let Some(catalog) = &request.catalog {
+                args.push("--catalog".into());
+                args.push(catalog.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -10524,6 +10606,7 @@ mod tests {
             JobKind::Preview,
             JobKind::Promote,
             JobKind::ProductApprove,
+            JobKind::Compact,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
@@ -14480,6 +14563,182 @@ adapter = "db"
     #[tokio::test]
     async fn product_approve_route_is_behind_the_write_gate() {
         assert_routes_behind_the_write_gate(&["product_approve"]).await;
+    }
+
+    // ----- Browser compact -----
+
+    /// `compact` spawns `rocky compact <table>` or `rocky compact --catalog
+    /// <name>` and nothing more: no `--dry-run`, no `--target-size`, because the
+    /// command's dry run still writes an applicable plan and the page offers no
+    /// size. It takes no permit (the command reads the config and writes a plan
+    /// file) and no other kind carries the verb.
+    #[test]
+    fn compact_job_argv_and_kind() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind, request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &dirs,
+                state,
+                request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--config",
+            "/p/rocky.toml",
+            "--state-path",
+            "/tmp/state.redb",
+            "compact",
+        ];
+        let table = JobRequest {
+            table: Some("cat.sch.orders".to_string()),
+            catalog: Some("ignored".to_string()),
+            ..JobRequest::default()
+        };
+        let mut expected = head.to_vec();
+        expected.push("cat.sch.orders");
+        assert_eq!(argv(JobKind::Compact, &table), expected);
+        let catalog = JobRequest {
+            catalog: Some("cat".to_string()),
+            ..JobRequest::default()
+        };
+        let mut expected = head.to_vec();
+        expected.extend(["--catalog", "cat"]);
+        assert_eq!(argv(JobKind::Compact, &catalog), expected);
+        for kind in [
+            JobKind::Plan,
+            JobKind::Preview,
+            JobKind::Promote,
+            JobKind::Apply,
+        ] {
+            let args = argv(kind, &table);
+            assert!(
+                !args.iter().any(|a| a == "compact" || a == "cat.sch.orders"),
+                "{kind:?} must not carry the compact target: {args:?}"
+            );
+        }
+        assert!(!JobKind::Compact.mutates());
+        assert_eq!(JobKind::Compact.verb(), "compact");
+        assert_eq!(JobKind::Compact.subcommand(), "compact");
+        assert_eq!(JobKind::parse("compact"), Some(JobKind::Compact));
+    }
+
+    /// The compact target is checked before the argv: none, both, a short or
+    /// long dotted name, a part that is not an identifier, and a catalog that is
+    /// not a bare name are each a `400` that spawns nothing. Other kinds ignore
+    /// the fields.
+    #[tokio::test]
+    async fn compact_route_validates_its_target() {
+        let base = spawn_router(test_state()).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/compact");
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "table": "a.b.c", "catalog": "a" }),
+            serde_json::json!({ "table": "" }),
+            serde_json::json!({ "table": "orders" }),
+            serde_json::json!({ "table": "b.orders" }),
+            serde_json::json!({ "table": "a.b.c.d" }),
+            serde_json::json!({ "table": "a..c" }),
+            serde_json::json!({ "table": ".b.c" }),
+            serde_json::json!({ "table": "-a.b.c" }),
+            serde_json::json!({ "table": "a.b.c --dry-run" }),
+            serde_json::json!({ "table": "a.b.c\n" }),
+            serde_json::json!({ "table": "a.b-x.c" }),
+            serde_json::json!({ "table": "a.`b`.c" }),
+            serde_json::json!({ "table": "é.b.c" }),
+            serde_json::json!({ "table": format!("a.b.{}", "x".repeat(300)) }),
+            serde_json::json!({ "catalog": "" }),
+            serde_json::json!({ "catalog": "-c" }),
+            serde_json::json!({ "catalog": "a.b" }),
+            serde_json::json!({ "catalog": "a b" }),
+            serde_json::json!({ "catalog": "x".repeat(301) }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        // Another kind ignores the fields: a bad `table` on `freeze` is not a 400
+        // (no permit is held here, so it would start; hold one to stop it).
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let other = spawn_router(state).await;
+        let resp = client
+            .post(format!("{other}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "table": "nope", "catalog": "-x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores table and catalog");
+        drop(held);
+    }
+
+    /// A compact plan applies through the generic apply, by its id: the gate
+    /// does not stop it (only an archive plan and an unapproved promote plan
+    /// are stopped), so it reaches the held permit.
+    #[tokio::test]
+    async fn a_compact_plan_applies_through_the_generic_apply_gate() {
+        use crate::plan_store::{PlanKind, write_plan};
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let compact = write_plan(
+            &root,
+            PlanKind::Compact,
+            &serde_json::json!({ "plans": [{ "target_table": "a.b.c" }] }),
+        )
+        .unwrap();
+        let archive = write_plan(
+            &root,
+            PlanKind::Archive,
+            &serde_json::json!({ "plans": [{ "target_table": "a.b.c" }] }),
+        )
+        .unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let code = |plan_id: String| {
+            let client = client.clone();
+            let url = format!("{base}/api/v1/jobs/apply");
+            async move {
+                let resp = client
+                    .post(url)
+                    .json(&serde_json::json!({ "plan_id": plan_id }))
+                    .send()
+                    .await
+                    .unwrap();
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                envelope.code
+            }
+        };
+        assert_eq!(code(compact).await, "mutation_in_progress");
+        assert_eq!(code(archive).await, "archive_apply_terminal_only");
+        drop(held);
+    }
+
+    /// Compact plans are planned from the browser but their job sits behind the
+    /// same write gate as every job route.
+    #[tokio::test]
+    async fn compact_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["compact"]).await;
     }
 }
 

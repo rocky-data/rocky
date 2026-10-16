@@ -410,7 +410,7 @@ Exactly one scope is required for plan generation: a fully-qualified `<model>`, 
 |------|------|---------|-------------|
 | `--catalog <NAME>` | `string` | | Aggregate per-table OPTIMIZE/VACUUM SQL across every Rocky-managed table in the catalog. The managed-table set is resolved from the pipeline config (replication discovery or transformation model files); no warehouse round trip. Mutually exclusive with `<model>` and `--measure-dedup`. Errors with the available catalogs listed if no managed tables match. |
 | `--target-size <SIZE>` | `string` | | Target file size (e.g., `256MB`, `512MB`, `1GB`). |
-| `--dry-run` | `bool` | `false` | Show SQL without executing. |
+| `--dry-run` | `bool` | `false` | Sets `dry_run: true` in the output. `rocky compact` never executes SQL, with or without it, and it still writes a plan that `rocky compact apply` can run. |
 | `--measure-dedup` | `bool` | `false` | Experimental. Measure the cross-table dedup ratio across all Rocky-managed tables in the project (Layer 0 storage experiment). Project-wide; does not take a model argument. |
 | `--exclude-columns <COLS>` | `string` | Rocky-owned metadata cols | Comma-separated columns to exclude from the "semantic" dedup hash. Defaults to `_loaded_by,_loaded_at,_fivetran_synced,_synced_at`. Requires `--measure-dedup`. |
 | `--calibrate-bytes` | `bool` | `false` | Run byte-level calibration on a sampled subset of tables. Produces a sharper but more expensive second estimate alongside the cheap partition-level one. Requires `--measure-dedup`. |

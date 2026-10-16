@@ -97,6 +97,14 @@ class JobKind11(StrEnum):
     product_approve = "product_approve"
 
 
+class JobKind12(StrEnum):
+    """
+    `rocky compact <table>` or `rocky compact --catalog <name>` — writes a compaction plan (`OPTIMIZE` and `VACUUM` per table) to `.rocky/plans/`. It writes no warehouse object and runs no statement, so it takes no permit. For a replication pipeline, `--catalog` asks the source adapter to discover tables. Applying the plan (`apply`, with the returned `plan_id`) is what runs the statements.
+    """
+
+    compact = "compact"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -168,6 +176,7 @@ class JobStatus(BaseModel):
         | JobKind9
         | JobKind10
         | JobKind11
+        | JobKind12
     )
     """
     Which operation the job wraps.

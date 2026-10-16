@@ -19,7 +19,8 @@ export type JobKind =
   | "unfreeze"
   | "preview"
   | "promote"
-  | "product_approve";
+  | "product_approve"
+  | "compact";
 /**
  * Lifecycle state of a job.
  */

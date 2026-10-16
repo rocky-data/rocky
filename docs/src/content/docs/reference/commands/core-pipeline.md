@@ -567,9 +567,9 @@ The plan file carries its kind. Apply reads that kind and takes one path.
 |---|---|---|
 | `run` | `rocky plan` | Re-executes the full pipeline with the flags the plan captured. |
 | `replication` | `rocky plan` on a project with no compiled models | Re-runs discovery and compares the result against the plan-time snapshot, then executes. See the staleness rules below. |
-| `promote` | `rocky plan promote` | Runs the promote statements. The approval and breaking-change gates ran at plan time and are not repeated. |
+| `promote` | `rocky plan promote` | Runs the promote statements. The approval and breaking-change gates ran at plan time and are not repeated. The HTTP API refuses a promote plan unless `[branch.approval] required = true` and the plan holds the approvals the config needs. |
 | `compact` | `rocky compact` | Runs the `OPTIMIZE` and `VACUUM` statements. |
-| `archive` | `rocky archive` | Runs the `DELETE` and `VACUUM` statements. |
+| `archive` | `rocky archive` | Runs the `DELETE` and `VACUUM` statements. The HTTP API (`POST /api/v1/jobs/apply`, so the browser UI too) refuses an archive plan with `archive_apply_terminal_only`. Apply it in a terminal. |
 | `ai_authored` | an AI agent, via the `propose` MCP tool | Same execution path as a `run` plan, but only after a review marker exists. |
 | `backfill` | `rocky backfill` | Rebuilds the scoped model set. Always needs a review marker. |
 | `gc` | `rocky gc --derivable` | Evicts each artifact. Always needs a review marker. |

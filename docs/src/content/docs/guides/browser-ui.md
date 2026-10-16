@@ -178,7 +178,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, promote a branch (only when the project requires a branch approval), approve a product's spec, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, promote a branch (only when the project requires a branch approval), approve a product's spec, plan and apply a compaction, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 ### Freeze and unfreeze
 
@@ -235,6 +235,17 @@ The approver is recorded with its channel, as `rocky review --approve` records i
 
 The job takes the same single write slot as a run. It answers `409 mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or another product approval is in progress.
 
+### Compact tables
+
+The **Estate** screen has a **Compact** panel. Compact runs `OPTIMIZE` (it rewrites small files) and `VACUUM` (it removes stale data files) on Delta tables. It works on Databricks only. It takes two steps, so you see what runs before it runs.
+
+1. Choose **One table** and type its full name, `catalog.schema.table`, or choose **Every managed table in a catalog** and type the catalog. Press **Plan compact**. The server runs `rocky compact <table>` or `rocky compact --catalog <name>`. The command writes a plan file and runs no statement. For a replication pipeline, a catalog plan asks the source adapter to discover tables. The page shows the number of statements, the table count, the target file size and every table. The statements are under **The statements**. If the command could not save the plan, the page says so and offers no apply.
+2. Press **Compact**. The confirm text names every table. After you confirm, the page applies the plan by its id, through the same apply as the Review screen. It does not plan again, so what runs is the plan you saw. Apply uses this server's warehouse credentials, and Rocky cannot undo it.
+
+The page never passes `--dry-run`. The command's `--dry-run` prints "no statements executed", but it still writes a plan that apply can run. The plan step is the preview.
+
+The plan step takes no write slot. The apply takes the same single write slot as a run, and answers `409 mutation_in_progress` while another job holds it. Archive is different: it deletes rows and then vacuums with no retention window. The Compact panel has no archive option, the plan screen shows no Apply button for an archive plan, and the server answers `409 archive_apply_terminal_only` to `POST /api/v1/jobs/apply` for one.
+
 ### Cancel a running job
 
 While a job runs, operator mode shows a **Cancel** button under it. A read-only page does not show it. The button calls `POST /api/v1/jobs/{id}/cancel`:
@@ -286,6 +297,7 @@ An approval from the UI records the approver source `http_api` and the server's 
 
 - **With a read-only token, it cannot write.** A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write.
 - **It cannot apply an archive plan.** Archive deletes rows and then vacuums with no retention window, so it cannot be undone. The plan screen shows no Apply button for an archive plan, and the server answers `409 archive_apply_terminal_only` to `POST /api/v1/jobs/apply` for one. Apply it in a terminal with `rocky apply <plan-id>`.
+- **It cannot archive.** `rocky archive` stays in a terminal. The Compact panel does not offer it, and the server refuses to apply an archive plan (see above).
 - **It cannot sign a branch approval.** Sign it in a terminal with `rocky branch approve <branch>`.
 - **It cannot know the spec digest for you.** A product-bound plan applies only with a digest you type, and the digest must come from the approval. The page never reads it from the plan.
 - **It cannot change policy.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules themselves live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
