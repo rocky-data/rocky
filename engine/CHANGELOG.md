@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The database name in config must match how Snowflake stores it, usually upper case.
   - Still unquoted: the database name in two `information_schema` reads (the batch column describe and the table listing). #2413 stays open for them.
   - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/load_create_live.rs` (`#[ignore]`, needs credentials).
+- Trino and Spark incremental replication no longer skips rows on a time-zone timestamp column when the session time zone is west of UTC (#2395). The bare `TIMESTAMP '…'` watermark literal was read in the session zone. Rocky now pins each session to UTC: Trino sends `X-Trino-Time-Zone: UTC`, and Spark runs `SET spark.sql.session.timeZone = UTC`. Postgres and Redshift already did this.
+  - Model SQL now also runs in UTC on these two adapters. `current_date`, `current_timestamp` and casts between zoned and plain timestamps use UTC, not the server's default zone.
+  - Databricks still renders a bare literal and sets no session zone. #2395 stays open for it.
+  - Not run against a live Trino or Spark server. The live checks are `session_time_zone_is_utc_live` (`rocky-trino/tests/conformance.rs`) and the `current_timezone()` assertion in `rocky-spark/tests/conformance.rs` (both `#[ignore]`).
 
 ## [1.85.1] — 2026-10-16
 

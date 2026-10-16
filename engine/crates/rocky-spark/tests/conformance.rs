@@ -167,6 +167,10 @@ async fn full_refresh_view_describe_kind_and_list() {
     let detail = rows(&a, &format!("DESCRIBE DETAIL {}", target(&a, &t))).await;
     assert_eq!(detail[0][0], "delta");
 
+    // The session reads the bare watermark literal in UTC (#2395).
+    let tz = rows(&a, "SELECT current_timezone()").await;
+    assert_eq!(tz[0][0], "UTC");
+
     // A timestamp reads back in the RFC 3339 shape Rocky's watermark parser
     // reads.
     let ts = rows(&a, &format!("SELECT MAX(ts) FROM {}", target(&a, &t))).await;

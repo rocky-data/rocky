@@ -437,3 +437,16 @@ async fn literal_escape_round_trips_live() {
 
     println!("VERDICT: Trino LiteralEscape::Standard round-trips byte-identical.");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
+async fn session_time_zone_is_utc_live() {
+    // The bare watermark literal is read in the session zone on a
+    // `timestamp with time zone` column, so the client pins UTC (#2395).
+    let adapter = build_adapter();
+    let result = adapter
+        .execute_query("SELECT current_timezone()")
+        .await
+        .expect("current_timezone");
+    assert_eq!(result.rows[0][0].as_str(), Some("UTC"));
+}
