@@ -18313,11 +18313,10 @@ async fn process_table(
 
     // #2395: a watermark filter renders a bare UTC literal. An adapter that
     // cannot pin its session to UTC refuses here when the session zone would
-    // read that literal wrong. Microbatch falls back to the same filter.
-    if matches!(
-        strategy,
-        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
-    ) {
+    // read that literal wrong. Microbatch falls back to the same filter. A
+    // `--resume` of a pruned table renders the held-back `row_count` cutoff
+    // without this check; that only measures, it writes nothing.
+    if uses_watermark {
         warehouse.check_watermark_time_zone().await?;
     }
 

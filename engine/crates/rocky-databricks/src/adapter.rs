@@ -237,8 +237,21 @@ fn watermark_zone_is_utc(zone: &str) -> AdapterResult<()> {
         "Etc/Zulu",
         "Z",
     ];
+    // Java `ZoneId` spellings Spark accepts for a zero offset.
+    const ZERO_OFFSETS: [&str; 10] = [
+        "+00:00",
+        "-00:00",
+        "+0000",
+        "UT",
+        "GMT+0",
+        "UTC+0",
+        "GMT+00:00",
+        "UTC+00:00",
+        "UT+0",
+        "UT+00:00",
+    ];
     let zone = zone.trim();
-    if UTC_NAMES.contains(&zone) || zone == "+00:00" || zone == "-00:00" {
+    if UTC_NAMES.contains(&zone) || ZERO_OFFSETS.contains(&zone) {
         return Ok(());
     }
     Err(AdapterError::msg(format!(
