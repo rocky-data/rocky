@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.85.1] — 2026-10-16
+
 ### Fixed
 
 - On Snowflake, Rocky now quotes database, schema and table names as written in every create and governance statement, the way the writes already do (#2405). This covers `CREATE DATABASE`, `CREATE SCHEMA` (`auto_create_catalogs`, `auto_create_schemas`, `rocky seed`, `rocky snapshot`), grants, revokes, `SHOW GRANTS`, tags, retention, and the `rocky replay --warehouse` schema. Before, these were unquoted, so Snowflake folded `marts` to `MARTS` and they named a different object than the writes (`"marts"`). Grants and tags on a `--branch` schema now land too, which closes the gap #2402 left open. Nothing is folded. Role names and tag names are unchanged.
