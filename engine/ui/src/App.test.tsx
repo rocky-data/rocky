@@ -493,7 +493,9 @@ describe("App", () => {
         window.history.back();
       });
       await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
-      expect(button).toHaveAttribute("aria-expanded", "false");
+      // The drawer closes on its own popstate handler, which can land after
+      // the page swap. Wait for it, as the in-drawer navigation test does.
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
     });
 
     it("closes on Escape and gives focus back to the button", async () => {
