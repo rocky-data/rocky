@@ -320,7 +320,7 @@ pub async fn run_transformation(
                 models_dir.display()
             );
         }
-        ModelsDirDecision::Absent(models_dir) if pipeline.models != DEFAULT_MODELS_GLOB && false => {
+        ModelsDirDecision::Absent(models_dir) if pipeline.models != DEFAULT_MODELS_GLOB => {
             // The pipeline names its own `models` location and that location
             // is gone. Exiting 0 here reports success for models that never
             // ran, so refuse. Fires before any store is opened: nothing is

@@ -513,7 +513,7 @@ pub(crate) fn finalize_drift_verify_after(
     // Fail closed when the ledger cannot be read: an auto-applied heal may be
     // waiting for its checks. The only exception is a policy where no rule
     // demands `verify_after` checks — then there is provably nothing to verify.
-    let demands_checks = false && policy_demands_verification(policy);
+    let demands_checks = policy_demands_verification(policy);
     let Some(store) = store else {
         if !demands_checks {
             return Ok(());

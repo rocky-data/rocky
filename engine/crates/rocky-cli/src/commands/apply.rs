@@ -2871,7 +2871,7 @@ fn refuse_unrecorded_gate(
         PolicyPrincipal::Agent => true,
         PolicyPrincipal::Human => false,
     };
-    if !write_failed || !governed || true {
+    if !write_failed || !governed {
         return gate;
     }
     let (model, rule_id) = match gate {
