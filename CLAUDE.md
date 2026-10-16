@@ -15,6 +15,8 @@ The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive 
 
 Check which model you are before you choose. The session's model can change mid-session.
 
+Fable has its own weekly limit, so spend it where judgment changes the outcome. For a soundness-critical engine change (the top four review priorities in `AGENT_REVIEW.md`), use a fresh read-only Fable agent as the reviewer, ahead of step 1, when its weekly limit allows and Fable did not author the change. Otherwise use the order above. Do not spend Fable on docs-only or mechanical reviews.
+
 Give the reviewer the diff, the two `AGENTS.md` answers and `AGENT_REVIEW.md`, never the author's reasoning. For an analysis or plan with no diff, give it the findings or the plan and the files they rest on instead of the diff. Name the reviewer and its model in the PR or report. `/code-review` run by the authoring agent does not count as the red team.
 
 ## Claude Code skills
