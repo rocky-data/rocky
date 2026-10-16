@@ -897,13 +897,16 @@ The kill switch for the default-on knob is `column_level = false`, which restore
 
 ## `[ai]`
 
-Cap what an AI generation can spend. The block applies to `rocky ai`, `rocky ai-explain`, `rocky ai-sync`, and `rocky ai-test`. Rocky rejects an unknown field here rather than ignoring it.
+Cap what an AI generation can spend, and choose where requests go. The block applies to `rocky ai`, `rocky ai-explain`, `rocky ai-sync`, and `rocky ai-test`. Rocky rejects an unknown field here rather than ignoring it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
+| `base_url` | string | `https://api.anthropic.com` | Base URL of the Anthropic-compatible API. Rocky sends requests to `{base_url}/v1/messages`. A trailing slash is ignored. The URL must use `https`. Plain `http` works only for loopback hosts (`localhost`, `127.0.0.1`, `::1`), so a local model server works. Rocky refuses any other `http` URL. If the key is unset, Rocky reads the `ROCKY_AI_BASE_URL` environment variable. |
 
 Every `rocky ai*` command reads this block. Rocky never reads the API key from `rocky.toml`. It comes from the `ANTHROPIC_API_KEY` environment variable instead, so the key never lands on disk in a project file.
+
+Rocky sends the API key to `base_url`. Point it only at a server you trust.
 
 ---
 

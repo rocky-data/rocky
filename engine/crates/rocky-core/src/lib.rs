@@ -52,6 +52,7 @@ pub mod physical_edges;
 pub mod plan_partition;
 pub mod policy;
 pub mod preview;
+pub mod private_fs;
 pub mod process;
 pub mod product;
 pub mod project_docs;

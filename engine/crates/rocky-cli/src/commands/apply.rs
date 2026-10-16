@@ -2359,9 +2359,10 @@ async fn commit_verify_after_custody(
 
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
 /// set and aggregate the most-restrictive effect. Records one
-/// [`PolicyDecisionRecord`] per evaluation to the ledger (best-effort — an
-/// audit-write failure never fails the caller; the *gate* is the safety
-/// boundary, the ledger is the trail).
+/// [`PolicyDecisionRecord`] per evaluation to the ledger. Fail-closed on the
+/// trail: a decision row that cannot be recorded turns an `allow` or
+/// `require_review` verdict into a `deny`, so no governed mutation proceeds
+/// without its audit row. A `deny` stays a `deny`.
 ///
 /// Shared by the mutating enforcement points — `rocky apply`, promote, and the
 /// MCP `propose` gate — so each evaluates the same per-model rules with the same
@@ -2713,6 +2714,9 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     // Tracks a failed budget-relevant decision-row write so we can fail closed
     // after the evaluation loop (the record sink returns `()`).
     let budget_write_failed = std::cell::Cell::new(false);
+    // Tracks ANY failed decision-row write. A governed mutation must not
+    // proceed without its audit row, so this also fails closed below.
+    let audit_write_failed = std::cell::Cell::new(false);
 
     let gate = evaluate_apply_policy_core(
         &policy,
@@ -2739,26 +2743,25 @@ fn evaluate_apply_policy_with_policy_matching_dual(
             match ledger {
                 Some(store) => {
                     if let Err(e) = store.record_policy_decision(record) {
+                        audit_write_failed.set(true);
                         if rec_budget_relevant {
                             budget_write_failed.set(true);
-                            warn!(
-                                target: "rocky::policy",
-                                error = %e,
-                                "fail-closed: could not persist a budget-relevant decision row"
-                            );
-                        } else {
-                            warn!(
-                                target: "rocky::policy",
-                                error = %e,
-                                "failed to record policy decision to the ledger (continuing)"
-                            );
                         }
+                        warn!(
+                            target: "rocky::policy",
+                            error = %e,
+                            budget_relevant = rec_budget_relevant,
+                            "fail-closed: could not record a policy decision to the ledger"
+                        );
                     }
                 }
-                // No write handle: fail closed only if this winning rule is
-                // itself budget / verify_after-relevant.
-                None if rec_budget_relevant => budget_write_failed.set(true),
-                None => {}
+                // No write handle: the row cannot be recorded at all.
+                None => {
+                    audit_write_failed.set(true);
+                    if rec_budget_relevant {
+                        budget_write_failed.set(true);
+                    }
+                }
             }
         },
     );
@@ -2769,6 +2772,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
             "a budget-relevant decision row could not be persisted",
         );
     }
+    let gate = refuse_unrecorded_gate(gate, audit_write_failed.get(), touched);
     if !pre_image_won {
         return gate;
     }
@@ -2847,6 +2851,44 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
 pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
     "(fail-closed deny; a review marker cannot satisfy it)";
 
+/// Fail closed when a decision row could not be recorded (`write_failed`).
+///
+/// The ledger row is the audit trail for a governed mutation. An `allow` or a
+/// `require_review` (which a review marker can satisfy) would let the mutation
+/// proceed with no row, so either becomes a `deny`. A `deny` already refuses
+/// and keeps its own reason. Gates that record no rows pass through.
+fn refuse_unrecorded_gate(
+    gate: PolicyGate,
+    write_failed: bool,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> PolicyGate {
+    if !write_failed {
+        return gate;
+    }
+    let (model, rule_id) = match gate {
+        PolicyGate::Allow => (
+            touched
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "*".to_string()),
+            None,
+        ),
+        PolicyGate::RequireReview { model, rule_id, .. } => (model, rule_id),
+        PolicyGate::NotConfigured | PolicyGate::Unloadable { .. } | PolicyGate::Deny { .. } => {
+            return gate;
+        }
+    };
+    PolicyGate::Deny {
+        model,
+        rule_id,
+        reason: "fail-closed: the policy decision could not be recorded to the state store \
+                 ledger, so this governed mutation is refused rather than run without its \
+                 audit row. Retry when the state store is writable and not contended."
+            .to_string(),
+    }
+}
+
 fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &str) -> PolicyGate {
     PolicyGate::Deny {
         model: touched
@@ -2902,7 +2944,8 @@ pub(crate) fn evaluate_apply_policy_with_store(
     let snapshot_unreadable = prior.is_err();
     let prior_decisions = prior.unwrap_or_default();
 
-    evaluate_apply_policy_core(
+    let write_failed = std::cell::Cell::new(false);
+    let gate = evaluate_apply_policy_core(
         &policy,
         plan_id,
         principal,
@@ -2915,14 +2958,16 @@ pub(crate) fn evaluate_apply_policy_with_store(
         snapshot_unreadable,
         |record| {
             if let Err(e) = ledger.record_policy_decision(record) {
+                write_failed.set(true);
                 warn!(
                     target: "rocky::policy",
                     error = %e,
-                    "failed to record policy decision to the ledger (continuing)"
+                    "fail-closed: could not record a policy decision to the ledger"
                 );
             }
         },
-    )
+    );
+    refuse_unrecorded_gate(gate, write_failed.get(), touched)
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
@@ -11150,6 +11195,66 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// RD-034: a governed decision whose audit row cannot be recorded must not
+    /// let the mutation proceed. Before the fix a plain `allow` (no budget, no
+    /// `verify_after`) logged a warning and returned `Allow`, so the apply ran
+    /// with no ledger row. A `require_review` is refused too, because a review
+    /// marker would otherwise unblock it without a row. A `deny` keeps its reason.
+    #[test]
+    fn unrecorded_decision_row_refuses_a_governed_mutation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        // Seed the store so the read-only snapshot succeeds, then hold only the
+        // writer lock: the snapshot reads, the decision-row write cannot open.
+        drop(StateStore::open(&state)?);
+        let _lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+        let models = dir.path().join("models");
+        let mut touched = BTreeMap::new();
+        touched.insert("orders".to_string(), PolicyCapability::Apply);
+
+        let gate_for = |effect: &str| -> anyhow::Result<PolicyGate> {
+            let cfg = write_config(
+                dir.path(),
+                &format!(
+                    r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = {{ any = true }}
+effect = "{effect}"
+"#
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&cfg)?.policy;
+            Ok(super::evaluate_apply_policy_with_policy(
+                policy.as_ref(),
+                "p",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                crate::commands::apply::EmptyTouched::NoOp,
+                &models,
+                &state,
+                &[],
+            ))
+        };
+
+        for effect in ["allow", "require_review"] {
+            let gate = gate_for(effect)?;
+            assert!(
+                matches!(&gate, PolicyGate::Deny { model, reason, .. }
+                    if model == "orders" && reason.contains("could not be recorded")),
+                "an unrecorded `{effect}` decision must fail closed; got {gate:?}"
+            );
+        }
+        let gate = gate_for("deny")?;
+        assert!(
+            matches!(&gate, PolicyGate::Deny { reason, .. } if !reason.contains("could not be recorded")),
+            "a `deny` keeps its own reason; got {gate:?}"
+        );
+        Ok(())
+    }
+
     /// Finding 6 (round-6 false-deny fix) — the true kill-check. Hold ONLY the
     /// writer lock (not a full `StateStore`), so `open_read_only` still succeeds
     /// (readable snapshot) while the ledger WRITE open fails — the real
@@ -11200,10 +11305,15 @@ effect = "allow"
             &state,
             &[],
         );
+        // The unrelated budget rule must not drive the verdict. The winner's own
+        // audit row still cannot be recorded, so the gate refuses on that ground
+        // instead (RD-034) — never with the budget-pair reason.
         assert!(
-            !matches!(&gate_a, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),
-            "a NON-budget winner must not be fail-closed-denied because an unrelated budget rule \
-             exists for a different target; got {gate_a:?}"
+            matches!(&gate_a, PolicyGate::Deny { reason, .. }
+                if reason.contains("could not be recorded") && !reason.contains("budget")),
+            "a NON-budget winner must not be budget-denied because an unrelated budget rule \
+             exists for a different target; it is refused only for its own unrecorded audit row; \
+             got {gate_a:?}"
         );
 
         // (b) `orders` wins under a BUDGET `any` rule whose decision row can't be

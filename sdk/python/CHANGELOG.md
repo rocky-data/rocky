@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RockyClient(state_path=...)` now defaults to `None`. The client omits `--state-path`, so the engine resolves the state file itself. Before, it always sent `--state-path .rocky-state.redb`. An explicit `state_path` still works.
+
+### Fixed
+
+- The lazy `rocky --version` check no longer marks itself done after a timeout, an `OSError`, or an unparseable version. The next call retries the check. The client logs one warning.
+
 ## [0.25.0] — 2026-10-16
 
 ### Added

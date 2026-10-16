@@ -338,8 +338,9 @@ class RockyClient:
     Args:
         config_path: Path to ``rocky.toml``.
         binary_path: Path to the ``rocky`` binary (default ``"rocky"`` on PATH).
-        state_path: Path to the state store file. Mutually exclusive with
-            ``state_namespace``.
+        state_path: Optional path to the state store file. ``None`` (default)
+            omits ``--state-path`` so the engine resolves the location itself.
+            Mutually exclusive with ``state_namespace``.
         state_namespace: Optional per-namespace state key (engine
             ``--state-namespace``). When set, ``--state-path`` is omitted.
         models_dir: Directory containing model files for model-aware commands,
@@ -361,7 +362,7 @@ class RockyClient:
         *,
         config_path: str = "rocky.toml",
         binary_path: str = "rocky",
-        state_path: str = ".rocky-state.redb",
+        state_path: str | None = None,
         state_namespace: str | None = None,
         models_dir: str = "models",
         contracts_dir: str | None = None,
@@ -382,6 +383,7 @@ class RockyClient:
         self._mirror_stderr = mirror_stderr
         self._resolved_binary: str | None = None
         self._version_checked = False
+        self._version_warned = False
         # Parsed engine version, when it could be determined. Kept so a
         # per-feature floor can be checked without re-running ``--version``.
         self._engine_version: tuple[int, int, int] | None = None
@@ -411,6 +413,20 @@ class RockyClient:
         self._resolved_binary = binary
         return binary
 
+    def _warn_version_check_skipped(self, reason: str) -> None:
+        """Log (once per client) that the version gate was skipped, without caching it.
+
+        ``_version_checked`` stays ``False`` so the next call retries the check.
+        """
+        if self._version_warned:
+            return
+        self._version_warned = True
+        self._logger.warning(
+            "%s; skipping the minimum-version (%s) check for this call and retrying on the next",
+            reason,
+            MIN_ROCKY_VERSION,
+        )
+
     def _verify_engine_version(self) -> None:
         """Check the binary meets :data:`MIN_ROCKY_VERSION` (lazy, cached).
 
@@ -435,7 +451,9 @@ class RockyClient:
             raise RockyBinaryNotFoundError(self.binary_path) from None
         except (subprocess.TimeoutExpired, OSError):
             # Best-effort — don't block the actual command on a slow/odd env.
-            self._version_checked = True
+            # Do not mark the check done: a transient failure must not skip the
+            # gate for the life of the client. Retry on the next call; warn once.
+            self._warn_version_check_skipped("rocky --version timed out or could not be run")
             return
 
         # ``rocky --version`` outputs "rocky X.Y.Z" or just "X.Y.Z".
@@ -444,12 +462,7 @@ class RockyClient:
             # Fail open (don't block the real command) but make it visible —
             # a silently-skipped gate is how an incompatible binary slips
             # through and surfaces later as a confusing parse error.
-            self._logger.warning(
-                "rocky --version produced no parseable version; skipping the "
-                "minimum-version (%s) check",
-                MIN_ROCKY_VERSION,
-            )
-            self._version_checked = True
+            self._warn_version_check_skipped("rocky --version produced no parseable version")
             return
 
         # First whitespace-delimited token is the version — trailing build
@@ -461,12 +474,7 @@ class RockyClient:
             detected = tuple(int(p) for p in core_version.split(".")[:3])
             required = tuple(int(p) for p in MIN_ROCKY_VERSION.split(".")[:3])
         except ValueError:
-            self._logger.warning(
-                "could not parse rocky version %r; skipping the minimum-version (%s) check",
-                version_str,
-                MIN_ROCKY_VERSION,
-            )
-            self._version_checked = True
+            self._warn_version_check_skipped(f"could not parse rocky version {version_str!r}")
             return
 
         # Pad both sides to three components so a short version ("1.34")
@@ -520,10 +528,11 @@ class RockyClient:
         cmd = [binary, "--config", self.config_path]
         # ``--state-namespace`` and ``--state-path`` are mutually exclusive: the
         # engine disables namespacing when an explicit ``--state-path`` is
-        # present, so send exactly one.
+        # present, so send exactly one. With neither set, the engine resolves
+        # the state location itself.
         if self.state_namespace is not None:
             cmd += ["--state-namespace", self.state_namespace]
-        else:
+        elif self.state_path is not None:
             cmd += ["--state-path", self.state_path]
         cmd += ["--output", "json", *args]
         return cmd

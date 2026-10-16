@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `state_path` on `RockyResource` and `RockyComponent` now defaults to `None`. The `--state-path` flag is omitted, so the engine resolves the state file itself. Before, the default was `.rocky-state.redb`. An explicit value still works.
+
+### Fixed
+
+- `RockyComponent.write_state_to_path` keeps the existing state file when `rocky discover` fails, and logs a warning. It writes an empty discover envelope only when no state file exists yet.
+
 ## [1.70.0] — 2026-10-09
 
 Pairs with engine 1.80.0. Works with `rocky-sdk` 0.18.0 or later.

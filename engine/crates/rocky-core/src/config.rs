@@ -4812,12 +4812,20 @@ pub struct AiSection {
     /// retries. Default [`DEFAULT_AI_MAX_TOKENS`].
     #[serde(default = "default_ai_max_tokens")]
     pub max_tokens: u32,
+    /// Base URL of the Anthropic-compatible API. Default
+    /// `https://api.anthropic.com`; the request goes to
+    /// `{base_url}/v1/messages`. Must be `https`, except for loopback hosts
+    /// (`localhost`, `127.0.0.1`, `::1`). The `ROCKY_AI_BASE_URL`
+    /// environment variable is the fallback when this key is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 impl Default for AiSection {
     fn default() -> Self {
         Self {
             max_tokens: DEFAULT_AI_MAX_TOKENS,
+            base_url: None,
         }
     }
 }

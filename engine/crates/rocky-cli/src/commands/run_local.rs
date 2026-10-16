@@ -43,6 +43,10 @@ pub enum ModelsDirDecision {
     Absent(PathBuf),
 }
 
+/// The `models` glob a transformation pipeline gets when its config has no
+/// `models` key. Mirrors the serde default in `rocky_core::config`.
+const DEFAULT_MODELS_GLOB: &str = "models/**";
+
 /// Execute `rocky run` for a transformation pipeline.
 ///
 /// Compiles and executes models from the caller-resolved
@@ -314,6 +318,21 @@ pub async fn run_transformation(
                  its planned models cannot run — refusing rather than reporting success for \
                  models that never executed. Re-plan with `rocky plan` before applying.",
                 models_dir.display()
+            );
+        }
+        ModelsDirDecision::Absent(models_dir) if pipeline.models != DEFAULT_MODELS_GLOB => {
+            // The pipeline names its own `models` location and that location
+            // is gone. Exiting 0 here reports success for models that never
+            // ran, so refuse. Fires before any store is opened: nothing is
+            // mutated. The default glob keeps the no-op below, because a
+            // transformation pipeline with no `models` key (a seed-only
+            // pipeline) legitimately has no models directory.
+            anyhow::bail!(
+                "models directory '{}' does not exist, but pipeline models = \"{}\" points at \
+                 it, so no model can run. Create the directory or fix the `models` path in \
+                 rocky.toml.",
+                models_dir.display(),
+                pipeline.models
             );
         }
         ModelsDirDecision::Absent(models_dir) => {
@@ -3910,6 +3929,72 @@ auto_create_schemas = true
             built, 0,
             "nothing may materialize on an Absent decision, even with the dir on disk"
         );
+    }
+
+    /// A pipeline whose explicit `models` path is absent must refuse, not
+    /// exit 0 having run nothing. The refusal fires before any state store is
+    /// opened. Pre-fix: the arm only logged a warning and returned `Ok`.
+    #[tokio::test]
+    async fn absent_custom_models_dir_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+        std::fs::write(
+            dir.join("rocky.toml"),
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let loaded =
+            rocky_core::config::load_rocky_config_fingerprinted(&dir.join("rocky.toml")).unwrap();
+        let rocky_cfg = &loaded.config;
+        let (_, pipeline_config) =
+            crate::registry::resolve_pipeline(rocky_cfg, None).expect("resolve pipeline");
+        let rocky_core::config::PipelineConfig::Transformation(t) = pipeline_config else {
+            panic!("test config must resolve to a transformation pipeline");
+        };
+        let models_dir = dir.join("transforms");
+        let models_glob = dir.join("transforms/**").to_string_lossy().into_owned();
+
+        let err = super::run_transformation(
+            super::ModelsDirDecision::Absent(models_dir.clone()),
+            &models_glob,
+            t,
+            rocky_cfg,
+            false, // output_json
+            &PartitionRunOptions::default(),
+            &rocky_core::config::SchemaCacheConfig::default(),
+            None, // shadow_config
+            super::super::run::SkipGateConfig::off(),
+            false, // no_reuse
+            &state_path,
+            "run-absent-custom",
+            chrono::Utc::now(),
+            "cfg-hash-test",
+            None, // pipeline_name
+            None, // idempotency_key
+            &rocky_core::run_vars::RunVars::new(),
+            None,  // exec_fp_gate
+            None,  // freeze_fence
+            false, // expects_models: a bare `rocky run`
+            None,  // hook_registry
+            None,  // contracts_dir
+            None,  // project
+            None,  // target_dialects
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("an absent explicit models directory must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") && msg.contains("transforms/**"),
+            "{msg}"
+        );
+        assert!(!state_path.exists(), "the refusal must open no state store");
     }
 
     /// A DuckDB adapter that records every statement and fails the one

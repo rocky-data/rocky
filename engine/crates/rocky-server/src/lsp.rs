@@ -3510,6 +3510,7 @@ async fn resolve_ai_contract_action(
         default_format: "sql".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        base_url: None,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -3737,6 +3738,7 @@ async fn resolve_ai_classification_action(data: &AiClassificationActionData) -> 
         default_format: "toml".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        base_url: None,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -3921,6 +3923,7 @@ async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveO
         default_format: "toml".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        base_url: None,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {
@@ -4031,6 +4034,7 @@ async fn resolve_ai_dsl_action(data: &AiDslActionData) -> AiResolveOutcome {
         default_format: "rocky".to_string(),
         max_attempts: 1,
         max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        base_url: None,
     };
 
     let client = match rocky_ai::client::LlmClient::new(ai_config) {

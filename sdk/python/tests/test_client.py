@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import signal
+import subprocess
 import threading
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -93,6 +94,14 @@ def test_build_cmd_uses_state_path_by_default():
         "json",
         "discover",
     ]
+
+
+def test_build_cmd_omits_state_path_by_default():
+    """With no ``state_path`` the engine resolves the state location itself."""
+    client = _client(config_path="r.toml")
+    with patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"):
+        cmd = client._build_cmd(["discover"])
+    assert cmd == ["/bin/rocky", "--config", "r.toml", "--output", "json", "discover"]
 
 
 def test_build_cmd_uses_state_namespace_when_set():
@@ -1624,3 +1633,34 @@ def test_schedule_spool_parses_the_typed_document():
         result = client.schedule_spool()
     assert result.pending[0].received_at.year == 2026
     assert result.spool_path.endswith("pending-demands")
+
+
+@pytest.mark.parametrize(
+    "run_kwargs",
+    [
+        {"side_effect": subprocess.TimeoutExpired(cmd="rocky", timeout=10)},
+        {"side_effect": OSError("boom")},
+        {"return_value": MagicMock(stdout="")},
+        {"return_value": MagicMock(stdout="rocky not-a-version\n")},
+    ],
+)
+def test_verify_version_transient_failure_is_not_cached_and_retries(run_kwargs, caplog):
+    client = RockyClient(binary_path="rocky")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", **run_kwargs),
+        caplog.at_level("WARNING"),
+    ):
+        client._verify_engine_version()
+        client._verify_engine_version()
+    assert client._version_checked is False
+    # Warned once, not once per call.
+    assert sum("minimum-version" in r.message for r in caplog.records) == 1
+
+    good = MagicMock(stdout="rocky 99.0.0\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=good),
+    ):
+        client._verify_engine_version()
+    assert client._version_checked is True

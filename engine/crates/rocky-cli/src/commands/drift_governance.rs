@@ -475,6 +475,12 @@ fn revert_pointer_for() -> Option<String> {
 /// failures burn that rule's autonomy budget. The two row shapes stay
 /// distinguishable by `verify_after` (empty = decision, non-empty =
 /// verification outcome).
+/// Whether any rule in `policy` demands `verify_after` checks. When none does,
+/// every heal resolves to an empty required set, so there is nothing to verify.
+fn policy_demands_verification(policy: Option<&PolicyConfig>) -> bool {
+    policy.is_some_and(|p| p.rules.iter().any(|r| !r.verify_after.is_empty()))
+}
+
 fn decision_plan_id(run_id: &str) -> String {
     format!("autoapply:{run_id}")
 }
@@ -495,19 +501,35 @@ fn decision_plan_id(run_id: &str) -> String {
 /// required check failed or was absent. The migration already landed and,
 /// with no rollback substrate, stays in place until a human reverts it.
 ///
-/// A no-op when the store is unavailable, nothing was auto-applied, or no
-/// granting rule demanded checks.
+/// A no-op when nothing was auto-applied or no granting rule demanded checks.
+/// Fail-closed when the ledger cannot be read (no store, or a list error)
+/// while some policy rule demands `verify_after` checks.
 pub(crate) fn finalize_drift_verify_after(
     store: Option<&StateStore>,
     run_id: &str,
     policy: Option<&PolicyConfig>,
     actor: &PrincipalRef,
 ) -> Result<()> {
+    // Fail closed when the ledger cannot be read: an auto-applied heal may be
+    // waiting for its checks. The only exception is a policy where no rule
+    // demands `verify_after` checks — then there is provably nothing to verify.
+    let demands_checks = policy_demands_verification(policy);
     let Some(store) = store else {
-        return Ok(());
+        if !demands_checks {
+            return Ok(());
+        }
+        bail!(
+            "verify_after gate cannot run: no state store is open, so the auto-applied drift \
+             decisions it must verify cannot be read (fail-closed)"
+        );
     };
-    let Ok(decisions) = store.list_policy_decisions() else {
-        return Ok(());
+    let decisions = match store.list_policy_decisions() {
+        Ok(decisions) => decisions,
+        Err(_) if !demands_checks => return Ok(()),
+        Err(e) => bail!(
+            "verify_after gate cannot run: the policy-decision ledger is unreadable ({e}), so \
+             the auto-applied drift decisions it must verify cannot be read (fail-closed)"
+        ),
     };
     let decision_plan = decision_plan_id(run_id);
     // Applied decision rows are PLAIN (empty verify_after); the non-empty
@@ -1011,6 +1033,28 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A missing state store cannot be read, so it cannot prove that no
+    /// auto-applied drift is waiting for a `verify_after` check. When a policy
+    /// rule demands checks, the gate must fail closed rather than pass.
+    #[test]
+    fn missing_store_fails_closed_when_a_rule_demands_checks() {
+        let policy = granting_policy(&["row_count"], None);
+        let err =
+            finalize_drift_verify_after(None, "run-1", Some(&policy), &PrincipalRef::unnamed())
+                .expect_err("an unreadable ledger must not pass a verify_after obligation");
+        assert!(err.to_string().contains("verify_after"), "{err}");
+    }
+
+    /// With no rule that demands checks there is provably nothing to verify,
+    /// so a missing store stays a no-op.
+    #[test]
+    fn missing_store_is_ok_when_no_rule_demands_checks() {
+        let actor = PrincipalRef::unnamed();
+        assert!(finalize_drift_verify_after(None, "run-1", None, &actor).is_ok());
+        let policy = granting_policy(&[], None);
+        assert!(finalize_drift_verify_after(None, "run-1", Some(&policy), &actor).is_ok());
     }
 
     #[test]

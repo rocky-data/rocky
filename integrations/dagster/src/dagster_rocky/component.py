@@ -471,7 +471,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
 
     binary_path: str = "rocky"
     config_path: str = "rocky.toml"
-    state_path: str = ".rocky-state.redb"
+    state_path: str | None = None
     #: Optional per-namespace state file (engine ``--state-namespace``); mirrors
     #: :attr:`RockyResource.state_namespace`. When set to a SQL identifier, the
     #: resource this component builds routes run state to
@@ -898,8 +898,19 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             # exception propagates instead of being swallowed.
             if self.strict_build:
                 raise
+            if state_path.exists():
+                # Keep the last-known-good state rather than clobbering a
+                # usable graph with an empty envelope on a transient failure.
+                _log.warning(
+                    "rocky discover failed during state write — keeping the "
+                    "existing state file at %s",
+                    state_path,
+                    exc_info=True,
+                )
+                return
             _log.warning(
-                "rocky discover failed during state write — writing empty discover envelope",
+                "rocky discover failed during state write — no previous state "
+                "exists, writing empty discover envelope",
                 exc_info=True,
             )
             discover_payload = {

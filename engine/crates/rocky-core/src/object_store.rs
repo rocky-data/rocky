@@ -399,7 +399,7 @@ impl ObjectStoreProvider {
         local_path: &Path,
     ) -> ObjectStoreResult<()> {
         let bytes = self.get(relative_path).await?;
-        self.atomic_write(&bytes, local_path).await
+        Self::atomic_write(bytes, local_path).await
     }
 
     /// Download an object, capturing its [`Generation`] from the same read.
@@ -425,7 +425,7 @@ impl ObjectStoreProvider {
             })
         };
         let bytes = result.bytes().await?;
-        self.atomic_write(&bytes, local_path).await?;
+        Self::atomic_write(bytes, local_path).await?;
         Ok(generation)
     }
 
@@ -433,32 +433,18 @@ impl ObjectStoreProvider {
     /// file + `rename` (POSIX rename is atomic within a filesystem), so a
     /// reader never observes a half-written file. Writing in place would leave
     /// a corrupt `state.redb` if the process died mid-write.
-    async fn atomic_write(&self, bytes: &[u8], local_path: &Path) -> ObjectStoreResult<()> {
-        let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = local_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "state".to_string());
-        // Same-directory temp name so the rename stays on one filesystem (a
-        // cross-device rename is not atomic and would error). The pid + a
-        // nanosecond timestamp keep concurrent downloads from colliding.
-        let unique = format!(
-            "{}.{}.{}.tmp",
-            file_name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let tmp_path = parent.join(unique);
-
-        tokio::fs::write(&tmp_path, bytes).await?;
-        // Atomic publish. On failure, best-effort clean up the temp file.
-        if let Err(e) = tokio::fs::rename(&tmp_path, local_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e.into());
-        }
+    ///
+    /// The temp file is created with `O_EXCL` under a random name and is
+    /// owner-only (`0600` on unix), so the published file is owner-only too
+    /// and a name planted in the directory cannot redirect the write. See
+    /// [`crate::private_fs::write_private_atomic`].
+    async fn atomic_write(bytes: Bytes, local_path: &Path) -> ObjectStoreResult<()> {
+        let local_path = local_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::private_fs::write_private_atomic(&local_path, &bytes)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(())
     }
 
@@ -841,6 +827,38 @@ mod tests {
             leftover.is_empty(),
             "no .tmp file should remain after an atomic download"
         );
+    }
+
+    /// The downloaded file is owner-only, even when it replaces a
+    /// world-readable one, and the temp name is not derived from the pid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_download_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let provider = ObjectStoreProvider::in_memory();
+        provider
+            .put("state", Bytes::from_static(b"secret-state"))
+            .await
+            .unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("state.redb");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A symlink at the old pid-derived temp name must not be written
+        // through: the temp name is random now.
+        let victim = target_dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let old_name = target_dir
+            .path()
+            .join(format!("state.redb.{}.0.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &old_name).unwrap();
+
+        provider.download_file("state", &target).await.unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret-state");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
     }
 
     /// `from_store` must behave exactly like a `from_uri`-built provider for

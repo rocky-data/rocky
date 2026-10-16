@@ -1183,7 +1183,9 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
 /// Open (creating if absent) the sidecar lock file for `path`.
 fn open_lock_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf), StateError> {
     let lock_path = path.with_extension("redb.lock");
-    let file = std::fs::OpenOptions::new()
+    // Owner-only when this open creates the sidecar; an existing one keeps its
+    // mode.
+    let file = crate::private_fs::private_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -2009,6 +2011,8 @@ impl StateStore {
             .map(|h| h.name().to_string())
             .collect();
 
+        crate::private_fs::ensure_private_file(dest)
+            .map_err(|e| StateError::Database(redb::DatabaseError::from(e)))?;
         let dest_db = Database::create(dest)?;
         let write_txn = dest_db.begin_write()?;
         let mut total_bytes: u64 = 0;
@@ -2467,6 +2471,14 @@ fn open_redb_with_retry_mode(
         (false, Some(bytes)) => Database::builder().set_cache_size(bytes).create(path),
         (false, None) => Database::create(path),
     };
+    if !existing_only {
+        // redb's `create` makes a missing file with the default `0666 & umask`
+        // mode. Create it first, empty and owner-only, so the state store is
+        // never readable by other local users; redb treats an empty file as a
+        // new database. An existing file is left exactly as it is.
+        crate::private_fs::ensure_private_file(path)
+            .map_err(|e| StateError::Database(redb::DatabaseError::from(e)))?;
+    }
     for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
         match open(path) {
             Ok(db) => return Ok(db),
@@ -8858,7 +8870,7 @@ pub fn resolve_state_path_ns(
         );
         return resolve_state_path(explicit, models_dir);
     }
-    if let Err(e) = std::fs::create_dir_all(&ns_dir) {
+    if let Err(e) = crate::private_fs::create_private_dir_all(&ns_dir) {
         tracing::warn!(
             target: "rocky::state_path",
             path = %ns_dir.display(),
@@ -19073,5 +19085,56 @@ mod rendered_debug_1919 {
         let debug = format!("{err:?}");
         assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
         assert!(debug.contains("${RV_STATE_ERR_DBG}"), "{debug}");
+    }
+}
+
+/// Files and directories the state store creates are owner-only on unix;
+/// files and directories that already exist keep their mode.
+#[cfg(all(test, unix))]
+mod private_mode_tests {
+    use super::*;
+    use crate::private_fs::mode_of;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn a_new_state_store_and_its_lock_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(mode_of(&path).unwrap(), 0o600, "state file");
+        assert_eq!(
+            mode_of(&path.with_extension("redb.lock")).unwrap(),
+            0o600,
+            "lock sidecar"
+        );
+        drop(store);
+    }
+
+    #[test]
+    fn an_existing_state_store_keeps_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        drop(StateStore::open(&path).unwrap());
+        assert_eq!(mode_of(&path).unwrap(), 0o640);
+    }
+
+    #[test]
+    fn a_snapshot_export_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let dest = dir.path().join("snapshot.redb");
+        store.snapshot_to_excluding(&dest, &[]).unwrap();
+        assert_eq!(mode_of(&dest).unwrap(), 0o600);
+    }
+
+    #[test]
+    fn the_namespace_dir_is_created_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_state_path_ns(None, dir.path(), Some("ns_a"));
+        let ns_dir = dir.path().join(STATE_NAMESPACE_DIR);
+        assert_eq!(resolved.path.parent().unwrap(), ns_dir);
+        assert_eq!(mode_of(&ns_dir).unwrap(), 0o700);
     }
 }

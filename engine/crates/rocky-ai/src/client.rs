@@ -20,6 +20,16 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// `rocky ai`.
 pub const AI_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
+/// Default API base URL. The Messages endpoint is `{base_url}/v1/messages`.
+pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// Environment variable that overrides the API base URL when `[ai] base_url`
+/// is not set in `rocky.toml`. Read by the `rocky ai*` commands.
+pub const AI_BASE_URL_ENV: &str = "ROCKY_AI_BASE_URL";
+
+/// Providers that [`LlmClient`] can talk to.
+const SUPPORTED_PROVIDERS: &[&str] = &["anthropic"];
+
 /// AI provider configuration.
 ///
 /// `api_key` is wrapped in [`RedactedString`] so accidental `?config` /
@@ -45,6 +55,11 @@ pub struct AiConfig {
     /// [`DEFAULT_MAX_TOKENS`] preserves pre-knob behaviour.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Optional API base URL (default [`DEFAULT_BASE_URL`]). The request
+    /// goes to `{base_url}/v1/messages`; a trailing slash is ignored. Must be
+    /// `https`, except for loopback hosts (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 fn default_format() -> String {
@@ -74,6 +89,15 @@ pub enum AiError {
     #[error("no API key configured")]
     NoApiKey,
 
+    /// The configured provider has no client in this build.
+    #[error("unsupported AI provider `{provider}`: supported providers are {supported}")]
+    UnsupportedProvider { provider: String, supported: String },
+
+    /// The configured base URL is malformed or uses plain `http` for a
+    /// non-loopback host.
+    #[error("invalid AI base URL `{url}`: {reason}")]
+    InvalidBaseUrl { url: String, reason: String },
+
     /// Cumulative output tokens consumed by the compile-verify retry loop
     /// exceeded the configured `[ai] max_tokens` budget. Bounds the
     /// worst-case cost when the LLM produces runaway responses across
@@ -98,6 +122,54 @@ impl std::fmt::Debug for AiError {
     }
 }
 
+/// Pick the base URL: the `[ai] base_url` value if set, else the
+/// `ROCKY_AI_BASE_URL` environment variable, else `None` (the default).
+pub fn resolve_base_url(configured: Option<String>) -> Option<String> {
+    configured.or_else(|| {
+        std::env::var(AI_BASE_URL_ENV)
+            .ok()
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// Validate `base_url` (or the default) and build the Messages endpoint URL.
+///
+/// Requires `https`; plain `http` is allowed only for loopback hosts so a
+/// local model server works without sending the API key over the network.
+pub fn messages_url(base_url: Option<&str>) -> Result<String, AiError> {
+    let raw = base_url.unwrap_or(DEFAULT_BASE_URL);
+    let invalid = |reason: &str| AiError::InvalidBaseUrl {
+        url: raw.to_string(),
+        reason: reason.to_string(),
+    };
+    let url = reqwest::Url::parse(raw).map_err(|e| invalid(&e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("missing host"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            if !loopback {
+                return Err(invalid(
+                    "http is only allowed for loopback hosts (localhost, 127.0.0.1, ::1); use https",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "scheme must be https (or http for a loopback host)",
+            ));
+        }
+    }
+    Ok(format!("{}/v1/messages", raw.trim_end_matches('/')))
+}
+
 /// Response from the LLM.
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
@@ -113,6 +185,7 @@ pub struct LlmResponse {
 /// LLM client for generating model code.
 pub struct LlmClient {
     config: AiConfig,
+    messages_url: String,
     http: reqwest::Client,
 }
 
@@ -122,6 +195,13 @@ impl LlmClient {
         if config.api_key.expose().is_empty() {
             return Err(AiError::NoApiKey);
         }
+        if !SUPPORTED_PROVIDERS.contains(&config.provider.as_str()) {
+            return Err(AiError::UnsupportedProvider {
+                provider: config.provider.clone(),
+                supported: SUPPORTED_PROVIDERS.join(", "),
+            });
+        }
+        let messages_url = messages_url(config.base_url.as_deref())?;
         // Match the per-adapter timeout pair used elsewhere in the
         // engine (Databricks/Snowflake/BigQuery/Trino/Fivetran/Airbyte).
         // Without these, a stalled Anthropic connection would pin
@@ -131,7 +211,11 @@ impl LlmClient {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("reqwest client builder is infallible with these options");
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            messages_url,
+            http,
+        })
     }
 
     /// `max_tokens` configured for this client. Used as the per-request cap
@@ -183,7 +267,7 @@ impl LlmClient {
 
         let response = self
             .http
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&self.messages_url)
             .header("x-api-key", self.config.api_key.expose())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -250,6 +334,7 @@ mod tests {
             default_format: "rocky".to_string(),
             max_attempts: 3,
             max_tokens: DEFAULT_MAX_TOKENS,
+            base_url: None,
         };
         assert!(LlmClient::new(config).is_err());
     }
@@ -266,6 +351,7 @@ mod tests {
             default_format: "rocky".to_string(),
             max_attempts: 3,
             max_tokens: DEFAULT_MAX_TOKENS,
+            base_url: None,
         };
         let dbg = format!("{config:?}");
         assert!(

@@ -24,6 +24,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

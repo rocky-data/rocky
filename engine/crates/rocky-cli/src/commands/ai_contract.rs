@@ -40,10 +40,13 @@ const DOMAIN_FETCH_LIMIT: u64 = LOW_CARDINALITY_CAP;
 /// have accepted.
 fn make_client(config_path: &Path) -> Result<LlmClient> {
     // Config first, API key second — same reasoning as `commands::ai`.
-    let max_tokens = rocky_core::config::load_optional_project_config(Some(config_path))
+    let ai_section = rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
-        .map(|cfg| cfg.ai.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+        .map(|cfg| cfg.ai);
+    let max_tokens = ai_section
+        .as_ref()
+        .map_or(DEFAULT_MAX_TOKENS, |ai| ai.max_tokens);
+    let base_url = rocky_ai::client::resolve_base_url(ai_section.and_then(|ai| ai.base_url));
 
     let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
         .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai-contract`.")?;
@@ -55,6 +58,7 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
         default_format: "rocky".to_string(),
         max_attempts: 3,
         max_tokens,
+        base_url,
     };
 
     LlmClient::new(config).map_err(|e| anyhow::anyhow!("{e}"))

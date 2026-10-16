@@ -231,7 +231,7 @@ pub fn ensure_rocky_gitignore(rocky_dir: &Path) {
     if gitignore.exists() {
         return;
     }
-    let _ = std::fs::create_dir_all(rocky_dir);
+    let _ = create_private_dir_all(rocky_dir);
     let _ = std::fs::write(
         &gitignore,
         "# Rocky local state (plans, traces) — not for version control.\n*\n",
@@ -280,15 +280,42 @@ pub fn ensure_rocky_gitignore_covers(rocky_dir: &Path, file_name: &str) {
     let _ = std::fs::write(&gitignore, appended);
 }
 
+/// Open a NEW trace file at `path`, creating missing parent directories.
+///
+/// Trace lines can carry SQL, table names and error text, so on unix the file
+/// is owner-only (`0600`) and the directories this creates are `0700`.
+/// Directories that already exist keep their mode. The open uses `O_EXCL`
+/// (`create_new`): a file or symlink already at the per-process name makes the
+/// open fail, so the writer is disabled instead of writing through it.
 fn open_jsonl(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
         // Keep Rocky's `.rocky/` state dir out of the user's git repo.
         if let Some(rocky_dir) = parent.parent() {
             ensure_rocky_gitignore(rocky_dir);
         }
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut options = OpenOptions::new();
+    options.create_new(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// `create_dir_all` that makes each NEW directory owner-only (`0700` on unix).
+/// Existing directories keep their mode.
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +588,52 @@ mod tests {
             Ok(r) => r,
             Err(e) => std::panic::resume_unwind(e),
         }
+    }
+
+    /// A trace file and the directories the writer creates for it are
+    /// owner-only, and a symlink planted at the trace name is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn open_jsonl_is_owner_only_and_refuses_existing_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        let traces_dir = rocky_dir.join("traces");
+        let path = traces_dir.join("t.jsonl");
+        drop(open_jsonl(&path).unwrap());
+        assert_eq!(mode(&path), 0o600, "trace file is owner-only");
+        assert_eq!(mode(&traces_dir), 0o700, "traces dir is owner-only");
+        assert_eq!(mode(&rocky_dir), 0o700, ".rocky dir is owner-only");
+
+        // A second open of the same name fails instead of appending.
+        assert_eq!(
+            open_jsonl(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // A symlink planted at the name is refused, its target untouched.
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let planted = traces_dir.join("planted.jsonl");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(open_jsonl(&planted).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    /// An existing `.rocky/` keeps the mode its owner gave it.
+    #[cfg(unix)]
+    #[test]
+    fn open_jsonl_leaves_existing_dir_mode_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir(&rocky_dir).unwrap();
+        std::fs::set_permissions(&rocky_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(open_jsonl(&rocky_dir.join("traces").join("t.jsonl")).unwrap());
+        let mode = std::fs::metadata(&rocky_dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
     }
 
     /// Lazy MakeWriter only creates the file once an actual write fires.

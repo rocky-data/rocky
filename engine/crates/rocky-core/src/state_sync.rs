@@ -1752,11 +1752,11 @@ impl LedgerSeamSession {
     /// recreates the file). Failures are logged, never masked — the
     /// caller's original error is what propagates.
     async fn restore_remote_winner(&self, context: &str) {
-        let quarantine = self
-            .state_path
-            .with_extension(format!("redb.unpublished-{}", std::process::id()));
-        let quarantined = match std::fs::rename(&self.state_path, &quarantine) {
-            Ok(()) => true,
+        // Rename onto an unpredictable, owner-only name reserved with `O_EXCL`
+        // beside the state file. A name planted in advance cannot redirect or
+        // clobber the quarantined copy.
+        let quarantine = match quarantine_aside(&self.state_path) {
+            Ok(path) => Some(path),
             Err(rename_error) => {
                 warn!(
                     rename_error = %rename_error,
@@ -1765,12 +1765,14 @@ impl LedgerSeamSession {
                      restoring the winner; a concurrent reader may observe \
                      uncommitted rows until the re-download completes"
                 );
-                false
+                None
             }
         };
         match download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await {
             Ok(_) => {
-                if quarantined && let Err(remove_error) = std::fs::remove_file(&quarantine) {
+                if let Some(quarantine) = &quarantine
+                    && let Err(remove_error) = std::fs::remove_file(quarantine)
+                {
                     warn!(
                         remove_error = %remove_error,
                         quarantine = %quarantine.display(),
@@ -1783,8 +1785,11 @@ impl LedgerSeamSession {
                 warn!(
                     error = %error,
                     context,
-                    quarantined_to = %quarantine.display(),
-                    quarantined,
+                    quarantined_to = %quarantine
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    quarantined = quarantine.is_some(),
                     "failed to restore the remote ledger winner after a terminal \
                      ledger-seam failure; the uncommitted local file stays \
                      quarantined aside (fail-closed: readers see absence, not \
@@ -1793,6 +1798,29 @@ impl LedgerSeamSession {
             }
         }
     }
+}
+
+/// Move the state file at `state_path` aside to a new quarantine path and
+/// return that path.
+///
+/// The quarantine name is `<state file name>.unpublished-<random>`, reserved
+/// first as an empty owner-only file with `O_EXCL`; the `rename` then replaces
+/// that reservation. On a failed rename the reservation is removed.
+fn quarantine_aside(state_path: &Path) -> std::io::Result<PathBuf> {
+    let dir = sibling_scratch_dir(state_path);
+    let prefix = format!(
+        "{}.unpublished-",
+        state_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "state.redb".to_string())
+    );
+    let quarantine = crate::private_fs::create_private_temp_in(&dir, &prefix, "")?;
+    if let Err(e) = std::fs::rename(state_path, &quarantine) {
+        let _ = std::fs::remove_file(&quarantine);
+        return Err(e);
+    }
+    Ok(quarantine)
 }
 
 fn ledger_seam_conflict_backoff(attempt: u32) -> Duration {
@@ -2021,7 +2049,13 @@ impl RemoteStateSession {
             return Ok(true);
         }
 
-        let scratch = ScratchGuard::new();
+        let scratch = match ScratchGuard::new("snapshot") {
+            Ok(scratch) => scratch,
+            Err(err) => {
+                apply_upload_failure_policy(&cfg, Err(err.into()))?;
+                return Ok(false);
+            }
+        };
         let excluded = crate::state::local_only_table_names(self.replicate_schema_cache);
         if let Err(err) = store.snapshot_to_excluding(scratch.path(), excluded) {
             apply_upload_failure_policy(&cfg, Err(err.into()))?;
@@ -2137,7 +2171,13 @@ impl RemoteStateSession {
                 // export is fsync-bearing). Cooperative shutdown lets this
                 // `.await` finish rather than being cancelled, so the scratch
                 // guard's cleanup and the `Arc` release both happen in-task.
-                let scratch = ScratchGuard::new();
+                let scratch = match ScratchGuard::new("snapshot") {
+                    Ok(scratch) => scratch,
+                    Err(e) => {
+                        warn!(error = %e, "periodic state snapshot scratch dir failed");
+                        continue;
+                    }
+                };
                 let scratch_path = scratch.path().to_path_buf();
                 let snapshot = tokio::task::spawn_blocking(move || {
                     store.snapshot_to_excluding(&scratch_path, local_only)
@@ -2792,7 +2832,7 @@ async fn download_state_impl(
     // 1. Download the remote into a STAGING file (no lock). `local_path` is left
     //    untouched; `Absent` leaves the staging file unwritten.
     let scratch_dir = sibling_scratch_dir(local_path);
-    let staged = unique_scratch_path(&scratch_dir, "download");
+    let staged = unique_scratch_path(&scratch_dir, "download")?;
     let outcome = match download_state_inner(config, &staged, &remote_key, gen_sink.take()).await {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -2917,22 +2957,25 @@ fn sibling_scratch_dir(local_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// A process-unique scratch path in `dir` (PID + nanos + a monotonic sequence,
-/// so two scratch files taken in the same nanosecond never collide).
-fn unique_scratch_path(dir: &Path, tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(
-        ".rocky-state-{tag}-{}-{}-{}.redb",
-        std::process::id(),
-        nanos,
-        seq
-    ))
+/// Write downloaded state `bytes` to `dest`, truncating it. A file this
+/// creates is owner-only (`0600` on unix); an existing file keeps its mode.
+async fn write_state_bytes(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut options = crate::private_fs::private_file_options();
+    options.write(true).create(true).truncate(true);
+    let mut file = tokio::fs::OpenOptions::from(options).open(dest).await?;
+    file.write_all(bytes).await?;
+    file.flush().await
+}
+
+/// Reserve a new, empty, owner-only scratch file in `dir` and return its path.
+///
+/// The name is `.rocky-state-{tag}-<random>.redb`, created with `O_EXCL`, so
+/// no two callers share a name and a name planted in advance (a symlink or a
+/// pre-created file) is never written through. The caller removes the file.
+/// redb treats the empty file as a new database, and a download overwrites it.
+fn unique_scratch_path(dir: &Path, tag: &str) -> std::io::Result<PathBuf> {
+    crate::private_fs::create_private_temp_in(dir, &format!(".rocky-state-{tag}-"), ".redb")
 }
 
 /// Bounded async retry for a synchronous redb file operation. Retries a small,
@@ -3557,7 +3600,7 @@ async fn read_coherent_cache(
         invalidate_coherent_cache(config, remote_key).await;
         return Ok(false);
     }
-    tokio::fs::write(dest_path, blob).await?;
+    write_state_bytes(dest_path, blob).await?;
     info!(
         size = blob.len(),
         outcome = "ok",
@@ -3752,7 +3795,7 @@ pub async fn upload_state_with_excluded_tables(
 
     // Filter path: copy, strip, upload the copy.
     let scratch = match strip_local_only_tables(local_path, excluded_tables) {
-        Ok(path) => path,
+        Ok(scratch) => scratch,
         Err(e) => {
             warn!(
                 error = %e,
@@ -3770,11 +3813,10 @@ pub async fn upload_state_with_excluded_tables(
             return apply_upload_failure_policy(config, Err(e));
         }
     };
-    let result = dispatch_upload(config, &scratch, &remote_key).await;
-    // Scratch files live under `std::env::temp_dir()`; best-effort cleanup
-    // on success or failure. A leaked scratch DB on this run is a small
-    // cost the OS cleans up at reboot.
-    let _ = std::fs::remove_file(&scratch);
+    let result = dispatch_upload(config, scratch.path(), &remote_key).await;
+    // Dropping the guard removes the private scratch directory and the copy,
+    // on success or failure.
+    drop(scratch);
     apply_upload_failure_policy(config, result)
 }
 
@@ -3803,25 +3845,30 @@ pub async fn upload_state_snapshot(
 
 /// A temp snapshot path removed on drop, so an aborted-mid-tick periodic upload
 /// leaks neither a scratch snapshot file nor a late upload.
+///
+/// The file lives in its own new directory under the system temp dir. The
+/// directory has an unpredictable name and is owner-only (`0700` on unix), so
+/// on a shared `/tmp` no other user can read the snapshot or plant a symlink
+/// at its name. Dropping the guard removes the directory and its contents.
 struct ScratchGuard {
+    /// Held for its `Drop`, which removes the directory and the file in it.
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl ScratchGuard {
-    /// Reserve a unique scratch path under the system temp dir. The file itself
-    /// is created by [`StateStore::snapshot_to_excluding`]; this owns its name
-    /// and its cleanup.
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rocky-state-snapshot-{}-{}.redb",
-            std::process::id(),
-            nanos
-        ));
-        Self { path }
+    /// Reserve a scratch path inside a new private temp directory. The file
+    /// itself is created by the caller (a snapshot export or a filtered copy);
+    /// this owns its name and its cleanup.
+    fn new(kind: &str) -> std::io::Result<Self> {
+        // The pid stays in the prefix only so a test can find this process's
+        // leftovers; the random suffix is what makes the name unguessable.
+        let dir = crate::private_fs::private_temp_dir(&format!(
+            "rocky-state-{kind}-{}-",
+            std::process::id()
+        ))?;
+        let path = dir.path().join("state.redb");
+        Ok(Self { _dir: dir, path })
     }
 
     fn path(&self) -> &Path {
@@ -3829,16 +3876,11 @@ impl ScratchGuard {
     }
 }
 
-impl Drop for ScratchGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Build a temp redb copy of `local_path` with `excluded_tables` removed.
 ///
-/// Returns the path of the temp copy. Caller is responsible for deleting
-/// it. Used by the replicate-filtered upload path. Kept small and
+/// Returns a guard over the temp copy; dropping it deletes the copy. The
+/// copy is created owner-only inside a new private temp directory (see
+/// [`ScratchGuard`]), never with the source file's mode. Used by the replicate-filtered upload path. Kept small and
 /// synchronous — the schema cache is the only local-only table today,
 /// its footprint is bounded by TTL, and the round-trip file copy is
 /// proportional to total state size (order of single-digit megabytes for
@@ -3846,30 +3888,25 @@ impl Drop for ScratchGuard {
 fn strip_local_only_tables(
     local_path: &Path,
     excluded_tables: &[&str],
-) -> Result<PathBuf, StateSyncError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // A process-unique sequence disambiguates two uploads that observe the same
-    // `nanos` on a coarse clock — the scratch file is read back and uploaded, so
-    // a collision would publish another upload's bytes. The name carries no
-    // contract; it is removed after the upload.
-    static SCRATCH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SCRATCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = std::env::temp_dir().join(format!(
-        "rocky-state-upload-{}-{}-{}.redb",
-        std::process::id(),
-        nanos,
-        sequence
-    ));
-    std::fs::copy(local_path, &scratch)?;
+) -> Result<ScratchGuard, StateSyncError> {
+    let guard = ScratchGuard::new("upload")?;
+    let scratch = guard.path();
+    // Not `std::fs::copy`: it gives the copy the source file's mode. The copy
+    // is created new and owner-only, then filled from the source.
+    {
+        let mut src = std::fs::File::open(local_path)?;
+        let mut dst = crate::private_fs::private_file_options()
+            .write(true)
+            .create_new(true)
+            .open(scratch)?;
+        std::io::copy(&mut src, &mut dst)?;
+    }
 
     // Open the copy and drop the excluded tables. `delete_table` returns
     // `Ok(false)` when the table doesn't exist, which is the right
     // behaviour: an older copy that never had `schema_cache` just no-ops
     // and uploads cleanly.
-    let db = redb::Database::create(&scratch).map_err(|e| {
+    let db = redb::Database::create(scratch).map_err(|e| {
         StateSyncError::Io(std::io::Error::other(format!(
             "redb open for state filter failed: {e}"
         )))
@@ -3907,7 +3944,7 @@ fn strip_local_only_tables(
     // Drop the db handle so the OS fully releases any mmap before the
     // scratch file is opened by the upload path.
     drop(db);
-    Ok(scratch)
+    Ok(guard)
 }
 
 /// Internal upload dispatch — runs the raw upload (with retry) without
@@ -4067,7 +4104,7 @@ async fn upload_state_cas(
         (local_path.to_path_buf(), None)
     } else {
         match strip_local_only_tables(local_path, excluded) {
-            Ok(p) => (p.clone(), Some(p)),
+            Ok(guard) => (guard.path().to_path_buf(), Some(guard)),
             Err(e) => {
                 warn!(
                     error = %e,
@@ -4081,9 +4118,8 @@ async fn upload_state_cas(
     };
 
     let outcome = dispatch_upload_cas(config, &upload_path, &remote_key, base).await;
-    if let Some(scratch) = scratch {
-        let _ = std::fs::remove_file(&scratch);
-    }
+    // Dropping the guard removes the private scratch directory and the copy.
+    drop(scratch);
     match outcome {
         Ok(PutIfMatchOutcome::Committed(_)) => Ok(()),
         Ok(PutIfMatchOutcome::Conflict) => Err(StateSyncError::CasConflict { key: remote_key }),
@@ -4642,7 +4678,7 @@ async fn download_from_valkey(
         let hit = with_transfer_timeout(timeout, valkey_get_first(config, candidates)).await?;
         match hit {
             Some((version, key, bytes)) => {
-                tokio::fs::write(dest_path, &bytes).await?;
+                write_state_bytes(dest_path, &bytes).await?;
                 if version == current {
                     info!(
                         size = bytes.len(),
@@ -5847,7 +5883,7 @@ mod tests {
 
         // Open the filtered DB and verify: watermark is preserved, schema
         // cache is empty.
-        let filtered_store = StateStore::open(&filtered).unwrap();
+        let filtered_store = StateStore::open(filtered.path()).unwrap();
         assert!(
             filtered_store
                 .get_watermark("cat.sch.tbl")
@@ -5865,7 +5901,7 @@ mod tests {
         let src_store = StateStore::open(&src).unwrap();
         assert_eq!(src_store.list_schema_cache().unwrap().len(), 1);
 
-        let _ = std::fs::remove_file(&filtered);
+        drop(filtered);
     }
 
     #[tokio::test]
@@ -6260,8 +6296,8 @@ mod tests {
             drop(store);
         }
         let stripped = strip_local_only_tables(&seed, LOCAL_ONLY_TABLE_NAMES).unwrap();
-        let bytes = std::fs::read(&stripped).unwrap();
-        let _ = std::fs::remove_file(&stripped);
+        let bytes = std::fs::read(stripped.path()).unwrap();
+        drop(stripped);
         let _ = std::fs::remove_file(&seed);
         bytes
     }
@@ -10645,5 +10681,93 @@ mod environment_publish_tests {
             v31
         );
         test_support::clear();
+    }
+}
+
+/// Scratch, staging and quarantine files are owner-only with unguessable
+/// names (RD-033).
+#[cfg(all(test, unix))]
+mod private_mode_tests {
+    use super::*;
+    use crate::private_fs::mode_of;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn seed_state(path: &Path) {
+        drop(StateStore::open(path).unwrap());
+    }
+
+    #[test]
+    fn the_staging_file_is_owner_only_and_carries_no_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = unique_scratch_path(dir.path(), "download").unwrap();
+        let b = unique_scratch_path(dir.path(), "download").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(mode_of(&a).unwrap(), 0o600);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".rocky-state-download-"), "{name}");
+        assert!(!name.contains(&std::process::id().to_string()), "{name}");
+    }
+
+    #[test]
+    fn the_filtered_upload_copy_is_owner_only_in_a_private_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_state(&src);
+        // A world-readable source must not make a world-readable copy.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let scratch = strip_local_only_tables(&src, crate::state::LOCAL_ONLY_TABLE_NAMES).unwrap();
+        let scratch_dir = scratch.path().parent().unwrap().to_path_buf();
+        assert_eq!(mode_of(scratch.path()).unwrap(), 0o600, "copy");
+        assert_eq!(mode_of(&scratch_dir).unwrap(), 0o700, "scratch dir");
+        drop(scratch);
+        assert!(!scratch_dir.exists(), "dropping the guard removes the dir");
+    }
+
+    #[test]
+    fn the_snapshot_scratch_dir_is_owner_only() {
+        let guard = ScratchGuard::new("snapshot").unwrap();
+        let scratch_dir = guard.path().parent().unwrap().to_path_buf();
+        assert_eq!(mode_of(&scratch_dir).unwrap(), 0o700);
+        drop(guard);
+        assert!(!scratch_dir.exists());
+    }
+
+    #[test]
+    fn the_quarantine_name_is_unguessable_and_not_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        std::fs::write(&state, b"uncommitted").unwrap();
+        // A file planted at the old pid-derived name is left untouched.
+        let planted = state.with_extension(format!("redb.unpublished-{}", std::process::id()));
+        std::fs::write(&planted, b"planted").unwrap();
+
+        let quarantine = quarantine_aside(&state).unwrap();
+        assert_ne!(quarantine, planted);
+        assert!(!state.exists());
+        assert_eq!(std::fs::read(&quarantine).unwrap(), b"uncommitted");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+        let name = quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("state.redb.unpublished-"), "{name}");
+    }
+
+    #[test]
+    fn a_failed_quarantine_leaves_no_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb"); // never created
+        assert!(quarantine_aside(&state).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn downloaded_bytes_create_an_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.redb");
+        write_state_bytes(&fresh, b"bytes").await.unwrap();
+        assert_eq!(mode_of(&fresh).unwrap(), 0o600);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"bytes");
     }
 }

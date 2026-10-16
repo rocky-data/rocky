@@ -2029,3 +2029,42 @@ def test_compile_state_from_result_is_compiled(compile_json: str):
     assert state.compiled is True
     assert state.has_errors is True
     assert len(state.diagnostics) == 2
+
+
+# RD-023: a failed discover must not clobber the last-known-good state file.
+
+
+def test_write_state_discover_failure_keeps_existing_state(monkeypatch, tmp_path: Path, caplog):
+    stub = _StubResource(discover_result=RuntimeError("discover down"))
+    _install_stub_resource(monkeypatch, stub)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+    good = json.dumps({"discover": {"command": "discover", "sources": [{"id": "keep"}]}})
+    state_path.write_text(good)
+
+    with caplog.at_level("WARNING"):
+        component.write_state_to_path(state_path)
+
+    assert state_path.read_text() == good
+    assert any("keeping the existing state" in r.message for r in caplog.records)
+
+
+def test_write_state_discover_failure_without_prior_state_writes_empty_envelope(
+    monkeypatch, tmp_path: Path
+):
+    stub = _StubResource(discover_result=RuntimeError("discover down"))
+    _install_stub_resource(monkeypatch, stub)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_existing_models_dir(tmp_path),
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)
+
+    assert json.loads(state_path.read_text())["discover"]["sources"] == []

@@ -133,6 +133,13 @@ def test_build_cmd_includes_global_flags():
     ]
 
 
+def test_build_cmd_omits_state_path_by_default():
+    """No ``state_path`` configured: the engine resolves the state location."""
+    rocky = RockyResource(config_path="rocky.toml")
+    cmd = rocky._build_cmd(["discover"])
+    assert "--state-path" not in cmd
+
+
 def test_build_cmd_state_namespace_replaces_state_path():
     """``state_namespace`` sends ``--state-namespace`` and omits ``--state-path``.
 

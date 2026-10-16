@@ -989,12 +989,13 @@ pub(crate) fn run_approval_gate(
 ///
 /// - `Ok(Some(findings))` — the gate ran; the caller filters on
 ///   [`BreakingFinding::is_breaking`];
-/// - `Ok(None)` — the gate was SKIPPED (no models directory, or either side
-///   failed to compile), with a `BreakingChangesGateSkipped` audit event
-///   carrying the reason. The caller lets the promote proceed;
-/// - `Err(_)` — the gate could not read the project at all (#1702). That is
-///   NOT a skip: skipping would let the promote through past a gate that
-///   examined nothing.
+/// - `Ok(None)` — the gate was SKIPPED (no models directory, no models at
+///   the base ref, or git could not read the base ref), with a
+///   `BreakingChangesGateSkipped` audit event carrying the reason. The
+///   caller lets the promote proceed;
+/// - `Err(_)` — the gate could not read the project (#1702), or HEAD or the
+///   base ref does not compile. That is NOT a skip: skipping would let the
+///   promote through past a gate that examined nothing.
 pub(crate) fn run_breaking_change_gate_for_plan(
     config_path: &Path,
     models_dir: &Path,
@@ -2225,9 +2226,13 @@ fn breaking_block_output(
 /// - `Some(findings)` when both refs compiled cleanly and the typed-IR diff
 ///   ran. `findings` is the full classified list, including `Info`-severity
 ///   entries — the caller filters on [`BreakingFinding::is_breaking`].
-/// - `None` when the gate was skipped because either side failed to compile
-///   or the models directory was unavailable. A `BreakingChangesGateSkipped`
-///   audit event is appended to `audit` carrying the human-readable reason.
+/// - `None` when the gate was skipped: the models directory is missing or
+///   empty, the base ref has no models, or git could not read the base ref.
+///   A `BreakingChangesGateSkipped` audit event is appended to `audit`
+///   carrying the human-readable reason.
+/// - `Err` when the gate cannot run and must refuse: the config is present
+///   and unreadable (#1702), HEAD does not compile, or the base ref's models
+///   do not compile. No audit event is recorded for a refusal.
 fn evaluate_breaking_change_gate(
     config_path: &Path,
     models_dir: &Path,
@@ -2303,11 +2308,27 @@ fn evaluate_breaking_change_gate(
             source_schemas: source_schemas.clone(),
             ..Default::default()
         };
+        // A HEAD that does not compile REFUSES the promote. The gate cannot
+        // diff a project it cannot compile, and a skip lets the promote
+        // through (the caller reads `None` as "proceed"). Same rule as the
+        // unreadable config above: a gate that examined nothing has not
+        // passed.
         match compile::compile(&config) {
             Ok(r) => r,
-            Err(e) => {
-                push_skip(audit, format!("HEAD compile failed — gate skipped: {e}"));
+            // An empty models directory is the missing-directory case: there
+            // is nothing at HEAD to compare, so it skips.
+            Err(e) if is_no_models(&e) => {
+                push_skip(audit, format!("{e} — gate skipped"));
                 return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot evaluate the breaking-change gate: the models in {} do not \
+                     compile: {e}. A promote past a gate that could not compile HEAD would \
+                     let a breaking change through unexamined. Fix the compile error, then \
+                     re-run the promote",
+                    models_dir.display()
+                ));
             }
         }
     };
@@ -2315,15 +2336,76 @@ fn evaluate_breaking_change_gate(
     let base_compile =
         match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
             Ok(r) => r,
-            Err(reason) => {
-                push_skip(audit, format!("{reason} — gate skipped"));
-                return Ok(None);
-            }
+            Err(reason) => match classify_base_compile_failure(&reason) {
+                // The base models exist and do not compile. That is the same
+                // "examined nothing" case as a HEAD compile failure, so it
+                // refuses too. `--base-ref` can name a ref that compiles.
+                BaseCompileFailure::DidNotCompile => {
+                    return Err(anyhow::anyhow!(
+                        "cannot evaluate the breaking-change gate: {reason}. A promote past a \
+                         gate that could not compile the base would let a breaking change \
+                         through unexamined. Fix the models at '{base_ref}', or pass a \
+                         `--base-ref` that compiles, then re-run the promote"
+                    ));
+                }
+                // No models at the base ref, or the ref could not be read
+                // from git. These still skip, with an audit event naming the
+                // reason.
+                BaseCompileFailure::NoModelsAtBase | BaseCompileFailure::Unavailable => {
+                    push_skip(audit, format!("{reason} — gate skipped"));
+                    return Ok(None);
+                }
+            },
         };
 
     let base_ir = compile_result_to_project_ir(&base_compile);
     let head_ir = compile_result_to_project_ir(&head_compile);
     Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
+}
+
+/// Why the base-ref compile in [`super::ci_diff::extract_base_compile`]
+/// failed. The breaking-change gates (branch promote and `rocky review`)
+/// refuse on [`Self::DidNotCompile`] and skip on the other two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaseCompileFailure {
+    /// The models at the base ref were read and do not compile.
+    DidNotCompile,
+    /// The base ref exists in git and holds no model files under the models
+    /// directory, for example before the first model was committed.
+    NoModelsAtBase,
+    /// Git could not read the base ref, or the models directory could not be
+    /// placed in the repository.
+    Unavailable,
+}
+
+/// Classify the error string from [`super::ci_diff::extract_base_compile`].
+///
+/// That function reports failures as a `String`, so this matches its
+/// message prefixes. The tests `gate_refuses_when_base_ref_does_not_compile`
+/// and `gate_fails_open_when_base_ref_missing_models` pin both messages: a
+/// reworded message there fails them instead of silently reopening the gate.
+pub(crate) fn classify_base_compile_failure(reason: &str) -> BaseCompileFailure {
+    if reason.starts_with("no model files found at base ref '")
+        || (reason.starts_with("base ref '")
+            && reason.contains("' did not compile: no models found"))
+    {
+        BaseCompileFailure::NoModelsAtBase
+    } else if reason.starts_with("base ref '") && reason.contains("' did not compile: ") {
+        BaseCompileFailure::DidNotCompile
+    } else {
+        BaseCompileFailure::Unavailable
+    }
+}
+
+/// Whether a HEAD compile failed only because the models directory (or its
+/// glob) holds no models. That is "nothing to compare", not a compile error.
+pub(crate) fn is_no_models(error: &rocky_compiler::compile::CompileError) -> bool {
+    matches!(
+        error,
+        rocky_compiler::compile::CompileError::Project(
+            rocky_compiler::project::ProjectError::NoModels { .. }
+        )
+    )
 }
 
 /// Project a [`rocky_compiler::compile::CompileResult`] into a
@@ -4076,6 +4158,116 @@ mod tests {
         );
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+    }
+
+    /// Run the gate from inside `dir`, holding the caller's cwd lock.
+    fn run_gate_in(
+        dir: &Path,
+        models_dir: &Path,
+        audit: &mut Vec<AuditEvent>,
+    ) -> anyhow::Result<Option<Vec<BreakingFinding>>> {
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = evaluate_breaking_change_gate(
+            &dir.join("rocky.toml"),
+            models_dir,
+            "main",
+            audit,
+            &dummy_actor(),
+            &sample_record("fix_price"),
+            "branch-state-hash",
+        );
+        std::env::set_current_dir(saved_cwd).unwrap();
+        result
+    }
+
+    /// A HEAD that does not compile REFUSES the promote. Before this, the
+    /// gate recorded `BreakingChangesGateSkipped` and returned `None`, and
+    /// the caller let the promote proceed past a gate that diffed nothing.
+    #[test]
+    fn gate_refuses_when_head_does_not_compile() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+        write_two_model_chain(&models_dir, "id, name, qty");
+        let commit = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        commit(&["add", "."]);
+        commit(&["commit", "-q", "-m", "base models"]);
+
+        // Break HEAD only: an unparseable sidecar fails the project load.
+        std::fs::write(models_dir.join("widgets.toml"), "[strategy\n").unwrap();
+
+        let mut audit = Vec::new();
+        let err = run_gate_in(dir, &models_dir, &mut audit)
+            .expect_err("a HEAD compile failure must refuse the promote, not skip the gate");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("do not compile"), "names the cause: {msg}");
+        assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
+    }
+
+    /// A base ref whose models do not compile REFUSES the promote too.
+    /// This also pins the `ci_diff` message that
+    /// [`classify_base_compile_failure`] matches.
+    #[test]
+    fn gate_refuses_when_base_ref_does_not_compile() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        // Commit a broken sidecar at `main`, then fix it in the working tree.
+        let models_dir = init_git_repo_with_models(
+            dir,
+            rocky_toml,
+            &[
+                ("widgets.sql", "SELECT 1 AS id"),
+                ("widgets.toml", "[strategy\n"),
+            ],
+        );
+        std::fs::remove_file(models_dir.join("widgets.toml")).unwrap();
+        write_two_model_chain(&models_dir, "id, name, qty");
+
+        let mut audit = Vec::new();
+        let err = run_gate_in(dir, &models_dir, &mut audit)
+            .expect_err("a base compile failure must refuse the promote, not skip the gate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base ref 'main' did not compile"),
+            "names the cause: {msg}"
+        );
+        assert!(audit.is_empty(), "a refusal records no skip: {audit:?}");
+    }
+
+    #[test]
+    fn classify_base_compile_failure_matches_each_ci_diff_message() {
+        assert_eq!(
+            classify_base_compile_failure("base ref 'main' did not compile: boom"),
+            BaseCompileFailure::DidNotCompile
+        );
+        assert_eq!(
+            classify_base_compile_failure("no model files found at base ref 'main'"),
+            BaseCompileFailure::NoModelsAtBase
+        );
+        assert_eq!(
+            classify_base_compile_failure(
+                "base ref 'main' did not compile: no models found in /tmp/x"
+            ),
+            BaseCompileFailure::NoModelsAtBase
+        );
+        assert_eq!(
+            classify_base_compile_failure(
+                "git ls-tree failed for base ref 'nope' — models directory missing at that ref?"
+            ),
+            BaseCompileFailure::Unavailable
+        );
     }
 
     /// The `BreakingChangesAllowed` audit event carries the findings — the

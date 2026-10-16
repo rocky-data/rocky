@@ -3356,6 +3356,7 @@ impl RockyMcpServer {
             default_format: "toml".to_string(),
             max_attempts: 1,
             max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+            base_url: None,
         };
         let client = rocky_ai::client::LlmClient::new(ai_config)
             .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
@@ -3623,6 +3624,7 @@ impl RockyMcpServer {
             default_format: "rocky".to_string(),
             max_attempts: 3,
             max_tokens,
+            base_url: None,
         };
         rocky_ai::client::LlmClient::new(ai_config)
             .map(Some)

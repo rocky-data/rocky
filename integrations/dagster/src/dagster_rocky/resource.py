@@ -498,7 +498,8 @@ class RockyResource(dg.ConfigurableResource):
     Args:
         binary_path: Path to the ``rocky`` binary. Defaults to ``"rocky"`` (on PATH).
         config_path: Path to the ``rocky.toml`` config file.
-        state_path: Path to the state store file.
+        state_path: Optional path to the state store file. ``None`` (default)
+            omits ``--state-path`` so the engine resolves the location.
         models_dir: Directory containing model files for model-aware commands,
             including compile, lineage, test, CI, AI, and compliance.
         contracts_dir: Optional directory containing contract files.
@@ -519,7 +520,7 @@ class RockyResource(dg.ConfigurableResource):
 
     binary_path: str = "rocky"
     config_path: str = "rocky.toml"
-    state_path: str = ".rocky-state.redb"
+    state_path: str | None = None
     #: Optional per-namespace state file (engine ``--state-namespace``). When set
     #: to a SQL identifier, this resource's commands route to a per-namespace
     #: redb file so independent fan-out runs don't serialize on a single writer
