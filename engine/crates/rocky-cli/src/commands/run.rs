@@ -32716,6 +32716,88 @@ row_count = true
         );
     }
 
+    /// #2376 with #1606: a cancel after a held-back copy still stores the
+    /// cutoff on each copied table's checkpoint row, and the resume checks
+    /// `row_count` against it. It neither fails on the held-back rows nor
+    /// copies a row twice.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_after_a_held_back_copy_keeps_the_cutoff_for_the_resume() {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_hold_back_project(dir.path()).await;
+        let state_path = dir.path().join("state.redb");
+        super::INTERRUPT_AFTER_COPY_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert("cancelled-2376".to_string());
+        let error = checkpoint_ordering_run(&config, &state_path, "cancelled-2376", false)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::Interrupted>(), "{error:#}");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let progress = store.get_run_progress("cancelled-2376").unwrap().unwrap();
+            for key in ["warehouse.staging__acme.t00", "warehouse.staging__acme.t01"] {
+                let row = progress
+                    .tables
+                    .iter()
+                    .find(|t| t.table_key == key)
+                    .unwrap_or_else(|| panic!("{key} has no checkpoint row"));
+                assert_eq!(row.status, rocky_core::state::TableStatus::Success);
+                assert_eq!(
+                    row.held_max,
+                    Some(Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 0).unwrap()),
+                    "{key}: the cancel keeps the cutoff"
+                );
+            }
+        }
+
+        {
+            // A resume refuses a run that copied every table, so leave `t01`
+            // unfinished. `t00` keeps its stored cutoff.
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_table_progress(
+                    "cancelled-2376",
+                    &table_entry(
+                        1,
+                        "warehouse.staging__acme.t01",
+                        rocky_core::state::TableStatus::Failed,
+                    ),
+                )
+                .unwrap();
+        }
+
+        drive_resume_test_run(&config, &state_path, "rep", None, true)
+            .await
+            .expect("the resume's row_count passes under the stored cutoff");
+        let record = latest_record(&state_path);
+        assert_ne!(record.run_id, "cancelled-2376");
+        assert_eq!(
+            row_count_outcomes(&record),
+            [true, true],
+            "{:?}",
+            record.check_outcomes
+        );
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(
+            &dir.path().join("warehouse.duckdb"),
+        )
+        .unwrap();
+        for table in ["t00", "t01"] {
+            assert_eq!(
+                warehouse
+                    .execute_query(&format!("SELECT COUNT(*) FROM staging__acme.{table}"))
+                    .await
+                    .unwrap()
+                    .rows[0][0],
+                serde_json::json!("1"),
+                "{table}: the resume copies no row twice"
+            );
+        }
+    }
+
     /// #2376 with #2235: a resumed table whose checkpoint row has no cutoff
     /// (the run pruned it as unchanged, so it never read the source MAX)
     /// reads the source MAX now. A pruned source is unchanged since the
