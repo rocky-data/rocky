@@ -16,8 +16,16 @@ use rocky_core::traits::{NullTimestamps, SqlDialect};
 use rocky_duckdb::DuckDbConnector;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 
-/// The column types a replication timestamp column can have on DuckDB.
-const COLUMN_TYPES: &[&str] = &["TIMESTAMP_NS", "TIMESTAMP", "TIMESTAMPTZ"];
+/// The timestamp column types on DuckDB. The coarse ones (`_MS`, `_S`) are
+/// here because a cast to them rounds: the bounds must still hold when the
+/// literal comes from the column's own maximum.
+const COLUMN_TYPES: &[&str] = &[
+    "TIMESTAMP_NS",
+    "TIMESTAMP",
+    "TIMESTAMPTZ",
+    "TIMESTAMP_MS",
+    "TIMESTAMP_S",
+];
 
 /// `UTC`, and a zone west of UTC where a bare literal skipped rows (#2395).
 const ZONES: &[&str] = &["UTC", "America/New_York"];
@@ -49,6 +57,18 @@ fn setup(column_type: &str, zone: &str) -> DuckDbConnector {
     let conn = DuckDbConnector::in_memory().unwrap();
     conn.execute_statement(&format!("SET TimeZone = '{zone}'"))
         .unwrap();
+    // `TimeZone` acts only with the ICU extension loaded. Without it the
+    // New York cases would pass at UTC and prove nothing, so check the zone
+    // took effect: 10:00 UTC is 05:00 in New York in March (EST).
+    let hour = conn
+        .execute_sql("SELECT strftime(TIMESTAMPTZ '2026-03-02 10:00:00+00:00', '%H')")
+        .unwrap();
+    let expected_hour = if zone == "UTC" { "10" } else { "05" };
+    assert_eq!(
+        hour.rows[0][0].as_str(),
+        Some(expected_hour),
+        "session zone {zone} did not take effect; is the ICU extension loaded?"
+    );
     conn.execute_statement(&format!("CREATE TABLE t (ts {column_type})"))
         .unwrap();
     // A naive column stores the UTC wall clock; a zone column stores the
@@ -80,17 +100,18 @@ fn both_bounds_compare_at_the_column_precision_in_every_session_zone() {
                 DateTime::parse_from_rfc3339(&format!("{}Z", NEWEST.replace(' ', "T")))
                     .unwrap()
                     .with_timezone(&Utc);
-            // The read side keeps the column's precision (#2004): nine digits
-            // on a nanosecond column, six on a microsecond one.
-            if *column_type == "TIMESTAMP_NS" {
-                assert_eq!(max, expected_max, "{case}: MAX read back");
-            } else {
-                assert_eq!(
-                    max,
-                    expected_max - chrono::Duration::nanoseconds(789),
-                    "{case}: MAX read back"
-                );
-            }
+            // The read side keeps the column's precision (#2004).
+            let dropped_nanos = match *column_type {
+                "TIMESTAMP_NS" => 0,
+                "TIMESTAMP_MS" => 456_789,
+                "TIMESTAMP_S" => 123_456_789,
+                _ => 789,
+            };
+            assert_eq!(
+                max,
+                expected_max - chrono::Duration::nanoseconds(dropped_nanos),
+                "{case}: MAX read back"
+            );
 
             let after_max = d.watermark_where("ts", Some(&max)).unwrap();
             let after_max = after_max.strip_prefix("WHERE ").unwrap();

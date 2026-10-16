@@ -32532,6 +32532,18 @@ backend = "local"
         ] {
             adapter.execute_statement(sql).await.unwrap();
         }
+        // `TimeZone` acts only with the ICU extension loaded. Without it this
+        // test would run at UTC and prove nothing, so check the zone took
+        // effect: 10:00 UTC is 05:00 in New York in March (EST).
+        let hour = adapter
+            .execute_query("SELECT strftime(TIMESTAMPTZ '2026-03-02 10:00:00+00:00', '%H')")
+            .await
+            .unwrap();
+        assert_eq!(
+            hour.rows[0][0].as_str(),
+            Some("05"),
+            "the session zone did not take effect; is the ICU extension loaded?"
+        );
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
         let t1 = chrono::DateTime::parse_from_rfc3339("2026-03-02T09:00:00Z")
