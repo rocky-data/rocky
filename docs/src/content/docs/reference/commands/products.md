@@ -98,6 +98,8 @@ A crash between step 1 and step 2 leaves only an orphan snapshot file — harmle
 
 The approver identity is the same best-effort git identity the review marker records. It is an attribution, not an authentication.
 
+The command reads the channel from `ROCKY_SESSION_SOURCE`, as `rocky review --approve` does. In a terminal, `approver` is the bare email. In a job that `rocky serve` started (the browser UI, or `POST /api/v1/jobs/product_approve`), `ROCKY_SESSION_SOURCE=http_api` is set and `approver` is `<email> (http_api)`. That job refuses with `approver_identity_unresolved`, and writes nothing, when the git identity cannot be read or is literally `unknown`. The label names the channel, not the person.
+
 ### JSON output
 
 `ProductApproveOutput`: `spec_digest`, `approver`, `approved_at`, `snapshot_path`, `previous_state`, and `already_approved`.

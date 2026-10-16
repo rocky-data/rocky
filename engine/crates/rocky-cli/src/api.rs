@@ -33,6 +33,7 @@
 //! POST /api/v1/jobs/preview                     → submit a preview create → 202 {job_id}
 //! POST /api/v1/jobs/promote                     → plan a branch promote (= rocky plan promote) → 202 {job_id}
 //! GET  /api/v1/branches                         → the branch list (= rocky branch list)
+//! POST /api/v1/jobs/product_approve             → approve a product spec (= rocky product approve) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -204,6 +205,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/unfreeze", post(submit_unfreeze))
         .route("/api/v1/jobs/preview", post(submit_preview))
         .route("/api/v1/jobs/promote", post(submit_promote))
+        .route("/api/v1/jobs/product_approve", post(submit_product_approve))
         .route("/api/v1/branches", get(list_branches))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -633,7 +635,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply, approve, freeze, unfreeze or preview job is already in progress on this project",
+            "another run, apply, approve, freeze, unfreeze, preview or product approval job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -979,6 +981,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/unfreeze",
         "POST /api/v1/jobs/preview",
         "POST /api/v1/jobs/promote",
+        "POST /api/v1/jobs/product_approve",
         "GET /api/v1/branches",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
@@ -2823,8 +2826,9 @@ pub(crate) struct JobRequest {
     reason: Option<String>,
     /// `--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`,
     /// 1 to 64 characters. Absent means a name derived from the project's git
-    /// branch. For `promote`: the branch to promote (required). Ignored by
-    /// every other kind.
+    /// branch. For `promote`: the branch to promote (required). For
+    /// `product_approve`: the product to approve (required). Ignored by every
+    /// other kind.
     name: Option<String>,
     /// `--base <git ref>` for `preview` and `promote`: the ref the change set
     /// is computed against. Absent means `main`. Ignored by every other kind.
@@ -3336,6 +3340,21 @@ async fn submit_promote(
     submit_job(JobKind::Promote, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/product_approve` — approve a product's working spec:
+/// `rocky product approve <name>` (mutating; takes the permit). Body
+/// `{"name": "<product>"}`; `name` is required. The child runs with
+/// `ROCKY_SESSION_SOURCE=http_api`, so the approval records
+/// `"<server git email> (http_api)"` and the child refuses
+/// (`approver_identity_unresolved`) when that identity cannot be read. The
+/// approval covers the spec as it is on disk when the job runs.
+async fn submit_product_approve(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::ProductApprove, state, &headers, &body).await
+}
+
 /// `GET /api/v1/branches` — canonical [`BranchListOutput`].
 ///
 /// The same bytes as `rocky branch list --output json` against the state
@@ -3377,6 +3396,7 @@ async fn submit_job(
     validate_preview_fields(kind, &request)?;
     validate_apply_digest(kind, &request)?;
     validate_promote_fields(kind, &request)?;
+    validate_product_approve_fields(kind, &request)?;
     // Project-state gates that need a read of the config or the plan: they run
     // before the permit, so a refused job never holds it.
     gate_job_against_project(kind, &state, &request).await?;
@@ -3490,7 +3510,8 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
         | JobKind::Freeze
         | JobKind::Unfreeze
         | JobKind::Preview
-        | JobKind::Promote => Ok(()),
+        | JobKind::Promote
+        | JobKind::ProductApprove => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3593,6 +3614,23 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
         }
     }
     Ok(())
+}
+
+/// Refuse a `product_approve` body without a product name the CLI would take,
+/// before the permit and the argv. The name must be a bare identifier, the
+/// spec parser's own rule (an ASCII letter or `_`, then letters, digits or
+/// `_`), so it cannot read as a flag or climb out of `products/`. Other kinds
+/// ignore the field.
+fn validate_product_approve_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::ProductApprove {
+        return Ok(());
+    }
+    match request.name.as_deref() {
+        Some(name) if is_bare_product_name(name) => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "invalid name: a product_approve job needs the product name, an ASCII letter or '_' then letters, digits or '_'",
+        )),
+    }
 }
 
 /// The most characters a promote branch `name` or `pipeline` may carry.
@@ -3859,7 +3897,8 @@ async fn gate_job_against_project(
         | JobKind::Ci
         | JobKind::Freeze
         | JobKind::Unfreeze
-        | JobKind::Preview => Ok(()),
+        | JobKind::Preview
+        | JobKind::ProductApprove => Ok(()),
     }
 }
 
@@ -4074,6 +4113,16 @@ fn job_subprocess_args(
             if let Some(models) = &dirs.models {
                 args.push("--models".into());
                 args.push(models.into());
+            }
+        }
+        JobKind::ProductApprove => {
+            // `rocky product approve <name>`: the verb and the product follow
+            // `product`. The name is its own entry, so it can never read as a
+            // flag. The child reads `products/` under its working directory,
+            // the project root.
+            args.push("approve".into());
+            if let Some(name) = &request.name {
+                args.push(name.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -10474,6 +10523,7 @@ mod tests {
             JobKind::Unfreeze,
             JobKind::Preview,
             JobKind::Promote,
+            JobKind::ProductApprove,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
@@ -14300,6 +14350,136 @@ adapter = "db"
             project.get("branch_approval_required").is_none(),
             "an unreadable config says nothing: {project}"
         );
+    }
+
+    // ----- Browser product approve -----
+
+    /// `product_approve` spawns `rocky product approve <name>`: the product is
+    /// a positional entry, nothing else rides along, and no other kind carries
+    /// the verb. It takes the permit (it writes the state store) and its wire
+    /// name is `product_approve`.
+    #[test]
+    fn product_approve_job_argv_and_kind() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let request = JobRequest {
+            name: Some("revenue_daily".to_string()),
+            base: Some("ignored".to_string()),
+            ..JobRequest::default()
+        };
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &dirs,
+                state,
+                &request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        assert_eq!(
+            argv(JobKind::ProductApprove),
+            [
+                "--output",
+                "json",
+                "--config",
+                "/p/rocky.toml",
+                "--state-path",
+                "/tmp/state.redb",
+                "product",
+                "approve",
+                "revenue_daily",
+            ]
+        );
+        for kind in [
+            JobKind::Preview,
+            JobKind::Promote,
+            JobKind::Freeze,
+            JobKind::Test,
+        ] {
+            assert!(
+                !argv(kind).iter().any(|a| a == "product" || a == "approve"),
+                "{kind:?} must not carry the product approve verb"
+            );
+        }
+        assert!(JobKind::ProductApprove.mutates());
+        assert_eq!(JobKind::ProductApprove.verb(), "product_approve");
+        assert_eq!(JobKind::ProductApprove.subcommand(), "product");
+        assert_eq!(
+            JobKind::parse("product_approve"),
+            Some(JobKind::ProductApprove)
+        );
+        assert_eq!(
+            serde_json::to_string(&JobKind::ProductApprove).unwrap(),
+            "\"product_approve\"",
+            "the wire name is the verb, which the UI posts to"
+        );
+    }
+
+    /// The product name is checked before the permit and the argv: a missing
+    /// or non-bare name is a `400` that never spawns a child, and a good name
+    /// takes the permit like a run (`409` while one is held).
+    #[tokio::test]
+    async fn product_approve_route_validates_its_name_and_takes_the_permit() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/product_approve");
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "name": "" }),
+            serde_json::json!({ "name": "-x" }),
+            serde_json::json!({ "name": "1abc" }),
+            serde_json::json!({ "name": "a-b" }),
+            serde_json::json!({ "name": "a b" }),
+            serde_json::json!({ "name": "../x" }),
+            serde_json::json!({ "name": "a/b" }),
+            serde_json::json!({ "name": "x\n" }),
+            serde_json::json!({ "name": "é" }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        for name in ["revenue_daily", "_x", "A1"] {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 409, "{name}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "mutation_in_progress", "{name}");
+            assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+        }
+        // Another kind ignores the field: a bad `name` on `freeze` is not a 400.
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "name": "a-b" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores name");
+        drop(held);
+    }
+
+    /// Approving a spec writes the state store, so it sits behind the write
+    /// gate like every job route.
+    #[tokio::test]
+    async fn product_approve_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["product_approve"]).await;
     }
 }
 

@@ -445,7 +445,7 @@ describe("Freeze and unfreeze on the brief", () => {
       submit: vi.fn(async () => {
         throw new ApiError(409, {
           code: "mutation_in_progress",
-          message: "another run, apply, approve, freeze or unfreeze job is already in progress on this project",
+          message: "another run, apply, approve, freeze, unfreeze, preview or product approval job is already in progress on this project",
         });
       }),
       status: vi.fn(),
@@ -454,7 +454,7 @@ describe("Freeze and unfreeze on the brief", () => {
     renderBrief(OPERATOR, busy);
     fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, freeze or unfreeze is already in progress");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, freeze, unfreeze, preview or product approval is already in progress");
 
     const failed = job("freeze", "failed", {
       error: [

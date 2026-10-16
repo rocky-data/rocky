@@ -12667,6 +12667,14 @@ pub enum JobKind {
     /// tables. Non-mutating; no permit. The server refuses it unless
     /// `[branch.approval] required = true`.
     Promote,
+    /// `rocky product approve <name>` — approves the product's current working
+    /// spec: writes an immutable digest-addressed snapshot file and records the
+    /// approval, the loop state and a journal row in one state-store
+    /// transaction. Takes the mutation permit. The record names the server's git
+    /// identity and the channel `http_api`; it does not prove a browser made the
+    /// call.
+    #[serde(rename = "product_approve")]
+    ProductApprove,
 }
 
 impl JobKind {
@@ -12685,6 +12693,7 @@ impl JobKind {
             JobKind::Unfreeze => "unfreeze",
             JobKind::Preview => "preview",
             JobKind::Promote => "promote",
+            JobKind::ProductApprove => "product_approve",
         }
     }
 
@@ -12692,7 +12701,8 @@ impl JobKind {
     /// `--approve`; there is no `rocky approve` verb. `Freeze` and `Unfreeze`
     /// run `policy` and `Preview` runs `preview`; the argv builder adds the verb
     /// (`freeze`, `unfreeze`, `create`) after it. `Promote` runs `plan` and the
-    /// builder adds `promote`.
+    /// builder adds `promote`; `ProductApprove` runs `product` and the builder
+    /// adds `approve`.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12704,6 +12714,7 @@ impl JobKind {
             JobKind::Freeze | JobKind::Unfreeze => "policy",
             JobKind::Preview => "preview",
             JobKind::Promote => "plan",
+            JobKind::ProductApprove => "product",
         }
     }
 
@@ -12711,7 +12722,8 @@ impl JobKind {
     /// change warehouse state; `approve` changes what `apply` may do; `freeze`
     /// and `unfreeze` write the policy ledger in the state store; `preview`
     /// registers a branch in the state store and writes the branch schema in the
-    /// warehouse. `plan`, `test` and `ci` only preview or check.
+    /// warehouse; `product_approve` writes the approval snapshot and the state
+    /// store. `plan`, `promote`, `test` and `ci` only preview or check.
     pub fn mutates(self) -> bool {
         match self {
             JobKind::Run
@@ -12719,7 +12731,8 @@ impl JobKind {
             | JobKind::Approve
             | JobKind::Freeze
             | JobKind::Unfreeze
-            | JobKind::Preview => true,
+            | JobKind::Preview
+            | JobKind::ProductApprove => true,
             JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote => false,
         }
     }
@@ -12737,6 +12750,7 @@ impl JobKind {
             "unfreeze" => Some(JobKind::Unfreeze),
             "preview" => Some(JobKind::Preview),
             "promote" => Some(JobKind::Promote),
+            "product_approve" => Some(JobKind::ProductApprove),
             _ => None,
         }
     }

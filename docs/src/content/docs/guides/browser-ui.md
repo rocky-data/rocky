@@ -141,6 +141,8 @@ Products shows each [data product](/reference/commands/products/): its fulfillme
 
 ![The products screen for revenue_daily: the loop state is observing, the approval is recorded, and the journal lists 82 events from ownership acquired through elicitation, spec approval, drafting and repair](/ui-governor-product.png)
 
+In operator mode, a product whose spec has no approval, or whose working spec differs from the approved one, shows an **Approve the spec** section. See [Approve a product spec](#approve-a-product-spec).
+
 ## Governance
 
 Governance answers "what did the agents do, and was it allowed?" It is the one area with tabs of its own: Scorecard, Custody and Audit.
@@ -176,7 +178,7 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, promote a branch (only when the project requires a branch approval), and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, create a preview, promote a branch (only when the project requires a branch approval), approve a product's spec, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
 
 ### Freeze and unfreeze
 
@@ -222,6 +224,16 @@ Plan promote ──▶ plan written, tables listed ──▶ Promote (confirm) �
 The server enforces the same rule, so a call that skips the page is checked too. `POST /api/v1/jobs/promote` and an apply of a promote plan answer `409 branch_approval_not_required` unless the config sets `required = true`. An apply of a promote plan that was built without the approval gate answers `409 promote_plan_not_approved`. That covers a plan built while `required` was off, a plan built with the gate bypassed, and a plan that holds fewer approvals than `min_approvers`. The promote job runs without `ROCKY_BRANCH_APPROVAL_SKIP`, whatever the server's environment holds.
 
 The page has no **Approve** button for a branch. A browser click would record the approval as `local`, although it came over the network, and one session could then approve and promote its own branch.
+
+### Approve a product spec
+
+A product's page on the **Products** screen shows **Approve spec** when the working spec has no approval yet, or differs from the approved one. The page asks you to confirm. The question names the product, the spec digest the page read and the output model. It also names the approval it replaces, when there is one. After you confirm, the server runs `rocky product approve <name>`.
+
+The command approves the spec as it is on disk when the job runs, not the one the page read. So the page compares the digest in the result with the one you confirmed. If they differ, it shows a warning that names both digests, not a plain "done". The result also says when the spec was already approved and nothing was written. The engine refuses a new spec revision while fulfillment work is in flight. The page shows that refusal.
+
+The approver is recorded with its channel, as `rocky review --approve` records it. The approval stores `<server git email> (http_api)`. A terminal approval stores the bare email, as before. The label names the channel and the server's git identity. It does not prove who was at the page, and nothing proves that a browser made the call. If the server cannot read `git config user.email`, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Nothing is written in that case: the snapshot file is not created either.
+
+The job takes the same single write slot as a run. It answers `409 mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or another product approval is in progress.
 
 ### Cancel a running job
 

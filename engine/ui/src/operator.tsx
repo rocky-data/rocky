@@ -498,7 +498,7 @@ function CancelControl({ cancel }: { cancel: JobCancel }) {
 
 /**
  * One line saying where a job stands. A `409 mutation_in_progress` says so
- * plainly: another run, apply, approve, freeze or unfreeze is going, wait for it. Given a
+ * plainly: another run, apply, approve, freeze, unfreeze, preview or product approval is going, wait for it. Given a
  * `cancel`, a running job also shows the Cancel button (operator mode only).
  */
 export function JobLine({ label, view, cancel }: { label: string; view: JobView; cancel?: JobCancel }) {
@@ -521,7 +521,7 @@ export function JobLine({ label, view, cancel }: { label: string; view: JobView;
       if (error instanceof ApiError && error.envelope.code === "mutation_in_progress") {
         return (
           <p role="alert" className="text-xs text-amber-800 dark:text-amber-300">
-            {label}: not started. Another run, apply, approve, freeze or unfreeze is already in progress on this
+            {label}: not started. Another run, apply, approve, freeze, unfreeze, preview or product approval is already in progress on this
             project. Wait for it to finish, then try again.
           </p>
         );

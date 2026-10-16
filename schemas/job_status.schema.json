@@ -73,6 +73,13 @@
             "promote"
           ],
           "type": "string"
+        },
+        {
+          "description": "`rocky product approve <name>` — approves the product's current working spec: writes an immutable digest-addressed snapshot file and records the approval, the loop state and a journal row in one state-store transaction. Takes the mutation permit. The record names the server's git identity and the channel `http_api`; it does not prove a browser made the call.",
+          "enum": [
+            "product_approve"
+          ],
+          "type": "string"
         }
       ]
     },

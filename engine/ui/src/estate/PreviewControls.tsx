@@ -137,7 +137,7 @@ function PreviewJobLine({ view, cancel }: { view: JobView; cancel: JobCancel }) 
  * model from its production schema into the warehouse schema
  * `branch__<name>`. It reads production tables and writes only that schema.
  * It does not re-run the changed models. It is refused (409) while a run,
- * apply, approve, freeze or unfreeze is in progress. A name already in use
+ * apply, approve, freeze, unfreeze or product approval is in progress. A name already in use
  * fails the job; pick another.
  */
 export function PreviewControls({

@@ -1225,11 +1225,33 @@ pub fn run_product_compile(
 /// Best-effort approver identity — the same convention the review marker
 /// uses (git identity when available), with the same honesty caveat: it
 /// is an attribution, not an authentication.
-fn approver_string() -> String {
-    match super::branch::approver_identity_pub() {
-        Ok(identity) => identity.email,
-        Err(_) => "unknown".to_string(),
-    }
+///
+/// The channel is read the way `rocky review --approve` reads it, from
+/// `ROCKY_SESSION_SOURCE`. A terminal approval records the bare email, as it
+/// always did. An approval made through the HTTP API (a job the server
+/// started; the browser UI uses it) records `"<email> (http_api)"`, and
+/// refuses when the server's git identity cannot be read or is the
+/// placeholder `unknown`, because the record would then name nobody. The
+/// label names the channel, not the person: the identity is the server's git
+/// identity, and nothing proves a browser made the call.
+fn approver_string() -> Result<String> {
+    Ok(approver_label(super::review::review_approver(
+        super::run_audit::detect_session_source(),
+        super::branch::approver_identity_pub(),
+    )?))
+}
+
+/// The recorded approver string for a resolved identity: the bare email for a
+/// local approval, `"<email> (<channel>)"` for every other channel.
+fn approver_label(identity: crate::output::ApproverIdentity) -> String {
+    use crate::output::ApproverSource;
+    let channel = match identity.source {
+        ApproverSource::Local => return identity.email,
+        ApproverSource::HttpApi => "http_api",
+        ApproverSource::CiOidc => "ci_oidc",
+        ApproverSource::Pat => "pat",
+    };
+    format!("{} ({channel})", identity.email)
 }
 
 /// Write the immutable digest-addressed snapshot file, tmp+rename.
@@ -1427,6 +1449,19 @@ pub(crate) fn product_approve_in(
     state_path: &Path,
     product_name: &str,
 ) -> Result<ProductApproveOutput> {
+    product_approve_with(root, state_path, product_name, &approver_string)
+}
+
+/// [`product_approve_in`] with the approver resolved by `approver`, so a test
+/// can fix the identity. It is called after the in-flight check and before the
+/// snapshot is written: an approval that must refuse for want of an identity
+/// writes nothing.
+fn product_approve_with(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+    approver: &dyn Fn() -> Result<String>,
+) -> Result<ProductApproveOutput> {
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
     let store = open_state_store(state_path)?;
 
@@ -1512,12 +1547,15 @@ pub(crate) fn product_approve_in(
         }
     }
 
+    // The approver is resolved first: an HTTP API approval with no usable git
+    // identity refuses here, before anything is written.
+    let approver = approver()?;
+
     // 1. The immutable snapshot file, before any record.
     let snapshot_path = write_approval_snapshot(root, &parsed)?;
 
     // 2. One all-or-nothing transaction.
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let approver = approver_string();
     let approval = ProductApprovalRecord {
         product_id: parsed.product_id(),
         spec_digest: parsed.digest.clone(),
@@ -3075,6 +3113,189 @@ effect = "require_review"
                 .len(),
             1
         );
+    }
+
+    fn identity(source: crate::output::ApproverSource) -> crate::output::ApproverIdentity {
+        crate::output::ApproverIdentity {
+            email: "dev@example.com".to_string(),
+            name: None,
+            host: "host".to_string(),
+            source,
+        }
+    }
+
+    /// The recorded string is the bare email for a local approval, as it
+    /// always was, and carries the channel for every other source.
+    #[test]
+    fn the_approver_string_names_the_channel_unless_it_is_local() {
+        use crate::output::ApproverSource;
+        assert_eq!(
+            approver_label(identity(ApproverSource::Local)),
+            "dev@example.com"
+        );
+        assert_eq!(
+            approver_label(identity(ApproverSource::HttpApi)),
+            "dev@example.com (http_api)"
+        );
+        assert_eq!(
+            approver_label(identity(ApproverSource::CiOidc)),
+            "dev@example.com (ci_oidc)"
+        );
+        assert_eq!(
+            approver_label(identity(ApproverSource::Pat)),
+            "dev@example.com (pat)"
+        );
+    }
+
+    /// Product approve reads the channel through `review_approver`, the
+    /// function `rocky review --approve` uses: the HTTP API source is labelled
+    /// and a terminal source is not.
+    #[test]
+    fn product_approve_labels_the_channel_the_way_review_does() {
+        use crate::commands::review::review_approver;
+        use rocky_core::state::SessionSource;
+        let for_source = |source| {
+            approver_label(
+                review_approver(source, Ok(identity(crate::output::ApproverSource::Local)))
+                    .expect("resolved"),
+            )
+        };
+        assert_eq!(
+            for_source(SessionSource::HttpApi),
+            "dev@example.com (http_api)"
+        );
+        for source in [
+            SessionSource::Cli,
+            SessionSource::Dagster,
+            SessionSource::Lsp,
+        ] {
+            assert_eq!(for_source(source), "dev@example.com", "{source:?}");
+        }
+    }
+
+    /// The production function reads `ROCKY_SESSION_SOURCE` itself. Which
+    /// answer it gives depends on this machine's git identity, so the test
+    /// asserts the branch that identity selects, and both branches assert
+    /// something.
+    #[test]
+    fn the_production_approver_reads_the_session_source() {
+        use crate::commands::review::APPROVER_IDENTITY_UNRESOLVED;
+        let _env = crate::testing::lock_pipes_env();
+        // SAFETY: serialized by the pipes-env lock, which every reader of
+        // ROCKY_SESSION_SOURCE takes; restored below.
+        let previous = std::env::var_os("ROCKY_SESSION_SOURCE");
+        unsafe { std::env::set_var("ROCKY_SESSION_SOURCE", "http_api") };
+        let over_http = approver_string();
+        unsafe { std::env::set_var("ROCKY_SESSION_SOURCE", "cli") };
+        let in_a_terminal = approver_string();
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("ROCKY_SESSION_SOURCE", v),
+                None => std::env::remove_var("ROCKY_SESSION_SOURCE"),
+            }
+        }
+        match crate::commands::branch::approver_identity_pub() {
+            Ok(id) if !id.email.trim().eq_ignore_ascii_case("unknown") => {
+                assert_eq!(
+                    over_http.expect("resolved"),
+                    format!("{} (http_api)", id.email)
+                );
+                assert_eq!(in_a_terminal.expect("resolved"), id.email);
+            }
+            _ => {
+                let error = over_http.expect_err("no usable identity refuses over the API");
+                assert!(
+                    format!("{error:#}").contains(APPROVER_IDENTITY_UNRESOLVED),
+                    "{error:#}"
+                );
+                assert!(
+                    in_a_terminal.is_ok(),
+                    "a terminal keeps recording `unknown`"
+                );
+            }
+        }
+    }
+
+    /// An HTTP API approval is recorded with its channel everywhere the
+    /// approver string shows: the command output, the stored record and the
+    /// status read. A terminal approval is recorded bare.
+    #[test]
+    fn an_http_api_approval_is_recorded_with_its_channel() {
+        use crate::commands::review::review_approver;
+        use rocky_core::state::SessionSource;
+        let approve_as = |source: SessionSource| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (root, _config) = project_with_config(dir.path(), &passing_config());
+            let state_path = temp_state_path(dir.path());
+            let approver = move || {
+                Ok(approver_label(review_approver(
+                    source,
+                    Ok(identity(crate::output::ApproverSource::Local)),
+                )?))
+            };
+            let output = product_approve_with(&root, &state_path, "revenue_daily", &approver)
+                .expect("approves");
+            let stored = StateStore::open(&state_path)
+                .expect("opens")
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded")
+                .approver;
+            let status = product_status_in(&root, Some(&state_path), "revenue_daily")
+                .expect("status")
+                .approval
+                .expect("approved")
+                .approver;
+            assert_eq!(output.approver, stored);
+            assert_eq!(output.approver, status);
+            output.approver
+        };
+        assert_eq!(
+            approve_as(SessionSource::HttpApi),
+            "dev@example.com (http_api)"
+        );
+        assert_eq!(approve_as(SessionSource::Cli), "dev@example.com");
+    }
+
+    /// An HTTP API approval whose server has no usable git identity refuses
+    /// BEFORE anything is written: no snapshot file, no store, no record.
+    /// (The CLI keeps recording `unknown` for a terminal approval.)
+    #[test]
+    fn an_http_api_approval_without_an_identity_writes_nothing() {
+        use crate::commands::review::{APPROVER_IDENTITY_UNRESOLVED, review_approver};
+        use rocky_core::state::SessionSource;
+        for identity_result in [
+            Err(anyhow::anyhow!("git is not configured")),
+            Ok(crate::output::ApproverIdentity {
+                email: "unknown".to_string(),
+                ..identity(crate::output::ApproverSource::Local)
+            }),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (root, _config) = project_with_config(dir.path(), &passing_config());
+            let state_path = temp_state_path(dir.path());
+            let shared = std::cell::RefCell::new(Some(identity_result));
+            let approver = || {
+                let identity = shared.borrow_mut().take().expect("called once");
+                Ok(approver_label(review_approver(
+                    SessionSource::HttpApi,
+                    identity,
+                )?))
+            };
+            let error = product_approve_with(&root, &state_path, "revenue_daily", &approver)
+                .expect_err("refuses");
+            assert!(
+                format!("{error:#}").contains(APPROVER_IDENTITY_UNRESOLVED),
+                "{error:#}"
+            );
+            let snapshot = root.join(approval_snapshot_rel("revenue_daily", &parsed_d3().digest));
+            assert!(!snapshot.exists(), "no snapshot was written");
+            let recorded = StateStore::open(&state_path)
+                .expect("opens")
+                .product_approval_get("revenue_daily")
+                .expect("reads");
+            assert!(recorded.is_none(), "no approval was recorded");
+        }
     }
 
     #[test]

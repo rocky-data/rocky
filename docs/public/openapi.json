@@ -10589,6 +10589,13 @@
               "promote"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky product approve <name>` — approves the product's current working spec: writes an immutable digest-addressed snapshot file and records the approval, the loop state and a journal row in one state-store transaction. Takes the mutation permit. The record names the server's git identity and the channel `http_api`; it does not prove a browser made the call.",
+            "enum": [
+              "product_approve"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -10629,7 +10636,7 @@
           },
           "name": {
             "default": null,
-            "description": "`--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`, 1 to 64 characters. Absent means a name derived from the project's git branch. For `promote`: the branch to promote (required). Ignored by every other kind.",
+            "description": "`--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`, 1 to 64 characters. Absent means a name derived from the project's git branch. For `promote`: the branch to promote (required). For `product_approve`: the product to approve (required). Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -26140,7 +26147,7 @@
     },
     "/api/v1/jobs/approve": {
       "post": {
-        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply, approve, freeze or unfreeze holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
+        "description": "Approve a plan: runs `rocky review <plan_id> --approve` as a job. Takes the single-mutating-job permit (409 while a run, apply, approve, freeze, unfreeze, preview or product approval holds it). `plan_id` must be 64 lowercase hex characters (400 `invalid_plan_id`). The marker records approver source `http_api` and the server's git identity; with no git identity the job fails with `approver_identity_unresolved`.",
         "operationId": "submitApproveJob",
         "parameters": [
           {
@@ -26408,7 +26415,7 @@
     },
     "/api/v1/jobs/preview": {
       "post": {
-        "description": "Submit a mutating `preview` job: `rocky preview create`. Registers a branch in the state store (the job fails if the name is taken) and copies the unchanged models from their production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. It reads production tables and writes only the branch schema; it does not re-run the changed models (`run_status` is `planned`). Takes the mutating permit (409 `mutation_in_progress` while a run, apply, approve, freeze or unfreeze holds it). The optional `name` (1 to 64 letters, digits or underscores; derived from the git branch when absent) and `base` (a git ref, default `main`) are validated before the job starts.",
+        "description": "Submit a mutating `preview` job: `rocky preview create`. Registers a branch in the state store (the job fails if the name is taken) and copies the unchanged models from their production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. It reads production tables and writes only the branch schema; it does not re-run the changed models (`run_status` is `planned`). Takes the mutating permit (409 `mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or product approval holds it). The optional `name` (1 to 64 letters, digits or underscores; derived from the git branch when absent) and `base` (a git ref, default `main`) are validated before the job starts.",
         "operationId": "submitPreviewJob",
         "parameters": [
           {
@@ -26473,6 +26480,78 @@
           }
         },
         "summary": "Submit a preview create job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/product_approve": {
+      "post": {
+        "description": "Submit a mutating `product_approve` job: `rocky product approve <name>`. Approves the product's working spec as it is on disk when the job runs: it writes an immutable snapshot file and records the approval, the loop state and a journal row in one state-store transaction. The record names the server's git identity with the channel, `<email> (http_api)`; with no usable git identity the job fails with `approver_identity_unresolved` and writes nothing. It refuses a new spec revision while fulfillment work is in flight. Takes the mutating permit (409 `mutation_in_progress` while a run, apply, approve, freeze, unfreeze, preview or product approval holds it). `name` is required: a bare product name (an ASCII letter or `_`, then letters, digits or `_`), validated before the job starts.",
+        "operationId": "submitProductApproveJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another run/apply job already holds the single-mutating-job permit. The holder's id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit a product approve job",
         "tags": [
           "jobs"
         ]

@@ -89,6 +89,14 @@ class JobKind10(StrEnum):
     promote = "promote"
 
 
+class JobKind11(StrEnum):
+    """
+    `rocky product approve <name>` — approves the product's current working spec: writes an immutable digest-addressed snapshot file and records the approval, the loop state and a journal row in one state-store transaction. Takes the mutation permit. The record names the server's git identity and the channel `http_api`; it does not prove a browser made the call.
+    """
+
+    product_approve = "product_approve"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -159,6 +167,7 @@ class JobStatus(BaseModel):
         | JobKind8
         | JobKind9
         | JobKind10
+        | JobKind11
     )
     """
     Which operation the job wraps.

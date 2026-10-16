@@ -10,6 +10,8 @@ import { navigateTo, pathForLane } from "../router";
 import { ResourceState } from "../review/ResourceState";
 import { reviewPath } from "../review/paths";
 import { AuditProductLink } from "./links";
+import { ProductApprove } from "./ProductApprove";
+import { defaultJobClient, type JobClient } from "../operator";
 
 export interface ProductLoaders {
   list: () => Promise<ProductListOutput>;
@@ -325,9 +327,12 @@ function Standing({ status }: { status: ProductStatusOutput }) {
 export function ProductTimeline({
   name,
   loaders = defaultProductLoaders,
+  jobs = defaultJobClient,
 }: {
   name: string;
   loaders?: ProductLoaders;
+  /** Where Approve submits its job. Tests hand in a fake. */
+  jobs?: JobClient;
 }) {
   const loadStatus = useCallback(() => loaders.status(name), [loaders, name]);
   const loadJournal = useCallback(() => loaders.journal(name), [loaders, name]);
@@ -345,7 +350,18 @@ export function ProductTimeline({
       </div>
 
       {status.kind === "ready" ? (
-        <Standing status={status.value} />
+        <>
+          <Standing status={status.value} />
+          <ProductApprove
+            name={name}
+            status={status.value}
+            jobs={jobs}
+            onDone={() => {
+              status.reload();
+              journal.reload();
+            }}
+          />
+        </>
       ) : (
         <section aria-label="Where it stands" className="space-y-2">
           <ResourceState resource={status} loadingLine="reading the product…" />
@@ -379,12 +395,14 @@ export function ProductTimeline({
 export function ProductsScreen({
   name,
   loaders = defaultProductLoaders,
+  jobs,
 }: {
   name: string | null;
   loaders?: ProductLoaders;
+  jobs?: JobClient;
 }) {
   if (name !== null) {
-    return <ProductTimeline name={name} loaders={loaders} />;
+    return <ProductTimeline name={name} loaders={loaders} jobs={jobs} />;
   }
   return <ProductList load={loaders.list} />;
 }

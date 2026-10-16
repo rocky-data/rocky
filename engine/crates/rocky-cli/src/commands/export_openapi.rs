@@ -822,7 +822,7 @@ fn route_table() -> Vec<Route> {
             tag: "jobs",
             summary: "Submit an approve job",
             description: "Approve a plan: runs `rocky review <plan_id> --approve` as a job. \
-                 Takes the single-mutating-job permit (409 while a run, apply, approve, freeze or unfreeze \
+                 Takes the single-mutating-job permit (409 while a run, apply, approve, freeze, unfreeze, preview or product approval \
                  holds it). `plan_id` must be 64 lowercase hex characters (400 \
                  `invalid_plan_id`). The marker records approver source `http_api` and the \
                  server's git identity; with no git identity the job fails with \
@@ -917,7 +917,7 @@ fn route_table() -> Vec<Route> {
                  `rocky.toml`. It reads production tables and writes only the branch \
                  schema; it does not re-run the changed models (`run_status` is \
                  `planned`). Takes the mutating permit (409 `mutation_in_progress` while a \
-                 run, apply, approve, freeze or unfreeze holds it). The optional `name` \
+                 run, apply, approve, freeze, unfreeze, preview or product approval holds it). The optional `name` \
                  (1 to 64 letters, digits or underscores; derived from the git branch when \
                  absent) and `base` (a git ref, default `main`) are validated before the \
                  job starts.",
@@ -948,6 +948,31 @@ fn route_table() -> Vec<Route> {
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST, BRANCH_APPROVAL_NOT_REQUIRED],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/product_approve",
+            operation_id: "submitProductApproveJob",
+            tag: "jobs",
+            summary: "Submit a product approve job",
+            description: "Submit a mutating `product_approve` job: `rocky product approve \
+                 <name>`. Approves the product's working spec as it is on disk when the job \
+                 runs: it writes an immutable snapshot file and records the approval, the \
+                 loop state and a journal row in one state-store transaction. The record \
+                 names the server's git identity with the channel, `<email> (http_api)`; \
+                 with no usable git identity the job fails with \
+                 `approver_identity_unresolved` and writes nothing. It refuses a new \
+                 spec revision while fulfillment work is in flight. Takes the mutating \
+                 permit (409 `mutation_in_progress` while a run, apply, approve, freeze, \
+                 unfreeze, preview or product approval holds it). `name` is required: a \
+                 bare product name (an ASCII letter or `_`, then letters, digits or `_`), \
+                 validated before the job starts.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
             auth_exempt: false,
         },
         Route {
