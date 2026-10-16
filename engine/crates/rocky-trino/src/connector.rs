@@ -6,7 +6,8 @@
 //!
 //! 1. **Submit:** `POST /v1/statement` with the SQL as the **plain-text**
 //!    request body (not JSON). Required headers: `X-Trino-User`,
-//!    `Authorization`, optionally `X-Trino-Catalog` / `X-Trino-Schema`.
+//!    `Authorization` and `X-Trino-Time-Zone: UTC`, optionally
+//!    `X-Trino-Catalog` / `X-Trino-Schema`.
 //! 2. **Response:** a `QueryResults` JSON document carrying `id`, `stats`,
 //!    optional `columns`, optional `data` (a slice of rows), optional
 //!    `nextUri` (the URL to poll for the next page), and optional `error`
@@ -363,7 +364,8 @@ impl TrinoClient {
     }
 
     /// Crate-internal handle on the shared header set
-    /// (`Authorization` + `X-Trino-User` + optional catalog/schema).
+    /// (`Authorization` + `X-Trino-User` + `X-Trino-Time-Zone` + optional
+    /// catalog/schema).
     /// Sibling modules add encoding-negotiation headers on top.
     pub(crate) fn base_headers(&self) -> Result<HeaderMap, TrinoError> {
         self.build_headers()
@@ -393,6 +395,13 @@ impl TrinoClient {
                     "X-Trino-User contains invalid bytes: {user}"
                 ))
             })?,
+        );
+        // Pin the session to UTC. A bare `TIMESTAMP '…'` watermark literal
+        // compared with a `timestamp with time zone` column is read in the
+        // session zone, so a zone west of UTC would skip rows (#2395).
+        headers.insert(
+            HeaderName::from_static("x-trino-time-zone"),
+            HeaderValue::from_static("UTC"),
         );
         headers.insert(
             HeaderName::from_static("x-trino-source"),
@@ -823,6 +832,15 @@ mod tests {
         // The Authorization header is marked sensitive so wiremock /
         // tracing redact it on Debug formatting.
         assert!(headers[AUTHORIZATION].is_sensitive());
+    }
+
+    #[test]
+    fn build_headers_pins_the_session_time_zone_to_utc() {
+        let auth = crate::test_helpers::test_basic_auth();
+        let cfg = TrinoClientConfig::new("http://localhost:8080");
+        let client = TrinoClient::new(cfg, auth);
+        let headers = client.build_headers().unwrap();
+        assert_eq!(headers["x-trino-time-zone"], "UTC");
     }
 
     #[test]

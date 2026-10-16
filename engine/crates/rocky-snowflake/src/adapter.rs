@@ -253,10 +253,13 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
     async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
         validation::validate_identifier(catalog).map_err(AdapterError::new)?;
         validation::validate_identifier(schema).map_err(AdapterError::new)?;
-        // Snowflake: SELECT table_name FROM <database>.information_schema.tables
+        // The database is quoted as written, the same as the writes, so a
+        // lowercase database Rocky created as `"acme"` is found (#2413). The
+        // schema is matched exactly.
         let sql = format!(
-            "SELECT table_name FROM {catalog}.information_schema.tables \
-             WHERE table_schema = '{schema}'"
+            "SELECT table_name FROM {}.information_schema.tables \
+             WHERE table_schema = '{schema}'",
+            self.dialect().quote_identifier(catalog)
         );
         let result = self
             .connector

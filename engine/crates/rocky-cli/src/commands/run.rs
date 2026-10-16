@@ -9740,12 +9740,25 @@ async fn run_batched_checks(
 /// same column, and a watermark that loses the fraction re-copies the
 /// newest source rows on the next run.
 pub(super) fn parse_timestamp_cell(s: &str) -> Option<DateTime<Utc>> {
-    s.parse::<DateTime<Utc>>().ok().or_else(|| {
+    let naive = |s: &str| {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
             .ok()
             .map(|naive| naive.and_utc())
-    })
+    };
+    s.parse::<DateTime<Utc>>()
+        .ok()
+        .or_else(|| naive(s))
+        // Trino prints a `timestamp with time zone` cell as
+        // `2026-04-17 09:30:00.000 UTC` or `… +02:00` (#2395). A named zone
+        // other than UTC stays unparsed, so the run fails loudly.
+        .or_else(|| s.strip_suffix(" UTC").and_then(naive))
+        .or_else(|| {
+            DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %:z")
+                .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S %:z"))
+                .ok()
+                .map(|t| t.with_timezone(&Utc))
+        })
 }
 
 /// Runs the null-rate check for every configured column of one table.
@@ -18297,6 +18310,15 @@ async fn process_table(
         .as_deref()
         .unwrap_or(pipeline.timestamp_column.as_str())
         .to_string();
+
+    // #2395: a watermark filter renders a bare UTC literal. An adapter that
+    // cannot pin its session to UTC refuses here when the session zone would
+    // read that literal wrong. Microbatch falls back to the same filter. A
+    // `--resume` of a pruned table renders the held-back `row_count` cutoff
+    // without this check; that only measures, it writes nothing.
+    if uses_watermark {
+        warehouse.check_watermark_time_zone().await?;
+    }
 
     // #2376: hold back the newest source timestamp. The next watermark is
     // `MAX(ts)` over the target, and the copy filters `ts > watermark`, so a
@@ -32022,6 +32044,37 @@ timestamp_column = "ts"
             "WHERE ts > TIMESTAMP '3000-01-01 00:00:00.000002'"
         );
         server.verify().await;
+    }
+
+    /// #2395: Trino prints a `timestamp with time zone` cell with a ` UTC`
+    /// or numeric-offset suffix.
+    #[test]
+    fn parse_timestamp_cell_reads_trino_zoned_cells() {
+        use chrono::TimeZone;
+
+        let expected = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 9, 30, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            super::parse_timestamp_cell("2026-04-17 09:30:00.250 UTC"),
+            Some(expected)
+        );
+        assert_eq!(
+            super::parse_timestamp_cell("2026-04-17 11:30:00.250 +02:00"),
+            Some(expected)
+        );
+        assert_eq!(
+            super::parse_timestamp_cell("2026-04-17 09:30:00 UTC"),
+            Some(expected - chrono::Duration::milliseconds(250))
+        );
+        assert_eq!(
+            super::parse_timestamp_cell("2026-04-17 11:30:00 +02:00"),
+            Some(expected - chrono::Duration::milliseconds(250))
+        );
+        // A named zone other than UTC is not guessed at.
+        assert_eq!(
+            super::parse_timestamp_cell("2026-04-17 09:30:00.250 Europe/Lisbon"),
+            None
+        );
     }
 
     /// #2004: the shared cell parser (`parse_timestamp_cell`, used by both

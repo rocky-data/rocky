@@ -39,18 +39,18 @@ impl SparkWarehouseAdapter {
         &self.client
     }
 
-    /// Set the session's default table format once, before the first
-    /// statement, so a `CREATE TABLE` without `USING` (every one Rocky
-    /// renders) makes a Delta or Iceberg table rather than a Parquet table
-    /// that cannot `MERGE`, `DELETE` or be replaced.
+    /// Run [`session_statements`] once, before the first statement.
+    ///
+    /// A failed `SET` leaves the cell empty, so the next call re-runs both;
+    /// both are idempotent. A replaced server session is refused by the
+    /// connector rather than run without them.
     async fn prepare_session(&self) -> AdapterResult<()> {
         self.session_ready
             .get_or_try_init(|| async {
-                let sql = format!(
-                    "SET spark.sql.sources.default = {}",
-                    self.dialect.table_format().source_name()
-                );
-                self.client.execute(&sql).await.map(|_| ()).map_err(wrap)
+                for sql in session_statements(self.dialect.table_format()) {
+                    self.client.execute(&sql).await.map_err(wrap)?;
+                }
+                Ok(())
             })
             .await
             .copied()
@@ -70,6 +70,22 @@ impl SparkWarehouseAdapter {
         self.dialect
             .format_table_ref(&table.catalog, &table.schema, &table.table)
     }
+}
+
+/// The `SET` statements each session runs before its first statement, one
+/// per `execute` call.
+///
+/// - `spark.sql.sources.default`: a `CREATE TABLE` without `USING` (every
+///   one Rocky renders) makes a Delta or Iceberg table, not a Parquet table
+///   that cannot `MERGE`, `DELETE` or be replaced.
+/// - `spark.sql.session.timeZone = UTC`: the watermark bounds render a bare
+///   `TIMESTAMP '…'` literal in UTC. Spark reads that literal in the session
+///   zone, so a zone west of UTC would skip rows (#2395).
+fn session_statements(format: TableFormat) -> [String; 2] {
+    [
+        format!("SET spark.sql.sources.default = {}", format.source_name()),
+        "SET spark.sql.session.timeZone = UTC".to_string(),
+    ]
 }
 
 fn wrap(err: SparkError) -> AdapterError {
@@ -314,6 +330,17 @@ mod tests {
 
     fn s(v: &str) -> serde_json::Value {
         serde_json::Value::String(v.into())
+    }
+
+    #[test]
+    fn session_pins_the_table_format_and_utc() {
+        assert_eq!(
+            session_statements(TableFormat::Iceberg),
+            [
+                "SET spark.sql.sources.default = iceberg".to_string(),
+                "SET spark.sql.session.timeZone = UTC".to_string(),
+            ]
+        );
     }
 
     #[test]

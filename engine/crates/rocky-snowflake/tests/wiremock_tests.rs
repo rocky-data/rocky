@@ -1580,8 +1580,11 @@ async fn test_batch_describe_single_query_groups_by_table() {
 
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
-        // The batched describe targets the database-scoped information_schema.
-        .and(body_string_contains("information_schema.columns"))
+        // The batched describe targets the database-scoped information_schema,
+        // with the database quoted as written (#2413).
+        .and(body_string_contains(
+            "\\\"TEST_DB\\\".information_schema.columns",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "statementHandle": "sf-batch-describe",
             "code": "00000",
@@ -1736,4 +1739,43 @@ async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
             panic!("expected CircuitBreakerOpen {{ cooldown_seconds: None, .. }}, got: {other:?}")
         }
     }
+}
+
+/// #2413: `list_tables` reads `"<db>".information_schema.tables` with the
+/// database quoted as written, so a lowercase database Rocky created as
+/// `"acme"` is found rather than folded to `ACME`.
+#[tokio::test]
+async fn test_list_tables_quotes_the_database_as_written() {
+    use rocky_core::traits::WarehouseAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(
+            "FROM \\\"acme\\\".information_schema.tables",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-list-tables",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 1,
+                "rowType": [
+                    {"name": "TABLE_NAME", "type": "TEXT", "nullable": false}
+                ]
+            },
+            "data": [["orders"]]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = rocky_snowflake::adapter::SnowflakeWarehouseAdapter::new(test_connector(&server));
+    let tables = adapter
+        .list_tables("acme", "marts")
+        .await
+        .expect("list_tables should succeed");
+    assert_eq!(tables, ["orders"]);
 }

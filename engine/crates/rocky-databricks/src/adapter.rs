@@ -35,6 +35,8 @@ pub struct DatabricksWarehouseAdapter {
     connector: DatabricksConnector,
     dialect: DatabricksSqlDialect,
     catalog_client: Option<UnityCatalogClient>,
+    /// Set once the warehouse's session zone has been read as UTC.
+    watermark_zone_utc: tokio::sync::OnceCell<()>,
 }
 
 impl DatabricksWarehouseAdapter {
@@ -43,6 +45,7 @@ impl DatabricksWarehouseAdapter {
             connector,
             dialect: DatabricksSqlDialect,
             catalog_client: None,
+            watermark_zone_utc: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -215,6 +218,51 @@ fn latest_history_version(result: &QueryResult) -> AdapterResult<u64> {
     })
 }
 
+/// `Ok` when `zone` (from `current_timezone()`) names UTC, else an error that
+/// tells the operator how to fix the SQL warehouse.
+fn watermark_zone_is_utc(zone: &str) -> AdapterResult<()> {
+    const UTC_NAMES: [&str; 14] = [
+        "UTC",
+        "Etc/UTC",
+        "UCT",
+        "Etc/UCT",
+        "GMT",
+        "Etc/GMT",
+        "Etc/GMT+0",
+        "Etc/GMT-0",
+        "Etc/GMT0",
+        "Universal",
+        "Etc/Universal",
+        "Zulu",
+        "Etc/Zulu",
+        "Z",
+    ];
+    // Java `ZoneId` spellings Spark accepts for a zero offset.
+    const ZERO_OFFSETS: [&str; 10] = [
+        "+00:00",
+        "-00:00",
+        "+0000",
+        "UT",
+        "GMT+0",
+        "UTC+0",
+        "GMT+00:00",
+        "UTC+00:00",
+        "UT+0",
+        "UT+00:00",
+    ];
+    let zone = zone.trim();
+    if UTC_NAMES.contains(&zone) || ZERO_OFFSETS.contains(&zone) {
+        return Ok(());
+    }
+    Err(AdapterError::msg(format!(
+        "the Databricks session time zone is {zone:?}, not UTC. Incremental \
+         replication compares the stored UTC watermark as a bare TIMESTAMP literal, \
+         which Databricks reads in the session zone, so rows could be skipped (#2395). \
+         Set the SQL warehouse's `TIMEZONE` configuration parameter \
+         (`spark.sql.session.timeZone` on a cluster) to `UTC`"
+    )))
+}
+
 #[async_trait]
 impl WarehouseAdapter for DatabricksWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -292,6 +340,27 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             columns: result.columns.iter().map(|c| c.name.clone()).collect(),
             rows: result.rows,
         })
+    }
+
+    /// Each statement is its own API call with the SQL warehouse's default
+    /// session, so Rocky cannot pin the zone. It reads `current_timezone()`
+    /// once per adapter and refuses a zone that is not UTC (#2395).
+    async fn check_watermark_time_zone(&self) -> AdapterResult<()> {
+        self.watermark_zone_utc
+            .get_or_try_init(|| async {
+                let result = self.execute_query("SELECT current_timezone()").await?;
+                let zone = result
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        AdapterError::msg("SELECT current_timezone() returned no zone")
+                    })?;
+                watermark_zone_is_utc(zone)
+            })
+            .await
+            .copied()
     }
 
     async fn promotion_destination_kind(
@@ -748,6 +817,35 @@ fn parse_databricks_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watermark_zone_accepts_utc_names() {
+        for zone in [
+            "UTC",
+            "Etc/UTC",
+            "GMT",
+            "Etc/GMT",
+            "Z",
+            "+00:00",
+            " Etc/UTC ",
+        ] {
+            assert!(watermark_zone_is_utc(zone).is_ok(), "{zone}");
+        }
+    }
+
+    #[test]
+    fn watermark_zone_refuses_other_zones() {
+        for zone in [
+            "America/New_York",
+            "Europe/London",
+            "-05:00",
+            "Etc/GMT+5",
+            "",
+        ] {
+            let err = watermark_zone_is_utc(zone).expect_err(zone);
+            assert!(err.to_string().contains("TIMEZONE"), "{err}");
+        }
+    }
     use rocky_catalog_core::{ColumnSchema as CatalogColumnSchema, TableSchema as CatalogSchema};
 
     #[test]

@@ -1906,6 +1906,99 @@ max_retries = 0
         );
     }
 
+    /// The test above checks only counts. This one checks the ledger the
+    /// winning replay leaves: after two conflicts, the remote winner's row
+    /// survives and the freeze row lands exactly once. A record rebuilt
+    /// inside the retry with a fresh timestamp would leave three freeze rows.
+    #[test]
+    fn freeze_replay_after_two_cas_conflicts_keeps_the_winner_and_one_freeze_row() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let winner = PolicyDecisionRecord {
+            seq: 0,
+            keys_recorded: false,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            plan_id: "existing-run-winner".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "winner".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "remote winner".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        };
+        {
+            let store = harness.open_store(&harness.pod_b);
+            store.record_policy_decision(&winner).unwrap();
+        }
+        block_on_state_sync(harness.upload(&harness.pod_b)).unwrap();
+
+        let body = format!(
+            "{POLICY}
+[state]
+backend = \"s3\"
+s3_bucket = \"test\"
+concurrency_control = \"cas\"
+freeze_marker_writes = true
+on_upload_failure = \"skip\"
+
+[state.retry]
+max_retries = 0
+"
+        );
+        let (_dir, path) = config_with(&body);
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        // Two conflicts, so the third full replay is the one that commits.
+        harness.faults.arm_precondition_failures(&object_key, 2);
+
+        run_policy_freeze(
+            &path,
+            &harness.pod_a.state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("any".to_string()),
+            Some("replayed freeze".to_string()),
+            false,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )
+        .expect("the third replay must commit");
+
+        harness.faults.clear();
+        let verify_dir = TempDir::new().unwrap();
+        let verify_path = verify_dir.path().join("verify.redb");
+        let _authority = block_on_state_sync(rocky_core::state_sync::download_state(
+            &harness.pod_b.cfg,
+            &verify_path,
+            false,
+        ))
+        .unwrap();
+        let rows = StateStore::open(&verify_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+
+        assert!(
+            rows.iter().any(|row| row.plan_id == "existing-run-winner"),
+            "the winner's row must survive the replay: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.reason == "replayed freeze")
+                .count(),
+            1,
+            "the freeze row must land exactly once across the replays: {rows:?}"
+        );
+    }
+
     /// Exhaustion propagates the typed conflict through the CLI layer, so the
     /// command exits nonzero even with `on_upload_failure = "skip"`. The
     /// existing remote winner remains the only ledger row, while the
