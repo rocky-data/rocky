@@ -145,7 +145,7 @@ pub enum OperandDialect {
 }
 
 impl OperandDialect {
-    const ALL: [OperandDialect; 8] = [
+    pub(crate) const ALL: [OperandDialect; 8] = [
         OperandDialect::DuckDb,
         OperandDialect::Snowflake,
         OperandDialect::Databricks,

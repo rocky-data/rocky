@@ -2702,23 +2702,24 @@ fn collect_refs_from_expr(expr: &Expr, file_path: &str, ref_map: &mut ReferenceM
 /// Whether `SUM` over `DECIMAL(p,s)` is a decimal of scale `s` on every
 /// warehouse the model runs on (#2398).
 ///
-/// DuckDB, Snowflake, Databricks, Trino, SQL Server, PostgreSQL and Redshift
-/// keep the input's scale. BigQuery does not: it drops the digits of a
-/// parameterized `NUMERIC(p,s)` column in an expression, so the sum is a plain
-/// `NUMERIC` (scale 9). With no known warehouse the model may run on BigQuery,
-/// so the scale is not claimed: a claimed scale turns a contract mismatch into
-/// `E011`, and a false `E011` on a correct contract is worse than `I003`.
+/// DuckDB, Snowflake, Databricks, Trino, SQL Server and Redshift return
+/// `DECIMAL(_, s)`. BigQuery does not: it drops the digits of a parameterized
+/// `NUMERIC(p,s)` column in an expression, so the sum is a plain `NUMERIC`
+/// (scale 9). PostgreSQL returns an unconstrained `numeric`, which states no
+/// scale; it counts as not keeping one until a live run settles it. With no
+/// known warehouse the model may run on either, so the scale is not claimed:
+/// a claimed scale turns a contract mismatch into `E011`, and a false `E011`
+/// on a correct contract is worse than `I003`.
 fn sum_keeps_decimal_scale(target: &OperandTarget) -> bool {
     let dialects = target.known_dialects();
     !dialects.is_empty()
         && dialects.iter().all(|dialect| match dialect {
-            OperandDialect::BigQuery => false,
+            OperandDialect::BigQuery | OperandDialect::Postgres => false,
             OperandDialect::DuckDb
             | OperandDialect::Snowflake
             | OperandDialect::Databricks
             | OperandDialect::Trino
             | OperandDialect::SqlServer
-            | OperandDialect::Postgres
             | OperandDialect::Redshift => true,
         })
 }
@@ -5833,6 +5834,14 @@ mod tests {
     /// Typecheck `sql` as model `m` over a source `t` with `d DECIMAL(10,2)
     /// NOT NULL`, `x INT NOT NULL` and `n STRING NOT NULL`.
     fn typecheck_over_decimal_t(sql: &str) -> Vec<(String, RockyType, bool)> {
+        typecheck_over_decimal_t_on(sql, duckdb())
+    }
+
+    /// [`typecheck_over_decimal_t`] for a model that runs on `target`.
+    fn typecheck_over_decimal_t_on(
+        sql: &str,
+        target: OperandTarget,
+    ) -> Vec<(String, RockyType, bool)> {
         let sources = HashMap::from([(
             "t".to_string(),
             source_schema(&[
@@ -5855,12 +5864,91 @@ mod tests {
             &sources,
             &project.models,
             None,
-            &TargetDialects::uniform(duckdb()),
+            &TargetDialects::uniform(target),
         );
         result.typed_models["m"]
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect()
+    }
+
+    /// #2398: where the model may run on BigQuery or PostgreSQL, or its
+    /// warehouse is not known, a decimal sum claims no scale, on the lineage
+    /// path (the bare aggregate) and on the expression path (windowed, inside
+    /// `COALESCE`, through a CTE) alike. On DuckDB it keeps scale 2.
+    #[test]
+    fn sum_over_a_decimal_claims_no_scale_without_a_scale_keeping_warehouse() {
+        let sqls = [
+            ("SELECT SUM(d) AS s FROM t", true),
+            ("SELECT SUM(t.d) OVER (PARTITION BY n) AS s FROM t", true),
+            ("SELECT COALESCE(SUM(d), 0) AS s FROM t", false),
+            (
+                "WITH c AS (SELECT n, SUM(d) AS s FROM t GROUP BY n) SELECT s FROM c",
+                true,
+            ),
+        ];
+        let targets: [(&str, OperandTarget, Option<u8>); 5] = [
+            ("unconfigured", OperandTarget::Unconfigured, None),
+            ("bigquery", Some(OperandDialect::BigQuery).into(), None),
+            ("postgres", Some(OperandDialect::Postgres).into(), None),
+            (
+                "duckdb and bigquery",
+                OperandTarget::Targets {
+                    dialects: vec![OperandDialect::DuckDb, OperandDialect::BigQuery],
+                    unruled: Vec::new(),
+                },
+                None,
+            ),
+            ("duckdb", duckdb(), Some(2)),
+        ];
+        for (label, target, scale) in targets {
+            for (sql, nullable) in sqls {
+                assert_eq!(
+                    typecheck_over_decimal_t_on(sql, target.clone()),
+                    vec![(
+                        "s".to_string(),
+                        RockyType::DecimalUnsized { scale },
+                        nullable
+                    )],
+                    "{label}: {sql}"
+                );
+            }
+        }
+
+        // Expression inference alone, with no target in the scope.
+        let scope = TypeScope::new();
+        let (ty, _) = infer_expr_type(&parse_expr("SUM(CAST(1 AS DECIMAL(10,2)))"), &scope);
+        assert_eq!(ty, RockyType::DecimalUnsized { scale: None });
+    }
+
+    /// #2398: each warehouse's answer, so flipping any one arm fails.
+    #[test]
+    fn sum_keeps_decimal_scale_per_dialect() {
+        use OperandDialect as D;
+        let expected = [
+            (D::DuckDb, true),
+            (D::Snowflake, true),
+            (D::Databricks, true),
+            (D::Trino, true),
+            (D::SqlServer, true),
+            (D::Redshift, true),
+            (D::BigQuery, false),
+            (D::Postgres, false),
+        ];
+        assert_eq!(expected.len(), OperandDialect::ALL.len());
+        for (dialect, keeps) in expected {
+            assert_eq!(
+                sum_keeps_decimal_scale(&Some(dialect).into()),
+                keeps,
+                "{dialect:?}"
+            );
+        }
+        assert!(!sum_keeps_decimal_scale(&OperandTarget::Unconfigured));
+        // A target this crate has no rules for (ClickHouse) is not known.
+        assert!(!sum_keeps_decimal_scale(&OperandTarget::Targets {
+            dialects: vec![D::DuckDb],
+            unruled: vec!["clickhouse".to_string()],
+        }));
     }
 
     /// #2356: `SUM` over a DECIMAL is a decimal whose digits Rocky does not
