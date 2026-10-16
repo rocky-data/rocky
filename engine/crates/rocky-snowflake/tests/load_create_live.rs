@@ -29,13 +29,14 @@
 //! -> BOOLEAN, joined_at -> TIMESTAMP_NTZ) and (2) lands the rows.
 //!
 //! **Snowflake-specific test details (load-bearing).**
-//! - The loader's `format_target` emits an UNQUOTED `db.schema.table` ref, so
-//!   Snowflake folds the schema and table names to UPPER. Every reference in
-//!   this test (schema create/drop, the load target, and the verification
-//!   queries) therefore stays unquoted too, so they resolve the same folded
-//!   objects the loader's CREATE TABLE produced. The data *columns*, by
-//!   contrast, the loader creates double-quoted lowercase (`"id"`, `"name"`,
-//!   …) — so verification queries reference columns double-quoted.
+//! - The loader quotes the target as written (`"db"."schema"."table"`, the
+//!   same string as `SnowflakeSqlDialect::format_table_ref`), so Snowflake
+//!   does not fold it (#2413). Every reference in this test (schema
+//!   create/drop, the load target, and the verification queries) is quoted
+//!   the same way, so they resolve the object the loader created. The
+//!   database name is quoted too, so `SNOWFLAKE_TEST_DATABASE` must match how
+//!   Snowflake stores it (usually upper case). The data *columns* are also
+//!   double-quoted lowercase (`"id"`, `"name"`, …).
 //! - The staging schema uses the `rocky_load_create_test_*` prefix with a
 //!   microsecond suffix for per-run isolation, and is dropped CASCADE before
 //!   assertions so a failed assertion still leaves the sandbox clean.
@@ -91,11 +92,12 @@ fn schema_suffix() -> u128 {
 }
 
 async fn create_schema(adapter: &SnowflakeWarehouseAdapter, database: &str, schema: &str) {
-    // Unquoted, matching `format_target`: Snowflake folds the schema name to
-    // UPPER, so the loader's later unquoted CREATE TABLE resolves the same
-    // schema object.
+    // Quoted as written, matching the loader's target ref, so the loader's
+    // CREATE TABLE resolves this same (lowercase) schema object.
     adapter
-        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {database}.{schema}"))
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS \"{database}\".\"{schema}\""
+        ))
         .await
         .expect("create schema");
 }
@@ -103,15 +105,15 @@ async fn create_schema(adapter: &SnowflakeWarehouseAdapter, database: &str, sche
 async fn drop_schema(adapter: &SnowflakeWarehouseAdapter, database: &str, schema: &str) {
     let _ = adapter
         .execute_statement(&format!(
-            "DROP SCHEMA IF EXISTS {database}.{schema} CASCADE"
+            "DROP SCHEMA IF EXISTS \"{database}\".\"{schema}\" CASCADE"
         ))
         .await;
 }
 
 /// Read the warehouse data type for `column` of `table` from
-/// `information_schema.columns`. Column/table identifiers were created
-/// unquoted-table / quoted-lowercase-columns by the loader, so they live
-/// upper-cased (table) / lowercase (columns) — match that here.
+/// `information_schema.columns`. The loader created the schema, table and
+/// columns quoted as written, so information_schema stores them lowercase,
+/// exactly as passed here.
 async fn column_type(
     adapter: &SnowflakeWarehouseAdapter,
     database: &str,
@@ -119,19 +121,12 @@ async fn column_type(
     table: &str,
     column: &str,
 ) -> Option<String> {
-    // `format_target` leaves schema + table unquoted, so Snowflake folds both
-    // to UPPER. information_schema stores names case-sensitively as resolved,
-    // so the SCHEMA / TABLE_NAME literals must be uppercased to match. The data
-    // columns were created double-quoted lowercase, so COLUMN_NAME stays
-    // lowercase.
     let result = adapter
         .execute_query(&format!(
-            "SELECT DATA_TYPE FROM {database}.INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = '{schema_upper}' \
-             AND TABLE_NAME = '{table_upper}' \
-             AND COLUMN_NAME = '{column}'",
-            schema_upper = schema.to_uppercase(),
-            table_upper = table.to_uppercase(),
+            "SELECT DATA_TYPE FROM \"{database}\".INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = '{schema}' \
+             AND TABLE_NAME = '{table}' \
+             AND COLUMN_NAME = '{column}'"
         ))
         .await
         .ok()?;
@@ -144,11 +139,11 @@ async fn count_rows(
     schema: &str,
     table: &str,
 ) -> Option<i64> {
-    // Schema + table unquoted (UPPER-folded, matching the loader); the COUNT
-    // alias is quoted only to fix the output column case for the reader.
+    // Quoted as written, matching the loader; the COUNT alias is quoted only
+    // to fix the output column case for the reader.
     let result = adapter
         .execute_query(&format!(
-            "SELECT COUNT(*) AS \"n\" FROM {database}.{schema}.{table}"
+            "SELECT COUNT(*) AS \"n\" FROM \"{database}\".\"{schema}\".\"{table}\""
         ))
         .await
         .ok()?;
@@ -164,10 +159,10 @@ async fn fetch_name(
     table: &str,
     id: i64,
 ) -> Option<String> {
-    // Schema + table unquoted (UPPER-folded); data columns quoted lowercase.
+    // Schema, table and data columns all quoted as written (lowercase).
     let result = adapter
         .execute_query(&format!(
-            "SELECT \"name\" FROM {database}.{schema}.{table} WHERE \"id\" = {id}"
+            "SELECT \"name\" FROM \"{database}\".\"{schema}\".\"{table}\" WHERE \"id\" = {id}"
         ))
         .await
         .ok()?;
@@ -189,7 +184,7 @@ async fn live_load_local_csv_creates_typed_table_and_lands_rows() {
 
     let suffix = schema_suffix();
     let schema = format!("rocky_load_create_test_{suffix}");
-    let table = "people"; // created unquoted -> folds to PEOPLE.
+    let table = "people"; // created quoted as written -> stays `people`.
 
     create_schema(&adapter, &database, &schema).await;
 

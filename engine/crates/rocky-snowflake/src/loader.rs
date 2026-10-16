@@ -105,21 +105,19 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
     })
 }
 
-/// Render a Snowflake target as `db.schema.table` (Snowflake uses the same
-/// 3-part form as Databricks for fully-qualified references). Each segment is
-/// validated as a SQL identifier so the result is safe to interpolate.
+/// Render a Snowflake load target as `"db"."schema"."table"`.
+///
+/// Delegates to [`SnowflakeSqlDialect::format_table_ref`], which validates
+/// each part as a SQL identifier and then quotes it as written. Every
+/// statement the loader issues against the target (`CREATE TABLE IF NOT
+/// EXISTS`, `DELETE FROM`, `COPY INTO`) uses this one string. So `rocky load`
+/// names the same object as `rocky run` and as the contract gate's staging
+/// drop, describe and promote. Snowflake does not fold a quoted name, so
+/// `marts` and `MARTS` are different schemas (#2413).
 fn format_target(target: &TableRef) -> AdapterResult<String> {
-    validate_identifier(&target.schema).map_err(AdapterError::new)?;
-    validate_identifier(&target.table).map_err(AdapterError::new)?;
-    if target.catalog.is_empty() {
-        Ok(format!("{}.{}", target.schema, target.table))
-    } else {
-        validate_identifier(&target.catalog).map_err(AdapterError::new)?;
-        Ok(format!(
-            "{}.{}.{}",
-            target.catalog, target.schema, target.table
-        ))
-    }
+    SnowflakeSqlDialect
+        .format_table_ref(&target.catalog, &target.schema, &target.table)
+        .map_err(AdapterError::new)
 }
 
 /// Map a [`rocky_core::seeds`]-inferred generic SQL type to its Snowflake
@@ -362,34 +360,63 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn sdk_ref(catalog: &str, schema: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
     #[test]
     fn test_format_target_fully_qualified() {
-        let t = TableRef {
-            catalog: "DB".into(),
-            schema: "RAW".into(),
-            table: "ORDERS".into(),
-        };
-        assert_eq!(format_target(&t).unwrap(), "DB.RAW.ORDERS");
+        let t = sdk_ref("DB", "RAW", "ORDERS");
+        assert_eq!(format_target(&t).unwrap(), "\"DB\".\"RAW\".\"ORDERS\"");
     }
 
     #[test]
     fn test_format_target_no_catalog() {
-        let t = TableRef {
-            catalog: String::new(),
-            schema: "RAW".into(),
-            table: "ORDERS".into(),
-        };
-        assert_eq!(format_target(&t).unwrap(), "RAW.ORDERS");
+        let t = sdk_ref("", "RAW", "ORDERS");
+        assert_eq!(format_target(&t).unwrap(), "\"RAW\".\"ORDERS\"");
+    }
+
+    /// #2413: the load target is quoted as written, never folded. It names
+    /// exactly what `format_table_ref` names, which is the string `rocky run`
+    /// writes and the contract gate's staging drop / describe / promote use.
+    #[test]
+    fn test_format_target_quotes_as_written_like_format_table_ref() {
+        let dialect = SnowflakeSqlDialect;
+        for (catalog, schema, table) in [
+            ("DB", "marts", "t"),
+            ("DB", "MARTS", "T"),
+            ("", "marts", "t"),
+            ("", "MARTS", "T"),
+            ("db", "marts", "t__rocky_stg"),
+        ] {
+            let target = format_target(&sdk_ref(catalog, schema, table)).unwrap();
+            let expected = dialect.format_table_ref(catalog, schema, table).unwrap();
+            assert_eq!(target, expected, "{catalog}.{schema}.{table}");
+        }
+        let lower = format_target(&sdk_ref("DB", "marts", "t")).unwrap();
+        let upper = format_target(&sdk_ref("DB", "MARTS", "T")).unwrap();
+        assert_eq!(lower, "\"DB\".\"marts\".\"t\"");
+        assert_eq!(upper, "\"DB\".\"MARTS\".\"T\"");
+        assert_ne!(
+            lower, upper,
+            "a lowercase target must not fold to upper case"
+        );
     }
 
     #[test]
     fn test_format_target_rejects_injection() {
-        let t = TableRef {
-            catalog: "DB".into(),
-            schema: "RAW; DROP TABLE x; --".into(),
-            table: "ORDERS".into(),
-        };
-        assert!(format_target(&t).is_err());
+        for t in [
+            sdk_ref("DB", "RAW; DROP TABLE x; --", "ORDERS"),
+            sdk_ref("DB", "RAW", "ORDERS\" x"),
+            sdk_ref("DB\" x", "RAW", "ORDERS"),
+            sdk_ref("", "RAW", "ORDERS; --"),
+        ] {
+            assert!(format_target(&t).is_err(), "{t:?}");
+        }
     }
 
     #[test]

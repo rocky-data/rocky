@@ -769,6 +769,151 @@ async fn test_loader_local_csv_creates_typed_table() {
     assert!(result.bytes_read > 0);
 }
 
+/// `ref_sql` as it appears inside the JSON request body: each `"` arrives
+/// escaped as `\"`.
+fn json_body_fragment(ref_sql: &str) -> String {
+    let quoted = serde_json::to_string(ref_sql).unwrap();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+fn ok_statement(handle: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "statementHandle": handle,
+        "code": "00000",
+        "message": "ok",
+        "statementStatusUrl": "",
+        "resultSetMetaData": null,
+        "data": null
+    }))
+}
+
+/// Run a local-CSV load with `create_table` and `truncate_first` against
+/// `DB.<schema>.<table>`. Every statement that names the target must name
+/// exactly what `SnowflakeSqlDialect::format_table_ref` names. A request
+/// that matches no mock gets a 404, so an unquoted or folded target fails
+/// the load.
+async fn assert_load_statements_name_format_table_ref(schema: &str, table: &str) {
+    use rocky_core::traits::SqlDialect;
+    use rocky_snowflake::dialect::SnowflakeSqlDialect;
+    use std::io::Write;
+
+    let target_sql = SnowflakeSqlDialect
+        .format_table_ref("DB", schema, table)
+        .unwrap();
+    assert_eq!(target_sql, format!("\"DB\".\"{schema}\".\"{table}\""));
+    let target_body = json_body_fragment(&target_sql);
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(format!(
+            "CREATE TABLE IF NOT EXISTS {target_body} ("
+        )))
+        .respond_with(ok_statement("sf-create-table"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(format!(
+            "\"statement\":\"DELETE FROM {target_body}\""
+        )))
+        .respond_with(ok_statement("sf-delete"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("CREATE TEMPORARY STAGE"))
+        .respond_with(ok_statement("sf-create-stage"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("PUT 'file://"))
+        .respond_with(ok_statement("sf-put"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains(format!(
+            "COPY INTO {target_body} FROM @"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-copy",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 1,
+                "rowType": [
+                    {"name": "rows_loaded", "type": "FIXED", "nullable": false}
+                ]
+            },
+            "data": [["2"]]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("DROP STAGE"))
+        .respond_with(ok_statement("sf-drop-stage"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut csv = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+    csv.write_all(b"id,name\n1,alice\n2,bob\n").unwrap();
+    csv.flush().unwrap();
+
+    let loader = SnowflakeLoaderAdapter::new(Arc::new(test_connector(&server)));
+    let target = TableRef {
+        catalog: "DB".into(),
+        schema: schema.into(),
+        table: table.into(),
+    };
+    let options = LoadOptions {
+        create_table: true,
+        truncate_first: true,
+        ..Default::default()
+    };
+    let result = loader
+        .load(
+            &LoadSource::LocalFile(csv.path().to_path_buf()),
+            &target,
+            &options,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("load into DB.{schema}.{table} failed: {e}"));
+    assert_eq!(result.rows_loaded, 2);
+}
+
+/// #2413: `rocky load` quotes the target as written, like `rocky run`. A
+/// lowercase `marts` target lands in `"marts"`, not a folded `MARTS`, and an
+/// upper-case target is unchanged.
+#[tokio::test]
+async fn test_loader_quotes_target_as_written_in_every_statement() {
+    assert_load_statements_name_format_table_ref("marts", "t").await;
+    assert_load_statements_name_format_table_ref("MARTS", "T").await;
+}
+
+/// #2413: the contract gate loads into `<table>__rocky_stg` through the
+/// loader, then drops, describes and promotes it via `format_table_ref`. The
+/// loader must name the same quoted staging object.
+#[tokio::test]
+async fn test_loader_quotes_contract_staging_table_as_written() {
+    assert_load_statements_name_format_table_ref("marts", "t__rocky_stg").await;
+}
+
 /// Bearer token is sent correctly in the Authorization header for OAuth
 /// auth, and the matching `X-Snowflake-Authorization-Token-Type: OAUTH`
 /// header rides alongside it.

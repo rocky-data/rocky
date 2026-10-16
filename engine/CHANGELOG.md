@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On Snowflake, `rocky load` now quotes the target database, schema and table as written, the same as `rocky run` (#2413). This covers `CREATE TABLE IF NOT EXISTS`, `DELETE FROM` and `COPY INTO`. Before, the target was unquoted, so `marts.t` landed in `MARTS.T` while `rocky run` wrote `"marts"."t"`. The contract-gated load also loaded its staging table unquoted while it dropped, described and promoted it quoted. All load statements now name the same object.
+  - Upper-case configs (`MARTS`) behave as before.
+  - A lowercase load target that relied on folding now writes to `"marts"`, not `MARTS`. The old `MARTS` table stays behind. With `create_table` off, a load into a table that exists only as `MARTS.T` now fails with table not found. To keep the old target, write the names in upper case.
+  - The database name in config must match how Snowflake stores it, usually upper case.
+  - Still unquoted: the database name in two `information_schema` reads (the batch column describe and the table listing). #2413 stays open for them.
+  - Not run against a live Snowflake account. The live check is `rocky-snowflake/tests/load_create_live.rs` (`#[ignore]`, needs credentials).
+
 ## [1.85.1] — 2026-10-16
 
 ### Fixed
