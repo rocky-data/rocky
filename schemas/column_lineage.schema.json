@@ -97,7 +97,7 @@
           "type": "string"
         },
         {
-          "description": "A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.",
+          "description": "A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a `VALUES` body.",
           "enum": [
             "unmodelled_relation"
           ],

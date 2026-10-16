@@ -66,7 +66,7 @@ class LineageGap7(StrEnum):
 
 class LineageGap8(StrEnum):
     """
-    A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, or a `VALUES` body.
+    A relation the extractor does not read: `PIVOT`, `UNNEST`, a table function, `APPLY`, `ARRAY JOIN`, `LATERAL VIEW`, `CONNECT BY`, or a `VALUES` body.
     """
 
     unmodelled_relation = "unmodelled_relation"

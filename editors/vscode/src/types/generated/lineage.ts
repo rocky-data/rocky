@@ -38,7 +38,7 @@ export interface LineageOutput {
   downstream: string[];
   edges: LineageEdgeRecord[];
   /**
-   * Models in this view (the focal model and the models it reads or that read it) whose lineage is known to be incomplete, sorted by name (#2377). Impact through them may be under-reported. `[]` means none.
+   * Models in this view (the focal model and every model upstream and downstream of it) whose lineage is known to be incomplete, sorted by name (#2377). Impact through them may be under-reported. `[]` means none.
    *
    * Always written. A payload with no such field comes from an older build: read it as unknown, never as complete.
    */
