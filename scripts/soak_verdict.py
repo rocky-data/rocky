@@ -756,7 +756,8 @@ def gate_log_corroboration(run: dict) -> list[dict]:
     the child's run record exists. The harness's own periodic ``GET
     /api/v1/runs`` is exactly the kind of third-party opener that induces it, so
     a two-sided equality would hard-FAIL a 24h gate on the harness's own
-    measurement.
+    measurement. In ``harvest_mode=end`` the harness makes no such reads while
+    serve runs, so a ``state_busy`` tick there points at some other opener.
 
     The bug-bearing direction is the log claiming MORE executions than the
     history has durable records for.
@@ -1255,6 +1256,12 @@ def main() -> int:
 
     print(f"\n=== soak verdict: {result['verdict']} ===")
     metrics = result["metrics"]
+    # Which arm of the #1416 experiment this was; meta.json predating the mode
+    # field is the polled harness.
+    mode = result["meta"].get("harvest_mode", "poll")
+    print(f"  harvest_mode={mode} "
+          + ("(ledger read once from the state file after shutdown)" if mode == "end"
+             else f"(GET /runs every {result['meta'].get('harvest_interval', '?')}s)"))
     if "ticks" in metrics:
         t = metrics["ticks"]
         print(f"  ticks={t['count']} executions={t['sum_executed']} fires={t['harvested_fires']} "
