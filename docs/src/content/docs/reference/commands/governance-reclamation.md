@@ -246,7 +246,9 @@ Read-only. Only mutating enforcement seams record decisions — reads are never 
 
 Each decision records two things about the actor. The class (`human` or `agent`) is what the policy gates enforce. The principal id is a name for who acted. Set it with the global `--principal-id` flag or `ROCKY_PRINCIPAL_ID`. When neither is set, the id is `unnamed`. The text output shows both as `class(id)`, for example `agent(mcp-worker)`.
 
-Each JSON entry carries `principal_id`, `principal_id_source` (`flag`, `env`, `mcp_profile` or `default`) and `principal_id_verified`. The id is self-asserted, so `principal_id_verified` is always `false`. A row written before ids existed has `principal_id: null`, and the text output shows `unrecorded`. An `--actor <ID>` filter cannot match those rows. The output counts them in `unattributed_skipped`, and the text output prints a note.
+Each JSON entry carries `kind`: `evaluation` for a policy decision, or `verify_after_custody`, `freeze`, `unfreeze` or `approval`. Only `evaluation` rows count in the scorecard and in the brief's counts. An `approval` row comes from `rocky review --approve`. Its `effect` is `allow` as a sign-off, not a policy verdict, and `approval_channel` names the channel (`cli` or `http_api`). The text output prints a row that is not an evaluation by its kind, for example `approval (cli) [effect allow]`.
+
+Each JSON entry also carries `principal_id`, `principal_id_source` (`flag`, `env`, `mcp_profile` or `default`) and `principal_id_verified`. The id is self-asserted, so `principal_id_verified` is always `false`. A row written before ids existed has `principal_id: null`, and the text output shows `unrecorded`. An `--actor <ID>` filter cannot match those rows. The output counts them in `unattributed_skipped`, and the text output prints a note.
 
 `rocky serve` answers the same data over HTTP:
 
@@ -273,10 +275,30 @@ rocky review <plan-id> --status      # typed, read-only: is the sign-off marker 
 |------|------|---------|-------------|
 | `--queue` | `bool` | `false` | List pending `require_review` escalations, ranked by blast radius, change class, and staleness. |
 | `--base <REF>` | `string` | `HEAD` | Git ref to diff the working-tree models against. |
-| `--approve` | `bool` | `false` | Record the sign-off marker. Without it, the review is a dry run. |
+| `--approve` | `bool` | `false` | Record an approval row in the policy-decision ledger, then the sign-off marker. Without it, the review is a dry run. |
 | `--status` | `bool` | `false` | Report the plan's review state without changing it: whether a well-formed marker naming the plan exists, who approved it and when, and the plan's product binding. Conflicts with `--approve` and `--queue`. |
 | `--models <DIR>` | `path` | `models` | Models directory used to rank the queue by downstream blast radius. |
 
-`rocky apply` refuses an AI-authored, policy-escalated, `gc`, `backfill`, or `restore` plan until a review marker exists for it. Approving records who signed off, and when, into the same ledger `rocky audit` reads.
+`rocky apply` refuses an AI-authored, policy-escalated, `gc`, `backfill`, or `restore` plan until a review marker exists for it. `--approve` does two things, in this order:
+
+1. It records one approval row in the policy-decision ledger that `rocky audit` reads. The row goes to the `[state]` backend: the local state file, or the shared remote state. A remote write uses the same fail-closed seam as `rocky policy freeze`: download, record, upload, and under `concurrency_control = "cas"` a replay on a conflict. If the row cannot be recorded, no marker is written and the plan stays blocked.
+2. It writes the review marker that `rocky apply` checks.
+
+```
+rocky review <plan-id> --approve
+  ledger row ── fails ──▶ error, no marker, apply stays blocked
+      │
+   recorded
+      ▼
+  marker ── fails ──▶ error names the row: "approval recorded as <decision_ref>"
+      │
+   written ──▶ rocky apply <plan-id> runs on this machine
+```
+
+The marker is a local file, so it unblocks `rocky apply` on this machine only. The ledger row is visible to every reader of the shared ledger. If the marker write fails after the row is recorded, run `--approve` again. That records a second row.
+
+The row names the approver by principal id (`--principal-id` or `ROCKY_PRINCIPAL_ID`, else `unnamed`) and class (`human` or `agent`). It also names the channel: `cli` for a terminal and for `rocky mcp`, and `http_api` for an approval from `rocky serve`. An approval from the browser UI records `unnamed`. The server's `ROCKY_PRINCIPAL_ID` and `ROCKY_PRINCIPAL` name the operator who started it, not the person who clicked, so the approve job drops them. The approver's git email stays in the local marker only. `--output json` gives the row's ledger key in `decision_ref`.
+
+For a `gc`, `restore`, `compact` or `archive` plan, `--approve` reads `rocky.toml` to find the `[state]` backend. With no `rocky.toml`, the row goes to the local state file. A `rocky.toml` that is present but does not load refuses the approval, with no row and no marker. A dry run of these plans reads no config.
 
 The marker must do more than exist. Apply parses it and checks that it names the exact plan; a truncated marker, or one copied from another plan, is refused with its own distinct error. The marker is written atomically (staged, then renamed), so a crash mid-approval leaves no marker at all. `--status` reads the same oracle and reports it as typed JSON — a tool that polls for approval should use it instead of probing the marker file.

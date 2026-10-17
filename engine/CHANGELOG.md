@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 replays on a conflict. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.
+  - The row is a plan-level `allow` with no rule, so the autonomy budget, the freeze reader and the review queue do not act on it. It names the approver's principal id (`--principal-id` / `ROCKY_PRINCIPAL_ID`, else `unnamed`) and class, the channel (`cli` for a terminal and for `rocky mcp`, `http_api` for `rocky serve`), the base ref and the breaking-change count. The approver's git email stays in the local marker only.
+  - An approval from the browser UI records an `unnamed` principal over `http_api`. The approve job no longer passes the server's `ROCKY_PRINCIPAL_ID` and `ROCKY_PRINCIPAL` to its child, because they name the operator who started `rocky serve`, not the person who clicked. Named tokens will name that person later. The other job kinds still pass them.
+  - The review marker is still a local file. It unblocks `rocky apply` on the machine that wrote it only; the ledger row is what other readers of a shared ledger see.
+  - A `gc`, `restore`, `compact` or `archive` approval now reads `rocky.toml` to find the `[state]` backend. A `rocky.toml` that is present but does not load now refuses the approval, with no row and no marker. Before, these kinds approved without reading the config. No `rocky.toml` still approves, into the local state file.
+  - `ReviewOutput` gains `decision_ref`, the ledger key of the row.
+- `rocky audit`, `rocky audit --for` and `rocky brief` show the approval row as `kind: approval`, not as a policy `allow`. `AuditDecisionEntry` gains `kind` and `approval_channel`, and `BriefDecisionKind` gains `approval`. The scorecard and the brief's counts leave approval rows out. The scorecard's `escalation_latency` note now says approvals are recorded but the metric is not computed yet.
+- State schema v32 -> v33. A v32 engine would read an approval row as a policy `allow` and count it. A v32 store opened for writing is stamped v33 in place and keeps every record; there is no table change. Remote state carries forward from the `v32/` key, and the first upload writes `v33/`. During a rolling upgrade, a v32 process keeps reading and writing `v32/`: after the first v33 upload, a row it records there, such as a freeze, is not seen by v33 processes until it upgrades. A rollback reads the stale `v32/` key.
+
 ### Fixed
 
 - A process adapter (an out-of-process adapter that talks JSON-RPC over stdin and stdout) can no longer block Rocky forever, fill its memory, or outlive it. `ProcessAdapter` now bounds every exchange and stops the adapter when a bound is hit.
