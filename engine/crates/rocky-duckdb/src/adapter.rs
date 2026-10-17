@@ -32,6 +32,148 @@ fn first_u64(rows: &[Vec<serde_json::Value>]) -> Option<u64> {
     rows.first()?.first()?.as_str()?.parse().ok()
 }
 
+/// A file-backed DuckDB database a measured table lives in.
+struct FileDatabase {
+    /// The catalog name DuckDB gave the database.
+    name: String,
+    /// The database file, as `duckdb_databases()` reports it.
+    path: String,
+}
+
+fn table_label(table: &TableRef) -> String {
+    format!("{}.{}.{}", table.catalog, table.schema, table.table)
+}
+
+/// The file-backed DuckDB database `table` lives in, or `None` for an
+/// in-memory or non-DuckDB catalog (nothing to measure).
+fn resolve_file_database(
+    conn: &DuckDbConnector,
+    table: &TableRef,
+) -> AdapterResult<Option<FileDatabase>> {
+    validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
+    validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+    let catalog_filter = if table.catalog.is_empty() {
+        "database_name = current_catalog()".to_string()
+    } else {
+        validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+        format!("lower(database_name) = lower('{}')", table.catalog)
+    };
+    let db = conn
+        .execute_sql(&format!(
+            "SELECT database_name, path, type FROM duckdb_databases() WHERE {catalog_filter}"
+        ))
+        .map_err(AdapterError::new)?;
+    let Some(row) = db.rows.first() else {
+        return Err(AdapterError::msg("the table's database is not attached"));
+    };
+    let Some(name) = row.first().and_then(|v| v.as_str()).map(str::to_string) else {
+        return Err(AdapterError::msg("duckdb_databases() returned no name"));
+    };
+    let path = row.get(1).and_then(|v| v.as_str()).map(str::to_string);
+    let is_duckdb = row.get(2).and_then(|v| v.as_str()) == Some("duckdb");
+    let Some(path) = path.filter(|_| is_duckdb) else {
+        return Ok(None);
+    };
+    validation::validate_identifier(&name).map_err(AdapterError::new)?;
+    Ok(Some(FileDatabase { name, path }))
+}
+
+/// Plain `CHECKPOINT` of one database. Never `FORCE CHECKPOINT`, which
+/// aborts other connections' open transactions.
+fn checkpoint_database(conn: &DuckDbConnector, db: &FileDatabase) -> AdapterResult<()> {
+    conn.execute_statement(&format!("CHECKPOINT \"{}\"", db.name))
+        .map_err(AdapterError::new)?;
+    record_checkpoint(&db.path);
+    Ok(())
+}
+
+/// The allocated-blocks figure for one table of a checkpointed database.
+fn count_allocated_bytes(
+    conn: &DuckDbConnector,
+    database: &str,
+    schema: &str,
+    name: &str,
+) -> AdapterResult<Option<StoredBytes>> {
+    let block_size = conn
+        .execute_sql(&format!(
+            "SELECT block_size FROM pragma_database_size() WHERE database_name = '{database}'"
+        ))
+        .map_err(AdapterError::new)?;
+    let block_size = first_u64(&block_size.rows)
+        .ok_or_else(|| AdapterError::msg("pragma_database_size() returned no block size"))?;
+    if block_size == 0 {
+        return Ok(None);
+    }
+
+    // Constant segments report `block_id = -1` and occupy no block.
+    let target = format!("{database}.{schema}.{name}");
+    let blocks = conn
+        .execute_sql(&format!(
+            "SELECT \
+               (SELECT count(*) FROM pragma_storage_info('{target}') \
+                WHERE NOT persistent), \
+               (SELECT count(DISTINCT b) FROM ( \
+                  SELECT block_id AS b FROM pragma_storage_info('{target}') \
+                  UNION ALL \
+                  SELECT unnest(additional_block_ids) FROM pragma_storage_info('{target}') \
+                ) WHERE b >= 0)"
+        ))
+        .map_err(AdapterError::new)?;
+    let row = blocks.rows.first();
+    let cell = |i: usize| {
+        row.and_then(|r| r.get(i))
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let (Some(not_persistent), Some(block_count)) = (cell(0), cell(1)) else {
+        return Err(AdapterError::msg(
+            "pragma_storage_info() returned no counts",
+        ));
+    };
+    // No data block (an empty table, or only constant segments): the table
+    // still has metadata this count leaves out, so 0 would be a wrong answer.
+    // Unknown instead.
+    if not_persistent > 0 || block_count == 0 {
+        return Ok(None);
+    }
+    let Some(bytes) = block_count.checked_mul(block_size) else {
+        return Err(AdapterError::msg("stored bytes overflow u64"));
+    };
+    Ok(Some(StoredBytes {
+        bytes,
+        basis: StoredBytesBasis::AllocatedBlocks,
+    }))
+}
+
+/// How many `CHECKPOINT`s the stored-bytes measurement has issued in this
+/// process, per database file. Read by tests through
+/// [`checkpoints_issued_for_test`]; one map entry per database file.
+static CHECKPOINTS_ISSUED: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(Mutex::default);
+
+fn checkpoint_key(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn record_checkpoint(path: &str) {
+    if let Ok(mut map) = CHECKPOINTS_ISSUED.lock() {
+        *map.entry(checkpoint_key(std::path::Path::new(path)))
+            .or_default() += 1;
+    }
+}
+
+/// Test hook: how many `CHECKPOINT`s [`WarehouseAdapter::stored_tables_bytes`]
+/// has issued against the database file at `path` in this process.
+#[doc(hidden)]
+pub fn checkpoints_issued_for_test(path: &std::path::Path) -> u64 {
+    CHECKPOINTS_ISSUED
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&checkpoint_key(path)).copied())
+        .unwrap_or(0)
+}
+
 /// DuckDB warehouse adapter wrapping [`DuckDbConnector`] behind the
 /// [`WarehouseAdapter`] trait.
 ///
@@ -288,110 +430,97 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
-    /// The file space a table's column segments occupy: the distinct storage
-    /// blocks they sit in, times the database's block size. An estimate
-    /// ([`StoredBytesBasis::AllocatedBlocks`]); see that variant for the error
-    /// sources.
+    /// The file space each table's column segments occupy: the distinct
+    /// storage blocks they sit in, times the database's block size. An
+    /// estimate ([`StoredBytesBasis::AllocatedBlocks`]); see that variant for
+    /// the error sources.
     ///
-    /// Checkpoints the table's database first. A small write lives in the WAL
-    /// until a checkpoint, and `pragma_storage_info` reports such segments as
-    /// not persistent with no block, so without the checkpoint a small table
-    /// would read as zero bytes. The checkpoint moves data DuckDB would move at
-    /// close anyway; it changes no table contents. Verified on DuckDB 1.5.6.
+    /// Runs one plain `CHECKPOINT` per distinct file database in the batch,
+    /// never `FORCE CHECKPOINT`. A small write lives in the WAL until a
+    /// checkpoint, and `pragma_storage_info` reports such segments as not
+    /// persistent with no block, so without it a small table reads as zero
+    /// blocks (probed on DuckDB 1.5.6: a 1,000-row and a 50-row table had 0
+    /// blocks before the checkpoint, 1 each after). The checkpoint moves data
+    /// DuckDB would move at close anyway; it changes no table contents.
     ///
-    /// Returns `Ok(None)` (unknown) for an in-memory or non-DuckDB catalog, a
-    /// zero block size, a table with no data block (empty, or only constant
-    /// segments), or any segment still not persistent after the checkpoint.
-    async fn stored_table_bytes(&self, table: &TableRef) -> AdapterResult<Option<StoredBytes>> {
-        validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
-        validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
-        let catalog_filter = if table.catalog.is_empty() {
-            "database_name = current_catalog()".to_string()
-        } else {
-            validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
-            format!("lower(database_name) = lower('{}')", table.catalog)
-        };
+    /// The whole batch holds the connection lock, so no statement lands
+    /// between a checkpoint and the counts. The runner calls this after every
+    /// model finished, so no other model's transaction is open: a
+    /// `CHECKPOINT` inside an open transaction with local changes fails and
+    /// aborts that transaction (probed on DuckDB 1.5.6).
+    ///
+    /// An entry is `None` (unknown) for an in-memory or non-DuckDB catalog, a
+    /// database whose checkpoint failed, a zero block size, a table with no
+    /// data block (empty, or only constant segments), any segment still not
+    /// persistent after the checkpoint, or a read that failed. Each failure is
+    /// logged and costs only that table's figure.
+    async fn stored_tables_bytes(
+        &self,
+        tables: &[TableRef],
+    ) -> AdapterResult<Vec<Option<StoredBytes>>> {
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = Arc::clone(&self.connector);
-        let schema = table.schema.clone();
-        let name = table.table.clone();
+        let tables = tables.to_vec();
         spawn_blocking(move || {
             let conn = conn
                 .lock()
                 .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-            // One lock for the whole read, so no statement lands between the
-            // checkpoint and the block count.
-            let db = conn
-                .execute_sql(&format!(
-                    "SELECT database_name, path, type FROM duckdb_databases() \
-                     WHERE {catalog_filter}"
-                ))
-                .map_err(AdapterError::new)?;
-            let Some(row) = db.rows.first() else {
-                return Err(AdapterError::msg("the table's database is not attached"));
-            };
-            let Some(database) = row.first().and_then(|v| v.as_str()).map(str::to_string) else {
-                return Err(AdapterError::msg("duckdb_databases() returned no name"));
-            };
-            let in_memory = row.get(1).is_none_or(serde_json::Value::is_null);
-            let is_duckdb = row.get(2).and_then(|v| v.as_str()) == Some("duckdb");
-            if in_memory || !is_duckdb {
-                return Ok(None);
+            let databases: Vec<Option<FileDatabase>> = tables
+                .iter()
+                .map(|table| match resolve_file_database(&conn, table) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::debug!(
+                            table = %table_label(table),
+                            error = %e,
+                            "could not resolve the table's database; stored bytes unknown"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            let mut checkpointed = std::collections::BTreeMap::<String, bool>::new();
+            for db in databases.iter().flatten() {
+                if checkpointed.contains_key(&db.name) {
+                    continue;
+                }
+                let ok = match checkpoint_database(&conn, db) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            database = %db.name,
+                            error = %e,
+                            "CHECKPOINT failed; stored bytes of this database's tables \
+                             are unknown (the run is not affected)"
+                        );
+                        false
+                    }
+                };
+                checkpointed.insert(db.name.clone(), ok);
             }
-            validation::validate_identifier(&database).map_err(AdapterError::new)?;
-            conn.execute_statement(&format!("CHECKPOINT \"{database}\""))
-                .map_err(AdapterError::new)?;
-
-            let block_size = conn
-                .execute_sql(&format!(
-                    "SELECT block_size FROM pragma_database_size() \
-                     WHERE database_name = '{database}'"
-                ))
-                .map_err(AdapterError::new)?;
-            let block_size = first_u64(&block_size.rows).ok_or_else(|| {
-                AdapterError::msg("pragma_database_size() returned no block size")
-            })?;
-            if block_size == 0 {
-                return Ok(None);
-            }
-
-            // Constant segments report `block_id = -1` and occupy no block.
-            let target = format!("{database}.{schema}.{name}");
-            let blocks = conn
-                .execute_sql(&format!(
-                    "SELECT \
-                       (SELECT count(*) FROM pragma_storage_info('{target}') \
-                        WHERE NOT persistent), \
-                       (SELECT count(DISTINCT b) FROM ( \
-                          SELECT block_id AS b FROM pragma_storage_info('{target}') \
-                          UNION ALL \
-                          SELECT unnest(additional_block_ids) FROM pragma_storage_info('{target}') \
-                        ) WHERE b >= 0)"
-                ))
-                .map_err(AdapterError::new)?;
-            let row = blocks.rows.first();
-            let cell = |i: usize| {
-                row.and_then(|r| r.get(i))
-                    .and_then(|v| v.as_str())
-                    .and_then(|v| v.parse::<u64>().ok())
-            };
-            let (Some(not_persistent), Some(block_count)) = (cell(0), cell(1)) else {
-                return Err(AdapterError::msg(
-                    "pragma_storage_info() returned no counts",
-                ));
-            };
-            // No data block (an empty table, or only constant segments): the
-            // table still has metadata this count leaves out, so 0 would be a
-            // wrong answer. Unknown instead.
-            if not_persistent > 0 || block_count == 0 {
-                return Ok(None);
-            }
-            let Some(bytes) = block_count.checked_mul(block_size) else {
-                return Err(AdapterError::msg("stored bytes overflow u64"));
-            };
-            Ok(Some(StoredBytes {
-                bytes,
-                basis: StoredBytesBasis::AllocatedBlocks,
-            }))
+            Ok(tables
+                .iter()
+                .zip(&databases)
+                .map(|(table, db)| {
+                    let db = db.as_ref()?;
+                    if !checkpointed.get(&db.name).copied().unwrap_or(false) {
+                        return None;
+                    }
+                    match count_allocated_bytes(&conn, &db.name, &table.schema, &table.table) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::debug!(
+                                table = %table_label(table),
+                                error = %e,
+                                "could not count the table's storage blocks; stored bytes unknown"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect())
         })
         .await
         .map_err(|e| join_error(&e))?
@@ -713,110 +842,81 @@ mod tests {
         assert!(!adapter.classify_failure(&permanent).is_retryable());
     }
 
-    /// A small table written to a file-backed database still sits in the WAL,
-    /// so this proves the checkpoint runs: the count is whole blocks and
-    /// non-zero. A larger table occupies more blocks. Each form of the name
-    /// (catalogless, three-part, attached catalog) resolves.
+    fn tref(catalog: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: catalog.into(),
+            schema: "main".into(),
+            table: table.into(),
+        }
+    }
+
+    /// One batch over five tables in two file databases issues exactly one
+    /// `CHECKPOINT` per database. The small tables still sit in the WAL
+    /// before the batch, so non-zero whole-block counts prove the checkpoint
+    /// ran before the counts. Each form of the name (catalogless, three-part,
+    /// attached catalog) resolves, and the answer keeps the input order.
     #[tokio::test]
-    async fn stored_table_bytes_counts_allocated_blocks_in_a_file_database() {
+    async fn stored_tables_bytes_checkpoints_each_database_once() {
         let dir = tempfile::TempDir::new().unwrap();
-        let adapter = DuckDbWarehouseAdapter::open(&dir.path().join("w.duckdb")).unwrap();
-        adapter
-            .execute_statement("CREATE TABLE main.small AS SELECT range AS id FROM range(10)")
-            .await
-            .unwrap();
-        adapter
-            .execute_statement(
-                "CREATE TABLE main.big AS SELECT range AS id, range * 2.5 AS amount, \
-                 'name_' || (range % 1000) AS name FROM range(1000000)",
-            )
+        let main_path = dir.path().join("w.duckdb");
+        let other_path = dir.path().join("other.duckdb");
+        let adapter = DuckDbWarehouseAdapter::open(&main_path).unwrap();
+        for sql in [
+            "CREATE TABLE main.small AS SELECT range AS id FROM range(10)".to_string(),
+            "CREATE TABLE main.big AS SELECT range AS id, range * 2.5 AS amount, \
+             'name_' || (range % 1000) AS name FROM range(1000000)"
+                .to_string(),
+            "CREATE TABLE main.empty (id BIGINT)".to_string(),
+            format!("ATTACH '{}' AS other", other_path.display()),
+            "CREATE TABLE other.main.t AS SELECT range AS id FROM range(10)".to_string(),
+        ] {
+            adapter.execute_statement(&sql).await.unwrap();
+        }
+        let got = adapter
+            .stored_tables_bytes(&[
+                tref("", "small"),
+                tref("w", "big"),
+                tref("other", "t"),
+                tref("", "empty"),
+                tref("", "missing"),
+            ])
             .await
             .unwrap();
         let block = 262_144;
-        let small = adapter
-            .stored_table_bytes(&TableRef {
-                catalog: String::new(),
-                schema: "main".into(),
-                table: "small".into(),
-            })
-            .await
-            .unwrap()
-            .expect("a file-backed table is measured");
-        assert_eq!(small.basis, StoredBytesBasis::AllocatedBlocks);
-        assert_eq!(small.bytes, block, "10 rows occupy one block");
-        let big = adapter
-            .stored_table_bytes(&TableRef {
-                catalog: "w".into(),
-                schema: "main".into(),
-                table: "big".into(),
-            })
-            .await
-            .unwrap()
-            .expect("a three-part name is measured");
+        let bytes: Vec<Option<u64>> = got.iter().map(|s| s.map(|s| s.bytes)).collect();
+        assert_eq!(bytes[0], Some(block), "10 rows occupy one block");
+        let big = bytes[1].expect("a three-part name is measured");
         assert!(
-            big.bytes > block,
-            "a million rows span blocks: {}",
-            big.bytes
+            big > block && big.is_multiple_of(block),
+            "a million rows: {big}"
         );
-        assert_eq!(big.bytes % block, 0);
-
-        adapter
-            .execute_statement(&format!(
-                "ATTACH '{}' AS other",
-                dir.path().join("other.duckdb").display()
-            ))
-            .await
-            .unwrap();
-        adapter
-            .execute_statement("CREATE TABLE other.main.t AS SELECT range AS id FROM range(10)")
-            .await
-            .unwrap();
-        let attached = adapter
-            .stored_table_bytes(&TableRef {
-                catalog: "other".into(),
-                schema: "main".into(),
-                table: "t".into(),
-            })
-            .await
-            .unwrap();
         assert_eq!(
-            attached.map(|s| s.bytes),
+            bytes[2],
             Some(block),
-            "an attached file catalog is checkpointed and measured"
+            "an attached file catalog is measured"
         );
-
-        adapter
-            .execute_statement("CREATE TABLE main.empty (id BIGINT)")
-            .await
-            .unwrap();
-        let empty = adapter
-            .stored_table_bytes(&TableRef {
-                catalog: String::new(),
-                schema: "main".into(),
-                table: "empty".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(empty, None, "no data block is unknown, not 0");
+        assert_eq!(bytes[3], None, "no data block is unknown, not 0");
+        assert_eq!(bytes[4], None, "a failed read costs only that table");
+        assert!(
+            got.iter()
+                .flatten()
+                .all(|s| s.basis == StoredBytesBasis::AllocatedBlocks)
+        );
+        assert_eq!(checkpoints_issued_for_test(&main_path), 1);
+        assert_eq!(checkpoints_issued_for_test(&other_path), 1);
     }
 
-    /// An in-memory database has no file blocks: unknown, never zero.
+    /// An in-memory database has no file blocks: unknown, never zero, and
+    /// nothing is checkpointed.
     #[tokio::test]
-    async fn stored_table_bytes_is_unknown_in_memory() {
+    async fn stored_tables_bytes_is_unknown_in_memory() {
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
         adapter
             .execute_statement("CREATE TABLE main.t AS SELECT range AS id FROM range(10)")
             .await
             .unwrap();
-        let got = adapter
-            .stored_table_bytes(&TableRef {
-                catalog: String::new(),
-                schema: "main".into(),
-                table: "t".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(got, None);
+        let got = adapter.stored_tables_bytes(&[tref("", "t")]).await.unwrap();
+        assert_eq!(got, vec![None]);
     }
 
     #[tokio::test]

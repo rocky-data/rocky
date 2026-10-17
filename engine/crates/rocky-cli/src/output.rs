@@ -1401,8 +1401,9 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub output_version: Option<rocky_core::state::OutputVersion>,
-    /// The bytes the output table stores, measured at the execution site
-    /// right after the write. `None` is unknown. [`RunOutput::to_run_record`]
+    /// The bytes the output table stores, measured in one batch after the
+    /// run's last model (`run_stored_bytes::PendingStoredBytes`). `None` is
+    /// unknown. [`RunOutput::to_run_record`]
     /// copies it onto the persisted
     /// [`rocky_core::state::ModelExecution::stored_bytes`]; `rocky cost`
     /// shows it.

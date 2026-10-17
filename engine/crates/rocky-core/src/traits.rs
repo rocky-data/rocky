@@ -659,21 +659,27 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
-    /// The bytes a table stores, read after Rocky wrote it.
+    /// The bytes each of these tables stores, read once after every model
+    /// of the run has finished.
     ///
-    /// The runner records the answer as
-    /// [`crate::state::ModelExecution::stored_bytes`] and `rocky cost` shows
-    /// it. An answer must be a measurement, never a guess: an adapter that
-    /// cannot measure a table returns `Ok(None)`, which reads as unknown.
+    /// The answer has one entry per input table, in the same order. The
+    /// runner records each as [`crate::state::ModelExecution::stored_bytes`]
+    /// and `rocky cost` shows it. An answer must be a measurement, never a
+    /// guess: an entry the adapter cannot measure is `None`, which reads as
+    /// unknown.
     ///
-    /// - **DuckDB:** the distinct storage blocks the table's column segments
-    ///   occupy, times the block size, after a `CHECKPOINT` of the table's
-    ///   database ([`crate::state::StoredBytesBasis::AllocatedBlocks`], an
-    ///   estimate). `None` for an in-memory database.
-    /// - **Every other adapter:** `Ok(None)`, the default.
+    /// - **DuckDB:** one plain `CHECKPOINT` per distinct file database in the
+    ///   batch (never `FORCE CHECKPOINT`), then, per table, the distinct
+    ///   storage blocks its column segments occupy, times the block size
+    ///   ([`crate::state::StoredBytesBasis::AllocatedBlocks`], an estimate).
+    ///   `None` for an in-memory database, and for every table of a database
+    ///   whose checkpoint fails.
+    /// - **Every other adapter:** all `None`, the default.
     ///
-    /// The content-addressed path does not call this: it records the exact
-    /// size of the Parquet files it wrote.
+    /// The runner calls this at most once per model execution phase, after
+    /// the last model, so no model's write is in flight. The content-addressed
+    /// path does not call it: it records the exact size of the Parquet files
+    /// it wrote.
     ///
     /// Like [`Self::observed_table_version`], the read is optional: make
     /// **one attempt**, with no retries and no draw from the run's retry
@@ -683,13 +689,14 @@ pub trait WarehouseAdapter: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `AdapterError` if the measurement fails. The runner records
-    /// `None` and logs at debug level. A failed read never fails the run.
-    async fn stored_table_bytes(
+    /// Returns `AdapterError` only if the whole measurement fails. The runner
+    /// then records every table as `None` and logs. A failed read never fails
+    /// the run.
+    async fn stored_tables_bytes(
         &self,
-        _table: &TableRef,
-    ) -> AdapterResult<Option<crate::state::StoredBytes>> {
-        Ok(None)
+        tables: &[TableRef],
+    ) -> AdapterResult<Vec<Option<crate::state::StoredBytes>>> {
+        Ok(vec![None; tables.len()])
     }
 
     /// Refuse a watermark filter the session would read in a zone other than
