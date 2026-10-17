@@ -1734,10 +1734,6 @@ pub(crate) fn persist_run_record(
     // succeed?" for `after`/`freshness` demands. `None` for a model-only run or
     // a multi-pipeline set (a backfill), which the reconciler never matches.
     pipeline: Option<&str>,
-    // The project root whose `products/` declare delivery deadlines: the
-    // config file's directory, as `rocky serve` resolves it. `None` records
-    // no deadlines.
-    project_root: Option<&Path>,
 ) -> bool {
     let Some(store) = state_store else {
         return false;
@@ -1765,9 +1761,20 @@ pub(crate) fn persist_run_record(
     // Delivery timing is advisory, like the record itself: a failure to read
     // the deadlines or the previous delivery leaves every field unset (never
     // half of them) and the run goes on.
-    let deadlines = project_root
-        .map(crate::commands::product::product_deadlines_in)
-        .unwrap_or_default();
+    //
+    // The deadlines come from the `products/` that `rocky product status`
+    // reads (the working directory), so a run and that command agree on which
+    // deadlines exist whatever `--config` points at.
+    let deadlines = match crate::commands::product::product_command_root() {
+        Ok(root) => crate::commands::product::product_deadlines_in(&root),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "cannot resolve the products directory; no delivery deadlines are recorded"
+            );
+            Vec::new()
+        }
+    };
     let mut stamped = record.clone();
     match rocky_core::delivery::stamp_delivery_timing(&mut stamped, store, &deadlines) {
         Ok(()) => record = stamped,
@@ -4059,7 +4066,6 @@ pub async fn run_with_explicit_contracts(
             &audit,
             // Model-only run — no single pipeline to attribute.
             None,
-            config_path.parent(),
         ));
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -4437,7 +4443,6 @@ pub async fn run_with_explicit_contracts(
                 defer_opts.project.as_ref(),
                 defer_opts.target_dialects.as_ref(),
                 &cancel,
-                config_path.parent(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -7091,7 +7096,6 @@ pub async fn run_with_explicit_contracts(
                     &config_hash,
                     &audit,
                     Some(pipeline_name),
-                    config_path.parent(),
                 );
             }
             finalize_idempotency(
@@ -7928,7 +7932,6 @@ pub async fn run_with_explicit_contracts(
         &config_hash,
         &audit,
         Some(pipeline_name),
-        config_path.parent(),
     ));
     // Owed post-copy checks retire per target, and only after this run's
     // record exists (#2235): a target this run checked, or one
@@ -8002,7 +8005,6 @@ pub async fn run_with_explicit_contracts(
             &config_hash,
             &audit,
             Some(pipeline_name),
-            config_path.parent(),
         );
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -12182,7 +12184,6 @@ pub(crate) async fn execute_backfill_set(
                 &audit,
                 // A backfill spans a model set, not a single pipeline.
                 None,
-                config_path.parent(),
             ));
 
             output.status = output.derive_run_status();
@@ -25228,7 +25229,6 @@ auto_create_schemas = true
             "cfg",
             &audit,
             Some("raw"),
-            None,
         );
         // SAFETY: serialized by TRIGGER_ENV_LOCK.
         unsafe {

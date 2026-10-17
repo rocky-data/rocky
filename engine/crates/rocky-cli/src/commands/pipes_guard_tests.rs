@@ -267,7 +267,6 @@ async fn direct_transformation_guard_refuses_bad_pipes() {
             None,
             None,
             &tokio_util::sync::CancellationToken::new(),
-            None,
         )
         .await,
     );
