@@ -257,6 +257,13 @@ pub(crate) static INTERRUPT_AFTER_COPY_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Run ids whose time_interval model cancels the run's token after its first
+/// partition succeeds (#1606): a deterministic "signal between partitions".
+#[cfg(test)]
+pub(crate) static CANCEL_AFTER_PARTITION_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 fn flush_run_watermarks(
     state: &StateStore,
     _run_id: &str,
@@ -14593,6 +14600,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     run_id,
                     output,
                     &exec_ctx,
+                    cancel,
                 )
                 .await
                 .with_context(|| format!("model '{model_name}' failed"));
@@ -16652,6 +16660,9 @@ async fn execute_time_interval_model(
     run_id: &str,
     output: &mut RunOutput,
     exec_ctx: &ExecutionContext<'_>,
+    // The run's cancellation token (#1606). Checked before the bootstrap and
+    // before each partition starts; never between a partition's statements.
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use rocky_core::plan_partition::{PartitionSelection, plan_partitions};
 
@@ -16775,6 +16786,19 @@ async fn execute_time_interval_model(
     // with the right output schema. If the metadata probe failed against a
     // live target, CREATE fails without overwriting it. Subsequent partition
     // runs use the normal DELETE+INSERT path.
+    // Cancel (#1606): a signal before any warehouse work skips every plan.
+    if cancel.is_cancelled() {
+        output.partition_summaries.push(PartitionSummary {
+            model: model_name.into(),
+            partitions_planned: plans.len(),
+            partitions_succeeded: 0,
+            partitions_failed: 0,
+            partitions_skipped: plans.len(),
+        });
+        output.interrupted = true;
+        return Ok(());
+    }
+
     let target_ref_struct = rocky_ir::TableRef {
         catalog: model.config.target.catalog.clone(),
         schema: model.config.target.schema.clone(),
@@ -16869,6 +16893,7 @@ async fn execute_time_interval_model(
                 model_name,
                 &asset_key,
                 exec_ctx,
+                cancel,
             )
         })
         .buffer_unordered(parallel_limit)
@@ -16885,10 +16910,11 @@ async fn execute_time_interval_model(
     let mut first_error: Option<(anyhow::Error, String)> = None;
     for r in results {
         match r.outcome {
-            Ok(materialization) => {
+            Ok(Some(materialization)) => {
                 output.materializations.push(materialization);
                 summary.partitions_succeeded += 1;
             }
+            Ok(None) => summary.partitions_skipped += 1,
             Err(err) => {
                 summary.partitions_failed += 1;
                 if first_error.is_none() {
@@ -16903,8 +16929,21 @@ async fn execute_time_interval_model(
         target = target_table.as_str(),
         succeeded = summary.partitions_succeeded,
         failed = summary.partitions_failed,
+        skipped = summary.partitions_skipped,
         "time_interval model execution complete"
     );
+
+    // Cancel (#1606): the skipped plans wrote no state row, so `--missing`
+    // re-plans them. A plain run does not: once any partition has a row, the
+    // first-run fill no longer applies and a plain run builds only the latest.
+    if summary.partitions_skipped > 0 {
+        output.interrupted = true;
+        warn!(
+            model = model_name,
+            skipped = summary.partitions_skipped,
+            "interrupted before every partition ran; run with --missing to build the rest"
+        );
+    }
 
     output.partition_summaries.push(summary);
 
@@ -16920,9 +16959,11 @@ async fn execute_time_interval_model(
 struct PartitionExecutionResult {
     /// Canonical partition key, used for sorting and error messages.
     partition_key: String,
-    /// Either the materialization to push into `RunOutput.materializations`,
-    /// or an error to surface after all partitions complete.
-    outcome: Result<MaterializationOutput, anyhow::Error>,
+    /// The materialization to push into `RunOutput.materializations`, `None`
+    /// when a cancel stopped the partition before it started (no state row,
+    /// no warehouse work), or an error to surface after all partitions
+    /// complete.
+    outcome: Result<Option<MaterializationOutput>, anyhow::Error>,
 }
 
 /// Execute exactly one partition: mark InProgress in the state store, generate
@@ -16946,9 +16987,19 @@ async fn run_one_partition(
     model_name: &str,
     asset_key: &[String],
     exec_ctx: &ExecutionContext<'_>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> PartitionExecutionResult {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus};
     let key = partition_plan.partition_key.clone();
+
+    // Cancel (#1606): start no new partition. This sits before the
+    // `InProgress` write, so a skipped partition leaves no state row.
+    if cancel.is_cancelled() {
+        return PartitionExecutionResult {
+            partition_key: key,
+            outcome: Ok(None),
+        };
+    }
     let partition_start = std::time::Instant::now();
     let partition_started_at = chrono::Utc::now();
 
@@ -17115,9 +17166,17 @@ async fn run_one_partition(
         chrono::Utc::now(),
     )
     .await;
+    #[cfg(test)]
+    if CANCEL_AFTER_PARTITION_FOR_TEST
+        .lock()
+        .ok()
+        .is_some_and(|mut ids| ids.remove(run_id))
+    {
+        cancel.cancel();
+    }
     PartitionExecutionResult {
         partition_key: key.clone(),
-        outcome: Ok(MaterializationOutput {
+        outcome: Ok(Some(MaterializationOutput {
             asset_key: asset_key.to_vec(),
             notes: vec![],
             attempts: Vec::new(),
@@ -17158,7 +17217,7 @@ async fn run_one_partition(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: Some(recorded_output_target(&tplan_ir)),
-        }),
+        })),
     }
 }
 
@@ -29876,6 +29935,7 @@ table = "fct_daily"
             "test-run",
             &mut output,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         {
@@ -29894,6 +29954,215 @@ table = "fct_daily"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Three daily partitions, one per plan, over an in-memory DuckDB source.
+    #[cfg(feature = "duckdb")]
+    async fn partition_cancel_fixture() -> (
+        rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        tempfile::TempDir,
+        rocky_core::models::Model,
+        rocky_core::state::StateStore,
+        [String; 3],
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let today = Utc::now().date_naive();
+        let days = [
+            today.pred_opt().unwrap().pred_opt().unwrap().to_string(),
+            today.pred_opt().unwrap().to_string(),
+            today.to_string(),
+        ];
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{} 12:00:00'), (TIMESTAMP '{} 12:00:00'), \
+                 (TIMESTAMP '{} 12:00:00')) AS t(order_at)",
+                days[0], days[1], days[2]
+            ))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nbatch_size = 1\nfirst_partition = \"{}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n",
+                days[0]
+            ),
+        )
+        .unwrap();
+        let model = rocky_core::models::load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+        (warehouse, dir, model, state, days)
+    }
+
+    /// #1606: a cancel that lands before the partitions start skips them all.
+    /// No partition writes a state row, and the target is not bootstrapped.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancel_before_the_partitions_start_skips_every_partition() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let (warehouse, _dir, model, state, days) = partition_cancel_fixture().await;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let range = PartitionRunOptions {
+            from: Some(days[0].clone()),
+            to: Some(days[2].clone()),
+            parallel: 1,
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &range,
+            "cancel-before",
+            &mut output,
+            &exec_ctx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.interrupted);
+        let summary = &output.partition_summaries[0];
+        assert_eq!(
+            (
+                summary.partitions_planned,
+                summary.partitions_succeeded,
+                summary.partitions_failed,
+                summary.partitions_skipped
+            ),
+            (3, 0, 0, 3)
+        );
+        assert!(output.materializations.is_empty());
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            warehouse
+                .execute_query("SELECT * FROM main.fct_daily_orders")
+                .await
+                .is_err(),
+            "a cancelled model must not bootstrap its target"
+        );
+    }
+
+    /// #1606: a cancel between partitions lets the running partition finish
+    /// and starts no other. The skipped partitions leave no state row, so
+    /// `--missing` re-plans exactly them.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancel_between_partitions_starts_no_further_partition() {
+        use rocky_core::incremental::PartitionStatus;
+        use rocky_core::plan_partition::PartitionSelection;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let (warehouse, _dir, model, state, days) = partition_cancel_fixture().await;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let range = PartitionRunOptions {
+            from: Some(days[0].clone()),
+            to: Some(days[2].clone()),
+            parallel: 1,
+            ..Default::default()
+        };
+        super::CANCEL_AFTER_PARTITION_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert("cancel-between".to_string());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &range,
+            "cancel-between",
+            &mut output,
+            &exec_ctx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert!(output.interrupted);
+        let summary = &output.partition_summaries[0];
+        assert_eq!(
+            (
+                summary.partitions_planned,
+                summary.partitions_succeeded,
+                summary.partitions_failed,
+                summary.partitions_skipped
+            ),
+            (3, 1, 0, 2)
+        );
+        assert_eq!(output.materializations.len(), 1);
+        let records = state.list_partitions("fct_daily_orders").unwrap();
+        assert_eq!(records.len(), 1, "only the finished partition has a row");
+        assert_eq!(records[0].partition_key, days[0]);
+        assert_eq!(records[0].status, PartitionStatus::Computed);
+
+        let missing = rocky_core::plan_partition::plan_partitions(
+            &model,
+            &PartitionSelection::Missing,
+            None,
+            &state,
+        )
+        .unwrap();
+        let replanned: Vec<_> = missing
+            .iter()
+            .flat_map(|plan| std::iter::once(&plan.partition_key).chain(&plan.batch_with))
+            .collect();
+        assert!(!replanned.contains(&&days[0]));
+        assert!(replanned.contains(&&days[1]));
+        assert!(replanned.contains(&&days[2]));
     }
 
     #[cfg(feature = "duckdb")]
@@ -29977,6 +30246,7 @@ table = "fct_daily"
             "batch-run",
             &mut output,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30088,6 +30358,7 @@ table = "fct_daily"
             "first-run",
             &mut first_run,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30104,6 +30375,7 @@ table = "fct_daily"
             "second-run",
             &mut second_run,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30193,6 +30465,7 @@ table = "fct_daily"
             "unreviewed",
             &mut refused,
             &ctx(&not_recorded),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect_err("a fill the plan did not show must refuse");
@@ -30217,6 +30490,7 @@ table = "fct_daily"
             "reviewed",
             &mut filled,
             &ctx(&recorded),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -45632,6 +45906,7 @@ auto_create_schemas = true
                 run_id,
                 &mut output,
                 &exec_ctx,
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await
             .unwrap();
