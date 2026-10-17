@@ -458,6 +458,17 @@ pub enum ConfigError {
     )]
     ResidencyRegionMissing { field: String },
 
+    /// A `region` label is set but is not lowercase letters, digits and
+    /// hyphens, starting with a letter or digit. Checked whether or not
+    /// `[residency] enforce` is on: labels compare as exact text, so `"EU"`
+    /// and `" eu"` would otherwise count as regions other than `"eu"`.
+    #[error(
+        "V060: `{field}` = {value:?} is not a valid region label. \
+         A region label uses only lowercase letters, digits and hyphens, \
+         and starts with a letter or digit (e.g. \"eu-west-1\")."
+    )]
+    ResidencyRegionMalformed { field: String, value: String },
+
     /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
     /// infinite. Detection compares a deviation against the threshold, and
     /// every comparison with NaN is false, so a NaN threshold flagged nothing
@@ -4218,24 +4229,20 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
-/// Validates `[residency] enforce = true`: every pipeline source block,
-/// every pipeline target block and `[ai]` must carry a non-empty `region`.
-/// Returns one [`ConfigError::ResidencyRegionMissing`] per missing label.
-///
-/// Absent `[residency]` or `enforce = false` ⇒ no requirement. A load
-/// pipeline has no source block (it reads `source_dir`), so only its target
-/// is checked.
-pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
-    let mut errors = Vec::new();
-    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
-    if !enforce {
-        return errors;
-    }
-    let mut require = |region: &Option<String>, field: String| {
-        if region.as_deref().is_none_or(|r| r.trim().is_empty()) {
-            errors.push(ConfigError::ResidencyRegionMissing { field });
-        }
+/// Is `label` a well-formed region label: `^[a-z0-9][a-z0-9-]*$`?
+fn is_well_formed_region(label: &str) -> bool {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return false;
     };
+    let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    ok(first) && chars.all(|c| ok(c) || c == '-')
+}
+
+/// Every `region` slot in the config, with its dotted key path:
+/// `(field, label)`. Pipeline sources and targets first, then `[ai]`.
+fn region_slots(config: &RockyConfig) -> Vec<(String, Option<&str>)> {
+    let mut slots = Vec::new();
     for (name, pipeline) in &config.pipelines {
         let (source, target) = match pipeline {
             PipelineConfig::Replication(r) => (Some(&r.source.region), &r.target.region),
@@ -4245,11 +4252,45 @@ pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
             PipelineConfig::Load(l) => (None, &l.target.region),
         };
         if let Some(source) = source {
-            require(source, format!("pipeline.{name}.source.region"));
+            slots.push((format!("pipeline.{name}.source.region"), source.as_deref()));
         }
-        require(target, format!("pipeline.{name}.target.region"));
+        slots.push((format!("pipeline.{name}.target.region"), target.as_deref()));
     }
-    require(&config.ai.region, "ai.region".to_string());
+    slots.push(("ai.region".to_string(), config.ai.region.as_deref()));
+    slots
+}
+
+/// Validates every `region` label and `[residency]`.
+///
+/// - A set label must be well-formed (`^[a-z0-9][a-z0-9-]*$`), whether or not
+///   `enforce` is on: [`ConfigError::ResidencyRegionMalformed`]. Rocky does
+///   not normalize labels, so `"EU"` is refused rather than read as `"eu"`.
+/// - With `[residency] enforce = true`, every pipeline source block, every
+///   pipeline target block and `[ai]` must carry a non-empty label:
+///   [`ConfigError::ResidencyRegionMissing`]. A blank label under `enforce`
+///   is reported as missing, not malformed.
+///
+/// A load pipeline has no source block (it reads `source_dir`), so only its
+/// target is checked.
+pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
+    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
+    let mut errors = Vec::new();
+    for (field, label) in region_slots(config) {
+        match label {
+            Some(label) if enforce && label.trim().is_empty() => {
+                errors.push(ConfigError::ResidencyRegionMissing { field });
+            }
+            Some(label) if !is_well_formed_region(label) => {
+                errors.push(ConfigError::ResidencyRegionMalformed {
+                    field,
+                    value: label.to_string(),
+                });
+            }
+            Some(_) => {}
+            None if enforce => errors.push(ConfigError::ResidencyRegionMissing { field }),
+            None => {}
+        }
+    }
     errors
 }
 
@@ -17384,6 +17425,85 @@ region = "us"
             "{err:?}"
         );
         assert!(err.to_string().starts_with("V060:"), "{err}");
+    }
+
+    /// The `(field, value)` of every malformed-label error.
+    fn malformed_region_fields(cfg: &RockyConfig) -> Vec<(String, String)> {
+        validate_residency(cfg)
+            .into_iter()
+            .filter_map(|e| match e {
+                ConfigError::ResidencyRegionMalformed { field, value } => Some((field, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A set label must be lowercase letters, digits and hyphens, starting
+    /// with a letter or digit, even with no `[residency]` block. Each bad
+    /// shape is refused with V060, naming the field and the value as written.
+    /// Rocky never normalizes, so `"EU"` is not read as `"eu"`.
+    #[test]
+    fn residency_refuses_every_malformed_region_label() {
+        for bad in [
+            "EU", "Eu", " eu", "eu ", "", " ", "-eu", "eu_west", "eu.west", "eu west", "eu\t",
+            "\u{e9}u",
+        ] {
+            let toml = residency_project("").replace(
+                "[pipeline.xf.target]\n",
+                &format!("[pipeline.xf.target]\nregion = {bad:?}\n"),
+            );
+            let cfg = parse(&toml);
+            assert_eq!(
+                malformed_region_fields(&cfg),
+                vec![("pipeline.xf.target.region".to_string(), bad.to_string())],
+                "label {bad:?} must be refused"
+            );
+            let err = validate_residency(&cfg).remove(0);
+            let msg = err.to_string();
+            assert!(msg.starts_with("V060:"), "{msg}");
+            assert!(msg.contains("pipeline.xf.target.region"), "{msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rocky.toml");
+            std::fs::write(&path, &toml).unwrap();
+            let err = load_rocky_config(&path).expect_err("a malformed label refuses the load");
+            assert!(
+                matches!(err, ConfigError::ResidencyRegionMalformed { .. }),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// Well-formed labels pass, with or without `enforce`.
+    #[test]
+    fn residency_accepts_well_formed_region_labels() {
+        for good in ["eu", "eu-west-1", "us", "1", "a-", "europe-west4"] {
+            let toml = residency_project("").replace(
+                "[pipeline.xf.target]\n",
+                &format!("[pipeline.xf.target]\nregion = {good:?}\n"),
+            );
+            assert!(
+                validate_residency(&parse(&toml)).is_empty(),
+                "label {good:?} must pass"
+            );
+        }
+    }
+
+    /// Under `enforce`, a blank label is reported once, as missing, and
+    /// a malformed `[ai] region` is malformed, not missing.
+    #[test]
+    fn residency_enforced_blank_is_missing_and_bad_case_is_malformed() {
+        let cfg = parse(&residency_project(
+            "\n[residency]\nenforce = true\n\n[ai]\nregion = \"US\"\n",
+        ));
+        assert_eq!(
+            malformed_region_fields(&cfg),
+            vec![("ai.region".to_string(), "US".to_string())]
+        );
+        assert!(!validate_residency(&cfg).iter().any(
+            |e| matches!(e, ConfigError::ResidencyRegionMissing { field } if field == "ai.region")
+        ));
     }
 
     /// `[residency]` rejects an unknown key rather than ignoring it.

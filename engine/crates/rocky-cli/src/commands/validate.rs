@@ -484,7 +484,8 @@ fn transformation_model_selections(
 /// Codes are a public contract, so the two pre-existing ones keep their exact
 /// meaning — V032 for `[adapter.*]` `kind` invariants, V033 for pipeline
 /// adapter-role mismatches — V057 covers a `manual` adapter's `schemas` list
-/// (#1994), V060 a `region` label missing under `[residency] enforce`, and
+/// (#1994), V060 a `region` label missing under `[residency] enforce` or not
+/// well-formed, and
 /// everything else the chain rejects lands on
 /// V046 rather than the V001 parse code, which already carries both the "Config
 /// syntax valid" ok message and the "Failed to parse config" error.
@@ -560,7 +561,8 @@ fn config_error_diagnostic(
         ConfigError::DuplicateCheckName { pipeline, .. } => {
             ("V046", Some(format!("pipeline.{pipeline}.checks")))
         }
-        ConfigError::ResidencyRegionMissing { field } => ("V060", Some(field.clone())),
+        ConfigError::ResidencyRegionMissing { field }
+        | ConfigError::ResidencyRegionMalformed { field, .. } => ("V060", Some(field.clone())),
         _ => ("V046", None),
     };
 
@@ -3548,6 +3550,43 @@ schema_template = "raw__{source}"
             "{:?}",
             out.messages
         );
+    }
+
+    /// A malformed `region` is a V060 error at its key even with no
+    /// `[residency]` block, and is never folded into the V046 catch-all.
+    #[test]
+    fn residency_malformed_region_is_v060_error() {
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "EU"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        assert!(!out.valid);
+        let v060: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V060" && m.severity == "error")
+            .collect();
+        assert_eq!(v060.len(), 1, "{:?}", out.messages);
+        assert_eq!(v060[0].field.as_deref(), Some("pipeline.p.source.region"));
+        assert!(v060[0].message.contains("\"EU\""), "{}", v060[0].message);
     }
 
     /// #1994: a manual adapter that lists schemas is valid, with no V057
