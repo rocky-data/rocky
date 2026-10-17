@@ -3,7 +3,7 @@ import type { AuditForOutput } from "@rocky-types/audit_for";
 import { apiGet } from "../api";
 import { EmptyState, StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
-import { formatInstant, orNotRecorded } from "../format";
+import { formatInstant, orNotRecorded, verdictLabel } from "../format";
 import { custodyPath, navigateTo } from "../router";
 import { CustodyLink } from "./links";
 import { Rows, SectionCard } from "./SectionCard";
@@ -122,13 +122,14 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       >
         <Rows
           ariaLabel="Decisions about the subject"
-          columns={["when", "principal", "capability", "model", "effect", "rule", "plan", "reason"]}
+          columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "plan", "reason"]}
           rows={decisions.entries.map((entry) => [
             formatInstant(entry.timestamp, now),
             entry.principal,
             entry.capability,
             entry.model,
-            entry.effect,
+            entry.kind,
+            verdictLabel(entry),
             entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
             <CustodyLink key={entry.plan_id} subject={entry.plan_id} />,
             entry.reason,

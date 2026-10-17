@@ -111,3 +111,21 @@ export function clipMiddle(value: string, head = 10, tail = 8): Clipped {
     tail: chars.slice(chars.length - tail).join(""),
   };
 }
+
+/**
+ * The verdict cell for a decision row, mirroring `verdict_label` in the CLI's
+ * `audit.rs`. An evaluation shows its policy effect. Any other row shows its
+ * kind with the recorded effect beside it, so an approval's `allow` never
+ * reads as a policy allow.
+ */
+export function verdictLabel(entry: {
+  kind: string;
+  effect: string;
+  approval_channel?: string | null;
+}): string {
+  if (entry.kind === "evaluation") return entry.effect;
+  if (entry.kind === "approval" && entry.approval_channel) {
+    return `approval (${entry.approval_channel}) [effect ${entry.effect}]`;
+  }
+  return `${entry.kind} [effect ${entry.effect}]`;
+}
