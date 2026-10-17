@@ -286,10 +286,21 @@ pre_assert "tick_line_carries_executed_field" $? \
   doctor --check scheduler 2>/dev/null | jq -e '.checks[] | select(.name=="scheduler")' >/dev/null 2>&1
 pre_assert "doctor_exposes_the_scheduler_check" $? "doctor --check scheduler emitted no 'scheduler' check"
 
+# Run ids the children logged on their `run` span, one per line. `-R` +
+# `fromjson?` skips a torn or plain-text line instead of stopping there: parent
+# and child output interleave in one file (see soak_verdict.py `read_jsonl`), and
+# plain `jq` drops every line after the first one it cannot parse. The `run` span
+# may be the event's own span or an outer one in `spans`.
+logged_run_ids() { # FILE -> sorted unique run ids
+  jq -rR 'fromjson? | (.span, .spans[]?) | select(type=="object" and .name=="run") | .run_id // empty' \
+    "$1" 2>/dev/null | grep -E '^run-[0-9-]+$' | sort -u
+}
+
 # The end-mode ledger is rebuilt from the run ids the children log, so prove the
-# log carries them BEFORE the clock starts. `poll` mode never reads them.
+# log carries them BEFORE the clock starts, with the same extraction the ledger
+# uses. `poll` mode never reads them.
 if [[ "$HARVEST_MODE" == end ]]; then
-  grep -q '"run_id":"run-' "$OUT/preflight.stderr.jsonl" 2>/dev/null
+  [[ -n "$(logged_run_ids "$OUT/preflight.stderr.jsonl")" ]]
   pre_assert "child_log_carries_run_id" $? \
     "no run_id span in serve stderr — HARVEST_MODE=end could not find the runs to read back"
 fi
@@ -386,8 +397,7 @@ harvest() { # -> appends projected Schedule runs, tagged with harvest time
 harvest_from_state() { # -> same harvest.jsonl shape as harvest()
   local t=$1 id raw="$OUT/harvest.raw" ids
   : >"$raw"
-  ids=$(jq -r 'select(.span.name=="run") | .span.run_id // empty' "$OUT/serve.stderr.jsonl" 2>/dev/null \
-    | grep -E '^run-[0-9-]+$' | sort -u)
+  ids=$(logged_run_ids "$OUT/serve.stderr.jsonl")
   "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json history \
     >>"$raw" 2>/dev/null
   for id in $ids; do

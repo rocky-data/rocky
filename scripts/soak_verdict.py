@@ -756,7 +756,8 @@ def gate_log_corroboration(run: dict) -> list[dict]:
     the child's run record exists. The harness's own periodic ``GET
     /api/v1/runs`` is exactly the kind of third-party opener that induces it, so
     a two-sided equality would hard-FAIL a 24h gate on the harness's own
-    measurement.
+    measurement. In ``harvest_mode=end`` the harness makes no such reads while
+    serve runs, so a ``state_busy`` tick there points at some other opener.
 
     The bug-bearing direction is the log claiming MORE executions than the
     history has durable records for.
