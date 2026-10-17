@@ -121,6 +121,8 @@ pub fn estimate_durations(newest_first: &[u64]) -> DurationEstimate {
     let p50_ms = percentile(&sorted, 50);
     let mut p90_ms = percentile(&sorted, 90);
 
+    // `split_at` panics unless the sample holds `GROWTH_RUNS` entries.
+    const _: () = assert!(ESTIMATE_MIN_RUNS >= GROWTH_RUNS);
     let (newest, older) = sample.split_at(GROWTH_RUNS);
     let mut growth = false;
     if older.len() >= GROWTH_RUNS {
@@ -362,13 +364,12 @@ pub fn stamp_delivery_timing(
         let previous = match previous_by_model.get(&model) {
             Some(previous) => *previous,
             None => {
-                let previous =
-                    store
-                        .last_delivery(&model, UnrecordedScope::Exclude)?
-                        .map(|previous| LastDelivery {
-                            finished_at: previous.finished_at,
-                            due_at: previous.due_at,
-                        });
+                let previous = store
+                    .last_delivery(&model, UnrecordedScope::Exclude, Some(&record.run_id))?
+                    .map(|previous| LastDelivery {
+                        finished_at: previous.finished_at,
+                        due_at: previous.due_at,
+                    });
                 previous_by_model.insert(model, previous);
                 previous
             }
@@ -876,5 +877,150 @@ mod tests {
         let mut other = bare_record(utc(2026, 5, 1, 6, 3), Some("sub-unknown"));
         stamp_delivery_timing(&mut other, &store, &[]).unwrap();
         assert_eq!(other.queued_ms, None, "no claim, no queue time");
+    }
+
+    fn lisbon_0130() -> DeliverBy {
+        DeliverBy {
+            cron: "30 1 * * *".to_string(),
+            tz: chrono_tz::Tz::Europe__Lisbon,
+        }
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> LastDelivery {
+        LastDelivery {
+            finished_at: utc(y, mo, d, h, mi),
+            due_at: None,
+        }
+    }
+
+    /// 2026-03-29, Europe/Lisbon: 01:00 WET jumps to 02:00 WEST, so 01:30
+    /// local does not exist. The cron library moves that day's deadline to
+    /// 02:00 local (01:00 UTC). Defensible but surprising: the deadline is
+    /// the end of the gap, one occurrence that day, none skipped.
+    #[test]
+    fn spring_forward_moves_a_nonexistent_deadline_to_the_end_of_the_gap() {
+        let d = lisbon_0130();
+        let prev_due = utc(2026, 3, 28, 1, 30);
+        let gap_due = utc(2026, 3, 29, 1, 0);
+        let next_due = utc(2026, 3, 30, 0, 30);
+        assert_eq!(due_after(&d, prev_due), Some(gap_due));
+        assert_eq!(due_after(&d, gap_due), Some(next_due));
+
+        let previous = Some(LastDelivery {
+            finished_at: utc(2026, 3, 28, 1, 10),
+            due_at: Some(prev_due),
+        });
+        // Early and exactly on the moved deadline: serves it.
+        for finished in [utc(2026, 3, 29, 0, 50), gap_due] {
+            assert_eq!(deadline_served(&d, previous, finished), Some(gap_due));
+        }
+        // After it: late for the moved deadline, never for the next.
+        let late = utc(2026, 3, 29, 1, 10);
+        assert_eq!(deadline_served(&d, previous, late), Some(gap_due));
+        let late_delivery = LastDelivery {
+            finished_at: late,
+            due_at: Some(gap_due),
+        };
+        assert_eq!(open_deadline_after(&d, late_delivery), Some(next_due));
+        // No recorded deadline: it covered the first deadline at or after
+        // its finish, one per day.
+        assert_eq!(
+            open_deadline_after(&d, at(2026, 3, 29, 0, 50)),
+            Some(next_due)
+        );
+        assert_eq!(
+            open_deadline_after(&d, at(2026, 3, 29, 1, 10)),
+            Some(utc(2026, 3, 31, 0, 30))
+        );
+    }
+
+    /// 2026-10-25, Europe/Lisbon: 02:00 WEST falls back to 01:00 WET, so
+    /// 01:30 local happens twice (00:30 UTC and 01:30 UTC). The cron library
+    /// yields the first only. Defensible but surprising: one deadline that
+    /// day at 00:30 UTC; the repeated 01:30 is not a second deadline.
+    #[test]
+    fn fall_back_counts_a_repeated_deadline_once() {
+        let d = lisbon_0130();
+        let prev_due = utc(2026, 10, 24, 0, 30);
+        let first = utc(2026, 10, 25, 0, 30);
+        let next_due = utc(2026, 10, 26, 1, 30);
+        assert_eq!(due_after(&d, prev_due), Some(first));
+        assert_eq!(due_after(&d, first), Some(next_due));
+
+        let previous = Some(LastDelivery {
+            finished_at: utc(2026, 10, 24, 0, 20),
+            due_at: Some(prev_due),
+        });
+        assert_eq!(
+            deadline_served(&d, previous, utc(2026, 10, 25, 0, 20)),
+            Some(first)
+        );
+        // Finishing between the two 01:30s, or after both: late for the
+        // first, and the repeated 01:30 UTC is neither skipped into nor
+        // counted again.
+        for finished in [
+            utc(2026, 10, 25, 0, 45),
+            utc(2026, 10, 25, 1, 10),
+            utc(2026, 10, 25, 1, 45),
+        ] {
+            assert_eq!(deadline_served(&d, previous, finished), Some(first));
+            let delivery = LastDelivery {
+                finished_at: finished,
+                due_at: Some(first),
+            };
+            assert_eq!(open_deadline_after(&d, delivery), Some(next_due));
+            let unrecorded = LastDelivery {
+                finished_at: finished,
+                due_at: None,
+            };
+            // Covers the first deadline at or after its finish: the 26th.
+            assert_eq!(
+                open_deadline_after(&d, unrecorded),
+                Some(utc(2026, 10, 27, 1, 30))
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_persisted_twice_is_not_its_own_previous_delivery() {
+        use crate::state::RunScope;
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let deadlines = [ProductDeadline {
+            product: "revenue".to_string(),
+            output_model: "revenue_daily".to_string(),
+            deliver_by: six_am(),
+        }];
+        // Day 1 delivered on time, due 06:00.
+        let mut day1 = delivery_run(
+            "day-1",
+            utc(2026, 5, 1, 5, 0),
+            30,
+            "success",
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut day1, &store, &deadlines).unwrap();
+        store.record_run(&day1).unwrap();
+        // Day 2 finishes at 07:30: late for the 06:00 deadline.
+        let mut day2 = delivery_run(
+            "day-2",
+            utc(2026, 5, 2, 7, 0),
+            30,
+            "success",
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut day2, &store, &deadlines).unwrap();
+        let due = utc(2026, 5, 2, 6, 0);
+        assert_eq!(day2.models_executed[0].due_at, Some(due));
+        // The run is persisted, then persisted again under the same id (a
+        // failed `verify_after`). The second stamp must stay late.
+        store.record_run(&day2).unwrap();
+        stamp_delivery_timing(&mut day2, &store, &deadlines).unwrap();
+        assert_eq!(
+            day2.models_executed[0].due_at,
+            Some(due),
+            "a second stamp must not re-cover the next deadline"
+        );
+        assert!(day2.models_executed[0].finished_at > due);
     }
 }

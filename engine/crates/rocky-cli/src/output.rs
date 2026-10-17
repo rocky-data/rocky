@@ -7551,6 +7551,7 @@ impl DeliveryStatus {
                 .last_delivery(
                     &deadline.output_model,
                     rocky_core::state::UnrecordedScope::Exclude,
+                    None,
                 )?
                 .map(|execution| rocky_core::delivery::LastDelivery {
                     finished_at: execution.finished_at,
