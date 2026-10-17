@@ -8041,6 +8041,7 @@ mod cost_finalize_tests {
             compute_cost_per_dbu: 0.40,
             warehouse_size: "Medium".to_string(),
             min_history_runs: 5,
+            ..Default::default()
         };
         out.populate_cost_summary("databricks", &cost_cfg);
 
@@ -8070,6 +8071,7 @@ mod cost_finalize_tests {
                 compute_cost_per_dbu: 0.40,
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
+                ..Default::default()
             },
         );
         let budget = BudgetConfig {

@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Content-addressed models: exact, basis `data_files`. The figure is the summed size of the Parquet data files the run committed or referenced, without the Delta log or Iceberg metadata.
   - Not measured, so unknown: views, replicated tables, `time_interval` partitions, an in-memory DuckDB database, a DuckDB table with no data block (empty, or only constant columns), and every other adapter. `duckdb_tables().estimated_size` is a row count, not bytes, so Rocky does not use it.
   - The run record's `ModelExecution` gains an optional `stored_bytes`. No state schema bump: it is omitted when unknown, and a value this binary cannot read loads as unknown. Adapters can implement the new `WarehouseAdapter::stored_table_bytes`; the default is unknown.
+- `[cost]` is now an engine-neutral price table. Three optional prices join `storage_cost_per_gb_month` and `compute_cost_per_dbu`: `compute_cost_per_machine_hour` (USD per machine-hour), `cross_region_transfer_cost_per_gb` (USD per GB moved across regions) and `ai_cost_per_million_tokens` (USD per 1,000,000 tokens). They are unset by default, are left out of serialized config when unset, and are not read by any cost command yet. Every `[cost]` price must now be finite and 0 or more, or the config is refused at load.
 
 ### Changed
 
