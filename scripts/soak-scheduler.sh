@@ -28,6 +28,7 @@
 #
 # Usage:  bash scripts/soak-scheduler.sh [OUT_DIR]
 #         ROCKY_BIN=... DURATION_HOURS=24 SAMPLE_SECONDS=30 PORT=8420
+#         HARVEST_MODE=end  (unpolled arm: no /api/v1/runs read while sampling)
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = INCOMPLETE/INVALID, 3 = preflight aborted.
 #
@@ -64,6 +65,13 @@ SAMPLE_SECONDS="${SAMPLE_SECONDS:-30}"
 # G6's log-corroboration still cross-checks harvested runs against the tick
 # log, so a cadence mistake surfaces as a verdict failure rather than silently.
 HARVEST_SECONDS="${HARVEST_SECONDS:-600}"
+# HARVEST_MODE=poll (default) harvests `/api/v1/runs` every HARVEST_SECONDS, as
+# above. HARVEST_MODE=end is the "unpolled" arm of the #1416 discriminating
+# experiment: ZERO `/runs` requests while the clock runs, so the `/health` poll
+# is the only observer. A lower cadence cannot stand in for it, because the RSS
+# high-water mark is set by the LARGEST scan and the table grows every minute.
+# The ledger is then read ONCE, after serve has exited (see harvest_from_state).
+HARVEST_MODE="${HARVEST_MODE:-poll}"
 # Bash arithmetic is integer-only, so DURATION_HOURS must be whole. Set
 # DURATION_SECONDS directly to smoke-test the harness over a few minutes.
 if [[ -n "${DURATION_SECONDS:-}" ]]; then
@@ -84,6 +92,11 @@ OUT="${1:-$REPO/.soak/$STAMP}"
 
 die() { printf '\n[soak] FATAL: %s\n' "$*" >&2; exit 3; }
 say() { printf '[soak %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+case "$HARVEST_MODE" in
+  poll|end) ;;
+  *) die "HARVEST_MODE must be 'poll' or 'end' (got '$HARVEST_MODE')" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Phase 0 — preconditions. Every one of these has cost a real debugging hour.
@@ -273,6 +286,25 @@ pre_assert "tick_line_carries_executed_field" $? \
   doctor --check scheduler 2>/dev/null | jq -e '.checks[] | select(.name=="scheduler")' >/dev/null 2>&1
 pre_assert "doctor_exposes_the_scheduler_check" $? "doctor --check scheduler emitted no 'scheduler' check"
 
+# Run ids the children logged on their `run` span, one per line. `-R` +
+# `fromjson?` skips a torn or plain-text line instead of stopping there: parent
+# and child output interleave in one file (see soak_verdict.py `read_jsonl`), and
+# plain `jq` drops every line after the first one it cannot parse. The `run` span
+# may be the event's own span or an outer one in `spans`.
+logged_run_ids() { # FILE -> sorted unique run ids
+  jq -rR 'fromjson? | (.span, .spans[]?) | select(type=="object" and .name=="run") | .run_id // empty' \
+    "$1" 2>/dev/null | grep -E '^run-[0-9-]+$' | sort -u
+}
+
+# The end-mode ledger is rebuilt from the run ids the children log, so prove the
+# log carries them BEFORE the clock starts, with the same extraction the ledger
+# uses. `poll` mode never reads them.
+if [[ "$HARVEST_MODE" == end ]]; then
+  [[ -n "$(logged_run_ids "$OUT/preflight.stderr.jsonl")" ]]
+  pre_assert "child_log_carries_run_id" $? \
+    "no run_id span in serve stderr — HARVEST_MODE=end could not find the runs to read back"
+fi
+
 kill -TERM "$PRE_PID" 2>/dev/null
 wait "$PRE_PID" 2>/dev/null
 say "preflight: complete"
@@ -312,12 +344,13 @@ jq -n \
   --arg state_path "$STATE_PATH" \
   --argjson t0 "$T0" --argjson end_ts "$END" --argjson pid "$SERVE_PID" \
   --argjson sample "$SAMPLE_SECONDS" --argjson poll "$POLL_SECONDS" \
-  --argjson harvest "$HARVEST_SECONDS" \
+  --argjson harvest "$([[ "$HARVEST_MODE" == end ]] && echo 0 || echo "$HARVEST_SECONDS")" \
+  --arg harvest_mode "$HARVEST_MODE" \
   --argjson drain "$DRAIN_SECONDS" --argjson port "$PORT" \
   --argjson token_was_set "$TOKEN_WAS_SET" \
   --argjson ulimit "$(ulimit -n)" \
   '{binary:$bin, version:$version, git_sha:$sha, branch:$branch, state_path:$state_path,
-    t0:$t0, planned_end:$end_ts, pid:$pid, sample_interval:$sample, harvest_interval:$harvest,
+    t0:$t0, planned_end:$end_ts, pid:$pid, sample_interval:$sample, harvest_interval:$harvest, harvest_mode:$harvest_mode,
     poll_interval:$poll,
     drain_timeout:$drain, port:$port, cron:"* * * * *", timezone:"UTC", catchup:"latest",
     retry_max:0, serve_token_was_unset:$token_was_set, ulimit_n:$ulimit}' \
@@ -353,7 +386,34 @@ harvest() { # -> appends projected Schedule runs, tagged with harvest time
   return 1
 }
 
-say "sampling every ${SAMPLE_SECONDS}s, harvesting every ${HARVEST_SECONDS}s"
+# HARVEST_MODE=end only; runs AFTER serve has exited, so nothing here can touch
+# serve's RSS. No CLI lists the whole run history (`rocky history` and
+# `GET /runs` both stop at the newest 50), so the ids come from the child runs'
+# own log spans and each row is then read back from the state file with
+# `history --run`. The newest-50 window is added too, so a recent row the log
+# never mentioned still lands in the ledger. A logged id the state file cannot
+# produce is counted in harvest_errors.jsonl and surfaces in G6 as an
+# execution with no durable record.
+harvest_from_state() { # -> same harvest.jsonl shape as harvest()
+  local t=$1 id raw="$OUT/harvest.raw" ids
+  : >"$raw"
+  ids=$(logged_run_ids "$OUT/serve.stderr.jsonl")
+  "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json history \
+    >>"$raw" 2>/dev/null
+  for id in $ids; do
+    "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json \
+      history --run "$id" >>"$raw" 2>/dev/null \
+      || printf '{"t":%s,"run_id":"%s","code":"history_run_failed"}\n' "$t" "$id" \
+        >>"$OUT/harvest_errors.jsonl"
+  done
+  jq -c --argjson h "$t" '.runs[]
+    | select(.trigger=="Schedule")
+    | {h:$h, run_id, started_at, status, pipeline, submission_id, duration_ms}' \
+    "$raw" >>"$OUT/harvest.jsonl"
+  say "read the run rows back from the state file ($(wc -w <<<"$ids") ids from the log)"
+}
+
+say "sampling every ${SAMPLE_SECONDS}s, harvesting: $([[ "$HARVEST_MODE" == end ]] && echo "never (end-of-run read)" || echo "every ${HARVEST_SECONDS}s")"
 n=0
 LAST_HARVEST=0
 while (( $(date +%s) < END )); do
@@ -369,7 +429,7 @@ while (( $(date +%s) < END )); do
   # Sample every iteration; harvest on its own slower cadence (see
   # HARVEST_SECONDS). `skip` is recorded distinctly from `ok`/`err` so a reader
   # can tell "not harvested this iteration" from "harvest failed".
-  if (( T - LAST_HARVEST >= HARVEST_SECONDS )); then
+  if [[ "$HARVEST_MODE" == poll ]] && (( T - LAST_HARVEST >= HARVEST_SECONDS )); then
     harvest "$T" && HARV=ok || HARV=err
     LAST_HARVEST="$T"
   else
@@ -411,7 +471,7 @@ done
 ALIVE_AT_END=false
 if kill -0 "$SERVE_PID" 2>/dev/null; then
   ALIVE_AT_END=true
-  harvest "$(date +%s)"
+  [[ "$HARVEST_MODE" == poll ]] && harvest "$(date +%s)"
   say "draining (SIGTERM)"
   kill -TERM "$SERVE_PID" 2>/dev/null
 fi
@@ -419,6 +479,11 @@ fi
 deadline=$(( $(date +%s) + DRAIN_SECONDS + 30 ))
 while kill -0 "$SERVE_PID" 2>/dev/null && (( $(date +%s) < deadline )); do sleep 1; done
 wait "$SERVE_PID" 2>/dev/null; EXIT_CODE=$?
+
+# The unpolled arm's only ledger read: serve is gone, the state file is quiet.
+if [[ "$HARVEST_MODE" == end ]]; then
+  harvest_from_state "$(date +%s)"
+fi
 
 printf '{"exit":%s,"t":%s,"expected":%s}\n' \
   "$EXIT_CODE" "$(date +%s)" "$ALIVE_AT_END" >"$OUT/serve.exit"

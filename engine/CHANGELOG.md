@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Because the adapter is in its own process group, a Ctrl-C in the terminal no longer reaches it directly. Rocky stops it when Rocky exits normally or drops it.
 - `GET /api/v1/jobs/{id}` now withholds `result` and `error` for a job record written before redaction (#1919). Before, when such a record was read from the state file and held a resolved `${VAR}` value, the server served the `held` placeholder in those two fields. Both fields now read `null`, as for every other record from before redaction. No secret value was shown either way.
 - A signal during a `time_interval` model in `rocky run` now starts no new partition (#1606). Partitions already running finish. Before, the run went on through every planned partition until the 5 s settle limit cut it. A skipped partition writes no state row, so `rocky run --missing` builds it later. If a first-run fill was cut after its first partition, a plain `rocky run` then builds only the latest partition, so use `--missing` for the rest. A model that skipped partitions fires no `after_model_run` hook. The run records itself as interrupted and exits 130. `rocky apply` of a backfill plan now settles the same way. Before, it had no signal handling and died at once. It skips the governance tag reconcile, records the run as interrupted, uploads remote state and exits 130.
+- A signal during a quality, snapshot or load pipeline in `rocky run` now settles the run (#1606). Before, the listener cancelled a token nothing read, so the 5 s grace cut the run mid-statement with no run record. The run exits 130.
+  - Quality starts no new table and no new quarantine. Checks already run stay in the record; the check gate does not fire.
+  - Snapshot checks once, before any warehouse work, because its `MERGE` and `INSERT` share no transaction. A snapshot that has started runs to completion.
+  - Load starts no new file. Loaded files keep their ledger rows and the remote state is still uploaded. The load JSON lists only the files that ran. An interrupted load exits 130 even when an earlier file failed. `rocky load` on its own has no signal handling, as before.
+  - Quality and snapshot record the run as interrupted and release the remote-state session without upload, as a transformation run does.
 
 ## [1.86.0] — 2026-10-17
 

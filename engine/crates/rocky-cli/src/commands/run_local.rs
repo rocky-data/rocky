@@ -610,6 +610,9 @@ pub async fn run_quality(
     // The resolved `--pipeline` name, stamped onto the persisted `RunRecord` so
     // the reconciler can answer `after`/`freshness` demands on this pipeline.
     pipeline_name: &str,
+    // The run's cancellation token (#1606). Checked before each table and
+    // before each quarantine; never between a quarantine's statements.
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -644,7 +647,13 @@ pub async fn run_quality(
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
     } else {
-        for table_ref in &pipeline.tables {
+        'targets: for table_ref in &pipeline.tables {
+            // Cancel (#1606): check no further target. Checks are read-only,
+            // so a skipped table loses nothing; it records no check result.
+            if cancel.is_cancelled() {
+                output.interrupted = true;
+                break;
+            }
             let tables_to_check: Vec<String> = if let Some(ref table) = table_ref.table {
                 vec![table.clone()]
             } else {
@@ -741,6 +750,10 @@ pub async fn run_quality(
             };
 
             for table_name in &tables_to_check {
+                if cancel.is_cancelled() {
+                    output.interrupted = true;
+                    break 'targets;
+                }
                 tables_checked += 1;
                 let full_table = dialect
                     .format_table_ref(&table_ref.catalog, &table_ref.schema, table_name)
@@ -808,6 +821,28 @@ pub async fn run_quality(
                 // above claims — before that arm existed, this comment was
                 // half true, because a refused predicate suppressed quarantine
                 // completely.
+                #[cfg(test)]
+                if CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST
+                    .lock()
+                    .ok()
+                    .is_some_and(|mut ids| ids.remove(run_id))
+                {
+                    cancel.cancel();
+                }
+                // Cancel (#1606): start no quarantine after a signal. Its
+                // statements are never cut once started. Only where a
+                // quarantine would run: a signal after the last table's checks
+                // skipped nothing, so it keeps the gate verdict.
+                if pipeline
+                    .checks
+                    .quarantine
+                    .as_ref()
+                    .is_some_and(|q_cfg| q_cfg.enabled)
+                    && cancel.is_cancelled()
+                {
+                    output.interrupted = true;
+                    break 'targets;
+                }
                 if let Some(ref q_cfg) = pipeline.checks.quarantine
                     && q_cfg.enabled
                 {
@@ -994,6 +1029,7 @@ pub async fn run_quality(
         // loop sets `COMPACT_JSON` to promise one compact object per line,
         // and a serializer called here never sees that flag (#1604).
         crate::output::print_json(&output)?;
+        super::run::capture_run_output_for_test(run_id, &output);
     } else {
         let total_checks: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
         let quarantine_summary = if output.quarantine.is_empty() {
@@ -1051,6 +1087,12 @@ pub async fn run_quality(
         Some(pipeline_name),
     );
 
+    // Cancel (#1606): an interrupted run exits 130 whatever its checks found,
+    // as `rocky run` does. Checked before the gate so a partial run is never
+    // reported as a gate verdict.
+    if output.interrupted {
+        return interrupted_result(recorded, run_id);
+    }
     // A quarantine that was refused or did not complete fails the run with the
     // check gate off too. Its `quarantine:compile` or `quarantine:execute`
     // check is among `error_failures`.
@@ -1575,6 +1617,11 @@ pub async fn run_snapshot(
     config_hash: &str,
     // The resolved `--pipeline` name, stamped onto the persisted `RunRecord`.
     pipeline_name: &str,
+    // The run's cancellation token (#1606). Checked once, before any warehouse
+    // work: the bootstrap, MERGE and INSERT are one logical write with no
+    // transaction, so a check between them would let the cancel corrupt the
+    // history. Once started, the snapshot runs to completion.
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -1588,6 +1635,22 @@ pub async fn run_snapshot(
 
     let mut output = RunOutput::new(String::new(), 0, 1);
     output.pipeline_type = Some("snapshot".to_string());
+
+    if cancel.is_cancelled() {
+        output.interrupted = true;
+        output.duration_ms = start.elapsed().as_millis() as u64;
+        if output_json {
+            crate::output::print_json(&output)?;
+        }
+        return persist_interrupted_record(
+            state_path,
+            &output,
+            run_id,
+            started_at,
+            config_hash,
+            pipeline_name,
+        );
+    }
 
     // sql_gen consumes the typed IR directly.
     let model_ir = ModelIr::snapshot(
@@ -1811,6 +1874,55 @@ pub async fn run_snapshot(
         .into());
     }
     Ok(())
+}
+
+/// Run ids whose quality run cancels its token right after a table's checks
+/// (#1606): a deterministic "signal between the checks and the quarantine".
+#[cfg(test)]
+pub(crate) static CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// The result of a run a signal cut short (#1606), once its record is written.
+///
+/// `Interrupted` (exit 130) only when the record landed. The dispatcher abandons
+/// the remote-state session on it, as the transformation arm does, so nothing
+/// is uploaded. A record that did not land is an untyped error, so nothing
+/// claims it exists.
+fn interrupted_result(recorded: bool, run_id: &str) -> Result<()> {
+    if !recorded {
+        anyhow::bail!(
+            "run was interrupted by a shutdown signal (run_id: {run_id}); the run record \
+             could not be written to the state store"
+        );
+    }
+    Err(super::run::Interrupted.into())
+}
+
+/// Persist the record of a run cancelled before it did any work (#1606).
+fn persist_interrupted_record(
+    state_path: &Path,
+    output: &RunOutput,
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    config_hash: &str,
+    pipeline_name: &str,
+) -> Result<()> {
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    super::run::mark_run_started(&store, run_id, started_at, Some(pipeline_name));
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
+    let audit = super::run::audit_to_record(&audit_ctx);
+    let recorded = super::run::persist_run_record(
+        Some(&store),
+        output,
+        run_id,
+        started_at,
+        config_hash,
+        &audit,
+        Some(pipeline_name),
+    );
+    interrupted_result(recorded, run_id)
 }
 
 #[cfg(all(test, feature = "duckdb"))]
@@ -4164,6 +4276,7 @@ auto_create_schemas = true
             chrono::Utc::now(),
             "test-hash",
             "dq",
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
     }
@@ -4181,6 +4294,171 @@ auto_create_schemas = true
             .into_iter()
             .map(|r| r[0].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    async fn run_tag_cancellable(
+        config_path: &Path,
+        state_path: &Path,
+        run_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        // JSON on, so the test capture holds the run's output.
+        let cfg = rocky_core::config::load_rocky_config(config_path).unwrap();
+        let rocky_core::config::PipelineConfig::Quality(pipeline) = &cfg.pipelines["dq"] else {
+            panic!("quality fixture");
+        };
+        let pipeline = pipeline.clone();
+        super::run_quality(
+            config_path,
+            &pipeline,
+            &cfg,
+            true,
+            state_path,
+            run_id,
+            chrono::Utc::now(),
+            "test-hash",
+            "dq",
+            cancel,
+        )
+        .await
+    }
+
+    async fn seed_orders(db: &Path) {
+        let adapter = DuckDbWarehouseAdapter::open(db).unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.orders AS SELECT * FROM (VALUES (1, 'ada'), (2, NULL)) t(id, name)",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// #1606: a quality run cancelled before it starts checks no table, runs
+    /// no quarantine, records the run and returns `Interrupted` (exit 130).
+    #[tokio::test]
+    async fn a_cancelled_quality_run_checks_nothing_and_exits_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, config_path) = tag_fixture(dir.path());
+        let state_path = dir.path().join("state.redb");
+        seed_orders(&db).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let error = run_tag_cancellable(&config_path, &state_path, "dq-cancel-before", &cancel)
+            .await
+            .expect_err("a cancelled quality run must not report success");
+        assert!(error.is::<super::super::run::Interrupted>(), "{error:#}");
+        assert_eq!(orders_columns(&db).await, vec!["id", "name"]);
+        let captured = super::super::run::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove("dq-cancel-before")
+            .expect("the interrupted run emits its JSON");
+        assert_eq!(captured["interrupted"], true);
+        assert!(
+            captured["check_results"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no table may be checked after the cancel: {captured}"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1, "the interrupted run records itself");
+        assert_eq!(runs[0].run_id, "dq-cancel-before");
+        assert_eq!(runs[0].status, rocky_core::state::RunStatus::Failure);
+    }
+
+    /// #1606: a signal after a table's checks starts no quarantine on it. The
+    /// check gate does not fire; the run exits `Interrupted`.
+    #[tokio::test]
+    async fn a_cancel_after_the_checks_starts_no_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, config_path) = tag_fixture(dir.path());
+        let state_path = dir.path().join("state.redb");
+        seed_orders(&db).await;
+        super::CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert("dq-cancel-between".to_string());
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let error = run_tag_cancellable(&config_path, &state_path, "dq-cancel-between", &cancel)
+            .await
+            .expect_err("an interrupted quality run must not report success");
+        assert!(cancel.is_cancelled());
+        assert!(error.is::<super::super::run::Interrupted>(), "{error:#}");
+        assert_eq!(
+            orders_columns(&db).await,
+            vec!["id", "name"],
+            "no quarantine may start after the cancel"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(store.list_runs(1).unwrap().len(), 1);
+    }
+
+    /// #1606: a snapshot cancelled before it starts writes nothing to the
+    /// warehouse, records the run and returns `Interrupted`.
+    #[tokio::test]
+    async fn a_cancelled_snapshot_writes_nothing_and_exits_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.snap]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
+                 updated_at = \"updated_at\"\n\n\
+                 [pipeline.snap.source]\ncatalog = \"\"\nschema = \"main\"\ntable = \"src\"\n\n\
+                 [pipeline.snap.target]\nadapter = \"default\"\ncatalog = \"\"\nschema = \"main\"\n\
+                 table = \"history\"\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.src AS SELECT 1 AS id, TIMESTAMP '2026-01-01' AS updated_at",
+            )
+            .await
+            .unwrap();
+        drop(adapter);
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let rocky_core::config::PipelineConfig::Snapshot(pipeline) = &cfg.pipelines["snap"] else {
+            panic!("snapshot fixture");
+        };
+        let state_path = dir.path().join("state.redb");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let error = super::run_snapshot(
+            &config_path,
+            pipeline,
+            &cfg,
+            false,
+            &state_path,
+            "snap-cancel",
+            chrono::Utc::now(),
+            "test-hash",
+            "snap",
+            &cancel,
+        )
+        .await
+        .expect_err("a cancelled snapshot must not report success");
+        assert!(error.is::<super::super::run::Interrupted>(), "{error:#}");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(
+            adapter
+                .execute_query("SELECT * FROM main.history")
+                .await
+                .is_err(),
+            "a cancelled snapshot must not bootstrap its target"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, rocky_core::state::RunStatus::Failure);
     }
 
     /// #2065 part 1: `tag` rewrites its own source, so run two reads run

@@ -4579,6 +4579,7 @@ pub async fn run_with_explicit_contracts(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                &cancel,
             )
             .await;
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
@@ -4706,6 +4707,7 @@ pub async fn run_with_explicit_contracts(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                &cancel,
             )
             .await;
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
@@ -4796,6 +4798,7 @@ pub async fn run_with_explicit_contracts(
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
                 output_json,
+                Some(&cancel),
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;

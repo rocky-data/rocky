@@ -52,6 +52,10 @@ pub async fn run_load(
     truncate: bool,
     durability: rocky_core::state_sync::FinalizeDurability,
     json: bool,
+    // `rocky run`'s cancellation token (#1606), checked before each file. A
+    // file already loading finishes. `None` for `rocky load`, which owns no
+    // signal listener.
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -310,7 +314,14 @@ pub async fn run_load(
     let mut total_rows = 0u64;
     let mut total_bytes = 0u64;
 
+    let mut interrupted = false;
     for file_path in &files {
+        // Cancel (#1606): load no further file. The loaded ones keep their
+        // ledger rows, which the finalize below uploads.
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            interrupted = true;
+            break;
+        }
         let file_start = Instant::now();
         let file_name = file_path
             .file_stem()
@@ -486,6 +497,10 @@ pub async fn run_load(
         }
     }
 
+    // An interrupted load exits 130 whatever else failed, as `rocky run` does.
+    if interrupted {
+        return Err(super::run::Interrupted.into());
+    }
     if files_failed > 0 {
         bail!("{files_failed} file(s) failed to load");
     }
@@ -1417,6 +1432,15 @@ required_columns = [
     /// zero-I/O no-op).
     #[cfg(feature = "duckdb")]
     async fn drive_load(config_path: &Path, json: bool) -> Result<()> {
+        drive_load_cancellable(config_path, json, None).await
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn drive_load_cancellable(
+        config_path: &Path,
+        json: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<()> {
         let loaded = rocky_core::config::load_rocky_config_fingerprinted(config_path)?;
         let state_path = config_path
             .parent()
@@ -1433,8 +1457,34 @@ required_columns = [
             false,
             rocky_core::state_sync::FinalizeDurability::ConfigDefault,
             json,
+            cancel,
         )
         .await
+    }
+
+    /// #1606: a load under `rocky run` that is cancelled before its first file
+    /// loads nothing and returns `Interrupted` (exit 130).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancelled_load_loads_no_file_and_exits_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("orders.csv"),
+            "id,product,qty\n1,Widget,10\n2,Gadget,5\n3,Doohickey,3\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("wh.duckdb");
+        let config_path = write_contract_config(dir.path(), &db_path);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let err = drive_load_cancellable(&config_path, false, Some(&cancel))
+            .await
+            .expect_err("a cancelled load must not report success");
+        assert!(err.is::<super::super::run::Interrupted>(), "{err:#}");
+        assert_eq!(table_row_count(&db_path, "orders"), None);
     }
 
     /// (a) A CSV satisfying the contract loads and lands rows in the target.
