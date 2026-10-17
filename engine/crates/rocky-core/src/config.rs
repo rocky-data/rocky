@@ -5044,6 +5044,16 @@ pub struct AdapterConfig {
     /// A persistent path is required when the same DuckDB adapter is also used
     /// as a discovery source — discovery and warehouse share the same database.
     pub path: Option<EnvString>,
+    /// Directory DuckDB keeps its extensions in (DuckDB's
+    /// `extension_directory` setting). When unset, DuckDB uses its own
+    /// default under the home directory. Every extension Rocky loads reads
+    /// from, and installs into, this one directory.
+    pub extension_directory: Option<EnvString>,
+    /// When `true`, the DuckDB adapter never fetches an extension from the
+    /// network. It loads `icu` from the extension directory only, and
+    /// refuses to connect if `icu` is missing there. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline: bool,
 
     // -- Manual discovery fields --
     /// The source schemas and tables a `type = "manual"` discovery adapter
@@ -5172,6 +5182,8 @@ impl std::fmt::Debug for AdapterConfig {
             .field("project_id", &self.project_id)
             .field("location", &self.location)
             .field("path", &self.path)
+            .field("extension_directory", &self.extension_directory)
+            .field("offline", &self.offline)
             .field("schemas", &self.schemas)
             .field("retry", &self.retry)
             .field("cache", &self.cache)
@@ -13395,6 +13407,8 @@ table = "customers_history"
             project_id: None,
             location: None,
             path: None,
+            extension_directory: None,
+            offline: false,
             schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
@@ -16283,6 +16297,23 @@ adapter = "default"
 
     fn adapter_from_toml(body: &str) -> AdapterConfig {
         toml::from_str(body).expect("adapter block parses")
+    }
+
+    /// The DuckDB extension settings parse, and are absent by default.
+    #[test]
+    fn duckdb_extension_settings_parse_and_default_off() {
+        let plain = adapter_from_toml("type = \"duckdb\"\n");
+        assert!(plain.extension_directory.is_none());
+        assert!(!plain.offline);
+
+        let set = adapter_from_toml(
+            "type = \"duckdb\"\nextension_directory = \"/opt/duckdb-ext\"\noffline = true\n",
+        );
+        assert_eq!(
+            set.extension_directory.expose_opt(),
+            Some("/opt/duckdb-ext")
+        );
+        assert!(set.offline);
     }
 
     /// Every credential and principal field an adapter block can carry,

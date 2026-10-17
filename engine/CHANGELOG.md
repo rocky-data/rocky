@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- DuckDB adapter: `extension_directory` and `offline` settings. `extension_directory` sets DuckDB's own `extension_directory`, so every extension Rocky loads (today `icu`; later `httpfs`, `postgres` and `iceberg`) reads from one directory. `offline = true` turns off DuckDB's auto-install and never runs `INSTALL`: Rocky loads `icu` from the directory only. If `icu` is not there, the connect fails with an error that names the directory and says how to fill it, instead of continuing without time-zone functions. This is an error, not a warning, because you asked for offline mode and the adapter cannot do what you asked without `icu`; the same connect step already fails when the database file cannot be opened. With neither setting, behaviour is unchanged. Both are fields of `[adapter.NAME]`, so `schemas/adapter_config.schema.json` and the generated bindings gain them.
+
 ### Changed
 
 - `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 attempts when another writer wins. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.

@@ -480,23 +480,33 @@ impl AdapterRegistry {
                     // Discovery + warehouse share the same connector via `Arc<Mutex<>>`.
                     // The message prints the path as `${NAME}`; only the
                     // open call sees the plaintext (#1919).
+                    let extensions = rocky_duckdb::ExtensionOptions {
+                        directory: adapter_cfg
+                            .extension_directory
+                            .as_ref()
+                            .map(|d| std::path::PathBuf::from(d.expose())),
+                        offline: adapter_cfg.offline,
+                    };
                     let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_ref() {
                         // DuckDB's own IO error names the plaintext path, so
                         // it is rendered here instead of chained as the source.
-                        DuckDbWarehouseAdapter::open(std::path::Path::new(p.expose())).map_err(
-                            |e| {
-                                anyhow::anyhow!(
-                                    "adapters.{name}: failed to open DuckDB at '{p}': {}",
-                                    rocky_core::secret_registry::render_placeholders(
-                                        &e.to_string()
-                                    )
-                                )
-                            },
-                        )?
+                        DuckDbWarehouseAdapter::open_with(
+                            std::path::Path::new(p.expose()),
+                            &extensions,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "adapters.{name}: failed to open DuckDB at '{p}': {}",
+                                rocky_core::secret_registry::render_placeholders(&e.to_string())
+                            )
+                        })?
                     } else {
-                        DuckDbWarehouseAdapter::in_memory().context(format!(
-                            "adapters.{name}: failed to create in-memory DuckDB"
-                        ))?
+                        DuckDbWarehouseAdapter::in_memory_with(&extensions).map_err(|e| {
+                            anyhow::anyhow!(
+                                "adapters.{name}: failed to create in-memory DuckDB: {}",
+                                rocky_core::secret_registry::render_placeholders(&e.to_string())
+                            )
+                        })?
                     };
 
                     let shared = warehouse_adapter.shared_connector();

@@ -13,6 +13,9 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 |-------|------|----------|---------|-------------|
 | `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
 
+| `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directory` to it at connect. Every extension Rocky loads uses this one directory. |
+| `offline` | bool | No | `false` | Never fetch an extension from the network. See [Offline mode](#offline-mode). |
+
 Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
 
 **In-memory.** DuckDB opens an in-memory database instead of a database file.
@@ -29,6 +32,28 @@ type = "duckdb"
 type = "duckdb"
 path = "warehouse.duckdb"
 ```
+
+## Offline mode
+
+By default, Rocky loads DuckDB's `icu` extension at connect. `icu` provides `current_date` and the time-zone functions. If `icu` is not in the extension directory, DuckDB downloads it. On a machine with no network, that download fails, Rocky logs a warning and carries on, and a query that uses a time-zone function then fails.
+
+Set `offline = true` to make that case explicit. DuckDB's auto-install is turned off, and Rocky never runs `INSTALL`. It runs `LOAD icu` from the extension directory only. If `icu` is not there, the connect fails with an error that names the directory and says how to fill it.
+
+```toml
+[adapter.local]
+type = "duckdb"
+extension_directory = "/opt/rocky/duckdb-extensions"
+offline = true
+```
+
+Fill the directory once, on a machine with network access:
+
+```sql
+SET extension_directory = '/opt/rocky/duckdb-extensions';
+INSTALL icu;
+```
+
+Then copy the directory to the offline machine. DuckDB stores files under `<version>/<platform>/`, so the directory must come from the same DuckDB build that Rocky runs. The connect error prints the version and platform it expects.
 
 ## Authentication
 

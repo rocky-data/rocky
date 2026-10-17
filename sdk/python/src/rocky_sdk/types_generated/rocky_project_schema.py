@@ -2051,6 +2051,10 @@ class AdapterConfig(BaseModel):
     Default database for the session.
     """
     destination_id: str | None = None
+    extension_directory: str | None = None
+    """
+    Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+    """
     extra: dict[str, Any] | None = None
     """
     Escape hatch for adapter-specific keys this struct doesn't model.
@@ -2080,6 +2084,10 @@ class AdapterConfig(BaseModel):
     oauth_token: str | None = None
     """
     OAuth access token (pre-obtained from an IdP).
+    """
+    offline: bool | None = None
+    """
+    When `true`, the DuckDB adapter never fetches an extension from the network. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. Default `false`.
     """
     password: str | None = None
     """

@@ -531,6 +531,8 @@ mod tests {
             project_id: None,
             location: None,
             path: None,
+            extension_directory: None,
+            offline: false,
             schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
