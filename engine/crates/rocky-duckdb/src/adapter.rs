@@ -81,8 +81,16 @@ fn resolve_file_database(
 /// Plain `CHECKPOINT` of one database. Never `FORCE CHECKPOINT`, which
 /// aborts other connections' open transactions.
 fn checkpoint_database(conn: &DuckDbConnector, db: &FileDatabase) -> AdapterResult<()> {
+    // Not bounded: a large WAL makes this slow while it holds the connector,
+    // so log the time to make a slow end-of-run checkpoint visible.
+    let started = std::time::Instant::now();
     conn.execute_statement(&format!("CHECKPOINT \"{}\"", db.name))
         .map_err(AdapterError::new)?;
+    tracing::info!(
+        database = %db.name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "checkpointed a DuckDB database to measure stored bytes"
+    );
     record_checkpoint(&db.path);
     Ok(())
 }

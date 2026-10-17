@@ -17,7 +17,7 @@
 //!   PendingStoredBytes::measure ─ cancelled ─────────▶ all None (no read)
 //!        │ stored_tables_bytes(all tables)
 //!        ├─ Ok(per table) ─▶ Some(b) or None per table
-//!        └─ Err ───────────▶ all None (logged at warn)
+//!        └─ Err ───────────▶ all None (logged at debug)
 //!
 //!   content-addressed write ──▶ Some(sum of written file sizes, data_files)
 //! ```
@@ -133,7 +133,9 @@ impl PendingStoredBytes {
                 return;
             }
             Err(e) => {
-                warn!(
+                // Debug, not warn: the figure is advisory, and a read-only
+                // attached database would otherwise warn on every run.
+                debug!(
                     error = %e,
                     "could not measure the stored bytes after the run; \
                      recording unknown (the run is not affected)"
@@ -173,7 +175,7 @@ pub(crate) async fn measure_single_table(
     {
         Ok(measured) => measured.into_iter().next().flatten(),
         Err(e) => {
-            warn!(
+            debug!(
                 table = %format!("{}.{}.{}", table.catalog, table.schema, table.table),
                 error = %e,
                 "could not measure the stored bytes after the write; \
