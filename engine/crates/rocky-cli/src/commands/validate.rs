@@ -2876,7 +2876,7 @@ schema_template = "demo"
              token = \"t\"\nextension_directory = \"/x\"\noffline = true\n\n\
              [pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\
              [pipeline.p.source]\nadapter = \"default\"\n\
-             [pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\ncomponents = [\"s\"]\n\
+             [pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"s\"]\n\
              [pipeline.p.target]\nadapter = \"wh\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n",
         );
         let hits: Vec<_> = out.messages.iter().filter(|m| m.code == "V059").collect();
