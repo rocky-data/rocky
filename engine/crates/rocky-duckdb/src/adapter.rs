@@ -300,8 +300,8 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     /// close anyway; it changes no table contents. Verified on DuckDB 1.5.6.
     ///
     /// Returns `Ok(None)` (unknown) for an in-memory or non-DuckDB catalog, a
-    /// zero block size, or any segment still not persistent after the
-    /// checkpoint.
+    /// zero block size, a table with no data block (empty, or only constant
+    /// segments), or any segment still not persistent after the checkpoint.
     async fn stored_table_bytes(&self, table: &TableRef) -> AdapterResult<Option<StoredBytes>> {
         validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
         validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
@@ -379,7 +379,10 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                     "pragma_storage_info() returned no counts",
                 ));
             };
-            if not_persistent > 0 {
+            // No data block (an empty table, or only constant segments): the
+            // table still has metadata this count leaves out, so 0 would be a
+            // wrong answer. Unknown instead.
+            if not_persistent > 0 || block_count == 0 {
                 return Ok(None);
             }
             let Some(bytes) = block_count.checked_mul(block_size) else {
@@ -781,6 +784,20 @@ mod tests {
             Some(block),
             "an attached file catalog is checkpointed and measured"
         );
+
+        adapter
+            .execute_statement("CREATE TABLE main.empty (id BIGINT)")
+            .await
+            .unwrap();
+        let empty = adapter
+            .stored_table_bytes(&TableRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "empty".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(empty, None, "no data block is unknown, not 0");
     }
 
     /// An in-memory database has no file blocks: unknown, never zero.

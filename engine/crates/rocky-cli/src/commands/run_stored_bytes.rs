@@ -41,10 +41,10 @@ pub(crate) fn measures_stored_bytes(strategy: &MaterializationStrategy) -> bool 
         // One execution per partition: the whole table's size would repeat
         // on every partition row, so it is not recorded per partition.
         MaterializationStrategy::TimeInterval { .. } => false,
-        // Content-addressed writes record their file sizes through
-        // `content_addressed_stored_bytes` instead.
-        MaterializationStrategy::ContentAddressed { .. }
-        | MaterializationStrategy::FullRefresh
+        // Content-addressed writes record their exact file sizes through
+        // `content_addressed_stored_bytes`, never through the adapter.
+        MaterializationStrategy::ContentAddressed { .. } => false,
+        MaterializationStrategy::FullRefresh
         | MaterializationStrategy::Incremental { .. }
         | MaterializationStrategy::Merge { .. }
         | MaterializationStrategy::DeleteInsert { .. }
