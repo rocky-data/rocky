@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.71.0] — 2026-10-17
+
 ### Changed
 
-- `state_path` on `RockyResource` and `RockyComponent` now defaults to `None`. The `--state-path` flag is omitted, so the engine resolves the state file itself. Before, the default was `.rocky-state.redb`. An explicit value still works.
+- `state_path` on `RockyResource` and `RockyComponent` now defaults to `None`. The `--state-path` flag is omitted, so the engine resolves the state file itself. Before, the default was `.rocky-state.redb`. An explicit value still works. This needs `rocky-sdk>=0.26.0`, so the floor rises from `0.18.0`.
 
 ### Fixed
 

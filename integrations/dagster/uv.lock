@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -275,7 +275,7 @@ wheels = [
 
 [[package]]
 name = "dagster-rocky"
-version = "1.70.0"
+version = "1.71.0"
 source = { editable = "." }
 dependencies = [
     { name = "dagster" },
@@ -997,7 +997,7 @@ wheels = [
 
 [[package]]
 name = "rocky-sdk"
-version = "0.25.0"
+version = "0.26.0"
 source = { editable = "../../sdk/python" }
 dependencies = [
     { name = "pydantic" },

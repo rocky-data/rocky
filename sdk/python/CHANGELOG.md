@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-17
+
 ### Changed
 
 - `RockyClient(state_path=...)` now defaults to `None`. The client omits `--state-path`, so the engine resolves the state file itself. Before, it always sent `--state-path .rocky-state.redb`. An explicit `state_path` still works.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.86.0] — 2026-10-17
+
 ### Fixed
 
 - On Snowflake, `rocky load` now quotes the target database, schema and table as written, the same as `rocky run` (#2413). This covers `CREATE TABLE IF NOT EXISTS`, `DELETE FROM` and `COPY INTO`. Before, the target was unquoted, so `marts.t` landed in `MARTS.T` while `rocky run` wrote `"marts"."t"`. The contract-gated load also loaded its staging table unquoted while it dropped, described and promoted it quoted. All load statements now name the same object.
