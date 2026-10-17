@@ -104,6 +104,13 @@ pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpe
     Ok(parsed)
 }
 
+/// The project root every `rocky product` command reads `products/` under:
+/// the working directory. A run stamps delivery deadlines from the same root,
+/// so the two never disagree about which products exist.
+pub(crate) fn product_command_root() -> Result<std::path::PathBuf> {
+    std::env::current_dir().context("failed to get current working directory")
+}
+
 /// Every delivery deadline the project's products declare.
 ///
 /// Reads `products/*.toml` under `root`. Best effort, because a run records
@@ -1080,7 +1087,7 @@ fn print_verify(output: &ProductVerifyOutput, output_json: bool) -> Result<()> {
 /// Exits 0 on `pass`, 1 on `needs_input`, 2 on `fail` — after printing
 /// the full report.
 pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: bool) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let (parsed, posture) = product_verify_outcome(&root, config_path, product_name)?;
     let output = verify_output_for(&parsed, &posture);
     print_verify(&output, output_json)?;
@@ -1253,7 +1260,7 @@ pub fn run_product_compile(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let output = product_compile_in(&root, config_path, Some(state_path), product_name)?;
     if output_json {
         print_json(&output)?;
@@ -1714,7 +1721,7 @@ pub fn run_product_approve(
     expect_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let output = product_approve_expecting(&root, state_path, product_name, expect_digest)?;
     if output_json {
         print_json(&output)?;
@@ -1982,7 +1989,7 @@ pub(crate) fn product_list_in(root: &Path, state_path: Option<&Path>) -> Result<
 ///
 /// Reads `products/` under the working directory, as `product status` does.
 pub fn run_product_list(_config_path: &Path, state_path: &Path, output_json: bool) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let output = product_list_in(&root, Some(state_path))?;
     if output_json {
         print_json(&output)?;
@@ -2068,7 +2075,7 @@ pub fn run_product_journal(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let Some(output) = product_journal_in(&root, Some(state_path), product_name)? else {
         anyhow::bail!(
             "product '{product_name}' is not known: no products/{product_name}.toml, and no \
@@ -2108,7 +2115,7 @@ pub fn run_product_status(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = product_command_root()?;
     let output = product_status_in(&root, Some(state_path), product_name)?;
     if output_json {
         print_json(&output)?;
@@ -4921,6 +4928,87 @@ pub(crate) mod delivery_tests {
         assert_eq!(deadlines[0].product, "revenue_daily");
         assert_eq!(deadlines[0].output_model, "revenue_daily");
         assert_eq!(deadlines[0].deliver_by.cron, "0 6 * * *");
+    }
+
+    /// A run stamps deadlines from the directory `rocky product status`
+    /// reads `products/` under (the working directory), not from the
+    /// `--config` file's directory. Here the config sits in `elsewhere/` with
+    /// no `products/`; the specs are in the working directory.
+    #[test]
+    fn a_run_stamps_deadlines_from_the_directory_product_status_reads() {
+        use crate::output::{MaterializationMetadata, MaterializationOutput, RunOutput};
+        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let store = StateStore::open(&root.join("state.redb")).unwrap();
+
+        let mut output = RunOutput::new(String::new(), 1, 1);
+        output.materializations.push(MaterializationOutput {
+            asset_key: vec!["revenue_daily".to_string()],
+            notes: vec![],
+            attempts: Vec::new(),
+            rows_copied: Some(2),
+            duration_ms: 1,
+            started_at: Utc::now(),
+            metadata: MaterializationMetadata {
+                strategy: "full_refresh".to_string(),
+                watermark: None,
+                target_table_full_name: None,
+                sql_hash: None,
+                column_count: None,
+                compile_time_ms: None,
+            },
+            partition: None,
+            cost_usd: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            job_ids: Vec::new(),
+            skip_internal: None,
+            recipe_identity: None,
+            output_column_hashes: None,
+            consumed_column_baseline: None,
+            output_version: None,
+            output_target: None,
+        });
+        let audit = crate::commands::run::audit_to_record(
+            &crate::commands::run_audit::AuditContext::detect(None, None, None),
+        );
+
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let status_root = product_command_root().unwrap();
+        let landed = crate::commands::run::persist_run_record(
+            Some(&store),
+            &output,
+            "run-root",
+            Utc::now(),
+            "cfg",
+            &audit,
+            Some("revenue"),
+        );
+        std::env::set_current_dir(saved).unwrap();
+
+        assert!(landed, "the record must land");
+        assert_eq!(
+            status_root, root,
+            "product status reads the working directory"
+        );
+        let record = store.get_run("run-root").unwrap().expect("record");
+        assert!(
+            record.models_executed[0].due_at.is_some(),
+            "the run must stamp the deadline that `product status` reads: {:?}",
+            record.models_executed[0]
+        );
     }
 
     #[test]
