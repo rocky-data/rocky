@@ -1021,6 +1021,7 @@ pub async fn run_quality(
         // loop sets `COMPACT_JSON` to promise one compact object per line,
         // and a serializer called here never sees that flag (#1604).
         crate::output::print_json(&output)?;
+        super::run::capture_run_output_for_test(run_id, &output);
     } else {
         let total_checks: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
         let quarantine_summary = if output.quarantine.is_empty() {
@@ -4293,6 +4294,7 @@ auto_create_schemas = true
         run_id: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
+        // JSON on, so the test capture holds the run's output.
         let cfg = rocky_core::config::load_rocky_config(config_path).unwrap();
         let rocky_core::config::PipelineConfig::Quality(pipeline) = &cfg.pipelines["dq"] else {
             panic!("quality fixture");
@@ -4302,7 +4304,7 @@ auto_create_schemas = true
             config_path,
             &pipeline,
             &cfg,
-            false,
+            true,
             state_path,
             run_id,
             chrono::Utc::now(),
@@ -4339,6 +4341,18 @@ auto_create_schemas = true
             .expect_err("a cancelled quality run must not report success");
         assert!(error.is::<super::super::run::Interrupted>(), "{error:#}");
         assert_eq!(orders_columns(&db).await, vec!["id", "name"]);
+        let captured = super::super::run::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove("dq-cancel-before")
+            .expect("the interrupted run emits its JSON");
+        assert_eq!(captured["interrupted"], true);
+        assert!(
+            captured["check_results"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no table may be checked after the cancel: {captured}"
+        );
         let store = StateStore::open(&state_path).unwrap();
         let runs = store.list_runs(1).unwrap();
         assert_eq!(runs.len(), 1, "the interrupted run records itself");
