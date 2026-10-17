@@ -138,8 +138,10 @@ pub fn run_publish_ir(
     out_path: &Path,
     with_seed: bool,
 ) -> Result<()> {
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let source_schemas = if with_seed {
-        load_source_schemas_from_seed(models_dir)?
+        load_source_schemas_from_seed(models_dir, project_config.as_ref())?
     } else {
         HashMap::new()
     };
@@ -149,8 +151,6 @@ pub fn run_publish_ir(
     // run types it, so the snapshot's typed columns, and its recipe hash,
     // match the run's (#2342). As in `rocky compile`, only a missing
     // `rocky.toml` is tolerated.
-    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let config = CompilerConfig {
         target_dialects: super::compile::target_dialects(project_config.as_ref(), config_path),
         strict_contracts: false,

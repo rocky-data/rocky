@@ -349,7 +349,7 @@ fn compile_inner(
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
-        let schemas = load_source_schemas_from_seed_at(project_root)?;
+        let schemas = load_source_schemas_from_seed_at(project_root, project_config.as_ref())?;
         let provenance = SourceProvenance::uniform(schemas.keys(), &SourceSchemaOrigin::Seed);
         (schemas, provenance)
     } else {
@@ -371,7 +371,12 @@ fn compile_inner(
         };
         match seed_use {
             SeedUse::IfPresent => {
-                merge_default_seed_schemas(project_root, &mut schemas, &mut provenance);
+                merge_default_seed_schemas(
+                    project_root,
+                    project_config.as_ref(),
+                    &mut schemas,
+                    &mut provenance,
+                );
             }
             SeedUse::Never | SeedUse::Required => {}
         }
@@ -1543,8 +1548,9 @@ fn build_p001_diagnostic(
 /// the producing-edge lookup walks.
 pub(crate) fn load_source_schemas_from_seed(
     models_dir: &Path,
+    config: Option<&rocky_config::RockyConfig>,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
-    load_source_schemas_from_seed_at(models_dir.parent().unwrap_or(Path::new(".")))
+    load_source_schemas_from_seed_at(models_dir.parent().unwrap_or(Path::new(".")), config)
 }
 
 /// Fill `schemas` with the tables of the project's seed file that it does
@@ -1561,6 +1567,7 @@ pub(crate) fn load_source_schemas_from_seed(
 /// schemas it had.
 fn merge_default_seed_schemas(
     project_root: &Path,
+    config: Option<&rocky_config::RockyConfig>,
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
     provenance: &mut SourceProvenance,
 ) {
@@ -1568,7 +1575,7 @@ fn merge_default_seed_schemas(
     if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
         return;
     }
-    match load_source_schemas_from_seed_at(project_root) {
+    match load_source_schemas_from_seed_at(project_root, config) {
         Ok(seed) => {
             for (key, columns) in seed {
                 if schemas.contains_key(&key) {
@@ -1596,6 +1603,7 @@ fn seed_file(project_root: &Path) -> std::path::PathBuf {
 #[cfg(feature = "duckdb")]
 pub(crate) fn load_source_schemas_from_seed_at(
     project_root: &Path,
+    config: Option<&rocky_config::RockyConfig>,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
     use anyhow::Context;
     use rocky_duckdb::DuckDbConnector;
@@ -1611,8 +1619,10 @@ pub(crate) fn load_source_schemas_from_seed_at(
     let seed_sql = std::fs::read_to_string(&seed_path)
         .with_context(|| format!("failed to read seed file: {}", seed_path.display()))?;
 
-    // In-memory DuckDB; dropped at end of fn so no temp files leak.
-    let conn = DuckDbConnector::in_memory()
+    // In-memory DuckDB; dropped at end of fn so no temp files leak. It takes
+    // the project's extension settings, so `offline = true` holds here too.
+    let extensions = crate::registry::duckdb_extensions_from(config);
+    let conn = DuckDbConnector::in_memory_with(&extensions)
         .map_err(|e| anyhow::anyhow!("failed to open in-memory DuckDB for --with-seed: {e}"))?;
     conn.execute_statement(&seed_sql)
         .map_err(|e| anyhow::anyhow!("seed execution failed for {}: {e}", seed_path.display()))?;
@@ -1628,6 +1638,7 @@ pub(crate) fn load_source_schemas_from_seed_at(
 #[cfg(not(feature = "duckdb"))]
 pub(crate) fn load_source_schemas_from_seed_at(
     _project_root: &Path,
+    _config: Option<&rocky_config::RockyConfig>,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
     anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
@@ -2847,7 +2858,7 @@ schema_template = "s"
              CREATE TABLE raw__users.users (id BIGINT, name VARCHAR);\n",
         );
 
-        let source_schemas = load_source_schemas_from_seed(&models_dir).unwrap();
+        let source_schemas = load_source_schemas_from_seed(&models_dir, None).unwrap();
         let cols = source_schemas
             .get("raw__users.users")
             .expect("seed loader should produce raw__users.users entry");

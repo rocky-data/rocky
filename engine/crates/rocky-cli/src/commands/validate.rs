@@ -876,6 +876,29 @@ fn validate_adapter(
         }
     }
 
+    // V059: `extension_directory` and `offline` are DuckDB settings. On any
+    // other adapter type nothing reads them, so a project that relies on
+    // `offline = true` to keep a run off the network is not protected.
+    if adapter.adapter_type != "duckdb" {
+        for (key, set) in [
+            ("extension_directory", adapter.extension_directory.is_some()),
+            ("offline", adapter.offline),
+        ] {
+            if set {
+                msgs.push(ValidateMessage {
+                    severity: "warn".into(),
+                    code: "V059".into(),
+                    message: format!(
+                        "adapter.{name}: `{key}` is set on a '{}' adapter. Only `type = \"duckdb\"` adapters read it, so it has no effect here. Remove it, or move it to the DuckDB adapter.",
+                        adapter.adapter_type
+                    ),
+                    file: None,
+                    field: Some(format!("adapter.{name}.{key}")),
+                });
+            }
+        }
+    }
+
     (ok, msgs)
 }
 
@@ -2843,6 +2866,28 @@ schema_template = "demo"
             errors[0].field.as_deref(),
             Some("pipeline.poc.source.discovery.adapter")
         );
+    }
+
+    #[test]
+    fn duckdb_settings_on_another_adapter_type_warn_v059() {
+        let out = validate_toml(
+            "[adapter.default]\ntype = \"duckdb\"\noffline = true\n\n\
+             [adapter.wh]\ntype = \"databricks\"\nhost = \"h\"\nhttp_path = \"/p\"\n\
+             token = \"t\"\nextension_directory = \"/x\"\noffline = true\n\n\
+             [pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\
+             [pipeline.p.source]\nadapter = \"default\"\n\
+             [pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\ncomponents = [\"s\"]\n\
+             [pipeline.p.target]\nadapter = \"wh\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n",
+        );
+        let hits: Vec<_> = out.messages.iter().filter(|m| m.code == "V059").collect();
+        let fields: Vec<_> = hits.iter().filter_map(|m| m.field.as_deref()).collect();
+        assert_eq!(
+            fields,
+            ["adapter.wh.extension_directory", "adapter.wh.offline"],
+            "{:?}",
+            out.messages
+        );
+        assert!(hits.iter().all(|m| m.severity == "warn"));
     }
 
     /// #2005 case 5: a DuckDB adapter with no `path` used as a pipeline's
