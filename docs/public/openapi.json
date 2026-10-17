@@ -14248,7 +14248,7 @@
             "type": "integer"
           },
           "partitions_skipped": {
-            "description": "Partitions that were already `Computed` in the state store and skipped by the runtime (currently always 0; reserved for the `--missing` change-detection optimization).",
+            "description": "Planned partitions that never started because a shutdown signal cancelled the run (#1606). A skipped partition has no state row, so `--missing` re-plans it. Counts plans, as the other fields do.",
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
