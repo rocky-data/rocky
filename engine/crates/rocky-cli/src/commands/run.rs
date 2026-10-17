@@ -14629,6 +14629,16 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     }
                     return Err(e);
                 }
+                // Cancel (#1606): a model that skipped partitions was not
+                // built, so it records no `Build` and fires no
+                // `after_model_run`. The next loop check settles the run.
+                if output
+                    .partition_summaries
+                    .last()
+                    .is_some_and(|summary| summary.partitions_skipped > 0)
+                {
+                    continue;
+                }
                 // Per-model decision (reporting-only). time_interval is never
                 // skip-eligible, so it is suppressed in the skip-gate loop above
                 // and owns its `Build` entry here. Gated on the skip gate being
@@ -16934,8 +16944,9 @@ async fn execute_time_interval_model(
     );
 
     // Cancel (#1606): the skipped plans wrote no state row, so `--missing`
-    // re-plans them. A plain run does not: once any partition has a row, the
-    // first-run fill no longer applies and a plain run builds only the latest.
+    // re-plans them. A plain run may not: once any partition of the model has
+    // a row, the first-run fill no longer applies and a plain run builds only
+    // the latest.
     if summary.partitions_skipped > 0 {
         output.interrupted = true;
         warn!(
