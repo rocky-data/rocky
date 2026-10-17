@@ -4747,6 +4747,10 @@ impl StateStore {
     /// Matches on [`ModelExecution::rocky_model_name`], the model name, not
     /// the table name.
     ///
+    /// `exclude_run_id` skips that run. A run persisted twice under one id
+    /// (for example after a failed `verify_after`) must not be its own
+    /// previous delivery.
+    ///
     /// # Errors
     ///
     /// Returns a [`StateError`] when run history cannot be read.
@@ -4754,9 +4758,11 @@ impl StateStore {
         &self,
         model_name: &str,
         unrecorded: UnrecordedScope,
+        exclude_run_id: Option<&str>,
     ) -> Result<Option<ModelExecution>, StateError> {
         let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
-            if !run.counts_as_production(unrecorded) {
+            if exclude_run_id == Some(run.run_id.as_str()) || !run.counts_as_production(unrecorded)
+            {
                 return None;
             }
             run.models_executed
