@@ -14479,6 +14479,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                                 ),
                             ),
                             output_target: Some(recorded_output_target(&model_ir)),
+                            // Exact: the sizes of the Parquet files just
+                            // committed or referenced.
+                            stored_bytes: Some(
+                                super::run_stored_bytes::content_addressed_stored_bytes(&summary),
+                            ),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -16347,6 +16352,18 @@ async fn execute_one_plain_model(
         Utc::now(),
     )
     .await;
+    // The output table's stored bytes, also measured after
+    // `model_duration_ms`. A failed read records unknown, never a failure.
+    let stored_bytes = super::run_stored_bytes::observe_stored_bytes(
+        warehouse,
+        &model_ir.materialization,
+        &rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        },
+    )
+    .await;
     Ok(MaterializationOutput {
         asset_key,
         notes: pending_drop
@@ -16392,6 +16409,7 @@ async fn execute_one_plain_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(&model_ir)),
+        stored_bytes,
     })
 }
 
@@ -16628,6 +16646,17 @@ async fn execute_snapshot_model(
         Utc::now(),
     )
     .await;
+    // The snapshot table's stored bytes. A failed read records unknown.
+    let stored_bytes = super::run_stored_bytes::observe_stored_bytes(
+        warehouse,
+        &model_ir.materialization,
+        &rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        },
+    )
+    .await;
     Ok(MaterializationOutput {
         asset_key: vec![
             model_ir.target.catalog.clone(),
@@ -16665,6 +16694,7 @@ async fn execute_snapshot_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(model_ir)),
+        stored_bytes,
     })
 }
 
@@ -17324,6 +17354,8 @@ async fn run_one_partition(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: Some(recorded_output_target(&tplan_ir)),
+            // Not measured per partition: see `run_stored_bytes::measures_stored_bytes`.
+            stored_bytes: None,
         })),
     }
 }
@@ -18928,6 +18960,9 @@ async fn process_table(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: None,
+            // Replicated tables are not measured, so replication sends no
+            // extra query.
+            stored_bytes: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -25453,6 +25488,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -41760,6 +41796,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
@@ -44172,6 +44209,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let run = rocky_core::state::RunRecord {
@@ -44374,6 +44412,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let base_run = rocky_core::state::RunRecord {
@@ -44507,6 +44546,7 @@ auto_create_schemas = true
             hash_scheme: Some(identity.hash_scheme.clone()),
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
+            stored_bytes: None,
             attempts: Vec::new(),
             output_target: None,
         };
@@ -44652,6 +44692,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
@@ -45636,6 +45677,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             };
             let run = rocky_core::state::RunRecord {
@@ -45943,6 +45985,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             };
             store

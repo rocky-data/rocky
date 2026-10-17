@@ -659,6 +659,39 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// The bytes a table stores, read after Rocky wrote it.
+    ///
+    /// The runner records the answer as
+    /// [`crate::state::ModelExecution::stored_bytes`] and `rocky cost` shows
+    /// it. An answer must be a measurement, never a guess: an adapter that
+    /// cannot measure a table returns `Ok(None)`, which reads as unknown.
+    ///
+    /// - **DuckDB:** the distinct storage blocks the table's column segments
+    ///   occupy, times the block size, after a `CHECKPOINT` of the table's
+    ///   database ([`crate::state::StoredBytesBasis::AllocatedBlocks`], an
+    ///   estimate). `None` for an in-memory database.
+    /// - **Every other adapter:** `Ok(None)`, the default.
+    ///
+    /// The content-addressed path does not call this: it records the exact
+    /// size of the Parquet files it wrote.
+    ///
+    /// Like [`Self::observed_table_version`], the read is optional: make
+    /// **one attempt**, with no retries and no draw from the run's retry
+    /// budget. An implementation may flush data the warehouse would flush
+    /// anyway (DuckDB writes its WAL into the database file), but must not
+    /// change table contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` if the measurement fails. The runner records
+    /// `None` and logs at debug level. A failed read never fails the run.
+    async fn stored_table_bytes(
+        &self,
+        _table: &TableRef,
+    ) -> AdapterResult<Option<crate::state::StoredBytes>> {
+        Ok(None)
+    }
+
     /// Refuse a watermark filter the session would read in a zone other than
     /// UTC (#2395).
     ///

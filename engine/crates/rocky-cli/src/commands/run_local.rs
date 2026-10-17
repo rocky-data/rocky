@@ -1747,6 +1747,16 @@ pub async fn run_snapshot(
             Utc::now(),
         )
         .await;
+        // The snapshot table's stored bytes. A failed read records unknown.
+        let stored_bytes = super::run_stored_bytes::observe_table_stored_bytes(
+            warehouse_adapter.as_ref(),
+            &rocky_ir::TableRef {
+                catalog: pipeline.target.catalog.clone(),
+                schema: pipeline.target.schema.clone(),
+                table: pipeline.target.table.clone(),
+            },
+        )
+        .await;
         output.materializations.push(MaterializationOutput {
             attempts: Vec::new(),
             notes: vec![],
@@ -1787,6 +1797,7 @@ pub async fn run_snapshot(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: None,
+            stored_bytes,
         });
     } else {
         output.tables_failed = 1;

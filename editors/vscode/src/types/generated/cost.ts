@@ -6,6 +6,10 @@
  */
 
 /**
+ * How a [`StoredBytes`] figure was measured.
+ */
+export type StoredBytesBasis = "data_files" | "allocated_blocks";
+/**
  * Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).
  */
 export type RunScopeKind = "production" | "shadow" | "branch" | "unrecorded";
@@ -123,6 +127,16 @@ export interface PerModelCostHistorical {
   model_name: string;
   rows_affected?: number | null;
   status: string;
+  /**
+   * The bytes the model's output table stored right after this execution wrote it, read back from the persisted `rocky_core::state::ModelExecution::stored_bytes`. Read `stored_bytes_basis` to tell an exact figure from an estimate.
+   *
+   * `None` (and omitted from JSON) means unknown: a view, a replicated table, a `time_interval` partition, an adapter that cannot measure it (every adapter except DuckDB today), an in-memory DuckDB database, a failed measurement, or a run recorded before this field existed. There is no run total: the bases differ, so a sum would mix exact and estimated figures.
+   */
+  stored_bytes?: number | null;
+  /**
+   * How `stored_bytes` was measured: `data_files` (exact Parquet data-file bytes, content-addressed outputs) or `allocated_blocks` (an estimate: DuckDB storage blocks times the block size, which overstates a small table). Present exactly when `stored_bytes` is.
+   */
+  stored_bytes_basis?: StoredBytesBasis | null;
   /**
    * Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
    */
