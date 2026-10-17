@@ -3466,7 +3466,7 @@
     },
     "ResidencyConfig": {
       "additionalProperties": false,
-      "description": "`[residency]` — data-residency settings.\n\nA region is a free-text label (`\"eu-west-1\"`, `\"eu\"`) set on pipeline sources, pipeline targets and `[ai]`. Labels compare as exact text.\n\n```toml [residency] enforce = true ```\n\nWith `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.",
+      "description": "`[residency]` — data-residency settings.\n\nA region is a free-text label (`\"eu-west-1\"`, `\"eu\"`) set on pipeline sources, pipeline targets and `[ai]`.\n\n```toml [residency] enforce = true ```\n\nWith `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.",
       "properties": {
         "enforce": {
           "default": false,

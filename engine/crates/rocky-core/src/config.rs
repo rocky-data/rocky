@@ -4888,7 +4888,7 @@ impl Default for AiSection {
 /// `[residency]` — data-residency settings.
 ///
 /// A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline
-/// sources, pipeline targets and `[ai]`. Labels compare as exact text.
+/// sources, pipeline targets and `[ai]`.
 ///
 /// ```toml
 /// [residency]

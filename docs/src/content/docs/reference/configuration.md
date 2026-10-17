@@ -1344,7 +1344,7 @@ Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `roc
 
 ## `[residency]`
 
-Make every pipeline and the AI endpoint say which region it is in. A region is a free-text label, such as `"eu-west-1"` or `"eu"`. Rocky compares labels as exact text, so pick one spelling and keep it.
+Make every pipeline and the AI endpoint say which region it is in. A region is a free-text label, such as `"eu-west-1"` or `"eu"`. Pick one spelling and keep it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

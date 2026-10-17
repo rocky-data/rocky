@@ -2337,7 +2337,7 @@ export interface PortabilityConfig {
 /**
  * `[residency]` — data-residency settings.
  *
- * A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`. Labels compare as exact text.
+ * A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`.
  *
  * ```toml [residency] enforce = true ```
  *
