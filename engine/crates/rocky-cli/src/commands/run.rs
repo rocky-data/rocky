@@ -304,15 +304,15 @@ pub(crate) static STALL_COPY_FOR_TEST: std::sync::LazyLock<
 /// pool: the settle grace may drop the run at any `.await`, and a sync write
 /// cannot be cut. Writing a set again is idempotent, and a recovery run is
 /// confirmed only once every key it needs is in the set, so a partial set
-/// confirms fewer runs, never a wrong one. A failure is logged; the run is
-/// already exiting.
+/// confirms fewer runs, never a wrong one. A failure is logged, and returns
+/// `false` so the caller writes the set again; the run is already exiting.
 fn flush_interrupted_watermarks(
     state: &StateStore,
     run_id: &str,
     recovery_tables: &[WatermarkRecoveryTable],
     replacements: &[ReplacementRecovery],
     deferred: &[DeferredWatermark],
-) {
+) -> bool {
     let materialized: Vec<WatermarkState> = deferred
         .iter()
         .map(|wm| WatermarkState {
@@ -327,12 +327,16 @@ fn flush_interrupted_watermarks(
         .collect();
     let confirmed = watermark_confirmation_runs(run_id, recovery_tables, replacements, deferred);
     let runs: Vec<_> = confirmed.iter().map(String::as_str).collect();
-    if let Err(e) = flush_run_watermarks(state, run_id, &entries, &runs) {
-        tracing::warn!(
-            error = %e,
-            count = entries.len(),
-            "failed to persist watermarks for interrupted run",
-        );
+    match flush_run_watermarks(state, run_id, &entries, &runs) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                count = entries.len(),
+                "failed to persist watermarks for interrupted run",
+            );
+            false
+        }
     }
 }
 
@@ -6572,9 +6576,12 @@ pub async fn run_with_explicit_contracts(
     // `Failed` in the state store after drain is marked `Interrupted`.
     //
     // The drain and the batch watermark flush after it are NOT bounded by the
-    // settle grace (`run_cancel::SIGNAL_SETTLE_GRACE`): every committed
-    // table's watermark is written only in that one batch, so cutting the
-    // drain would make the next run re-append those deltas. The hold lives
+    // settle grace (`run_cancel::SIGNAL_SETTLE_GRACE`): a copy still running
+    // when the signal lands writes its watermark only once it is collected,
+    // so cutting the drain would make the next run re-append its delta. Once
+    // interrupted, the drain writes each collected watermark before it waits
+    // on the next copy (#1606), so a cut loses only the copies still running
+    // and a copy caught between its commit and that write. The hold lives
     // until the batch watermark flush, on the normal and the interrupted path
     // alike. Under `--watch` it has no effect: the watch loop's own grace
     // bounds the iteration, as it bounded nothing before #1606 (it dropped
@@ -6752,14 +6759,16 @@ pub async fn run_with_explicit_contracts(
         // `--watch` the iteration is dropped after it) without losing the
         // watermarks of the copies that already committed. The terminal flush
         // below still writes the full set.
-        if interrupted && deferred_watermarks.len() > flushed_watermarks {
-            flush_interrupted_watermarks(
+        if interrupted
+            && deferred_watermarks.len() > flushed_watermarks
+            && flush_interrupted_watermarks(
                 &shared_state,
                 &run_id,
                 &recovery_tables,
                 &replaced_recovery_runs,
                 &deferred_watermarks,
-            );
+            )
+        {
             flushed_watermarks = deferred_watermarks.len();
         }
         // An inline drain already aborted every remaining task. Joining them
@@ -6993,7 +7002,7 @@ pub async fn run_with_explicit_contracts(
 
         // Terminal SIGINT flush: the fan-out has drained and this returns
         // right after, so nothing concurrent is running.
-        flush_interrupted_watermarks(
+        let _ = flush_interrupted_watermarks(
             &shared_state,
             &run_id,
             &recovery_tables,
@@ -33460,7 +33469,9 @@ row_count = true
             token,
             checkpoint_ordering_run(&config, &state_path, "stalled-1606", false),
         )));
-        let dropped = tokio::time::timeout(std::time::Duration::from_secs(5), run.as_mut()).await;
+        // t00 copies in milliseconds before t01 stalls; the generous bound
+        // only keeps a slow runner from dropping the run before that.
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(15), run.as_mut()).await;
         assert!(
             dropped.is_err(),
             "the stalled copy must hold the run until it is dropped"
@@ -33483,6 +33494,14 @@ row_count = true
                 .unwrap()
                 .is_none(),
             "the stalled copy never committed"
+        );
+        // A partial set confirms no recovery run: t01's watermark is missing.
+        assert!(
+            !store
+                .get_run_progress("stalled-1606")
+                .unwrap()
+                .expect("the run's checkpoint")
+                .watermarks_confirmed
         );
     }
 

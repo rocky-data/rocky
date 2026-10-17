@@ -171,10 +171,11 @@ impl Drop for UnboundedHold {
 /// release its claim.
 ///
 /// The replication fan-out is exempt (see [`RunCancel::hold_unbounded`]): its
-/// watermarks are deferred in memory and written in ONE batch after the drain
-/// (`flush_run_watermarks`), not as each table finishes. Cutting the drain
-/// would lose the watermark of every table already committed, so the next run
-/// would re-append those deltas on adapters without watermark recovery. That
+/// watermarks are deferred in memory. Once interrupted, the drain writes each
+/// collected watermark before it waits on the next copy, but a copy still
+/// running writes its watermark only after it is collected. Cutting the drain
+/// would lose those, so the next run would re-append their deltas on adapters
+/// without watermark recovery. That
 /// drain waited without a limit before #1606 and still does; a second signal
 /// stops it.
 pub(crate) const SIGNAL_SETTLE_GRACE: Duration = Duration::from_secs(5);
