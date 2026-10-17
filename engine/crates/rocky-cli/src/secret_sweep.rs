@@ -49,7 +49,7 @@ const PROBE: &str = "ROCKYPROBE-c7f1a93e5d2b4806-LEAKED-SECRET-VALUE";
 /// The variable every fixture field references.
 const PROBE_VAR: &str = "ROCKY_PROBE_SECRET";
 
-/// The floor Hugo ruled on 2026-09-11: a resolved value of 8 bytes or more is
+/// The floor ruled on 2026-09-11: a resolved value of 8 bytes or more is
 /// redacted everywhere; a shorter one is shown.
 const REDACTION_FLOOR_BYTES: usize = 8;
 
@@ -71,7 +71,7 @@ const PROBE_SHORT_VAR: &str = "ROCKY_PROBE_SHORT";
 /// A value that lands in a NUMERIC JSON position. `redact()` is a text
 /// replacement over the whole body, so rewriting `1234567890` to
 /// `${ROCKY_PROBE_NUMERIC}` produces `{"max_downstreams":${...}}` — not valid
-/// JSON. The ruling (drain, 2026-09-11) is that the response is then REFUSED
+/// JSON. The ruling (2026-09-11) is that the response is then REFUSED
 /// with `secret_redaction_unavailable`, deterministically and at the response
 /// level, never partially rendered.
 ///
@@ -1126,7 +1126,7 @@ async fn a_persisted_job_hands_back_no_secret_and_no_legacy_payload() {
 
         let legacy = version.is_none_or(|v| v < MIN_TRUSTED_REDACTION_VERSION);
         if legacy {
-            // Hugo's ruling: a record written before the redaction existed
+            // The ruling: a record written before the redaction existed
             // returns lifecycle metadata only. `error` is refused, not shown.
             //
             // "Omitted" is checked on the parsed value, not on the key's
