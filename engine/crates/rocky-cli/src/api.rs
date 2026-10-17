@@ -2364,8 +2364,10 @@ fn is_bare_product_name(name: &str) -> bool {
 /// Reports stored cursors, claims and tick-lock state. It deliberately does
 /// **not** evaluate demand — `rocky tick --dry-run` is the evaluation — so it
 /// stays side-effect free. With no product declaring `deliver_by` it is
-/// `O(pipelines)`. With one, each pipeline's delivery state reads run history,
-/// which makes it `O(pipelines × runs)`; see `commands::schedule_status`.
+/// `O(pipelines)`. With one, each pipeline's delivery state reads run history:
+/// the ordering-key walk is `O(pipelines × runs)`, but full-record decoding is
+/// capped at a fixed window of the newest runs per pipeline; see
+/// `commands::schedule_status`.
 async fn schedule_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ScheduleStatusOutput>, ApiError> {

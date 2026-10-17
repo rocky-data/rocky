@@ -4508,9 +4508,10 @@ impl StateStore {
     fn scan_runs_newest_first<T>(
         &self,
         limit: usize,
+        window: usize,
         mut weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
     ) -> Result<Vec<T>, StateError> {
-        if limit == 0 {
+        if limit == 0 || window == 0 {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read()?;
@@ -4536,11 +4537,13 @@ impl StateStore {
         // for a weight-1 caller that bound is exact.
         let mut kept = Vec::with_capacity(limit.min(keys.len()));
         let mut weight = 0usize;
+        let mut decoded = 0usize;
         for (_, run_id) in keys {
-            if weight >= limit {
+            if weight >= limit || decoded >= window {
                 break;
             }
             if let Some(value) = table.get(run_id.as_str())? {
+                decoded += 1;
                 let run: RunRecord = serde_json::from_slice(value.value())?;
                 if let Some((w, value)) = weigh(run) {
                     weight = weight.saturating_add(w);
@@ -4577,7 +4580,29 @@ impl StateStore {
         keep: impl Fn(&RunRecord) -> bool,
     ) -> Result<Vec<RunRecord>, StateError> {
         // Each kept run weighs exactly 1 because the unit here *is* the run.
-        self.scan_runs_newest_first(limit, |run| keep(&run).then_some((1, run)))
+        self.scan_runs_newest_first(limit, usize::MAX, |run| keep(&run).then_some((1, run)))
+    }
+
+    /// Like [`Self::list_runs_matching`], but decodes at most `window` of the
+    /// newest runs.
+    ///
+    /// A window, not a history search: a match older than the `window` newest
+    /// runs is not found, and the result then reads as "no match". Pass 1
+    /// still parses the ordering key of every row; the window bounds only the
+    /// full-record decoding, which is the dominant cost (a record is far
+    /// larger than its ordering key). Use it where "none in the recent
+    /// history" is an acceptable answer for a request that must stay cheap.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn list_runs_matching_within(
+        &self,
+        limit: usize,
+        window: usize,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<Vec<RunRecord>, StateError> {
+        self.scan_runs_newest_first(limit, window, |run| keep(&run).then_some((1, run)))
     }
 
     /// Get execution history for a specific model across runs, newest first.
@@ -4625,7 +4650,7 @@ impl StateStore {
         limit: usize,
         keep: impl Fn(&RunRecord) -> bool,
     ) -> Result<Vec<ModelExecution>, StateError> {
-        let per_run = self.scan_runs_newest_first(limit, |run| {
+        let per_run = self.scan_runs_newest_first(limit, usize::MAX, |run| {
             if !keep(&run) {
                 return None;
             }
@@ -4672,19 +4697,20 @@ impl StateStore {
         model_name: &str,
         unrecorded: UnrecordedScope,
     ) -> Result<crate::delivery::DurationEstimate, StateError> {
-        let durations = self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, |run| {
-            if !run.counts_as_production(unrecorded) {
-                return None;
-            }
-            let run_started = run.started_at;
-            run.models_executed
-                .iter()
-                .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
-                .map(|m| m.finished_at)
-                .max()
-                .and_then(|finished| elapsed_ms(run_started, finished))
-                .map(|elapsed| (1, elapsed))
-        })?;
+        let durations =
+            self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, usize::MAX, |run| {
+                if !run.counts_as_production(unrecorded) {
+                    return None;
+                }
+                let run_started = run.started_at;
+                run.models_executed
+                    .iter()
+                    .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
+                    .map(|m| m.finished_at)
+                    .max()
+                    .and_then(|finished| elapsed_ms(run_started, finished))
+                    .map(|elapsed| (1, elapsed))
+            })?;
         Ok(crate::delivery::estimate_durations(&durations))
     }
 
@@ -4701,15 +4727,16 @@ impl StateStore {
         pipeline: &str,
         unrecorded: UnrecordedScope,
     ) -> Result<crate::delivery::DurationEstimate, StateError> {
-        let durations = self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, |run| {
-            if run.pipeline.as_deref() != Some(pipeline)
-                || !matches!(run.status, RunStatus::Success)
-                || !run.counts_as_production(unrecorded)
-            {
-                return None;
-            }
-            elapsed_ms(run.started_at, run.finished_at).map(|elapsed| (1, elapsed))
-        })?;
+        let durations =
+            self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, usize::MAX, |run| {
+                if run.pipeline.as_deref() != Some(pipeline)
+                    || !matches!(run.status, RunStatus::Success)
+                    || !run.counts_as_production(unrecorded)
+                {
+                    return None;
+                }
+                elapsed_ms(run.started_at, run.finished_at).map(|elapsed| (1, elapsed))
+            })?;
         Ok(crate::delivery::estimate_durations(&durations))
     }
 
@@ -4728,7 +4755,7 @@ impl StateStore {
         model_name: &str,
         unrecorded: UnrecordedScope,
     ) -> Result<Option<ModelExecution>, StateError> {
-        let found = self.scan_runs_newest_first(1, |run| {
+        let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
             if !run.counts_as_production(unrecorded) {
                 return None;
             }
@@ -16347,6 +16374,50 @@ mod tests {
     /// The #1304 filter-below-the-cap contract: a matching run older than 50
     /// non-matching ones is still returned, where filtering the capped result
     /// would report "no matching runs" over a project full of them.
+    /// `list_runs_matching_within` decodes at most `window` runs, however many
+    /// are recorded, and a match older than the window is not found. Counted
+    /// by predicate invocations: the predicate runs once per decoded record.
+    #[test]
+    fn list_runs_matching_within_bounds_the_decoding() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        for i in 0..20i64 {
+            store
+                .record_run(&run_at(
+                    &format!("run-{i:02}"),
+                    base - chrono::Duration::minutes(i),
+                ))
+                .unwrap();
+        }
+
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let none = store
+            .list_runs_matching_within(1, 5, |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            })
+            .unwrap();
+        assert!(none.is_empty());
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "a never-matching predicate decodes the window, not the history"
+        );
+
+        // The oldest run matches but sits outside the window.
+        let found = store
+            .list_runs_matching_within(1, 5, |run| run.run_id == "run-19")
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a match older than the window is not found"
+        );
+        let found = store
+            .list_runs_matching_within(1, 20, |run| run.run_id == "run-19")
+            .unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
     #[test]
     fn list_runs_matching_filters_below_the_recency_cap() {
         let tmp = tempfile::tempdir().unwrap();
