@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `GET /api/v1/jobs/{id}` now withholds `result` and `error` for a job record written before redaction (#1919). Before, when such a record was read from the state file and held a resolved `${VAR}` value, the server served the `held` placeholder in those two fields. Both fields now read `null`, as for every other record from before redaction. No secret value was shown either way.
+- A signal during a `time_interval` model in `rocky run` now starts no new partition (#1606). Partitions already running finish. Before, the run went on through every planned partition until the 5 s settle limit cut it. A skipped partition writes no state row, so `rocky run --missing` builds it later; a plain `rocky run` builds only the latest partition. The run records itself as interrupted and exits 130. `rocky backfill` still has no signal handling, so a signal stops it at once, as before.
 
 ## [1.86.0] — 2026-10-17
 
