@@ -21294,6 +21294,7 @@ schema_template = "staging"
     /// one catalog. Tests that vary the SOURCE half build their own.
     fn test_source_config() -> rocky_core::config::PipelineSourceConfig {
         rocky_core::config::PipelineSourceConfig {
+            region: None,
             adapter: "default".to_string(),
             catalog: Some("src".to_string()),
             schema_pattern: rocky_core::config::SchemaPatternConfig {

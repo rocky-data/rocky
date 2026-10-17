@@ -2260,6 +2260,7 @@ mod tests {
             map.insert(name.to_string(), cfg);
         }
         RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: StateConfig::default(),
             adapters: IndexMap::new(),
@@ -2304,6 +2305,7 @@ mod tests {
             merge_keys_fallback: None,
             metadata_columns: vec![],
             source: PipelineSourceConfig {
+                region: None,
                 adapter: "default".into(),
                 catalog: None,
                 schema_pattern: SchemaPatternConfig {
@@ -2314,6 +2316,7 @@ mod tests {
                 discovery: None,
             },
             target: PipelineTargetConfig {
+                region: None,
                 adapter: "default".into(),
                 catalog_template: "{client}_warehouse".into(),
                 schema_template: "raw__{regions}__{source}".into(),
@@ -2334,6 +2337,7 @@ mod tests {
         PipelineConfig::Transformation(Box::new(TransformationPipelineConfig {
             models: "models/**".into(),
             target: TransformationTargetConfig {
+                region: None,
                 adapter: "default".into(),
                 governance: GovernanceConfig::default(),
             },
@@ -2349,6 +2353,7 @@ mod tests {
     fn quality_pipeline(depends_on: Vec<&str>) -> PipelineConfig {
         PipelineConfig::Quality(Box::new(QualityPipelineConfig {
             target: QualityTargetConfig {
+                region: None,
                 adapter: "default".into(),
             },
             tables: vec![],

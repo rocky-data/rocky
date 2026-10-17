@@ -484,7 +484,9 @@ fn transformation_model_selections(
 /// Codes are a public contract, so the two pre-existing ones keep their exact
 /// meaning — V032 for `[adapter.*]` `kind` invariants, V033 for pipeline
 /// adapter-role mismatches — V057 covers a `manual` adapter's `schemas` list
-/// (#1994), and everything else the chain rejects lands on
+/// (#1994), V060 a `region` label missing under `[residency] enforce` or not
+/// well-formed, V061 a pipeline whose source and target regions differ, and
+/// everything else the chain rejects lands on
 /// V046 rather than the V001 parse code, which already carries both the "Config
 /// syntax valid" ok message and the "Failed to parse config" error.
 fn config_error_diagnostic(
@@ -558,6 +560,11 @@ fn config_error_diagnostic(
         ),
         ConfigError::DuplicateCheckName { pipeline, .. } => {
             ("V046", Some(format!("pipeline.{pipeline}.checks")))
+        }
+        ConfigError::ResidencyRegionMissing { field }
+        | ConfigError::ResidencyRegionMalformed { field, .. } => ("V060", Some(field.clone())),
+        ConfigError::ResidencyCrossRegion { pipeline, .. } => {
+            ("V061", Some(format!("pipeline.{pipeline}.target.region")))
         }
         _ => ("V046", None),
     };
@@ -3500,6 +3507,133 @@ schema_template = "staging__{{source}}"
             .filter(|m| m.code == code && m.severity == severity)
             .map(|m| m.message.clone())
             .collect()
+    }
+
+    /// `[residency] enforce = true` with an unlabelled target and `[ai]` is
+    /// one V060 error per missing label, each pointing at its key. A labelled
+    /// source raises nothing.
+    #[test]
+    fn residency_missing_region_is_v060_error_per_field() {
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[residency]
+enforce = true
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "eu"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        assert!(!out.valid);
+        let mut fields: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V060" && m.severity == "error")
+            .map(|m| m.field.clone().unwrap_or_default())
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["ai.region", "pipeline.p.target.region"],
+            "{:?}",
+            out.messages
+        );
+    }
+
+    /// A malformed `region` is a V060 error at its key even with no
+    /// `[residency]` block, and is never folded into the V046 catch-all.
+    #[test]
+    fn residency_malformed_region_is_v060_error() {
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "EU"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        assert!(!out.valid);
+        let v060: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V060" && m.severity == "error")
+            .collect();
+        assert_eq!(v060.len(), 1, "{:?}", out.messages);
+        assert_eq!(v060[0].field.as_deref(), Some("pipeline.p.source.region"));
+        assert!(v060[0].message.contains("\"EU\""), "{}", v060[0].message);
+    }
+
+    /// An EU source with a US target is a V061 error at the target's region
+    /// key, found offline. `[residency] allow` for that direction clears it.
+    #[test]
+    fn residency_cross_region_is_v061_error() {
+        let toml = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "eu"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+region = "us"
+"#;
+        let out = validate_toml(toml);
+        assert!(!out.valid);
+        let v061: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V061" && m.severity == "error")
+            .collect();
+        assert_eq!(v061.len(), 1, "{:?}", out.messages);
+        assert_eq!(v061[0].field.as_deref(), Some("pipeline.p.target.region"));
+
+        let allowed = format!("{toml}\n[residency]\nallow = [{{ from = \"eu\", to = \"us\" }}]\n");
+        let out = validate_toml(&allowed);
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V061"),
+            "{:?}",
+            out.messages
+        );
     }
 
     /// #1994: a manual adapter that lists schemas is valid, with no V057

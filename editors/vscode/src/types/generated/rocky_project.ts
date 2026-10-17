@@ -530,6 +530,10 @@ export interface RockyConfig {
    */
   portability?: PortabilityConfig;
   /**
+   * `[residency]` — require region labels. Absent ⇒ no requirement, and the key is not serialized, so a project without the block keeps its config snapshot byte-identical. See [`ResidencyConfig`].
+   */
+  residency?: ResidencyConfig | null;
+  /**
    * `[resilience]` — the run loop's classified-retry policy. Governs whether a model whose materialization fails *transiently* is re-run, with a conservative bounded budget and capped backoff. On by default (a transient failure is retried), but every knob is small and explicit; see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
    */
   resilience?: ResilienceConfig;
@@ -932,6 +936,10 @@ export interface AiSection {
    * Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
    */
   max_tokens?: number;
+  /**
+   * Region label of the AI endpoint. See [`ResidencyConfig`].
+   */
+  region?: string | null;
 }
 /**
  * Top-level `[branch]` configuration section.
@@ -1570,6 +1578,10 @@ export interface PipelineSourceConfig {
    */
   discovery?: DiscoveryConfig | null;
   /**
+   * Region label where the source data lives. See [`ResidencyConfig`].
+   */
+  region?: string | null;
+  /**
    * Schema pattern for parsing source schema names.
    */
   schema_pattern: SchemaPatternConfig;
@@ -1673,6 +1685,10 @@ export interface PipelineTargetConfig {
    * Governance settings for the target.
    */
   governance?: GovernanceConfig;
+  /**
+   * Region label where the target stores the data. See [`ResidencyConfig`].
+   */
+  region?: string | null;
   /**
    * Template for the target schema name.
    */
@@ -1842,6 +1858,10 @@ export interface TransformationTargetConfig {
    * Governance settings for the target.
    */
   governance?: GovernanceConfig;
+  /**
+   * Region label where the target stores the data. See [`ResidencyConfig`].
+   */
+  region?: string | null;
 }
 /**
  * Quality pipeline configuration — standalone data quality checks.
@@ -1902,6 +1922,10 @@ export interface QualityTargetConfig {
    * Name of the adapter to use (references a key in `[adapter.*]`).
    */
   adapter?: string;
+  /**
+   * Region label where the checked data lives. See [`ResidencyConfig`].
+   */
+  region?: string | null;
 }
 /**
  * Snapshot pipeline configuration — SCD Type 2 slowly-changing dimension capture.
@@ -1962,6 +1986,10 @@ export interface SnapshotSourceConfig {
    */
   adapter?: string;
   catalog: string;
+  /**
+   * Region label where the source data lives. See [`ResidencyConfig`].
+   */
+  region?: string | null;
   schema: string;
   table: string;
 }
@@ -1975,6 +2003,10 @@ export interface SnapshotTargetConfig {
   adapter?: string;
   catalog: string;
   governance?: GovernanceConfig;
+  /**
+   * Region label where the target stores the data. See [`ResidencyConfig`].
+   */
+  region?: string | null;
   schema: string;
   table: string;
 }
@@ -2107,6 +2139,10 @@ export interface LoadTargetConfig {
    * Governance settings for the target.
    */
   governance?: GovernanceConfig;
+  /**
+   * Region label where the target stores the data. See [`ResidencyConfig`].
+   */
+  region?: string | null;
   /**
    * Target schema name.
    */
@@ -2297,6 +2333,40 @@ export interface PortabilityConfig {
    * Target dialect for the portability lint. When unset, no lint runs (matches the wave-1 "flag opt-in" behavior). The CLI flag overrides this if both are present.
    */
   target_dialect?: Dialect | null;
+}
+/**
+ * `[residency]` — data-residency settings.
+ *
+ * A region is a label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`: lowercase letters, digits and hyphens.
+ *
+ * ```toml [residency] enforce = true ```
+ *
+ * With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`.
+ *
+ * Whether or not `enforce` is on, a pipeline whose source and target labels differ is refused (V061) unless `allow` lists that direction.
+ */
+export interface ResidencyConfig {
+  /**
+   * Cross-region moves that are deliberate. Each entry permits one direction, from a source region to a target region. Labels compare as exact text.
+   */
+  allow?: ResidencyAllow[];
+  /**
+   * Require a `region` label on every source, target and `[ai]`.
+   */
+  enforce?: boolean;
+}
+/**
+ * One permitted cross-region direction in `[residency] allow`.
+ */
+export interface ResidencyAllow {
+  /**
+   * Region label of the source.
+   */
+  from: string;
+  /**
+   * Region label of the target.
+   */
+  to: string;
 }
 /**
  * `[resilience]` — the run loop's classified-retry policy.
