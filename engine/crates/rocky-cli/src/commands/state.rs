@@ -998,6 +998,7 @@ mod retention_sweep_config_tests {
             submission_id: None,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 

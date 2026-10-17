@@ -104,6 +104,58 @@ pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpe
     Ok(parsed)
 }
 
+/// Every delivery deadline the project's products declare.
+///
+/// Reads `products/*.toml` under `root`. Best effort, because a run records
+/// delivery timing as advice: a spec that does not parse, or a directory that
+/// cannot be read, contributes no deadline and logs a warning. `rocky
+/// validate` and `rocky product status` are where a broken spec is refused.
+pub(crate) fn product_deadlines_in(root: &Path) -> Vec<rocky_core::delivery::ProductDeadline> {
+    let dir = root.join("products");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                dir = %dir.display(),
+                "cannot read the products directory; no delivery deadlines are recorded"
+            );
+            return Vec::new();
+        }
+    };
+    let mut stems: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    stems.sort();
+    let mut deadlines = Vec::new();
+    for stem in stems {
+        match load_spec(root, &stem) {
+            Ok(parsed) => {
+                if let Some(deliver_by) = parsed.product().deliver_by() {
+                    deadlines.push(rocky_core::delivery::ProductDeadline {
+                        product: parsed.product().name.clone(),
+                        output_model: parsed.output_model().to_string(),
+                        deliver_by,
+                    });
+                }
+            }
+            Err(reject) => tracing::warn!(
+                product = %stem,
+                "product spec does not load ({reject}); its delivery deadline is not recorded"
+            ),
+        }
+    }
+    deadlines
+}
+
 // ---------------------------------------------------------------------------
 // The posture verification (D5 checks 1 + 2 against the real evaluator)
 // ---------------------------------------------------------------------------
@@ -4570,5 +4622,57 @@ effect = "require_review"
             text.contains("cannot be read") && text.contains("cannot be resolved"),
             "the refusal must name the broken ancestor, got: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    const SPEC: &str =
+        include_str!("../../../rocky-core/src/product/testdata/revenue_daily.spec.toml");
+
+    /// The shared spec fixture with a delivery deadline added to `[product]`.
+    fn spec_with_deadline(deliver_by: &str) -> String {
+        let intent = "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n";
+        assert!(SPEC.contains(intent), "fixture layout changed");
+        SPEC.replacen(
+            intent,
+            &format!("{intent}deliver_by = \"{deliver_by}\"\n"),
+            1,
+        )
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn deadlines_come_from_specs_that_declare_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        // A spec without a deadline and a broken spec contribute nothing.
+        write(
+            &root.join("products/other.toml"),
+            &SPEC.replace("revenue_daily", "other"),
+        );
+        write(&root.join("products/broken.toml"), "not = [toml");
+
+        let deadlines = product_deadlines_in(root);
+        assert_eq!(deadlines.len(), 1, "{deadlines:?}");
+        assert_eq!(deadlines[0].product, "revenue_daily");
+        assert_eq!(deadlines[0].output_model, "revenue_daily");
+        assert_eq!(deadlines[0].deliver_by.cron, "0 6 * * *");
+    }
+
+    #[test]
+    fn a_project_without_products_has_no_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(product_deadlines_in(dir.path()).is_empty());
     }
 }

@@ -6559,6 +6559,8 @@ impl RunOutput {
                 output_version: mat.output_version.clone(),
                 // Where this model wrote, for `rocky run --defer-state`.
                 output_target: mat.output_target.clone(),
+                due_at: None,
+                wait_for_upstream_ms: None,
             });
         }
 
@@ -6602,6 +6604,8 @@ impl RunOutput {
                 // recorded"); it may have written nothing at all.
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             });
         }
 
@@ -6658,6 +6662,7 @@ impl RunOutput {
             // `fail_on_error = false`), so deriving one from the other fails
             // open (#1732).
             verify_after_failed: self.verify_after_failed,
+            queued_ms: None,
         }
     }
 

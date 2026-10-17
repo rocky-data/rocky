@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed.
+A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. The one exception is the delivery deadline (below): the engine reads it from the spec itself, and nothing is lowered for it.
 
 The verbs on this page are the deterministic half of spec fulfillment. They parse, verify, lower, and approve. The agent loop that drafts SQL is [`rocky fulfill`](/reference/commands/fulfill/), and it is gated by the same policy plane as every other agent action.
 
@@ -18,6 +18,22 @@ products/<name>.toml ──verify──▶ posture + tags + collisions
                       Phase B: metadata merged into models/<model>.toml
                       (staged writes; the manifest rename commits)
 ```
+
+### Delivery deadline
+
+A product can say when its output must arrive. Add two optional keys to `[product]`:
+
+```toml
+[product]
+name = "revenue_daily"
+intent = "Daily gross revenue per client in EUR"
+deliver_by = "0 6 * * *"     # a 5-field cron expression; each occurrence is a deadline
+timezone = "Europe/Lisbon"   # IANA name; defaults to UTC
+```
+
+The parser checks `deliver_by` with the scheduler's own cron parser (`deliver-by-unparseable`). It refuses an unknown timezone (`timezone-unknown`) and a `timezone` without `deliver_by` (`timezone-without-deliver-by`).
+
+Each production `rocky run` that builds the product's output model records the deadline that build served. A build covers the first deadline at or after it finished. If an earlier deadline was still open when it finished, the build serves that one instead, and it is late. Lateness is wall-clock time from the deadline to the moment the model finished. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of the `rocky.toml` it runs.
 
 ---
 

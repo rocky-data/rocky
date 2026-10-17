@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A product spec can declare a delivery deadline: `deliver_by` (a 5-field cron expression) and `timezone` (an IANA name, UTC when omitted) in `[product]`. The parser uses the scheduler's cron parser. New reject codes: `deliver-by-unparseable`, `timezone-unknown`, `timezone-without-deliver-by`. The lowering manifest records both keys as verified, with no artifact.
+- Each production run now records delivery timing. A successful build of a product's output model records `due_at`, the deadline it served. Lateness is `finished_at - due_at`. A build serves the oldest deadline still open when it finished; with none open, the first deadline at or after it finished. Each model execution also records `wait_for_upstream_ms`, the time from run start to model start. A run launched by the scheduler records `queued_ms`, the time from the claim's logical timestamp to run start. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of its `rocky.toml`. The three fields are optional and omitted when empty, so the state schema stays at v33.
+
 ### Changed
 
 - `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 attempts when another writer wins. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.

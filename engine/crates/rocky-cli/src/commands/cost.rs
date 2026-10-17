@@ -570,6 +570,8 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         }
     }
 
@@ -610,6 +612,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 

@@ -583,6 +583,24 @@ fn field_rows(parsed: &ParsedSpec, phase: Phase) -> BTreeMap<String, FieldRow> {
              three-check posture verification ran before lowering",
         ),
     );
+    if parsed.product().deliver_by.is_some() {
+        rows.insert(
+            "product.deliver_by".to_string(),
+            FieldRow::new(Disposition::Verified).with_note(
+                "verified by the spec parser (the scheduler's cron grammar); no artifact: \
+                 run records and the status surfaces read the deadline from the spec itself",
+            ),
+        );
+    }
+    if parsed.product().timezone.is_some() {
+        rows.insert(
+            "product.timezone".to_string(),
+            FieldRow::new(Disposition::Verified).with_note(
+                "verified by the spec parser (an IANA timezone name); no artifact: read with \
+                 deliver_by from the spec itself",
+            ),
+        );
+    }
     rows
 }
 

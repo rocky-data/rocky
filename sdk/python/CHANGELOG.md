@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The generated `ProductSpec` model gains `deliver_by` and `timezone`, the optional delivery deadline of a product spec.
+
 ## [0.26.0] — 2026-10-17
 
 ### Changed

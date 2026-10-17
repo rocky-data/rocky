@@ -1048,6 +1048,16 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///
 ///   **RV1-P2 bumped to v32 when publish started reading `output_version`**
 ///   (see the v32 stanza above). The field itself is unchanged.
+///
+/// - **[`ModelExecution::due_at`], [`ModelExecution::wait_for_upstream_ms`]
+///   and [`RunRecord::queued_ms`]** (at v33). Delivery timing. Only status
+///   reports read them (`rocky product status` and the scheduler status);
+///   no gate or write decision does, so a binary that ignores them acts the
+///   same. Each is omitted when `None`, so a row without them is
+///   byte-identical to an older row. A row from an older binary reads back
+///   `None`, which means "not recorded". Guarded by
+///   `test_pre_delivery_timing_model_execution_forward_deserializes_to_none`
+///   and `test_pre_queued_ms_run_record_forward_deserializes_to_none`.
 const CURRENT_SCHEMA_VERSION: u32 = 33;
 
 /// Errors from the embedded redb state store.
@@ -2962,6 +2972,55 @@ pub struct ModelExecution {
     /// byte-identical. State-internal: not part of any `*Output` JSON schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_target: Option<RecordedTarget>,
+
+    // --- Delivery timing (no schema bump) ---------------------------------
+    /// The delivery deadline this execution served, when the model is the
+    /// output of a product that declares `deliver_by`. See
+    /// [`crate::delivery`] for how the deadline is chosen. Lateness is
+    /// `finished_at - due_at`; see [`Self::late_by_seconds`].
+    ///
+    /// `None` for a model that is no product's output, for a product with no
+    /// `deliver_by`, for a run that does not count as production, and for a
+    /// record written before this field existed.
+    ///
+    /// Added without a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`]. Omitted when `None`, so the
+    /// `ledger_record_serialization_pinned` golden stays byte-identical.
+    /// State-internal: not part of any `*Output` JSON schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Milliseconds from the start of the run to the start of this model:
+    /// the time it waited behind the models it depends on, plus the run's
+    /// own setup. `None` when the model started before the recorded run
+    /// start (a clock step), and for records written before this field.
+    ///
+    /// Added without a schema bump, like [`Self::due_at`]. Omitted when
+    /// `None`. State-internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for_upstream_ms: Option<u64>,
+}
+
+impl ModelExecution {
+    /// The Rocky model this execution built.
+    ///
+    /// [`Self::model_name`] holds the table name, which can differ from the
+    /// model name. [`RecordedTarget::model`] is the model name, so it wins
+    /// when the execution recorded one.
+    #[must_use]
+    pub fn rocky_model_name(&self) -> &str {
+        self.output_target
+            .as_ref()
+            .map_or(self.model_name.as_str(), |target| target.model.as_str())
+    }
+
+    /// Seconds from [`Self::due_at`] to [`Self::finished_at`]. Positive is
+    /// late, zero or negative is on time. `None` when no deadline was
+    /// recorded.
+    #[must_use]
+    pub fn late_by_seconds(&self) -> Option<i64> {
+        self.due_at
+            .map(|due| (self.finished_at - due).num_seconds())
+    }
 }
 
 /// Where one successful model execution wrote its output.
@@ -3399,6 +3458,19 @@ pub struct RunRecord {
     /// `None` means an older record whose write scope cannot be classified.
     #[serde(default)]
     pub run_scope: Option<RunScope>,
+
+    /// Milliseconds from the instant the scheduler found this run's demand
+    /// due (the claim's logical timestamp) to [`Self::started_at`]. Recorded
+    /// only for a run launched by the scheduler for a cron, `after` or
+    /// freshness demand. `None` for a run started by hand, for a webhook
+    /// demand (whose claim carries no instant), and for records written
+    /// before this field existed.
+    ///
+    /// Added without a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`]. Omitted when `None`, so the
+    /// `ledger_record_serialization_pinned` golden stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -4571,6 +4643,34 @@ impl StateStore {
         }
         let avg = history.iter().map(|m| m.duration_ms as f64).sum::<f64>() / history.len() as f64;
         Ok(Some(avg))
+    }
+
+    /// The newest successful execution of `model_name` in a run that counts
+    /// as production under `unrecorded`. This is the model's latest
+    /// delivery.
+    ///
+    /// Matches on [`ModelExecution::rocky_model_name`], the model name, not
+    /// the table name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn last_delivery(
+        &self,
+        model_name: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<Option<ModelExecution>, StateError> {
+        let found = self.scan_runs_newest_first(1, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            run.models_executed
+                .into_iter()
+                .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
+                .max_by_key(|m| m.finished_at)
+                .map(|m| (1, m))
+        })?;
+        Ok(found.into_iter().next())
     }
 
     /// Record quality metrics for a model.
@@ -9588,6 +9688,8 @@ pub fn run_with_output_versions(
                 attempts: Vec::new(),
                 output_version: version.clone(),
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             })
             .collect(),
         trigger: RunTrigger::Manual,
@@ -9607,6 +9709,7 @@ pub fn run_with_output_versions(
         verify_after_failed: false,
         rocky_branch: None,
         run_scope: Some(RunScope::Production),
+        queued_ms: None,
     }
 }
 
@@ -10786,6 +10889,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(RunScope::Production),
+            queued_ms: None,
         }
     }
 
@@ -11745,6 +11849,8 @@ mod tests {
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -11945,6 +12051,8 @@ mod tests {
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             })
             .collect();
         for i in 0..1440u32 {
@@ -12244,6 +12352,8 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         }
     }
 
@@ -12337,6 +12447,8 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -12360,6 +12472,8 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 },
             ],
         );
@@ -12398,6 +12512,8 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -12551,6 +12667,63 @@ mod tests {
         let back: ModelExecution =
             serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
         assert_eq!(back.output_target, exec.output_target);
+    }
+
+    /// A `ModelExecution` written before the delivery-timing fields existed
+    /// reads with `due_at` and `wait_for_upstream_ms` `None`, and writing
+    /// them back as `None` adds no keys, so older ledger bytes are unchanged.
+    /// Set values round-trip.
+    #[test]
+    fn test_pre_delivery_timing_model_execution_forward_deserializes_to_none() {
+        let blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": null,
+            "status": "success",
+            "sql_hash": "h",
+            "bytes_scanned": null,
+            "bytes_written": null
+        }"#;
+        let mut exec: ModelExecution =
+            serde_json::from_slice(blob).expect("pre-field record must read");
+        assert_eq!(exec.due_at, None);
+        assert_eq!(exec.wait_for_upstream_ms, None);
+        assert_eq!(exec.late_by_seconds(), None);
+        let written = serde_json::to_string(&exec).unwrap();
+        assert!(!written.contains("due_at"), "{written}");
+        assert!(!written.contains("wait_for_upstream_ms"), "{written}");
+
+        exec.due_at = Some("2024-01-01T12:00:00Z".parse().unwrap());
+        exec.wait_for_upstream_ms = Some(750);
+        let back: ModelExecution =
+            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        assert_eq!(back.due_at, exec.due_at);
+        assert_eq!(back.wait_for_upstream_ms, Some(750));
+        assert_eq!(back.late_by_seconds(), Some(2));
+    }
+
+    /// A `RunRecord` written before `queued_ms` existed reads with it `None`;
+    /// `None` is omitted on write, and a value round-trips.
+    #[test]
+    fn test_pre_queued_ms_run_record_forward_deserializes_to_none() {
+        let mut value = serde_json::to_value(minimal_run_record("run-pre-queue", vec![]))
+            .expect("serialize run record");
+        assert!(
+            !value.as_object().unwrap().contains_key("queued_ms"),
+            "a None queued_ms adds no key"
+        );
+        value.as_object_mut().unwrap().remove("queued_ms");
+        let record: RunRecord = serde_json::from_slice(&serde_json::to_vec(&value).unwrap())
+            .expect("a pre-queued_ms RunRecord must forward-deserialize");
+        assert_eq!(record.queued_ms, None);
+
+        let mut queued = minimal_run_record("run-queued", vec![]);
+        queued.queued_ms = Some(42_000);
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&queued).unwrap()).unwrap();
+        assert_eq!(round.queued_ms, Some(42_000));
     }
 
     /// v10 → v11 forward-compat: a `ModelExecution` blob written before the
@@ -12762,6 +12935,8 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -12816,6 +12991,8 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 

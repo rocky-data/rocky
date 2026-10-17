@@ -313,6 +313,8 @@ pub(crate) mod tests {
                 schema: schema.to_string(),
                 table: table.to_string(),
             }),
+            due_at: None,
+            wait_for_upstream_ms: None,
         }
     }
 
@@ -340,6 +342,7 @@ pub(crate) mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: scope,
+            queued_ms: None,
         }
     }
 
