@@ -1425,4 +1425,58 @@ for line in sys.stdin:
             .await
             .expect("the drop test itself hung");
     }
+
+    /// An adapter that exits on `SIGTERM` is not made to wait out the grace:
+    /// the stop path sees the leader exit and returns at once. The adapters
+    /// above ignore `SIGTERM`, so they reach `SIGKILL` even when the exit
+    /// check never fires. With a 5 s grace, a check that never fires would
+    /// take about 6 s here and fail the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_leader_that_exits_on_sigterm_does_not_wait_out_the_grace() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            // The same adapter, minus the line that ignores `SIGTERM`.
+            let script =
+                LIMITS_ADAPTER.replace("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n", "");
+            assert_ne!(script, LIMITS_ADAPTER, "the SIGTERM line should be gone");
+            let adapter = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", &script],
+                &serde_json::json!({}),
+                ProcessLimits {
+                    call_timeout: Duration::from_secs(1),
+                    stop_grace: Duration::from_secs(5),
+                    ..test_limits()
+                },
+            )
+            .await
+            .expect("adapter should initialize");
+
+            let started = std::time::Instant::now();
+            let err = adapter
+                .call("hang", serde_json::json!({}))
+                .await
+                .expect_err("a hung call must time out");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(
+                    err.inner().downcast_ref::<ProcessAdapterError>(),
+                    Some(ProcessAdapterError::Timeout { .. })
+                ),
+                "expected a Timeout, got {err}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(2500),
+                "the stop path waited out the grace: {elapsed:?}"
+            );
+            eprintln!("sigterm-exit call returned in {elapsed:?}");
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the grace test itself hung");
+    }
 }
