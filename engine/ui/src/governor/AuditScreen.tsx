@@ -4,7 +4,7 @@ import type { ProductListOutput } from "@rocky-types/product_list";
 import { apiGet } from "../api";
 import { EmptyState, StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
-import { formatInstant } from "../format";
+import { formatInstant, verdictLabel } from "../format";
 import { auditPath, navigateTo } from "../router";
 import { CustodyLink } from "./links";
 import { Rows } from "./SectionCard";
@@ -133,7 +133,7 @@ function LedgerBody({ ledger, now }: { ledger: AuditOutput; now?: number }) {
       )}
       <Rows
         ariaLabel="Policy decisions"
-        columns={["when", "principal", "capability", "model", "effect", "rule", "plan", "reason"]}
+        columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "plan", "reason"]}
         rows={ledger.decisions.map((entry) => [
           formatInstant(entry.timestamp, now),
           // `class(id)`: the id is self-asserted (`principal_id_verified` is
@@ -141,7 +141,8 @@ function LedgerBody({ ledger, now }: { ledger: AuditOutput; now?: number }) {
           `${entry.principal}(${entry.principal_id ?? "unrecorded"})`,
           entry.capability,
           <CustodyLink key={`m-${entry.plan_id}-${entry.model}`} subject={entry.model} />,
-          entry.effect,
+          entry.kind,
+          verdictLabel(entry),
           entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
           <CustodyLink key={`p-${entry.plan_id}-${entry.model}`} subject={entry.plan_id} />,
           entry.reason,

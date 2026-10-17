@@ -90,6 +90,29 @@ describe("AuditScreen", () => {
     expect(screen.getByText("2 decision(s), oldest first, the whole ledger")).toBeInTheDocument();
   });
 
+  it("shows an approval row as an approval, not a policy allow, and an evaluation by its effect", async () => {
+    const [evaluation] = LEDGER.decisions;
+    const approval = {
+      ...evaluation,
+      plan_id: "d".repeat(64),
+      kind: "approval" as const,
+      approval_channel: "http_api" as const,
+    };
+    render(
+      <AuditScreen
+        loaders={loaders({ ledger: async () => ({ ...LEDGER, decisions: [evaluation, approval] }) })}
+        now={NOW}
+      />,
+    );
+    const table = await screen.findByRole("table", { name: "Policy decisions" });
+    const [evalRow, approvalRow] = within(table).getAllByRole("row").slice(1);
+    expect(within(evalRow).getByText("evaluation")).toBeInTheDocument();
+    expect(within(evalRow).getByText("allow")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval (http_api) [effect allow]")).toBeInTheDocument();
+    expect(within(approvalRow).queryByText("allow")).toBeNull();
+  });
+
   it("scopes the ledger through the product selector and shows the output model", async () => {
     const l = loaders();
     render(<AuditScreen loaders={l} now={NOW} />);
