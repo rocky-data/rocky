@@ -3251,17 +3251,17 @@ pub struct RockyConfig {
     ///
     /// ```toml
     /// [freshness]
-    /// expected_lag_seconds = 3600
+    /// warn_after = "1h"
     /// time_column = "updated_at"
-    /// severity = "warning"
     /// ```
     ///
     /// Precedence, first match wins: a model's own `[freshness]`
     /// sidecar table, then its directory `_defaults.toml`, then this
     /// block. Inheritance is **whole-block**: a model that declares its
     /// own table keeps exactly what it wrote and picks up nothing from
-    /// here. This block is inherited only when it carries an
-    /// `expected_lag_seconds`.
+    /// here. This block is inherited only when it carries a level
+    /// (`warn_after`, `error_after`, or the deprecated
+    /// `expected_lag_seconds`).
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
 

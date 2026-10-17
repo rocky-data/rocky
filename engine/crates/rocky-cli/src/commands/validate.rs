@@ -2311,6 +2311,16 @@ agent = "propose_only"
             ),
         )
         .unwrap();
+        // An inline `---toml` frontmatter model: no sidecar, the SQL file
+        // carries the block.
+        std::fs::write(
+            models.join("inline.sql"),
+            format!(
+                "---toml\n{}\n[freshness]\n{sidecar}\n---\nSELECT 1 AS id\n",
+                target("inline")
+            ),
+        )
+        .unwrap();
         std::fs::write(models.join("sub").join("child.sql"), "SELECT 1 AS id").unwrap();
         std::fs::write(models.join("sub").join("child.toml"), target("child")).unwrap();
         std::fs::write(
@@ -2360,7 +2370,20 @@ agent = "propose_only"
             "{w058:#?}"
         );
         assert!(
+            found("inline.sql", "freshness", "error_after = \"2h\""),
+            "an inline frontmatter model is reported on its SQL file: {w058:#?}"
+        );
+        assert!(
             found("_defaults.toml", "freshness", "warn_after = \"600s\""),
+            "{w058:#?}"
+        );
+        // The key is named as the file spelled it.
+        assert!(
+            found("_defaults.toml", "freshness", "`expected_lag_seconds`"),
+            "{w058:#?}"
+        );
+        assert!(
+            found("own.toml", "freshness", "`max_lag_seconds` and `severity`"),
             "{w058:#?}"
         );
         assert!(
@@ -2371,7 +2394,7 @@ agent = "propose_only"
             ),
             "{w058:#?}"
         );
-        assert_eq!(w058.len(), 5, "the generated sidecar is skipped: {w058:#?}");
+        assert_eq!(w058.len(), 6, "the generated sidecar is skipped: {w058:#?}");
         assert!(
             w058.iter().all(|m| m.message.contains("It still works")),
             "{w058:#?}"

@@ -391,6 +391,12 @@ pub struct ModelFreshnessConfig {
     #[serde(skip)]
     #[schemars(skip)]
     pub declared_in_sidecar: bool,
+    /// The key the file spelled the deprecated lag with (`max_lag_seconds`
+    /// or `expected_lag_seconds`), so W058 names what the user wrote. Not
+    /// serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub lag_key: Option<&'static str>,
     /// Age above which the model reports `warn` (`"1h"`, `"7d"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_after: Option<String>,
@@ -406,8 +412,10 @@ impl<'de> Deserialize<'de> for ModelFreshnessConfig {
         // and an unchanged sidecar must keep parsing.
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default, alias = "expected_lag_seconds")]
+            #[serde(default)]
             max_lag_seconds: Option<u64>,
+            #[serde(default)]
+            expected_lag_seconds: Option<u64>,
             #[serde(default)]
             time_column: Option<String>,
             #[serde(default)]
@@ -418,9 +426,19 @@ impl<'de> Deserialize<'de> for ModelFreshnessConfig {
             error_after: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
+        // The two spellings were one aliased field, which refused both at
+        // once as a duplicate; that stays refused.
+        let (max_lag_seconds, lag_key) = match (raw.max_lag_seconds, raw.expected_lag_seconds) {
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::duplicate_field("max_lag_seconds"));
+            }
+            (Some(v), None) => (Some(v), Some("max_lag_seconds")),
+            (None, Some(v)) => (Some(v), Some("expected_lag_seconds")),
+            (None, None) => (None, None),
+        };
         let mut old = Vec::new();
-        if raw.max_lag_seconds.is_some() {
-            old.push("max_lag_seconds");
+        if let Some(key) = lag_key {
+            old.push(key);
         }
         if raw.severity.is_some() {
             old.push("severity");
@@ -431,7 +449,7 @@ impl<'de> Deserialize<'de> for ModelFreshnessConfig {
                 crate::source_freshness::mixed_spelling_message(&old),
             ));
         }
-        if raw.max_lag_seconds.is_none()
+        if max_lag_seconds.is_none()
             && let Err(problems) = crate::source_freshness::parse_levels(
                 raw.warn_after.as_deref(),
                 raw.error_after.as_deref(),
@@ -443,10 +461,11 @@ impl<'de> Deserialize<'de> for ModelFreshnessConfig {
             )));
         }
         Ok(ModelFreshnessConfig {
-            max_lag_seconds: raw.max_lag_seconds,
+            max_lag_seconds,
             time_column: raw.time_column,
             severity: raw.severity,
             declared_in_sidecar: false,
+            lag_key,
             warn_after: raw.warn_after,
             error_after: raw.error_after,
         })
@@ -465,6 +484,7 @@ impl ModelFreshnessConfig {
             time_column,
             severity,
             declared_in_sidecar: false,
+            lag_key: None,
             warn_after: None,
             error_after: None,
         }
@@ -481,6 +501,7 @@ impl ModelFreshnessConfig {
             time_column,
             severity: None,
             declared_in_sidecar: false,
+            lag_key: None,
             warn_after: warn_after.map(str::to_string),
             error_after: error_after.map(str::to_string),
         }
@@ -510,12 +531,13 @@ impl ModelFreshnessConfig {
         self.thresholds().budget_seconds()
     }
 
-    /// The deprecated keys this block uses. `max_lag_seconds` stands for
-    /// either of its spellings (`expected_lag_seconds` is an alias).
+    /// The deprecated keys this block uses, spelled as the file wrote them
+    /// (`max_lag_seconds` when the spelling is unknown, e.g. a block built
+    /// in code).
     pub fn legacy_keys(&self) -> Vec<&'static str> {
         let mut keys = Vec::new();
         if self.max_lag_seconds.is_some() {
-            keys.push("max_lag_seconds");
+            keys.push(self.lag_key.unwrap_or("max_lag_seconds"));
         }
         if self.severity.is_some() {
             keys.push("severity");
@@ -543,6 +565,7 @@ impl ModelFreshnessConfig {
                 time_column: default.time_column.clone(),
                 severity: default.severity,
                 declared_in_sidecar: false,
+                lag_key: Some("expected_lag_seconds"),
                 warn_after: None,
                 error_after: None,
             });

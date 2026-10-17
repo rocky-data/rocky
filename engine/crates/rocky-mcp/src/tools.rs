@@ -3315,7 +3315,7 @@ impl RockyMcpServer {
 
     #[tool(
         description = "Draft a `[freshness]` TOML block for a model with temporal columns (the \
-         W005 fix): an LLM picks a sensible `expected_lag_seconds` TTL and a `time_column` from \
+         W005 fix): an LLM picks a sensible `warn_after` duration and a `time_column` from \
          the supplied candidates. Returns the ready-to-paste block directly (NOT a TextEdit); the \
          caller appends it to the model's sidecar. Requires ANTHROPIC_API_KEY in the server \
          environment — without it, `freshness_block` is null and `message` explains why."

@@ -70,15 +70,46 @@
     },
     "freshness": {
       "type": "object",
-      "description": "Per-model freshness expectation (metadata only — consumed by downstream observability tools)",
-      "required": ["max_lag_seconds"],
+      "description": "Per-model freshness expectation. `rocky freshness` reports warn past `warn_after` and error past `error_after`.",
       "properties": {
+        "warn_after": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[shd]$",
+          "description": "Age above which the model reports warn, e.g. \"1h\" or \"7d\" (an integer and one unit of s, h or d)"
+        },
+        "error_after": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[shd]$",
+          "description": "Age above which the model reports error, e.g. \"1d\". Must not be shorter than warn_after"
+        },
+        "time_column": {
+          "type": "string",
+          "description": "Timestamp column `rocky freshness` reads MAX() from; without it the last successful build is used"
+        },
         "max_lag_seconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum lag in seconds before the model is considered stale"
+          "deprecated": true,
+          "description": "Deprecated (W058): write warn_after / error_after. Maximum lag in seconds"
+        },
+        "expected_lag_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "deprecated": true,
+          "description": "Deprecated (W058): alias of max_lag_seconds"
+        },
+        "severity": {
+          "enum": ["warning", "error"],
+          "deprecated": true,
+          "description": "Deprecated (W058), only with max_lag_seconds: the level that value sits on"
         }
       },
+      "anyOf": [
+        { "required": ["warn_after"] },
+        { "required": ["error_after"] },
+        { "required": ["max_lag_seconds"] },
+        { "required": ["expected_lag_seconds"] }
+      ],
       "additionalProperties": false
     }
   },

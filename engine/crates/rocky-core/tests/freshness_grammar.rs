@@ -133,7 +133,7 @@ fn model_sidecar_old_forms_map_by_severity_with_warning_default() {
     let f = model_freshness("[freshness]\nexpected_lag_seconds = 60\nseverity = \"error\"\n")
         .expect("loads");
     assert_eq!(f.thresholds(), levels(None, Some(60)));
-    assert_eq!(f.legacy_keys(), vec!["max_lag_seconds", "severity"]);
+    assert_eq!(f.legacy_keys(), vec!["expected_lag_seconds", "severity"]);
 }
 
 #[test]
