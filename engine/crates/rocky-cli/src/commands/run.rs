@@ -264,6 +264,13 @@ pub(crate) static CANCEL_AFTER_PARTITION_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// State paths whose backfill cancels its own run token as it starts (#1606):
+/// a deterministic stand-in for a signal reaching the backfill's listener.
+#[cfg(test)]
+pub(crate) static CANCEL_BACKFILL_AT_START_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 fn flush_run_watermarks(
     state: &StateStore,
     _run_id: &str,
@@ -11909,6 +11916,14 @@ pub(crate) async fn execute_backfill_set(
     // starts, the run records itself interrupted and the finalize below still
     // uploads. Held to the end: dropping it stops the listener.
     let run_cancel = super::run_cancel::for_run();
+    #[cfg(test)]
+    if CANCEL_BACKFILL_AT_START_FOR_TEST
+        .lock()
+        .ok()
+        .is_some_and(|mut paths| paths.remove(state_path))
+    {
+        run_cancel.token().cancel();
+    }
     let exec_result: Result<()> = run_cancel
         .shared()
         .scope(async {
@@ -27502,22 +27517,21 @@ adapter = "default"
         let _authority = session.acquire().await.unwrap();
         session.require_synced().unwrap();
         let model_set = std::collections::BTreeSet::from(["m".to_string()]);
-        let token = tokio_util::sync::CancellationToken::new();
-        token.cancel();
-        let result = super::super::run_cancel::scope(
-            token,
-            super::execute_backfill_set(
-                &loaded,
-                &config_path,
-                session,
-                &state_path,
-                &models,
-                &model_set,
-                &PartitionRunOptions::default(),
-                None,
-                None,
-                true,
-            ),
+        super::CANCEL_BACKFILL_AT_START_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert(state_path.clone());
+        let result = super::execute_backfill_set(
+            &loaded,
+            &config_path,
+            session,
+            &state_path,
+            &models,
+            &model_set,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            true,
         )
         .await;
         let error = result.expect_err("a cancelled backfill must not report success");
