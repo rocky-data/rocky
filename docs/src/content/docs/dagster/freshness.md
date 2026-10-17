@@ -28,7 +28,7 @@ Add a `[checks.freshness]` block to `rocky.toml`:
 enabled = true
 
 [checks.freshness]
-threshold_seconds = 86400  # 24 hours
+error_after = "24h"
 ```
 
 `RockyComponent` reads `discover.checks.freshness` and attaches a matching
@@ -69,7 +69,7 @@ schema = "marts"
 table = "fct_daily_orders"
 
 [freshness]
-expected_lag_seconds = 3600  # 1 hour — overrides the pipeline default (max_lag_seconds is accepted as a legacy alias)
+warn_after = "1h"  # overrides the pipeline default
 ```
 
 `rocky compile` emits this in its JSON output, in the `models_detail` field.
@@ -104,7 +104,8 @@ model's `[freshness]` frontmatter. Returns `None` when not configured.
 from dagster_rocky import freshness_policy_from_model
 from dagster_rocky.types import ModelFreshnessConfig
 
-policy = freshness_policy_from_model(ModelFreshnessConfig(max_lag_seconds=3600))
+policy = freshness_policy_from_model(ModelFreshnessConfig(warn_after="1h", error_after="6h"))
+# fail_window is the smaller level: 1 hour
 ```
 
 ### `per_model_freshness_policies(compile_result)`

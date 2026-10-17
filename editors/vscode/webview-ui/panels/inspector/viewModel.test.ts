@@ -3,8 +3,10 @@ import type { CatalogEdge } from "../../../src/types/generated/catalog";
 import {
   contractLabel,
   costLabel,
+  durationSeconds,
   formatCount,
   formatDuration,
+  freshnessBudgetSeconds,
   freshnessLabel,
   groupColumnLineage,
   statusRank,
@@ -32,6 +34,20 @@ describe("viewModel", () => {
     expect(freshnessLabel({ max_lag_seconds: 3600, severity: "error" })).toBe(
       "≤ 1h (error)",
     );
+  });
+
+  it("formats warn_after / error_after levels and their budget", () => {
+    expect(freshnessLabel({ warn_after: "1h", error_after: "6h" })).toBe(
+      "≤ 1h (warning) · ≤ 6h (error)",
+    );
+    expect(freshnessLabel({ error_after: "1d" })).toBe("≤ 1d (error)");
+    expect(freshnessBudgetSeconds({ warn_after: "2h", error_after: "1d" })).toBe(
+      7200,
+    );
+    expect(freshnessBudgetSeconds({ error_after: "3d" })).toBe(259200);
+    expect(freshnessBudgetSeconds({ max_lag_seconds: 60 })).toBe(60);
+    expect(durationSeconds("30m")).toBeNull();
+    expect(durationSeconds("012h")).toBeNull();
   });
 
   it("formats counts and the heuristic cost", () => {

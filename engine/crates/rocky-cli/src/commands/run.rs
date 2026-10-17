@@ -9338,6 +9338,11 @@ async fn run_batched_checks(
     // Process freshness results
     if let Some(ref freshness_cfg) = pipeline.checks.freshness {
         let now = Utc::now();
+        // One shape whichever spelling the block used: a deprecated
+        // `threshold_seconds` + `severity` is one level, so it grades and
+        // reports exactly as it did.
+        let freshness_levels = freshness_cfg.thresholds();
+        let freshness_budget = freshness_levels.budget_seconds().unwrap_or(0);
         // Driven by the REQUESTED tables, not the returned ones. Iterating
         // the results would drop a table the batch query left out, which is
         // exactly the silent gap this change closes for row counts. A batch
@@ -9361,12 +9366,12 @@ async fn run_batched_checks(
                 Some(fr) => match (fr.max_timestamp, fr.row_count) {
                     (Some(ts), _) => {
                         let lag = (now - ts).num_seconds().unsigned_abs();
-                        Some((key, checks::check_freshness(lag, freshness_cfg.threshold_seconds)))
+                        Some((key, checks::grade_freshness(lag, &freshness_levels)))
                     }
                     (None, Some(rows)) if rows > 0 => Some((
                         key,
                         checks::freshness_not_evaluated(
-                            freshness_cfg.threshold_seconds,
+                            freshness_budget,
                             format!(
                                 "the table has {rows} row(s) and no value in its timestamp column, so there is no timestamp to measure freshness from"
                             ),
@@ -9384,7 +9389,7 @@ async fn run_batched_checks(
                     Some((
                         key,
                         checks::freshness_not_evaluated(
-                            freshness_cfg.threshold_seconds,
+                            freshness_budget,
                             "the batch freshness query returned no readable timestamp for this table",
                         ),
                     ))
@@ -9401,22 +9406,20 @@ async fn run_batched_checks(
         let unevaluated = freshness_failures.iter().map(|(key, reason)| {
             (
                 key.clone(),
-                checks::freshness_not_evaluated(freshness_cfg.threshold_seconds, reason.clone()),
+                checks::freshness_not_evaluated(freshness_budget, reason.clone()),
             )
         });
-        for (key, mut check) in measured.chain(unevaluated) {
-            // The configured severity applies to a MEASURED result — how
-            // loudly a stale table is reported. A check the engine could not
-            // evaluate keeps the `TestSeverity::Error` its constructor chose,
-            // so it still gates (#1719).
+        for (key, check) in measured.chain(unevaluated) {
+            // The level that tripped sets a MEASURED result's severity
+            // (`grade_freshness`) — how loudly a stale table is reported. A
+            // check the engine could not evaluate keeps the
+            // `TestSeverity::Error` its constructor chose, so it still gates
+            // (#1719).
             //
             // `severity = "warning"` used to silence both. An operator who
             // wrote it to mean "a stale table is only a warning" was also
             // saying "a freshness query I could not run is only a warning",
             // and the run exited 0 with `status: "Success"`.
-            if check.not_evaluated.is_none() {
-                check.severity = freshness_cfg.severity;
-            }
             if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
                 let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
                     asset_key: asset_key.clone(),
@@ -47732,6 +47735,53 @@ threshold = 0
             "an empty table has no freshness to measure: {checks:?}",
             checks = pending.get(&fx.target_key()).map(|p| &p.checks)
         );
+    }
+
+    /// `warn_after` / `error_after` reach the replication run: the level the
+    /// table's age crosses sets the result's severity and reported threshold.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn freshness_levels_grade_a_measured_table() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nwarn_after = \"1h\"\nerror_after = \"1d\"",
+        );
+        let grade = |age_seconds: i64| LegFailingBatchCheck {
+            max_timestamp: Some(Utc::now() - chrono::Duration::seconds(age_seconds)),
+            ..LegFailingBatchCheck::healthy()
+        };
+        for (age, passed, severity, threshold) in [
+            (60, true, rocky_core::tests::TestSeverity::Warning, 3_600),
+            (
+                7_200,
+                false,
+                rocky_core::tests::TestSeverity::Warning,
+                3_600,
+            ),
+            (
+                200_000,
+                false,
+                rocky_core::tests::TestSeverity::Error,
+                86_400,
+            ),
+        ] {
+            let leg = grade(age);
+            let (pending, _, _) = fx
+                .try_run(&inner, Some(&leg), None)
+                .await
+                .expect("a readable leg is not a failure");
+            let result = the_result(&pending, &fx.target_key(), "freshness");
+            assert_eq!(result.passed, passed, "age {age}: {result:?}");
+            assert_eq!(result.severity, severity, "age {age}: {result:?}");
+            assert!(
+                matches!(
+                    result.details,
+                    rocky_core::checks::CheckDetails::Freshness { threshold_seconds, .. }
+                        if threshold_seconds == threshold
+                ),
+                "age {age}: {result:?}"
+            );
+        }
     }
 
     /// The other half of a NULL maximum: rows exist and none carries a

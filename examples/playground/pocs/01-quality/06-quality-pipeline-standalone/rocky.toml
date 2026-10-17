@@ -25,7 +25,7 @@ schema  = "staging__customers"
 enabled = true
 row_count = true
 column_match = { enabled = true, severity = "warning" }
-freshness = { threshold_seconds = 86400, severity = "warning" }
+freshness = { warn_after = "1d" }
 anomaly_threshold_pct = 30.0
 # Escape hatch: keep the POC green while surfacing failing rows.
 # Remove (or set `true`) to fail CI on any error-severity violation.

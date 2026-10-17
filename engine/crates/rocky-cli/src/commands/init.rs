@@ -229,7 +229,7 @@ auto_create_schemas = true
 enabled = true
 row_count = true
 column_match = true
-freshness = { threshold_seconds = 86400 }
+freshness = { error_after = "24h" }
 
 [pipeline.raw_replication.execution]
 concurrency = 8

@@ -2291,17 +2291,34 @@ class FreshnessConfig(BaseModel):
     """
     Freshness check configuration.
 
-    A single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).
+    `warn_after` / `error_after` apply to every checked table: a table older than `error_after` fails the check at error severity, one older than `warn_after` fails it at warning severity.
+
+    `threshold_seconds` + `severity` is the deprecated spelling. It still parses and behaves as before (`rocky validate` reports W058): the one value is the error level, or the warn level under `severity = "warning"`. Mixing it with `warn_after` / `error_after` is refused.
+
+    There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).
+
+    Serialization is hand-written so a deprecated block serializes exactly as it did before the new keys existed (plan ids hash it), and a new one carries no `severity` it never had.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    error_after: str | None = None
+    """
+    Age above which the check fails at error severity (`"24h"`). Must not be shorter than `warn_after`.
+    """
     severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
-    Severity reported when freshness lag exceeds the threshold.
+    Deprecated, only with `threshold_seconds`: severity reported when freshness lag exceeds the threshold. Defaults to `error`.
     """
-    threshold_seconds: conint(ge=0)
+    threshold_seconds: conint(ge=0) | None = None
+    """
+    Deprecated: write `warn_after` / `error_after`. Maximum lag in seconds before the check fails.
+    """
+    warn_after: str | None = None
+    """
+    Age above which the check fails at warning severity (`"12h"`).
+    """
 
 
 class FulfillConfig(BaseModel):
@@ -2526,23 +2543,33 @@ class ProjectFreshnessConfig(BaseModel):
 
     Top-level `[freshness]` block on `rocky.toml`. A model that declares no [`crate::models::ModelFreshnessConfig`] of its own, and sits under no `_defaults.toml` that declares one, inherits this block **whole** (see [`crate::models::ModelFreshnessConfig::from_project_default`]). Inheritance is not field-by-field: a model that declares its own block keeps exactly what it wrote. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).
 
-    All fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` supplies nothing at all: it is "no project default" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete TTL.
+    All fields are optional. A project-level `[freshness]` with neither `warn_after` nor `error_after` (nor the deprecated `expected_lag_seconds`) supplies nothing at all: it is "no project default" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete threshold.
+
+    `expected_lag_seconds` and `severity` are the deprecated spelling. They still parse and behave as before (`rocky validate` reports W058): the one value is the error level under `severity = "error"`, else the warn level. A block that mixes them with `warn_after` / `error_after` is refused.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    error_after: str | None = None
+    """
+    Default age above which a model reports `error` and `rocky freshness` exits 1. Must not be shorter than `warn_after`.
+    """
     expected_lag_seconds: conint(ge=0) | None = None
     """
-    Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value and the other fields alongside it. When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata, and the other two fields here are inherited by nobody.
+    Deprecated: write `warn_after` / `error_after`. Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value and the other fields alongside it.
     """
     severity: TestSeverity5 | TestSeverity6 | None = None
     """
-    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1.
+    Deprecated, only with `expected_lag_seconds`: severity reported when the freshness check trips. Under `error`, a stale model makes `rocky freshness` exit 1.
     """
     time_column: str | None = None
     """
     Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.
+    """
+    warn_after: str | None = None
+    """
+    Default age above which a model reports `warn` (`"12h"`, `"7d"`). Inherited, with `error_after` and `time_column`, by every model with no `[freshness]` block of its own.
     """
 
 
@@ -4043,9 +4070,9 @@ class RockyConfig(BaseModel):
     """
     Project-level freshness defaults. See [`ProjectFreshnessConfig`] for the TOML shape:
 
-    ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
+    ```toml [freshness] warn_after = "1h" time_column = "updated_at" ```
 
-    Precedence, first match wins: a model's own `[freshness]` sidecar table, then its directory `_defaults.toml`, then this block. Inheritance is **whole-block**: a model that declares its own table keeps exactly what it wrote and picks up nothing from here. This block is inherited only when it carries an `expected_lag_seconds`.
+    Precedence, first match wins: a model's own `[freshness]` sidecar table, then its directory `_defaults.toml`, then this block. Inheritance is **whole-block**: a model that declares its own table keeps exactly what it wrote and picks up nothing from here. This block is inherited only when it carries a level (`warn_after`, `error_after`, or the deprecated `expected_lag_seconds`).
     """
     fulfill: FulfillConfig | None = Field({}, validate_default=True)
     """

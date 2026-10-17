@@ -10,7 +10,7 @@
       "message": "model 'fct_daily_orders' has temporal column(s) (order_date) but no `freshness` block declared",
       "span": null,
       "model": "fct_daily_orders",
-      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"order_date\"`"
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] warn_after = \"1h\", time_column = \"order_date\"`"
     }
   ],
   "has_errors": false,

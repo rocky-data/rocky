@@ -95,7 +95,7 @@ def test_rocky_toml_template_keeps_freshness_as_a_commented_opt_in():
     assert "timestamp_column" not in pipeline
     assert "freshness" not in pipeline["checks"]
     assert '# strategy = "incremental"' in ROCKY_TOML_TEMPLATE
-    assert "# threshold_seconds = 86400" in ROCKY_TOML_TEMPLATE
+    assert '# error_after = "24h"' in ROCKY_TOML_TEMPLATE
 
 
 def test_rocky_toml_template_uses_the_pipeline_layout_the_engine_reads():
