@@ -1408,20 +1408,44 @@ class RequiredColumn(BaseModel):
     """
 
 
-class ResidencyConfig(BaseModel):
+class ResidencyAllow(BaseModel):
     """
-    `[residency]` — data-residency settings.
-
-    A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`.
-
-    ```toml [residency] enforce = true ```
-
-    With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.
+    One permitted cross-region direction in `[residency] allow`.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    from_: str = Field(..., alias="from")
+    """
+    Region label of the source.
+    """
+    to: str
+    """
+    Region label of the target.
+    """
+
+
+class ResidencyConfig(BaseModel):
+    """
+    `[residency]` — data-residency settings.
+
+    A region is a label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`: lowercase letters, digits and hyphens.
+
+    ```toml [residency] enforce = true ```
+
+    With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`.
+
+    Whether or not `enforce` is on, a pipeline whose source and target labels differ is refused (V061) unless `allow` lists that direction.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    allow: list[ResidencyAllow] | None = None
+    """
+    Cross-region moves that are deliberate. Each entry permits one direction, from a source region to a target region. Labels compare as exact text.
+    """
     enforce: bool | None = False
     """
     Require a `region` label on every source, target and `[ai]`.

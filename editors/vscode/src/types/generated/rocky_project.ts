@@ -2337,17 +2337,36 @@ export interface PortabilityConfig {
 /**
  * `[residency]` — data-residency settings.
  *
- * A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`.
+ * A region is a label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`: lowercase letters, digits and hyphens.
  *
  * ```toml [residency] enforce = true ```
  *
- * With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.
+ * With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`.
+ *
+ * Whether or not `enforce` is on, a pipeline whose source and target labels differ is refused (V061) unless `allow` lists that direction.
  */
 export interface ResidencyConfig {
+  /**
+   * Cross-region moves that are deliberate. Each entry permits one direction, from a source region to a target region. Labels compare as exact text.
+   */
+  allow?: ResidencyAllow[];
   /**
    * Require a `region` label on every source, target and `[ai]`.
    */
   enforce?: boolean;
+}
+/**
+ * One permitted cross-region direction in `[residency] allow`.
+ */
+export interface ResidencyAllow {
+  /**
+   * Region label of the source.
+   */
+  from: string;
+  /**
+   * Region label of the target.
+   */
+  to: string;
 }
 /**
  * `[resilience]` — the run loop's classified-retry policy.

@@ -17668,6 +17668,20 @@ region = "{target_region}"
         assert!(msg.starts_with("V061:"), "{msg}");
         assert!(msg.contains("{ from = \"eu\", to = \"us\" }"), "{msg}");
 
+        // `rocky run` / `rocky apply` load through the fingerprinted loader,
+        // offline compile paths through the credential-tolerant one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, cross_region_project("eu", "us", "")).unwrap();
+        assert!(matches!(
+            load_rocky_config_fingerprinted(&path),
+            Err(ConfigError::ResidencyCrossRegion { .. })
+        ));
+        assert!(matches!(
+            load_rocky_config_credential_tolerant(&path),
+            Err(ConfigError::ResidencyCrossRegion { .. })
+        ));
+
         // Same under `enforce = true` (with `[ai] region` set so V060 stays quiet).
         let err = load_str(&cross_region_project(
             "eu",
