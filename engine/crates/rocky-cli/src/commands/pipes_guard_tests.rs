@@ -290,6 +290,7 @@ async fn direct_quality_guard_refuses_bad_pipes() {
             chrono::Utc::now(),
             "test-hash",
             "quality",
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await,
     );
@@ -317,6 +318,7 @@ async fn direct_snapshot_guard_refuses_bad_pipes() {
             chrono::Utc::now(),
             "test-hash",
             "snapshot",
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await,
     );

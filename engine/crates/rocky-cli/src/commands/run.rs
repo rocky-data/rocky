@@ -4579,6 +4579,7 @@ pub async fn run_with_explicit_contracts(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                &cancel,
             )
             .await;
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
@@ -4706,6 +4707,7 @@ pub async fn run_with_explicit_contracts(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                &cancel,
             )
             .await;
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
