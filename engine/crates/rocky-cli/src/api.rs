@@ -2363,7 +2363,9 @@ fn is_bare_product_name(name: &str) -> bool {
 ///
 /// Reports stored cursors, claims and tick-lock state. It deliberately does
 /// **not** evaluate demand — `rocky tick --dry-run` is the evaluation — so it
-/// stays side-effect free and `O(pipelines)` rather than `O(runs × pipelines)`.
+/// stays side-effect free. With no product declaring `deliver_by` it is
+/// `O(pipelines)`. With one, each pipeline's delivery state reads run history,
+/// which makes it `O(pipelines × runs)`; see `commands::schedule_status`.
 async fn schedule_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ScheduleStatusOutput>, ApiError> {
@@ -6793,6 +6795,8 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 }],
                 trigger: RunTrigger::Manual,
                 config_hash: "c".to_string(),
@@ -6811,6 +6815,7 @@ mod tests {
                 verify_after_failed: false,
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
+                queued_ms: None,
             })
             .expect("run recorded");
         store

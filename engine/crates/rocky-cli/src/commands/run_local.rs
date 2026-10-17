@@ -140,6 +140,9 @@ pub async fn run_transformation(
     target_dialects: Option<&rocky_compiler::operand_check::TargetDialects>,
     // The run's cancellation token (#1606), observed by `execute_models`.
     cancel: &tokio_util::sync::CancellationToken,
+    // The project root whose `products/` declare delivery deadlines (the
+    // config file's directory). `None` records no deadlines.
+    project_root: Option<&Path>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -376,6 +379,7 @@ pub async fn run_transformation(
         config_hash,
         &audit,
         pipeline_name,
+        project_root,
     ));
 
     // Stamp the terminal status onto the emitted payload so a JSON
@@ -590,7 +594,7 @@ fn finalize_quality_status(output: &mut RunOutput, error_failures: usize, fail_o
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_quality")]
 pub async fn run_quality(
-    _config_path: &Path,
+    config_path: &Path,
     pipeline: &rocky_core::config::QualityPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
@@ -1085,6 +1089,7 @@ pub async fn run_quality(
         config_hash,
         &audit,
         Some(pipeline_name),
+        config_path.parent(),
     );
 
     // Cancel (#1606): an interrupted run exits 130 whatever its checks found,
@@ -1599,7 +1604,7 @@ fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_snapshot")]
 pub async fn run_snapshot(
-    _config_path: &Path,
+    config_path: &Path,
     pipeline: &rocky_core::config::SnapshotPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
@@ -1860,6 +1865,7 @@ pub async fn run_snapshot(
         config_hash,
         &audit,
         Some(pipeline_name),
+        config_path.parent(),
     );
 
     if tables_failed > 0 {
@@ -1921,6 +1927,8 @@ fn persist_interrupted_record(
         config_hash,
         &audit,
         Some(pipeline_name),
+        // Cancelled before any work: no successful build to stamp a deadline on.
+        None,
     );
     interrupted_result(recorded, run_id)
 }
@@ -3997,6 +4005,7 @@ auto_create_schemas = true
             None,  // project
             None,  // target_dialects
             &tokio_util::sync::CancellationToken::new(),
+            None, // project_root
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

@@ -104,6 +104,58 @@ pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpe
     Ok(parsed)
 }
 
+/// Every delivery deadline the project's products declare.
+///
+/// Reads `products/*.toml` under `root`. Best effort, because a run records
+/// delivery timing as advice: a spec that does not parse, or a directory that
+/// cannot be read, contributes no deadline and logs a warning. `rocky
+/// validate` and `rocky product status` are where a broken spec is refused.
+pub(crate) fn product_deadlines_in(root: &Path) -> Vec<rocky_core::delivery::ProductDeadline> {
+    let dir = root.join("products");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                dir = %dir.display(),
+                "cannot read the products directory; no delivery deadlines are recorded"
+            );
+            return Vec::new();
+        }
+    };
+    let mut stems: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    stems.sort();
+    let mut deadlines = Vec::new();
+    for stem in stems {
+        match load_spec(root, &stem) {
+            Ok(parsed) => {
+                if let Some(deliver_by) = parsed.product().deliver_by() {
+                    deadlines.push(rocky_core::delivery::ProductDeadline {
+                        product: parsed.product().name.clone(),
+                        output_model: parsed.output_model().to_string(),
+                        deliver_by,
+                    });
+                }
+            }
+            Err(reject) => tracing::warn!(
+                product = %stem,
+                "product spec does not load ({reject}); its delivery deadline is not recorded"
+            ),
+        }
+    }
+    deadlines
+}
+
 // ---------------------------------------------------------------------------
 // The posture verification (D5 checks 1 + 2 against the real evaluator)
 // ---------------------------------------------------------------------------
@@ -803,6 +855,12 @@ pub struct ProductStatusOutput {
     pub fulfill_state: Option<String>,
     /// Number of fulfillment journal rows recorded for this product.
     pub journal_rows: u64,
+    /// Delivery state, when the spec declares `deliver_by`: whether the
+    /// latest production delivery was on time, how late, and whether the
+    /// next delivery is at risk. The estimate times run start to the output
+    /// model's finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::output::DeliveryStatus>,
 }
 
 /// One product's row in `rocky product list`.
@@ -1717,6 +1775,17 @@ pub(crate) fn product_status_in(
     state_path: Option<&Path>,
     product_name: &str,
 ) -> Result<ProductStatusOutput> {
+    product_status_at(root, state_path, product_name, chrono::Utc::now())
+}
+
+/// [`product_status_in`] judged at `now`, so a test can fix the clock the
+/// delivery verdict reads.
+pub(crate) fn product_status_at(
+    root: &Path,
+    state_path: Option<&Path>,
+    product_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ProductStatusOutput> {
     let mut output = ProductStatusOutput {
         version: VERSION.to_string(),
         command: "product_status".to_string(),
@@ -1735,6 +1804,7 @@ pub(crate) fn product_status_in(
         spec_matches_approval: None,
         fulfill_state: None,
         journal_rows: 0,
+        delivery: None,
     };
 
     let parsed = match load_spec(root, product_name) {
@@ -1776,6 +1846,29 @@ pub(crate) fn product_status_in(
     // store must refuse, never render as a healthy empty one. `rocky-core`
     // already owns the discriminator this needs (#1668, #1707).
     let store = open_store_if_present(state_path, open_state_store_read_only)?;
+    if let Some(parsed) = &parsed
+        && let Some(deliver_by) = parsed.product().deliver_by()
+    {
+        let deadline = rocky_core::delivery::ProductDeadline {
+            product: parsed.product().name.clone(),
+            output_model: parsed.output_model().to_string(),
+            deliver_by,
+        };
+        let estimate = match &store {
+            Some(store) => store.get_duration_estimate(
+                &deadline.output_model,
+                rocky_core::state::UnrecordedScope::Exclude,
+            )?,
+            None => rocky_core::delivery::estimate_durations(&[]),
+        };
+        output.delivery = Some(crate::output::DeliveryStatus::judge(
+            &deadline,
+            store.as_ref(),
+            &estimate,
+            crate::output::EstimateBasis::ModelDelivery,
+            now,
+        )?);
+    }
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
             // `snapshot_intact: false` is an accusation — it says the bytes a
@@ -2062,8 +2155,46 @@ pub fn run_product_status(
             Some(state) => println!("  state: {state} ({} journal rows)", output.journal_rows),
             None => println!("  state: none recorded"),
         }
+        if let Some(delivery) = &output.delivery {
+            print_delivery(delivery);
+        }
     }
     Ok(())
+}
+
+/// The human-readable delivery lines of `rocky product status`.
+fn print_delivery(delivery: &crate::output::DeliveryStatus) {
+    println!(
+        "  delivery: by '{}' ({})",
+        delivery.deliver_by, delivery.timezone
+    );
+    let last = match (delivery.on_time, delivery.late_by_seconds) {
+        (Some(true), _) => "on time".to_string(),
+        (Some(false), Some(late)) => format!("late by {late}s"),
+        (Some(false), None) => "late".to_string(),
+        (None, _) => "no deadline recorded yet".to_string(),
+    };
+    println!("    last delivery: {last}");
+    let estimate = &delivery.estimate;
+    match (estimate.p50_ms, estimate.p90_ms) {
+        (Some(p50), Some(p90)) => println!(
+            "    estimate: p50 {p50} ms, p90 {p90} ms (n = {} of {})",
+            estimate.n, estimate.window
+        ),
+        _ => println!(
+            "    estimate: unknown (n = {}, needs 5 production runs)",
+            estimate.n
+        ),
+    }
+    let risk = match delivery.at_risk {
+        Some(true) => "AT RISK",
+        Some(false) => "not at risk",
+        None => "no verdict",
+    };
+    match delivery.next_due_at {
+        Some(due) => println!("    next deadline: {} ({risk})", due.to_rfc3339()),
+        None => println!("    next deadline: unknown ({risk})"),
+    }
 }
 
 /// Recovery surface for tests: expose whether a pending journal would
@@ -4570,5 +4701,231 @@ effect = "require_review"
             text.contains("cannot be read") && text.contains("cannot be resolved"),
             "the refusal must name the broken ancestor, got: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod delivery_tests {
+    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    const SPEC: &str =
+        include_str!("../../../rocky-core/src/product/testdata/revenue_daily.spec.toml");
+
+    /// The injected clock for the delivery tests: May 2026, UTC.
+    pub(crate) fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, day, hour, minute, 0).unwrap()
+    }
+
+    /// Record one production run of pipeline `revenue` that built
+    /// `revenue_daily`, stamped exactly as `rocky run` stamps it.
+    pub(crate) fn seed_delivery(
+        store: &StateStore,
+        root: &Path,
+        id: &str,
+        started: DateTime<Utc>,
+        finished: DateTime<Utc>,
+    ) {
+        let mut record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": id,
+            "started_at": started,
+            "finished_at": finished,
+            "status": rocky_core::state::RunStatus::Success,
+            "models_executed": [{
+                "model_name": "revenue_daily",
+                "started_at": started,
+                "finished_at": finished,
+                "duration_ms": (finished - started).num_milliseconds(),
+                "rows_affected": 2,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+            }],
+            "trigger": rocky_core::state::RunTrigger::Schedule,
+            "config_hash": "c",
+            "pipeline": "revenue",
+            "run_scope": rocky_core::state::RunScope::Production,
+        }))
+        .expect("a run record");
+        rocky_core::delivery::stamp_delivery_timing(
+            &mut record,
+            store,
+            &product_deadlines_in(root),
+        )
+        .expect("stamp");
+        store.record_run(&record).expect("record");
+    }
+
+    /// Five production runs on days 1..=5, each started 05:00 and landed
+    /// 05:10 against a 06:00 deadline: on time, with a 10-minute p90.
+    pub(crate) fn seed_five_on_time(store: &StateStore, root: &Path) {
+        for day in 1..=5 {
+            seed_delivery(
+                store,
+                root,
+                &format!("run-{day}"),
+                at(day, 5, 0),
+                at(day, 5, 10),
+            );
+        }
+    }
+
+    /// The shared spec fixture with a delivery deadline added to `[product]`.
+    pub(crate) fn spec_with_deadline(deliver_by: &str) -> String {
+        let intent = "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n";
+        assert!(SPEC.contains(intent), "fixture layout changed");
+        SPEC.replacen(
+            intent,
+            &format!("{intent}deliver_by = \"{deliver_by}\"\n"),
+            1,
+        )
+    }
+
+    pub(crate) fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A project root with the deadline spec and an open state store.
+    fn project() -> (tempfile::TempDir, PathBuf, PathBuf, StateStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        let state_path = root.join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        (dir, root, state_path, store)
+    }
+
+    /// The `delivery` object of `rocky product status --output json`, read
+    /// at `now`.
+    fn status_json(root: &Path, state_path: &Path, now: DateTime<Utc>) -> serde_json::Value {
+        let output =
+            product_status_at(root, Some(state_path), "revenue_daily", now).expect("status");
+        let json = serde_json::to_value(&output).expect("json");
+        json["delivery"].clone()
+    }
+
+    #[test]
+    fn status_json_reports_an_on_time_delivery() {
+        let (_dir, root, state_path, store) = project();
+        seed_five_on_time(&store, &root);
+        drop(store);
+
+        let delivery = status_json(&root, &state_path, at(5, 12, 0));
+        assert_eq!(delivery["product"], "revenue_daily");
+        assert_eq!(delivery["deliver_by"], "0 6 * * *");
+        assert_eq!(delivery["timezone"], "UTC");
+        assert_eq!(delivery["on_time"], true);
+        assert_eq!(delivery["late_by_seconds"], 0);
+        assert_eq!(delivery["last_due_at"], "2026-05-05T06:00:00Z");
+        assert_eq!(delivery["next_due_at"], "2026-05-06T06:00:00Z");
+        assert_eq!(delivery["at_risk"], false);
+        let estimate = &delivery["estimate"];
+        assert_eq!(estimate["state"], "known");
+        assert_eq!(estimate["basis"], "model_delivery");
+        assert_eq!(estimate["n"], 5);
+        assert_eq!(estimate["window"], 20);
+        assert_eq!(estimate["p50_ms"], 600_000);
+        assert_eq!(estimate["p90_ms"], 600_000);
+    }
+
+    #[test]
+    fn status_json_reports_a_late_delivery() {
+        let (_dir, root, state_path, store) = project();
+        seed_five_on_time(&store, &root);
+        // Day 6: starts 07:20, after the 06:00 deadline, lands 07:30.
+        seed_delivery(&store, &root, "run-6", at(6, 7, 20), at(6, 7, 30));
+        drop(store);
+
+        let delivery = status_json(&root, &state_path, at(6, 12, 0));
+        assert_eq!(delivery["on_time"], false);
+        assert_eq!(delivery["late_by_seconds"], 90 * 60);
+        assert_eq!(delivery["last_due_at"], "2026-05-06T06:00:00Z");
+        assert_eq!(delivery["last_delivered_at"], "2026-05-06T07:30:00Z");
+        assert_eq!(delivery["next_due_at"], "2026-05-07T06:00:00Z");
+    }
+
+    #[test]
+    fn status_json_reports_an_at_risk_delivery() {
+        let (_dir, root, state_path, store) = project();
+        seed_five_on_time(&store, &root);
+        drop(store);
+
+        // Day 6, 05:55: the open deadline is 06:00, five minutes away, and
+        // the p90 is ten minutes.
+        let delivery = status_json(&root, &state_path, at(6, 5, 55));
+        assert_eq!(delivery["next_due_at"], "2026-05-06T06:00:00Z");
+        assert_eq!(delivery["at_risk"], true);
+        // The last delivery itself was on time.
+        assert_eq!(delivery["on_time"], true);
+    }
+
+    #[test]
+    fn status_json_gives_no_risk_verdict_below_five_runs() {
+        let (_dir, root, state_path, store) = project();
+        for day in 1..=4 {
+            seed_delivery(
+                &store,
+                &root,
+                &format!("run-{day}"),
+                at(day, 5, 0),
+                at(day, 5, 10),
+            );
+        }
+        drop(store);
+
+        let delivery = status_json(&root, &state_path, at(5, 5, 55));
+        assert_eq!(delivery["estimate"]["state"], "unknown");
+        assert_eq!(delivery["estimate"]["n"], 4);
+        assert!(delivery["estimate"].get("p90_ms").is_none());
+        assert!(
+            delivery["at_risk"].is_null(),
+            "no verdict without 5 runs: {delivery}"
+        );
+        // The delivery facts do not need the estimate.
+        assert_eq!(delivery["on_time"], true);
+    }
+
+    #[test]
+    fn a_spec_without_deliver_by_reports_no_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("products/revenue_daily.toml"), SPEC);
+        let output =
+            product_status_at(dir.path(), None, "revenue_daily", at(1, 0, 0)).expect("status");
+        assert!(output.delivery.is_none());
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json.get("delivery").is_none(), "absent, not null: {json}");
+    }
+
+    #[test]
+    fn deadlines_come_from_specs_that_declare_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        // A spec without a deadline and a broken spec contribute nothing.
+        write(
+            &root.join("products/other.toml"),
+            &SPEC.replace("revenue_daily", "other"),
+        );
+        write(&root.join("products/broken.toml"), "not = [toml");
+
+        let deadlines = product_deadlines_in(root);
+        assert_eq!(deadlines.len(), 1, "{deadlines:?}");
+        assert_eq!(deadlines[0].product, "revenue_daily");
+        assert_eq!(deadlines[0].output_model, "revenue_daily");
+        assert_eq!(deadlines[0].deliver_by.cron, "0 6 * * *");
+    }
+
+    #[test]
+    fn a_project_without_products_has_no_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(product_deadlines_in(dir.path()).is_empty());
     }
 }
