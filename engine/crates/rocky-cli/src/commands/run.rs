@@ -12716,7 +12716,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<GovernanceSnapshot> {
     let mut stored_bytes = super::run_stored_bytes::PendingStoredBytes::default();
-    let result = execute_models_phase(
+    // Boxed so this wrapper does not add the whole phase future to the
+    // caller's stack: the apply tests overflowed a 2 MiB test thread without it.
+    let result = Box::pin(execute_models_phase(
         models_dir,
         models_glob,
         warehouse,
@@ -12746,7 +12748,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         strict_contracts,
         cancel,
         &mut stored_bytes,
-    )
+    ))
     .await;
     stored_bytes
         .measure(warehouse, &mut output.materializations, cancel)
