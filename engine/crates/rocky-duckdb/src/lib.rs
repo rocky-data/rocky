@@ -470,6 +470,34 @@ mod tests {
             .to_string()
     }
 
+    /// `from_adapters` merges the `type = "duckdb"` blocks: the first
+    /// configured directory wins, and `offline` is OR'd across blocks.
+    #[test]
+    fn from_adapters_takes_the_first_directory_and_ors_offline() {
+        let adapter = |value: serde_json::Value| -> rocky_core::config::AdapterConfig {
+            serde_json::from_value(value).unwrap()
+        };
+        let adapters = [
+            adapter(serde_json::json!({"type": "duckdb"})),
+            adapter(serde_json::json!({
+                "type": "duckdb", "extension_directory": "/first", "offline": true
+            })),
+            adapter(serde_json::json!({
+                "type": "duckdb", "extension_directory": "/second", "offline": false
+            })),
+            adapter(serde_json::json!({
+                "type": "snowflake", "extension_directory": "/other", "offline": true
+            })),
+        ];
+        let merged = ExtensionOptions::from_adapters(&adapters);
+        assert_eq!(merged.directory, Some(PathBuf::from("/first")));
+        assert!(merged.offline);
+
+        let reversed = ExtensionOptions::from_adapters(adapters[..1].iter().chain(&adapters[2..3]));
+        assert_eq!(reversed.directory, Some(PathBuf::from("/second")));
+        assert!(!reversed.offline);
+    }
+
     /// The configured directory reaches DuckDB's `extension_directory`, and
     /// offline mode turns auto-install off. The directory is empty, so the
     /// connect fails at `LOAD icu`; the settings are read from the raw

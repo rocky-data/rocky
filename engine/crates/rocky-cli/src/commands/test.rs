@@ -1454,13 +1454,21 @@ mod tests {
     #[test]
     fn a_scoped_test_still_reports_the_consumer_error() {
         let (_tmp, models) = project_with_a_bad_consumer();
-        let mut result = rocky_engine::test_runner::run_tests(
-            &models,
-            None,
-            None,
-            &rocky_core::run_vars::RunVars::new(),
-        )
-        .expect("run");
+        let mut result =
+            rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
+                models_dir: &models,
+                project_root: models.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                models: rocky_engine::test_runner::TestModels::Dir,
+                contracts_dir: None,
+                model_filter: None,
+                run_vars: &rocky_core::run_vars::RunVars::new(),
+                gates: None,
+                inlined_gates: None,
+                strict_contracts: false,
+                target_dialects: Default::default(),
+                extensions: Default::default(),
+            })
+            .expect("run");
         let mut unit_run = rocky_engine::test_runner::run_unit_tests(
             &models,
             None,

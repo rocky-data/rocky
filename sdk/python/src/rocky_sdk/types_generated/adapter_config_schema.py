@@ -435,7 +435,7 @@ class AdapterConfig(BaseModel):
     """
     offline: bool | None = None
     """
-    When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. A model's own SQL can still install an extension. Default `false`.
+    When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.
     """
     password: str | None = None
     """

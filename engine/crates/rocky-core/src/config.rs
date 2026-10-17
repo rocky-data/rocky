@@ -5052,7 +5052,8 @@ pub struct AdapterConfig {
     /// When `true`, Rocky never runs `INSTALL` for a DuckDB extension and
     /// turns DuckDB's extension auto-install off. It loads `icu` from the
     /// extension directory only, and refuses to connect if `icu` is missing
-    /// there. A model's own SQL can still install an extension. Default
+    /// there. For `rocky compile`, a missing extension only logs a warning.
+    /// A model's own SQL can still install an extension. Default
     /// `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub offline: bool,
