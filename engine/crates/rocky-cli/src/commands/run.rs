@@ -11903,248 +11903,259 @@ pub(crate) async fn execute_backfill_set(
     // status-derived return — funnels through the single finalize below. The
     // block's locals (including the open `StateStore`) drop before the
     // finalize uploads.
-    let exec_result: Result<()> = async {
-        if output_json {
-            crate::output::reserve_stdout_for_json();
-        }
+    //
+    // Cancel (#1606): the backfill owns its run's token and signal listener,
+    // so a signal settles it like `rocky run`: no new model or partition
+    // starts, the run records itself interrupted and the finalize below still
+    // uploads. Held to the end: dropping it stops the listener.
+    let run_cancel = super::run_cancel::for_run();
+    let exec_result: Result<()> = run_cancel
+        .shared()
+        .scope(async {
+            if output_json {
+                crate::output::reserve_stdout_for_json();
+            }
 
-        let rocky_cfg = &loaded.config;
-        let start = Instant::now();
-        let started_at = Utc::now();
-        let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
-        let config_hash = loaded.fingerprint.clone();
+            let rocky_cfg = &loaded.config;
+            let start = Instant::now();
+            let started_at = Utc::now();
+            let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+            let config_hash = loaded.fingerprint.clone();
 
-        anyhow::ensure!(
-            models_dir.exists(),
-            "models directory '{}' not found (required for backfill)",
-            models_dir.display()
-        );
+            anyhow::ensure!(
+                models_dir.exists(),
+                "models directory '{}' not found (required for backfill)",
+                models_dir.display()
+            );
 
-        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
-        // Mirror the `--model` path: the first transformation pipeline's target
-        // adapter, falling back to the first replication pipeline's.
-        let target_adapter_name = rocky_cfg
-            .pipelines
-            .values()
-            .find_map(|p| match p {
-                rocky_core::config::PipelineConfig::Transformation(t) => {
-                    Some(t.target.adapter.clone())
-                }
-                _ => None,
-            })
-            .or_else(|| {
-                rocky_cfg.pipelines.values().find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Replication(r) => {
-                        Some(r.target.adapter.clone())
+            let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+            // Mirror the `--model` path: the first transformation pipeline's target
+            // adapter, falling back to the first replication pipeline's.
+            let target_adapter_name = rocky_cfg
+                .pipelines
+                .values()
+                .find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Transformation(t) => {
+                        Some(t.target.adapter.clone())
                     }
                     _ => None,
                 })
-            })
-            .unwrap_or_else(|| "default".to_string());
+                .or_else(|| {
+                    rocky_cfg.pipelines.values().find_map(|p| match p {
+                        rocky_core::config::PipelineConfig::Replication(r) => {
+                            Some(r.target.adapter.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| "default".to_string());
 
-        let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
-        let state_store = Some(
-            rocky_core::state::StateStore::open_with_policy(
-                state_path,
-                rocky_cfg.state.on_schema_mismatch,
+            let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+            let state_store = Some(
+                rocky_core::state::StateStore::open_with_policy(
+                    state_path,
+                    rocky_cfg.state.on_schema_mismatch,
+                )
+                .with_context(|| {
+                    format!("failed to open state store at {}", state_path.display())
+                })?,
+            );
+            if let Some(store) = state_store.as_ref() {
+                mark_run_started(store, &run_id, started_at, None);
+            }
+            // Forward-incompat recreate ⇒ never push the downgraded ledger back
+            // over newer shared state (the state.rs caller obligation; same
+            // suppression as the replication / model-only / load arms). The
+            // ALWAYS-finalize shape below stays — a suppressed finalize consumes
+            // the session without uploading.
+            if state_store
+                .as_ref()
+                .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
+            {
+                session.set_suppress_upload("forward-incompat recreate");
+            }
+
+            let mut output = RunOutput::new(String::new(), 0, 1);
+
+            let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
+            // A backfill is an explicit, reviewed rebuild order, so the plain skip
+            // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
+            // rowcount) are blind to exactly the backdated corrections backfills
+            // exist to repair, and `[run] skip_unchanged = true` would otherwise
+            // silently no-op the whole approved recovery. `force_rebuild` makes the
+            // gate inert (`is_active()` = false) and pins the content-addressed
+            // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
+            // point-to reuse stays governed by `backfill_reuse_gates` alone — a
+            // byte-identical reuse still satisfies a rebuild order.
+            let skip_gate = SkipGateConfig::resolve(
+                &SkipRunOptions {
+                    force_rebuild: true,
+                    ..Default::default()
+                },
+                &rocky_cfg.run,
+                false,
+            );
+            let run_vars = rocky_core::run_vars::RunVars::new();
+            // A backfill is an explicit rebuild order: point-to reuse may still
+            // satisfy it byte-identically, but the column-level skip never may.
+            let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
+
+            // Finding #1: baseline failures so a soft model failure skips governance.
+            let failures_before = output.tables_failed;
+            let exec_result = execute_models(
+                models_dir,
+                None,
+                warehouse.as_ref(),
+                state_store.as_ref(),
+                partition_opts,
+                &run_id,
+                None, // selection is driven by `model_set`, not the single-name filter
+                Some(model_set),
+                &mut output,
+                None, // backfill has no pipeline hook context
+                None,
+                &schema_cache_cfg,
+                // Target schemas already exist (the closure was built before); do not
+                // auto-create, matching the `--model` entry point.
+                false,
+                None, // backfills always target production
+                // Each model's casts are typed for the warehouse its own pipelines
+                // write to, not for this backfill's warehouse (#2333).
+                &DeferOptions {
+                    target_dialects: Some(super::compile::target_dialects(
+                        Some(rocky_cfg),
+                        config_path,
+                    )),
+                    ..DeferOptions::default()
+                },
+                skip_gate,
+                reuse_enabled,
+                column_level_enabled,
+                &run_vars,
+                rocky_cfg.resilience.clone(),
+                rocky_cfg.run.strict_scheduling,
+                super::resilience::retry_policy_allows(rocky_cfg),
+                exec_fp_gate,
+                freeze_fence,
+                // Finding #4: a backfill reconciles only tags, not masks.
+                false,
+                rocky_cfg.contracts.strict,
             )
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
-        );
-        if let Some(store) = state_store.as_ref() {
-            mark_run_started(store, &run_id, started_at, None);
-        }
-        // Forward-incompat recreate ⇒ never push the downgraded ledger back
-        // over newer shared state (the state.rs caller obligation; same
-        // suppression as the replication / model-only / load arms). The
-        // ALWAYS-finalize shape below stays — a suppressed finalize consumes
-        // the session without uploading.
-        if state_store
-            .as_ref()
-            .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
-        {
-            session.set_suppress_upload("forward-incompat recreate");
-        }
+            .await;
 
-        let mut output = RunOutput::new(String::new(), 0, 1);
-
-        let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
-        // A backfill is an explicit, reviewed rebuild order, so the plain skip
-        // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
-        // rowcount) are blind to exactly the backdated corrections backfills
-        // exist to repair, and `[run] skip_unchanged = true` would otherwise
-        // silently no-op the whole approved recovery. `force_rebuild` makes the
-        // gate inert (`is_active()` = false) and pins the content-addressed
-        // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
-        // point-to reuse stays governed by `backfill_reuse_gates` alone — a
-        // byte-identical reuse still satisfies a rebuild order.
-        let skip_gate = SkipGateConfig::resolve(
-            &SkipRunOptions {
-                force_rebuild: true,
-                ..Default::default()
-            },
-            &rocky_cfg.run,
-            false,
-        );
-        let run_vars = rocky_core::run_vars::RunVars::new();
-        // A backfill is an explicit rebuild order: point-to reuse may still
-        // satisfy it byte-identically, but the column-level skip never may.
-        let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
-
-        // Finding #1: baseline failures so a soft model failure skips governance.
-        let failures_before = output.tables_failed;
-        let exec_result = execute_models(
-            models_dir,
-            None,
-            warehouse.as_ref(),
-            state_store.as_ref(),
-            partition_opts,
-            &run_id,
-            None, // selection is driven by `model_set`, not the single-name filter
-            Some(model_set),
-            &mut output,
-            None, // backfill has no pipeline hook context
-            None,
-            &schema_cache_cfg,
-            // Target schemas already exist (the closure was built before); do not
-            // auto-create, matching the `--model` entry point.
-            false,
-            None, // backfills always target production
-            // Each model's casts are typed for the warehouse its own pipelines
-            // write to, not for this backfill's warehouse (#2333).
-            &DeferOptions {
-                target_dialects: Some(super::compile::target_dialects(
-                    Some(rocky_cfg),
-                    config_path,
-                )),
-                ..DeferOptions::default()
-            },
-            skip_gate,
-            reuse_enabled,
-            column_level_enabled,
-            &run_vars,
-            rocky_cfg.resilience.clone(),
-            rocky_cfg.run.strict_scheduling,
-            super::resilience::retry_policy_allows(rocky_cfg),
-            exec_fp_gate,
-            freeze_fence,
-            // Finding #4: a backfill reconciles only tags, not masks.
-            false,
-            rocky_cfg.contracts.strict,
-        )
-        .await;
-
-        match exec_result {
-            // Finding #1: only when the model phase is CLEAN (no new soft failures).
-            Ok(snapshot) if output.tables_failed == failures_before => {
-                // Pre-reconcile freeze fence (fresh LIST): a freeze landing
-                // after the rebuild must withhold the governance reconcile,
-                // recorded so the ALWAYS-finalize below still uploads the
-                // committed rebuild state.
-                let fence_withhold = match freeze_fence {
-                    Some(fence) => {
-                        fence
-                            .check_withhold(
-                                // Only the EXECUTING backfill closure — the
-                                // captured snapshot carries every COMPILED
-                                // model, so a freeze on a model outside this
-                                // backfill's `model_set` must not withhold its
-                                // reconcile (the reconcile below iterates
-                                // exactly `model_set`).
-                                snapshot
-                                    .models
-                                    .iter()
-                                    .map(|m| m.name.as_str())
-                                    .filter(|name| model_set.contains(*name)),
+            match exec_result {
+                // Finding #1: only when the model phase is CLEAN (no new soft failures)
+                // and no signal cut it short (#1606).
+                Ok(snapshot) if output.tables_failed == failures_before && !output.interrupted => {
+                    // Pre-reconcile freeze fence (fresh LIST): a freeze landing
+                    // after the rebuild must withhold the governance reconcile,
+                    // recorded so the ALWAYS-finalize below still uploads the
+                    // committed rebuild state.
+                    let fence_withhold = match freeze_fence {
+                        Some(fence) => {
+                            fence
+                                .check_withhold(
+                                    // Only the EXECUTING backfill closure — the
+                                    // captured snapshot carries every COMPILED
+                                    // model, so a freeze on a model outside this
+                                    // backfill's `model_set` must not withhold its
+                                    // reconcile (the reconcile below iterates
+                                    // exactly `model_set`).
+                                    snapshot
+                                        .models
+                                        .iter()
+                                        .map(|m| m.name.as_str())
+                                        .filter(|name| model_set.contains(*name)),
+                                )
+                                .await
+                        }
+                        None => None,
+                    };
+                    if let Some(msg) = fence_withhold {
+                        output.tables_failed += 1;
+                        output.errors.push(crate::output::TableErrorOutput {
+                            asset_key: vec!["<freeze>".to_string()],
+                            error: msg,
+                            failure_kind: crate::output::FailureKind::Unknown,
+                            cooldown_seconds: None,
+                        });
+                    } else {
+                        // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
+                        // closure so unrelated models are untouched.
+                        // #1093: every iteration reuses the ONE snapshot captured at
+                        // the fingerprint gate inside `execute_models` — the old
+                        // signature fresh-compiled the whole project from disk once
+                        // PER model in the closure (N recompiles), and each of those
+                        // compiles could pick up a post-execution sidecar edit.
+                        let governance_adapter =
+                            adapter_registry.governance_adapter(&target_adapter_name);
+                        for model in model_set {
+                            apply_model_governance_tags(
+                                &snapshot,
+                                governance_adapter.as_ref(),
+                                Some(model.as_str()),
                             )
-                            .await
+                            .await;
+                        }
+                        write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
                     }
-                    None => None,
-                };
-                if let Some(msg) = fence_withhold {
+                }
+                // Soft model failure — skip governance/manifest, fall through.
+                Ok(_) => {}
+                Err(e) => {
+                    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
                     output.errors.push(crate::output::TableErrorOutput {
-                        asset_key: vec!["<freeze>".to_string()],
-                        error: msg,
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        asset_key: vec!["backfill".to_string()],
+                        error: format!("{e:#}"),
+                        failure_kind,
+                        cooldown_seconds,
                     });
-                } else {
-                    // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
-                    // closure so unrelated models are untouched.
-                    // #1093: every iteration reuses the ONE snapshot captured at
-                    // the fingerprint gate inside `execute_models` — the old
-                    // signature fresh-compiled the whole project from disk once
-                    // PER model in the closure (N recompiles), and each of those
-                    // compiles could pick up a post-execution sidecar edit.
-                    let governance_adapter =
-                        adapter_registry.governance_adapter(&target_adapter_name);
-                    for model in model_set {
-                        apply_model_governance_tags(
-                            &snapshot,
-                            governance_adapter.as_ref(),
-                            Some(model.as_str()),
-                        )
-                        .await;
-                    }
-                    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
                 }
             }
-            // Soft model failure — skip governance/manifest, fall through.
-            Ok(_) => {}
-            Err(e) => {
-                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
-                output.tables_failed += 1;
-                output.errors.push(crate::output::TableErrorOutput {
-                    asset_key: vec!["backfill".to_string()],
-                    error: format!("{e:#}"),
-                    failure_kind,
-                    cooldown_seconds,
-                });
+
+            output.duration_ms = start.elapsed().as_millis() as u64;
+
+            let adapter_type = rocky_cfg
+                .adapters
+                .get(&target_adapter_name)
+                .map(|a| a.adapter_type.clone())
+                .unwrap_or_default();
+            output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+            let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+            // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
+            // there is no Rocky branch to stamp here (#2032).
+            let audit_ctx = AuditContext::detect(None, None, None);
+            let audit = audit_to_record(&audit_ctx);
+            let custody = RecordCustody::from_persisted(persist_run_record(
+                state_store.as_ref(),
+                &output,
+                &run_id,
+                started_at,
+                &config_hash,
+                &audit,
+                // A backfill spans a model set, not a single pipeline.
+                None,
+            ));
+
+            output.status = output.derive_run_status();
+            if output_json {
+                print_json(&output)?;
+                capture_run_output_for_test(&run_id, &output);
             }
-        }
-
-        output.duration_ms = start.elapsed().as_millis() as u64;
-
-        let adapter_type = rocky_cfg
-            .adapters
-            .get(&target_adapter_name)
-            .map(|a| a.adapter_type.clone())
-            .unwrap_or_default();
-        output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
-        let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
-
-        // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
-        // there is no Rocky branch to stamp here (#2032).
-        let audit_ctx = AuditContext::detect(None, None, None);
-        let audit = audit_to_record(&audit_ctx);
-        let custody = RecordCustody::from_persisted(persist_run_record(
-            state_store.as_ref(),
-            &output,
-            &run_id,
-            started_at,
-            &config_hash,
-            &audit,
-            // A backfill spans a model set, not a single pipeline.
-            None,
-        ));
-
-        output.status = output.derive_run_status();
-        if output_json {
-            print_json(&output)?;
-            capture_run_output_for_test(&run_id, &output);
-        }
-        budget_result?;
-        run_status_exit_result(&output, &run_id, custody)?;
-        // A backfill's session is `Durable` (governed), so a lost record on a
-        // successful backfill fails the apply after the upload below (#1884).
-        record_custody_exit_result(
-            custody,
-            &run_id,
-            true,
-            rocky_core::config::StateUploadFailureMode::Fail,
-        )
-    }
-    .await;
+            budget_result?;
+            run_status_exit_result(&output, &run_id, custody)?;
+            // A backfill's session is `Durable` (governed), so a lost record on a
+            // successful backfill fails the apply after the upload below (#1884).
+            record_custody_exit_result(
+                custody,
+                &run_id,
+                true,
+                rocky_core::config::StateUploadFailureMode::Fail,
+            )
+        })
+        .await;
 
     // WP-01 PR-B (2b): ALWAYS finalize — even when the backfill failed. A
     // mid-run failure can still have committed run/artifact/provenance rows
@@ -12571,8 +12582,8 @@ pub(crate) async fn execute_models(
         reconciles_masks,
         None,
         strict_contracts,
-        // Backfill and tests: no run owns a token here, so adopt a `--watch`
-        // scope's when there is one and otherwise never cancel.
+        // Backfill scopes its own run's token (#1606); tests and a `--watch`
+        // scope are adopted the same way. With no scope, never cancel.
         &super::run_cancel::ambient().unwrap_or_default(),
     )
     .await
@@ -27450,6 +27461,82 @@ adapter = "default"
         for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
             assert_supervised_backfill_failure(failure, expected_kind, expected_cooldown).await;
         }
+    }
+
+    /// #1606: a signal during `rocky apply` of a backfill plan settles the
+    /// backfill like `rocky run`. A cancel before the first model starts no
+    /// model, records the run and returns `Interrupted` (exit 130).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancelled_backfill_starts_no_model_and_exits_interrupted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
+                 models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
+                dir.join("wh.duckdb").display(),
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+        let state_path = dir.join("state.redb");
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+        let mut session = rocky_core::state_sync::RemoteStateSession::new(
+            &loaded.config.state,
+            &state_path,
+            rocky_core::state_sync::FinalizeDurability::Durable,
+            false,
+        );
+        let _authority = session.acquire().await.unwrap();
+        session.require_synced().unwrap();
+        let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let result = super::super::run_cancel::scope(
+            token,
+            super::execute_backfill_set(
+                &loaded,
+                &config_path,
+                session,
+                &state_path,
+                &models,
+                &model_set,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                true,
+            ),
+        )
+        .await;
+        let error = result.expect_err("a cancelled backfill must not report success");
+        assert!(error.is::<super::Interrupted>(), "{error:#}");
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1, "the interrupted backfill records its run");
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&runs[0].run_id)
+            .expect("backfill must emit terminal JSON");
+        assert!(
+            captured["materializations"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no model may start after the cancel: {captured}"
+        );
     }
 
     #[cfg(feature = "duckdb")]
