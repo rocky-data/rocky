@@ -2262,6 +2262,23 @@ mod delivery_timing_e2e {
         );
         assert_eq!(exec.late_by_seconds(), Some(90 * 60), "90 minutes late");
         assert_eq!(exec.wait_for_upstream_ms, Some(5 * 60 * 1000));
+
+        // Day 3: late again. The late day-2 delivery covered day 2 only, so
+        // this one serves day 3 06:00, not day 4.
+        let rows = build(&adapter).await;
+        let mut late_again = run_record(
+            "run-day3",
+            at(3, 7, 0),
+            at(3, 7, 0),
+            at(3, 7, 15),
+            rows,
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut late_again, &store, &deadlines).unwrap();
+        store.record_run(&late_again).unwrap();
+        let day3 = store.get_run("run-day3").unwrap().expect("day 3 recorded");
+        assert_eq!(day3.models_executed[0].due_at, Some(at(3, 6, 0)));
+        assert_eq!(day3.models_executed[0].late_by_seconds(), Some(75 * 60));
     }
 
     #[tokio::test]

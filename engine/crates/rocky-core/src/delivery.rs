@@ -4,9 +4,10 @@
 //! # When a delivery is due
 //!
 //! A product declares `deliver_by`, a cron expression. Each occurrence is a
-//! deadline. A delivery that finishes at `t` covers the first deadline at or
-//! after `t`. So the deadline still open after a delivery is the occurrence
-//! after the one it covered.
+//! deadline. Each delivery records the deadline it served. It also covers
+//! every deadline that had passed when it finished, so a late delivery
+//! catches up. The deadline still open after a delivery is the occurrence
+//! after the latest one it covered.
 //!
 //! The deadline a new delivery serves:
 //!
@@ -16,6 +17,9 @@
 //!   it is on time.
 //! - With no previous delivery, there is no open deadline to miss, so the
 //!   first delivery is on time.
+//!
+//! A late delivery reports one lateness, against the oldest missed
+//! deadline. The deadlines it caught up on are not reported separately.
 //!
 //! Anchoring on the previous delivery, not on the run's start, keeps a late
 //! run honest. A run that starts after today's deadline still serves today's
@@ -42,7 +46,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::product::spec::DeliverBy;
-use crate::schedule::occurrence::next_occurrence;
+use crate::schedule::occurrence::{next_occurrence, previous_or_equal_occurrence};
 use crate::state::{RunRecord, StateError, StateStore, UnrecordedScope};
 
 /// How many recent production durations the estimate reads.
@@ -171,25 +175,47 @@ pub fn covered_by(deliver_by: &DeliverBy, at: DateTime<Utc>) -> Option<DateTime<
     }
 }
 
-/// The deadline still open after a delivery that finished at
-/// `last_delivered`: the occurrence after the one that delivery covered.
+/// A previous delivery: when it finished, and the deadline its run recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastDelivery {
+    /// When the model finished.
+    pub finished_at: DateTime<Utc>,
+    /// The deadline the run recorded for it, when it recorded one.
+    pub due_at: Option<DateTime<Utc>>,
+}
+
+/// The latest deadline a delivery satisfied: the one it served, or a later
+/// one that had already passed when it finished. A late delivery catches up
+/// on every deadline before its finish.
+///
+/// A delivery with no recorded deadline (written before this field existed)
+/// is taken to have covered the first deadline at or after its finish.
+fn last_covered(deliver_by: &DeliverBy, delivery: LastDelivery) -> Option<DateTime<Utc>> {
+    let served = match delivery.due_at {
+        Some(due) => due,
+        None => covered_by(deliver_by, delivery.finished_at)?,
+    };
+    let passed =
+        previous_or_equal_occurrence(&deliver_by.cron, deliver_by.tz, delivery.finished_at).ok();
+    Some(passed.map_or(served, |passed| passed.max(served)))
+}
+
+/// The deadline still open after `last`: the occurrence after the latest one
+/// it covered.
 #[must_use]
-pub fn open_deadline_after(
-    deliver_by: &DeliverBy,
-    last_delivered: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    due_after(deliver_by, covered_by(deliver_by, last_delivered)?)
+pub fn open_deadline_after(deliver_by: &DeliverBy, last: LastDelivery) -> Option<DateTime<Utc>> {
+    due_after(deliver_by, last_covered(deliver_by, last)?)
 }
 
 /// The deadline a delivery finishing at `finished` serves, given the
-/// previous delivery's finish. See the module docs.
+/// previous delivery. See the module docs.
 #[must_use]
 pub fn deadline_served(
     deliver_by: &DeliverBy,
-    previous_delivered: Option<DateTime<Utc>>,
+    previous: Option<LastDelivery>,
     finished: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    if let Some(previous) = previous_delivered {
+    if let Some(previous) = previous {
         let open = open_deadline_after(deliver_by, previous)?;
         if open < finished {
             return Some(open);
@@ -254,7 +280,10 @@ pub fn stamp_delivery_timing(
         };
         let previous = store
             .last_delivery(&model, UnrecordedScope::Exclude)?
-            .map(|previous| previous.finished_at);
+            .map(|previous| LastDelivery {
+                finished_at: previous.finished_at,
+                due_at: previous.due_at,
+            });
         execution.due_at = deadline_served(&deadline.deliver_by, previous, execution.finished_at);
     }
     Ok(())
@@ -394,9 +423,17 @@ mod tests {
         assert_eq!(covered_by(&d, just_after), Some(utc(2026, 5, 2, 6, 0)));
     }
 
+    fn previous(finished: DateTime<Utc>, due: DateTime<Utc>) -> Option<LastDelivery> {
+        Some(LastDelivery {
+            finished_at: finished,
+            due_at: Some(due),
+        })
+    }
+
     #[test]
     fn deadline_served_cases() {
         let d = six_am();
+        let day1_on_time = previous(utc(2026, 5, 1, 5, 40), utc(2026, 5, 1, 6, 0));
         // First delivery: nothing was open, so it covers the next deadline.
         assert_eq!(
             deadline_served(&d, None, utc(2026, 5, 1, 7, 30)),
@@ -404,22 +441,72 @@ mod tests {
         );
         // On time the next day.
         assert_eq!(
-            deadline_served(&d, Some(utc(2026, 5, 1, 5, 40)), utc(2026, 5, 2, 5, 50)),
+            deadline_served(&d, day1_on_time, utc(2026, 5, 2, 5, 50)),
             Some(utc(2026, 5, 2, 6, 0))
         );
         // Late the next day: the open deadline passed before it finished.
         assert_eq!(
-            deadline_served(&d, Some(utc(2026, 5, 1, 5, 40)), utc(2026, 5, 2, 7, 30)),
+            deadline_served(&d, day1_on_time, utc(2026, 5, 2, 7, 30)),
             Some(utc(2026, 5, 2, 6, 0))
         );
         // A second delivery the same day covers the next deadline, on time.
         assert_eq!(
-            deadline_served(&d, Some(utc(2026, 5, 1, 5, 40)), utc(2026, 5, 1, 12, 0)),
+            deadline_served(&d, day1_on_time, utc(2026, 5, 1, 12, 0)),
             Some(utc(2026, 5, 2, 6, 0))
         );
         // A missed day: the delivery serves the oldest open deadline.
         assert_eq!(
-            deadline_served(&d, Some(utc(2026, 5, 1, 5, 40)), utc(2026, 5, 3, 7, 0)),
+            deadline_served(&d, day1_on_time, utc(2026, 5, 3, 7, 0)),
+            Some(utc(2026, 5, 2, 6, 0))
+        );
+    }
+
+    #[test]
+    fn a_late_delivery_does_not_cover_the_next_deadline() {
+        let d = six_am();
+        // Day 2's delivery landed at 07:30, late for day 2 06:00.
+        let day2_late = previous(utc(2026, 5, 2, 7, 30), utc(2026, 5, 2, 6, 0));
+        assert_eq!(
+            open_deadline_after(&d, day2_late.unwrap()),
+            Some(utc(2026, 5, 3, 6, 0))
+        );
+        // So day 3 at 07:00 is late again, not on time for day 4.
+        assert_eq!(
+            deadline_served(&d, day2_late, utc(2026, 5, 3, 7, 0)),
+            Some(utc(2026, 5, 3, 6, 0))
+        );
+        // And day 3 at 05:50 is on time.
+        assert_eq!(
+            deadline_served(&d, day2_late, utc(2026, 5, 3, 5, 50)),
+            Some(utc(2026, 5, 3, 6, 0))
+        );
+    }
+
+    #[test]
+    fn a_late_delivery_catches_up_on_every_passed_deadline() {
+        let d = six_am();
+        // Day 3 at 07:00 served day 2 06:00 late; day 3 06:00 had passed too.
+        let caught_up = previous(utc(2026, 5, 3, 7, 0), utc(2026, 5, 2, 6, 0));
+        assert_eq!(
+            open_deadline_after(&d, caught_up.unwrap()),
+            Some(utc(2026, 5, 4, 6, 0))
+        );
+        assert_eq!(
+            deadline_served(&d, caught_up, utc(2026, 5, 4, 5, 50)),
+            Some(utc(2026, 5, 4, 6, 0)),
+            "day 4 on time is not charged with day 3"
+        );
+    }
+
+    #[test]
+    fn a_delivery_without_a_recorded_deadline_covers_the_next_one() {
+        let d = six_am();
+        let unrecorded = Some(LastDelivery {
+            finished_at: utc(2026, 5, 1, 5, 40),
+            due_at: None,
+        });
+        assert_eq!(
+            deadline_served(&d, unrecorded, utc(2026, 5, 2, 7, 30)),
             Some(utc(2026, 5, 2, 6, 0))
         );
     }

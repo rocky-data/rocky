@@ -33,7 +33,7 @@ timezone = "Europe/Lisbon"   # IANA name; defaults to UTC
 
 The parser checks `deliver_by` with the scheduler's own cron parser (`deliver-by-unparseable`). It refuses an unknown timezone (`timezone-unknown`) and a `timezone` without `deliver_by` (`timezone-without-deliver-by`).
 
-Each production `rocky run` that builds the product's output model records the deadline that build served. A build covers the first deadline at or after it finished. If an earlier deadline was still open when it finished, the build serves that one instead, and it is late. Lateness is wall-clock time from the deadline to the moment the model finished. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of the `rocky.toml` it runs.
+Each production `rocky run` that builds the product's output model records the deadline that build served. A build covers the first deadline at or after it finished. If an earlier deadline was still open when it finished, the build serves that one instead, and it is late. A late build also covers every deadline that passed before it finished, so it reports one lateness, not one per missed deadline. Lateness is wall-clock time from the deadline to the moment the model finished. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of the `rocky.toml` it runs.
 
 ---
 
