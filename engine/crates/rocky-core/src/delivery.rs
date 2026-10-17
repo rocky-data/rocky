@@ -31,12 +31,110 @@
 //!
 //! Lateness is wall-clock time from the deadline to the moment the model
 //! finished. Only runs that count as production carry a deadline.
+//!
+//! # How long a delivery takes
+//!
+//! [`estimate_durations`] reads the last [`ESTIMATE_WINDOW`] production
+//! durations and returns their p50 and p90. With fewer than
+//! [`ESTIMATE_MIN_RUNS`] it returns no band, and no verdict may rest on it.
+//! It has no day-of-week model.
 
 use chrono::{DateTime, Utc};
 
 use crate::product::spec::DeliverBy;
 use crate::schedule::occurrence::next_occurrence;
 use crate::state::{RunRecord, StateError, StateStore, UnrecordedScope};
+
+/// How many recent production durations the estimate reads.
+pub const ESTIMATE_WINDOW: usize = 20;
+
+/// The fewest durations the estimate needs before it reports a band.
+pub const ESTIMATE_MIN_RUNS: usize = 5;
+
+/// How many of the newest durations the growth check compares.
+pub const GROWTH_RUNS: usize = 5;
+
+/// A p50/p90 band over recent durations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurationBand {
+    /// Median duration in milliseconds.
+    pub p50_ms: u64,
+    /// 90th-percentile duration in milliseconds. Raised to the slowest of
+    /// the newest runs when they all ran slower than before; see
+    /// [`Self::growth`].
+    pub p90_ms: u64,
+    /// True when the newest [`GROWTH_RUNS`] durations all exceed the p90 of
+    /// the older durations, so `p90_ms` is the largest of those newest runs.
+    pub growth: bool,
+}
+
+/// The duration estimate: the band, plus the sample it rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurationEstimate {
+    /// How many durations the estimate read.
+    pub n: usize,
+    /// The most durations it reads ([`ESTIMATE_WINDOW`]).
+    pub window: usize,
+    /// The band. `None` when `n` is below [`ESTIMATE_MIN_RUNS`]: too few
+    /// runs to say anything.
+    pub band: Option<DurationBand>,
+}
+
+/// Nearest-rank percentile of a sorted, non-empty slice.
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    let rank = (pct * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
+}
+
+/// Estimate p50 and p90 from durations listed newest first.
+///
+/// Reads at most [`ESTIMATE_WINDOW`] durations. Below [`ESTIMATE_MIN_RUNS`]
+/// the band is `None`. Percentiles are nearest-rank.
+///
+/// **Growth.** When the newest [`GROWTH_RUNS`] durations all exceed the p90
+/// of the older durations in the window, the runs have grown slower and the
+/// window's own p90 lags behind. Then `p90_ms` is the largest of the newest
+/// [`GROWTH_RUNS`]. The comparison must use the older durations: over the
+/// whole window of 20, at most two values sit above the p90, so "the newest
+/// five all exceed it" could never be true. With exactly
+/// [`ESTIMATE_MIN_RUNS`] durations there are no older ones, and no growth.
+#[must_use]
+pub fn estimate_durations(newest_first: &[u64]) -> DurationEstimate {
+    let sample = &newest_first[..newest_first.len().min(ESTIMATE_WINDOW)];
+    let n = sample.len();
+    if n < ESTIMATE_MIN_RUNS {
+        return DurationEstimate {
+            n,
+            window: ESTIMATE_WINDOW,
+            band: None,
+        };
+    }
+    let mut sorted = sample.to_vec();
+    sorted.sort_unstable();
+    let p50_ms = percentile(&sorted, 50);
+    let mut p90_ms = percentile(&sorted, 90);
+
+    let (newest, older) = sample.split_at(GROWTH_RUNS);
+    let mut growth = false;
+    if !older.is_empty() {
+        let mut older_sorted = older.to_vec();
+        older_sorted.sort_unstable();
+        let older_p90 = percentile(&older_sorted, 90);
+        if newest.iter().all(|duration| *duration > older_p90) {
+            growth = true;
+            p90_ms = newest.iter().copied().max().unwrap_or(p90_ms);
+        }
+    }
+    DurationEstimate {
+        n,
+        window: ESTIMATE_WINDOW,
+        band: Some(DurationBand {
+            p50_ms,
+            p90_ms,
+            growth,
+        }),
+    }
+}
 
 /// A product's delivery deadline, keyed by the model it delivers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +276,84 @@ mod tests {
         }
     }
 
+    // ----- the duration estimate -----
+
+    #[test]
+    fn cold_start_has_no_band() {
+        for n in 0..ESTIMATE_MIN_RUNS {
+            let durations = vec![1_000; n];
+            let estimate = estimate_durations(&durations);
+            assert_eq!(estimate.n, n);
+            assert_eq!(estimate.window, ESTIMATE_WINDOW);
+            assert_eq!(estimate.band, None, "{n} runs must give no band");
+        }
+    }
+
+    #[test]
+    fn five_runs_are_enough_for_a_band() {
+        let estimate = estimate_durations(&[500, 400, 300, 200, 100]);
+        assert_eq!(estimate.n, 5);
+        let band = estimate.band.expect("five runs give a band");
+        assert_eq!(band.p50_ms, 300);
+        assert_eq!(band.p90_ms, 500);
+        assert!(!band.growth, "no older runs to compare against");
+    }
+
+    #[test]
+    fn a_stable_series_gives_its_own_percentiles() {
+        // 20 runs, newest first: 1..=20 seconds, shuffled so the newest five
+        // are not the slowest.
+        let newest_first: Vec<u64> = [
+            7, 3, 12, 1, 18, 20, 5, 9, 14, 2, 16, 11, 4, 19, 8, 13, 6, 17, 10, 15,
+        ]
+        .iter()
+        .map(|s| s * 1_000)
+        .collect();
+        let estimate = estimate_durations(&newest_first);
+        assert_eq!(estimate.n, 20);
+        assert_eq!(estimate.window, ESTIMATE_WINDOW);
+        let band = estimate.band.expect("band");
+        assert_eq!(band.p50_ms, 10_000, "nearest-rank p50 of 1..=20");
+        assert_eq!(band.p90_ms, 18_000, "nearest-rank p90 of 1..=20");
+        assert!(!band.growth);
+    }
+
+    #[test]
+    fn only_the_newest_window_is_read() {
+        let mut newest_first = vec![1_000; ESTIMATE_WINDOW];
+        // Older than the window: must not move the band.
+        newest_first.extend(vec![1_000_000; 10]);
+        let estimate = estimate_durations(&newest_first);
+        assert_eq!(estimate.n, ESTIMATE_WINDOW);
+        assert_eq!(estimate.band.expect("band").p90_ms, 1_000);
+    }
+
+    #[test]
+    fn a_growth_series_uses_the_largest_of_the_newest_five() {
+        // 15 older runs near 10 s, then the 5 newest runs, all slower.
+        let mut newest_first = vec![31_000, 34_000, 30_000, 33_000, 32_000];
+        newest_first.extend((0..15).map(|i| 9_000 + i * 100));
+        let band = estimate_durations(&newest_first).band.expect("band");
+        assert!(band.growth, "the newest five all exceed the older p90");
+        assert_eq!(band.p90_ms, 34_000);
+        // The window's own nearest-rank p90 is 32 s: two of the newest runs
+        // are slower than it, so it would under-state the next run.
+        let mut sorted = newest_first.clone();
+        sorted.sort_unstable();
+        assert_eq!(percentile(&sorted, 90), 32_000);
+    }
+
+    #[test]
+    fn one_fast_run_among_the_newest_five_is_not_growth() {
+        let mut newest_first = vec![31_000, 34_000, 5_000, 33_000, 32_000];
+        newest_first.extend((0..15).map(|i| 9_000 + i * 100));
+        let band = estimate_durations(&newest_first).band.expect("band");
+        assert!(!band.growth);
+        assert_eq!(band.p90_ms, 32_000, "the window's own nearest-rank p90");
+    }
+
+    // ----- deadlines -----
+
     #[test]
     fn due_after_is_strictly_after_the_anchor() {
         assert_eq!(
@@ -261,6 +437,109 @@ mod tests {
             "run_scope": crate::state::RunScope::Production,
         }))
         .expect("a minimal run record")
+    }
+
+    /// A run that built `model`: the run starts at `started`, the model
+    /// finishes `minutes` later.
+    fn delivery_run(
+        id: &str,
+        started: DateTime<Utc>,
+        minutes: i64,
+        status: &str,
+        scope: crate::state::RunScope,
+    ) -> RunRecord {
+        let finished = started + chrono::Duration::minutes(minutes);
+        let mut record = bare_record(started, None);
+        record.run_id = id.to_string();
+        record.finished_at = finished;
+        record.pipeline = Some("revenue".to_string());
+        record.run_scope = Some(scope);
+        record.models_executed = vec![
+            serde_json::from_value(serde_json::json!({
+                "model_name": "revenue_daily",
+                "started_at": started,
+                "finished_at": finished,
+                "duration_ms": 1,
+                "rows_affected": null,
+                "status": status,
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+            }))
+            .unwrap(),
+        ];
+        record
+    }
+
+    #[test]
+    fn the_store_estimate_reads_production_successes_only() {
+        use crate::state::RunScope;
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        for day in 1..=4 {
+            store
+                .record_run(&delivery_run(
+                    &format!("prod-{day}"),
+                    utc(2026, 5, day, 5, 0),
+                    10 * i64::from(day),
+                    "success",
+                    RunScope::Production,
+                ))
+                .unwrap();
+        }
+        // Four production runs: below the minimum, no band.
+        let estimate = store
+            .get_duration_estimate("revenue_daily", UnrecordedScope::Exclude)
+            .unwrap();
+        assert_eq!((estimate.n, estimate.band), (4, None));
+
+        // A shadow run and a failed execution do not count.
+        store
+            .record_run(&delivery_run(
+                "shadow",
+                utc(2026, 5, 5, 5, 0),
+                500,
+                "success",
+                RunScope::Shadow { schema: None },
+            ))
+            .unwrap();
+        store
+            .record_run(&delivery_run(
+                "failed",
+                utc(2026, 5, 6, 5, 0),
+                500,
+                "failed",
+                RunScope::Production,
+            ))
+            .unwrap();
+        let estimate = store
+            .get_duration_estimate("revenue_daily", UnrecordedScope::Exclude)
+            .unwrap();
+        assert_eq!(estimate.n, 4, "shadow and failed builds are not deliveries");
+
+        store
+            .record_run(&delivery_run(
+                "prod-7",
+                utc(2026, 5, 7, 5, 0),
+                50,
+                "success",
+                RunScope::Production,
+            ))
+            .unwrap();
+        let estimate = store
+            .get_duration_estimate("revenue_daily", UnrecordedScope::Exclude)
+            .unwrap();
+        assert_eq!(estimate.n, 5);
+        let band = estimate.band.expect("five production runs give a band");
+        assert_eq!(band.p50_ms, 30 * 60 * 1000);
+        assert_eq!(band.p90_ms, 50 * 60 * 1000);
+
+        let pipeline = store
+            .get_pipeline_duration_estimate("revenue", UnrecordedScope::Exclude)
+            .unwrap();
+        // The failed execution's run still has status Success here, so the
+        // pipeline sees six production runs; the shadow run stays out.
+        assert_eq!(pipeline.n, 6);
     }
 
     #[test]

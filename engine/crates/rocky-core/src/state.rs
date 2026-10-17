@@ -3023,6 +3023,15 @@ impl ModelExecution {
     }
 }
 
+/// Milliseconds from `from` to `to`, clamped at zero when the clock stepped
+/// back between them.
+fn elapsed_ms_or_zero(
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    u64::try_from((to - from).num_milliseconds()).unwrap_or(0)
+}
+
 /// Where one successful model execution wrote its output.
 ///
 /// The model name is recorded next to the table because
@@ -4643,6 +4652,60 @@ impl StateStore {
         }
         let avg = history.iter().map(|m| m.duration_ms as f64).sum::<f64>() / history.len() as f64;
         Ok(Some(avg))
+    }
+
+    /// The p50/p90 estimate of how long a production run takes to deliver
+    /// `model_name`: from the run's start to the model's finish, over the
+    /// last [`crate::delivery::ESTIMATE_WINDOW`] successful executions in
+    /// runs that count as production under `unrecorded`.
+    ///
+    /// Run start, not model start, because a model also waits for the models
+    /// it depends on. That is the time a run starting now needs to deliver.
+    /// The mean in [`Self::get_average_duration`] is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn get_duration_estimate(
+        &self,
+        model_name: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<crate::delivery::DurationEstimate, StateError> {
+        let durations = self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            let run_started = run.started_at;
+            run.models_executed
+                .iter()
+                .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
+                .map(|m| m.finished_at)
+                .max()
+                .map(|finished| (1, elapsed_ms_or_zero(run_started, finished)))
+        })?;
+        Ok(crate::delivery::estimate_durations(&durations))
+    }
+
+    /// The p50/p90 estimate of a pipeline's wall-clock duration: from run
+    /// start to run finish, over its last
+    /// [`crate::delivery::ESTIMATE_WINDOW`] successful runs that count as
+    /// production under `unrecorded`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn get_pipeline_duration_estimate(
+        &self,
+        pipeline: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<crate::delivery::DurationEstimate, StateError> {
+        let durations = self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, |run| {
+            (run.pipeline.as_deref() == Some(pipeline)
+                && matches!(run.status, RunStatus::Success)
+                && run.counts_as_production(unrecorded))
+            .then(|| (1, elapsed_ms_or_zero(run.started_at, run.finished_at)))
+        })?;
+        Ok(crate::delivery::estimate_durations(&durations))
     }
 
     /// The newest successful execution of `model_name` in a run that counts
