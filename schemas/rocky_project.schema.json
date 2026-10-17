@@ -411,6 +411,13 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "region": {
+          "description": "Region label of the AI endpoint. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -1886,6 +1893,13 @@
           },
           "description": "Governance settings for the target."
         },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema": {
           "description": "Target schema name.",
           "type": "string"
@@ -2198,6 +2212,13 @@
           "default": null,
           "description": "Optional discovery configuration."
         },
+        "region": {
+          "description": "Region label where the source data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema_pattern": {
           "allOf": [
             {
@@ -2276,6 +2297,13 @@
             "tags": {}
           },
           "description": "Governance settings for the target."
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "schema_template": {
           "description": "Template for the target schema name.",
@@ -3214,6 +3242,13 @@
           "default": "default",
           "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
           "type": "string"
+        },
+        "region": {
+          "description": "Region label where the checked data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -3426,6 +3461,18 @@
         "name",
         "type"
       ],
+      "type": "object"
+    },
+    "ResidencyConfig": {
+      "additionalProperties": false,
+      "description": "`[residency]` — data-residency settings.\n\nA region is a free-text label (`\"eu-west-1\"`, `\"eu\"`) set on pipeline sources, pipeline targets and `[ai]`. Labels compare as exact text.\n\n```toml [residency] enforce = true ```\n\nWith `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.",
+      "properties": {
+        "enforce": {
+          "default": false,
+          "description": "Require a `region` label on every source, target and `[ai]`.",
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "ResilienceConfig": {
@@ -3935,6 +3982,13 @@
         "catalog": {
           "type": "string"
         },
+        "region": {
+          "description": "Region label where the source data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema": {
           "type": "string"
         },
@@ -3976,6 +4030,13 @@
             "tag_prefix": null,
             "tags": {}
           }
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "schema": {
           "type": "string"
@@ -4569,6 +4630,13 @@
             "tags": {}
           },
           "description": "Governance settings for the target."
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -4901,6 +4969,17 @@
         "target_dialect": null
       },
       "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
+    },
+    "residency": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ResidencyConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[residency]` — require region labels. Absent ⇒ no requirement, and the key is not serialized, so a project without the block keeps its config snapshot byte-identical. See [`ResidencyConfig`]."
     },
     "resilience": {
       "allOf": [

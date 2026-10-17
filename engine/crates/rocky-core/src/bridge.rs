@@ -297,6 +297,7 @@ mod tests {
 
     fn empty_config() -> RockyConfig {
         RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: Default::default(),

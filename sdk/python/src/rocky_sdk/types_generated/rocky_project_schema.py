@@ -106,6 +106,10 @@ class AiSection(BaseModel):
     """
     Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
     """
+    region: str | None = None
+    """
+    Region label of the AI endpoint. See [`ResidencyConfig`].
+    """
 
 
 class AllowedTypeChange(BaseModel):
@@ -1361,6 +1365,10 @@ class QualityTargetConfig(BaseModel):
     """
     Name of the adapter to use (references a key in `[adapter.*]`).
     """
+    region: str | None = None
+    """
+    Region label where the checked data lives. See [`ResidencyConfig`].
+    """
 
 
 class QuarantineMode1(StrEnum):
@@ -1397,6 +1405,26 @@ class RequiredColumn(BaseModel):
     type: str
     """
     Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type string here that the normalizer does not recognise is reported in `ContractResult::warnings` and not compared — it is yours to correct, and presence and nullability still apply. An unrecognised *landed* type is different: it refuses the load (#1721).
+    """
+
+
+class ResidencyConfig(BaseModel):
+    """
+    `[residency]` — data-residency settings.
+
+    A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`. Labels compare as exact text.
+
+    ```toml [residency] enforce = true ```
+
+    With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`. It does not compare regions with each other.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    enforce: bool | None = False
+    """
+    Require a `region` label on every source, target and `[ai]`.
     """
 
 
@@ -1720,6 +1748,10 @@ class SnapshotSourceConfig(BaseModel):
     Name of the adapter to use (references a key in `[adapter.*]`).
     """
     catalog: str
+    region: str | None = None
+    """
+    Region label where the source data lives. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     table: str
 
@@ -2425,6 +2457,10 @@ class PipelineSourceConfig(BaseModel):
     discovery: DiscoveryConfig | None = None
     """
     Optional discovery configuration.
+    """
+    region: str | None = None
+    """
+    Region label where the source data lives. See [`ResidencyConfig`].
     """
     schema_pattern: SchemaPatternConfig
     """
@@ -3289,6 +3325,10 @@ class LoadTargetConfig(BaseModel):
     """
     Governance settings for the target.
     """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     """
     Target schema name.
@@ -3329,6 +3369,10 @@ class PipelineTargetConfig(BaseModel):
     )
     """
     Governance settings for the target.
+    """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
     """
     schema_template: str
     """
@@ -3549,6 +3593,10 @@ class SnapshotTargetConfig(BaseModel):
         },
         validate_default=True,
     )
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     table: str
 
@@ -3692,6 +3740,10 @@ class TransformationTargetConfig(BaseModel):
     )
     """
     Governance settings for the target.
+    """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
     """
 
 
@@ -4119,6 +4171,10 @@ class RockyConfig(BaseModel):
     )
     """
     Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
+    """
+    residency: ResidencyConfig | None = None
+    """
+    `[residency]` — require region labels. Absent ⇒ no requirement, and the key is not serialized, so a project without the block keeps its config snapshot byte-identical. See [`ResidencyConfig`].
     """
     resilience: ResilienceConfig | None = Field(
         {

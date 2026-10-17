@@ -1029,12 +1029,14 @@ mod tests {
             updated_at: "modified_at".into(),
             invalidate_hard_deletes: true,
             source: SnapshotSourceConfig {
+                region: None,
                 adapter: "default".into(),
                 catalog: "src_cat".into(),
                 schema: "src_sch".into(),
                 table: "orders".into(),
             },
             target: SnapshotTargetConfig {
+                region: None,
                 adapter: "default".into(),
                 catalog: "tgt_cat".into(),
                 schema: "tgt_sch".into(),

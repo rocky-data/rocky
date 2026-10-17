@@ -10348,6 +10348,100 @@ auto_create_schemas = true
         );
     }
 
+    /// A project that sets no `region` and no `[residency]` must hash exactly
+    /// as it did before those keys existed. The routing identity is stored in
+    /// plan files, so a moved digest would refuse every plan made before the
+    /// upgrade. The golden below was captured on the commit before the
+    /// residency keys were added. It covers every pipeline type that has a
+    /// source or target block, plus `[ai]`.
+    ///
+    /// Mutation that must turn this red: drop `skip_serializing_if` from any
+    /// new `region` field (it then serializes as `"region": null`).
+    #[test]
+    fn config_identity_unchanged_for_a_project_without_residency_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rocky.toml");
+        std::fs::write(
+            &p,
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[ai]
+max_tokens = 2048
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[pipeline.xf]
+type = "transformation"
+models = "models/**"
+
+[pipeline.xf.target]
+adapter = "default"
+
+[pipeline.qa]
+type = "quality"
+
+[pipeline.qa.target]
+adapter = "default"
+
+[pipeline.qa.checks]
+row_count = true
+
+[pipeline.snap]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.snap.source]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.snap.target]
+catalog = "c"
+schema = "s"
+table = "t_hist"
+
+[pipeline.ld]
+type = "load"
+source_dir = "data"
+
+[pipeline.ld.target]
+catalog = "c"
+schema = "s"
+"#,
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&p).unwrap();
+
+        let snapshot =
+            rocky_core::env_string::with_env_values_scope(|| serde_json::to_string(&cfg)).unwrap();
+        for key in ["\"region\"", "\"residency\""] {
+            assert!(
+                !snapshot.contains(key),
+                "a project without residency keys must not serialize {key}: {snapshot}"
+            );
+        }
+
+        assert_eq!(
+            super::config_policy_identity(&cfg),
+            "2686e2d3fa1b19d3199e25137e2460808e650de8a251a133a616e2e96f4b9f7b",
+            "the routing identity of a project without residency keys moved"
+        );
+    }
+
     /// #1919: an env swap in `extra` (a Postgres `port`, a `keyfile`) still
     /// changes the routing identity, and the identity holds no plaintext.
     #[test]

@@ -686,6 +686,7 @@ mod tests {
     /// exact shape the fail-open regression guards.
     fn cfg_opt_in_no_policy() -> RockyConfig {
         RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: Default::default(),

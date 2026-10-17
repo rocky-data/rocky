@@ -448,6 +448,16 @@ pub enum ConfigError {
     )]
     StateFreezeMarkerWritesUnsupportedBackend { backend: EnvString },
 
+    /// `[residency] enforce = true`, and a source, target or `[ai]` block
+    /// has no `region` (or an empty one). `field` is the dotted key path,
+    /// e.g. `pipeline.bronze.target.region`.
+    #[error(
+        "V060: [residency] enforce = true requires a region label, but `{field}` is not set. \
+         Set it to the region where that data lives (e.g. \"eu-west-1\"), \
+         or set `[residency] enforce = false`."
+    )]
+    ResidencyRegionMissing { field: String },
+
     /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
     /// infinite. Detection compares a deviation against the threshold, and
     /// every comparison with NaN is false, so a NaN threshold flagged nothing
@@ -3128,6 +3138,12 @@ pub struct RockyConfig {
     /// see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
     #[serde(default)]
     pub resilience: ResilienceConfig,
+
+    /// `[residency]` — require region labels. Absent ⇒ no requirement, and
+    /// the key is not serialized, so a project without the block keeps its
+    /// config snapshot byte-identical. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residency: Option<ResidencyConfig>,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.
@@ -4202,6 +4218,41 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// Validates `[residency] enforce = true`: every pipeline source block,
+/// every pipeline target block and `[ai]` must carry a non-empty `region`.
+/// Returns one [`ConfigError::ResidencyRegionMissing`] per missing label.
+///
+/// Absent `[residency]` or `enforce = false` ⇒ no requirement. A load
+/// pipeline has no source block (it reads `source_dir`), so only its target
+/// is checked.
+pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
+    if !enforce {
+        return errors;
+    }
+    let mut require = |region: &Option<String>, field: String| {
+        if region.as_deref().is_none_or(|r| r.trim().is_empty()) {
+            errors.push(ConfigError::ResidencyRegionMissing { field });
+        }
+    };
+    for (name, pipeline) in &config.pipelines {
+        let (source, target) = match pipeline {
+            PipelineConfig::Replication(r) => (Some(&r.source.region), &r.target.region),
+            PipelineConfig::Snapshot(s) => (Some(&s.source.region), &s.target.region),
+            PipelineConfig::Transformation(t) => (None, &t.target.region),
+            PipelineConfig::Quality(q) => (None, &q.target.region),
+            PipelineConfig::Load(l) => (None, &l.target.region),
+        };
+        if let Some(source) = source {
+            require(source, format!("pipeline.{name}.source.region"));
+        }
+        require(target, format!("pipeline.{name}.target.region"));
+    }
+    require(&config.ai.region, "ai.region".to_string());
+    errors
+}
+
 /// Validate the `[state] freeze_marker_writes` flag against the backend.
 ///
 /// Enabling marker writes on a backend with no durable object tier (`local`,
@@ -4819,6 +4870,9 @@ pub struct AiSection {
     /// environment variable is the fallback when this key is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Region label of the AI endpoint. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 impl Default for AiSection {
@@ -4826,8 +4880,30 @@ impl Default for AiSection {
         Self {
             max_tokens: DEFAULT_AI_MAX_TOKENS,
             base_url: None,
+            region: None,
         }
     }
+}
+
+/// `[residency]` — data-residency settings.
+///
+/// A region is a free-text label (`"eu-west-1"`, `"eu"`) set on pipeline
+/// sources, pipeline targets and `[ai]`. Labels compare as exact text.
+///
+/// ```toml
+/// [residency]
+/// enforce = true
+/// ```
+///
+/// With `enforce = true`, [`validate_residency`] requires a non-empty
+/// `region` on every pipeline source block, every pipeline target block and
+/// `[ai]`. It does not compare regions with each other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResidencyConfig {
+    /// Require a `region` label on every source, target and `[ai]`.
+    #[serde(default)]
+    pub enforce: bool,
 }
 
 /// Default value for [`AiSection::max_tokens`]. Mirrors
@@ -6895,6 +6971,11 @@ pub struct TransformationTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 // ---- Quality pipeline ----
@@ -6952,6 +7033,11 @@ pub struct QualityTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
     pub adapter: String,
+
+    /// Region label where the checked data lives. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// A reference to a specific catalog/schema/table for quality checks
@@ -7038,6 +7124,9 @@ pub struct SnapshotSourceConfig {
     pub catalog: String,
     pub schema: String,
     pub table: String,
+    /// Region label where the source data lives. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Target table for a snapshot pipeline (explicit single-table reference + governance).
@@ -7052,6 +7141,10 @@ pub struct SnapshotTargetConfig {
     pub table: String,
     #[serde(default)]
     pub governance: GovernanceConfig,
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 // ---- Load pipeline (file ingestion) ----
@@ -7165,6 +7258,11 @@ pub struct LoadTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Load-specific options parsed from TOML.
@@ -7253,6 +7351,10 @@ pub struct PipelineSourceConfig {
     /// Optional discovery configuration.
     #[serde(default)]
     pub discovery: Option<DiscoveryConfig>,
+
+    /// Region label where the source data lives. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Action when `rocky discover` detects a cross-source collision — the same
@@ -7325,6 +7427,11 @@ pub struct PipelineTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Collects every `kind`-field and pipeline-role issue in a parsed
@@ -8177,6 +8284,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_freeze_marker_writes,
     validate_checks,
     validate_metadata_columns,
+    validate_residency,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -17093,5 +17201,196 @@ schema_template = "demo"
             "omitting [checks] must not zero the anomaly threshold, which \
              disables detection"
         );
+    }
+
+    /// Every pipeline type that has a source or target block, with no
+    /// `region` anywhere. `extra` is appended verbatim.
+    fn residency_project(extra: &str) -> String {
+        format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+
+[pipeline.xf]
+type = "transformation"
+
+[pipeline.xf.target]
+adapter = "default"
+
+[pipeline.qa]
+type = "quality"
+
+[pipeline.qa.target]
+adapter = "default"
+
+[pipeline.qa.checks]
+row_count = true
+
+[pipeline.snap]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.snap.source]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.snap.target]
+catalog = "c"
+schema = "s"
+table = "t_hist"
+
+[pipeline.ld]
+type = "load"
+source_dir = "data"
+
+[pipeline.ld.target]
+catalog = "c"
+schema = "s"
+{extra}"#
+        )
+    }
+
+    fn parse(raw: &str) -> RockyConfig {
+        parse_rocky_config_str(raw).expect("residency test config parses")
+    }
+
+    fn missing_region_fields(cfg: &RockyConfig) -> Vec<String> {
+        validate_residency(cfg)
+            .into_iter()
+            .map(|e| match e {
+                ConfigError::ResidencyRegionMissing { field } => field,
+                other => panic!("unexpected error {other:?}"),
+            })
+            .collect()
+    }
+
+    /// No `[residency]`, or `enforce = false`, requires nothing.
+    #[test]
+    fn residency_not_enforced_requires_no_region() {
+        assert!(missing_region_fields(&parse(&residency_project(""))).is_empty());
+        let off = parse(&residency_project("\n[residency]\nenforce = false\n"));
+        assert!(missing_region_fields(&off).is_empty());
+    }
+
+    /// `enforce = true` names every source block, every target block and
+    /// `[ai]` that lacks a region. An empty label counts as missing.
+    #[test]
+    fn residency_enforced_names_every_missing_region() {
+        let cfg = parse(&residency_project(
+            "\n[residency]\nenforce = true\n\n[ai]\nregion = \"  \"\n",
+        ));
+        let mut got = missing_region_fields(&cfg);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "ai.region",
+                "pipeline.ld.target.region",
+                "pipeline.qa.target.region",
+                "pipeline.repl.source.region",
+                "pipeline.repl.target.region",
+                "pipeline.snap.source.region",
+                "pipeline.snap.target.region",
+                "pipeline.xf.target.region",
+            ]
+        );
+    }
+
+    /// With every label set, `enforce = true` passes, the labels round-trip
+    /// through serde, and the load path accepts the file.
+    #[test]
+    fn residency_enforced_passes_when_every_region_is_set() {
+        let toml = residency_project(
+            r#"
+[residency]
+enforce = true
+
+[ai]
+region = "us"
+"#,
+        );
+        // Add a region line to each source/target table header.
+        let toml = toml
+            .replace(
+                "[pipeline.repl.target]\n",
+                "[pipeline.repl.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.xf.target]\n",
+                "[pipeline.xf.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.qa.target]\n",
+                "[pipeline.qa.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.snap.source]\n",
+                "[pipeline.snap.source]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.snap.target]\n",
+                "[pipeline.snap.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.ld.target]\n",
+                "[pipeline.ld.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.repl.source.schema_pattern]\n",
+                "[pipeline.repl.source]\nregion = \"eu-west-1\"\n\n[pipeline.repl.source.schema_pattern]\n",
+            );
+        let cfg = parse(&toml);
+        assert!(
+            missing_region_fields(&cfg).is_empty(),
+            "{:?}",
+            missing_region_fields(&cfg)
+        );
+        let PipelineConfig::Replication(repl) = &cfg.pipelines["repl"] else {
+            panic!("repl is a replication pipeline");
+        };
+        assert_eq!(repl.source.region.as_deref(), Some("eu-west-1"));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"region\":\"eu-west-1\""), "{json}");
+        assert!(json.contains("\"residency\":{\"enforce\":true}"), "{json}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, &toml).unwrap();
+        load_rocky_config(&path).expect("a fully labelled project loads");
+    }
+
+    /// The load path refuses a missing label with the V060 message, so
+    /// `plan` and `run` cannot proceed on an unlabelled project.
+    #[test]
+    fn residency_enforced_missing_region_refuses_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, residency_project("\n[residency]\nenforce = true\n")).unwrap();
+        let err = load_rocky_config(&path).expect_err("an unlabelled source must refuse");
+        assert!(
+            matches!(err, ConfigError::ResidencyRegionMissing { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("V060:"), "{err}");
+    }
+
+    /// `[residency]` rejects an unknown key rather than ignoring it.
+    #[test]
+    fn residency_rejects_an_unknown_key() {
+        let value: toml::Value =
+            toml::from_str("[residency]\nenforce = true\nallow = [\"eu->us\"]\n").unwrap();
+        assert!(value.try_into::<RockyConfig>().is_err());
     }
 }

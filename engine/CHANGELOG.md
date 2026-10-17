@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- A `region` label on pipeline sources and targets and on `[ai]`, and a new `[residency]` section with `enforce` (default `false`). A region is free text, such as `"eu-west-1"`. With `enforce = true`, every source block, every target block and `[ai]` must set `region`. A missing or empty label is a `V060` error in `rocky validate`, and every command that loads the config refuses it. `enforce` does not compare regions yet. Source blocks exist on replication and snapshot pipelines; every pipeline type has a target block.
+  - A project that sets none of these keys serializes as before, so its plan ids and config routing identity do not change.
 
 - `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 attempts when another writer wins. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.
   - The row is a plan-level `allow` with no rule, so the autonomy budget, the freeze reader and the review queue do not act on it. It names the approver's principal id (`--principal-id` / `ROCKY_PRINCIPAL_ID`, else `unnamed`) and class, the channel (`cli` for a terminal and for `rocky mcp`, `http_api` for `rocky serve`), the base ref and the breaking-change count. The approver's git email stays in the local marker only.

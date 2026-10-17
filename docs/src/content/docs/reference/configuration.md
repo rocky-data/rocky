@@ -336,6 +336,7 @@ Point the pipeline at the system it reads from.
 |-------|------|----------|-------------|
 | `adapter` | string | Yes | Name of the adapter that reads the source rows. Must match a `[adapter.NAME]` key, and that adapter must move data. A discovery-only adapter such as Fivetran goes in [`source.discovery`](#pipelinenamesourcediscovery) instead. |
 | `catalog` | string | No | Source catalog name (used by warehouse-resident sources like Databricks). |
+| `region` | string | No | The region where the source data lives, for example `"eu-west-1"` or `"eu"`. A free-text label. Required when [`[residency] enforce = true`](#residency). |
 
 Fivetran lands its tables in your warehouse. The warehouse adapter reads the rows, and the Fivetran adapter (`kind = "discovery"`) only lists what exists. Set it in `source.discovery`.
 
@@ -385,6 +386,7 @@ Say where the pipeline writes. The two templates build the catalog and schema na
 | `adapter` | string | Yes | Name of the warehouse adapter. Must match a `[adapter.NAME]` key. |
 | `catalog_template` | string | Yes | Template for the target catalog name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
 | `schema_template` | string | Yes | Template for the target schema name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
+| `region` | string | No | The region where the target warehouse stores the data. A free-text label. Required when [`[residency] enforce = true`](#residency). |
 
 A template without a placeholder (`warehouse`) is static. The two blocks work as one path. `schema_pattern` takes a source schema apart, and the target templates put a destination name back together from the pieces:
 
@@ -903,6 +905,7 @@ Cap what an AI generation can spend, and choose where requests go. The block app
 |-------|------|---------|-------------|
 | `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
 | `base_url` | string | `https://api.anthropic.com` | Base URL of the Anthropic-compatible API. Rocky sends requests to `{base_url}/v1/messages`. A trailing slash is ignored. The URL must use `https`. Plain `http` works only for loopback hosts (`localhost`, `127.0.0.1`, `::1`), so a local model server works. Rocky refuses any other `http` URL. If the key is unset, Rocky reads the `ROCKY_AI_BASE_URL` environment variable. |
+| `region` | string | None | The region of the AI endpoint, for example `"us"`. A free-text label. Required when [`[residency] enforce = true`](#residency). |
 
 Every `rocky ai*` command reads this block. Rocky never reads the API key from `rocky.toml`. It comes from the `ANTHROPIC_API_KEY` environment variable instead, so the key never lands on disk in a project file.
 
@@ -1336,6 +1339,47 @@ scope = { classifications = ["pii"] }
 ```
 
 Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `rocky policy test` in CI. A later policy edit then cannot open a hole unnoticed. See [Testing policies](/guides/testing-policies/) for the scenario fields, and [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) for where the gates sit.
+
+---
+
+## `[residency]`
+
+Make every pipeline and the AI endpoint say which region it is in. A region is a free-text label, such as `"eu-west-1"` or `"eu"`. Rocky compares labels as exact text, so pick one spelling and keep it.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enforce` | bool | `false` | Require a `region` label on every source, target and the `[ai]` block. |
+
+```toml
+[residency]
+enforce = true
+
+[ai]
+region = "us"
+
+[pipeline.bronze.source]
+region = "eu-west-1"
+
+[pipeline.bronze.target]
+region = "eu-west-1"
+```
+
+With `enforce = true`, Rocky requires `region` on each of these blocks:
+
+| Pipeline type | Blocks that need `region` |
+|---------------|---------------------------|
+| `replication` | `source`, `target` |
+| `snapshot` | `source`, `target` |
+| `transformation` | `target` |
+| `quality` | `target` |
+| `load` | `target` |
+| (any) | `[ai]` |
+
+Rocky requires `[ai] region` even when the project does not use `rocky ai`. An empty string counts as missing. A missing label is a `V060` error in `rocky validate`. Every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message.
+
+`enforce` only requires the labels. It does not compare one region with another, so a plan that moves data from one region to another still runs.
+
+A load pipeline reads `source_dir`, which has no `region`. The `regions...` component in a `schema_pattern` is a different thing: it names part of a source schema, not where the data lives.
 
 ---
 
