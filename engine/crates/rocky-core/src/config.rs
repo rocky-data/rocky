@@ -486,6 +486,34 @@ pub enum ConfigError {
         to: String,
     },
 
+    /// An AI request would carry data from region `from` to an AI endpoint
+    /// whose `[ai] region` is `to`, and `[residency] allow` has no
+    /// `{ from, to }` entry. Raised at call time, before any request is sent,
+    /// by [`check_ai_residency`]; `rocky validate` reports the same pairs as
+    /// warnings. `data` names what the request carries, e.g. "model `orders`".
+    #[error(
+        "V062: the AI request carries {data}, which is in region {from:?}, and the AI \
+         endpoint is in region {to:?} (`ai.region`). Rocky refuses to send data from one \
+         region to an AI endpoint in another. If this is deliberate, add \
+         `{{ from = {from:?}, to = {to:?} }}` to `[residency] allow`."
+    )]
+    ResidencyAiCrossRegion {
+        data: String,
+        from: String,
+        to: String,
+    },
+
+    /// `[residency] enforce = true`, and an AI request would carry data that
+    /// has no region label, so Rocky cannot show that the data may go to the
+    /// AI endpoint. Raised at call time by [`check_ai_residency`].
+    #[error(
+        "V062: [residency] enforce = true, and the AI request carries {data}, which has no \
+         known region. Rocky refuses to send data of unknown region to the AI endpoint. \
+         A model takes the `region` of the target of each pipeline that loads it; a table \
+         that is not a Rocky model has no region."
+    )]
+    ResidencyAiRegionUnknown { data: String },
+
     /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
     /// infinite. Detection compares a deviation against the threshold, and
     /// every comparison with NaN is false, so a NaN threshold flagged nothing
@@ -4261,17 +4289,13 @@ fn is_well_formed_region(label: &str) -> bool {
 fn region_slots(config: &RockyConfig) -> Vec<(String, Option<&str>)> {
     let mut slots = Vec::new();
     for (name, pipeline) in &config.pipelines {
-        let (source, target) = match pipeline {
-            PipelineConfig::Replication(r) => (Some(&r.source.region), &r.target.region),
-            PipelineConfig::Snapshot(s) => (Some(&s.source.region), &s.target.region),
-            PipelineConfig::Transformation(t) => (None, &t.target.region),
-            PipelineConfig::Quality(q) => (None, &q.target.region),
-            PipelineConfig::Load(l) => (None, &l.target.region),
-        };
-        if let Some(source) = source {
-            slots.push((format!("pipeline.{name}.source.region"), source.as_deref()));
+        if let Some(source) = pipeline.source_region() {
+            slots.push((format!("pipeline.{name}.source.region"), source));
         }
-        slots.push((format!("pipeline.{name}.target.region"), target.as_deref()));
+        slots.push((
+            format!("pipeline.{name}.target.region"),
+            pipeline.target_region(),
+        ));
     }
     slots.push(("ai.region".to_string(), config.ai.region.as_deref()));
     slots
@@ -4346,6 +4370,111 @@ pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// One item an AI request carries from the warehouse, and its region.
+///
+/// Built by the AI callers and judged by [`check_ai_residency`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiDataRegion {
+    /// What the item is, for the refusal message, e.g. "model `orders`".
+    pub data: String,
+    /// Its region label. `None` when Rocky knows no region for it.
+    pub region: Option<String>,
+}
+
+/// May an AI request that carries `data` go to the `[ai]` endpoint?
+///
+/// The same rule as V061, with the AI endpoint as the target:
+///
+/// ```text
+///   data region   ai.region   enforce   result
+///   "eu"          "eu"        any       ok
+///   "eu"          "us"        any       V062 unless allow { from = "eu", to = "us" }
+///   none          any         true      V062 (unknown region)
+///   any           none        true      V060 (ai.region missing)
+///   none or any   none / any  false     ok when either side has no label
+/// ```
+///
+/// `config` is `None` for a project with no `rocky.toml`: nothing carries a
+/// label, so nothing is refused. Returns the first refusal, in `data` order.
+/// Call it before any request is sent.
+pub fn check_ai_residency(
+    config: Option<&RockyConfig>,
+    data: &[AiDataRegion],
+) -> Result<(), ConfigError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
+    let allow = config
+        .residency
+        .as_ref()
+        .map_or(&[][..], |r| r.allow.as_slice());
+    let ai_region = config.ai.region.as_deref().filter(|r| !r.trim().is_empty());
+    for item in data {
+        let region = item.region.as_deref().filter(|r| !r.trim().is_empty());
+        match (region, ai_region) {
+            (Some(from), Some(to)) => {
+                let allowed = from == to || allow.iter().any(|a| a.from == from && a.to == to);
+                if !allowed {
+                    return Err(ConfigError::ResidencyAiCrossRegion {
+                        data: item.data.clone(),
+                        from: from.to_string(),
+                        to: to.to_string(),
+                    });
+                }
+            }
+            (None, _) if enforce => {
+                return Err(ConfigError::ResidencyAiRegionUnknown {
+                    data: item.data.clone(),
+                });
+            }
+            (_, None) if enforce => {
+                return Err(ConfigError::ResidencyRegionMissing {
+                    field: "ai.region".to_string(),
+                });
+            }
+            (None, _) | (_, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every pipeline region label that an AI request could not carry to the
+/// `[ai]` endpoint: the label differs from `[ai] region` and `[residency]
+/// allow` lists no such direction. One [`ConfigError::ResidencyAiCrossRegion`]
+/// per pipeline source or target block.
+///
+/// `rocky validate` reports these as warnings: it is certain that an AI
+/// request over that data would be refused, but not that the project ever
+/// makes one, so it is not a load error.
+pub fn ai_cross_region_labels(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut out = Vec::new();
+    for (name, pipeline) in &config.pipelines {
+        let mut slots = Vec::new();
+        if let Some(source) = pipeline.source_region() {
+            slots.push(("source", source));
+        }
+        slots.push(("target", pipeline.target_region()));
+        for (end, region) in slots {
+            let Some(region) = region.filter(|r| is_well_formed_region(r)) else {
+                continue;
+            };
+            let item = AiDataRegion {
+                data: format!("data of `pipeline.{name}.{end}`"),
+                region: Some(region.to_string()),
+            };
+            // Only the cross-region case: an unknown region under `enforce`
+            // is already a V060 load error.
+            if let Err(e @ ConfigError::ResidencyAiCrossRegion { .. }) =
+                check_ai_residency(Some(config), std::slice::from_ref(&item))
+            {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
 /// Every pipeline whose source and target both carry a well-formed region
 /// label, and the labels differ: `(pipeline, source region, target region)`.
 ///
@@ -4360,15 +4489,12 @@ fn cross_region_edges(config: &RockyConfig) -> Vec<(&String, &str, &str)> {
         .pipelines
         .iter()
         .filter_map(|(name, pipeline)| {
-            let (source, target) = match pipeline {
-                PipelineConfig::Replication(r) => (&r.source.region, &r.target.region),
-                PipelineConfig::Snapshot(s) => (&s.source.region, &s.target.region),
-                PipelineConfig::Transformation(_)
-                | PipelineConfig::Quality(_)
-                | PipelineConfig::Load(_) => return None,
-            };
-            let from = source.as_deref().filter(|r| is_well_formed_region(r))?;
-            let to = target.as_deref().filter(|r| is_well_formed_region(r))?;
+            let from = pipeline
+                .source_region()?
+                .filter(|r| is_well_formed_region(r))?;
+            let to = pipeline
+                .target_region()
+                .filter(|r| is_well_formed_region(r))?;
             (from != to).then_some((name, from, to))
         })
         .collect()
@@ -6374,6 +6500,28 @@ impl PipelineConfig {
             Self::Replication(_) => ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
             Self::Quality(_) => &[RowCount, Custom, Assertions],
             Self::Transformation(_) | Self::Snapshot(_) | Self::Load(_) => &[],
+        }
+    }
+
+    /// The target block's `region` label, regardless of variant.
+    pub fn target_region(&self) -> Option<&str> {
+        match self {
+            Self::Replication(r) => r.target.region.as_deref(),
+            Self::Transformation(t) => t.target.region.as_deref(),
+            Self::Quality(q) => q.target.region.as_deref(),
+            Self::Snapshot(s) => s.target.region.as_deref(),
+            Self::Load(l) => l.target.region.as_deref(),
+        }
+    }
+
+    /// The source block's `region` label. The outer `None` means the
+    /// pipeline type has no source block (transformation, quality, load);
+    /// `Some(None)` means it has one with no label.
+    pub fn source_region(&self) -> Option<Option<&str>> {
+        match self {
+            Self::Replication(r) => Some(r.source.region.as_deref()),
+            Self::Snapshot(s) => Some(s.source.region.as_deref()),
+            Self::Transformation(_) | Self::Quality(_) | Self::Load(_) => None,
         }
     }
 
@@ -17770,5 +17918,93 @@ region = "{target_region}"
         ));
         let json = serde_json::to_string(&cfg.residency).unwrap();
         assert_eq!(json, r#"{"enforce":false}"#);
+    }
+
+    fn ai_item(region: Option<&str>) -> AiDataRegion {
+        AiDataRegion {
+            data: "the schema of model `m`".to_string(),
+            region: region.map(str::to_string),
+        }
+    }
+
+    /// V062, case by case: the table in [`check_ai_residency`]'s doc.
+    #[test]
+    fn check_ai_residency_follows_the_v061_rule() {
+        let eu_us = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n",
+        ));
+        let err = check_ai_residency(Some(&eu_us), &[ai_item(Some("eu"))])
+            .expect_err("eu data to a us endpoint");
+        assert!(
+            matches!(&err, ConfigError::ResidencyAiCrossRegion { from, to, .. } if from == "eu" && to == "us"),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("V062"), "{err}");
+        assert!(check_ai_residency(Some(&eu_us), &[ai_item(Some("us"))]).is_ok());
+        assert!(check_ai_residency(Some(&eu_us), &[ai_item(None)]).is_ok());
+        assert!(check_ai_residency(None, &[ai_item(Some("eu"))]).is_ok());
+
+        let allowed = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        ));
+        assert!(check_ai_residency(Some(&allowed), &[ai_item(Some("eu"))]).is_ok());
+
+        let enforced = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"eu\"\n\n[residency]\nenforce = true\n",
+        ));
+        assert!(check_ai_residency(Some(&enforced), &[ai_item(Some("eu"))]).is_ok());
+        assert!(matches!(
+            check_ai_residency(Some(&enforced), &[ai_item(None)]),
+            Err(ConfigError::ResidencyAiRegionUnknown { .. })
+        ));
+
+        // `enforce` with no `[ai] region` (only reachable on a config that
+        // skipped the V060 load check) refuses as V060 at `ai.region`.
+        let no_ai = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[residency]\nenforce = true\n",
+        ));
+        assert!(matches!(
+            check_ai_residency(Some(&no_ai), &[ai_item(Some("eu"))]),
+            Err(ConfigError::ResidencyRegionMissing { field }) if field == "ai.region"
+        ));
+    }
+
+    /// The `rocky validate` V062 warnings: one per labelled pipeline block
+    /// in another region than `[ai]`, none when `allow` lists it.
+    #[test]
+    fn ai_cross_region_labels_names_each_block() {
+        let cfg = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n",
+        ));
+        let data: Vec<String> = ai_cross_region_labels(&cfg)
+            .into_iter()
+            .map(|e| match e {
+                ConfigError::ResidencyAiCrossRegion { data, .. } => data,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            data,
+            vec![
+                "data of `pipeline.bronze.source`",
+                "data of `pipeline.bronze.target`"
+            ]
+        );
+        let allowed = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        ));
+        assert!(ai_cross_region_labels(&allowed).is_empty());
     }
 }

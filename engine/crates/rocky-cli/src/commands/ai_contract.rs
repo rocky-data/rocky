@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use rocky_ai::client::{AiConfig, DEFAULT_MAX_TOKENS, LlmClient};
 use rocky_ai::contract::{ColumnProfile, TableProfile, contract_type_name, draft_contract};
+use rocky_ai::residency::AiResidency;
 use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::redacted::RedactedString;
@@ -38,15 +39,20 @@ const DOMAIN_FETCH_LIMIT: u64 = LOW_CARDINALITY_CAP;
 /// credentials have to resolve. This read only picks a token ceiling, so
 /// failing it on an unset `${VAR}` would refuse a command the strict leg would
 /// have accepted.
-fn make_client(config_path: &Path) -> Result<LlmClient> {
+///
+/// The prompt carries statistics (and, with `--with-data`, values) of the
+/// model's table in the target warehouse of the project's pipeline, so the
+/// client is built for that data: V062 refuses here, before the warehouse is
+/// profiled and before any request is sent, when it may not go to the `[ai]`
+/// endpoint's region.
+fn make_client(config_path: &Path, model_name: &str) -> Result<LlmClient> {
     // Config first, API key second — same reasoning as `commands::ai`.
-    let ai_section = rocky_core::config::load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?
-        .map(|cfg| cfg.ai);
-    let max_tokens = ai_section
-        .as_ref()
-        .map_or(DEFAULT_MAX_TOKENS, |ai| ai.max_tokens);
-    let base_url = rocky_ai::client::resolve_base_url(ai_section.and_then(|ai| ai.base_url));
+    let project = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let ai_section = project.as_ref().map(|cfg| &cfg.ai);
+    let max_tokens = ai_section.map_or(DEFAULT_MAX_TOKENS, |ai| ai.max_tokens);
+    let base_url =
+        rocky_ai::client::resolve_base_url(ai_section.and_then(|ai| ai.base_url.clone()));
 
     let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
         .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai-contract`.")?;
@@ -61,7 +67,38 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
         base_url,
     };
 
-    LlmClient::new(config).map_err(|e| anyhow::anyhow!("{e}"))
+    let data = profile_data_regions(project.as_ref(), model_name);
+    let residency = AiResidency::for_data(project.as_ref(), &data);
+    LlmClient::new(config, residency).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Where the profiled table of `model_name` lives: the target of the
+/// pipeline the profile runs on (`resolve_pipeline(cfg, None)`, as
+/// `resolve_target` picks it), and its source too for a replication or
+/// snapshot pipeline, whose target holds data copied from the source. When
+/// no single pipeline resolves, the region is unknown.
+pub fn profile_data_regions(
+    project: Option<&rocky_core::config::RockyConfig>,
+    model_name: &str,
+) -> Vec<rocky_core::config::AiDataRegion> {
+    let Some(cfg) = project else {
+        return Vec::new();
+    };
+    let data = format!("statistics of the table of model `{model_name}`");
+    let Ok((_, pipeline)) = crate::registry::resolve_pipeline(cfg, None) else {
+        return vec![rocky_core::config::AiDataRegion { data, region: None }];
+    };
+    let mut regions = vec![pipeline.target_region()];
+    if let Some(source) = pipeline.source_region() {
+        regions.push(source);
+    }
+    regions
+        .into_iter()
+        .map(|region| rocky_core::config::AiDataRegion {
+            data: data.clone(),
+            region: region.map(str::to_string),
+        })
+        .collect()
 }
 
 /// Compile the project to obtain typed model schemas. Source schemas come from
@@ -422,7 +459,7 @@ pub async fn run_ai_contract(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client(config_path)?;
+    let client = make_client(config_path, model_name)?;
     let compile_result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     // The model's inferred output schema — the basis for compile-verification.
@@ -584,6 +621,44 @@ pub async fn run_ai_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `rocky ai-contract` / MCP `ai_contract` profile: its statistics
+    /// are in the region of the project's pipeline, source and target, and
+    /// V062 judges both against `[ai] region`.
+    #[test]
+    fn profile_data_regions_cover_the_pipeline_source_and_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let load = |extra: &str| {
+            let path = tmp.path().join("rocky.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                     [pipeline.p.source]\nregion = \"eu\"\n\n\
+                     [pipeline.p.source.schema_pattern]\nprefix = \"src__\"\n\
+                     separator = \"__\"\ncomponents = [\"source\"]\n\n\
+                     [pipeline.p.target]\ncatalog_template = \"wh\"\n\
+                     schema_template = \"raw__{{source}}\"\nregion = \"eu\"\n{extra}"
+                ),
+            )
+            .unwrap();
+            rocky_core::config::load_optional_project_config(Some(&path))
+                .expect("loads")
+                .expect("present")
+        };
+
+        let cfg = load("\n[ai]\nregion = \"us\"\n");
+        let data = profile_data_regions(Some(&cfg), "orders");
+        assert_eq!(data.len(), 2, "{data:?}");
+        assert!(data.iter().all(|d| d.region.as_deref() == Some("eu")));
+        let err = rocky_core::config::check_ai_residency(Some(&cfg), &data)
+            .expect_err("EU statistics to a US endpoint");
+        assert!(err.to_string().starts_with("V062"), "{err}");
+
+        let same = load("\n[ai]\nregion = \"eu\"\n");
+        let data = profile_data_regions(Some(&same), "orders");
+        assert!(rocky_core::config::check_ai_residency(Some(&same), &data).is_ok());
+    }
 
     #[test]
     fn as_u64_handles_number_and_string() {
@@ -1014,7 +1089,7 @@ type = "full_refresh"
         let cfg = tmp.path().join("rocky.toml");
         std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
 
-        let Err(err) = make_client(&cfg) else {
+        let Err(err) = make_client(&cfg, "m") else {
             panic!("a present but unloadable rocky.toml must refuse the ai-contract client");
         };
         let rendered = format!("{err:#}");
@@ -1039,7 +1114,7 @@ type = "full_refresh"
             rocky_core::config::load_rocky_config(&cfg).is_err(),
             "fixture must fail the STRICT loader, or this proves nothing"
         );
-        match make_client(&cfg) {
+        match make_client(&cfg, "m") {
             Ok(_) => {}
             Err(e) => {
                 let rendered = format!("{e:#}");

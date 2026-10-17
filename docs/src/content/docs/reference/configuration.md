@@ -1344,7 +1344,7 @@ Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `roc
 
 ## `[residency]`
 
-Say which region each pipeline and the AI endpoint is in, and stop a plan that moves data from one region to another.
+Say which region each pipeline and the AI endpoint is in, and stop a plan or an AI request that moves data from one region to another.
 
 A region is a label, such as `"eu-west-1"` or `"eu"`. It uses only lowercase letters, digits and hyphens, and starts with a letter or digit. Rocky compares labels as exact text, so `"eu"` and `"eu-west-1"` are two different regions. Pick one spelling and keep it. Rocky does not correct a label: `"EU"` or `" eu"` is a `V060` error, whether or not `enforce` is on.
 
@@ -1389,7 +1389,42 @@ Rocky checks only a pipeline's own source and target. These carry no region, so 
 
 So a transformation in `"us"` that reads a table another pipeline wrote in `"eu"` is not refused.
 
-`[ai] region` is not compared with anything yet. An AI endpoint in `"us"` over a project whose data is in `"eu"` is not refused.
+### AI requests (`V062`)
+
+Rocky compares `[ai] region` with the region of the data that an AI request carries. The rule is the same as for `V061`, with the AI endpoint as the target:
+
+```text
+data in region "eu"   ──▶   [ai] region = "us"
+                      V062 unless allow has { from = "eu", to = "us" }
+```
+
+- Data and endpoint in the same region: the request goes.
+- Different regions: Rocky refuses the request with a `V062` error, unless `allow` has an entry from the data's region to the `[ai]` region. The check runs whether or not `enforce` is on.
+- No label on the data or on `[ai]`, and `enforce` is off: the request goes.
+
+Rocky makes the check when it builds the AI client. That is before it profiles the warehouse and before it sends any request, so a refused request sends nothing.
+
+Data here means the schema (column names and types), the statistics or the values of a table. The SQL, `.rocky` source or `rocky.toml` text you wrote is not data. Each AI feature carries this data:
+
+| Feature | What the request carries | Region of that data |
+|---------|--------------------------|---------------------|
+| `rocky ai-contract`, MCP `ai_contract` | Statistics of the model's table (row, null and distinct counts; with `--with-data`, also min, max and sample values) | The `target` of the project's pipeline, and its `source` for a replication or snapshot pipeline |
+| `rocky ai-explain`, `rocky ai-sync`, MCP `explain_model`, the editor's contract fix | The model's schema and the schemas of its direct upstreams | The model's region; see below |
+| `rocky ai-test`, MCP `ai_test` | The model's schema | The model's region |
+| `rocky ai "<intent>"` | The schema of every compiled model and source table | The model's region; see below |
+| MCP `suggest_freshness_block`, the editor's freshness and classification fixes | The model's column names | The model's region |
+| The editor's `.rocky` syntax fix | The `.rocky` source and the parse error only | No data, so no check |
+
+A model is in the region of the `target` of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads can run on any pipeline, so it is in the `target` region of every pipeline.
+
+A table that is not a Rocky model, such as a source table from the schema cache, has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+
+- `rocky ai "<intent>"` is refused when the source schema cache holds any table.
+- `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads a source table directly.
+
+`rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. It is a warning, not an error: an AI request over that data is certain to be refused, but the project may never make one, and `rocky run` never does.
+
+`ROCKY_AI_BASE_URL` changes where AI requests go, but not `[ai] region`. Keep the label in step with the endpoint you use.
 
 ### Required labels (`V060`)
 

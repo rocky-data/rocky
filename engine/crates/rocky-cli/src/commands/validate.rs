@@ -74,6 +74,15 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         out.push(config_error_diagnostic(&err, config_path));
     }
 
+    // V062: a pipeline region label that an AI request could not carry to
+    // the `[ai]` endpoint. A warning, not an error: the refusal is certain
+    // for any AI request over that data (the comparison needs only config),
+    // but the project may never make one, and `rocky run` never does. The
+    // refusal itself happens when the AI client is built, before any request.
+    for err in rocky_core::config::ai_cross_region_labels(&cfg) {
+        out.push(ai_residency_warning(&err, config_path));
+    }
+
     // V002: a document with no `[adapter*]` and no `[pipeline.*]` at all has
     // nothing for `rocky run`/`plan`/`discover` to act on — every one of
     // them would exit having done nothing, silently. V010/V020 below already
@@ -575,6 +584,21 @@ fn config_error_diagnostic(
         message: err.to_string(),
         file: Some(config_path.display().to_string()),
         field,
+    }
+}
+
+/// A V062 warning for one pipeline region that an AI request could not
+/// carry to the `[ai]` endpoint, pointing at `ai.region`.
+fn ai_residency_warning(
+    err: &rocky_core::config::ConfigError,
+    config_path: &Path,
+) -> ValidateMessage {
+    ValidateMessage {
+        severity: "warn".into(),
+        code: "V062".into(),
+        message: err.to_string(),
+        file: Some(config_path.display().to_string()),
+        field: Some("ai.region".into()),
     }
 }
 
@@ -3634,6 +3658,58 @@ region = "us"
             "{:?}",
             out.messages
         );
+    }
+
+    /// A labelled pipeline target in another region than `[ai]` is a V062
+    /// warning at `ai.region`; the config stays valid. `[residency] allow`
+    /// for that direction clears it, and so does a matching region.
+    #[test]
+    fn ai_cross_region_label_is_v062_warning() {
+        let toml = |target: &str, extra: &str| {
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.xf]
+type = "transformation"
+
+[pipeline.xf.target]
+adapter = "default"
+region = "{target}"
+
+[ai]
+region = "us"
+{extra}"#
+            )
+        };
+        let v062 = |out: &ValidateOutput| -> Vec<ValidateMessage> {
+            out.messages
+                .iter()
+                .filter(|m| m.code == "V062")
+                .cloned()
+                .collect()
+        };
+
+        let out = validate_toml(&toml("eu", ""));
+        assert!(out.valid, "{:?}", out.messages);
+        let warnings = v062(&out);
+        assert_eq!(warnings.len(), 1, "{:?}", out.messages);
+        assert_eq!(warnings[0].severity, "warn");
+        assert_eq!(warnings[0].field.as_deref(), Some("ai.region"));
+        assert!(
+            warnings[0].message.contains("pipeline.xf.target"),
+            "{}",
+            warnings[0].message
+        );
+
+        let allowed = toml(
+            "eu",
+            "\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        );
+        assert!(v062(&validate_toml(&allowed)).is_empty());
+        assert!(v062(&validate_toml(&toml("us", ""))).is_empty());
     }
 
     /// #1994: a manual adapter that lists schemas is valid, with no V057

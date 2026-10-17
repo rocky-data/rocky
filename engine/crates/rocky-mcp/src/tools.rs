@@ -3351,6 +3351,18 @@ impl RockyMcpServer {
         let base_url = self
             .ai_base_url()
             .map_err(|e| ToolError::ai_error(format!("{e:#}")))?;
+        // The prompt carries the model's temporal column names: V062 refuses
+        // the client, before any request, when they may not go to the AI
+        // endpoint's region.
+        let project = rocky_core::config::load_optional_project_config(Some(&self.config_path))
+            .map_err(|e| ToolError::ai_error(format!("{e:#}")))?;
+        let data = rocky_ai::residency::data_regions(
+            project.as_ref(),
+            &self.config_path,
+            &[args.model.as_str()],
+            &[],
+        );
+        let residency = rocky_ai::residency::AiResidency::for_data(project.as_ref(), &data);
         // Mirror the LSP's AiConfig: anthropic / sonnet / TOML / single attempt.
         let ai_config = rocky_ai::client::AiConfig {
             provider: "anthropic".to_string(),
@@ -3361,7 +3373,7 @@ impl RockyMcpServer {
             max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
             base_url,
         };
-        let client = rocky_ai::client::LlmClient::new(ai_config)
+        let client = rocky_ai::client::LlmClient::new(ai_config, residency)
             .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
         let response = client
             .generate(&system_prompt, &user_prompt, None)
@@ -3407,8 +3419,8 @@ impl RockyMcpServer {
     ) -> ToolResult<AiContractResult> {
         let model_name = params.0.model;
 
-        let client = match self.make_ai_client() {
-            Ok(Some(c)) => c,
+        let setup = match self.ai_setup() {
+            Ok(Some(s)) => s,
             Ok(None) => {
                 return Ok(Json(AiContractResult {
                     model: model_name,
@@ -3421,6 +3433,12 @@ impl RockyMcpServer {
             }
             Err(e) => return Err(ToolError::ai_error(format!("AI client init failed: {e}"))),
         };
+        // The prompt carries statistics of the model's table: V062 refuses
+        // here, before the warehouse is profiled and before any request.
+        let data = rocky_cli::commands::profile_data_regions(setup.project.as_ref(), &model_name);
+        let client = setup
+            .client(&data)
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
 
         // The model's inferred output schema — the basis for compile-verifying
         // the drafted contract.
@@ -3476,8 +3494,8 @@ impl RockyMcpServer {
     async fn ai_test(&self, params: Parameters<AiTestArgs>) -> ToolResult<AiTestResult> {
         let model_name = params.0.model;
 
-        let client = match self.make_ai_client() {
-            Ok(Some(c)) => c,
+        let setup = match self.ai_setup() {
+            Ok(Some(s)) => s,
             Ok(None) => {
                 return Ok(Json(AiTestResult {
                     model: model_name,
@@ -3492,6 +3510,11 @@ impl RockyMcpServer {
         };
 
         let (compiled, model) = self.compile_and_find_model(&model_name)?;
+        // The prompt carries the model's own schema.
+        let data = setup.model_data(&[model_name.as_str()], &[]);
+        let client = setup
+            .client(&data)
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
         let assertions = rocky_ai::testgen::generate_tests(&model, &compiled, &client)
             .await
             .map_err(|e| ToolError::ai_error(format!("test generation failed: {e}")))?;
@@ -3526,8 +3549,8 @@ impl RockyMcpServer {
     ) -> ToolResult<ExplainModelResult> {
         let model_name = params.0.model;
 
-        let client = match self.make_ai_client() {
-            Ok(Some(c)) => c,
+        let setup = match self.ai_setup() {
+            Ok(Some(s)) => s,
             Ok(None) => {
                 return Ok(Json(ExplainModelResult {
                     model: model_name,
@@ -3542,6 +3565,15 @@ impl RockyMcpServer {
         };
 
         let (compiled, model) = self.compile_and_find_model(&model_name)?;
+        // The prompt carries the model's schema and its upstream schemas.
+        let (mut models, tables) = rocky_ai::residency::upstream_schemas(&compiled, &model_name);
+        models.push(model_name.clone());
+        let models: Vec<&str> = models.iter().map(String::as_str).collect();
+        let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+        let data = setup.model_data(&models, &tables);
+        let client = setup
+            .client(&data)
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
         let intent = rocky_ai::explain::explain_model(&model, &compiled, &client)
             .await
             .map_err(|e| ToolError::ai_error(format!("explain failed: {e}")))?;
@@ -3560,8 +3592,8 @@ impl RockyMcpServer {
     /// `load_rocky_config(..).unwrap_or(DEFAULT)`, which discarded a configured
     /// ceiling whenever any `${VAR}` in the config was unset.
     ///
-    /// Split out of [`Self::make_ai_client`] so the refusal is unit-testable:
-    /// `make_ai_client` returns `Ok(None)` before this read when
+    /// Split out of [`Self::ai_setup`] so the refusal is unit-testable:
+    /// `ai_setup` returns `Ok(None)` before this read when
     /// `ANTHROPIC_API_KEY` is unset, and setting a process-wide environment
     /// variable inside a test is `unsafe` on edition 2024.
     fn ai_max_tokens(&self) -> anyhow::Result<u32> {
@@ -3586,8 +3618,10 @@ impl RockyMcpServer {
             .with_context(|| format!("failed to load config from {}", self.config_path.display()))
     }
 
-    /// Build an [`LlmClient`](rocky_ai::client::LlmClient) for the generator
-    /// tools, BYOK via `ANTHROPIC_API_KEY`. Returns `Ok(None)` when the key is
+    /// Read the AI settings for the generator tools, BYOK via
+    /// `ANTHROPIC_API_KEY`. Each tool then builds its client with
+    /// [`AiSetup::client`] for the data its prompt carries (V062). Returns
+    /// `Ok(None)` when the key is
     /// unset so each tool degrades to a null draft + explanatory message (the
     /// same graceful no-op as `suggest_freshness_block`).
     ///
@@ -3602,15 +3636,15 @@ impl RockyMcpServer {
     /// Credential-TOLERANT: the MCP generator tools call the Anthropic API, not
     /// the warehouse, so an unset `${VAR}` in an adapter's connection field
     /// must not block them (#1536).
-    fn make_ai_client(&self) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
-        self.make_ai_client_with_key(
+    fn ai_setup(&self) -> anyhow::Result<Option<AiSetup>> {
+        self.ai_setup_with_key(
             std::env::var(rocky_ai::client::AI_API_KEY_ENV)
                 .ok()
                 .filter(|v| !v.is_empty()),
         )
     }
 
-    /// [`Self::make_ai_client`] with the key supplied rather than read from the
+    /// [`Self::ai_setup`] with the key supplied rather than read from the
     /// environment.
     ///
     /// The seam exists so the refusal can be TESTED (#1702). The ordering below
@@ -3619,10 +3653,7 @@ impl RockyMcpServer {
     /// config read. `std::env::set_var` is `unsafe` on edition 2024 and racy
     /// across the test binary's threads, so injecting the key is the honest way
     /// to reach the second line.
-    fn make_ai_client_with_key(
-        &self,
-        api_key: Option<String>,
-    ) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
+    fn ai_setup_with_key(&self, api_key: Option<String>) -> anyhow::Result<Option<AiSetup>> {
         // The key check stays FIRST. A server with no key never builds a client
         // at all, so the token ceiling is moot there and refusing on the config
         // would be a new failure on a healthy keyless server.
@@ -3631,6 +3662,7 @@ impl RockyMcpServer {
         };
         let max_tokens = self.ai_max_tokens()?;
         let base_url = self.ai_base_url()?;
+        let project = rocky_core::config::load_optional_project_config(Some(&self.config_path))?;
         let ai_config = rocky_ai::client::AiConfig {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-6".to_string(),
@@ -3640,9 +3672,11 @@ impl RockyMcpServer {
             max_tokens,
             base_url,
         };
-        rocky_ai::client::LlmClient::new(ai_config)
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        Ok(Some(AiSetup {
+            project,
+            config_path: self.config_path.clone(),
+            ai: ai_config,
+        }))
     }
 
     /// Compile the project and resolve `model_name` to its loaded
@@ -6858,6 +6892,37 @@ impl ServerHandler for RockyMcpServer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The AI settings of one generator tool call, read before its compile.
+struct AiSetup {
+    project: Option<rocky_core::config::RockyConfig>,
+    config_path: std::path::PathBuf,
+    ai: rocky_ai::client::AiConfig,
+}
+
+impl AiSetup {
+    /// The data items of the schemas of `models` (project models) and
+    /// `tables` (other tables).
+    fn model_data(
+        &self,
+        models: &[&str],
+        tables: &[&str],
+    ) -> Vec<rocky_core::config::AiDataRegion> {
+        rocky_ai::residency::data_regions(self.project.as_ref(), &self.config_path, models, tables)
+    }
+
+    /// Build the client for requests that carry `data`. Refuses with V062,
+    /// before any request is sent, when that data may not go to the `[ai]`
+    /// endpoint's region.
+    fn client(
+        &self,
+        data: &[rocky_core::config::AiDataRegion],
+    ) -> anyhow::Result<rocky_ai::client::LlmClient> {
+        let residency = rocky_ai::residency::AiResidency::for_data(self.project.as_ref(), data);
+        rocky_ai::client::LlmClient::new(self.ai.clone(), residency)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
 
 /// A validated, runnable table reference plus the warehouse adapter to run it on.
 struct Prepared {
@@ -11313,24 +11378,23 @@ database = ":memory:"
     // ------------------------------------------------------------------
     // #1680 — the `[ai]` secondary read behind the generator tools
     // (`ai_contract`, `ai_test`, `explain_model`). Each calls
-    // `make_ai_client` BEFORE its compile, so this is the first config read
+    // `ai_setup` BEFORE its compile, so this is the first config read
     // those tools make.
     // ------------------------------------------------------------------
 
     /// The refusal reaches the path callers actually take (#1702).
     ///
     /// `ai_max_tokens_refuses_a_present_but_unloadable_config` below proves the
-    /// helper refuses. It does NOT prove `make_ai_client` propagates that — it
+    /// helper refuses. It does NOT prove `ai_setup` propagates that — it
     /// calls a different function, and the tools call this one. With no key in
     /// the environment the production entry point returns `Ok(None)` before it
     /// ever reads the config, so the whole class was covered one function away
     /// from where it fires.
     #[test]
-    fn make_ai_client_refuses_an_unloadable_config_once_a_key_is_present() {
+    fn ai_setup_refuses_an_unloadable_config_once_a_key_is_present() {
         let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
         // `LlmClient` is not `Debug`, so `expect_err` is unavailable here.
-        let Err(err) = server.make_ai_client_with_key(Some("sk-test-not-a-real-key".to_string()))
-        else {
+        let Err(err) = server.ai_setup_with_key(Some("sk-test-not-a-real-key".to_string())) else {
             panic!("a present-but-unloadable rocky.toml must refuse, not default")
         };
         let msg = format!("{err:#}");
@@ -11340,13 +11404,52 @@ database = ":memory:"
         );
     }
 
+    /// V062 on the MCP generator tools: with EU data and a US `[ai]`
+    /// endpoint, both the model-schema client (`ai_test`, `explain_model`)
+    /// and the statistics client (`ai_contract`) are refused when built,
+    /// before any profile query or request. A matching region builds both.
+    #[test]
+    fn ai_setup_client_refuses_eu_data_for_a_us_endpoint() {
+        let toml = |ai: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+                 [pipeline.xf]\ntype = \"transformation\"\n\n\
+                 [pipeline.xf.target]\nadapter = \"default\"\nregion = \"eu\"\n\n\
+                 [ai]\nregion = \"{ai}\"\n"
+            )
+        };
+        let (_tmp, server) = write_mcp_project(Some(&toml("us")));
+        let setup = server
+            .ai_setup_with_key(Some("sk-test-not-a-real-key".to_string()))
+            .expect("config loads")
+            .expect("a key gives a setup");
+        let Err(err) = setup.client(&setup.model_data(&["m"], &[])) else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        assert!(format!("{err:#}").starts_with("V062"), "{err:#}");
+        let stats = rocky_cli::commands::profile_data_regions(setup.project.as_ref(), "m");
+        let Err(err) = setup.client(&stats) else {
+            panic!("EU statistics to a US endpoint must be refused");
+        };
+        assert!(format!("{err:#}").contains("statistics"), "{err:#}");
+
+        let (_tmp, server) = write_mcp_project(Some(&toml("eu")));
+        let setup = server
+            .ai_setup_with_key(Some("sk-test-not-a-real-key".to_string()))
+            .expect("config loads")
+            .expect("a key gives a setup");
+        assert!(setup.client(&setup.model_data(&["m"], &[])).is_ok());
+        let stats = rocky_cli::commands::profile_data_regions(setup.project.as_ref(), "m");
+        assert!(setup.client(&stats).is_ok());
+    }
+
     /// And the ordering it depends on: no key means no client, whatever the
     /// config says. A keyless server is healthy, so a broken `rocky.toml` must
     /// not turn it into a failing one.
     #[test]
-    fn make_ai_client_without_a_key_is_none_even_on_an_unloadable_config() {
+    fn ai_setup_without_a_key_is_none_even_on_an_unloadable_config() {
         let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
-        let Ok(client) = server.make_ai_client_with_key(None) else {
+        let Ok(client) = server.ai_setup_with_key(None) else {
             panic!("a keyless server must not fail on the config it never reads")
         };
         assert!(client.is_none());

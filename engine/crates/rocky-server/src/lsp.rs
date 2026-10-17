@@ -436,6 +436,27 @@ impl RockyLsp {
         rocky_ai::client::resolve_project_base_url(toml_path.as_deref()).map_err(|e| e.to_string())
     }
 
+    /// The project config the AI code actions judge residency against
+    /// (V062), and its path. `(None, _)` when there is no `rocky.toml`.
+    /// Fails when `rocky.toml` exists but does not load.
+    async fn ai_project(
+        &self,
+    ) -> std::result::Result<
+        (
+            Option<rocky_core::config::RockyConfig>,
+            Option<std::path::PathBuf>,
+        ),
+        String,
+    > {
+        let models_dir = self.models_dir.read().await;
+        let toml_path = models_dir
+            .as_deref()
+            .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)));
+        let config = rocky_core::config::load_optional_project_config(toml_path.as_deref())
+            .map_err(|e| e.to_string())?;
+        Ok((config, toml_path))
+    }
+
     /// The project-level compiler inputs, read from `rocky.toml`.
     ///
     /// One derivation for both compile paths — the initial
@@ -2644,6 +2665,29 @@ impl LanguageServer for RockyLsp {
                 return Ok(action);
             }
         };
+        let (project, project_path) = match self.ai_project().await {
+            Ok(p) => p,
+            Err(message) => {
+                tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                action.data = Some(data);
+                return Ok(action);
+            }
+        };
+        // What each action's prompt carries from the warehouse: the schemas
+        // of `models` (project models) and `tables` (other tables). V062
+        // refuses the client, before any request, when that data may not go
+        // to the AI endpoint's region.
+        let residency_for = |models: &[&str], tables: &[&str]| {
+            let data = rocky_ai::residency::data_regions(
+                project.as_ref(),
+                project_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("rocky.toml")),
+                models,
+                tables,
+            );
+            rocky_ai::residency::AiResidency::for_data(project.as_ref(), &data)
+        };
 
         match kind.as_str() {
             AI_CONTRACT_FIX_KIND => {
@@ -2668,10 +2712,24 @@ impl LanguageServer for RockyLsp {
                     .as_ref()
                     .map(|r| r.type_check.typed_models.clone())
                     .unwrap_or_default();
+                // The prompt carries the model's upstream schemas: a project
+                // model has its pipeline's region, any other table none.
+                let (up_models, up_tables): (Vec<&str>, Vec<&str>) = resolved_data
+                    .upstream_models
+                    .iter()
+                    .map(String::as_str)
+                    .partition(|name| {
+                        lock.as_ref()
+                            .is_some_and(|r| r.project.model(name).is_some())
+                    });
                 drop(lock);
+                let mut models = up_models;
+                models.push(resolved_data.model_name.as_str());
+                let residency = residency_for(&models, &up_tables);
 
                 let outcome =
-                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url).await;
+                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url, residency)
+                        .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_CLASSIFICATION_FIX_KIND => {
@@ -2685,7 +2743,10 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_classification_action(&resolved_data, base_url).await;
+                // The prompt names a column of the model.
+                let residency = residency_for(&[resolved_data.model_name.as_str()], &[]);
+                let outcome =
+                    resolve_ai_classification_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
             }
             AI_DSL_FIX_KIND => {
@@ -2697,7 +2758,14 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_dsl_action(&resolved_data, base_url).await;
+                // The prompt carries the `.rocky` source and a parse
+                // diagnostic: text the user wrote, no warehouse data.
+                let outcome = resolve_ai_dsl_action(
+                    &resolved_data,
+                    base_url,
+                    rocky_ai::residency::AiResidency::no_warehouse_data(),
+                )
+                .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_FRESHNESS_FIX_KIND => {
@@ -2711,7 +2779,10 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_freshness_action(&resolved_data, base_url).await;
+                // The prompt carries the model's temporal column names.
+                let residency = residency_for(&[resolved_data.model_name.as_str()], &[]);
+                let outcome =
+                    resolve_ai_freshness_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
             }
             _ => {
@@ -3511,6 +3582,7 @@ async fn resolve_ai_contract_action(
     data: &AiContractActionData,
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3550,7 +3622,7 @@ async fn resolve_ai_contract_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -3754,6 +3826,7 @@ pub(crate) fn build_ai_classification_action(
 async fn resolve_ai_classification_action(
     data: &AiClassificationActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3781,7 +3854,7 @@ async fn resolve_ai_classification_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -3943,6 +4016,7 @@ pub(crate) fn build_ai_freshness_action(
 async fn resolve_ai_freshness_action(
     data: &AiFreshnessActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3969,7 +4043,7 @@ async fn resolve_ai_freshness_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -4060,6 +4134,7 @@ pub(crate) fn build_ai_dsl_action(
 async fn resolve_ai_dsl_action(
     data: &AiDslActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4083,7 +4158,7 @@ async fn resolve_ai_dsl_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -7595,7 +7670,13 @@ mod tests {
             upstream_models: vec!["upstream".into()],
         };
         let typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
-        let outcome = resolve_ai_contract_action(&data, &typed, None).await;
+        let outcome = resolve_ai_contract_action(
+            &data,
+            &typed,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await;
         match outcome {
             AiResolveOutcome::Disabled(reason) => {
                 assert!(
@@ -7702,7 +7783,13 @@ mod tests {
             rocky_toml_uri: tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap(),
             rocky_toml_text: "[adapter]\ntype = \"duckdb\"\n".into(),
         };
-        match resolve_ai_classification_action(&data, None).await {
+        match resolve_ai_classification_action(
+            &data,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await
+        {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"
@@ -7807,7 +7894,13 @@ mod tests {
             rocky_source: "from upstream\nselct { id }\n".into(),
             uri: tower_lsp::lsp_types::Url::parse("file:///tmp/m/broken.rocky").unwrap(),
         };
-        match resolve_ai_dsl_action(&data, None).await {
+        match resolve_ai_dsl_action(
+            &data,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await
+        {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"

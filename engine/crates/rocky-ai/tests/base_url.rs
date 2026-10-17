@@ -1,6 +1,7 @@
 //! `AiConfig::base_url` routing and validation.
 
 use rocky_ai::client::{AiConfig, AiError, DEFAULT_MAX_TOKENS, LlmClient, messages_url};
+use rocky_ai::residency::AiResidency;
 use rocky_core::redacted::RedactedString;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -33,7 +34,11 @@ async fn generate_posts_to_custom_base_url() {
         .await;
 
     // wiremock listens on http://127.0.0.1:<port>; a trailing slash is allowed.
-    let client = LlmClient::new(config("anthropic", Some(format!("{}/", server.uri())))).unwrap();
+    let client = LlmClient::new(
+        config("anthropic", Some(format!("{}/", server.uri()))),
+        AiResidency::no_warehouse_data(),
+    )
+    .unwrap();
     let resp = client.generate("sys", "user", None).await.unwrap();
     assert_eq!(resp.content, "hello");
     assert_eq!(resp.output_tokens, Some(5));
@@ -87,16 +92,21 @@ fn malformed_or_odd_scheme_is_refused() {
 
 #[test]
 fn client_new_rejects_bad_base_url() {
-    let err = LlmClient::new(config("anthropic", Some("http://example.com".into())))
-        .err()
-        .unwrap();
+    let err = LlmClient::new(
+        config("anthropic", Some("http://example.com".into())),
+        AiResidency::no_warehouse_data(),
+    )
+    .err()
+    .unwrap();
     assert!(matches!(err, AiError::InvalidBaseUrl { .. }));
 }
 
 #[test]
 fn unknown_provider_is_an_error_at_construction() {
-    let err = LlmClient::new(config("openai", None)).err().unwrap();
+    let err = LlmClient::new(config("openai", None), AiResidency::no_warehouse_data())
+        .err()
+        .unwrap();
     assert!(matches!(err, AiError::UnsupportedProvider { .. }));
     assert!(err.to_string().contains("openai"));
-    assert!(LlmClient::new(config("anthropic", None)).is_ok());
+    assert!(LlmClient::new(config("anthropic", None), AiResidency::no_warehouse_data()).is_ok());
 }

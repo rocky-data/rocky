@@ -191,3 +191,83 @@ fn pipeline_model_names(
         }
     }
 }
+
+/// The `region` labels of the data each model writes, resolved from the
+/// targets of the pipelines that load it, by the same rules as
+/// [`ModelTargets`]:
+///
+/// - A model that a transformation pipeline's `models` glob loads takes
+///   that pipeline's `target.region`. Several pipelines can load one model;
+///   it then has several regions.
+/// - A model no transformation pipeline loads can still run through
+///   `rocky run --models` on any pipeline, so it takes every pipeline's
+///   target region.
+/// - A pipeline whose model set cannot be read adds its region to every
+///   model (fail closed).
+///
+/// `None` in a list is a target with no label. Used to decide whether an AI
+/// request about a model may go to the `[ai]` endpoint
+/// ([`rocky_core::config::check_ai_residency`]).
+pub struct ModelRegions {
+    by_model: HashMap<String, Vec<Option<String>>>,
+    unclaimed: Vec<Option<String>>,
+    everywhere: Vec<Option<String>>,
+}
+
+impl ModelRegions {
+    /// Resolve the regions of every model from `config`, whose file is at
+    /// `config_path` (pipeline `models` globs are relative to it). Reads
+    /// every transformation pipeline's model files from disk.
+    pub fn resolve(config: &RockyConfig, config_path: &Path) -> Self {
+        let mut pipelines: Vec<(&String, &rocky_core::config::PipelineConfig)> =
+            config.pipelines.iter().collect();
+        pipelines.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut by_model: HashMap<String, Vec<Option<String>>> = HashMap::new();
+        let mut everywhere = Vec::new();
+        let mut unclaimed = Vec::new();
+        for (_, pipeline) in &pipelines {
+            let region = pipeline.target_region().map(str::to_string);
+            push_unique_region(&mut unclaimed, &region);
+            let Some(tx) = pipeline.as_transformation() else {
+                continue;
+            };
+            match pipeline_model_names(tx, config_path) {
+                Some(names) => {
+                    for name in names {
+                        push_unique_region(by_model.entry(name).or_default(), &region);
+                    }
+                }
+                None => push_unique_region(&mut everywhere, &region),
+            }
+        }
+        Self {
+            by_model,
+            unclaimed,
+            everywhere,
+        }
+    }
+
+    /// The regions of the data `model` writes. Never empty: a project with
+    /// no pipeline gives `[None]`, a model of no known region.
+    pub fn for_model(&self, model: &str) -> Vec<Option<String>> {
+        let mut out = self
+            .by_model
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| self.unclaimed.clone());
+        for region in &self.everywhere {
+            push_unique_region(&mut out, region);
+        }
+        if out.is_empty() {
+            out.push(None);
+        }
+        out
+    }
+}
+
+fn push_unique_region(list: &mut Vec<Option<String>>, region: &Option<String>) {
+    if !list.contains(region) {
+        list.push(region.clone());
+    }
+}

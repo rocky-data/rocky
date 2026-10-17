@@ -7,6 +7,8 @@ use rocky_core::redacted::RedactedString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::residency::AiResidency;
+
 /// Default `max_tokens` for the Anthropic Messages API request body. Also
 /// serves as the default cumulative-output token budget enforced across the
 /// compile-verify retry loop in [`crate::generate::generate_model`]. Stays at
@@ -88,6 +90,12 @@ pub enum AiError {
 
     #[error("no API key configured")]
     NoApiKey,
+
+    /// The request would carry data to an AI endpoint in a region that
+    /// `[residency]` does not allow (V062), or of unknown region under
+    /// `enforce`. Raised by [`LlmClient::new`], so no request is sent.
+    #[error("{0}")]
+    Residency(rocky_core::config::ConfigError),
 
     /// The configured provider has no client in this build.
     #[error("unsupported AI provider `{provider}`: supported providers are {supported}")]
@@ -220,8 +228,14 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    /// Create a new LLM client.
-    pub fn new(config: AiConfig) -> Result<Self, AiError> {
+    /// Create a new LLM client for requests that carry the data `residency`
+    /// names.
+    ///
+    /// Refuses with [`AiError::Residency`] when that data may not go to the
+    /// `[ai]` endpoint's region. Every request goes through a client, so the
+    /// refusal comes before any request is sent.
+    pub fn new(config: AiConfig, residency: AiResidency) -> Result<Self, AiError> {
+        residency.into_verdict().map_err(AiError::Residency)?;
         if config.api_key.expose().is_empty() {
             return Err(AiError::NoApiKey);
         }
@@ -408,7 +422,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             base_url: None,
         };
-        assert!(LlmClient::new(config).is_err());
+        assert!(LlmClient::new(config, AiResidency::no_warehouse_data()).is_err());
     }
 
     /// `Debug` on [`AiConfig`] must NOT leak the api_key. Defends against a
