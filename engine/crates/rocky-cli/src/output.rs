@@ -1709,9 +1709,9 @@ pub struct PartitionSummary {
     pub partitions_planned: usize,
     pub partitions_succeeded: usize,
     pub partitions_failed: usize,
-    /// Partitions that were already `Computed` in the state store and
-    /// skipped by the runtime (currently always 0; reserved for the
-    /// `--missing` change-detection optimization).
+    /// Planned partitions that never started because a shutdown signal
+    /// cancelled the run (#1606). A skipped partition has no state row, so
+    /// `--missing` re-plans it. Counts plans, as the other fields do.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub partitions_skipped: usize,
 }

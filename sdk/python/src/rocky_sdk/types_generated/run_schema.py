@@ -433,7 +433,7 @@ class PartitionSummary(BaseModel):
     partitions_planned: conint(ge=0)
     partitions_skipped: conint(ge=0) | None = None
     """
-    Partitions that were already `Computed` in the state store and skipped by the runtime (currently always 0; reserved for the `--missing` change-detection optimization).
+    Planned partitions that never started because a shutdown signal cancelled the run (#1606). A skipped partition has no state row, so `--missing` re-plans it. Counts plans, as the other fields do.
     """
     partitions_succeeded: conint(ge=0)
 

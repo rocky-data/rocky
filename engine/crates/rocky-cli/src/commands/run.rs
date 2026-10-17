@@ -257,6 +257,20 @@ pub(crate) static INTERRUPT_AFTER_COPY_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Run ids whose time_interval model cancels the run's token after its first
+/// partition succeeds (#1606): a deterministic "signal between partitions".
+#[cfg(test)]
+pub(crate) static CANCEL_AFTER_PARTITION_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// State paths whose backfill cancels its own run token as it starts (#1606):
+/// a deterministic stand-in for a signal reaching the backfill's listener.
+#[cfg(test)]
+pub(crate) static CANCEL_BACKFILL_AT_START_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 fn flush_run_watermarks(
     state: &StateStore,
     _run_id: &str,
@@ -11896,248 +11910,274 @@ pub(crate) async fn execute_backfill_set(
     // status-derived return — funnels through the single finalize below. The
     // block's locals (including the open `StateStore`) drop before the
     // finalize uploads.
-    let exec_result: Result<()> = async {
-        if output_json {
-            crate::output::reserve_stdout_for_json();
-        }
+    //
+    // Cancel (#1606): the backfill owns its run's token and signal listener,
+    // so a signal settles it like `rocky run`: no new model or partition
+    // starts, the run records itself interrupted and the finalize below still
+    // uploads. Held to the end: dropping it stops the listener.
+    let run_cancel = super::run_cancel::for_run();
+    #[cfg(test)]
+    if CANCEL_BACKFILL_AT_START_FOR_TEST
+        .lock()
+        .ok()
+        .is_some_and(|mut paths| paths.remove(state_path))
+    {
+        run_cancel.token().cancel();
+    }
+    // Boxed: the body is a large future, and holding it inline in the scope
+    // future overflows a test thread's stack on Linux.
+    let exec_result: Result<()> = run_cancel
+        .shared()
+        .scope(Box::pin(async {
+            if output_json {
+                crate::output::reserve_stdout_for_json();
+            }
 
-        let rocky_cfg = &loaded.config;
-        let start = Instant::now();
-        let started_at = Utc::now();
-        let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
-        let config_hash = loaded.fingerprint.clone();
+            let rocky_cfg = &loaded.config;
+            let start = Instant::now();
+            let started_at = Utc::now();
+            let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+            let config_hash = loaded.fingerprint.clone();
 
-        anyhow::ensure!(
-            models_dir.exists(),
-            "models directory '{}' not found (required for backfill)",
-            models_dir.display()
-        );
+            anyhow::ensure!(
+                models_dir.exists(),
+                "models directory '{}' not found (required for backfill)",
+                models_dir.display()
+            );
 
-        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
-        // Mirror the `--model` path: the first transformation pipeline's target
-        // adapter, falling back to the first replication pipeline's.
-        let target_adapter_name = rocky_cfg
-            .pipelines
-            .values()
-            .find_map(|p| match p {
-                rocky_core::config::PipelineConfig::Transformation(t) => {
-                    Some(t.target.adapter.clone())
-                }
-                _ => None,
-            })
-            .or_else(|| {
-                rocky_cfg.pipelines.values().find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Replication(r) => {
-                        Some(r.target.adapter.clone())
+            let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+            // Mirror the `--model` path: the first transformation pipeline's target
+            // adapter, falling back to the first replication pipeline's.
+            let target_adapter_name = rocky_cfg
+                .pipelines
+                .values()
+                .find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Transformation(t) => {
+                        Some(t.target.adapter.clone())
                     }
                     _ => None,
                 })
-            })
-            .unwrap_or_else(|| "default".to_string());
+                .or_else(|| {
+                    rocky_cfg.pipelines.values().find_map(|p| match p {
+                        rocky_core::config::PipelineConfig::Replication(r) => {
+                            Some(r.target.adapter.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| "default".to_string());
 
-        let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
-        let state_store = Some(
-            rocky_core::state::StateStore::open_with_policy(
-                state_path,
-                rocky_cfg.state.on_schema_mismatch,
+            let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+            let state_store = Some(
+                rocky_core::state::StateStore::open_with_policy(
+                    state_path,
+                    rocky_cfg.state.on_schema_mismatch,
+                )
+                .with_context(|| {
+                    format!("failed to open state store at {}", state_path.display())
+                })?,
+            );
+            if let Some(store) = state_store.as_ref() {
+                mark_run_started(store, &run_id, started_at, None);
+            }
+            // Forward-incompat recreate ⇒ never push the downgraded ledger back
+            // over newer shared state (the state.rs caller obligation; same
+            // suppression as the replication / model-only / load arms). The
+            // ALWAYS-finalize shape below stays — a suppressed finalize consumes
+            // the session without uploading.
+            if state_store
+                .as_ref()
+                .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
+            {
+                session.set_suppress_upload("forward-incompat recreate");
+            }
+
+            let mut output = RunOutput::new(String::new(), 0, 1);
+
+            let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
+            // A backfill is an explicit, reviewed rebuild order, so the plain skip
+            // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
+            // rowcount) are blind to exactly the backdated corrections backfills
+            // exist to repair, and `[run] skip_unchanged = true` would otherwise
+            // silently no-op the whole approved recovery. `force_rebuild` makes the
+            // gate inert (`is_active()` = false) and pins the content-addressed
+            // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
+            // point-to reuse stays governed by `backfill_reuse_gates` alone — a
+            // byte-identical reuse still satisfies a rebuild order.
+            let skip_gate = SkipGateConfig::resolve(
+                &SkipRunOptions {
+                    force_rebuild: true,
+                    ..Default::default()
+                },
+                &rocky_cfg.run,
+                false,
+            );
+            let run_vars = rocky_core::run_vars::RunVars::new();
+            // A backfill is an explicit rebuild order: point-to reuse may still
+            // satisfy it byte-identically, but the column-level skip never may.
+            let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
+
+            // Finding #1: baseline failures so a soft model failure skips governance.
+            let failures_before = output.tables_failed;
+            let exec_result = execute_models(
+                models_dir,
+                None,
+                warehouse.as_ref(),
+                state_store.as_ref(),
+                partition_opts,
+                &run_id,
+                None, // selection is driven by `model_set`, not the single-name filter
+                Some(model_set),
+                &mut output,
+                None, // backfill has no pipeline hook context
+                None,
+                &schema_cache_cfg,
+                // Target schemas already exist (the closure was built before); do not
+                // auto-create, matching the `--model` entry point.
+                false,
+                None, // backfills always target production
+                // Each model's casts are typed for the warehouse its own pipelines
+                // write to, not for this backfill's warehouse (#2333).
+                &DeferOptions {
+                    target_dialects: Some(super::compile::target_dialects(
+                        Some(rocky_cfg),
+                        config_path,
+                    )),
+                    ..DeferOptions::default()
+                },
+                skip_gate,
+                reuse_enabled,
+                column_level_enabled,
+                &run_vars,
+                rocky_cfg.resilience.clone(),
+                rocky_cfg.run.strict_scheduling,
+                super::resilience::retry_policy_allows(rocky_cfg),
+                exec_fp_gate,
+                freeze_fence,
+                // Finding #4: a backfill reconciles only tags, not masks.
+                false,
+                rocky_cfg.contracts.strict,
             )
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
-        );
-        if let Some(store) = state_store.as_ref() {
-            mark_run_started(store, &run_id, started_at, None);
-        }
-        // Forward-incompat recreate ⇒ never push the downgraded ledger back
-        // over newer shared state (the state.rs caller obligation; same
-        // suppression as the replication / model-only / load arms). The
-        // ALWAYS-finalize shape below stays — a suppressed finalize consumes
-        // the session without uploading.
-        if state_store
-            .as_ref()
-            .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
-        {
-            session.set_suppress_upload("forward-incompat recreate");
-        }
+            .await;
 
-        let mut output = RunOutput::new(String::new(), 0, 1);
-
-        let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
-        // A backfill is an explicit, reviewed rebuild order, so the plain skip
-        // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
-        // rowcount) are blind to exactly the backdated corrections backfills
-        // exist to repair, and `[run] skip_unchanged = true` would otherwise
-        // silently no-op the whole approved recovery. `force_rebuild` makes the
-        // gate inert (`is_active()` = false) and pins the content-addressed
-        // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
-        // point-to reuse stays governed by `backfill_reuse_gates` alone — a
-        // byte-identical reuse still satisfies a rebuild order.
-        let skip_gate = SkipGateConfig::resolve(
-            &SkipRunOptions {
-                force_rebuild: true,
-                ..Default::default()
-            },
-            &rocky_cfg.run,
-            false,
-        );
-        let run_vars = rocky_core::run_vars::RunVars::new();
-        // A backfill is an explicit rebuild order: point-to reuse may still
-        // satisfy it byte-identically, but the column-level skip never may.
-        let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
-
-        // Finding #1: baseline failures so a soft model failure skips governance.
-        let failures_before = output.tables_failed;
-        let exec_result = execute_models(
-            models_dir,
-            None,
-            warehouse.as_ref(),
-            state_store.as_ref(),
-            partition_opts,
-            &run_id,
-            None, // selection is driven by `model_set`, not the single-name filter
-            Some(model_set),
-            &mut output,
-            None, // backfill has no pipeline hook context
-            None,
-            &schema_cache_cfg,
-            // Target schemas already exist (the closure was built before); do not
-            // auto-create, matching the `--model` entry point.
-            false,
-            None, // backfills always target production
-            // Each model's casts are typed for the warehouse its own pipelines
-            // write to, not for this backfill's warehouse (#2333).
-            &DeferOptions {
-                target_dialects: Some(super::compile::target_dialects(
-                    Some(rocky_cfg),
-                    config_path,
-                )),
-                ..DeferOptions::default()
-            },
-            skip_gate,
-            reuse_enabled,
-            column_level_enabled,
-            &run_vars,
-            rocky_cfg.resilience.clone(),
-            rocky_cfg.run.strict_scheduling,
-            super::resilience::retry_policy_allows(rocky_cfg),
-            exec_fp_gate,
-            freeze_fence,
-            // Finding #4: a backfill reconciles only tags, not masks.
-            false,
-            rocky_cfg.contracts.strict,
-        )
-        .await;
-
-        match exec_result {
-            // Finding #1: only when the model phase is CLEAN (no new soft failures).
-            Ok(snapshot) if output.tables_failed == failures_before => {
-                // Pre-reconcile freeze fence (fresh LIST): a freeze landing
-                // after the rebuild must withhold the governance reconcile,
-                // recorded so the ALWAYS-finalize below still uploads the
-                // committed rebuild state.
-                let fence_withhold = match freeze_fence {
-                    Some(fence) => {
-                        fence
-                            .check_withhold(
-                                // Only the EXECUTING backfill closure — the
-                                // captured snapshot carries every COMPILED
-                                // model, so a freeze on a model outside this
-                                // backfill's `model_set` must not withhold its
-                                // reconcile (the reconcile below iterates
-                                // exactly `model_set`).
-                                snapshot
-                                    .models
-                                    .iter()
-                                    .map(|m| m.name.as_str())
-                                    .filter(|name| model_set.contains(*name)),
+            match exec_result {
+                // Finding #1: only when the model phase is CLEAN (no new soft failures)
+                // and no signal cut it short (#1606).
+                Ok(snapshot) if output.tables_failed == failures_before && !output.interrupted => {
+                    // Pre-reconcile freeze fence (fresh LIST): a freeze landing
+                    // after the rebuild must withhold the governance reconcile,
+                    // recorded so the ALWAYS-finalize below still uploads the
+                    // committed rebuild state.
+                    let fence_withhold = match freeze_fence {
+                        Some(fence) => {
+                            fence
+                                .check_withhold(
+                                    // Only the EXECUTING backfill closure — the
+                                    // captured snapshot carries every COMPILED
+                                    // model, so a freeze on a model outside this
+                                    // backfill's `model_set` must not withhold its
+                                    // reconcile (the reconcile below iterates
+                                    // exactly `model_set`).
+                                    snapshot
+                                        .models
+                                        .iter()
+                                        .map(|m| m.name.as_str())
+                                        .filter(|name| model_set.contains(*name)),
+                                )
+                                .await
+                        }
+                        None => None,
+                    };
+                    if let Some(msg) = fence_withhold {
+                        output.tables_failed += 1;
+                        output.errors.push(crate::output::TableErrorOutput {
+                            asset_key: vec!["<freeze>".to_string()],
+                            error: msg,
+                            failure_kind: crate::output::FailureKind::Unknown,
+                            cooldown_seconds: None,
+                        });
+                    } else {
+                        // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
+                        // closure so unrelated models are untouched.
+                        // #1093: every iteration reuses the ONE snapshot captured at
+                        // the fingerprint gate inside `execute_models` — the old
+                        // signature fresh-compiled the whole project from disk once
+                        // PER model in the closure (N recompiles), and each of those
+                        // compiles could pick up a post-execution sidecar edit.
+                        let governance_adapter =
+                            adapter_registry.governance_adapter(&target_adapter_name);
+                        for model in model_set {
+                            apply_model_governance_tags(
+                                &snapshot,
+                                governance_adapter.as_ref(),
+                                Some(model.as_str()),
                             )
-                            .await
+                            .await;
+                        }
+                        write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
                     }
-                    None => None,
-                };
-                if let Some(msg) = fence_withhold {
+                }
+                // Soft model failure — skip governance/manifest, fall through.
+                Ok(_) => {}
+                Err(e) => {
+                    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
                     output.errors.push(crate::output::TableErrorOutput {
-                        asset_key: vec!["<freeze>".to_string()],
-                        error: msg,
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        asset_key: vec!["backfill".to_string()],
+                        error: format!("{e:#}"),
+                        failure_kind,
+                        cooldown_seconds,
                     });
-                } else {
-                    // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
-                    // closure so unrelated models are untouched.
-                    // #1093: every iteration reuses the ONE snapshot captured at
-                    // the fingerprint gate inside `execute_models` — the old
-                    // signature fresh-compiled the whole project from disk once
-                    // PER model in the closure (N recompiles), and each of those
-                    // compiles could pick up a post-execution sidecar edit.
-                    let governance_adapter =
-                        adapter_registry.governance_adapter(&target_adapter_name);
-                    for model in model_set {
-                        apply_model_governance_tags(
-                            &snapshot,
-                            governance_adapter.as_ref(),
-                            Some(model.as_str()),
-                        )
-                        .await;
-                    }
-                    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
                 }
             }
-            // Soft model failure — skip governance/manifest, fall through.
-            Ok(_) => {}
-            Err(e) => {
-                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
-                output.tables_failed += 1;
-                output.errors.push(crate::output::TableErrorOutput {
-                    asset_key: vec!["backfill".to_string()],
-                    error: format!("{e:#}"),
-                    failure_kind,
-                    cooldown_seconds,
-                });
+
+            output.duration_ms = start.elapsed().as_millis() as u64;
+
+            let adapter_type = rocky_cfg
+                .adapters
+                .get(&target_adapter_name)
+                .map(|a| a.adapter_type.clone())
+                .unwrap_or_default();
+            output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+            let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+            // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
+            // there is no Rocky branch to stamp here (#2032).
+            let audit_ctx = AuditContext::detect(None, None, None);
+            let audit = audit_to_record(&audit_ctx);
+            let custody = RecordCustody::from_persisted(persist_run_record(
+                state_store.as_ref(),
+                &output,
+                &run_id,
+                started_at,
+                &config_hash,
+                &audit,
+                // A backfill spans a model set, not a single pipeline.
+                None,
+            ));
+
+            output.status = output.derive_run_status();
+            if output_json {
+                print_json(&output)?;
+                capture_run_output_for_test(&run_id, &output);
             }
-        }
-
-        output.duration_ms = start.elapsed().as_millis() as u64;
-
-        let adapter_type = rocky_cfg
-            .adapters
-            .get(&target_adapter_name)
-            .map(|a| a.adapter_type.clone())
-            .unwrap_or_default();
-        output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
-        let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
-
-        // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
-        // there is no Rocky branch to stamp here (#2032).
-        let audit_ctx = AuditContext::detect(None, None, None);
-        let audit = audit_to_record(&audit_ctx);
-        let custody = RecordCustody::from_persisted(persist_run_record(
-            state_store.as_ref(),
-            &output,
-            &run_id,
-            started_at,
-            &config_hash,
-            &audit,
-            // A backfill spans a model set, not a single pipeline.
-            None,
-        ));
-
-        output.status = output.derive_run_status();
-        if output_json {
-            print_json(&output)?;
-            capture_run_output_for_test(&run_id, &output);
-        }
-        budget_result?;
-        run_status_exit_result(&output, &run_id, custody)?;
-        // A backfill's session is `Durable` (governed), so a lost record on a
-        // successful backfill fails the apply after the upload below (#1884).
-        record_custody_exit_result(
-            custody,
-            &run_id,
-            true,
-            rocky_core::config::StateUploadFailureMode::Fail,
-        )
-    }
-    .await;
+            // An interrupted backfill (#1606) exits 130 even with a hard
+            // `[budget]` breach, as `rocky run` does: the cancel ended it.
+            if output.interrupted {
+                return Err(anyhow::Error::new(Interrupted));
+            }
+            budget_result?;
+            run_status_exit_result(&output, &run_id, custody)?;
+            // A backfill's session is `Durable` (governed), so a lost record on a
+            // successful backfill fails the apply after the upload below (#1884).
+            record_custody_exit_result(
+                custody,
+                &run_id,
+                true,
+                rocky_core::config::StateUploadFailureMode::Fail,
+            )
+        }))
+        .await;
 
     // WP-01 PR-B (2b): ALWAYS finalize — even when the backfill failed. A
     // mid-run failure can still have committed run/artifact/provenance rows
@@ -12564,8 +12604,8 @@ pub(crate) async fn execute_models(
         reconciles_masks,
         None,
         strict_contracts,
-        // Backfill and tests: no run owns a token here, so adopt a `--watch`
-        // scope's when there is one and otherwise never cancel.
+        // Backfill scopes its own run's token (#1606); tests and a `--watch`
+        // scope are adopted the same way. With no scope, never cancel.
         &super::run_cancel::ambient().unwrap_or_default(),
     )
     .await
@@ -14593,6 +14633,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     run_id,
                     output,
                     &exec_ctx,
+                    cancel,
                 )
                 .await
                 .with_context(|| format!("model '{model_name}' failed"));
@@ -14620,6 +14661,16 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                         continue;
                     }
                     return Err(e);
+                }
+                // Cancel (#1606): a model that skipped partitions was not
+                // built, so it records no `Build` and fires no
+                // `after_model_run`. The next loop check settles the run.
+                if output
+                    .partition_summaries
+                    .last()
+                    .is_some_and(|summary| summary.partitions_skipped > 0)
+                {
+                    continue;
                 }
                 // Per-model decision (reporting-only). time_interval is never
                 // skip-eligible, so it is suppressed in the skip-gate loop above
@@ -16652,6 +16703,9 @@ async fn execute_time_interval_model(
     run_id: &str,
     output: &mut RunOutput,
     exec_ctx: &ExecutionContext<'_>,
+    // The run's cancellation token (#1606). Checked before the bootstrap and
+    // before each partition starts; never between a partition's statements.
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use rocky_core::plan_partition::{PartitionSelection, plan_partitions};
 
@@ -16775,6 +16829,19 @@ async fn execute_time_interval_model(
     // with the right output schema. If the metadata probe failed against a
     // live target, CREATE fails without overwriting it. Subsequent partition
     // runs use the normal DELETE+INSERT path.
+    // Cancel (#1606): a signal before any warehouse work skips every plan.
+    if cancel.is_cancelled() {
+        output.partition_summaries.push(PartitionSummary {
+            model: model_name.into(),
+            partitions_planned: plans.len(),
+            partitions_succeeded: 0,
+            partitions_failed: 0,
+            partitions_skipped: plans.len(),
+        });
+        output.interrupted = true;
+        return Ok(());
+    }
+
     let target_ref_struct = rocky_ir::TableRef {
         catalog: model.config.target.catalog.clone(),
         schema: model.config.target.schema.clone(),
@@ -16869,6 +16936,7 @@ async fn execute_time_interval_model(
                 model_name,
                 &asset_key,
                 exec_ctx,
+                cancel,
             )
         })
         .buffer_unordered(parallel_limit)
@@ -16885,10 +16953,11 @@ async fn execute_time_interval_model(
     let mut first_error: Option<(anyhow::Error, String)> = None;
     for r in results {
         match r.outcome {
-            Ok(materialization) => {
+            Ok(Some(materialization)) => {
                 output.materializations.push(materialization);
                 summary.partitions_succeeded += 1;
             }
+            Ok(None) => summary.partitions_skipped += 1,
             Err(err) => {
                 summary.partitions_failed += 1;
                 if first_error.is_none() {
@@ -16903,8 +16972,22 @@ async fn execute_time_interval_model(
         target = target_table.as_str(),
         succeeded = summary.partitions_succeeded,
         failed = summary.partitions_failed,
+        skipped = summary.partitions_skipped,
         "time_interval model execution complete"
     );
+
+    // Cancel (#1606): the skipped plans wrote no state row, so `--missing`
+    // re-plans them. A plain run may not: once any partition of the model has
+    // a row, the first-run fill no longer applies and a plain run builds only
+    // the latest.
+    if summary.partitions_skipped > 0 {
+        output.interrupted = true;
+        warn!(
+            model = model_name,
+            skipped = summary.partitions_skipped,
+            "interrupted before every partition ran; run with --missing to build the rest"
+        );
+    }
 
     output.partition_summaries.push(summary);
 
@@ -16920,9 +17003,11 @@ async fn execute_time_interval_model(
 struct PartitionExecutionResult {
     /// Canonical partition key, used for sorting and error messages.
     partition_key: String,
-    /// Either the materialization to push into `RunOutput.materializations`,
-    /// or an error to surface after all partitions complete.
-    outcome: Result<MaterializationOutput, anyhow::Error>,
+    /// The materialization to push into `RunOutput.materializations`, `None`
+    /// when a cancel stopped the partition before it started (no state row,
+    /// no warehouse work), or an error to surface after all partitions
+    /// complete.
+    outcome: Result<Option<MaterializationOutput>, anyhow::Error>,
 }
 
 /// Execute exactly one partition: mark InProgress in the state store, generate
@@ -16946,9 +17031,19 @@ async fn run_one_partition(
     model_name: &str,
     asset_key: &[String],
     exec_ctx: &ExecutionContext<'_>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> PartitionExecutionResult {
     use rocky_core::incremental::{PartitionRecord, PartitionStatus};
     let key = partition_plan.partition_key.clone();
+
+    // Cancel (#1606): start no new partition. This sits before the
+    // `InProgress` write, so a skipped partition leaves no state row.
+    if cancel.is_cancelled() {
+        return PartitionExecutionResult {
+            partition_key: key,
+            outcome: Ok(None),
+        };
+    }
     let partition_start = std::time::Instant::now();
     let partition_started_at = chrono::Utc::now();
 
@@ -17115,9 +17210,17 @@ async fn run_one_partition(
         chrono::Utc::now(),
     )
     .await;
+    #[cfg(test)]
+    if CANCEL_AFTER_PARTITION_FOR_TEST
+        .lock()
+        .ok()
+        .is_some_and(|mut ids| ids.remove(run_id))
+    {
+        cancel.cancel();
+    }
     PartitionExecutionResult {
         partition_key: key.clone(),
-        outcome: Ok(MaterializationOutput {
+        outcome: Ok(Some(MaterializationOutput {
             asset_key: asset_key.to_vec(),
             notes: vec![],
             attempts: Vec::new(),
@@ -17158,7 +17261,7 @@ async fn run_one_partition(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: Some(recorded_output_target(&tplan_ir)),
-        }),
+        })),
     }
 }
 
@@ -27382,6 +27485,81 @@ adapter = "default"
         }
     }
 
+    /// #1606: a signal during `rocky apply` of a backfill plan settles the
+    /// backfill like `rocky run`. A cancel before the first model starts no
+    /// model, records the run and returns `Interrupted` (exit 130).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancelled_backfill_starts_no_model_and_exits_interrupted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
+                 models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
+                dir.join("wh.duckdb").display(),
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+        let state_path = dir.join("state.redb");
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+        let mut session = rocky_core::state_sync::RemoteStateSession::new(
+            &loaded.config.state,
+            &state_path,
+            rocky_core::state_sync::FinalizeDurability::Durable,
+            false,
+        );
+        let _authority = session.acquire().await.unwrap();
+        session.require_synced().unwrap();
+        let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+        super::CANCEL_BACKFILL_AT_START_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert(state_path.clone());
+        let result = super::execute_backfill_set(
+            &loaded,
+            &config_path,
+            session,
+            &state_path,
+            &models,
+            &model_set,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        let error = result.expect_err("a cancelled backfill must not report success");
+        assert!(error.is::<super::Interrupted>(), "{error:#}");
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1, "the interrupted backfill records its run");
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&runs[0].run_id)
+            .expect("backfill must emit terminal JSON");
+        assert!(
+            captured["materializations"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no model may start after the cancel: {captured}"
+        );
+    }
+
     #[cfg(feature = "duckdb")]
     async fn assert_supervised_backfill_failure(
         failure: &str,
@@ -29876,6 +30054,7 @@ table = "fct_daily"
             "test-run",
             &mut output,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         {
@@ -29894,6 +30073,215 @@ table = "fct_daily"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Three daily partitions, one per plan, over an in-memory DuckDB source.
+    #[cfg(feature = "duckdb")]
+    async fn partition_cancel_fixture() -> (
+        rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        tempfile::TempDir,
+        rocky_core::models::Model,
+        rocky_core::state::StateStore,
+        [String; 3],
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let today = Utc::now().date_naive();
+        let days = [
+            today.pred_opt().unwrap().pred_opt().unwrap().to_string(),
+            today.pred_opt().unwrap().to_string(),
+            today.to_string(),
+        ];
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{} 12:00:00'), (TIMESTAMP '{} 12:00:00'), \
+                 (TIMESTAMP '{} 12:00:00')) AS t(order_at)",
+                days[0], days[1], days[2]
+            ))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nbatch_size = 1\nfirst_partition = \"{}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n",
+                days[0]
+            ),
+        )
+        .unwrap();
+        let model = rocky_core::models::load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+        (warehouse, dir, model, state, days)
+    }
+
+    /// #1606: a cancel that lands before the partitions start skips them all.
+    /// No partition writes a state row, and the target is not bootstrapped.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancel_before_the_partitions_start_skips_every_partition() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let (warehouse, _dir, model, state, days) = partition_cancel_fixture().await;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let range = PartitionRunOptions {
+            from: Some(days[0].clone()),
+            to: Some(days[2].clone()),
+            parallel: 1,
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &range,
+            "cancel-before",
+            &mut output,
+            &exec_ctx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.interrupted);
+        let summary = &output.partition_summaries[0];
+        assert_eq!(
+            (
+                summary.partitions_planned,
+                summary.partitions_succeeded,
+                summary.partitions_failed,
+                summary.partitions_skipped
+            ),
+            (3, 0, 0, 3)
+        );
+        assert!(output.materializations.is_empty());
+        assert!(
+            state
+                .list_partitions("fct_daily_orders")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            warehouse
+                .execute_query("SELECT * FROM main.fct_daily_orders")
+                .await
+                .is_err(),
+            "a cancelled model must not bootstrap its target"
+        );
+    }
+
+    /// #1606: a cancel between partitions lets the running partition finish
+    /// and starts no other. The skipped partitions leave no state row, so
+    /// `--missing` re-plans exactly them.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_cancel_between_partitions_starts_no_further_partition() {
+        use rocky_core::incremental::PartitionStatus;
+        use rocky_core::plan_partition::PartitionSelection;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let (warehouse, _dir, model, state, days) = partition_cancel_fixture().await;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let range = PartitionRunOptions {
+            from: Some(days[0].clone()),
+            to: Some(days[2].clone()),
+            parallel: 1,
+            ..Default::default()
+        };
+        super::CANCEL_AFTER_PARTITION_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert("cancel-between".to_string());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &range,
+            "cancel-between",
+            &mut output,
+            &exec_ctx,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert!(output.interrupted);
+        let summary = &output.partition_summaries[0];
+        assert_eq!(
+            (
+                summary.partitions_planned,
+                summary.partitions_succeeded,
+                summary.partitions_failed,
+                summary.partitions_skipped
+            ),
+            (3, 1, 0, 2)
+        );
+        assert_eq!(output.materializations.len(), 1);
+        let records = state.list_partitions("fct_daily_orders").unwrap();
+        assert_eq!(records.len(), 1, "only the finished partition has a row");
+        assert_eq!(records[0].partition_key, days[0]);
+        assert_eq!(records[0].status, PartitionStatus::Computed);
+
+        let missing = rocky_core::plan_partition::plan_partitions(
+            &model,
+            &PartitionSelection::Missing,
+            None,
+            &state,
+        )
+        .unwrap();
+        let replanned: Vec<_> = missing
+            .iter()
+            .flat_map(|plan| std::iter::once(&plan.partition_key).chain(&plan.batch_with))
+            .collect();
+        assert!(!replanned.contains(&&days[0]));
+        assert!(replanned.contains(&&days[1]));
+        assert!(replanned.contains(&&days[2]));
     }
 
     #[cfg(feature = "duckdb")]
@@ -29977,6 +30365,7 @@ table = "fct_daily"
             "batch-run",
             &mut output,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30088,6 +30477,7 @@ table = "fct_daily"
             "first-run",
             &mut first_run,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30104,6 +30494,7 @@ table = "fct_daily"
             "second-run",
             &mut second_run,
             &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -30193,6 +30584,7 @@ table = "fct_daily"
             "unreviewed",
             &mut refused,
             &ctx(&not_recorded),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect_err("a fill the plan did not show must refuse");
@@ -30217,6 +30609,7 @@ table = "fct_daily"
             "reviewed",
             &mut filled,
             &ctx(&recorded),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -45632,6 +46025,7 @@ auto_create_schemas = true
                 run_id,
                 &mut output,
                 &exec_ctx,
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await
             .unwrap();
