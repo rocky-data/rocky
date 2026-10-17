@@ -14,7 +14,7 @@
       "sql": "CREATE OR REPLACE TABLE staging__orders.orders AS\nSELECT *\nFROM raw__orders.orders"
     }
   ],
-  "plan_id": "57e5ddef8e12a4a6fcb5aef52e73b86188797289abfe1e5d347d2856cee8bc66",
+  "plan_id": "c3c67da4bd160e2a2451f173d2dd1110442d4b425966e55f68b26e84b9bd7f93",
   "plan_kind": "run",
   "created_at": "2000-01-01T00:00:00Z",
   "models": [

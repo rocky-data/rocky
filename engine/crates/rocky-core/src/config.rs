@@ -5048,6 +5048,9 @@ pub struct AdapterConfig {
     /// `extension_directory` setting). When unset, DuckDB uses its own
     /// default under the home directory. Every extension Rocky loads reads
     /// from, and installs into, this one directory.
+    // Skipped when unset, so the config digest a plan records stays the same
+    // for a project that does not use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_directory: Option<EnvString>,
     /// When `true`, Rocky never runs `INSTALL` for a DuckDB extension and
     /// turns DuckDB's extension auto-install off. It loads `icu` from the
