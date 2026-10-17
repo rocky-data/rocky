@@ -669,16 +669,14 @@ pub fn check_freshness(lag_seconds: u64, threshold_seconds: u64) -> CheckResult 
 /// exactly as before: failed past the threshold, at the configured
 /// severity, and the reported threshold is the configured one.
 pub fn grade_freshness(lag_seconds: u64, levels: &FreshnessThresholds) -> CheckResult {
-    let (passed, severity, threshold_seconds) = match (
-        levels.warn_after_seconds,
-        levels.error_after_seconds,
-    ) {
-        (_, Some(error)) if lag_seconds > error => (false, TestSeverity::Error, error),
-        (Some(warn), _) if lag_seconds > warn => (false, TestSeverity::Warning, warn),
-        (Some(warn), _) => (true, TestSeverity::Warning, warn),
-        (None, Some(error)) => (true, TestSeverity::Error, error),
-        (None, None) => (true, TestSeverity::Error, 0),
-    };
+    let (passed, severity, threshold_seconds) =
+        match (levels.warn_after_seconds, levels.error_after_seconds) {
+            (_, Some(error)) if lag_seconds > error => (false, TestSeverity::Error, error),
+            (Some(warn), _) if lag_seconds > warn => (false, TestSeverity::Warning, warn),
+            (Some(warn), _) => (true, TestSeverity::Warning, warn),
+            (None, Some(error)) => (true, TestSeverity::Error, error),
+            (None, None) => (true, TestSeverity::Error, 0),
+        };
     let mut check = check_freshness(lag_seconds, threshold_seconds);
     check.passed = passed;
     check.severity = severity;

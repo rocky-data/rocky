@@ -1743,8 +1743,7 @@ impl ProjectFreshnessConfig {
         match self.expected_lag_seconds {
             Some(seconds) => crate::source_freshness::FreshnessThresholds::from_single(
                 seconds,
-                self.severity
-                    .unwrap_or(crate::tests::TestSeverity::Warning),
+                self.severity.unwrap_or(crate::tests::TestSeverity::Warning),
             ),
             None => crate::source_freshness::levels_of(
                 self.warn_after.as_deref(),
@@ -1828,8 +1827,8 @@ impl Serialize for FreshnessConfig {
                 s.end()
             }
             None => {
-                let len =
-                    usize::from(self.warn_after.is_some()) + usize::from(self.error_after.is_some());
+                let len = usize::from(self.warn_after.is_some())
+                    + usize::from(self.error_after.is_some());
                 let mut s = serializer.serialize_struct("FreshnessConfig", len)?;
                 if let Some(warn_after) = &self.warn_after {
                     s.serialize_field("warn_after", warn_after)?;
@@ -12674,7 +12673,10 @@ fail_fast = true
         assert_eq!(t.target.adapter, "db");
         assert!(t.target.governance.auto_create_schemas);
         assert!(t.checks.enabled);
-        assert_eq!(t.checks.freshness.as_ref().unwrap().threshold_seconds, Some(3600));
+        assert_eq!(
+            t.checks.freshness.as_ref().unwrap().threshold_seconds,
+            Some(3600)
+        );
         assert_eq!(t.execution.concurrency, ConcurrencyMode::Fixed(4));
         assert!(t.execution.fail_fast);
     }

@@ -93,7 +93,9 @@ fn pipeline_check_refuses_mixed_and_inverted_levels() {
         "threshold_seconds = 60\nwarn_after = \"1h\"",
         "severity = \"warning\"\nerror_after = \"1h\"",
     ] {
-        let err = toml::from_str::<FreshnessConfig>(bad).unwrap_err().to_string();
+        let err = toml::from_str::<FreshnessConfig>(bad)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("mixes the deprecated"), "{bad}: {err}");
     }
     let err = toml::from_str::<FreshnessConfig>("warn_after = \"2h\"\nerror_after = \"1h\"")
@@ -136,14 +138,17 @@ fn model_sidecar_old_forms_map_by_severity_with_warning_default() {
 
 #[test]
 fn model_sidecar_refuses_mixed_and_inverted_levels() {
-    let err = model_freshness("[freshness]\nmax_lag_seconds = 60\nwarn_after = \"1h\"\n")
-        .unwrap_err();
+    let err =
+        model_freshness("[freshness]\nmax_lag_seconds = 60\nwarn_after = \"1h\"\n").unwrap_err();
     assert!(err.contains("mixes the deprecated"), "{err}");
     let err =
         model_freshness("[freshness]\nwarn_after = \"2d\"\nerror_after = \"1d\"\n").unwrap_err();
     assert!(err.contains("shorter than `warn_after`"), "{err}");
     let err = model_freshness("[freshness]\ntime_column = \"ts\"\n").unwrap_err();
-    assert!(err.contains("neither `warn_after` nor `error_after`"), "{err}");
+    assert!(
+        err.contains("neither `warn_after` nor `error_after`"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -164,8 +169,8 @@ fn defaults_file_parses_the_new_form() {
 
 #[test]
 fn project_block_parses_the_new_form_and_is_inherited() {
-    let cfg = config_with("\n[freshness]\nwarn_after = \"1h\"\ntime_column = \"ts\"\n")
-        .expect("parses");
+    let cfg =
+        config_with("\n[freshness]\nwarn_after = \"1h\"\ntime_column = \"ts\"\n").expect("parses");
     assert_eq!(cfg.freshness.budget_seconds(), Some(3_600));
     assert!(cfg.freshness.has_default());
     let dir = tempfile::tempdir().expect("temp dir");
@@ -244,19 +249,17 @@ fn rocky_toml_deprecations_name_the_block_and_the_replacement() {
 
 // --- product spec -------------------------------------------------------------
 
-
 #[test]
 fn spec_grammar_follows_the_shared_rules() {
     use rocky_core::product::spec::FreshnessSpec;
-    let spec = |max_lag: Option<&str>, severity, warn: Option<&str>, error: Option<&str>| {
-        FreshnessSpec {
+    let spec =
+        |max_lag: Option<&str>, severity, warn: Option<&str>, error: Option<&str>| FreshnessSpec {
             max_lag: max_lag.map(str::to_string),
             time_column: "date".to_string(),
             severity,
             warn_after: warn.map(str::to_string),
             error_after: error.map(str::to_string),
-        }
-    };
+        };
     use rocky_core::product::spec::FreshnessSeverity;
     assert_eq!(
         spec(Some("24h"), None, None, None).thresholds().unwrap(),
@@ -269,7 +272,10 @@ fn spec_grammar_follows_the_shared_rules() {
         levels(None, Some(86_400))
     );
     let new = spec(None, None, Some("12h"), Some("1d"));
-    assert_eq!(new.thresholds().unwrap(), levels(Some(43_200), Some(86_400)));
+    assert_eq!(
+        new.thresholds().unwrap(),
+        levels(Some(43_200), Some(86_400))
+    );
     assert_eq!(new.budget_seconds().unwrap(), 43_200);
     assert!(new.legacy_keys().is_empty());
 }

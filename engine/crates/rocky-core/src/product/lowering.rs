@@ -353,7 +353,10 @@ pub fn merge_sidecar_text(
             // verbatim: the sidecar grades exactly as the spec declares.
             freshness.thresholds()?;
             if let Some(warn_after) = &freshness.warn_after {
-                block.insert("warn_after".to_string(), TomlValue::string(warn_after.clone()));
+                block.insert(
+                    "warn_after".to_string(),
+                    TomlValue::string(warn_after.clone()),
+                );
             }
             if let Some(error_after) = &freshness.error_after {
                 block.insert(
@@ -1555,10 +1558,9 @@ agent = "propose_only"
         assert_eq!(freshness["error_after"], TomlValue::string("1d"));
         assert_eq!(freshness["time_column"], TomlValue::string("date"));
         // The lowered sidecar parses back to the levels the spec declared.
-        let sidecar: crate::models::ModelFreshnessConfig = toml::from_str(
-            "warn_after = \"12h\"\nerror_after = \"1d\"\ntime_column = \"date\"",
-        )
-        .expect("parses");
+        let sidecar: crate::models::ModelFreshnessConfig =
+            toml::from_str("warn_after = \"12h\"\nerror_after = \"1d\"\ntime_column = \"date\"")
+                .expect("parses");
         assert_eq!(
             sidecar.thresholds(),
             parsed

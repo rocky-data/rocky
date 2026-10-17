@@ -303,6 +303,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         vec![]
     };
 
+    // --- Deprecated freshness spellings (W058) ---
+    freshness_deprecations(&cfg, config_path, &loaded_models, &mut out);
+
     // --- Lint rules ---
     // Re-parses the file into the raw (normalized-shorthand, un-defaulted)
     // document so L004/L006 can tell "the file sets this key" from "the
@@ -317,6 +320,120 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     validate_products(config_path, &mut out);
 
     Ok(out)
+}
+
+/// One W058: a freshness block written in a deprecated spelling.
+///
+/// The old keys keep working, so this is a warning. It names the file, the
+/// block, the deprecated keys and the `warn_after` / `error_after` text
+/// that replaces them.
+fn freshness_deprecation_message(
+    file: String,
+    field: String,
+    keys: &[&str],
+    replacement: &str,
+) -> ValidateMessage {
+    let keys_text = keys
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let remedy = if replacement.is_empty() {
+        "Delete them: with no lag value they set nothing.".to_string()
+    } else {
+        format!("Write `{replacement}` instead; it behaves the same.")
+    };
+    ValidateMessage {
+        severity: "warn".into(),
+        code: rocky_compiler::diagnostic::W058.into(),
+        message: format!(
+            "`{field}` uses the deprecated freshness spelling {keys_text}. It still works. {remedy}"
+        ),
+        file: Some(file),
+        field: Some(field),
+    }
+}
+
+/// W058 for every deprecated freshness spelling `rocky validate` can see:
+/// `rocky.toml` (project `[freshness]`, each `checks.freshness`), each
+/// model's own `[freshness]` and each `_defaults.toml`. Product specs are
+/// reported by [`validate_products`].
+///
+/// A sidecar that a product spec generated is skipped: its `[freshness]`
+/// is lowered from the spec, so the spec carries the warning and the fix.
+fn freshness_deprecations(
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    models: &[rocky_core::models::Model],
+    out: &mut ValidateOutput,
+) {
+    let config_file = config_path.display().to_string();
+    for deprecated in rocky_core::config::deprecated_freshness_spellings(cfg) {
+        out.push(freshness_deprecation_message(
+            config_file.clone(),
+            deprecated.field,
+            &deprecated.keys,
+            &deprecated.replacement,
+        ));
+    }
+
+    let mut defaults_files = std::collections::BTreeSet::new();
+    for model in models {
+        if let Some(dir) = model.file_path.parent() {
+            defaults_files.insert(dir.join("_defaults.toml"));
+        }
+        let Some(freshness) = &model.config.freshness else {
+            continue;
+        };
+        if !freshness.declared_in_sidecar {
+            continue;
+        }
+        let keys = freshness.legacy_keys();
+        if keys.is_empty() {
+            continue;
+        }
+        // The sidecar, or the model file itself for inline frontmatter.
+        let sidecar = model.file_path.with_extension("toml");
+        let file = match std::fs::read_to_string(&sidecar) {
+            Ok(text) => {
+                if text.starts_with("# GENERATED from products/") {
+                    continue;
+                }
+                sidecar
+            }
+            Err(_) => model.file_path.clone(),
+        };
+        out.push(freshness_deprecation_message(
+            file.display().to_string(),
+            "freshness".to_string(),
+            &keys,
+            &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+        ));
+    }
+
+    for path in defaults_files {
+        if !path.is_file() {
+            continue;
+        }
+        // The model load above already read this file; a failure here was
+        // reported there.
+        let Ok(defaults) = rocky_core::models::load_dir_defaults(&path) else {
+            continue;
+        };
+        let Some(freshness) = &defaults.freshness else {
+            continue;
+        };
+        let keys = freshness.legacy_keys();
+        if keys.is_empty() {
+            continue;
+        }
+        out.push(freshness_deprecation_message(
+            path.display().to_string(),
+            "freshness".to_string(),
+            &keys,
+            &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+        ));
+    }
 }
 
 /// Validate every `products/<name>.toml` spec, offline (no APIs, no
@@ -373,6 +490,21 @@ fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
                 continue;
             }
         };
+        if let Some(freshness) = &parsed.product().output.freshness {
+            let keys = freshness.legacy_keys();
+            if !keys.is_empty() {
+                let replacement = freshness
+                    .thresholds()
+                    .map(|levels| rocky_core::source_freshness::replacement_for(&levels))
+                    .unwrap_or_default();
+                out.push(freshness_deprecation_message(
+                    file_label.clone(),
+                    "product.output.freshness".to_string(),
+                    &keys,
+                    &replacement,
+                ));
+            }
+        }
         if parsed.product().name != stem {
             out.push(ValidateMessage {
                 severity: "error".into(),
@@ -991,7 +1123,7 @@ fn schedule_messages(
         sched,
         &cfg.schedule.timezone,
         &[],
-        cfg.freshness.expected_lag_seconds,
+        cfg.freshness.budget_seconds(),
     ) {
         let (code, message) = match e {
             ScheduleConfigError::BadCron(expr) => (
@@ -1021,7 +1153,7 @@ fn schedule_messages(
             ScheduleConfigError::FreshnessNoBudget => (
                 "V038",
                 format!(
-                    "pipeline.{name}: schedule.freshness = true but no freshness budget resolves — set [freshness].expected_lag_seconds or a per-model max_lag_seconds."
+                    "pipeline.{name}: schedule.freshness = true but no freshness budget resolves — set warn_after or error_after in the project [freshness] block or in a model [freshness] block."
                 ),
             ),
         };
@@ -2119,6 +2251,143 @@ agent = "propose_only"
 
     fn codes(out: &ValidateOutput, code: &str) -> usize {
         out.messages.iter().filter(|m| m.code == code).count()
+    }
+
+    // ----- deprecated freshness spellings (W058) -----
+
+    /// Write a project whose every freshness block uses `old` or `new`
+    /// spelling, and validate it.
+    fn freshness_project(old: bool) -> (tempfile::TempDir, ValidateOutput) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (project, check, sidecar, defaults, spec) = if old {
+            (
+                "expected_lag_seconds = 3600",
+                "threshold_seconds = 86400\nseverity = \"warning\"",
+                "max_lag_seconds = 7200\nseverity = \"error\"",
+                "expected_lag_seconds = 600",
+                r#"freshness = { max_lag = "24h", time_column = "id" }"#,
+            )
+        } else {
+            (
+                "warn_after = \"1h\"",
+                "warn_after = \"1d\"",
+                "error_after = \"2h\"",
+                "warn_after = \"600s\"",
+                r#"freshness = { warn_after = "24h", time_column = "id" }"#,
+            )
+        };
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.db]\ntype = \"duckdb\"\n\n[freshness]\n{project}\n\n\
+                 [pipeline.raw]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 [pipeline.raw.target]\nadapter = \"db\"\n\
+                 [pipeline.raw.checks]\nenabled = true\n\
+                 [pipeline.raw.checks.freshness]\n{check}\n"
+            ),
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("sub")).unwrap();
+        let target = |name: &str| {
+            format!(
+                "name = \"{name}\"\ntarget = {{ catalog = \"c\", schema = \"s\", table = \"{name}\" }}\n"
+            )
+        };
+        std::fs::write(models.join("own.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("own.toml"),
+            format!("{}\n[freshness]\n{sidecar}\n", target("own")),
+        )
+        .unwrap();
+        // A product-generated sidecar: the spec carries the warning.
+        std::fs::write(models.join("gen.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("gen.toml"),
+            format!(
+                "# GENERATED from products/alpha.toml (spec x) — edit the spec, not this file.\n{}\n[freshness]\n{sidecar}\n",
+                target("gen")
+            ),
+        )
+        .unwrap();
+        std::fs::write(models.join("sub").join("child.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(models.join("sub").join("child.toml"), target("child")).unwrap();
+        std::fs::write(
+            models.join("sub").join("_defaults.toml"),
+            format!("[freshness]\n{defaults}\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("products")).unwrap();
+        std::fs::write(
+            root.join("products").join("alpha.toml"),
+            MINIMAL_SPEC
+                .replace("NAME", "alpha")
+                .replace("grain = [\"id\"]", &format!("grain = [\"id\"]\n{spec}")),
+        )
+        .unwrap();
+        let out = validate_inner(&root.join("rocky.toml")).unwrap();
+        (dir, out)
+    }
+
+    #[test]
+    fn every_old_freshness_spelling_reports_w058_with_its_replacement() {
+        let (_dir, out) = freshness_project(true);
+        let w058: Vec<&ValidateMessage> =
+            out.messages.iter().filter(|m| m.code == "W058").collect();
+        let found = |file_suffix: &str, field: &str, replacement: &str| {
+            w058.iter().any(|m| {
+                m.severity == "warn"
+                    && m.file.as_deref().is_some_and(|f| f.ends_with(file_suffix))
+                    && m.field.as_deref() == Some(field)
+                    && m.message.contains(replacement)
+            })
+        };
+        assert!(
+            found("rocky.toml", "freshness", "warn_after = \"1h\""),
+            "{w058:#?}"
+        );
+        assert!(
+            found(
+                "rocky.toml",
+                "pipeline.raw.checks.freshness",
+                "warn_after = \"1d\""
+            ),
+            "{w058:#?}"
+        );
+        assert!(
+            found("own.toml", "freshness", "error_after = \"2h\""),
+            "{w058:#?}"
+        );
+        assert!(
+            found("_defaults.toml", "freshness", "warn_after = \"600s\""),
+            "{w058:#?}"
+        );
+        assert!(
+            found(
+                "products/alpha.toml",
+                "product.output.freshness",
+                "warn_after = \"1d\""
+            ),
+            "{w058:#?}"
+        );
+        assert_eq!(w058.len(), 5, "the generated sidecar is skipped: {w058:#?}");
+        assert!(
+            w058.iter().all(|m| m.message.contains("It still works")),
+            "{w058:#?}"
+        );
+        assert!(
+            out.valid,
+            "a deprecation never fails validate: {:?}",
+            out.messages
+        );
+    }
+
+    #[test]
+    fn the_new_freshness_spelling_reports_no_w058() {
+        let (_dir, out) = freshness_project(false);
+        assert_eq!(codes(&out, "W058"), 0, "{:?}", out.messages);
+        assert!(out.valid, "{:?}", out.messages);
     }
 
     #[test]

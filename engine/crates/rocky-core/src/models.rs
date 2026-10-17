@@ -496,8 +496,7 @@ impl ModelFreshnessConfig {
         match self.max_lag_seconds {
             Some(seconds) => crate::source_freshness::FreshnessThresholds::from_single(
                 seconds,
-                self.severity
-                    .unwrap_or(crate::tests::TestSeverity::Warning),
+                self.severity.unwrap_or(crate::tests::TestSeverity::Warning),
             ),
             None => crate::source_freshness::levels_of(
                 self.warn_after.as_deref(),
@@ -3369,7 +3368,8 @@ table = "fct_orders"
 
         let freshness = models[0].config.freshness.as_ref().expect("sidecar block");
         assert_eq!(
-            freshness.max_lag_seconds, Some(60),
+            freshness.max_lag_seconds,
+            Some(60),
             "the sidecar value must survive project inheritance"
         );
         assert_eq!(freshness.time_column.as_deref(), Some("event_ts"));
