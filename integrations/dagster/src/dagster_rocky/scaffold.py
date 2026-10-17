@@ -115,7 +115,7 @@ column_match = true
 # timestamp_column = "_loaded_at"
 #
 # [pipeline.main.checks.freshness]
-# threshold_seconds = 86400
+# error_after = "24h"
 """
 
 #: ``.gitignore`` for the scaffolded project: the files the engine creates
