@@ -11964,6 +11964,46 @@ schema_template = "raw"
         }
     }
 
+    /// TOML accepts `nan` and `inf`; neither is a price.
+    #[test]
+    fn cost_price_non_finite_is_rejected() {
+        for literal in ["nan", "inf", "-inf"] {
+            let config: RockyConfig =
+                toml::from_str(&format!("[cost]\ncompute_cost_per_dbu = {literal}\n")).unwrap();
+            let errors = validate_cost_prices(&config);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [ConfigError::CostPriceInvalid {
+                        key: "compute_cost_per_dbu",
+                        ..
+                    }]
+                ),
+                "{literal}: {errors:?}"
+            );
+        }
+    }
+
+    /// Zero is a valid price (a free tier, a sunk cost).
+    #[test]
+    fn cost_price_zero_is_accepted() {
+        let config: RockyConfig =
+            toml::from_str("[cost]\ncompute_cost_per_machine_hour = 0.0\n").unwrap();
+        assert!(validate_cost_prices(&config).is_empty());
+    }
+
+    /// The check runs when a project loads, not only when called directly.
+    #[test]
+    fn load_rocky_config_rejects_a_negative_price() {
+        let (_d, path) =
+            write_cfg("[adapter]\ntype = \"duckdb\"\n\n[cost]\nstorage_cost_per_gb_month = -1.0\n");
+        let err = load_rocky_config(&path).expect_err("a negative price must not load");
+        assert!(
+            format!("{err:#}").contains("storage_cost_per_gb_month"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn cost_section_unset_prices_are_not_serialized() {
         let json = serde_json::to_value(CostSection::default()).unwrap();
