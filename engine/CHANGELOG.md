@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A process adapter (an out-of-process adapter that talks JSON-RPC over stdin and stdout) can no longer block Rocky forever, fill its memory, or outlive it. `ProcessAdapter` now bounds every exchange and stops the adapter when a bound is hit.
+  - A call that gets no answer within 1 hour fails with `ProcessAdapterError::Timeout`. The `initialize` exchange in `ProcessAdapter::spawn` has a 60-second limit, so one hung `rocky-*` binary no longer blocks `rocky adapter list`. The timeout also covers writing the request.
+  - A response line longer than 64 MiB fails with `ProcessAdapterError::ResponseTooLarge`. Rocky reads one byte past the limit and no more.
+  - After a timeout or an oversized response, the adapter is stopped, and every later call on it fails with `ProcessAdapterError::Stopped`.
+  - On Unix the adapter now leads its own process group. Stopping it sends `SIGTERM` to the group, waits up to 5 seconds for the adapter to exit, then sends `SIGKILL` to the group. That stops what the adapter started too. `close()` does the same after its `shutdown` call, which now waits at most 5 seconds. Dropping a `ProcessAdapter` sends `SIGKILL` to the group. On other platforms only the adapter itself is killed.
+  - The limits are in code only, not in `rocky.toml`. `ProcessAdapter::spawn_with_limits` takes a `ProcessLimits`; `spawn` uses the defaults above.
+  - Because the adapter is in its own process group, a Ctrl-C in the terminal no longer reaches it directly. Rocky stops it when Rocky exits normally or drops it.
+
 ## [1.86.0] — 2026-10-17
 
 ### Fixed
