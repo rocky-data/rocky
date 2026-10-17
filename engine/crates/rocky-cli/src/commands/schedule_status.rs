@@ -11,10 +11,13 @@
 //! delivers such a product it
 //! also reads the product's latest delivery and the pipeline's last 20
 //! production runs for the duration estimate. Each of those history reads
-//! walks the ordering key of every recorded run, and decodes runs until it
-//! finds what it needs, every run when the pipeline never ran in production.
-//! So with a deadline declared, this read is `O(pipelines × runs)`. With no
-//! product declaring `deliver_by`, it reads no run history at all.
+//! walks the ordering key of every recorded run (cheap), and decodes full
+//! records only until it finds what it needs. The search for the newest
+//! deadlined build decodes at most [`DELIVERY_LOOKUP_WINDOW`] runs per
+//! pipeline, so full-record decoding is `O(pipelines × window)`; the key walk
+//! stays `O(pipelines × runs)`. A deadlined build older than the window reads
+//! as no delivery. With no product declaring `deliver_by`, it reads no run
+//! history at all.
 //!
 //! The scheduled set comes from [`resolve_schedules_detailed`], the
 //! reconciler's own resolution — not from iterating `config.pipelines` and
@@ -188,13 +191,23 @@ fn collect_claims(store: Option<&StateStore>) -> Result<ClaimsByPipeline, Schedu
     Ok(out)
 }
 
+/// How many of the newest recorded runs the delivery lookup decodes per
+/// pipeline.
+///
+/// A window, not a history search: a pipeline whose newest deadlined build is
+/// older than this many runs (of any pipeline) reads as delivering nothing.
+/// It stops a pipeline that never builds a deadlined model from decoding the
+/// whole, never-pruned history on every request.
+const DELIVERY_LOOKUP_WINDOW: usize = 500;
+
 /// The delivery state of the most urgent product deadline `pipeline`
 /// delivers.
 ///
 /// The pipeline delivers the products whose output models its newest
 /// production run that built any deadlined model built. With several, the one
 /// whose next deadline comes first wins. `None` without a store, or when no
-/// production run of the pipeline ever built a deadlined model.
+/// production run of the pipeline, within the newest [`DELIVERY_LOOKUP_WINDOW`]
+/// runs, built a deadlined model.
 ///
 /// # Errors
 ///
@@ -220,7 +233,7 @@ fn pipeline_delivery(
     // before the output model, would otherwise make the pipeline read as
     // delivering nothing.
     let latest = store
-        .list_runs_matching(1, |run| {
+        .list_runs_matching_within(1, DELIVERY_LOOKUP_WINDOW, |run| {
             run.pipeline.as_deref() == Some(pipeline)
                 && run.counts_as_production(UnrecordedScope::Exclude)
                 && run.models_executed.iter().any(|execution| {
