@@ -431,16 +431,16 @@ impl<'de> Deserialize<'de> for ModelFreshnessConfig {
                 crate::source_freshness::mixed_spelling_message(&old),
             ));
         }
-        if raw.max_lag_seconds.is_none() {
-            if let Err(problems) = crate::source_freshness::parse_levels(
+        if raw.max_lag_seconds.is_none()
+            && let Err(problems) = crate::source_freshness::parse_levels(
                 raw.warn_after.as_deref(),
                 raw.error_after.as_deref(),
-            ) {
-                return Err(serde::de::Error::custom(format!(
-                    "[freshness]: {}",
-                    crate::source_freshness::problems_message(&problems)
-                )));
-            }
+            )
+        {
+            return Err(serde::de::Error::custom(format!(
+                "[freshness]: {}",
+                crate::source_freshness::problems_message(&problems)
+            )));
         }
         Ok(ModelFreshnessConfig {
             max_lag_seconds: raw.max_lag_seconds,

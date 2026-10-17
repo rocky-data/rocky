@@ -200,9 +200,9 @@ pub fn problems_message(problems: &[FreshnessConfigProblem]) -> String {
 /// Render seconds in the duration grammar, in the largest exact unit
 /// (`86400` -> `"1d"`, `3600` -> `"1h"`, `90` -> `"90s"`).
 pub fn format_duration(seconds: u64) -> String {
-    if seconds > 0 && seconds % 86_400 == 0 {
+    if seconds > 0 && seconds.is_multiple_of(86_400) {
         format!("{}d", seconds / 86_400)
-    } else if seconds > 0 && seconds % 3_600 == 0 {
+    } else if seconds > 0 && seconds.is_multiple_of(3_600) {
         format!("{}h", seconds / 3_600)
     } else {
         format!("{seconds}s")
