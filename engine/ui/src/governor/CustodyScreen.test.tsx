@@ -28,6 +28,7 @@ const CHAIN: AuditForOutput = {
         reason: "<script>alert(1)</script> hostile reason",
         principal_id: null,
         principal_id_verified: false,
+        kind: "evaluation",
       },
     ],
   },
