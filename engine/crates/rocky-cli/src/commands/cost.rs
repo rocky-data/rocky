@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use rocky_core::config::load_optional_project_config;
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
-    ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore, UnrecordedScope,
+    ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore, StoredBytesBasis, UnrecordedScope,
 };
 
 use crate::output::{CostGroup, CostOutput, PerModelCostHistorical};
@@ -218,6 +218,8 @@ fn build_output(
             bytes_scanned: exec.bytes_scanned,
             bytes_written: exec.bytes_written,
             cost_usd: cost,
+            stored_bytes: exec.stored_bytes.map(|s| s.bytes),
+            stored_bytes_basis: exec.stored_bytes.map(|s| s.basis),
         });
     }
 
@@ -327,6 +329,16 @@ fn build_groups(per_model: &[PerModelCostHistorical], by: CostGroupBy) -> Vec<Co
         .collect()
 }
 
+/// One `stored_bytes` table cell: the bytes, marked `(est)` when the
+/// figure is an estimate, or `-` when unknown.
+fn stored_bytes_cell(bytes: Option<u64>, basis: Option<StoredBytesBasis>) -> String {
+    match (bytes, basis) {
+        (Some(b), Some(StoredBytesBasis::DataFiles)) => b.to_string(),
+        (Some(b), Some(StoredBytesBasis::AllocatedBlocks)) => format!("{b} (est)"),
+        (Some(_), None) | (None, _) => "-".to_string(),
+    }
+}
+
 fn print_table(output: &CostOutput) {
     println!("run: {}", output.run_id);
     println!("status: {}", output.status);
@@ -345,10 +357,11 @@ fn print_table(output: &CostOutput) {
     println!("models ({}):", output.per_model.len());
     // Align headers roughly; keep it simple (no external table crate).
     println!(
-        "  {:<32}  {:>10}  {:>12}  {:>14}  {:>14}  {:>12}  status",
-        "model", "duration", "rows", "bytes_scan", "bytes_write", "cost_usd"
+        "  {:<32}  {:>10}  {:>12}  {:>14}  {:>14}  {:>16}  {:>12}  status",
+        "model", "duration", "rows", "bytes_scan", "bytes_write", "stored_bytes", "cost_usd"
     );
     for m in &output.per_model {
+        let stored = stored_bytes_cell(m.stored_bytes, m.stored_bytes_basis);
         let rows = m
             .rows_affected
             .map(|v| v.to_string())
@@ -366,8 +379,18 @@ fn print_table(output: &CostOutput) {
             .map(|v| format!("${v:.6}"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {:<32}  {:>10}  {:>12}  {:>14}  {:>14}  {:>12}  {}",
-            m.model_name, m.duration_ms, rows, bs, bw, cost, m.status
+            "  {:<32}  {:>10}  {:>12}  {:>14}  {:>14}  {:>16}  {:>12}  {}",
+            m.model_name, m.duration_ms, rows, bs, bw, stored, cost, m.status
+        );
+    }
+    if output
+        .per_model
+        .iter()
+        .any(|m| m.stored_bytes_basis == Some(StoredBytesBasis::AllocatedBlocks))
+    {
+        println!(
+            "  (est) = estimate: storage blocks x block size; overstates a small table, \
+             because a partly filled block counts in full"
         );
     }
     println!();
@@ -569,6 +592,7 @@ mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -682,6 +706,45 @@ mod tests {
         assert_eq!(out.per_model[0].duration_ms, 5_000);
         assert_eq!(out.per_model[0].bytes_scanned, Some(1_024));
         assert_eq!(out.per_model[0].status, "success");
+    }
+
+    /// Recorded stored bytes reach the per-model row with their basis; an
+    /// unknown stays unknown and is omitted from JSON.
+    #[test]
+    fn per_model_reports_recorded_stored_bytes_with_basis() {
+        let mut measured = sample_exec("orders", "success", 10, None, None);
+        measured.stored_bytes = Some(rocky_core::state::StoredBytes {
+            bytes: 524_288,
+            basis: StoredBytesBasis::AllocatedBlocks,
+        });
+        let unknown = sample_exec("v", "success", 10, None, None);
+        let record = sample_run("run-sb", vec![measured, unknown]);
+
+        let out = build_output(&record, None, None, None);
+
+        assert_eq!(out.per_model[0].stored_bytes, Some(524_288));
+        assert_eq!(
+            out.per_model[0].stored_bytes_basis,
+            Some(StoredBytesBasis::AllocatedBlocks)
+        );
+        assert_eq!(out.per_model[1].stored_bytes, None);
+        assert_eq!(out.per_model[1].stored_bytes_basis, None);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["per_model"][0]["stored_bytes"], 524_288);
+        assert_eq!(
+            json["per_model"][0]["stored_bytes_basis"],
+            "allocated_blocks"
+        );
+        assert!(json["per_model"][1].get("stored_bytes").is_none());
+        assert_eq!(
+            stored_bytes_cell(Some(524_288), Some(StoredBytesBasis::AllocatedBlocks)),
+            "524288 (est)"
+        );
+        assert_eq!(
+            stored_bytes_cell(Some(10), Some(StoredBytesBasis::DataFiles)),
+            "10"
+        );
+        assert_eq!(stored_bytes_cell(None, None), "-");
     }
 
     #[test]

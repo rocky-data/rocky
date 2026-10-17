@@ -45,37 +45,6 @@ class CostGroup(BaseModel):
     """
 
 
-class PerModelCostHistorical(BaseModel):
-    """
-    A single model's cost attribution inside [`CostOutput`].
-
-    Distinct from [`ModelCostEntry`] (which lives on [`RunCostSummary`]) because the historical surface carries the richer fields the state store actually persists: model name (not asset-key vector), row/byte counts, and the recorded per-model status.
-    """
-
-    bytes_scanned: conint(ge=0) | None = None
-    """
-    Adapter-reported bytes figure used for cost accounting. This is the *billing-relevant* number per adapter, not literal scan volume:
-
-    - **BigQuery:** `totalBytesBilled` — includes the 10 MB per-query minimum floor; matches the BigQuery console's "Bytes billed" field, **not** "Bytes processed". - **Databricks:** when populated, byte count from the statement-execution manifest (`total_byte_count`); `None` today until the manifest plumbing lands. - **Snowflake:** `None` — deferred by design (QUERY_HISTORY round-trip cost; Snowflake cost is duration × DBU, not bytes-driven). - **DuckDB:** `None` — no billed-bytes concept.
-    """
-    bytes_written: conint(ge=0) | None = None
-    """
-    Adapter-reported bytes-written figure. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet.
-    """
-    cost_usd: float | None = None
-    """
-    Observed cost for this execution. `None` when the adapter isn't a billed warehouse, the config couldn't be loaded, or the formula inputs were unavailable (e.g. BigQuery without `bytes_scanned`).
-    """
-    duration_ms: conint(ge=0)
-    model_name: str
-    rows_affected: conint(ge=0) | None = None
-    status: str
-    tenant: str | None = None
-    """
-    Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
-    """
-
-
 class RunScopeKind1(StrEnum):
     """
     Wrote production targets.
@@ -106,6 +75,63 @@ class RunScopeKind4(StrEnum):
     """
 
     unrecorded = "unrecorded"
+
+
+class StoredBytesBasis1(StrEnum):
+    """
+    Exact: the summed size of the table's live Parquet data files, as Rocky wrote them. Excludes table-format metadata (the Delta log, Iceberg manifests).
+    """
+
+    data_files = "data_files"
+
+
+class StoredBytesBasis2(StrEnum):
+    """
+    Estimate: the number of storage blocks the table's column segments occupy, times the block size (DuckDB). It is file space allocated to the table, not payload bytes. It overstates a small table (a partly filled block counts in full), counts a block shared with another table once for each table, and leaves out table metadata blocks.
+    """
+
+    allocated_blocks = "allocated_blocks"
+
+
+class PerModelCostHistorical(BaseModel):
+    """
+    A single model's cost attribution inside [`CostOutput`].
+
+    Distinct from [`ModelCostEntry`] (which lives on [`RunCostSummary`]) because the historical surface carries the richer fields the state store actually persists: model name (not asset-key vector), row/byte counts, and the recorded per-model status.
+    """
+
+    bytes_scanned: conint(ge=0) | None = None
+    """
+    Adapter-reported bytes figure used for cost accounting. This is the *billing-relevant* number per adapter, not literal scan volume:
+
+    - **BigQuery:** `totalBytesBilled` — includes the 10 MB per-query minimum floor; matches the BigQuery console's "Bytes billed" field, **not** "Bytes processed". - **Databricks:** when populated, byte count from the statement-execution manifest (`total_byte_count`); `None` today until the manifest plumbing lands. - **Snowflake:** `None` — deferred by design (QUERY_HISTORY round-trip cost; Snowflake cost is duration × DBU, not bytes-driven). - **DuckDB:** `None` — no billed-bytes concept.
+    """
+    bytes_written: conint(ge=0) | None = None
+    """
+    Adapter-reported bytes-written figure. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet.
+    """
+    cost_usd: float | None = None
+    """
+    Observed cost for this execution. `None` when the adapter isn't a billed warehouse, the config couldn't be loaded, or the formula inputs were unavailable (e.g. BigQuery without `bytes_scanned`).
+    """
+    duration_ms: conint(ge=0)
+    model_name: str
+    rows_affected: conint(ge=0) | None = None
+    status: str
+    stored_bytes: conint(ge=0) | None = None
+    """
+    The bytes the model's output table stored right after this execution wrote it, read back from the persisted `rocky_core::state::ModelExecution::stored_bytes`. Read `stored_bytes_basis` to tell an exact figure from an estimate.
+
+    `None` (and omitted from JSON) means unknown: a view, a replicated table, a `time_interval` partition, an adapter that cannot measure it (every adapter except DuckDB today), an in-memory DuckDB database, a failed measurement, or a run recorded before this field existed. There is no run total: the bases differ, so a sum would mix exact and estimated figures.
+    """
+    stored_bytes_basis: StoredBytesBasis1 | StoredBytesBasis2 | None = None
+    """
+    How `stored_bytes` was measured: `data_files` (exact Parquet data-file bytes, content-addressed outputs) or `allocated_blocks` (an estimate: DuckDB storage blocks times the block size, which overstates a small table). Present exactly when `stored_bytes` is.
+    """
+    tenant: str | None = None
+    """
+    Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
+    """
 
 
 class CostOutput(BaseModel):

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rocky run` now records the bytes each model's output table stores, and `rocky cost` shows them. `PerModelCostHistorical` gains `stored_bytes` and `stored_bytes_basis`; the table output gains a `stored_bytes` column. An unknown size is omitted, never guessed. There is no run total, because the two bases below do not add up to one honest figure.
+  - DuckDB (file database): an estimate, basis `allocated_blocks`. Rocky runs `CHECKPOINT` on the table's database, then counts the distinct storage blocks in `pragma_storage_info` and multiplies by the block size. A small table reads as one whole block (262,144 bytes by default), so the figure overstates it. A block that two tables share counts for both. The checkpoint writes the WAL into the database file, which DuckDB does at close anyway; it adds one checkpoint per measured model.
+  - Content-addressed models: exact, basis `data_files`. The figure is the summed size of the Parquet data files the run committed or referenced, without the Delta log or Iceberg metadata.
+  - Not measured, so unknown: views, replicated tables, `time_interval` partitions, an in-memory DuckDB database, and every other adapter. `duckdb_tables().estimated_size` is a row count, not bytes, so Rocky does not use it.
+  - The run record's `ModelExecution` gains an optional `stored_bytes`. No state schema bump: it is omitted when unknown, and a value this binary cannot read loads as unknown. Adapters can implement the new `WarehouseAdapter::stored_table_bytes`; the default is unknown.
+
 ### Changed
 
 - `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 attempts when another writer wins. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.
