@@ -153,7 +153,7 @@ Rocky prints the placeholder, not the value. Some fields print `${DATABRICKS_TOK
 | `rocky validate` | A pipeline's `strategy`, `catalog_template` and `schema_template`, and the text of every message. |
 | `rocky doctor` | Every check message, detail and suggestion. |
 | `rocky hooks list`, `rocky hooks test` | A hook's `command`, and the abort reason (which quotes a command or webhook URL). |
-| `rocky schedule status` | `timezone`, and each pipeline's `cron`, `after` and config error. |
+| `GET /api/v1/schedule` (`rocky serve`) | `timezone`, and each pipeline's `cron`, `after` and config error. |
 | `rocky audit` | A decision's `model` and `reason`, and a verification's `checks` and `reason`. |
 | The policy-decision ledger | A `verify_after` check name and its outcome text are stored as `${NAME}`, so a later reader never needs the value. |
 | `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section is stored beside it, so `rocky apply` still refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |

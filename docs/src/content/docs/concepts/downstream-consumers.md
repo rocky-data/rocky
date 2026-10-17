@@ -77,8 +77,8 @@ error.
 `diagnostics`, but does not fail on it, so a scoped test is not blocked by a
 consumer file it never selected. `rocky ci` always covers the whole project.
 
-`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan`,
-`rocky propose` and the compile check of `rocky fulfill` do not stop for it. A
+`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan`, the MCP
+`propose` tool and the compile check of `rocky fulfill` do not stop for it. A
 consumer is metadata about the readers of your models, so a wrong record cannot
 make a model unsafe to write. The run writes the models, does not count the
 consumer as a failed table, and lists each problem in the
