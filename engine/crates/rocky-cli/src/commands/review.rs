@@ -5807,8 +5807,9 @@ max_retries = 0
     /// Test 4. Under CAS, two conflicts replay the transition: one approval
     /// row lands next to the remote winner, and one marker. Three conflicts
     /// exhaust the seam: the command fails, no marker, and the remote keeps
-    /// only the winner. Mutation: build the record inside the attempt with a
-    /// fresh timestamp and the replay leaves three rows.
+    /// only the winner. Each attempt starts from a fresh download, so the
+    /// attempt must write the row every time. Mutation: write the row on the
+    /// first attempt only and the committed replay holds no approval.
     #[tokio::test(flavor = "multi_thread")]
     async fn cas_conflicts_replay_to_one_row_and_exhaustion_writes_no_marker() {
         use rocky_core::test_harness::CrossPodHarness;
@@ -5871,9 +5872,9 @@ max_retries = 0
 
     /// Test 5. Across the v32 -> v33 bump: only `v32/state.redb` holds the
     /// shared ledger. The approval carries it forward, writes `v33/` with the
-    /// old rows and the approval, and never writes `v32/`. Mutation: an
-    /// approval that skipped the download would publish a v33 ledger without
-    /// the old rows.
+    /// old rows and the approval, and never writes `v32/`. Mutation: record
+    /// the row in the local store instead of through the seam and no `v33/`
+    /// key is written.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_approval_carries_the_previous_version_ledger_forward() {
         use rocky_core::test_harness::CrossPodHarness;
