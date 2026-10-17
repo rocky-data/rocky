@@ -827,7 +827,21 @@ impl RockyLsp {
         let schema_cache_config = models_dir
             .parent()
             .map(|root| root.join("rocky.toml"))
-            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
+            .and_then(|toml_path| {
+                if !toml_path.exists() {
+                    return None;
+                }
+                // A config the CLI refuses (V060, V061, a parse error) still
+                // falls back to defaults here, but says why.
+                rocky_core::config::load_rocky_config(&toml_path)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            path = %toml_path.display(),
+                            "rocky.toml did not load, so the schema cache uses its defaults: {e}"
+                        );
+                    })
+                    .ok()
+            })
             .map(|c| c.cache.schemas)
             .unwrap_or_default();
 

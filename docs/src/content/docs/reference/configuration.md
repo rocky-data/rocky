@@ -1389,6 +1389,8 @@ Rocky checks only a pipeline's own source and target. These carry no region, so 
 
 So a transformation in `"us"` that reads a table another pipeline wrote in `"eu"` is not refused.
 
+`[ai] region` is not compared with anything yet. An AI endpoint in `"us"` over a project whose data is in `"eu"` is not refused.
+
 ### Required labels (`V060`)
 
 With `enforce = true`, Rocky requires `region` on each of these blocks:

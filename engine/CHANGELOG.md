@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Under `enforce`, `[ai] region` is required even in a project that never runs `rocky ai`.
   - A replication or snapshot pipeline whose source and target labels differ is a `V061` error, whether or not `enforce` is on. `[residency] allow = [{ from = "eu", to = "us" }]` lets one direction through.
   - Rocky checks only a pipeline's own source and target. A transformation's SQL inputs, a quality pipeline's `tables`, a load pipeline's `source_dir`, a Fivetran `source.discovery` and a pipeline-level `depends_on` carry no region, so a move through them is not refused.
+  - `[ai] region` is not compared with anything yet, so an AI endpoint in another region is not refused.
   - `rocky validate` reports `V060` and `V061` offline. Every command that loads the config (`plan`, `run`, `apply`, `discover`) refuses them.
   - A project that sets none of these keys serializes as before, so its plan ids and config routing identity do not change. `rocky apply` reloads the config and runs the same checks, so removing an `allow` entry also refuses a plan made before.
 

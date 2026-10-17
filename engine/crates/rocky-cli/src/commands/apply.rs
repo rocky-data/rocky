@@ -13677,6 +13677,54 @@ schema_template = "s__{source}"
         Ok(())
     }
 
+    /// A plan made while `[residency] allow` let an EU-to-US pipeline through
+    /// must not apply once that entry is gone: apply reloads the config, and
+    /// the reload refuses the cross-region pipeline with V061.
+    #[tokio::test]
+    async fn replication_apply_refuses_once_the_allow_entry_is_removed() -> anyhow::Result<()> {
+        let labelled = REPLICATION_TOML
+            .replace(
+                "[pipeline.p.source.schema_pattern]",
+                "[pipeline.p.source]\nregion = \"eu\"\n\n[pipeline.p.source.schema_pattern]",
+            )
+            .replace(
+                r#"catalog_template = "c""#,
+                "catalog_template = \"c\"\nregion = \"us\"",
+            );
+        let allowed =
+            format!("{labelled}\n[residency]\nallow = [{{ from = \"eu\", to = \"us\" }}]\n");
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, &allowed)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        std::fs::write(&cfg_path, &labelled)?;
+
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )
+        .await
+        .expect_err("removing the allow entry must refuse a plan made under it");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("V061"),
+            "must refuse on the cross-region check, got: {msg}"
+        );
+        Ok(())
+    }
+
     /// The comparison must not fire when the config is untouched, or every
     /// replication apply would refuse. Proves the refusal above is caused by
     /// the change, not by the comparison always failing.
