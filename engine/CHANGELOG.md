@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Snapshot checks once, before any warehouse work, because its `MERGE` and `INSERT` share no transaction. A snapshot that has started runs to completion.
   - Load starts no new file. Loaded files keep their ledger rows and the remote state is still uploaded. The load JSON lists only the files that ran. An interrupted load exits 130 even when an earlier file failed. `rocky load` on its own has no signal handling, as before.
   - Quality and snapshot record the run as interrupted and release the remote-state session without upload, as a transformation run does.
+- An interrupted replication run now writes the watermarks of copies that already committed before it waits on the copies still running (#1606). Before, they were written only after every running copy finished, so a stalled copy that outlasted the 5 s settle grace lost them. Where the adapter cannot recover a watermark from the target, the next run then appended those rows again. This hit `rocky run --watch` most, which drops the interrupted iteration after 5 s. A shutdown signal under `--watch` stays prompt.
 
 ## [1.86.0] — 2026-10-17
 
