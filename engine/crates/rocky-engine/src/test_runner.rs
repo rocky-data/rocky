@@ -190,29 +190,6 @@ pub fn source_schemas_from_db(
     Ok(by_table)
 }
 
-/// Run tests on the models under `models_dir`, with the seed file at
-/// `data/seed.sql` beside it. See [`run_tests_with`].
-pub fn run_tests(
-    models_dir: &Path,
-    contracts_dir: Option<&Path>,
-    model_filter: Option<&str>,
-    run_vars: &rocky_core::run_vars::RunVars,
-) -> anyhow::Result<TestResult> {
-    run_tests_with(TestRunInputs {
-        models_dir,
-        project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
-        models: TestModels::Dir,
-        contracts_dir,
-        model_filter,
-        run_vars,
-        gates: None,
-        inlined_gates: None,
-        strict_contracts: false,
-        target_dialects: Default::default(),
-        extensions: ExtensionOptions::default(),
-    })
-}
-
 /// Run tests on a project.
 ///
 /// 1. Run the project's seed file, when it has one, in a fresh in-memory
@@ -872,6 +849,29 @@ fn ordered_mismatches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: [`run_tests_with`] on `models_dir` with default extension
+    /// options. Lives here so production code cannot reach DuckDB's autoinstall.
+    fn run_tests(
+        models_dir: &Path,
+        contracts_dir: Option<&Path>,
+        model_filter: Option<&str>,
+        run_vars: &rocky_core::run_vars::RunVars,
+    ) -> anyhow::Result<TestResult> {
+        run_tests_with(TestRunInputs {
+            models_dir,
+            project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+            models: TestModels::Dir,
+            contracts_dir,
+            model_filter,
+            run_vars,
+            gates: None,
+            inlined_gates: None,
+            strict_contracts: false,
+            target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
+        })
+    }
 
     /// Set up a temp project with two SQL models (`raw_orders`, `good_mart`)
     /// where `good_mart` reads from `raw_orders`. Returns the temp dir guard

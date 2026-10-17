@@ -52,7 +52,7 @@ SET extension_directory = '/opt/rocky/duckdb-extensions';
 INSTALL icu;
 ```
 
-Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter itself, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed it runs for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. These read the settings of the `type = "duckdb"` adapters in `rocky.toml`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found.
+Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter itself, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed it runs for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. These read the settings of the `type = "duckdb"` adapters in `rocky.toml`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found. For `rocky compile`, a missing extension only logs a warning, and compile goes on without the seed schemas.
 
 Offline mode limits what Rocky does. It does not sandbox a model's own SQL: a model that runs `INSTALL` or `SET autoinstall_known_extensions = true` can still reach the network. `rocky validate` warns with `V059` when `extension_directory` or `offline` is set on an adapter whose `type` is not `duckdb`, because no other adapter reads them.
 
