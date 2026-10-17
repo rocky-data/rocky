@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `GET /api/v1/jobs/{id}` now withholds `result` and `error` for a job record written before redaction (#1919). Before, when such a record was read from the state file and held a resolved `${VAR}` value, the server served the `held` placeholder in those two fields. Both fields now read `null`, as for every other record from before redaction. No secret value was shown either way.
+
 ## [1.86.0] — 2026-10-17
 
 ### Fixed

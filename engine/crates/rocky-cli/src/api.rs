@@ -4927,7 +4927,15 @@ async fn get_job(
 
     match record {
         Some(record) => {
-            let record = sanitize_for_storage(record);
+            // Sanitizing stamps the current redaction version on a record it
+            // rewrites. A legacy record must stay legacy, so its payload is
+            // still withheld rather than served as the `held` markers.
+            let version = record.redaction_version;
+            let legacy = record.redaction_is_legacy();
+            let mut record = sanitize_for_storage(record);
+            if legacy {
+                record.redaction_version = version;
+            }
             // Warm the cache so subsequent reads are hot — but only for a
             // finished record.
             //
