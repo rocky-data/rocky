@@ -126,7 +126,12 @@ storage_cost_per_gb_month = 0.023
 compute_cost_per_dbu      = 0.40
 warehouse_size            = "Medium"
 min_history_runs          = 5
+# Optional prices, unset by default, read by no cost command yet (USD):
+# compute_cost_per_machine_hour     = 1.50  # per machine-hour
+# cross_region_transfer_cost_per_gb = 0.02  # per GB moved across regions
+# ai_cost_per_million_tokens        = 3.00  # per 1,000,000 tokens
 ```
+A negative or non-finite price is refused at load.
 
 ## Hooks
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[cost]` is now an engine-neutral price table. Three optional prices join `storage_cost_per_gb_month` and `compute_cost_per_dbu`: `compute_cost_per_machine_hour` (USD per machine-hour), `cross_region_transfer_cost_per_gb` (USD per GB moved across regions) and `ai_cost_per_million_tokens` (USD per 1,000,000 tokens). They are unset by default, are left out of serialized config when unset, and are not read by any cost command yet. Every `[cost]` price must now be finite and 0 or more, or the config is refused at load.
+
 ### Changed
 
 - `rocky review <plan-id> --approve` now records one approval row in the policy-decision ledger before it writes the review marker. This covers the CLI, the MCP `review_queue` approve action and the browser UI's approve job. The row goes through the same ledger seam as `rocky policy freeze`: the local state file, or the remote `[state]` ledger with a fail-closed upload and, under `concurrency_control = "cas"`, up to 3 attempts when another writer wins. If the row cannot be recorded, no marker is written and `rocky apply` stays blocked. If the marker write fails after the row is recorded, the error says `approval recorded as <decision_ref>`; re-running `--approve` records a second row.
