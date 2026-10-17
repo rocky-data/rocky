@@ -1255,6 +1255,12 @@ def main() -> int:
 
     print(f"\n=== soak verdict: {result['verdict']} ===")
     metrics = result["metrics"]
+    # Which arm of the #1416 experiment this was; meta.json predating the mode
+    # field is the polled harness.
+    mode = result["meta"].get("harvest_mode", "poll")
+    print(f"  harvest_mode={mode} "
+          + ("(ledger read once from the state file after shutdown)" if mode == "end"
+             else f"(GET /runs every {result['meta'].get('harvest_interval', '?')}s)"))
     if "ticks" in metrics:
         t = metrics["ticks"]
         print(f"  ticks={t['count']} executions={t['sum_executed']} fires={t['harvested_fires']} "
