@@ -118,6 +118,7 @@ fn project_inherited_old_spelling_serializes_as_before() {
         expected_lag_seconds: Some(1800),
         time_column: Some("updated_at".to_string()),
         severity: Some(rocky_core::tests::TestSeverity::Error),
+        ..Default::default()
     };
     assert_eq!(
         model_freshness_json("", None, Some(&project)),
