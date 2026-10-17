@@ -886,7 +886,10 @@ mod tests {
         let bytes: Vec<Option<u64>> = got.iter().map(|s| s.map(|s| s.bytes)).collect();
         assert_eq!(bytes[0], Some(block), "10 rows occupy one block");
         let big = bytes[1].expect("a three-part name is measured");
-        assert!(big > block && big % block == 0, "a million rows: {big}");
+        assert!(
+            big > block && big.is_multiple_of(block),
+            "a million rows: {big}"
+        );
         assert_eq!(
             bytes[2],
             Some(block),
