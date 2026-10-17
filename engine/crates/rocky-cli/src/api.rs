@@ -1634,10 +1634,7 @@ fn project_root_for(state: &ServerState) -> Result<std::path::PathBuf, ApiError>
         .config_path
         .as_deref()
         .ok_or_else(ApiError::engine_not_ready)?;
-    Ok(match config.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    })
+    Ok(crate::commands::product::product_command_root(config))
 }
 
 /// `GET /api/v1/products` — canonical [`ProductListOutput`].

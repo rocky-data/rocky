@@ -336,7 +336,7 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 /// A project without a `products/` directory emits nothing — the block
 /// is silent rather than noisy for the majority that don't use specs.
 fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
-    let root = config_path.parent().unwrap_or(Path::new("."));
+    let root = crate::commands::product::product_command_root(config_path);
     let products_dir = root.join("products");
     let Ok(entries) = std::fs::read_dir(&products_dir) else {
         return;
