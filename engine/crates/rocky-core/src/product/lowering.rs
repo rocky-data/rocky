@@ -1463,6 +1463,37 @@ agent = "propose_only"
     }
 
     #[test]
+    fn a_delivery_deadline_lowers_to_verified_rows_in_both_phases() {
+        let intent = "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n";
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replacen(
+                intent,
+                &format!("{intent}deliver_by = \"0 6 * * *\"\ntimezone = \"Europe/Lisbon\"\n"),
+                1,
+            );
+        let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid");
+        assert!(parsed.product().deliver_by().is_some(), "precondition");
+
+        // Both phases run the totality check; a missing row would refuse.
+        let phase_a = lower_phase_a(&parsed, SPEC_PATH).expect("phase A").manifest;
+        let phase_b = lower_phase_b(
+            &parsed,
+            SPEC_PATH,
+            &drafted_sidecar_text(),
+            &verified_phase_a_manifest(&parsed),
+        )
+        .expect("phase B")
+        .manifest;
+        for manifest in [&phase_a, &phase_b] {
+            for key in ["product.deliver_by", "product.timezone"] {
+                let row = manifest.fields.get(key).expect(key);
+                assert_eq!(row.disposition, Disposition::Verified, "{key}");
+            }
+        }
+    }
+
+    #[test]
     fn a_single_column_grain_changes_the_manifest_location_detail() {
         let single = String::from_utf8(SPEC_FIXTURE.to_vec())
             .expect("utf-8")
