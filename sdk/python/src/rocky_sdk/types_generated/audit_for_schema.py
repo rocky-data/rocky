@@ -84,6 +84,46 @@ class AuditVerifyEntry(BaseModel):
     """
 
 
+class BriefDecisionKind6(StrEnum):
+    """
+    A policy gate evaluated a plan. `effect` is the policy verdict.
+    """
+
+    evaluation = "evaluation"
+
+
+class BriefDecisionKind7(StrEnum):
+    """
+    A post-apply verification row. `effect` says whether the named checks passed; it is not a policy verdict.
+    """
+
+    verify_after_custody = "verify_after_custody"
+
+
+class BriefDecisionKind8(StrEnum):
+    """
+    An operator froze a scope. Recorded with `effect = deny`.
+    """
+
+    freeze = "freeze"
+
+
+class BriefDecisionKind9(StrEnum):
+    """
+    An operator lifted a freeze. Recorded with `effect = allow`.
+    """
+
+    unfreeze = "unfreeze"
+
+
+class BriefDecisionKind10(StrEnum):
+    """
+    A person approved a plan with `rocky review --approve`. Recorded with `effect = allow`; it is a sign-off, not a policy verdict.
+    """
+
+    approval = "approval"
+
+
 class PolicyCapability13(StrEnum):
     """
     Read model output / metadata. Always allowed.
@@ -276,6 +316,38 @@ class SectionAvailability3(StrEnum):
     unavailable = "unavailable"
 
 
+class SessionSource5(StrEnum):
+    """
+    Direct invocation — shell, script, or CI runner.
+    """
+
+    cli = "cli"
+
+
+class SessionSource6(StrEnum):
+    """
+    Dagster Pipes / subprocess client launched the process.
+    """
+
+    dagster = "dagster"
+
+
+class SessionSource7(StrEnum):
+    """
+    LSP server invoked the run. Reserved; see enum-level docs.
+    """
+
+    lsp = "lsp"
+
+
+class SessionSource8(StrEnum):
+    """
+    HTTP API caller stamped itself via `ROCKY_SESSION_SOURCE=http_api`.
+    """
+
+    http_api = "http_api"
+
+
 class AuditChainBlastRadius(BaseModel):
     """
     Blast-radius link of the custody chain: the models that transitively consume the subject, recomputed from the current compiled graph.
@@ -354,6 +426,12 @@ class AuditDecisionEntry(BaseModel):
     One recorded policy decision in the [`AuditOutput`] ledger.
     """
 
+    approval_channel: (
+        SessionSource5 | SessionSource6 | SessionSource7 | SessionSource8 | None
+    ) = None
+    """
+    The channel an approval came through (`cli`, `http_api`). Present only on an `approval` row whose channel this binary can read. An approval through `rocky mcp` reads `cli`.
+    """
     capability: (
         PolicyCapability13
         | PolicyCapability14
@@ -374,6 +452,16 @@ class AuditDecisionEntry(BaseModel):
     effect: PolicyEffect4 | PolicyEffect5 | PolicyEffect6
     """
     The resolved verdict (`allow` / `require_review` / `deny`).
+    """
+    kind: (
+        BriefDecisionKind6
+        | BriefDecisionKind7
+        | BriefDecisionKind8
+        | BriefDecisionKind9
+        | BriefDecisionKind10
+    )
+    """
+    What kind of event the row records. Only `evaluation` carries a policy verdict in `effect`; an `approval` row's `allow` is a person's sign-off on the plan (`rocky review --approve`).
     """
     model: str
     """

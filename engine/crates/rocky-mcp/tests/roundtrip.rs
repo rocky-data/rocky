@@ -1454,6 +1454,30 @@ effect = "require_review"
         "the confirmed approve wrote the sign-off marker"
     );
 
+    // C2-P0: the approval is also one row in the policy-decision ledger,
+    // naming this server's actor. `rocky mcp` is a CLI process, so the
+    // channel reads `cli`; the class is the MCP surface's, `agent`.
+    let state_path = rocky_core::state::resolve_state_path(None, &dir.path().join("models")).path;
+    let rows: Vec<_> = rocky_core::state::StateStore::open_read_only(&state_path)
+        .expect("open ledger")
+        .list_policy_decisions()
+        .expect("read ledger")
+        .into_iter()
+        .filter(|d| d.kind() == rocky_core::state::DecisionKind::Approval)
+        .collect();
+    assert_eq!(rows.len(), 1, "one approval row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.plan_id, plan_id);
+    assert_eq!(row.principal, rocky_core::config::PolicyPrincipal::Agent);
+    assert_eq!(
+        row.principal_ref.as_ref().map(|r| r.id.as_str()),
+        Some("mcp-approver")
+    );
+    let custody = row.approval.as_ref().expect("approval custody");
+    assert_eq!(custody.channel, Some(rocky_core::state::SessionSource::Cli));
+    assert_eq!(custody.base_ref, "HEAD");
+    assert_eq!(row.models, vec!["orders".to_string()]);
+
     client.cancel().await.unwrap();
 }
 

@@ -1661,7 +1661,6 @@ mod tests {
         use crate::commands::gc::{
             LivenessOracle, ReclaimVerdict, run_gc_apply_in_with, run_gc_plan_in,
         };
-        use crate::commands::review::compute_review;
 
         const STORAGE_PREFIX: &str = "s3://bucket/tgt/raw/orders";
         const KEY_PREFIX: &str = "tgt/raw/orders";
@@ -1968,9 +1967,16 @@ mod tests {
             .unwrap();
             let plans_dir = root.join(".rocky").join("plans");
             let gc_plan_id = find_plan_id(&plans_dir);
-            compute_review(root, &config, &gc_plan_id, "HEAD", true)
-                .await
-                .unwrap();
+            crate::commands::review::compute_review_with_state_path(
+                root,
+                &config,
+                Some(&state_path),
+                &gc_plan_id,
+                "HEAD",
+                crate::commands::review::test_approval(),
+            )
+            .await
+            .unwrap();
             run_gc_apply_in_with(
                 root,
                 &config,

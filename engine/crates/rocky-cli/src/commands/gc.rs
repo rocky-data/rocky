@@ -4368,9 +4368,16 @@ effect = "allow"
         assert_eq!(queue.pending[0].blast_radius, None);
 
         // 3. Approve through the exact core the MCP review_queue tool calls.
-        let review = crate::commands::review::compute_review(root, &config, &plan_id, "HEAD", true)
-            .await
-            .unwrap();
+        let review = crate::commands::review::compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state_path),
+            &plan_id,
+            "HEAD",
+            crate::commands::review::test_approval(),
+        )
+        .await
+        .unwrap();
         assert!(review.marker_written);
 
         // 4. The queue empties — the marker filter clears the escalation.
@@ -4823,6 +4830,7 @@ effect = "allow"
         // A ledger-only freeze row for THIS principal → deny. This is the
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -4963,6 +4971,7 @@ effect = "allow"
                         let store = StateStore::open(&self.path).unwrap();
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                approval: None,
                                 seq: 0,
                                 keys_recorded: false,
                                 fail_closed: false,

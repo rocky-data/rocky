@@ -14,6 +14,10 @@
 //!   and `GET /api/v1/review/{plan_id}/status` shows the same;
 //! - none resolves: the job fails with `approver_identity_unresolved` and
 //!   writes no marker, where the CLI would have recorded `unknown`.
+//!
+//! An approval also records one row in the policy-decision ledger. The
+//! server's `ROCKY_PRINCIPAL_ID` / `ROCKY_PRINCIPAL` name its operator, so the
+//! approve child drops them: the row names an `unnamed` human over `http_api`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -102,7 +106,7 @@ fn project_with_a_backfill_plan(dir: &Path) -> (std::path::PathBuf, String) {
 /// Started from the directory ABOVE the project, with `--config` naming the
 /// project's `rocky.toml`: the approve child must still write its marker in
 /// the project root, where the review routes read it.
-fn serve(dir: &Path, root: &Path, gitconfig: &Path) -> (Server, u16) {
+fn serve(dir: &Path, root: &Path, gitconfig: &Path, env: &[(&str, &str)]) -> (Server, u16) {
     let port = TcpListener::bind("127.0.0.1:0")
         .expect("bind")
         .local_addr()
@@ -117,6 +121,9 @@ fn serve(dir: &Path, root: &Path, gitconfig: &Path) -> (Server, u16) {
             .env_remove("ROCKY_SERVE_TOKEN")
             .env_remove("ROCKY_SERVE_TOKEN_SCOPE")
             .env_remove("ROCKY_SESSION_SOURCE")
+            .env_remove("ROCKY_PRINCIPAL_ID")
+            .env_remove("ROCKY_PRINCIPAL")
+            .envs(env.iter().copied())
             .args([
                 "--config",
                 root.join("rocky.toml").to_str().unwrap(),
@@ -144,6 +151,35 @@ fn serve(dir: &Path, root: &Path, gitconfig: &Path) -> (Server, u16) {
         std::thread::sleep(Duration::from_millis(200));
     }
     (server, port)
+}
+
+/// The approval rows `rocky audit` reads from the server's state store.
+fn approval_rows(dir: &Path, root: &Path) -> Vec<serde_json::Value> {
+    let out = rocky()
+        .current_dir(root)
+        .env_remove("ROCKY_PRINCIPAL_ID")
+        .args([
+            "-o",
+            "json",
+            "--state-path",
+            dir.join("state.redb").to_str().unwrap(),
+            "audit",
+        ])
+        .output()
+        .expect("spawn rocky audit");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let audit: serde_json::Value = serde_json::from_slice(&out.stdout).expect("audit JSON");
+    audit["decisions"]
+        .as_array()
+        .expect("decisions")
+        .iter()
+        .filter(|d| d["kind"] == "approval")
+        .cloned()
+        .collect()
 }
 
 /// Submit an approve job and wait for its terminal record.
@@ -185,7 +221,7 @@ fn the_approve_job_stamps_http_api_and_the_identity_or_refuses_without_one() {
     // No git identity: the job fails with the stable code, and no marker.
     let empty = dir.path().join("empty.gitconfig");
     std::fs::write(&empty, "").unwrap();
-    let (server, port) = serve(dir.path(), &root, &empty);
+    let (server, port) = serve(dir.path(), &root, &empty, &[]);
     let job = approve(port, &plan_id);
     assert_eq!(job["state"], "failed", "{job}");
     assert!(
@@ -197,6 +233,10 @@ fn the_approve_job_stamps_http_api_and_the_identity_or_refuses_without_one() {
     );
     assert!(!marker.exists(), "a refused approval must write no marker");
     drop(server);
+    assert!(
+        approval_rows(dir.path(), &root).is_empty(),
+        "a refused approval must record no ledger row"
+    );
 
     // An identity: the marker records it, over the HTTP API.
     let named = dir.path().join("named.gitconfig");
@@ -205,7 +245,16 @@ fn the_approve_job_stamps_http_api_and_the_identity_or_refuses_without_one() {
         "[user]\n\temail = operator@example.com\n\tname = Operator\n",
     )
     .unwrap();
-    let (_server, port) = serve(dir.path(), &root, &named);
+    // The operator's own id and class must not reach the approval row.
+    let (server, port) = serve(
+        dir.path(),
+        &root,
+        &named,
+        &[
+            ("ROCKY_PRINCIPAL_ID", "operator"),
+            ("ROCKY_PRINCIPAL", "agent"),
+        ],
+    );
     let job = approve(port, &plan_id);
     assert_eq!(job["state"], "succeeded", "{job}");
     let written: serde_json::Value =
@@ -227,4 +276,16 @@ fn the_approve_job_stamps_http_api_and_the_identity_or_refuses_without_one() {
     let review: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(review["reviewed"], true, "{body}");
     assert_eq!(review["approver"]["source"], "http_api", "{body}");
+    drop(server);
+
+    let rows = approval_rows(dir.path(), &root);
+    assert_eq!(rows.len(), 1, "one approval row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["plan_id"], plan_id.as_str(), "{row}");
+    assert_eq!(row["approval_channel"], "http_api", "{row}");
+    assert_eq!(row["principal_id"], "unnamed", "{row}");
+    assert_eq!(row["principal_id_source"], "default", "{row}");
+    assert_eq!(row["principal"], "human", "{row}");
+    assert_eq!(row["capability"], "backfill", "{row}");
+    assert_eq!(row["effect"], "allow", "{row}");
 }

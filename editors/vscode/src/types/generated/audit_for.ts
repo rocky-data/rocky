@@ -12,6 +12,14 @@
  */
 export type SectionAvailability = "available" | "no_data" | "unavailable";
 /**
+ * Where the `rocky` invocation originated — the calling surface that spawned the process.
+ *
+ * Stamped on every [`RunRecord`] at claim time for the governance audit trail (§1.4 item 2). The CLI derives it from the environment:
+ *
+ * - [`SessionSource::Dagster`] — `DAGSTER_PIPES_CONTEXT` is set (Dagster's Pipes protocol populates this when a Pipes client launches the subprocess — whether or not the binary emits Pipes messages back). - [`SessionSource::HttpApi`] — `ROCKY_SESSION_SOURCE=http_api` is set (an HTTP caller explicitly stamps itself; Rocky's server never spawns `rocky run` today, but the variant is reserved for future wiring). - [`SessionSource::Lsp`] — `ROCKY_SESSION_SOURCE=lsp` is set. Reserved for completeness; the LSP server (`rocky lsp`) handles requests in-process rather than shelling out to `rocky run`, so this is effectively unreachable today. - [`SessionSource::Cli`] — the fallback. A human / script / CI runner invoking `rocky run` directly.
+ */
+export type SessionSource = "cli" | "dagster" | "lsp" | "http_api";
+/**
  * The class of action a policy rule governs.
  *
  * `read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.
@@ -35,6 +43,12 @@ export type PolicyCapability =
  * Ordered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.
  */
 export type PolicyEffect = "allow" | "require_review" | "deny";
+/**
+ * What kind of event a ledger row records, so a reader can tell a policy evaluation from the other rows the policy-decision ledger holds.
+ *
+ * Mirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).
+ */
+export type BriefDecisionKind = "evaluation" | "verify_after_custody" | "freeze" | "unfreeze" | "approval";
 /**
  * Who is attempting an action.
  *
@@ -140,6 +154,10 @@ export interface AuditChainDecisions {
  */
 export interface AuditDecisionEntry {
   /**
+   * The channel an approval came through (`cli`, `http_api`). Present only on an `approval` row whose channel this binary can read. An approval through `rocky mcp` reads `cli`.
+   */
+  approval_channel?: SessionSource | null;
+  /**
    * The capability that was evaluated.
    */
   capability: PolicyCapability;
@@ -147,6 +165,10 @@ export interface AuditDecisionEntry {
    * The resolved verdict (`allow` / `require_review` / `deny`).
    */
   effect: PolicyEffect;
+  /**
+   * What kind of event the row records. Only `evaluation` carries a policy verdict in `effect`; an `approval` row's `allow` is a person's sign-off on the plan (`rocky review --approve`).
+   */
+  kind: BriefDecisionKind;
   /**
    * The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */

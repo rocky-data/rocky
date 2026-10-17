@@ -1461,7 +1461,8 @@ fn render_markdown(out: &BriefOutput) -> String {
                     BriefDecisionKind::Evaluation => plain(&d.effect).to_uppercase(),
                     BriefDecisionKind::VerifyAfterCustody
                     | BriefDecisionKind::Freeze
-                    | BriefDecisionKind::Unfreeze => {
+                    | BriefDecisionKind::Unfreeze
+                    | BriefDecisionKind::Approval => {
                         format!("{} [effect {}]", plain(&d.kind), plain(&d.effect))
                     }
                 };
@@ -1773,6 +1774,7 @@ mod tests {
         rule_id: Option<usize>,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1914,7 +1916,15 @@ mod tests {
         unfreeze.plan_id = format!("{}models/b", rocky_core::policy::UNFREEZE_PLAN_PREFIX);
         let mut verification = decision(12, PolicyPrincipal::Agent, PolicyEffect::Deny, "c", None);
         verification.verify_after = vec!["not_null_id".to_string()];
-        let rows = [evaluation, freeze, unfreeze, verification];
+        // C2-P0: a person's `rocky review --approve` row is an `allow` that
+        // is a sign-off, not a policy verdict.
+        let mut approval = decision(13, PolicyPrincipal::Human, PolicyEffect::Allow, "d", None);
+        approval.approval = Some(rocky_core::state::ApprovalCustody {
+            channel: Some(rocky_core::state::SessionSource::Cli),
+            base_ref: "HEAD".to_string(),
+            breaking_change_count: 0,
+        });
+        let rows = [evaluation, freeze, unfreeze, verification, approval];
         let refs: Vec<&PolicyDecisionRecord> = rows.iter().collect();
 
         let section = build_agent_activity(&refs);
@@ -1943,6 +1953,7 @@ mod tests {
                 BriefDecisionKind::Freeze,
                 BriefDecisionKind::Unfreeze,
                 BriefDecisionKind::VerifyAfterCustody,
+                BriefDecisionKind::Approval,
             ],
             "every row is listed, labelled with its kind"
         );

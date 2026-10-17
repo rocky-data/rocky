@@ -25,6 +25,7 @@ const LEDGER: AuditOutput = {
       principal_id: "alice",
       principal_id_source: "flag",
       principal_id_verified: false,
+      kind: "evaluation",
     },
     {
       timestamp: "2026-09-04T10:00:00Z",
@@ -37,6 +38,7 @@ const LEDGER: AuditOutput = {
       reason: "<i>frozen</i> by the governor",
       principal_id: null,
       principal_id_verified: false,
+      kind: "freeze",
     },
   ],
 };

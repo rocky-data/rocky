@@ -1380,9 +1380,16 @@ effect = "deny"
 
             // Drive the REAL `rocky review --approve` path (fails on a head that
             // omits Archive from the reviewable allowlist).
-            crate::commands::review::compute_review(dir.path(), &config, &plan_id, "HEAD", true)
-                .await
-                .expect("`rocky review --approve` must accept an archive plan");
+            crate::commands::review::compute_review_with_state_path(
+                dir.path(),
+                &config,
+                Some(&state),
+                &plan_id,
+                "HEAD",
+                crate::commands::review::test_approval(),
+            )
+            .await
+            .expect("`rocky review --approve` must accept an archive plan");
 
             // With the marker the destructive apply proceeds and executes.
             let adapter2 = CountingAdapter::new();

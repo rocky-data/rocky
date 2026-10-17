@@ -1072,6 +1072,7 @@ pub fn run_policy_freeze(
             });
         }
         let record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1917,6 +1918,7 @@ max_retries = 0
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let harness = CrossPodHarness::new_s3_like();
         let winner = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -2011,6 +2013,7 @@ max_retries = 0
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let harness = CrossPodHarness::new_s3_like();
         let winner = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -2079,6 +2082,7 @@ max_retries = 0
             local_rows,
             // The store stamped the winner's insertion sequence.
             vec![PolicyDecisionRecord {
+                approval: None,
                 seq: 1,
                 ..winner.clone()
             }],
