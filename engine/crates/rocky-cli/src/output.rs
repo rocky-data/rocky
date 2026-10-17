@@ -7358,10 +7358,10 @@ pub struct SchedulePipelineStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
     /// Delivery state of the most urgent product deadline this pipeline
-    /// delivers: a product whose output model the pipeline's latest
-    /// production run built, and whose spec declares `deliver_by`. The
-    /// estimate times the whole pipeline run. Absent when the pipeline
-    /// delivers no product with a deadline.
+    /// delivers: a product whose spec declares `deliver_by` and whose output
+    /// model the pipeline's newest production run that built any such model
+    /// built. The estimate times the whole pipeline run. Absent when no
+    /// production run of the pipeline built a product with a deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryStatus>,
 }

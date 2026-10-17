@@ -100,8 +100,11 @@ fn percentile(sorted: &[u64], pct: usize) -> u64 {
 /// window's own p90 lags behind. Then `p90_ms` is the largest of the newest
 /// [`GROWTH_RUNS`]. The comparison must use the older durations: over the
 /// whole window of 20, at most two values sit above the p90, so "the newest
-/// five all exceed it" could never be true. With exactly
-/// [`ESTIMATE_MIN_RUNS`] durations there are no older ones, and no growth.
+/// five all exceed it" could never be true. The check needs at least
+/// [`GROWTH_RUNS`] older durations, so it starts at 10 runs: against one or
+/// two older values almost any five runs would read as growth. Growth never
+/// lowers the p90: it is the larger of the window's p90 and the slowest of
+/// the newest five.
 #[must_use]
 pub fn estimate_durations(newest_first: &[u64]) -> DurationEstimate {
     let sample = &newest_first[..newest_first.len().min(ESTIMATE_WINDOW)];
@@ -120,13 +123,13 @@ pub fn estimate_durations(newest_first: &[u64]) -> DurationEstimate {
 
     let (newest, older) = sample.split_at(GROWTH_RUNS);
     let mut growth = false;
-    if !older.is_empty() {
+    if older.len() >= GROWTH_RUNS {
         let mut older_sorted = older.to_vec();
         older_sorted.sort_unstable();
         let older_p90 = percentile(&older_sorted, 90);
         if newest.iter().all(|duration| *duration > older_p90) {
             growth = true;
-            p90_ms = newest.iter().copied().max().unwrap_or(p90_ms);
+            p90_ms = p90_ms.max(newest.iter().copied().max().unwrap_or(p90_ms));
         }
     }
     DurationEstimate {
@@ -215,13 +218,26 @@ pub fn deadline_served(
     previous: Option<LastDelivery>,
     finished: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    if let Some(previous) = previous {
+    // A previous delivery with no recorded deadline (written before the
+    // product declared `deliver_by`, or before this field existed) is no
+    // baseline: judging from it would charge every deadline since then, often
+    // days, to this delivery.
+    if let Some(previous) = previous.filter(|previous| previous.due_at.is_some()) {
         let open = open_deadline_after(deliver_by, previous)?;
         if open < finished {
             return Some(open);
         }
     }
     covered_by(deliver_by, finished)
+}
+
+/// Seconds from `due` to `finished`, rounded up: a delivery a fraction of a
+/// second late is late by one second, never by zero. Zero or negative is on
+/// time.
+#[must_use]
+pub fn late_by_seconds(due: DateTime<Utc>, finished: DateTime<Utc>) -> i64 {
+    (finished - due).num_milliseconds().div_euclid(1000)
+        + i64::from((finished - due).num_milliseconds().rem_euclid(1000) != 0)
 }
 
 /// The delivery state a status surface reports for one deadline.
@@ -262,7 +278,7 @@ pub fn delivery_verdict(
 ) -> DeliveryVerdict {
     let late = last.and_then(|last| {
         last.due_at
-            .map(|due| (last.finished_at - due).num_seconds())
+            .map(|due| late_by_seconds(due, last.finished_at))
     });
     let next_due_at = match last {
         Some(last) => open_deadline_after(deliver_by, last),
@@ -331,6 +347,10 @@ pub fn stamp_delivery_timing(
     if deadlines.is_empty() || !record.counts_as_production(UnrecordedScope::Exclude) {
         return Ok(());
     }
+    // One history read per delivered model, not per execution: a partitioned
+    // model records one execution per partition.
+    let mut previous_by_model: std::collections::BTreeMap<String, Option<LastDelivery>> =
+        std::collections::BTreeMap::new();
     for execution in &mut record.models_executed {
         if execution.status != "success" {
             continue;
@@ -339,12 +359,20 @@ pub fn stamp_delivery_timing(
         let Some(deadline) = deadlines.iter().find(|d| d.output_model == model) else {
             continue;
         };
-        let previous = store
-            .last_delivery(&model, UnrecordedScope::Exclude)?
-            .map(|previous| LastDelivery {
-                finished_at: previous.finished_at,
-                due_at: previous.due_at,
-            });
+        let previous = match previous_by_model.get(&model) {
+            Some(previous) => *previous,
+            None => {
+                let previous =
+                    store
+                        .last_delivery(&model, UnrecordedScope::Exclude)?
+                        .map(|previous| LastDelivery {
+                            finished_at: previous.finished_at,
+                            due_at: previous.due_at,
+                        });
+                previous_by_model.insert(model, previous);
+                previous
+            }
+        };
         execution.due_at = deadline_served(&deadline.deliver_by, previous, execution.finished_at);
     }
     Ok(())
@@ -431,6 +459,30 @@ mod tests {
         let mut sorted = newest_first.clone();
         sorted.sort_unstable();
         assert_eq!(percentile(&sorted, 90), 32_000);
+    }
+
+    #[test]
+    fn growth_needs_five_older_runs() {
+        // Nine runs: the newest five all exceed the four older ones, but
+        // four older values are too few to call it growth.
+        let newest_first = [50, 60, 70, 80, 90, 10, 11, 12, 13];
+        let band = estimate_durations(&newest_first).band.expect("band");
+        assert!(!band.growth);
+        assert_eq!(band.p90_ms, 90, "the window's own nearest-rank p90");
+    }
+
+    #[test]
+    fn growth_never_lowers_the_p90() {
+        // One large older spike, and the newest five still exceed the older
+        // p90. The growth p90 must not fall below the window's own.
+        let mut newest_first = vec![31_000, 34_000, 30_000, 33_000, 32_000];
+        newest_first.extend((0..14).map(|i| 9_000 + i * 100));
+        newest_first.push(500_000);
+        let mut sorted = newest_first.clone();
+        sorted.sort_unstable();
+        let window_p90 = percentile(&sorted, 90);
+        let band = estimate_durations(&newest_first).band.expect("band");
+        assert!(band.p90_ms >= window_p90);
     }
 
     #[test]
@@ -560,16 +612,30 @@ mod tests {
     }
 
     #[test]
-    fn a_delivery_without_a_recorded_deadline_covers_the_next_one() {
+    fn a_delivery_without_a_recorded_deadline_is_no_baseline() {
         let d = six_am();
+        // Five days old and recorded before deadlines existed: judging from
+        // it would charge four missed days to this delivery.
         let unrecorded = Some(LastDelivery {
             finished_at: utc(2026, 5, 1, 5, 40),
             due_at: None,
         });
         assert_eq!(
-            deadline_served(&d, unrecorded, utc(2026, 5, 2, 7, 30)),
-            Some(utc(2026, 5, 2, 6, 0))
+            deadline_served(&d, unrecorded, utc(2026, 5, 6, 7, 30)),
+            Some(utc(2026, 5, 7, 6, 0)),
+            "treated like a first delivery"
         );
+    }
+
+    #[test]
+    fn a_fraction_of_a_second_late_is_late() {
+        let due = utc(2026, 5, 1, 6, 0);
+        let ms = chrono::Duration::milliseconds;
+        assert_eq!(late_by_seconds(due, due), 0);
+        assert_eq!(late_by_seconds(due, due + ms(300)), 1);
+        assert_eq!(late_by_seconds(due, due - ms(300)), 0);
+        assert_eq!(late_by_seconds(due, due + ms(5_400_000)), 5_400);
+        assert_eq!(late_by_seconds(due, due - ms(1_200_000)), -1_200);
     }
 
     // ----- the verdict -----

@@ -3013,23 +3013,24 @@ impl ModelExecution {
             .map_or(self.model_name.as_str(), |target| target.model.as_str())
     }
 
-    /// Seconds from [`Self::due_at`] to [`Self::finished_at`]. Positive is
-    /// late, zero or negative is on time. `None` when no deadline was
-    /// recorded.
+    /// Seconds from [`Self::due_at`] to [`Self::finished_at`], rounded up,
+    /// so a fraction of a second late counts as late. Positive is late, zero
+    /// or negative is on time. `None` when no deadline was recorded.
     #[must_use]
     pub fn late_by_seconds(&self) -> Option<i64> {
         self.due_at
-            .map(|due| (self.finished_at - due).num_seconds())
+            .map(|due| crate::delivery::late_by_seconds(due, self.finished_at))
     }
 }
 
-/// Milliseconds from `from` to `to`, clamped at zero when the clock stepped
-/// back between them.
-fn elapsed_ms_or_zero(
+/// Milliseconds from `from` to `to`. `None` when the clock stepped back
+/// between them, so the caller drops the sample rather than count a false
+/// zero.
+fn elapsed_ms(
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
-) -> u64 {
-    u64::try_from((to - from).num_milliseconds()).unwrap_or(0)
+) -> Option<u64> {
+    u64::try_from((to - from).num_milliseconds()).ok()
 }
 
 /// Where one successful model execution wrote its output.
@@ -4681,7 +4682,8 @@ impl StateStore {
                 .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
                 .map(|m| m.finished_at)
                 .max()
-                .map(|finished| (1, elapsed_ms_or_zero(run_started, finished)))
+                .and_then(|finished| elapsed_ms(run_started, finished))
+                .map(|elapsed| (1, elapsed))
         })?;
         Ok(crate::delivery::estimate_durations(&durations))
     }
@@ -4700,10 +4702,13 @@ impl StateStore {
         unrecorded: UnrecordedScope,
     ) -> Result<crate::delivery::DurationEstimate, StateError> {
         let durations = self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, |run| {
-            (run.pipeline.as_deref() == Some(pipeline)
-                && matches!(run.status, RunStatus::Success)
-                && run.counts_as_production(unrecorded))
-            .then(|| (1, elapsed_ms_or_zero(run.started_at, run.finished_at)))
+            if run.pipeline.as_deref() != Some(pipeline)
+                || !matches!(run.status, RunStatus::Success)
+                || !run.counts_as_production(unrecorded)
+            {
+                return None;
+            }
+            elapsed_ms(run.started_at, run.finished_at).map(|elapsed| (1, elapsed))
         })?;
         Ok(crate::delivery::estimate_durations(&durations))
     }

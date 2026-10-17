@@ -7,7 +7,8 @@
 //!
 //! It does read run history for one thing: delivery state. When any product
 //! declares a `deliver_by` deadline, it reads, per pipeline, the pipeline's
-//! latest production run. For a pipeline that delivers such a product it
+//! newest production run that built a deadlined model. For a pipeline that
+//! delivers such a product it
 //! also reads the product's latest delivery and the pipeline's last 20
 //! production runs for the duration estimate. Each of those history reads
 //! walks the ordering key of every recorded run, and decodes runs until it
@@ -190,10 +191,10 @@ fn collect_claims(store: Option<&StateStore>) -> Result<ClaimsByPipeline, Schedu
 /// The delivery state of the most urgent product deadline `pipeline`
 /// delivers.
 ///
-/// The pipeline delivers a product when its latest production run built the
-/// product's output model. With several, the one whose next deadline comes
-/// first wins. `None` without a store, without such a product, or when the
-/// pipeline never ran in production.
+/// The pipeline delivers the products whose output models its newest
+/// production run that built any deadlined model built. With several, the one
+/// whose next deadline comes first wins. `None` without a store, or when no
+/// production run of the pipeline ever built a deadlined model.
 ///
 /// # Errors
 ///
@@ -214,10 +215,19 @@ fn pipeline_delivery(
     if deadlines.is_empty() {
         return Ok(None);
     }
+    // The newest production run of this pipeline that built any deadlined
+    // model. Not simply the newest run: a `--model` run, or a run that failed
+    // before the output model, would otherwise make the pipeline read as
+    // delivering nothing.
     let latest = store
         .list_runs_matching(1, |run| {
             run.pipeline.as_deref() == Some(pipeline)
                 && run.counts_as_production(UnrecordedScope::Exclude)
+                && run.models_executed.iter().any(|execution| {
+                    deadlines
+                        .iter()
+                        .any(|deadline| deadline.output_model == execution.rocky_model_name())
+                })
         })
         .map_err(anyhow::Error::from)?;
     let Some(run) = latest.first() else {
@@ -613,6 +623,42 @@ mod delivery_state_tests {
         let delivery = delivery_json(&config_path, &state_path, at(2, 5, 55));
         assert_eq!(delivery["estimate"]["state"], "unknown");
         assert!(delivery["at_risk"].is_null(), "{delivery}");
+    }
+
+    #[test]
+    fn a_newer_run_without_the_output_model_keeps_the_delivery() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        // A newer production run of the same pipeline that built another
+        // model only, as `--model other` would.
+        let other: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "run-other",
+            "started_at": at(5, 9, 0),
+            "finished_at": at(5, 9, 5),
+            "status": rocky_core::state::RunStatus::Success,
+            "models_executed": [{
+                "model_name": "other",
+                "started_at": at(5, 9, 0),
+                "finished_at": at(5, 9, 5),
+                "duration_ms": 300_000,
+                "rows_affected": 1,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+            }],
+            "trigger": rocky_core::state::RunTrigger::Manual,
+            "config_hash": "c",
+            "pipeline": "revenue",
+            "run_scope": rocky_core::state::RunScope::Production,
+        }))
+        .unwrap();
+        store.record_run(&other).unwrap();
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(5, 12, 0));
+        assert_eq!(delivery["product"], "revenue_daily", "{delivery}");
+        assert_eq!(delivery["on_time"], true);
     }
 
     #[test]
