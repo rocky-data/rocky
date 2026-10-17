@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - On Unix the adapter now leads its own process group. Stopping it sends `SIGTERM` to the group, waits up to 5 seconds for the adapter to exit, then sends `SIGKILL` to the group. That stops what the adapter started too. `close()` does the same after its `shutdown` call, which now waits at most 5 seconds. Dropping a `ProcessAdapter` sends `SIGKILL` to the group. On other platforms only the adapter itself is killed.
   - The limits are in code only, not in `rocky.toml`. `ProcessAdapter::spawn_with_limits` takes a `ProcessLimits`; `spawn` uses the defaults above.
   - Because the adapter is in its own process group, a Ctrl-C in the terminal no longer reaches it directly. Rocky stops it when Rocky exits normally or drops it.
+- `GET /api/v1/jobs/{id}` now withholds `result` and `error` for a job record written before redaction (#1919). Before, when such a record was read from the state file and held a resolved `${VAR}` value, the server served the `held` placeholder in those two fields. Both fields now read `null`, as for every other record from before redaction. No secret value was shown either way.
 
 ## [1.86.0] — 2026-10-17
 
