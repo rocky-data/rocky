@@ -14,7 +14,7 @@ pub mod seed;
 pub mod test_harness;
 pub mod types;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::{Connection, params, types::Value};
@@ -43,6 +43,23 @@ pub enum DuckDbError {
         rollback: Box<duckdb::Error>,
     },
 
+    /// Offline mode is on and an extension Rocky needs is not in the
+    /// extension directory.
+    #[error(
+        "DuckDB offline mode needs the `{extension}` extension in '{directory}', but it could not \
+         be loaded ({cause}). Offline mode never downloads extensions. Fill the directory once \
+         while online: run `SET extension_directory = '{directory}'; INSTALL {extension};` in \
+         DuckDB, or copy `{extension}.duckdb_extension` for this DuckDB build ({build}) into \
+         '{directory}/{build_dir}/'. Then connect again."
+    )]
+    OfflineExtensionMissing {
+        extension: &'static str,
+        directory: String,
+        cause: String,
+        build: String,
+        build_dir: String,
+    },
+
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
     KindSwitchCommitUncertain(duckdb::Error),
 }
@@ -60,6 +77,109 @@ impl std::fmt::Debug for DuckDbError {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// Where DuckDB keeps extensions, and whether it may fetch them.
+///
+/// The default (no directory, `offline = false`) keeps DuckDB's own
+/// behaviour: its default extension directory, and `INSTALL` from the
+/// network when an extension is not there yet.
+///
+/// Every extension Rocky loads, now `icu` and later `httpfs`, `postgres` or
+/// `iceberg`, goes through this one directory, so one populated directory
+/// serves a whole offline deployment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionOptions {
+    /// DuckDB's `extension_directory`. `None` leaves DuckDB's default.
+    pub directory: Option<PathBuf>,
+    /// Never fetch an extension from the network. A required extension that
+    /// is missing from the directory is an error at connect.
+    pub offline: bool,
+}
+
+impl ExtensionOptions {
+    /// The extension settings of one `type = "duckdb"` adapter block.
+    ///
+    /// A relative `extension_directory` stays relative: DuckDB resolves it
+    /// against the process working directory.
+    #[must_use]
+    pub fn from_adapter(cfg: &rocky_core::config::AdapterConfig) -> Self {
+        Self {
+            directory: cfg
+                .extension_directory
+                .as_ref()
+                .map(|d| PathBuf::from(d.expose())),
+            offline: cfg.offline,
+        }
+    }
+
+    /// The extension settings for a connection that no single adapter owns,
+    /// such as the in-memory database `rocky test` runs models in.
+    ///
+    /// Reads every `type = "duckdb"` block. The connection is offline when
+    /// any block sets `offline = true`, so one offline adapter is never
+    /// overridden by another. The directory is the first one a block sets.
+    /// A config with no DuckDB adapter gives the defaults.
+    #[must_use]
+    pub fn from_adapters<'a>(
+        adapters: impl IntoIterator<Item = &'a rocky_core::config::AdapterConfig>,
+    ) -> Self {
+        let mut merged = Self::default();
+        for cfg in adapters.into_iter().filter(|a| a.adapter_type == "duckdb") {
+            let one = Self::from_adapter(cfg);
+            merged.offline |= one.offline;
+            if merged.directory.is_none() {
+                merged.directory = one.directory;
+            }
+        }
+        merged
+    }
+}
+
+/// Quotes `value` as a SQL string literal.
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Applies the extension settings, then loads `icu`, before the connection
+/// runs any statement.
+fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), DuckDbError> {
+    if let Some(dir) = &opts.directory {
+        conn.execute_batch(&format!(
+            "SET extension_directory = {}",
+            sql_literal(&dir.to_string_lossy())
+        ))?;
+    }
+    if !opts.offline {
+        load_icu(conn);
+        return Ok(());
+    }
+    // Offline: an extension that DuckDB knows about is never installed on
+    // demand, so no statement can reach the network behind our back.
+    conn.execute_batch("SET autoinstall_known_extensions = false")?;
+    if let Err(err) = conn.execute_batch("LOAD icu") {
+        let directory = match &opts.directory {
+            Some(dir) => dir.to_string_lossy().into_owned(),
+            None => conn
+                .query_row("SELECT current_setting('extension_directory')", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default(),
+        };
+        let (version, platform): (String, String) = conn
+            .query_row("SELECT version(), pragma_platform()", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap_or_default();
+        return Err(DuckDbError::OfflineExtensionMissing {
+            extension: "icu",
+            directory,
+            cause: err.to_string(),
+            build_dir: format!("{version}/{platform}"),
+            build: format!("{version}, {platform}"),
+        });
+    }
+    Ok(())
 }
 
 /// Loads DuckDB's `icu` extension before the connection runs any statement.
@@ -108,15 +228,25 @@ pub struct DuckDbConnector {
 impl DuckDbConnector {
     /// Creates an in-memory DuckDB database.
     pub fn in_memory() -> Result<Self, DuckDbError> {
+        Self::in_memory_with(&ExtensionOptions::default())
+    }
+
+    /// Creates an in-memory DuckDB database with explicit extension settings.
+    pub fn in_memory_with(opts: &ExtensionOptions) -> Result<Self, DuckDbError> {
         let conn = Connection::open_in_memory()?;
-        load_icu(&conn);
+        prepare_extensions(&conn, opts)?;
         Ok(DuckDbConnector { conn })
     }
 
     /// Opens or creates a persistent DuckDB database file.
     pub fn open(path: &Path) -> Result<Self, DuckDbError> {
+        Self::open_with(path, &ExtensionOptions::default())
+    }
+
+    /// Opens or creates a persistent database with explicit extension settings.
+    pub fn open_with(path: &Path, opts: &ExtensionOptions) -> Result<Self, DuckDbError> {
         let conn = Connection::open(path)?;
-        load_icu(&conn);
+        prepare_extensions(&conn, opts)?;
         Ok(DuckDbConnector { conn })
     }
 
@@ -331,6 +461,144 @@ impl DuckDbConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setting(db: &DuckDbConnector, name: &str) -> String {
+        let sql = format!("SELECT current_setting('{name}')::VARCHAR");
+        db.execute_sql(&sql).unwrap().rows[0][0]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `from_adapters` merges the `type = "duckdb"` blocks: the first
+    /// configured directory wins, and `offline` is OR'd across blocks.
+    #[test]
+    fn from_adapters_takes_the_first_directory_and_ors_offline() {
+        let adapter = |value: serde_json::Value| -> rocky_core::config::AdapterConfig {
+            serde_json::from_value(value).unwrap()
+        };
+        let adapters = [
+            adapter(serde_json::json!({"type": "duckdb"})),
+            adapter(serde_json::json!({
+                "type": "duckdb", "extension_directory": "/first", "offline": true
+            })),
+            adapter(serde_json::json!({
+                "type": "duckdb", "extension_directory": "/second", "offline": false
+            })),
+            adapter(serde_json::json!({
+                "type": "snowflake", "extension_directory": "/other", "offline": true
+            })),
+        ];
+        let merged = ExtensionOptions::from_adapters(&adapters);
+        assert_eq!(merged.directory, Some(PathBuf::from("/first")));
+        assert!(merged.offline);
+
+        let reversed = ExtensionOptions::from_adapters(adapters[..1].iter().chain(&adapters[2..3]));
+        assert_eq!(reversed.directory, Some(PathBuf::from("/second")));
+        assert!(!reversed.offline);
+    }
+
+    /// The configured directory reaches DuckDB's `extension_directory`, and
+    /// offline mode turns auto-install off. The directory is empty, so the
+    /// connect fails at `LOAD icu`; the settings are read from the raw
+    /// connection afterwards. No network is used.
+    #[test]
+    fn extension_options_reach_the_duckdb_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ExtensionOptions {
+            directory: Some(dir.path().to_path_buf()),
+            offline: true,
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        let err = prepare_extensions(&conn, &opts).unwrap_err();
+        assert!(matches!(err, DuckDbError::OfflineExtensionMissing { .. }));
+        let dir_setting: String = conn
+            .query_row("SELECT current_setting('extension_directory')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dir_setting, dir.path().to_string_lossy());
+        let auto: bool = conn
+            .query_row(
+                "SELECT current_setting('autoinstall_known_extensions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!auto, "offline mode must switch auto-install off");
+    }
+
+    /// Without the new settings nothing changes: auto-install stays on.
+    #[test]
+    fn default_options_leave_the_duckdb_settings_alone() {
+        assert_eq!(ExtensionOptions::default().directory, None);
+        assert!(!ExtensionOptions::default().offline);
+        let db = DuckDbConnector::in_memory().unwrap();
+        assert_eq!(setting(&db, "autoinstall_known_extensions"), "true");
+    }
+
+    /// Offline mode with no `icu` in the directory is a connect error that
+    /// names the directory and how to fill it. No network is used: offline
+    /// mode never installs.
+    #[test]
+    fn offline_with_an_empty_directory_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ExtensionOptions {
+            directory: Some(dir.path().to_path_buf()),
+            offline: true,
+        };
+        let err = DuckDbConnector::in_memory_with(&opts).err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&*dir.path().to_string_lossy()),
+            "must name the directory: {msg}"
+        );
+        assert!(
+            msg.contains("INSTALL icu"),
+            "must say how to fill it: {msg}"
+        );
+        assert!(msg.contains("never downloads"), "{msg}");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "offline mode must not write into the directory"
+        );
+    }
+
+    /// Offline mode loads `icu` from a populated directory and a time-zone
+    /// query works. Filling the directory the first time needs the network
+    /// (one `INSTALL icu`), so the test is ignored by default; the connect
+    /// under test is offline.
+    #[test]
+    #[ignore = "needs the network once to INSTALL icu into a temp directory"]
+    fn offline_loads_icu_from_a_populated_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let online = Connection::open_in_memory().unwrap();
+            online
+                .execute_batch(&format!(
+                    "SET extension_directory = {}; INSTALL icu",
+                    sql_literal(&dir.path().to_string_lossy())
+                ))
+                .expect("populating the directory needs the network");
+        }
+        let opts = ExtensionOptions {
+            directory: Some(dir.path().to_path_buf()),
+            offline: true,
+        };
+        let db = DuckDbConnector::in_memory_with(&opts).unwrap();
+        assert_eq!(setting(&db, "autoinstall_known_extensions"), "false");
+        let r = db
+            .execute_sql(
+                "SELECT strftime('2024-01-01 12:00:00+00'::TIMESTAMPTZ AT TIME ZONE \
+                 'America/New_York', '%H')",
+            )
+            .unwrap();
+        assert_eq!(r.rows[0][0], serde_json::json!("07"));
+        let loaded = db
+            .execute_sql("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'icu'")
+            .unwrap();
+        assert_eq!(loaded.rows[0][0], serde_json::json!("true"));
+    }
 
     /// `current_date + 1` must bind as the FIRST statement on a fresh
     /// connection. `current_date` lives in DuckDB's `icu` extension; when

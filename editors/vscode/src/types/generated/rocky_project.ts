@@ -610,6 +610,10 @@ export interface AdapterConfig {
   database?: string | null;
   destination_id?: string | null;
   /**
+   * Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+   */
+  extension_directory?: string | null;
+  /**
    * Escape hatch for adapter-specific keys this struct doesn't model.
    *
    * `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.
@@ -641,6 +645,10 @@ export interface AdapterConfig {
    * OAuth access token (pre-obtained from an IdP).
    */
   oauth_token?: RedactedString | null;
+  /**
+   * When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.
+   */
+  offline?: boolean;
   /**
    * Snowflake password (for password auth).
    */

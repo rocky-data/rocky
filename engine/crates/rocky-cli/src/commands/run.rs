@@ -1771,6 +1771,7 @@ pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 /// run the `run_progress` header written before the first copy travels in the
 /// same upload, and `rocky history` lists a header with no record as an
 /// unrecorded run, so other pods do not read the history as complete.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -1783,6 +1784,11 @@ pub(crate) fn persist_run_record(
     // succeed?" for `after`/`freshness` demands. `None` for a model-only run or
     // a multi-pipeline set (a backfill), which the reconciler never matches.
     pipeline: Option<&str>,
+    // The config file this run loaded. The `products/` next to it declare the
+    // delivery deadlines stamped onto the record; the root is derived here,
+    // never passed, so a run reads the same directory `rocky product` reads.
+    // `None` stamps no deadline (a run cancelled before it built anything).
+    config_path: Option<&Path>,
 ) -> bool {
     let Some(store) = state_store else {
         return false;
@@ -1807,6 +1813,29 @@ pub(crate) fn persist_run_record(
     record.submission_id = std::env::var("ROCKY_SUBMISSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
+    // Delivery timing is advisory, like the record itself: a failure to read
+    // the deadlines or the previous delivery leaves every field unset (never
+    // half of them) and the run goes on.
+    //
+    // The deadlines come from the `products/` next to the config file, the
+    // directory `rocky product status` reads. Never the working directory: a
+    // scheduled child run inherits whatever directory the scheduler ran in.
+    let deadlines = config_path
+        .map(|config_path| {
+            crate::commands::product::product_deadlines_in(
+                &crate::commands::product::product_command_root(config_path),
+            )
+        })
+        .unwrap_or_default();
+    let mut stamped = record.clone();
+    match rocky_core::delivery::stamp_delivery_timing(&mut stamped, store, &deadlines) {
+        Ok(()) => record = stamped,
+        Err(e) => warn!(
+            error = %e,
+            run_id = run_id,
+            "could not read delivery history; this run records no delivery timing"
+        ),
+    }
     #[cfg(test)]
     let written = if FAIL_RECORD_WRITE_FOR_TEST
         .lock()
@@ -4089,6 +4118,7 @@ pub async fn run_with_explicit_contracts(
             &audit,
             // Model-only run — no single pipeline to attribute.
             None,
+            Some(config_path),
         ));
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -4466,6 +4496,7 @@ pub async fn run_with_explicit_contracts(
                 defer_opts.project.as_ref(),
                 defer_opts.target_dialects.as_ref(),
                 &cancel,
+                Some(config_path),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -7129,6 +7160,7 @@ pub async fn run_with_explicit_contracts(
                     &config_hash,
                     &audit,
                     Some(pipeline_name),
+                    Some(config_path),
                 );
             }
             finalize_idempotency(
@@ -7965,6 +7997,7 @@ pub async fn run_with_explicit_contracts(
         &config_hash,
         &audit,
         Some(pipeline_name),
+        Some(config_path),
     ));
     // Owed post-copy checks retire per target, and only after this run's
     // record exists (#2235): a target this run checked, or one
@@ -8038,6 +8071,7 @@ pub async fn run_with_explicit_contracts(
             &config_hash,
             &audit,
             Some(pipeline_name),
+            Some(config_path),
         );
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -12217,6 +12251,7 @@ pub(crate) async fn execute_backfill_set(
                 &audit,
                 // A backfill spans a model set, not a single pipeline.
                 None,
+                Some(config_path),
             ));
 
             output.status = output.derive_run_status();
@@ -25262,6 +25297,7 @@ auto_create_schemas = true
             "cfg",
             &audit,
             Some("raw"),
+            None,
         );
         // SAFETY: serialized by TRIGGER_ENV_LOCK.
         unsafe {
@@ -41761,6 +41797,8 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -41779,6 +41817,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         };
         state.record_run(&failed).unwrap();
 
@@ -44173,6 +44212,8 @@ auto_create_schemas = true
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -44197,6 +44238,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -44375,6 +44417,8 @@ auto_create_schemas = true
             attempts: Vec::new(),
             output_version: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -44399,6 +44443,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -44509,6 +44554,8 @@ auto_create_schemas = true
             output_version: None,
             attempts: Vec::new(),
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
             "run_id": "run-prod",
@@ -44653,6 +44700,8 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -44671,6 +44720,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         };
         store.record_run(&run).unwrap();
 
@@ -45637,6 +45687,8 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -45661,6 +45713,7 @@ auto_create_schemas = true
                 verify_after_failed: false,
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
+                queued_ms: None,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -45944,6 +45997,8 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {
@@ -45969,6 +46024,7 @@ auto_create_schemas = true
                     verify_after_failed: false,
                     rocky_branch: None,
                     run_scope: Some(rocky_core::state::RunScope::Production),
+                    queued_ms: None,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

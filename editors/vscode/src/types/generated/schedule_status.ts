@@ -6,6 +6,14 @@
  */
 
 /**
+ * What a duration estimate timed.
+ */
+export type EstimateBasis = "model_delivery" | "pipeline_run";
+/**
+ * Whether a duration estimate has enough runs to judge from.
+ */
+export type EstimateState = "known" | "unknown";
+/**
  * Why a demand is currently suppressed.
  */
 export type ScheduleThrottleKind = "failure_backoff" | "partial_backoff";
@@ -109,6 +117,10 @@ export interface SchedulePipelineStatus {
    */
   cron?: string | null;
   /**
+   * Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline's newest production run that built any such model built. The estimate times the whole pipeline run. Absent when no production run of the pipeline built a product with a deadline.
+   */
+  delivery?: DeliveryStatus | null;
+  /**
    * False when the schedule declares `enabled = false`.
    */
   enabled: boolean;
@@ -176,6 +188,92 @@ export interface ScheduleClaimStatus {
    * The submission id — the join key to `GET /api/v1/jobs/{id}` and to run history.
    */
   submission_id: string;
+  [k: string]: unknown;
+}
+/**
+ * Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.
+ *
+ * Reported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.
+ */
+export interface DeliveryStatus {
+  /**
+   * True when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`: no verdict.
+   */
+  at_risk?: boolean | null;
+  /**
+   * The product's `deliver_by` cron expression.
+   */
+  deliver_by: string;
+  /**
+   * The duration estimate `at_risk` rests on.
+   */
+  estimate: DurationEstimateStatus;
+  /**
+   * When the latest production delivery finished.
+   */
+  last_delivered_at?: string | null;
+  /**
+   * The deadline the latest delivery served, when its run recorded one.
+   */
+  last_due_at?: string | null;
+  /**
+   * How late the latest delivery was, in seconds; `0` when on time. `null` when no delivery recorded a deadline.
+   */
+  late_by_seconds?: number | null;
+  /**
+   * The deadline the next delivery must meet. A time in the past means the next delivery is already late.
+   */
+  next_due_at?: string | null;
+  /**
+   * Whether the latest delivery met its deadline. `null` when no delivery recorded a deadline.
+   */
+  on_time?: boolean | null;
+  /**
+   * The model the product delivers.
+   */
+  output_model: string;
+  /**
+   * The product whose deadline this is.
+   */
+  product: string;
+  /**
+   * The timezone `deliver_by` is read in.
+   */
+  timezone: string;
+  [k: string]: unknown;
+}
+/**
+ * A p50/p90 duration estimate and the sample behind it.
+ */
+export interface DurationEstimateStatus {
+  /**
+   * What was timed: `model_delivery` (run start to the model's finish) or `pipeline_run` (run start to run finish).
+   */
+  basis: EstimateBasis;
+  /**
+   * True when the newest 5 runs were all slower than the p90 of the older ones, so `p90_ms` is the slowest of those 5.
+   */
+  growth: boolean;
+  /**
+   * How many production runs the estimate read.
+   */
+  n: number;
+  /**
+   * Median duration in milliseconds, when `known`.
+   */
+  p50_ms?: number | null;
+  /**
+   * 90th-percentile duration in milliseconds, when `known`.
+   */
+  p90_ms?: number | null;
+  /**
+   * `known` with at least 5 runs; `unknown` below that, and then no verdict rests on the estimate.
+   */
+  state: EstimateState;
+  /**
+   * The most runs it reads (the newest 20).
+   */
+  window: number;
   [k: string]: unknown;
 }
 /**

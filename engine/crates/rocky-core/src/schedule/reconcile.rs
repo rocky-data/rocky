@@ -1931,6 +1931,7 @@ cron = "also invalid"
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(crate::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 

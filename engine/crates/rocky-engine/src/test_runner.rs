@@ -13,8 +13,8 @@ use rocky_core::models::load_unit_tests_from_tree;
 use rocky_core::unit_test::{
     MismatchKind, RowMismatch, UnitTestDef, UnitTestResult, fixture_to_sql, json_to_sql_literal,
 };
-use rocky_duckdb::DuckDbConnector;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
+use rocky_duckdb::{DuckDbConnector, ExtensionOptions};
 use rocky_sql::validation::validate_identifier;
 use tracing::info;
 
@@ -111,6 +111,10 @@ pub struct TestRunInputs<'a> {
     /// whose width differs between warehouses (#2333). The models still
     /// execute on DuckDB here. The default knows none.
     pub target_dialects: rocky_compiler::operand_check::TargetDialects,
+    /// The project's DuckDB extension settings, for the in-memory database
+    /// the models run in. `offline` and `extension_directory` reach it here;
+    /// the default is DuckDB's own behaviour.
+    pub extensions: ExtensionOptions,
 }
 
 /// Checks a caller runs over a test run's compile result. See
@@ -186,28 +190,6 @@ pub fn source_schemas_from_db(
     Ok(by_table)
 }
 
-/// Run tests on the models under `models_dir`, with the seed file at
-/// `data/seed.sql` beside it. See [`run_tests_with`].
-pub fn run_tests(
-    models_dir: &Path,
-    contracts_dir: Option<&Path>,
-    model_filter: Option<&str>,
-    run_vars: &rocky_core::run_vars::RunVars,
-) -> anyhow::Result<TestResult> {
-    run_tests_with(TestRunInputs {
-        models_dir,
-        project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
-        models: TestModels::Dir,
-        contracts_dir,
-        model_filter,
-        run_vars,
-        gates: None,
-        inlined_gates: None,
-        strict_contracts: false,
-        target_dialects: Default::default(),
-    })
-}
-
 /// Run tests on a project.
 ///
 /// 1. Run the project's seed file, when it has one, in a fresh in-memory
@@ -234,12 +216,13 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
         inlined_gates,
         strict_contracts,
         target_dialects,
+        extensions,
     } = inputs;
 
     // The seed runs before the compile, so the compile is typed from the
     // tables the models then execute on. A seed that fails is reported after
     // any compile error, as it was when the seed ran second.
-    let db = DuckDbConnector::in_memory()?;
+    let db = DuckDbConnector::in_memory_with(&extensions)?;
     let seed_file = seed_path(project_root);
     let seeded = seed_file.exists();
     let seed_error: Option<String> = if seeded {
@@ -487,6 +470,7 @@ impl UnitTestRun {
 pub fn run_unit_tests(
     models_dir: &Path,
     model_filter: Option<&str>,
+    extensions: &ExtensionOptions,
 ) -> anyhow::Result<UnitTestRun> {
     let unit_tests = load_unit_tests_from_tree(models_dir)?;
     if unit_tests.is_empty() {
@@ -542,7 +526,13 @@ pub fn run_unit_tests(
             .map(|m| rocky_core::sql_gen::local_test_sql(m).into_owned());
         for test in &unit_tests[name] {
             match &compiled_sql {
-                Some(sql) => results.push(run_one_unit_test(name, sql, test, &compile_result)),
+                Some(sql) => results.push(run_one_unit_test(
+                    name,
+                    sql,
+                    test,
+                    &compile_result,
+                    extensions,
+                )),
                 None => results.push(UnitTestResult {
                     model: name.clone(),
                     test: test.name.clone(),
@@ -571,6 +561,7 @@ fn run_one_unit_test(
     compiled_sql: &str,
     test: &UnitTestDef,
     compile_result: &rocky_compiler::compile::CompileResult,
+    extensions: &ExtensionOptions,
 ) -> UnitTestResult {
     let fail = |msg: String, mismatches: Vec<RowMismatch>| UnitTestResult {
         model: model.to_string(),
@@ -587,7 +578,7 @@ fn run_one_unit_test(
         mismatches: Vec::new(),
     };
 
-    let db = match DuckDbConnector::in_memory() {
+    let db = match DuckDbConnector::in_memory_with(extensions) {
         Ok(d) => d,
         Err(e) => return fail(format!("DuckDB init failed: {e}"), Vec::new()),
     };
@@ -859,6 +850,29 @@ fn ordered_mismatches(
 mod tests {
     use super::*;
 
+    /// Test helper: [`run_tests_with`] on `models_dir` with default extension
+    /// options. Lives here so production code cannot reach DuckDB's autoinstall.
+    fn run_tests(
+        models_dir: &Path,
+        contracts_dir: Option<&Path>,
+        model_filter: Option<&str>,
+        run_vars: &rocky_core::run_vars::RunVars,
+    ) -> anyhow::Result<TestResult> {
+        run_tests_with(TestRunInputs {
+            models_dir,
+            project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+            models: TestModels::Dir,
+            contracts_dir,
+            model_filter,
+            run_vars,
+            gates: None,
+            inlined_gates: None,
+            strict_contracts: false,
+            target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
+        })
+    }
+
     /// Set up a temp project with two SQL models (`raw_orders`, `good_mart`)
     /// where `good_mart` reads from `raw_orders`. Returns the temp dir guard
     /// so the caller can drop it.
@@ -1123,7 +1137,7 @@ mod tests {
     #[test]
     fn time_interval_unit_test_keeps_rows_at_calendar_edges() {
         let (_tmp, models) = scaffold_time_interval_project();
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.total(), 1);
         assert!(
             run.results[0].passed,
@@ -1137,7 +1151,7 @@ mod tests {
     #[test]
     fn unit_test_passes_when_output_matches() {
         let (_tmp, models) = scaffold_unit_test_project(true);
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(run.passed(), 1, "error: {:?}", run.results[0].error);
         assert!(run.results[0].passed);
@@ -1148,7 +1162,7 @@ mod tests {
     #[test]
     fn unit_test_fails_and_reports_mismatch() {
         let (_tmp, models) = scaffold_unit_test_project(false);
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(run.passed(), 0);
         assert!(!run.results[0].passed);
@@ -1163,7 +1177,7 @@ mod tests {
     #[test]
     fn unit_tests_empty_when_none_declared() {
         let (_tmp, models) = scaffold_two_model_project();
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.total(), 0);
     }
 
@@ -1208,7 +1222,7 @@ mod tests {
         )
         .unwrap();
 
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(
             run.passed(),
@@ -1274,6 +1288,7 @@ mod tests {
             inlined_gates: None,
             strict_contracts: false,
             target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1465,7 +1480,7 @@ mod tests {
     fn a_dependency_cycle_fails_every_unit_test() {
         let (_dir, models) = scaffold_unit_test_project(true);
         std::fs::write(models.join("orders.sql"), "SELECT id, amount FROM flagged").unwrap();
-        let run = run_unit_tests(&models, None).unwrap();
+        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
         assert_eq!(run.results.len(), 1, "{:?}", run.results);
         let result = &run.results[0];
         assert_eq!(result.model, "flagged");
@@ -1474,6 +1489,53 @@ mod tests {
             result.error.as_deref().is_some_and(|e| e.contains("E058")),
             "{:?}",
             result.error
+        );
+    }
+
+    /// Offline mode reaches the runner's own in-memory database. The empty
+    /// extension directory holds no `icu`, so the connect fails with the
+    /// offline error instead of running `INSTALL icu` over the network.
+    #[test]
+    fn offline_mode_reaches_the_test_runner_connection() {
+        let dir = scaffold_seeded_project();
+        let models_dir = dir.path().join("models");
+        let ext_dir = tempfile::tempdir().unwrap();
+        let offline = ExtensionOptions {
+            directory: Some(ext_dir.path().to_path_buf()),
+            offline: true,
+        };
+        let err = run_tests_with(TestRunInputs {
+            models_dir: &models_dir,
+            project_root: dir.path(),
+            models: TestModels::Dir,
+            contracts_dir: None,
+            model_filter: None,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
+            inlined_gates: None,
+            strict_contracts: false,
+            target_dialects: Default::default(),
+            extensions: offline.clone(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<rocky_duckdb::DuckDbError>(),
+                Some(rocky_duckdb::DuckDbError::OfflineExtensionMissing { .. })
+            ),
+            "{err:#}"
+        );
+
+        let (_unit_dir, unit_models) = scaffold_unit_test_project(true);
+        let run = run_unit_tests(&unit_models, None, &offline).unwrap();
+        assert!(!run.results.is_empty());
+        assert!(
+            run.results.iter().all(|r| !r.passed
+                && r.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("offline mode needs the `icu` extension"))),
+            "{:?}",
+            run.results
         );
     }
 
@@ -1501,6 +1563,7 @@ mod tests {
             inlined_gates: None,
             strict_contracts: false,
             target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1522,6 +1585,7 @@ mod tests {
             inlined_gates: None,
             strict_contracts: false,
             target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
         })
         .unwrap();
         assert!(result.failures.is_empty(), "{:?}", result.failures);
@@ -1539,6 +1603,7 @@ mod tests {
             inlined_gates: Some(&refuse),
             strict_contracts: false,
             target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
         })
         .unwrap();
         assert_eq!(result.passed, 0, "{:?}", result.model_results);
@@ -1582,6 +1647,7 @@ mod tests {
             inlined_gates: Some(&record_inlined),
             strict_contracts: false,
             target_dialects: Default::default(),
+            extensions: ExtensionOptions::default(),
         })
         .unwrap();
         assert_eq!(seen.borrow().trim(), "SELECT id FROM eph");

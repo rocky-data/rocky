@@ -285,10 +285,7 @@ fn w055(message: String, path: Option<String>, model: Option<String>) -> Package
 
 /// Project root: the directory holding `rocky.toml`.
 fn project_root(config_path: &Path) -> PathBuf {
-    match config_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
+    crate::commands::product::product_command_root(config_path)
 }
 
 // ---------------------------------------------------------------------------

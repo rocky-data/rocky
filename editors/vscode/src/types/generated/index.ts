@@ -61,6 +61,10 @@ export type {
   ScheduleStatusCounts,
   ScheduleThrottleKind,
   TickLockState,
+  DeliveryStatus,
+  DurationEstimateStatus,
+  EstimateBasis,
+  EstimateState,
 } from "./schedule_status";
 export type {
   ScheduleSpoolOutput,

@@ -367,6 +367,10 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ScheduleSpoolOutput": ("schedule_spool_schema", "ScheduleSpoolOutput"),
     "ScheduleStatusOutput": ("schedule_status_schema", "ScheduleStatusOutput"),
     "ScheduleThrottleStatus": ("schedule_status_schema", "ScheduleThrottleStatus"),
+    # Shared by `ProductStatusOutput.delivery` and
+    # `SchedulePipelineStatus.delivery`; both schemas define the same shape.
+    "DeliveryStatus": ("schedule_status_schema", "DeliveryStatus"),
+    "DurationEstimateStatus": ("schedule_status_schema", "DurationEstimateStatus"),
     "SettingsOutput": ("settings_schema", "SettingsOutput"),
     "TokenSettings": ("settings_schema", "TokenSettings"),
     "SpoolCounts": ("schedule_spool_schema", "SpoolCounts"),
@@ -841,6 +845,8 @@ if TYPE_CHECKING:
         TokenSettings,
     )
     from .schedule_status_schema import (
+        DeliveryStatus,
+        DurationEstimateStatus,
         ScheduleClaimStatus,
         ScheduleLockStatus,
         SchedulePipelineStatus,
@@ -1179,6 +1185,8 @@ __all__ = [
     "ScheduleSpoolOutput",
     "ScheduleStatusOutput",
     "ScheduleThrottleStatus",
+    "DeliveryStatus",
+    "DurationEstimateStatus",
     "SettingsOutput",
     "TokenSettings",
     "SpoolCounts",

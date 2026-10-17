@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed.
+A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. The one exception is the delivery deadline (below): the engine reads it from the spec itself, and nothing is lowered for it.
 
 The verbs on this page are the deterministic half of spec fulfillment. They parse, verify, lower, and approve. The agent loop that drafts SQL is [`rocky fulfill`](/reference/commands/fulfill/), and it is gated by the same policy plane as every other agent action.
 
@@ -18,6 +18,22 @@ products/<name>.toml ──verify──▶ posture + tags + collisions
                       Phase B: metadata merged into models/<model>.toml
                       (staged writes; the manifest rename commits)
 ```
+
+### Delivery deadline
+
+A product can say when its output must arrive. Add two optional keys to `[product]`:
+
+```toml
+[product]
+name = "revenue_daily"
+intent = "Daily gross revenue per client in EUR"
+deliver_by = "0 6 * * *"     # a 5-field cron expression; each occurrence is a deadline
+timezone = "Europe/Lisbon"   # IANA name; defaults to UTC
+```
+
+The parser checks `deliver_by` with the scheduler's own cron parser (`deliver-by-unparseable`). It refuses an unknown timezone (`timezone-unknown`) and a `timezone` without `deliver_by` (`timezone-without-deliver-by`).
+
+Each production `rocky run` that builds the product's output model records the deadline that build served. A build covers the first deadline at or after it finished. If an earlier deadline was still open when it finished, the build serves that one instead, and it is late. A late build also covers every deadline that passed before it finished, so it reports one lateness, not one per missed deadline. A previous build with no recorded deadline is no baseline, so the first build after a spec gains `deliver_by` is judged like a first delivery. Lateness is wall-clock time from the deadline to the moment the model finished. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of the `rocky.toml` it runs.
 
 ---
 
@@ -119,6 +135,18 @@ rocky product status revenue_daily
 
 Reports: the spec's identity (or its parse error), the committed lowering phase, byte-verification of every committed artifact against the manifest, whether a crashed commit's journal is pending (the next `compile` resolves it), the approval record with snapshot integrity, whether the working spec still matches the approved revision, and the persisted fulfillment state with its journal row count.
 
+When the spec declares `deliver_by`, status also reports `delivery`:
+
+| Field | Meaning |
+|---|---|
+| `on_time`, `late_by_seconds` | Whether the latest production delivery met the deadline it served, and by how much it missed. `null` until a run records a deadline. |
+| `last_due_at`, `last_delivered_at` | That deadline, and when the output model finished. |
+| `next_due_at` | The deadline the next delivery must meet. A time in the past means it is already late. |
+| `at_risk` | `true` when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`. |
+| `estimate` | `state` (`known` or `unknown`), `n`, `window` (20), `p50_ms`, `p90_ms`, `growth`. |
+
+The estimate times each of the last 20 successful production deliveries from run start to the output model's finish. With fewer than 5, it is `unknown` and gives no verdict. From 10 runs on, when the newest 5 all ran slower than the p90 of the older ones, `growth` is `true` and `p90_ms` is the slowest of those 5.
+
 ### JSON output
 
 `ProductStatusOutput` — every field above, machine-readable.
@@ -138,7 +166,7 @@ A product is listed when either is true: `products/<name>.toml` exists, or the s
 
 Each row is a projection of `rocky product status <name>`: spec identity or its error, the committed lowering phase, the count of artifact byte-verification problems, whether a staging journal is pending, the approval record, whether the working spec matches the approved revision, the fulfillment state, and the journal row count. The two commands are built by the same code, so a row can never disagree with the status it summarises.
 
-The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`, and one product's status at `GET /api/v1/products/{name}`. The server reads `products/` under the directory of the bound `rocky.toml`; the CLI reads it under the working directory. The server reads the state store named by `--state-path`, or the default under its own models directory, namespaced when `--state-namespace` or the config's `[state] namespacing` resolves one, the same derivation every command makes. So a server started with the namespace the CLI uses answers from the store the CLI wrote. Both reads open the store read-only: a store at the current schema version is never written, an older one is migrated forward as every read command does, and a store written by a newer engine is refused.
+The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`, and one product's status at `GET /api/v1/products/{name}`. The server and the CLI both read `products/` under the directory of the `rocky.toml` they use. With the default `--config rocky.toml`, that is the working directory. The server reads the state store named by `--state-path`, or the default under its own models directory, namespaced when `--state-namespace` or the config's `[state] namespacing` resolves one, the same derivation every command makes. So a server started with the namespace the CLI uses answers from the store the CLI wrote. Both reads open the store read-only: a store at the current schema version is never written, an older one is migrated forward as every read command does, and a store written by a newer engine is refused.
 
 ### JSON output
 

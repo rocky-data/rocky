@@ -1020,6 +1020,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 

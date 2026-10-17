@@ -14,6 +14,32 @@ use tracing::warn;
 
 use crate::error_reporter;
 
+/// The DuckDB extension settings of the project at `config_path`, for a
+/// local connection that no registry adapter owns (`rocky test`, `rocky ci`,
+/// `rocky replay --execute`, `rocky compile --with-seed`).
+///
+/// No file at `config_path` gives the defaults. A file that exists but does
+/// not load is an error: the project may say `offline = true`, so the
+/// connection must not guess.
+///
+/// # Errors
+///
+/// Returns an error when the config exists and cannot be loaded.
+#[cfg(feature = "duckdb")]
+pub fn duckdb_extensions_for(config_path: &Path) -> Result<rocky_duckdb::ExtensionOptions> {
+    let config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    Ok(duckdb_extensions_from(config.as_ref()))
+}
+
+/// [`duckdb_extensions_for`] for a config the caller already loaded.
+#[cfg(feature = "duckdb")]
+pub fn duckdb_extensions_from(config: Option<&RockyConfig>) -> rocky_duckdb::ExtensionOptions {
+    config.map_or_else(rocky_duckdb::ExtensionOptions::default, |c| {
+        rocky_duckdb::ExtensionOptions::from_adapters(c.adapters.values())
+    })
+}
+
 use rocky_adapter_sdk::LoaderAdapter;
 use rocky_core::adapter_capability::capability_for;
 use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig};
@@ -480,23 +506,27 @@ impl AdapterRegistry {
                     // Discovery + warehouse share the same connector via `Arc<Mutex<>>`.
                     // The message prints the path as `${NAME}`; only the
                     // open call sees the plaintext (#1919).
+                    let extensions = rocky_duckdb::ExtensionOptions::from_adapter(adapter_cfg);
                     let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_ref() {
                         // DuckDB's own IO error names the plaintext path, so
                         // it is rendered here instead of chained as the source.
-                        DuckDbWarehouseAdapter::open(std::path::Path::new(p.expose())).map_err(
-                            |e| {
-                                anyhow::anyhow!(
-                                    "adapters.{name}: failed to open DuckDB at '{p}': {}",
-                                    rocky_core::secret_registry::render_placeholders(
-                                        &e.to_string()
-                                    )
-                                )
-                            },
-                        )?
+                        DuckDbWarehouseAdapter::open_with(
+                            std::path::Path::new(p.expose()),
+                            &extensions,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "adapters.{name}: failed to open DuckDB at '{p}': {}",
+                                rocky_core::secret_registry::render_placeholders(&e.to_string())
+                            )
+                        })?
                     } else {
-                        DuckDbWarehouseAdapter::in_memory().context(format!(
-                            "adapters.{name}: failed to create in-memory DuckDB"
-                        ))?
+                        DuckDbWarehouseAdapter::in_memory_with(&extensions).map_err(|e| {
+                            anyhow::anyhow!(
+                                "adapters.{name}: failed to create in-memory DuckDB: {}",
+                                rocky_core::secret_registry::render_placeholders(&e.to_string())
+                            )
+                        })?
                     };
 
                     let shared = warehouse_adapter.shared_connector();
