@@ -752,7 +752,7 @@ fn parse_freshness(value: &toml::Value, path: &str) -> SpecResult<FreshnessSpec>
         ));
     }
     if max_lag.is_some() {
-        tracing::warn!(
+        tracing::debug!(
             path,
             keys = %old_keys.join(", "),
             "deprecated product freshness spelling (W058); it still works, write warn_after / error_after instead"

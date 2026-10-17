@@ -8147,7 +8147,7 @@ fn parse_rocky_config_str_with(
     let mut config: RockyConfig = value.try_into().map_err(to_parse_err)?;
     apply_single_adapter_discovery_default(&mut config);
     for deprecated in deprecated_freshness_spellings(&config) {
-        tracing::warn!(
+        tracing::debug!(
             field = %deprecated.field,
             keys = %deprecated.keys.join(", "),
             replacement = %deprecated.replacement,
@@ -8168,6 +8168,8 @@ pub struct DeprecatedFreshness {
     pub keys: Vec<&'static str>,
     /// The `warn_after` / `error_after` text that replaces them.
     pub replacement: String,
+    /// A level is zero seconds, which the new grammar cannot spell.
+    pub zero_threshold: bool,
 }
 
 /// Every freshness block in `config` that uses a deprecated spelling: the
@@ -8183,6 +8185,7 @@ pub fn deprecated_freshness_spellings(config: &RockyConfig) -> Vec<DeprecatedFre
             field: "freshness".to_string(),
             keys: project_keys,
             replacement: crate::source_freshness::replacement_for(&config.freshness.thresholds()),
+            zero_threshold: config.freshness.thresholds().has_zero(),
         });
     }
     for (name, pipeline) in &config.pipelines {
@@ -8197,6 +8200,7 @@ pub fn deprecated_freshness_spellings(config: &RockyConfig) -> Vec<DeprecatedFre
             field: format!("pipeline.{name}.checks.freshness"),
             keys,
             replacement: crate::source_freshness::replacement_for(&freshness.thresholds()),
+            zero_threshold: freshness.thresholds().has_zero(),
         });
     }
     out

@@ -322,6 +322,32 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     Ok(out)
 }
 
+/// What W058 tells the user to do about a deprecated freshness block.
+#[derive(Clone, Copy)]
+enum FreshnessRemedy<'a> {
+    /// Write this text; it grades exactly as the old block did.
+    Same(&'a str),
+    /// Product `max_lag` with `severity = "error"`. The old lowering
+    /// dropped the severity, so this text grades differently.
+    ErrorNowFails(&'a str),
+    /// A zero threshold: the duration grammar takes only positive values.
+    Zero,
+}
+
+impl<'a> FreshnessRemedy<'a> {
+    /// The remedy for thresholds written in a deprecated block.
+    fn of(
+        thresholds: &rocky_core::source_freshness::FreshnessThresholds,
+        replacement: &'a str,
+    ) -> Self {
+        if thresholds.has_zero() {
+            Self::Zero
+        } else {
+            Self::Same(replacement)
+        }
+    }
+}
+
 /// One W058: a freshness block written in a deprecated spelling.
 ///
 /// The old keys keep working, so this is a warning. It names the file, the
@@ -331,17 +357,25 @@ fn freshness_deprecation_message(
     file: String,
     field: String,
     keys: &[&str],
-    replacement: &str,
+    remedy: FreshnessRemedy<'_>,
 ) -> ValidateMessage {
     let keys_text = keys
         .iter()
         .map(|k| format!("`{k}`"))
         .collect::<Vec<_>>()
         .join(" and ");
-    let remedy = if replacement.is_empty() {
-        "Delete them: with no lag value they set nothing.".to_string()
-    } else {
-        format!("Write `{replacement}` instead; it behaves the same.")
+    let remedy = match remedy {
+        FreshnessRemedy::Same("") => {
+            "Delete them: with no lag value they set nothing.".to_string()
+        }
+        FreshnessRemedy::Same(replacement) => {
+            format!("Write `{replacement}` instead; it behaves the same.")
+        }
+        FreshnessRemedy::ErrorNowFails(replacement) => format!(
+            "Write `{replacement}` instead. It does not behave the same: the old form graded this as a warning, and `error_after` makes it fail at error, as `severity = \"error\"` asked."
+        ),
+        FreshnessRemedy::Zero => "A zero threshold has no spelling in the new form: `warn_after` and `error_after` take a positive duration. Keep the old key, or write the smallest duration, `\"1s\"`, which is not the same check."
+            .to_string(),
     };
     ValidateMessage {
         severity: "warn".into(),
@@ -373,7 +407,11 @@ fn freshness_deprecations(
             config_file.clone(),
             deprecated.field,
             &deprecated.keys,
-            &deprecated.replacement,
+            if deprecated.zero_threshold {
+                FreshnessRemedy::Zero
+            } else {
+                FreshnessRemedy::Same(&deprecated.replacement)
+            },
         ));
     }
 
@@ -407,7 +445,10 @@ fn freshness_deprecations(
             file.display().to_string(),
             "freshness".to_string(),
             &keys,
-            &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+            FreshnessRemedy::of(
+                &freshness.thresholds(),
+                &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+            ),
         ));
     }
 
@@ -431,7 +472,10 @@ fn freshness_deprecations(
             path.display().to_string(),
             "freshness".to_string(),
             &keys,
-            &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+            FreshnessRemedy::of(
+                &freshness.thresholds(),
+                &rocky_core::source_freshness::replacement_for(&freshness.thresholds()),
+            ),
         ));
     }
 }
@@ -497,11 +541,22 @@ fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
                     .thresholds()
                     .map(|levels| rocky_core::source_freshness::replacement_for(&levels))
                     .unwrap_or_default();
+                // The old lowering dropped `severity`, so a `max_lag` with
+                // `severity = "error"` graded as a warning. (`max_lag` is
+                // positive by grammar, so a zero level cannot occur here.)
+                let remedy = if freshness.max_lag.is_some()
+                    && freshness.severity
+                        == Some(rocky_core::product::spec::FreshnessSeverity::Error)
+                {
+                    FreshnessRemedy::ErrorNowFails(&replacement)
+                } else {
+                    FreshnessRemedy::Same(&replacement)
+                };
                 out.push(freshness_deprecation_message(
                     file_label.clone(),
                     "product.output.freshness".to_string(),
                     &keys,
-                    &replacement,
+                    remedy,
                 ));
             }
         }
@@ -2411,6 +2466,55 @@ agent = "propose_only"
         let (_dir, out) = freshness_project(false);
         assert_eq!(codes(&out, "W058"), 0, "{:?}", out.messages);
         assert!(out.valid, "{:?}", out.messages);
+    }
+
+    fn w058_messages(out: &ValidateOutput) -> Vec<&ValidateMessage> {
+        out.messages.iter().filter(|m| m.code == "W058").collect()
+    }
+
+    #[test]
+    fn product_max_lag_with_error_severity_says_the_replacement_grades_differently() {
+        let spec = MINIMAL_SPEC.replace("NAME", "alpha").replace(
+            "grain = [\"id\"]",
+            "grain = [\"id\"]\nfreshness = { max_lag = \"24h\", time_column = \"id\", severity = \"error\" }",
+        );
+        let (_dir, out) = project_with_products(&[("alpha.toml", &spec)]);
+        let w058 = w058_messages(&out);
+        assert_eq!(w058.len(), 1, "{w058:#?}");
+        let message = &w058[0].message;
+        assert!(message.contains("error_after = \"1d\""), "{message}");
+        assert!(message.contains("does not behave the same"), "{message}");
+        assert!(message.contains("graded this as a warning"), "{message}");
+        assert!(!message.contains("it behaves the same"), "{message}");
+
+        // Without `severity = "error"` the move is a pure rename.
+        let plain = MINIMAL_SPEC.replace("NAME", "alpha").replace(
+            "grain = [\"id\"]",
+            "grain = [\"id\"]\nfreshness = { max_lag = \"24h\", time_column = \"id\" }",
+        );
+        let (_dir, out) = project_with_products(&[("alpha.toml", &plain)]);
+        let w058 = w058_messages(&out);
+        assert_eq!(w058.len(), 1, "{w058:#?}");
+        assert!(w058[0].message.contains("it behaves the same"), "{w058:#?}");
+    }
+
+    #[test]
+    fn a_zero_threshold_is_never_offered_an_invalid_replacement() {
+        for block in [
+            "[freshness]\nexpected_lag_seconds = 0",
+            "[freshness]\nexpected_lag_seconds = 0\nseverity = \"error\"",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("rocky.toml");
+            std::fs::write(&config, format!("{MINIMAL_CONFIG}\n{block}\n")).unwrap();
+            let out = validate_inner(&config).unwrap();
+            let w058 = w058_messages(&out);
+            assert_eq!(w058.len(), 1, "{block}: {w058:#?}");
+            let message = &w058[0].message;
+            assert!(!message.contains("0s"), "{block}: {message}");
+            assert!(!message.contains("behaves the same"), "{block}: {message}");
+            assert!(message.contains("zero threshold"), "{block}: {message}");
+        }
     }
 
     #[test]

@@ -105,7 +105,11 @@ fn pipeline_check_refuses_mixed_and_inverted_levels() {
     let err = toml::from_str::<FreshnessConfig>("warn_after = \"30m\"")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("does not parse"), "{err}");
+    assert!(
+        err.contains("`warn_after` = \"30m\" does not parse"),
+        "{err}"
+    );
+    assert!(!err.contains("max_lag"), "{err}");
     let err = toml::from_str::<FreshnessConfig>("severity = \"error\"")
         .unwrap_err()
         .to_string();
@@ -278,4 +282,11 @@ fn spec_grammar_follows_the_shared_rules() {
     );
     assert_eq!(new.budget_seconds().unwrap(), 43_200);
     assert!(new.legacy_keys().is_empty());
+
+    // A bad value names the key the user wrote, never `max_lag`.
+    let bad = spec(None, None, None, Some("30m"))
+        .thresholds()
+        .unwrap_err();
+    assert!(bad.to_string().contains("`error_after` = \"30m\""), "{bad}");
+    assert!(!bad.to_string().contains("max_lag"), "{bad}");
 }

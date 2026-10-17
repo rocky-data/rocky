@@ -1134,14 +1134,15 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     Ok(defaults)
 }
 
-/// Log a deprecated `[freshness]` spelling once at load (W058 is the
-/// structured form `rocky validate` reports).
+/// Log a deprecated `[freshness]` spelling at debug level on load. Loads
+/// repeat (the language server, each compile), so the user-facing surface
+/// is W058 from `rocky validate`.
 fn warn_deprecated_freshness(location: &str, freshness: &ModelFreshnessConfig) {
     let keys = freshness.legacy_keys();
     if keys.is_empty() {
         return;
     }
-    tracing::warn!(
+    tracing::debug!(
         location,
         keys = %keys.join(", "),
         replacement = %crate::source_freshness::replacement_for(&freshness.thresholds()),

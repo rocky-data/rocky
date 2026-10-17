@@ -130,6 +130,15 @@ impl FreshnessThresholds {
     }
 }
 
+impl FreshnessThresholds {
+    /// True when a level is zero seconds. A deprecated scalar TTL may be
+    /// zero, but the duration grammar takes only positive values, so such
+    /// a block has no `warn_after` / `error_after` spelling.
+    pub fn has_zero(&self) -> bool {
+        self.warn_after_seconds == Some(0) || self.error_after_seconds == Some(0)
+    }
+}
+
 /// Parse and cross-check a `warn_after` / `error_after` pair.
 ///
 /// The one grammar every freshness block shares: each value is a duration
