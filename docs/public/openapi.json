@@ -1426,6 +1426,17 @@
       "AuditDecisionEntry": {
         "description": "One recorded policy decision in the [`AuditOutput`] ledger.",
         "properties": {
+          "approval_channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The channel an approval came through (`cli`, `http_api`). Present only on an `approval` row whose channel this binary can read. An approval through `rocky mcp` reads `cli`."
+          },
           "capability": {
             "allOf": [
               {
@@ -1441,6 +1452,14 @@
               }
             ],
             "description": "The resolved verdict (`allow` / `require_review` / `deny`)."
+          },
+          "kind": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BriefDecisionKind"
+              }
+            ],
+            "description": "What kind of event the row records. Only `evaluation` carries a policy verdict in `effect`; an `approval` row's `allow` is a person's sign-off on the plan (`rocky review --approve`)."
           },
           "model": {
             "description": "The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
@@ -1502,6 +1521,7 @@
         "required": [
           "capability",
           "effect",
+          "kind",
           "model",
           "plan_id",
           "principal",
@@ -3338,6 +3358,13 @@
             "description": "An operator lifted a freeze. Recorded with `effect = allow`.",
             "enum": [
               "unfreeze"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A person approved a plan with `rocky review --approve`. Recorded with `effect = allow`; it is a sign-off, not a policy verdict.",
+            "enum": [
+              "approval"
             ],
             "type": "string"
           }
@@ -20141,6 +20168,13 @@
             },
             "type": "array"
           },
+          "decision_ref": {
+            "description": "The ledger key of the approval row this invocation recorded in the policy-decision ledger (`\"{timestamp}|{plan_id}|{model}\"`), the same key `rocky audit` and `rocky brief` cite. Absent on a dry run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "marker_written": {
             "description": "True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.",
             "type": "boolean"
@@ -22490,6 +22524,39 @@
           "findings"
         ],
         "type": "object"
+      },
+      "SessionSource": {
+        "description": "Where the `rocky` invocation originated — the calling surface that spawned the process.\n\nStamped on every [`RunRecord`] at claim time for the governance audit trail (§1.4 item 2). The CLI derives it from the environment:\n\n- [`SessionSource::Dagster`] — `DAGSTER_PIPES_CONTEXT` is set (Dagster's Pipes protocol populates this when a Pipes client launches the subprocess — whether or not the binary emits Pipes messages back). - [`SessionSource::HttpApi`] — `ROCKY_SESSION_SOURCE=http_api` is set (an HTTP caller explicitly stamps itself; Rocky's server never spawns `rocky run` today, but the variant is reserved for future wiring). - [`SessionSource::Lsp`] — `ROCKY_SESSION_SOURCE=lsp` is set. Reserved for completeness; the LSP server (`rocky lsp`) handles requests in-process rather than shelling out to `rocky run`, so this is effectively unreachable today. - [`SessionSource::Cli`] — the fallback. A human / script / CI runner invoking `rocky run` directly.",
+        "oneOf": [
+          {
+            "description": "Direct invocation — shell, script, or CI runner.",
+            "enum": [
+              "cli"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Dagster Pipes / subprocess client launched the process.",
+            "enum": [
+              "dagster"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "LSP server invoked the run. Reserved; see enum-level docs.",
+            "enum": [
+              "lsp"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "HTTP API caller stamped itself via `ROCKY_SESSION_SOURCE=http_api`.",
+            "enum": [
+              "http_api"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "SettingsOutput": {
         "description": "The running server's posture, served by `GET /api/v1/settings`.\n\n**An allowlist, not a config dump.** Every field below is projected individually, by hand, in `crate::api::settings_output` — from a [`rocky_server::state::SettingsSnapshot`] of primitives plus two fieldless enum labels taken out of the config file, after which the config is dropped. No `RockyConfig` is serialised or `Debug`-printed anywhere on that path: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface.\n\nNo secret appears — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.\n\nTo be exact about what enforces that: the **projection function** does, not the type. Rust would happily let a future field carry a secret. What makes it hold is that the projection names every field explicitly, and three tests stand behind it — `settings_reports_exactly_the_allowlisted_fields` fails when a field is *added*, `settings_never_discloses_a_configured_secret` greps this document for three real configured secrets, and `no_safe_route_discloses_a_configured_secret` greps every safe route for the same three.\n\n**API-only, deliberately.** There is no `rocky settings` verb, because this document describes *a server that is running* and a one-shot CLI invocation would have to invent one. [`ScheduleStatusOutput`] is the established precedent for a route with no CLI oracle.\n\n**Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs.\n\nThose two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: on a plain `rocky serve` nothing on the path to binding the listener reads a file, and an eager read would put one there — letting a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that path is unchanged.)\n\nThat read is bounded by one permit and a deadline, so a stuck file cannot starve the server either: a caller that finds it busy gets `503 engine_busy`, and one whose read blows the deadline gets `504 settings_config_timeout`. Every other field is unaffected.\n\nSo they are a snapshot, not a live view, and the scheduler re-reads that same file every tick — a config edited after the first request to this route is not reflected here, while the scheduler acts on the new one.",

@@ -4,6 +4,17 @@
     "AuditDecisionEntry": {
       "description": "One recorded policy decision in the [`AuditOutput`] ledger.",
       "properties": {
+        "approval_channel": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SessionSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The channel an approval came through (`cli`, `http_api`). Present only on an `approval` row whose channel this binary can read. An approval through `rocky mcp` reads `cli`."
+        },
         "capability": {
           "allOf": [
             {
@@ -19,6 +30,14 @@
             }
           ],
           "description": "The resolved verdict (`allow` / `require_review` / `deny`)."
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BriefDecisionKind"
+            }
+          ],
+          "description": "What kind of event the row records. Only `evaluation` carries a policy verdict in `effect`; an `approval` row's `allow` is a person's sign-off on the plan (`rocky review --approve`)."
         },
         "model": {
           "description": "The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
@@ -80,6 +99,7 @@
       "required": [
         "capability",
         "effect",
+        "kind",
         "model",
         "plan_id",
         "principal",
@@ -125,6 +145,46 @@
         "output_model"
       ],
       "type": "object"
+    },
+    "BriefDecisionKind": {
+      "description": "What kind of event a ledger row records, so a reader can tell a policy evaluation from the other rows the policy-decision ledger holds.\n\nMirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).",
+      "oneOf": [
+        {
+          "description": "A policy gate evaluated a plan. `effect` is the policy verdict.",
+          "enum": [
+            "evaluation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A post-apply verification row. `effect` says whether the named checks passed; it is not a policy verdict.",
+          "enum": [
+            "verify_after_custody"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An operator froze a scope. Recorded with `effect = deny`.",
+          "enum": [
+            "freeze"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An operator lifted a freeze. Recorded with `effect = allow`.",
+          "enum": [
+            "unfreeze"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A person approved a plan with `rocky review --approve`. Recorded with `effect = allow`; it is a sign-off, not a policy verdict.",
+          "enum": [
+            "approval"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "PolicyCapability": {
       "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
@@ -288,6 +348,39 @@
           "description": "Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].",
           "enum": [
             "default"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SessionSource": {
+      "description": "Where the `rocky` invocation originated — the calling surface that spawned the process.\n\nStamped on every [`RunRecord`] at claim time for the governance audit trail (§1.4 item 2). The CLI derives it from the environment:\n\n- [`SessionSource::Dagster`] — `DAGSTER_PIPES_CONTEXT` is set (Dagster's Pipes protocol populates this when a Pipes client launches the subprocess — whether or not the binary emits Pipes messages back). - [`SessionSource::HttpApi`] — `ROCKY_SESSION_SOURCE=http_api` is set (an HTTP caller explicitly stamps itself; Rocky's server never spawns `rocky run` today, but the variant is reserved for future wiring). - [`SessionSource::Lsp`] — `ROCKY_SESSION_SOURCE=lsp` is set. Reserved for completeness; the LSP server (`rocky lsp`) handles requests in-process rather than shelling out to `rocky run`, so this is effectively unreachable today. - [`SessionSource::Cli`] — the fallback. A human / script / CI runner invoking `rocky run` directly.",
+      "oneOf": [
+        {
+          "description": "Direct invocation — shell, script, or CI runner.",
+          "enum": [
+            "cli"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Dagster Pipes / subprocess client launched the process.",
+          "enum": [
+            "dagster"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "LSP server invoked the run. Reserved; see enum-level docs.",
+          "enum": [
+            "lsp"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "HTTP API caller stamped itself via `ROCKY_SESSION_SOURCE=http_api`.",
+          "enum": [
+            "http_api"
           ],
           "type": "string"
         }

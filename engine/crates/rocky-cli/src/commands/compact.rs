@@ -2238,9 +2238,16 @@ effect = "deny"
 
             // Drive the REAL `rocky review --approve` path (fails on a head that
             // omits Compact from the reviewable allowlist).
-            crate::commands::review::compute_review(dir.path(), &config, &plan_id, "HEAD", true)
-                .await
-                .expect("`rocky review --approve` must accept a compact plan");
+            crate::commands::review::compute_review_with_state_path(
+                dir.path(),
+                &config,
+                Some(&state),
+                &plan_id,
+                "HEAD",
+                crate::commands::review::test_approval(),
+            )
+            .await
+            .expect("`rocky review --approve` must accept a compact plan");
 
             // With the marker the apply proceeds and executes its statements.
             let adapter2 = CountingAdapter::new();

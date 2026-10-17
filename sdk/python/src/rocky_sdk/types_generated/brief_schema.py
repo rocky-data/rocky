@@ -28,7 +28,7 @@ class BriefBudgetStatus(BaseModel):
     """
 
 
-class BriefDecisionKind1(StrEnum):
+class BriefDecisionKind11(StrEnum):
     """
     A policy gate evaluated a plan. `effect` is the policy verdict.
     """
@@ -36,7 +36,7 @@ class BriefDecisionKind1(StrEnum):
     evaluation = "evaluation"
 
 
-class BriefDecisionKind2(StrEnum):
+class BriefDecisionKind12(StrEnum):
     """
     A post-apply verification row. `effect` says whether the named checks passed; it is not a policy verdict.
     """
@@ -44,7 +44,7 @@ class BriefDecisionKind2(StrEnum):
     verify_after_custody = "verify_after_custody"
 
 
-class BriefDecisionKind3(StrEnum):
+class BriefDecisionKind13(StrEnum):
     """
     An operator froze a scope. Recorded with `effect = deny`.
     """
@@ -52,12 +52,20 @@ class BriefDecisionKind3(StrEnum):
     freeze = "freeze"
 
 
-class BriefDecisionKind4(StrEnum):
+class BriefDecisionKind14(StrEnum):
     """
     An operator lifted a freeze. Recorded with `effect = allow`.
     """
 
     unfreeze = "unfreeze"
+
+
+class BriefDecisionKind15(StrEnum):
+    """
+    A person approved a plan with `rocky review --approve`. Recorded with `effect = allow`; it is a sign-off, not a policy verdict.
+    """
+
+    approval = "approval"
 
 
 class BriefDegradedRule(BaseModel):
@@ -505,10 +513,11 @@ class BriefDecisionEntry(BaseModel):
     Ordered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.
     """
     kind: (
-        BriefDecisionKind1
-        | BriefDecisionKind2
-        | BriefDecisionKind3
-        | BriefDecisionKind4
+        BriefDecisionKind11
+        | BriefDecisionKind12
+        | BriefDecisionKind13
+        | BriefDecisionKind14
+        | BriefDecisionKind15
     )
     """
     What kind of row this is. Only `evaluation` rows carry a policy verdict in `effect`, and only they are counted by the agent-activity counters.

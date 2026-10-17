@@ -959,6 +959,37 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   nor overwrites environments a v32 binary published; it also does not
 ///   see them.
 ///
+/// - **v33** — adds [`PolicyDecisionRecord::approval`] (C2-P0): `rocky review
+///   --approve` records one plan-level row in [`POLICY_DECISIONS`] before it
+///   writes the review marker. Not a table change — `EXPECTED_TABLES` is
+///   untouched; no blob walk. A v32 row forward-deserializes with the field
+///   `None`, guarded by
+///   `test_v32_policy_decision_approval_defaults_none_and_round_trips`.
+///
+///   **Why it is a bump and not a rider.** An approval row has `effect =
+///   allow` and no other marker a v32 binary knows. A v32 binary classifies
+///   it as [`DecisionKind::Evaluation`] and counts it in the scorecard and in
+///   the brief's allow counts, so it would mean something different there.
+///   No gate reads the row: `active_freezes` reads only freeze rows, and the
+///   budget reads only `verify_after` custody rows and rule-matched
+///   evaluations.
+///
+///   **On upgrade.** A v32 store opened read-write is stamped v33 in place
+///   and every record is kept (`test_v32_opens_and_stamps_v33_keeping_rows`).
+///   Remote state carries forward from the `v32/` key
+///   ([`crate::state_sync`]); the first upload creates the `v33/` key and the
+///   `v32/` key is never written.
+///
+///   **During a rolling upgrade.** A v32 pod keeps reading and writing the
+///   `v32/` key. After the first v33 upload, a row a v32 pod records there (a
+///   freeze, for example) is invisible to the v33 pods until that pod
+///   upgrades. Rollback reads the stale `v32/` key.
+///
+///   **On rollback.** The version check runs at OPEN.
+///   [`SchemaMismatchPolicy::Fail`] refuses with the version pair.
+///   [`SchemaMismatchPolicy::Recreate`] starts a fresh local store and never
+///   uploads it.
+///
 /// # Fields added without a bump
 ///
 /// A serde-additive field needs no bump when an older binary that ignores it
@@ -1017,7 +1048,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///
 ///   **RV1-P2 bumped to v32 when publish started reading `output_version`**
 ///   (see the v32 stanza above). The field itself is unchanged.
-const CURRENT_SCHEMA_VERSION: u32 = 32;
+const CURRENT_SCHEMA_VERSION: u32 = 33;
 
 /// Errors from the embedded redb state store.
 #[derive(Error)]
@@ -7750,7 +7781,7 @@ fn provenance_key(run_id: &str, model_name: &str) -> String {
 /// order, so a forward scan replays decisions oldest-first; `plan_id` +
 /// `model` disambiguate multiple decisions recorded within the same
 /// timestamp tick.
-fn policy_decision_key(
+pub fn policy_decision_key(
     timestamp: &chrono::DateTime<chrono::Utc>,
     plan_id: &str,
     model: &str,
@@ -8098,6 +8129,74 @@ pub struct PolicyDecisionRecord {
     /// see "Fields added without a bump" above [`CURRENT_SCHEMA_VERSION`].
     #[serde(default, skip_serializing_if = "is_zero_seq")]
     pub seq: u64,
+    /// Custody detail for a human approval of a plan (`rocky review
+    /// --approve`). Present only on the row the approval writes; its presence
+    /// is what makes the row a [`DecisionKind::Approval`]. `None` on every
+    /// other row.
+    ///
+    /// Added with the v33 bump; see the v33 stanza on
+    /// [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// Read leniently field by field ([`ApprovalCustody`]): a value this
+    /// binary cannot parse still reads as an approval, never as an
+    /// evaluation, so a later binary's row is not counted in the rates.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_approval_lenient"
+    )]
+    pub approval: Option<ApprovalCustody>,
+}
+
+/// Custody detail on a [`PolicyDecisionRecord`] written by `rocky review
+/// --approve`.
+///
+/// The approver's id is the row's [`PolicyDecisionRecord::principal_ref`];
+/// this struct carries what the approval was about. The approver's git email
+/// is deliberately not here: it stays in the local review marker, because a
+/// personal account name does not belong in a shared ledger by default.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ApprovalCustody {
+    /// The channel the approval came through: `cli` for a terminal, and also
+    /// for an approval through `rocky mcp` (the MCP server runs as a CLI
+    /// process); `http_api` for a job the HTTP API started.
+    ///
+    /// Always written. `None` when this binary cannot read the stored value,
+    /// for example a channel a later binary added.
+    #[serde(default, deserialize_with = "deserialize_session_source_lenient")]
+    pub channel: Option<SessionSource>,
+    /// The git ref the breaking-change compare ran against. Empty for the
+    /// plan kinds that have no compare (gc, restore, compact, archive).
+    #[serde(default)]
+    pub base_ref: String,
+    /// The breaking-change findings the approver signed off on.
+    #[serde(default)]
+    pub breaking_change_count: usize,
+}
+
+/// Lenient reader for [`ApprovalCustody::channel`]: a value that does not
+/// parse as a [`SessionSource`] reads as `None`.
+fn deserialize_session_source_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<SessionSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Lenient reader for [`PolicyDecisionRecord::approval`]. A present value
+/// that does not parse as an [`ApprovalCustody`] reads as an empty custody,
+/// so the row stays an approval. Only an absent or `null` value is `None`.
+fn deserialize_approval_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<ApprovalCustody>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.map(|v| serde_json::from_value(v).unwrap_or_default()))
 }
 
 fn is_zero_seq(seq: &u64) -> bool {
@@ -8155,6 +8254,8 @@ where
 ///                        VERIFICATION verdict, not a policy verdict
 ///   Freeze / Unfreeze    `plan_id` prefixed "freeze:" / "unfreeze:";
 ///                        `effect` is Deny / Allow as an administrative act
+///   Approval             `approval` present; `effect` is Allow as a human
+///                        sign-off, not a policy verdict
 /// ```
 ///
 /// # Why this is derived rather than stored
@@ -8171,8 +8272,11 @@ where
 /// function does not know about is classified `Evaluation` and counted as one.
 /// The mitigation is that there is now exactly ONE place to teach, instead of
 /// the three separate ad-hoc predicates that let this reach three kinds
-/// unnoticed. A stored tag is now possible. It changes meaning for an older
-/// binary that counts rows, so it needs a schema bump when it lands.
+/// unnoticed.
+///
+/// [`DecisionKind::Approval`] is the first kind read from a stored field
+/// ([`PolicyDecisionRecord::approval`]). It changes meaning for an older
+/// binary that counts rows, so it landed with the v33 schema bump.
 // Not serialized, by construction: this is derived from the row on read and
 // never written. No serde, no schema, no binding to regenerate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8189,6 +8293,9 @@ pub enum DecisionKind {
     Freeze,
     /// An operator lifted a freeze. `effect` is `Allow` for the mirror reason.
     Unfreeze,
+    /// A person approved a plan with `rocky review --approve`. `effect` is
+    /// `Allow` as a sign-off, not because a policy allowed the plan.
+    Approval,
 }
 
 impl PolicyDecisionRecord {
@@ -8214,6 +8321,9 @@ impl PolicyDecisionRecord {
             .starts_with(crate::policy::UNFREEZE_PLAN_PREFIX)
         {
             return DecisionKind::Unfreeze;
+        }
+        if self.approval.is_some() {
+            return DecisionKind::Approval;
         }
         if !self.verify_after.is_empty() {
             return DecisionKind::VerifyAfterCustody;
@@ -9798,7 +9908,10 @@ mod environment_tests {
         assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(31));
 
         drop(StateStore::open(&path).unwrap());
-        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
         let store = StateStore::open(&path).unwrap();
         assert!(store.list_environments().unwrap().is_empty());
         assert!(store.publish_history(&env("prod")).unwrap().is_empty());
@@ -9848,10 +9961,13 @@ mod environment_tests {
             assert!(txn.delete_table(ENVIRONMENTS).unwrap());
             txn.commit().unwrap();
         }
-        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
         match StateStore::open_read_only(&path).map(|_| ()) {
             Err(StateError::ReadOnlyNeedsInit { found, missing, .. }) => {
-                assert_eq!(found, Some(32));
+                assert_eq!(found, Some(CURRENT_SCHEMA_VERSION));
                 assert_eq!(missing, vec!["environments".to_string()]);
             }
             other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
@@ -14133,6 +14249,7 @@ mod tests {
 
         let (store, _dir) = temp_store();
         let row = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             timestamp: Utc::now(),
             plan_id: "plan-new".to_string(),
@@ -14157,6 +14274,7 @@ mod tests {
         // This build reads its own row back with the actor intact.
         let back = store.list_policy_decisions().unwrap();
         let stamped = PolicyDecisionRecord {
+            approval: None,
             seq: 1,
             ..row.clone()
         };
@@ -16642,6 +16760,7 @@ mod tests {
         let (store, _dir) = temp_store();
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -16661,6 +16780,7 @@ mod tests {
             principal_ref: None,
         };
         let later = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -16684,10 +16804,12 @@ mod tests {
         store.record_policy_decision(&earlier).unwrap();
         // The store stamps the insertion order: `later` went in first.
         let later_stamped = PolicyDecisionRecord {
+            approval: None,
             seq: 1,
             ..later.clone()
         };
         let earlier_stamped = PolicyDecisionRecord {
+            approval: None,
             seq: 2,
             ..earlier.clone()
         };
@@ -16713,6 +16835,7 @@ mod tests {
 
         // A full record serialized with `models` stripped — a v27 blob.
         let record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -16762,6 +16885,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: true,
             fail_closed: false,
@@ -16804,6 +16928,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let mut record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: true,
             fail_closed: false,
@@ -16838,6 +16963,102 @@ mod tests {
         assert_eq!(store.list_policy_decisions().unwrap(), vec![record]);
     }
 
+    fn approval_row() -> PolicyDecisionRecord {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        PolicyDecisionRecord {
+            approval: None,
+            seq: 0,
+            keys_recorded: true,
+            fail_closed: false,
+            models: vec!["orders".to_string()],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-10-17T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_ap".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Apply,
+            model: "approval: run plan".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "approved".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        }
+    }
+
+    /// C2-P0 (v33): a row without `approval` keeps its bytes and is an
+    /// evaluation; a row with it round-trips and is an approval. A channel
+    /// this binary cannot read (a later binary's) still reads as an approval,
+    /// and so does a custody value that does not parse at all. Mutation: drop
+    /// the `approval` arm from `kind()`, or make the whole field lenient to
+    /// `None`, and the approval rows read as evaluations.
+    #[test]
+    fn test_v32_policy_decision_approval_defaults_none_and_round_trips() {
+        let plain = approval_row();
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("approval").is_none(), "None is omitted");
+        let read: PolicyDecisionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(read.approval, None);
+        assert_eq!(read.kind(), DecisionKind::Evaluation);
+
+        let mut record = approval_row();
+        record.approval = Some(ApprovalCustody {
+            channel: Some(SessionSource::HttpApi),
+            base_ref: "main".to_string(),
+            breaking_change_count: 2,
+        });
+        assert_eq!(record.kind(), DecisionKind::Approval);
+        assert!(!record.is_evaluation());
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["approval"]["channel"], "http_api");
+        let read: PolicyDecisionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(read, record);
+
+        let mut unknown = value.clone();
+        unknown["approval"]["channel"] = serde_json::json!("carrier_pigeon");
+        let read: PolicyDecisionRecord = serde_json::from_value(unknown).unwrap();
+        assert_eq!(read.kind(), DecisionKind::Approval);
+        let custody = read.approval.expect("still an approval");
+        assert_eq!(custody.channel, None);
+        assert_eq!(custody.base_ref, "main");
+        assert_eq!(custody.breaking_change_count, 2);
+
+        let mut garbled = value;
+        garbled["approval"] = serde_json::json!("not an object");
+        let read: PolicyDecisionRecord = serde_json::from_value(garbled).unwrap();
+        assert_eq!(read.kind(), DecisionKind::Approval);
+
+        let (store, _dir) = temp_store();
+        store.record_policy_decision(&record).unwrap();
+        record.seq = 1;
+        assert_eq!(store.list_policy_decisions().unwrap(), vec![record]);
+    }
+
+    /// C2-P0: a v32 store opened read-write is stamped v33 and keeps its
+    /// ledger rows. Mutation: leave `CURRENT_SCHEMA_VERSION` at 32 and the
+    /// stamp stays 32.
+    #[test]
+    fn test_v32_opens_and_stamps_v33_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.record_policy_decision(&approval_row()).unwrap();
+        }
+        force_schema_version(&path, "32");
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+
+        drop(StateStore::open(&path).unwrap());
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(33));
+        let rows = StateStore::open(&path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "records kept");
+        assert_eq!(rows[0].plan_id, "plan_ap");
+    }
+
     /// #2293: the store stamps an insertion sequence, so a row written after
     /// the clock stepped back is still the later one by `seq` although it sorts
     /// first by timestamp. A row from before the field reads `0`, and `0` is
@@ -16847,6 +17068,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let row = |ts: &str, plan: &str| PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: true,
             fail_closed: false,
@@ -16892,6 +17114,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let row = |i: u32| PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: true,
             fail_closed: false,
@@ -16964,6 +17187,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let row = |i: u32| PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: true,
             fail_closed: false,
@@ -17015,6 +17239,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let base = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -17045,6 +17270,7 @@ mod tests {
         // keeps the audit screen's `subject={entry.model}` custody link
         // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -17058,6 +17284,7 @@ mod tests {
 
         // An ordinary row: `model` is the graph key and there is no set.
         let ordinary = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -17077,6 +17304,7 @@ mod tests {
 
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -17875,6 +18103,7 @@ mod tests {
             let store = StateStore::open(&path).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    approval: None,
                     seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
@@ -18031,7 +18260,10 @@ mod tests {
         // v32 adds the `environments` + `publish_history` tables (RV1-P2) —
         // new tables, so they ARE in EXPECTED_TABLES below; guarded by
         // `test_v31_opens_and_creates_environment_tables`. Both replicate.
-        const EXPECTED_VERSION: u32 = 32;
+        // v33 adds `PolicyDecisionRecord::approval` (C2-P0), a serde-additive
+        // field that changes what an older binary counts. NO table change;
+        // guarded by `test_v32_opens_and_stamps_v33_keeping_rows`.
+        const EXPECTED_VERSION: u32 = 33;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`

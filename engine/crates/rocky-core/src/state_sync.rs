@@ -6780,6 +6780,7 @@ mod tests {
             let store = StateStore::open(&pod_a).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    approval: None,
                     seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
@@ -6799,6 +6800,7 @@ mod tests {
                 .unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    approval: None,
                     seq: 0,
                     keys_recorded: false,
                     fail_closed: false,
@@ -7799,6 +7801,7 @@ mod tests {
 
     fn seam_policy_record(plan_id: &str) -> crate::state::PolicyDecisionRecord {
         crate::state::PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -10417,7 +10420,8 @@ mod environment_publish_tests {
             &path,
             &crate::environments::history_key(&staging, 2),
         );
-        let key = "v32/state.redb";
+        let key = format!("v{}/state.redb", crate::state::current_schema_version());
+        let key = key.as_str();
         assert!(h.provider.exists(key).await.unwrap());
         h.provider
             .put(key, Bytes::from(std::fs::read(&path).unwrap()))
@@ -10587,10 +10591,10 @@ mod environment_publish_tests {
         std::fs::read(&path).unwrap()
     }
 
-    /// Carry-forward across the bump. Only `v31/state.redb` exists. The v32
-    /// download restores it (Authoritative, stamped 32, run kept); a publish
-    /// creates `v32/state.redb` with create-if-absent; the v31 key stays
-    /// byte-identical.
+    /// Carry-forward across the bump. Only `v31/state.redb` exists. The
+    /// current binary's download restores it (Authoritative, stamped current,
+    /// run kept); a publish creates the current key with create-if-absent;
+    /// the v31 key stays byte-identical.
     #[tokio::test]
     async fn publish_after_the_bump_carries_v31_forward_and_never_writes_it() {
         use crate::fault_store::PutKind;
@@ -10598,10 +10602,11 @@ mod environment_publish_tests {
         test_support::clear();
         let mut h = CrossPodHarness::new_s3_like();
         h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
-        assert_eq!(crate::state::current_schema_version(), 32);
+        let current = crate::state::current_schema_version();
         let seed_dir = TempDir::new().unwrap();
         let v31 = v31_state_bytes(seed_dir.path());
-        let (v31_key, v32_key) = ("v31/state.redb", "v32/state.redb");
+        let current_key = format!("v{current}/state.redb");
+        let (v31_key, v32_key) = ("v31/state.redb", current_key.as_str());
         h.provider
             .put(v31_key, Bytes::from(v31.clone()))
             .await
@@ -10613,7 +10618,7 @@ mod environment_publish_tests {
         assert!(h.open_store(&h.pod_a).get_run("r1").unwrap().is_some());
         assert_eq!(
             StateStore::peek_schema_version(&h.pod_a.state_path).unwrap(),
-            Some(32)
+            Some(current)
         );
         assert!(!h.provider.exists(v32_key).await.unwrap());
 

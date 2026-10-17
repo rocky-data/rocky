@@ -6051,7 +6051,7 @@ impl RockyMcpServer {
                 Some(&state_path),
                 plan_id,
                 "HEAD",
-                false,
+                None,
             )
             .await
             .map_err(|e| {
@@ -6076,7 +6076,7 @@ impl RockyMcpServer {
             Some(&state_path),
             plan_id,
             "HEAD",
-            false,
+            None,
         )
         .await
         .map_err(|e| ToolError::internal(format!("{e:#}"), "Retry the dry-run review."))?;
@@ -6103,7 +6103,13 @@ impl RockyMcpServer {
             Some(&state_path),
             plan_id,
             "HEAD",
-            true,
+            // The approval row names this server's actor. The class is the
+            // MCP surface's (`agent`), as on every row this server records;
+            // the channel reads `cli`, because `rocky mcp` is a CLI process.
+            Some(commands::ApprovalContext {
+                actor: self.actor.clone(),
+                principal: rocky_core::config::PolicyPrincipal::Agent,
+            }),
             |drops, findings| {
                 let token = review_token_parts(
                     &review_key,
@@ -11194,6 +11200,7 @@ database = ":memory:"
             base_ref: "HEAD".to_string(),
             approved: false,
             marker_written: false,
+            decision_ref: None,
             breaking_changes: None,
             conditional_drops: vec![rocky_cli::output::ConditionalDrop {
                 model: "orders".to_string(),
@@ -11232,6 +11239,7 @@ database = ":memory:"
             base_ref: "HEAD".to_string(),
             approved: true,
             marker_written: true,
+            decision_ref: None,
             breaking_changes: None,
             conditional_drops: vec![rocky_cli::output::ConditionalDrop {
                 model: "orders".to_string(),
