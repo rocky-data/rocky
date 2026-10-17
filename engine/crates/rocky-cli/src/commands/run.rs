@@ -12674,9 +12674,88 @@ pub(crate) async fn execute_models(
     .await
 }
 
+/// Compile and execute the transformation models, then measure the stored
+/// bytes of the tables they wrote in one batch.
+///
+/// Every path that executes transformation models funnels through here, and
+/// a run calls it once, so the adapter's measurement (on DuckDB, one
+/// `CHECKPOINT` per database) runs once per run, after the last model. The
+/// body measures at its normal end, before a shadow cleanup can drop the
+/// tables; this wrapper measures whatever an early return left noted. The
+/// measurement is best-effort and never changes the result.
 #[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models_with_explicit_contracts(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    output: &mut RunOutput,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    schema_cache_config: &rocky_core::config::SchemaCacheConfig,
+    auto_create_schemas: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    defer_opts: &DeferOptions,
+    skip_gate: SkipGateConfig,
+    reuse_enabled: bool,
+    column_level_enabled: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+    resilience: rocky_core::config::ResilienceConfig,
+    strict_scheduling: bool,
+    retry_policy_allows: bool,
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
+    reconciles_masks: bool,
+    contracts: Option<RunContracts<'_>>,
+    strict_contracts: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<GovernanceSnapshot> {
+    let mut stored_bytes = super::run_stored_bytes::PendingStoredBytes::default();
+    let result = execute_models_phase(
+        models_dir,
+        models_glob,
+        warehouse,
+        state_store,
+        partition_opts,
+        run_id,
+        model_name_filter,
+        model_set,
+        output,
+        hook_registry,
+        pipeline_name,
+        schema_cache_config,
+        auto_create_schemas,
+        shadow_config,
+        defer_opts,
+        skip_gate,
+        reuse_enabled,
+        column_level_enabled,
+        run_vars,
+        resilience,
+        strict_scheduling,
+        retry_policy_allows,
+        exec_fp_gate,
+        freeze_fence,
+        reconciles_masks,
+        contracts,
+        strict_contracts,
+        cancel,
+        &mut stored_bytes,
+    )
+    .await;
+    stored_bytes
+        .measure(warehouse, &mut output.materializations, cancel)
+        .await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_models_phase(
     models_dir: &Path,
     models_glob: Option<&str>,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -12789,6 +12868,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // model starts, `output.interrupted` is set and this returns `Ok` so the
     // caller's terminal persist + settle runs (the freeze fence's shape).
     cancel: &tokio_util::sync::CancellationToken,
+    // The outputs whose stored bytes are measured after the last model. The
+    // body notes each measured write and measures at its normal end.
+    stored_bytes: &mut super::run_stored_bytes::PendingStoredBytes,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -14139,6 +14221,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                             materialization.skip_internal = Some(state);
                         }
                         gate.record(name, super::skip_gate::Verdict::Built);
+                        stored_bytes.note(
+                            &matched[idx].2.to_model_ir().materialization,
+                            output.materializations.len(),
+                            &materialization.asset_key,
+                        );
                         output.materializations.push(materialization);
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
@@ -14809,6 +14896,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     // output instead of having to infer them from check /
                     // drift records. Mirrors the time_interval and
                     // replication paths.
+                    stored_bytes.note(
+                        &model.to_model_ir().materialization,
+                        output.materializations.len(),
+                        &materialization.asset_key,
+                    );
                     output.materializations.push(materialization);
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
@@ -14872,6 +14964,13 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             );
         }
     }
+
+    // Every model has finished: measure the noted outputs' stored bytes in
+    // one batch, before a shadow cleanup below can drop them. The wrapper
+    // measures anything an early return left behind.
+    stored_bytes
+        .measure(warehouse, &mut output.materializations, cancel)
+        .await;
 
     if let Some(config) = shadow_config
         && config.branch.is_none()
@@ -16352,18 +16451,6 @@ async fn execute_one_plain_model(
         Utc::now(),
     )
     .await;
-    // The output table's stored bytes, also measured after
-    // `model_duration_ms`. A failed read records unknown, never a failure.
-    let stored_bytes = super::run_stored_bytes::observe_stored_bytes(
-        warehouse,
-        &model_ir.materialization,
-        &rocky_ir::TableRef {
-            catalog: model_ir.target.catalog.clone(),
-            schema: model_ir.target.schema.clone(),
-            table: model_ir.target.table.clone(),
-        },
-    )
-    .await;
     Ok(MaterializationOutput {
         asset_key,
         notes: pending_drop
@@ -16409,7 +16496,8 @@ async fn execute_one_plain_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(&model_ir)),
-        stored_bytes,
+        // Measured once after the last model: `PendingStoredBytes`.
+        stored_bytes: None,
     })
 }
 
@@ -16646,17 +16734,6 @@ async fn execute_snapshot_model(
         Utc::now(),
     )
     .await;
-    // The snapshot table's stored bytes. A failed read records unknown.
-    let stored_bytes = super::run_stored_bytes::observe_stored_bytes(
-        warehouse,
-        &model_ir.materialization,
-        &rocky_ir::TableRef {
-            catalog: model_ir.target.catalog.clone(),
-            schema: model_ir.target.schema.clone(),
-            table: model_ir.target.table.clone(),
-        },
-    )
-    .await;
     Ok(MaterializationOutput {
         asset_key: vec![
             model_ir.target.catalog.clone(),
@@ -16694,7 +16771,8 @@ async fn execute_snapshot_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(model_ir)),
-        stored_bytes,
+        // Measured once after the last model: `PendingStoredBytes`.
+        stored_bytes: None,
     })
 }
 

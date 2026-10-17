@@ -1747,8 +1747,9 @@ pub async fn run_snapshot(
             Utc::now(),
         )
         .await;
-        // The snapshot table's stored bytes. A failed read records unknown.
-        let stored_bytes = super::run_stored_bytes::observe_table_stored_bytes(
+        // The snapshot table's stored bytes, read after its only write. A
+        // failed read records unknown.
+        let stored_bytes = super::run_stored_bytes::measure_single_table(
             warehouse_adapter.as_ref(),
             &rocky_ir::TableRef {
                 catalog: pipeline.target.catalog.clone(),
