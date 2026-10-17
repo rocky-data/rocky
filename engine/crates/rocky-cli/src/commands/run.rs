@@ -11924,9 +11924,11 @@ pub(crate) async fn execute_backfill_set(
     {
         run_cancel.token().cancel();
     }
+    // Boxed: the body is a large future, and holding it inline in the scope
+    // future overflows a test thread's stack on Linux.
     let exec_result: Result<()> = run_cancel
         .shared()
-        .scope(async {
+        .scope(Box::pin(async {
             if output_json {
                 crate::output::reserve_stdout_for_json();
             }
@@ -12174,7 +12176,7 @@ pub(crate) async fn execute_backfill_set(
                 true,
                 rocky_core::config::StateUploadFailureMode::Fail,
             )
-        })
+        }))
         .await;
 
     // WP-01 PR-B (2b): ALWAYS finalize — even when the backfill failed. A
