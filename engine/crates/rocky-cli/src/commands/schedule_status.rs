@@ -99,12 +99,9 @@ pub fn schedule_status_output(
     };
 
     let claims_by_pipeline = collect_claims(store.as_ref())?;
-    // The project root as `rocky serve` resolves it: the config's directory.
-    let project_root = match config_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let deadlines = crate::commands::product::product_deadlines_in(project_root);
+    // The project root every product reader shares: the config's directory.
+    let project_root = crate::commands::product::product_command_root(config_path);
+    let deadlines = crate::commands::product::product_deadlines_in(&project_root);
     let pipelines = build_pipelines(
         &config,
         config_path,

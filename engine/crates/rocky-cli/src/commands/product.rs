@@ -104,11 +104,19 @@ pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpe
     Ok(parsed)
 }
 
-/// The project root every `rocky product` command reads `products/` under:
-/// the working directory. A run stamps delivery deadlines from the same root,
-/// so the two never disagree about which products exist.
-pub(crate) fn product_command_root() -> Result<std::path::PathBuf> {
-    std::env::current_dir().context("failed to get current working directory")
+/// The project root: the directory that holds the config file.
+///
+/// Every `rocky product` command reads `products/` under it, a run stamps
+/// delivery deadlines from it, and `rocky validate` and `rocky serve`
+/// (including `GET /api/v1/schedule`) read it too, so none of them disagree about which
+/// products exist. A scheduled child run starts with no working directory of
+/// its own, so the root must never be the working directory. A bare config
+/// name (`rocky.toml`) has an empty parent and maps to `.`.
+pub(crate) fn product_command_root(config_path: &Path) -> std::path::PathBuf {
+    match config_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    }
 }
 
 /// Every delivery deadline the project's products declare.
@@ -1087,7 +1095,7 @@ fn print_verify(output: &ProductVerifyOutput, output_json: bool) -> Result<()> {
 /// Exits 0 on `pass`, 1 on `needs_input`, 2 on `fail` — after printing
 /// the full report.
 pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: bool) -> Result<()> {
-    let root = product_command_root()?;
+    let root = product_command_root(config_path);
     let (parsed, posture) = product_verify_outcome(&root, config_path, product_name)?;
     let output = verify_output_for(&parsed, &posture);
     print_verify(&output, output_json)?;
@@ -1260,7 +1268,7 @@ pub fn run_product_compile(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = product_command_root()?;
+    let root = product_command_root(config_path);
     let output = product_compile_in(&root, config_path, Some(state_path), product_name)?;
     if output_json {
         print_json(&output)?;
@@ -1715,13 +1723,13 @@ fn product_approve_with(
 
 /// Execute `rocky product approve <name>`.
 pub fn run_product_approve(
-    _config_path: &Path,
+    config_path: &Path,
     product_name: &str,
     state_path: &Path,
     expect_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let root = product_command_root()?;
+    let root = product_command_root(config_path);
     let output = product_approve_expecting(&root, state_path, product_name, expect_digest)?;
     if output_json {
         print_json(&output)?;
@@ -1987,9 +1995,9 @@ pub(crate) fn product_list_in(root: &Path, state_path: Option<&Path>) -> Result<
 
 /// Execute `rocky product list`.
 ///
-/// Reads `products/` under the working directory, as `product status` does.
-pub fn run_product_list(_config_path: &Path, state_path: &Path, output_json: bool) -> Result<()> {
-    let root = product_command_root()?;
+/// Reads `products/` next to the config file, as `product status` does.
+pub fn run_product_list(config_path: &Path, state_path: &Path, output_json: bool) -> Result<()> {
+    let root = product_command_root(config_path);
     let output = product_list_in(&root, Some(state_path))?;
     if output_json {
         print_json(&output)?;
@@ -2070,12 +2078,12 @@ pub(crate) fn product_journal_in(
 
 /// Execute `rocky product journal <name>`.
 pub fn run_product_journal(
-    _config_path: &Path,
+    config_path: &Path,
     product_name: &str,
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = product_command_root()?;
+    let root = product_command_root(config_path);
     let Some(output) = product_journal_in(&root, Some(state_path), product_name)? else {
         anyhow::bail!(
             "product '{product_name}' is not known: no products/{product_name}.toml, and no \
@@ -2110,12 +2118,12 @@ pub fn run_product_journal(
 
 /// Execute `rocky product status <name>`.
 pub fn run_product_status(
-    _config_path: &Path,
+    config_path: &Path,
     product_name: &str,
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    let root = product_command_root()?;
+    let root = product_command_root(config_path);
     let output = product_status_in(&root, Some(state_path), product_name)?;
     if output_json {
         print_json(&output)?;
@@ -4930,26 +4938,38 @@ pub(crate) mod delivery_tests {
         assert_eq!(deadlines[0].deliver_by.cron, "0 6 * * *");
     }
 
-    /// A run stamps deadlines from the directory `rocky product status`
-    /// reads `products/` under (the working directory), not from the
-    /// `--config` file's directory. Here the config sits in `elsewhere/` with
-    /// no `products/`; the specs are in the working directory.
+    /// A run, `rocky product status` and the scheduler status all read
+    /// `products/` next to the config file, never the working directory. A
+    /// scheduled child run (`rocky run -c <config>`) inherits the scheduler's
+    /// working directory, so a cwd-anchored writer stamps nothing there. The
+    /// config here sits in `proj/`; the working directory is left alone and
+    /// holds no `products/`.
     #[test]
-    fn a_run_stamps_deadlines_from_the_directory_product_status_reads() {
+    fn a_run_stamps_deadlines_from_the_products_next_to_the_config() {
         use crate::output::{MaterializationMetadata, MaterializationOutput, RunOutput};
-        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CWD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let proj = dir.path().join("proj");
         write(
-            &root.join("products/revenue_daily.toml"),
+            &proj.join("products/revenue_daily.toml"),
             &spec_with_deadline("0 6 * * *"),
         );
-        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
-        let store = StateStore::open(&root.join("state.redb")).unwrap();
+        let config_path = proj.join("rocky.toml");
+        write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.revenue]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.revenue.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.revenue.schedule]\ncron = \"0 5 * * *\"\ntimezone = \"UTC\"\n",
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            !cwd.join("products").exists(),
+            "the test needs a working directory without products/: {}",
+            cwd.display()
+        );
+        let state_path = dir.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
 
         let mut output = RunOutput::new(String::new(), 1, 1);
         output.materializations.push(MaterializationOutput {
@@ -4984,9 +5004,6 @@ pub(crate) mod delivery_tests {
             &crate::commands::run_audit::AuditContext::detect(None, None, None),
         );
 
-        let saved = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-        let status_root = product_command_root().unwrap();
         let landed = crate::commands::run::persist_run_record(
             Some(&store),
             &output,
@@ -4995,19 +5012,54 @@ pub(crate) mod delivery_tests {
             "cfg",
             &audit,
             Some("revenue"),
+            Some(&config_path),
         );
-        std::env::set_current_dir(saved).unwrap();
-
         assert!(landed, "the record must land");
-        assert_eq!(
-            status_root, root,
-            "product status reads the working directory"
-        );
         let record = store.get_run("run-root").unwrap().expect("record");
         assert!(
             record.models_executed[0].due_at.is_some(),
-            "the run must stamp the deadline that `product status` reads: {:?}",
+            "the run must stamp the deadline declared next to the config: {:?}",
             record.models_executed[0]
+        );
+        drop(store);
+
+        // `rocky product status` resolves the same root and finds the spec.
+        let status_root = product_command_root(&config_path);
+        assert_eq!(status_root, proj);
+        let status = product_status_in(&status_root, Some(&state_path), "revenue_daily")
+            .expect("product status");
+        assert!(
+            status.delivery.is_some(),
+            "product status must read the deadline the run stamped"
+        );
+
+        // The scheduler status resolves the same root and reports the same
+        // product's delivery.
+        let schedule = crate::commands::schedule_status::schedule_status_output(
+            &config_path,
+            &state_path,
+            &proj.join(".rocky"),
+            Utc::now(),
+        )
+        .expect("schedule status");
+        let json = serde_json::to_value(&schedule).unwrap();
+        assert_eq!(json["pipelines"][0]["pipeline"], "revenue");
+        assert_eq!(
+            json["pipelines"][0]["delivery"]["product"], "revenue_daily",
+            "schedule status must read the products/ next to the config: {json}"
+        );
+    }
+
+    /// A bare config name has an empty parent, so the root is `.`.
+    #[test]
+    fn a_bare_config_name_roots_at_the_working_directory() {
+        assert_eq!(
+            product_command_root(Path::new("rocky.toml")),
+            std::path::PathBuf::from(".")
+        );
+        assert_eq!(
+            product_command_root(Path::new("/srv/x/rocky.toml")),
+            std::path::PathBuf::from("/srv/x")
         );
     }
 
