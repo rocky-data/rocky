@@ -115,6 +115,9 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",
+    // DELIBERATE addition: the products root, so the loop and `rocky product`
+    // never read two different `products/` directories.
+    "rocky_cli::commands::fulfill_api::product_command_root",
     "rocky_cli::commands::fulfill_api::product_reopen_drafting",
     "rocky_cli::commands::fulfill_api::product_status",
     "rocky_cli::commands::fulfill_api::product_verify",

@@ -58,12 +58,12 @@ struct LostRace(String);
 /// transaction (approval CAS + state CAS + journal append). The output
 /// keeps the `product_approve` command tag so consumers see one schema.
 pub fn run_fulfill_approve_spec(
-    _config_path: &Path,
+    config_path: &Path,
     state_path: &Path,
     product: &str,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = fulfill_api::product_command_root(config_path);
     refuse_state_store_in_models(&root, state_path)?;
     create_state_store_parent(state_path)?;
     let output = fulfill_api::product_approve(&root, state_path, product)?;
@@ -252,7 +252,7 @@ pub async fn run_fulfill(
     actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
-    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let root = fulfill_api::product_command_root(config_path);
     refuse_state_store_in_models(&root, state_path)?;
     create_state_store_parent(state_path)?;
     let cfg = rocky_core::config::load_rocky_config(config_path)

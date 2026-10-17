@@ -106,13 +106,13 @@ pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpe
 
 /// The project root: the directory that holds the config file.
 ///
-/// Every `rocky product` command reads `products/` under it, a run stamps
+/// Every `rocky product` and `rocky fulfill` command reads `products/` under it, a run stamps
 /// delivery deadlines from it, and `rocky validate` and `rocky serve`
 /// (including `GET /api/v1/schedule`) read it too, so none of them disagree about which
 /// products exist. A scheduled child run starts with no working directory of
 /// its own, so the root must never be the working directory. A bare config
 /// name (`rocky.toml`) has an empty parent and maps to `.`.
-pub(crate) fn product_command_root(config_path: &Path) -> std::path::PathBuf {
+pub fn product_command_root(config_path: &Path) -> std::path::PathBuf {
     match config_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => std::path::PathBuf::from("."),

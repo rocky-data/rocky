@@ -28,6 +28,9 @@ pub use crate::commands::product::{
     ProductApproveOutput, ProductCompileOutput, ProductStatusOutput, ProductVerifyOutput,
     VerifyStatus,
 };
+// The one products root (the config file's directory), so the loop reads the
+// same `products/` as `rocky product`, a run and `rocky serve`.
+pub use crate::commands::product::product_command_root;
 // The typed review-marker oracle the loop polls (`run_review_status` is
 // its printing CLI shell).
 pub use crate::commands::review::{compute_review_status, run_review_status};
