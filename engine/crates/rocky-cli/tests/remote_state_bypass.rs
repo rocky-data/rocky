@@ -380,6 +380,7 @@ async fn drive_load(project: &LoadProject) -> anyhow::Result<()> {
         false,
         rocky_core::state_sync::FinalizeDurability::ConfigDefault,
         false,
+        None,
     )
     .await
 }

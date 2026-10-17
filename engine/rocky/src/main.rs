@@ -4968,6 +4968,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 truncate,
                 rocky_core::state_sync::FinalizeDurability::ConfigDefault,
                 json,
+                None, // `rocky load` owns no signal listener
             )
             .await
         }

@@ -4798,6 +4798,7 @@ pub async fn run_with_explicit_contracts(
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
                 output_json,
+                Some(&cancel),
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
