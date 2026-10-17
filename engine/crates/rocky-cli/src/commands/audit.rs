@@ -29,8 +29,8 @@ use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
     AuditDecisionEntry, AuditFilter, AuditForOutput, AuditOutput, AuditPlanChange,
     AuditProductScope, AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry,
-    ScorecardDimension, ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter,
-    SectionAvailability, print_json,
+    BriefDecisionKind, ScorecardDimension, ScorecardGroup, ScorecardUnavailableMetric,
+    ScorecardVerifyAfter, SectionAvailability, print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -265,6 +265,8 @@ fn audit_output_from(
 
 /// Map a ledger record to its serializable entry.
 fn to_decision_entry(d: PolicyDecisionRecord) -> AuditDecisionEntry {
+    let kind = d.kind().into();
+    let approval_channel = d.approval.as_ref().and_then(|a| a.channel);
     let (principal_id, principal_id_source) = match d.principal_ref {
         Some(r) => (Some(r.id.to_string()), Some(r.source)),
         None => (None, None),
@@ -283,6 +285,25 @@ fn to_decision_entry(d: PolicyDecisionRecord) -> AuditDecisionEntry {
         // Self-asserted in P1: nothing verifies an id until signed approvals
         // exist (RV4-P2).
         principal_id_verified: false,
+        kind,
+        approval_channel,
+    }
+}
+
+/// The verdict for text output. An evaluation prints its policy effect. Any
+/// other row prints its kind with the recorded effect beside it, so an
+/// approval's `allow` never reads as a policy allow.
+fn verdict_label(d: &AuditDecisionEntry) -> String {
+    let effect = serde_plain(&d.effect);
+    match d.kind {
+        BriefDecisionKind::Evaluation => effect,
+        BriefDecisionKind::Approval => match d.approval_channel {
+            Some(channel) => format!("approval ({}) [effect {effect}]", serde_plain(&channel)),
+            None => format!("approval [effect {effect}]"),
+        },
+        BriefDecisionKind::VerifyAfterCustody
+        | BriefDecisionKind::Freeze
+        | BriefDecisionKind::Unfreeze => format!("{} [effect {effect}]", serde_plain(&d.kind)),
     }
 }
 
@@ -322,7 +343,7 @@ fn render_text(out: &AuditOutput) {
     for d in &out.decisions {
         let principal = principal_label(d);
         let capability = serde_plain(&d.capability);
-        let effect = serde_plain(&d.effect);
+        let effect = verdict_label(d);
         let rule = d
             .rule_id
             .map(|r| format!("rule {r}"))
@@ -1052,7 +1073,7 @@ fn render_chain_text(out: &AuditForOutput) {
                     principal_label(d),
                     serde_plain(&d.capability),
                     d.model,
-                    serde_plain(&d.effect).to_uppercase(),
+                    verdict_label(d).to_uppercase(),
                     rule,
                     d.reason,
                 );
@@ -1532,9 +1553,9 @@ fn scorecard_unavailable_metrics(verify_recorded: bool) -> Vec<ScorecardUnavaila
     metrics.push(ScorecardUnavailableMetric {
         metric: "escalation_latency".to_string(),
         availability: SectionAvailability::Unavailable,
-        note: "the resolution of a require_review escalation is not recorded to the ledger \
-               (an approval leaves only an on-disk plan marker, a denial records nothing), so \
-               escalation latency cannot be computed"
+        note: "an approval of a require_review escalation is recorded to the ledger as an \
+               approval row, but escalation latency is not computed from it yet, and a denial \
+               records nothing"
             .to_string(),
     });
     metrics
@@ -1605,6 +1626,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1636,6 +1658,7 @@ mod tests {
 
     fn row_at(ts: DateTime<Utc>, plan: &str, who: Option<&str>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             timestamp: ts,
             principal_ref: who.map(actor),
@@ -1871,6 +1894,7 @@ mod tests {
 
         let label = "backfill: 2 model(s)";
         let plan_level = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1928,6 +1952,7 @@ mod tests {
         use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let decisions = vec![PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1972,6 +1997,7 @@ mod tests {
         let state_path = root.join("state.redb");
 
         let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -2365,6 +2391,7 @@ mod tests {
         reason: &str,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -2622,6 +2649,103 @@ mod tests {
             auto_apply_verification.kind(),
             DecisionKind::VerifyAfterCustody
         );
+
+        // C2-P0: a `rocky review --approve` row.
+        assert_eq!(approval_row(3, "plan-a").kind(), DecisionKind::Approval);
+    }
+
+    fn approval_row(secs: u32, plan_id: &str) -> PolicyDecisionRecord {
+        let mut row = sc_decision(
+            secs,
+            plan_id,
+            "approval: run plan",
+            PolicyPrincipal::Human,
+            None,
+            PolicyEffect::Allow,
+        );
+        row.keys_recorded = true;
+        row.models = vec!["orders".to_string()];
+        row.principal_ref = Some(rocky_core::config::PrincipalRef::unnamed());
+        row.approval = Some(rocky_core::state::ApprovalCustody {
+            channel: Some(rocky_core::state::SessionSource::HttpApi),
+            base_ref: "HEAD".to_string(),
+            breaking_change_count: 1,
+        });
+        row
+    }
+
+    /// C2-P0 test 9. An approval row is an `allow` that no rate counts and no
+    /// gate reads: the scorecard total and allow count, the autonomy budget
+    /// and the active freezes are the same with it present. Mutation: drop
+    /// the `approval` arm from `DecisionKind` and the scorecard counts it.
+    #[test]
+    fn an_approval_row_is_not_counted_and_moves_no_gate() {
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::RequireReview,
+        );
+        let mut failed_check = sc_decision(
+            2,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            None,
+            PolicyEffect::Deny,
+        );
+        failed_check.verify_after = vec!["row_count".to_string()];
+        let without = vec![evaluation, failed_check];
+        let mut with = without.clone();
+        with.push(approval_row(3, "plan-a"));
+
+        let before = build_scorecard(ScorecardDimension::Principal, "all", None, &without);
+        let after = build_scorecard(ScorecardDimension::Principal, "all", None, &with);
+        assert_eq!(after.total_decisions, before.total_decisions);
+        assert_eq!(after.total_decisions, 1);
+        assert_eq!(
+            after.groups.iter().map(|g| g.allow).sum::<u64>(),
+            0,
+            "the approval is not a policy allow"
+        );
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 8, 0, 0, 0).unwrap();
+        let window = chrono::Duration::days(7);
+        assert_eq!(
+            rocky_core::policy::budget_failures_in_window(&with, 0, window, now),
+            rocky_core::policy::budget_failures_in_window(&without, 0, window, now),
+        );
+        assert!(rocky_core::policy::active_freezes(&with).is_empty());
+    }
+
+    /// C2-P0 test 10, the entry shape: kind, approver id and channel.
+    #[test]
+    fn an_approval_entry_names_its_kind_id_and_channel() {
+        let entry = to_decision_entry(approval_row(3, "plan-a"));
+        assert_eq!(entry.kind, BriefDecisionKind::Approval);
+        assert_eq!(entry.principal_id.as_deref(), Some("unnamed"));
+        assert_eq!(
+            entry.approval_channel,
+            Some(rocky_core::state::SessionSource::HttpApi)
+        );
+        assert_eq!(verdict_label(&entry), "approval (http_api) [effect allow]");
+
+        let evaluation = to_decision_entry(sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        ));
+        assert_eq!(evaluation.kind, BriefDecisionKind::Evaluation);
+        assert_eq!(evaluation.approval_channel, None);
+        assert_eq!(verdict_label(&evaluation), "allow");
+        let json = serde_json::to_value(&evaluation).unwrap();
+        assert!(json.get("approval_channel").is_none());
+        assert_eq!(json["kind"], "evaluation");
     }
 
     /// **The defect this closes.** A failed post-apply check must not move the
@@ -2801,6 +2925,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,

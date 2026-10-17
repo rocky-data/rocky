@@ -3212,6 +3212,7 @@ pub(crate) fn evaluate_apply_policy_core(
         }
 
         record(&PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             // The gate decided this set on purpose: an empty one says "no
             // compiled model here", and the queue must not re-resolve it.
@@ -4910,6 +4911,7 @@ fn evaluate_verify_after(
         )
     });
     let record = PolicyDecisionRecord {
+        approval: None,
         seq: 0,
         keys_recorded: false,
         fail_closed: false,
@@ -8273,6 +8275,7 @@ auto_create_schemas = true
         let store = StateStore::open(state_path)?;
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -8428,6 +8431,7 @@ default_agent_effect = "require_review"
         }
         // The custody seam downloads first and fails closed on the remote error.
         let record = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -15041,6 +15045,7 @@ autonomy_budget = { failures = 1, window = "7d" }
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -15263,6 +15268,7 @@ autonomy_budget = { failures = 1, window = "7d" }
 
     fn custody_record() -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             // A fixed, distinctive event time: budget consumers key on it, so
             // the published row must carry exactly this value.
@@ -15619,6 +15625,7 @@ effect = "allow"
 
         let frozen_at = Utc::now() - chrono::Duration::hours(1);
         let freeze = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             timestamp: frozen_at,
             plan_id: "freeze:real".to_string(),
@@ -15626,6 +15633,7 @@ effect = "allow"
             ..row("freeze:real", None, &[], PolicyEffect::Deny)
         };
         let honest_draft = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             timestamp: frozen_at,
             capability: PolicyCapability::Propose,
@@ -15641,6 +15649,7 @@ effect = "allow"
 
         // The worker forges its local file.
         let unfreeze = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             timestamp: Utc::now(),
             plan_id: "unfreeze:real".to_string(),
@@ -15648,6 +15657,7 @@ effect = "allow"
             ..row("unfreeze:real", None, &[], PolicyEffect::Allow)
         };
         let budget_burn = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             capability: PolicyCapability::Propose,
             model: "orders".to_string(),
@@ -15659,6 +15669,7 @@ effect = "allow"
             )
         };
         let overwrite = PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             effect: PolicyEffect::Allow,
             reason: "forged".to_string(),
@@ -15808,6 +15819,7 @@ effect = "allow"
             for i in 0..10_001i64 {
                 local
                     .record_policy_decision(&PolicyDecisionRecord {
+                        approval: None,
                         seq: 0,
                         timestamp: base + chrono::Duration::seconds(i),
                         capability: PolicyCapability::Propose,
@@ -15819,6 +15831,7 @@ effect = "allow"
             }
             local
                 .record_policy_decision(&PolicyDecisionRecord {
+                    approval: None,
                     seq: 0,
                     capability: PolicyCapability::Propose,
                     model: "orders".to_string(),
@@ -15860,6 +15873,7 @@ effect = "allow"
             for i in 0..20i64 {
                 local
                     .record_policy_decision(&PolicyDecisionRecord {
+                        approval: None,
                         seq: 0,
                         timestamp: base + chrono::Duration::seconds(i),
                         capability: PolicyCapability::Propose,
@@ -15871,6 +15885,7 @@ effect = "allow"
             }
             local
                 .record_policy_decision(&PolicyDecisionRecord {
+                    approval: None,
                     seq: 0,
                     capability: PolicyCapability::Propose,
                     model: "orders".to_string(),

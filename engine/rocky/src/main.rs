@@ -4139,12 +4139,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          pending-review queue"
                     );
                 };
+                // Resolved only on an approval, so a malformed
+                // `ROCKY_PRINCIPAL_ID` cannot refuse a dry run.
+                let approval = if approve {
+                    Some(rocky_cli::commands::ApprovalContext {
+                        actor: resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
+                        principal: resolve_cli_principal(cli.principal)?,
+                    })
+                } else {
+                    None
+                };
                 rocky_cli::commands::run_review(
                     &cli.config,
                     &state_path,
                     &plan_id,
                     &base,
-                    approve,
+                    approval,
                     json,
                 )
                 .await

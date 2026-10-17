@@ -328,6 +328,13 @@
             "unfreeze"
           ],
           "type": "string"
+        },
+        {
+          "description": "A person approved a plan with `rocky review --approve`. Recorded with `effect = allow`; it is a sign-off, not a policy verdict.",
+          "enum": [
+            "approval"
+          ],
+          "type": "string"
         }
       ]
     },

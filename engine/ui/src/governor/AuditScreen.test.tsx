@@ -25,6 +25,7 @@ const LEDGER: AuditOutput = {
       principal_id: "alice",
       principal_id_source: "flag",
       principal_id_verified: false,
+      kind: "evaluation",
     },
     {
       timestamp: "2026-09-04T10:00:00Z",
@@ -37,6 +38,7 @@ const LEDGER: AuditOutput = {
       reason: "<i>frozen</i> by the governor",
       principal_id: null,
       principal_id_verified: false,
+      kind: "freeze",
     },
   ],
 };
@@ -86,6 +88,29 @@ describe("AuditScreen", () => {
     expect(screen.getByText("human(unrecorded)")).toBeInTheDocument();
     expect(container.querySelector("i")).toBeNull();
     expect(screen.getByText("2 decision(s), oldest first, the whole ledger")).toBeInTheDocument();
+  });
+
+  it("shows an approval row as an approval, not a policy allow, and an evaluation by its effect", async () => {
+    const [evaluation] = LEDGER.decisions;
+    const approval = {
+      ...evaluation,
+      plan_id: "d".repeat(64),
+      kind: "approval" as const,
+      approval_channel: "http_api" as const,
+    };
+    render(
+      <AuditScreen
+        loaders={loaders({ ledger: async () => ({ ...LEDGER, decisions: [evaluation, approval] }) })}
+        now={NOW}
+      />,
+    );
+    const table = await screen.findByRole("table", { name: "Policy decisions" });
+    const [evalRow, approvalRow] = within(table).getAllByRole("row").slice(1);
+    expect(within(evalRow).getByText("evaluation")).toBeInTheDocument();
+    expect(within(evalRow).getByText("allow")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval (http_api) [effect allow]")).toBeInTheDocument();
+    expect(within(approvalRow).queryByText("allow")).toBeNull();
   });
 
   it("scopes the ledger through the product selector and shows the output model", async () => {

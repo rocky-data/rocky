@@ -9367,6 +9367,11 @@ pub struct ReviewOutput {
     /// this invocation. Mirrors `approved` today; kept distinct so callers
     /// reading the JSON do not have to infer marker state from the flag.
     pub marker_written: bool,
+    /// The ledger key of the approval row this invocation recorded in the
+    /// policy-decision ledger (`"{timestamp}|{plan_id}|{model}"`), the same
+    /// key `rocky audit` and `rocky brief` cite. Absent on a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ref: Option<String>,
     /// Semantic breaking-change findings between `base_ref` and the working
     /// tree. Empty when the classifier ran and found no breaking changes;
     /// absent when the gate was skipped (compile failure on either side, or
@@ -9906,6 +9911,15 @@ pub struct AuditDecisionEntry {
     /// reading an older binary's output sees `false`.
     #[serde(default)]
     pub principal_id_verified: bool,
+    /// What kind of event the row records. Only `evaluation` carries a policy
+    /// verdict in `effect`; an `approval` row's `allow` is a person's sign-off
+    /// on the plan (`rocky review --approve`).
+    pub kind: BriefDecisionKind,
+    /// The channel an approval came through (`cli`, `http_api`). Present only
+    /// on an `approval` row whose channel this binary can read. An approval
+    /// through `rocky mcp` reads `cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_channel: Option<rocky_core::state::SessionSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -10516,6 +10530,9 @@ pub enum BriefDecisionKind {
     Freeze,
     /// An operator lifted a freeze. Recorded with `effect = allow`.
     Unfreeze,
+    /// A person approved a plan with `rocky review --approve`. Recorded with
+    /// `effect = allow`; it is a sign-off, not a policy verdict.
+    Approval,
 }
 
 impl From<rocky_core::state::DecisionKind> for BriefDecisionKind {
@@ -10526,6 +10543,7 @@ impl From<rocky_core::state::DecisionKind> for BriefDecisionKind {
             DecisionKind::VerifyAfterCustody => BriefDecisionKind::VerifyAfterCustody,
             DecisionKind::Freeze => BriefDecisionKind::Freeze,
             DecisionKind::Unfreeze => BriefDecisionKind::Unfreeze,
+            DecisionKind::Approval => BriefDecisionKind::Approval,
         }
     }
 }

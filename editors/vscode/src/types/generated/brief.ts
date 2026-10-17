@@ -46,7 +46,7 @@ export type PolicyEffect = "allow" | "require_review" | "deny";
  *
  * Mirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).
  */
-export type BriefDecisionKind = "evaluation" | "verify_after_custody" | "freeze" | "unfreeze";
+export type BriefDecisionKind = "evaluation" | "verify_after_custody" | "freeze" | "unfreeze" | "approval";
 /**
  * How the digest window was resolved.
  */

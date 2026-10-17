@@ -350,6 +350,10 @@ class ReviewOutput(BaseModel):
     """
     Conditional kind-switch DROPs at their effective execution targets.
     """
+    decision_ref: str | None = None
+    """
+    The ledger key of the approval row this invocation recorded in the policy-decision ledger (`"{timestamp}|{plan_id}|{model}"`), the same key `rocky audit` and `rocky brief` cite. Absent on a dry run.
+    """
     marker_written: bool
     """
     True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.

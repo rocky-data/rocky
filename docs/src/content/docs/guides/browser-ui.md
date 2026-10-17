@@ -125,6 +125,8 @@ In operator mode, the plan screen can approve and apply the plan. With a read-on
 rocky review <plan-id> --approve
 ```
 
+An approval records a row in the policy-decision ledger before it writes the review marker. An approval from this page records the channel `http_api` and an `unnamed` principal. The approve job drops the server's `ROCKY_PRINCIPAL_ID` and `ROCKY_PRINCIPAL`, because they name the operator who started the server, not you. See [`rocky review`](/reference/commands/governance-reclamation/#rocky-review).
+
 A plan bound to a data product shows a **Spec digest you approved** box instead. It is always empty when the page opens, and the page never fills it in from the plan, the product status or any other response. Type the digest of the spec you approved. Apply stays off until the plan is approved and the box holds a digest. The page then asks you to confirm, and repeats the digest you typed. It sends exactly that digest (without any spaces around it). The engine compares it with the digest the plan carries and refuses the apply if they differ. A refused apply shows the engine's last `Error:` lines, with paths and secrets removed. The engine's mismatch message names both digests. The plan's digest is not a secret. The check only works when the digest you type comes from the approval: it is `approval.spec_digest` in `rocky product status <name>`. Do not copy the plan's own digest from the spec card, because then the plan is compared with itself. The same apply works in a terminal:
 
 ```bash

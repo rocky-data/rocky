@@ -11,11 +11,21 @@
 //!    `rocky ci-diff` / the branch-promote gate.
 //! 3. Without `--approve`: report the findings (dry run); the plan stays
 //!    blocked.
-//! 4. With `--approve`: write a review marker at
+//! 4. With `--approve`: record one approval row in the policy-decision
+//!    ledger, then write a review marker at
 //!    `<root>/.rocky/plans/<plan_id>.reviewed.json`. `rocky apply` checks the
 //!    marker's CONTENTS before executing, not just its presence: it must parse
 //!    and name that exact plan. The marker is unsigned, so it records that an
 //!    approval was made on this machine, not who made it.
+//!
+//! The ledger row goes first, through the same ledger seam `rocky policy
+//! freeze` uses ([`rocky_core::state_sync::LedgerSeamSession`]): the local
+//! store, or the remote `[state]` ledger with its CAS replay. If that write
+//! fails, no marker is written and apply stays blocked. If the marker write
+//! fails after the row committed, the error names the row; re-running
+//! `--approve` records a second row. The marker is a local file: it unblocks
+//! `rocky apply` on this machine only, while the ledger row is visible to
+//! every reader of the shared ledger.
 //!
 //! The marker is written even when breaking changes exist: approving over a
 //! reported break is allowed.
@@ -46,9 +56,13 @@
 //! loader it used before silently cooled the cache.
 //!
 //! The marker-only kinds (gc / restore / compact / archive) short-circuit in
-//! `compute_review_marker_only` before any config read, so they still approve
-//! on an unloadable config. There is no breaking-change gate on them to
-//! degrade — reviewing is purely the human sign-off.
+//! `compute_review_marker_only`. There is no breaking-change gate on them —
+//! reviewing is purely the human sign-off. A dry run reads no config. An
+//! approval reads it to find the `[state]` backend the ledger row goes to:
+//! no `rocky.toml` at all selects the local store, and a present
+//! `rocky.toml` that does not load refuses, with no row and no marker.
+//! Recording to the local store there would leave a row the next remote
+//! download erases.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -56,8 +70,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rocky_core::breaking_change::{self, BreakingFinding};
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
-use rocky_core::state::{PolicyDecisionRecord, StateStore};
+use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalRef};
+use rocky_core::state::{ApprovalCustody, PolicyDecisionRecord, SessionSource, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{FAIL_CLOSED_FLOOR_MARKER, ai_plan_is_reviewed, review_marker_path};
@@ -142,6 +156,21 @@ pub(crate) fn review_marker_state(root: &Path, plan_id: &str) -> ReviewMarkerSta
     }
 }
 
+/// Who is approving a plan, for the approval row in the policy-decision
+/// ledger.
+///
+/// Passing one to the review core is what makes it approve; `None` is a dry
+/// run. An approval also needs an explicit state path, so the findings and
+/// the ledger row read one store: the core refuses an approval without one.
+#[derive(Debug, Clone)]
+pub struct ApprovalContext {
+    /// The approver's id, recorded as the row's `principal_ref`.
+    pub actor: PrincipalRef,
+    /// The approver's class (`human` / `agent`), recorded as the row's
+    /// `principal`.
+    pub principal: PolicyPrincipal,
+}
+
 /// Execute `rocky review <plan-id>`.
 ///
 /// Resolves the worktree root from the process cwd (mirroring
@@ -151,7 +180,7 @@ pub async fn run_review(
     state_path: &Path,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -176,9 +205,10 @@ pub(crate) async fn run_review_in(
     state_path: &Path,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
     output_json: bool,
 ) -> Result<()> {
+    let approving = approve.is_some();
     let output = compute_review_with_disclosure(
         root,
         config_path,
@@ -187,7 +217,7 @@ pub(crate) async fn run_review_in(
         base_ref,
         approve,
         |drops, findings| {
-            if approve {
+            if approving {
                 eprintln!("Review findings before approval:");
                 for drop in drops {
                     eprintln!(
@@ -264,7 +294,7 @@ pub async fn compute_review(
     config_path: &Path,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
 ) -> Result<ReviewOutput> {
     compute_review_with_state_path(root, config_path, None, plan_id, base_ref, approve).await
 }
@@ -277,7 +307,7 @@ pub async fn compute_review_with_state_path(
     state_path: Option<&Path>,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
 ) -> Result<ReviewOutput> {
     compute_review_with_disclosure(
         root,
@@ -299,7 +329,7 @@ pub async fn compute_review_with_disclosure(
     state_path: Option<&Path>,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
     disclose: impl FnOnce(
         &[crate::output::ConditionalDrop],
         &Option<Vec<BreakingFinding>>,
@@ -326,7 +356,7 @@ async fn compute_review_with_disclosure_and_seam(
     state_path: Option<&Path>,
     plan_id: &str,
     base_ref: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
     disclose: impl FnOnce(
         &[crate::output::ConditionalDrop],
         &Option<Vec<BreakingFinding>>,
@@ -338,6 +368,15 @@ async fn compute_review_with_disclosure_and_seam(
 ) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
+    // One store for the findings and the approval row: an approval without
+    // an explicit state path would record into a default the caller never
+    // named. Every production approver passes one.
+    if approve.is_some() && state_path.is_none() {
+        bail!(
+            "cannot approve plan '{plan_id}': an approval needs an explicit state path for its \
+             ledger row"
+        );
+    }
 
     // `rocky review` writes the human sign-off marker that satisfies a
     // `require_review` policy effect. It applies to AI-authored plans and to
@@ -369,7 +408,16 @@ async fn compute_review_with_disclosure_and_seam(
         plan.kind,
         PlanKind::Gc | PlanKind::Restore | PlanKind::Compact | PlanKind::Archive
     ) {
-        return compute_review_marker_only(root, plan_id, approve, &plan.kind, disclose).await;
+        return compute_review_marker_only(
+            root,
+            config_path,
+            state_path,
+            plan_id,
+            approve,
+            &plan.kind,
+            disclose,
+        )
+        .await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
@@ -460,8 +508,9 @@ async fn compute_review_with_disclosure_and_seam(
     // zero from a compare that never ran reads as "no breaking changes". So
     // `--approve` refuses when HEAD or the base ref does not compile. The dry
     // run still reports, with no findings, so the reviewer sees the cause.
+    let approving = approve.is_some();
     let findings = match findings {
-        ReviewFindings::NotComputed(reason) if approve => bail!(
+        ReviewFindings::NotComputed(reason) if approving => bail!(
             "cannot approve plan '{plan_id}': the breaking-change findings could not be \
              computed because {reason}. No review marker was written. Fix the compile error \
              (or pass a base ref whose models compile), then re-run `rocky review {plan_id} \
@@ -486,7 +535,7 @@ async fn compute_review_with_disclosure_and_seam(
         && loaded_config
             .as_ref()
             .is_some_and(|cfg| super::apply::is_replication_only(cfg, &run_plan));
-    let approval_models = if approve && !replication_only {
+    let approval_models = if approving && !replication_only {
         Some(compile_approval_models(&plan, &scope)?)
     } else {
         None
@@ -527,11 +576,31 @@ async fn compute_review_with_disclosure_and_seam(
     disclose(&conditional_drops, &findings)?;
 
     let mut marker_written = false;
-    if approve {
+    let mut decision_ref = None;
+    if let Some(ctx) = approve {
+        let session_source = super::run_audit::detect_session_source();
         let approver = review_approver(
-            super::run_audit::detect_session_source(),
+            session_source,
             crate::commands::branch::approver_identity_pub(),
         )?;
+        let models: BTreeSet<String> = match &executed_models {
+            Some(executed) => executed.clone(),
+            None => approval_models
+                .iter()
+                .flatten()
+                .flat_map(|unit| unit.models().iter().map(|m| m.config.name.clone()))
+                .collect(),
+        };
+        let record = approval_record(
+            plan_id,
+            &plan.kind,
+            &ctx,
+            session_source,
+            base_ref,
+            breaking_count,
+            models.into_iter().collect(),
+        );
+        let recorded = record_plan_approval(loaded_config.as_ref(), state_path, record).await?;
         let marker = ReviewMarker {
             plan_id: plan_id.to_string(),
             reviewed_at: Utc::now(),
@@ -539,7 +608,9 @@ async fn compute_review_with_disclosure_and_seam(
             breaking_change_count: breaking_count,
             approver,
         };
-        write_review_marker(root, plan_id, &marker)?;
+        write_review_marker(root, plan_id, &marker)
+            .with_context(|| marker_after_ledger_error(plan_id, &recorded))?;
+        decision_ref = Some(recorded);
         marker_written = true;
         tracing::info!(
             target: "rocky::review",
@@ -558,7 +629,7 @@ async fn compute_review_with_disclosure_and_seam(
         );
     }
 
-    let mut message = build_message(approve, breaking_count, &findings, plan_id);
+    let mut message = build_message(approving, breaking_count, &findings, plan_id);
     for drop in &conditional_drops {
         message.push('\n');
         message.push_str(&format!(
@@ -572,12 +643,127 @@ async fn compute_review_with_disclosure_and_seam(
         command: "review".to_string(),
         plan_id: plan_id.to_string(),
         base_ref: base_ref.to_string(),
-        approved: approve,
+        approved: approving,
         marker_written,
+        decision_ref,
         breaking_changes: findings,
         conditional_drops,
         message: Some(message),
     })
+}
+
+/// The ledger row an approval records: one plan-level `allow` that carries
+/// [`ApprovalCustody`], so every reader classifies it as an approval and not
+/// as a policy evaluation.
+///
+/// It has no `rule_id` and no `verify_after`, so neither the freeze reader
+/// nor the autonomy budget reads it. Its `model` is a label, not a graph
+/// key, so it supersedes no `require_review` row in the review queue.
+fn approval_record(
+    plan_id: &str,
+    kind: &PlanKind,
+    ctx: &ApprovalContext,
+    channel: SessionSource,
+    base_ref: &str,
+    breaking_change_count: usize,
+    models: Vec<String>,
+) -> PolicyDecisionRecord {
+    let reason = if base_ref.is_empty() {
+        format!("approved {kind} plan")
+    } else {
+        format!(
+            "approved {kind} plan against {base_ref} with {breaking_change_count} breaking \
+             change(s)"
+        )
+    };
+    PolicyDecisionRecord {
+        timestamp: Utc::now(),
+        plan_id: plan_id.to_string(),
+        principal: ctx.principal,
+        capability: approval_capability(kind),
+        model: format!("approval: {kind} plan"),
+        models,
+        keys_recorded: true,
+        fail_closed: false,
+        effect: PolicyEffect::Allow,
+        rule_id: None,
+        reason,
+        verify_after: Vec::new(),
+        auto_apply: None,
+        principal_ref: Some(ctx.actor.clone()),
+        seq: 0,
+        approval: Some(ApprovalCustody {
+            channel: Some(channel),
+            base_ref: base_ref.to_string(),
+            breaking_change_count,
+        }),
+    }
+}
+
+/// The capability the plan's apply gate evaluates, which is what the
+/// approval unblocks.
+fn approval_capability(kind: &PlanKind) -> PolicyCapability {
+    match kind {
+        PlanKind::Run
+        | PlanKind::AiAuthored
+        | PlanKind::Compact
+        | PlanKind::Archive
+        | PlanKind::Replication => PolicyCapability::Apply,
+        PlanKind::Backfill => PolicyCapability::Backfill,
+        PlanKind::Gc => PolicyCapability::Gc,
+        PlanKind::Restore => PolicyCapability::Restore,
+        PlanKind::Promote => PolicyCapability::Promote,
+    }
+}
+
+/// Record the approval row through the ledger seam and return its ledger key.
+///
+/// The seam is the one `rocky policy freeze` uses: a local store is written
+/// directly; a remote `[state]` ledger is downloaded, written and uploaded
+/// with `on_upload_failure = fail`, replaying on a CAS conflict. The record
+/// is built once by the caller and only cloned per attempt, so a replay never
+/// adds a second row. `None` config (no `rocky.toml`) is the local store.
+async fn record_plan_approval(
+    config: Option<&rocky_core::config::RockyConfig>,
+    state_path: &Path,
+    record: PolicyDecisionRecord,
+) -> Result<String> {
+    let decision_ref =
+        rocky_core::state::policy_decision_key(&record.timestamp, &record.plan_id, &record.model);
+    let plan_id = record.plan_id.clone();
+    let default_state = rocky_core::config::StateConfig::default();
+    let (state_cfg, replicate_schema_cache) = match config {
+        Some(cfg) => (&cfg.state, cfg.cache.schemas.replicate),
+        None => (&default_state, false),
+    };
+    rocky_core::state_sync::LedgerSeamSession::new(state_cfg, state_path, replicate_schema_cache)
+        .execute(move |store, _generation| {
+            let record = record.clone();
+            Box::pin(async move {
+                store.record_policy_decision(&record)?;
+                Ok(())
+            })
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to record the approval of plan '{plan_id}' in the policy-decision \
+                 ledger ([state] backend `{}`, local file {}) (fail-closed). No review marker \
+                 was written, so `rocky apply {plan_id}` stays blocked",
+                state_cfg.backend,
+                state_path.display()
+            )
+        })?;
+    Ok(decision_ref)
+}
+
+/// The error when the marker write fails after the approval row committed.
+fn marker_after_ledger_error(plan_id: &str, decision_ref: &str) -> String {
+    format!(
+        "approval recorded as {decision_ref}, but the review marker was not written; \
+         `rocky apply {plan_id}` stays blocked. Re-run `rocky review {plan_id} --approve` \
+         (it records a second approval row)"
+    )
 }
 
 /// The units whose DROPs a review discloses: a plain plan's single unit, or
@@ -718,10 +904,13 @@ fn verify_current_models_for_approval(
 /// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it —
 /// which is exactly what clears a `require_review` verdict on a compact/archive
 /// apply.
+#[allow(clippy::too_many_arguments)]
 async fn compute_review_marker_only(
     root: &Path,
+    config_path: &Path,
+    state_path: Option<&Path>,
     plan_id: &str,
-    approve: bool,
+    approve: Option<ApprovalContext>,
     kind: &PlanKind,
     disclose: impl FnOnce(
         &[crate::output::ConditionalDrop],
@@ -729,12 +918,40 @@ async fn compute_review_marker_only(
     ) -> Result<()>,
 ) -> Result<ReviewOutput> {
     disclose(&[], &None)?;
+    let approving = approve.is_some();
     let mut marker_written = false;
-    if approve {
+    let mut decision_ref = None;
+    if let Some(ctx) = approve {
+        let session_source = super::run_audit::detect_session_source();
         let approver = review_approver(
-            super::run_audit::detect_session_source(),
+            session_source,
             crate::commands::branch::approver_identity_pub(),
         )?;
+        // Checked by the caller; repeated so this function cannot record a
+        // row into a store nobody named.
+        let Some(state_path) = state_path else {
+            bail!(
+                "cannot approve plan '{plan_id}': an approval needs an explicit state path for \
+                 its ledger row"
+            );
+        };
+        // The ledger row needs the `[state]` backend. Credential-tolerant, as
+        // the run-plan path above (#1536). No file selects the local store; a
+        // file that does not load refuses before anything is written.
+        let resolved_config_path = root.join(config_path);
+        let config = rocky_core::config::load_optional_project_config(Some(
+            &resolved_config_path,
+        ))
+        .with_context(|| {
+            format!(
+                "refusing to approve plan '{plan_id}': {} failed to load, so the [state] backend \
+                 for the approval row cannot be resolved. Nothing was recorded and no review \
+                 marker was written",
+                resolved_config_path.display()
+            )
+        })?;
+        let record = approval_record(plan_id, kind, &ctx, session_source, "", 0, Vec::new());
+        let recorded = record_plan_approval(config.as_ref(), state_path, record).await?;
         let marker = ReviewMarker {
             plan_id: plan_id.to_string(),
             reviewed_at: Utc::now(),
@@ -742,7 +959,9 @@ async fn compute_review_marker_only(
             breaking_change_count: 0,
             approver,
         };
-        write_review_marker(root, plan_id, &marker)?;
+        write_review_marker(root, plan_id, &marker)
+            .with_context(|| marker_after_ledger_error(plan_id, &recorded))?;
+        decision_ref = Some(recorded);
         marker_written = true;
         tracing::info!(
             target: "rocky::review",
@@ -752,9 +971,9 @@ async fn compute_review_marker_only(
         );
     }
 
-    let message = match (kind, approve) {
+    let message = match (kind, approving) {
         (PlanKind::Restore, true) => format!(
-            "approved restore plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
+            "approved restore plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked on this machine. Apply \
              rebuilds each artifact from its recorded recipe and asserts the recomputed blake3 \
              equals the tombstoned hash before any write becomes visible."
         ),
@@ -764,7 +983,7 @@ async fn compute_review_marker_only(
              restore goes through review."
         ),
         (PlanKind::Compact, true) => format!(
-            "approved compact plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. \
+            "approved compact plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked on this machine. \
              Apply runs the OPTIMIZE / VACUUM maintenance SQL against the target."
         ),
         (PlanKind::Compact, false) => format!(
@@ -772,7 +991,7 @@ async fn compute_review_marker_only(
              `rocky apply {plan_id}`."
         ),
         (PlanKind::Archive, true) => format!(
-            "approved archive plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. \
+            "approved archive plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked on this machine. \
              Apply runs the DELETE + VACUUM SQL against the target (a destructive operation)."
         ),
         (PlanKind::Archive, false) => format!(
@@ -780,7 +999,7 @@ async fn compute_review_marker_only(
              `rocky apply {plan_id}`. Archive is destructive (DELETE + VACUUM)."
         ),
         (_, true) => format!(
-            "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
+            "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked on this machine. Apply \
              re-verifies each artifact against the live ledger before evicting (a tombstone + \
              retired ledger row; no physical byte deletion), and every eviction is tombstoned \
              for restore."
@@ -797,8 +1016,9 @@ async fn compute_review_marker_only(
         command: "review".to_string(),
         plan_id: plan_id.to_string(),
         base_ref: String::new(),
-        approved: approve,
+        approved: approving,
         marker_written,
+        decision_ref,
         breaking_changes: None,
         conditional_drops: Vec::new(),
         message: Some(message),
@@ -831,12 +1051,12 @@ fn build_message(
     match (approve, breaking_count) {
         (true, 0) => {
             format!(
-                "approved plan '{plan_id}' — no breaking changes detected; `rocky apply {plan_id}` is now unblocked"
+                "approved plan '{plan_id}' — no breaking changes detected; `rocky apply {plan_id}` is now unblocked on this machine"
             )
         }
         (true, n) => {
             format!(
-                "approved plan '{plan_id}' WITH {n} breaking change(s) — the approver explicitly signed off on them; `rocky apply {plan_id}` is now unblocked"
+                "approved plan '{plan_id}' WITH {n} breaking change(s) — the approver explicitly signed off on them; `rocky apply {plan_id}` is now unblocked on this machine"
             )
         }
         (false, 0) => {
@@ -1147,6 +1367,16 @@ pub(crate) fn review_approver(
                 source: crate::output::ApproverSource::Local,
             })),
     }
+}
+
+/// Test-support: an approval by an unnamed human, as a terminal user with no
+/// `--principal-id` would make it.
+#[cfg(test)]
+pub(crate) fn test_approval() -> Option<ApprovalContext> {
+    Some(ApprovalContext {
+        actor: PrincipalRef::unnamed(),
+        principal: PolicyPrincipal::Human,
+    })
 }
 
 /// Test-support: write a WELL-FORMED review marker naming `plan_id`, exactly
@@ -1646,6 +1876,7 @@ pub(crate) fn record_plan_review_escalation(
     reason: &str,
 ) {
     let record = PolicyDecisionRecord {
+        approval: None,
         seq: 0,
         // The plan-level writer names its set on purpose.
         keys_recorded: true,
@@ -1872,9 +2103,17 @@ mod tests {
         unsafe { std::env::set_var("ROCKY_SESSION_SOURCE", "http_api") };
         let dir = tempfile::tempdir().unwrap();
         let plan_id = "c".repeat(64);
-        let result =
-            compute_review_marker_only(dir.path(), &plan_id, true, &PlanKind::Gc, |_, _| Ok(()))
-                .await;
+        let state = dir.path().join("state.redb");
+        let result = compute_review_marker_only(
+            dir.path(),
+            Path::new("rocky.toml"),
+            Some(&state),
+            &plan_id,
+            test_approval(),
+            &PlanKind::Gc,
+            |_, _| Ok(()),
+        )
+        .await;
         unsafe {
             match previous {
                 Some(v) => std::env::set_var("ROCKY_SESSION_SOURCE", v),
@@ -1988,7 +2227,7 @@ mod tests {
             Some(&state),
             &id,
             "HEAD",
-            true,
+            test_approval(),
             |drops, _| {
                 assert!(!marker.exists(), "the marker must follow disclosure");
                 assert_eq!(drops.len(), 1);
@@ -2000,9 +2239,16 @@ mod tests {
         assert!(output.marker_written);
         std::fs::remove_file(&marker)?;
         std::fs::write(&sidecar, "invalid = [")?;
-        let error = compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true)
-            .await
-            .expect_err("failed DROP review must refuse approval");
+        let error = compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect_err("failed DROP review must refuse approval");
         // RD-048: the HEAD compile failure now refuses at the breaking-change
         // compare, before the DROP review runs.
         assert!(format!("{error:#}").contains("do not compile"));
@@ -2056,9 +2302,16 @@ mod tests {
         let saved_sidecar = std::fs::read(&sidecar)?;
         std::fs::remove_file(&sql)?;
         std::fs::remove_file(&sidecar)?;
-        let error = compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true)
-            .await
-            .expect_err("a removed model must not be approved");
+        let error = compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect_err("a removed model must not be approved");
         assert!(
             error
                 .to_string()
@@ -2068,8 +2321,15 @@ mod tests {
 
         std::fs::write(&sql, saved_sql)?;
         std::fs::write(&sidecar, saved_sidecar)?;
-        let review =
-            compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true).await?;
+        let review = compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            test_approval(),
+        )
+        .await?;
         assert!(review.marker_written);
         assert_eq!(review.conditional_drops.len(), 1);
         assert_eq!(
@@ -2127,7 +2387,7 @@ mod tests {
             Some(&state),
             &id,
             "HEAD",
-            true,
+            test_approval(),
             |_, _| anyhow::bail!("disclosure must not run after a stale snapshot"),
             || {
                 std::fs::write(&sql, &saved_sql)?;
@@ -2184,8 +2444,15 @@ mod tests {
             PolicyPrincipal::Agent,
             capabilities,
         )?;
-        let output =
-            compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true).await?;
+        let output = compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            test_approval(),
+        )
+        .await?;
         assert!(output.marker_written);
         assert!(output.conditional_drops.is_empty());
         Ok(())
@@ -2227,7 +2494,7 @@ mod tests {
             Some(&state_path),
             &plan_id,
             "HEAD",
-            false,
+            None,
         )
         .await?;
         assert!(!review.marker_written);
@@ -2286,7 +2553,7 @@ mod tests {
             Some(&state),
             &plan_id,
             "HEAD",
-            false,
+            None,
         )
         .await?;
 
@@ -2342,7 +2609,7 @@ mod tests {
             Some(&state),
             &governed_id,
             "HEAD",
-            true,
+            test_approval(),
         )
         .await?;
         assert!(approved.marker_written);
@@ -2382,7 +2649,7 @@ mod tests {
             Some(&dir.path().join("state.redb")),
             &plan_id,
             "HEAD",
-            false,
+            None,
         )
         .await?;
         assert_eq!(review.conditional_drops.len(), 1);
@@ -2447,7 +2714,7 @@ mod tests {
             Some(&root.join("state.redb")),
             plan_id,
             "HEAD",
-            false,
+            None,
             |_, _| Ok(()),
             || Ok(()),
             Some(root),
@@ -2498,7 +2765,7 @@ mod tests {
             Some(&root.join("state.redb")),
             plan_id,
             "HEAD",
-            approve,
+            if approve { test_approval() } else { None },
             |_, _| Ok(()),
             || Ok(()),
             Some(root),
@@ -2569,7 +2836,7 @@ mod tests {
             Some(&root.join("state.redb")),
             &plan_id,
             "mian",
-            true,
+            test_approval(),
             |_, _| Ok(()),
             || Ok(()),
             Some(root),
@@ -2595,6 +2862,42 @@ mod tests {
         let out = review_in_repo(root, &plan_id, true).await?;
         assert!(out.marker_written);
         assert!(out.breaking_changes.is_some(), "the compare ran");
+
+        // C2-P0 test 6, run-plan half: the main path records one approval
+        // row at the explicit state path the findings read, never at the
+        // default `<models>/.rocky-state.redb`, with the approval's scope.
+        let rows = StateStore::open_read_only(&root.join("state.redb"))?.list_policy_decisions()?;
+        let approvals: Vec<_> = rows
+            .iter()
+            .filter(|d| d.kind() == rocky_core::state::DecisionKind::Approval)
+            .collect();
+        assert_eq!(approvals.len(), 1, "{rows:?}");
+        let row = approvals[0];
+        assert_eq!(row.plan_id, plan_id);
+        assert_eq!(row.capability, PolicyCapability::Apply);
+        assert_eq!(row.model, "approval: ai_authored plan");
+        assert_eq!(row.models, vec!["m".to_string()]);
+        assert!(row.keys_recorded);
+        assert_eq!(row.principal, PolicyPrincipal::Human);
+        assert_eq!(row.principal_ref, Some(PrincipalRef::unnamed()));
+        assert_eq!(row.rule_id, None);
+        assert!(row.verify_after.is_empty());
+        let custody = row.approval.as_ref().expect("custody");
+        assert_eq!(custody.base_ref, "HEAD");
+        assert_eq!(custody.breaking_change_count, 0);
+        assert!(custody.channel.is_some());
+        assert_eq!(
+            out.decision_ref,
+            Some(rocky_core::state::policy_decision_key(
+                &row.timestamp,
+                &row.plan_id,
+                &row.model
+            ))
+        );
+        assert!(
+            !root.join("models").join(".rocky-state.redb").exists(),
+            "nothing at the default path"
+        );
         Ok(())
     }
 
@@ -2828,7 +3131,7 @@ mod tests {
                     Some(&state),
                     &plan_id,
                     "HEAD",
-                    true,
+                    test_approval(),
                 )
                 .await
             }
@@ -2915,7 +3218,7 @@ mod tests {
             Some(&root.join("state.redb")),
             &plan_id,
             "HEAD",
-            true,
+            test_approval(),
         )
         .await?;
         assert!(approved.marker_written);
@@ -2970,7 +3273,7 @@ mod tests {
                 Some(&state),
                 &plan_id,
                 "HEAD",
-                true,
+                test_approval(),
             )
         };
 
@@ -3051,7 +3354,7 @@ mod tests {
             Some(&root.join("state.redb")),
             &plan_id,
             "HEAD",
-            true,
+            test_approval(),
         )
         .await
         .expect_err("a legacy plan keeps the full compare");
@@ -3068,18 +3371,23 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let plan_id =
             crate::plan_store::write_plan(dir.path(), PlanKind::Gc, &serde_json::json!({}))?;
+        let state = dir.path().join("state.redb");
         let result = compute_review_with_disclosure(
             dir.path(),
             Path::new("rocky.toml"),
-            None,
+            Some(&state),
             &plan_id,
             "HEAD",
-            true,
+            test_approval(),
             |_, _| anyhow::bail!("review token missing"),
         )
         .await;
-        assert!(result.is_err());
+        assert!(
+            format!("{:#}", result.expect_err("the guard refuses"))
+                .contains("review token missing")
+        );
         assert!(!review_marker_path(dir.path(), &plan_id).exists());
+        assert!(!state.exists(), "a refused approval records no ledger row");
         Ok(())
     }
 
@@ -3319,6 +3627,7 @@ mod tests {
         cap: PolicyCapability,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -3942,9 +4251,16 @@ mod tests {
         let marker_path = review_marker_path(root, &plan_id);
         assert!(!marker_path.exists(), "no marker before the approve");
 
-        let err = compute_review(root, &config_path, &plan_id, "HEAD", true)
-            .await
-            .expect_err("--approve on an unloadable rocky.toml must refuse");
+        let err = compute_review_with_state_path(
+            root,
+            &config_path,
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect_err("--approve on an unloadable rocky.toml must refuse");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
@@ -3974,7 +4290,7 @@ mod tests {
         std::fs::write(&config_path, BROKEN_CONFIG_1680)?;
 
         assert!(
-            compute_review(root, &config_path, &plan_id, "HEAD", false)
+            compute_review(root, &config_path, &plan_id, "HEAD", None)
                 .await
                 .is_err(),
             "the dry run must refuse an unloadable config too"
@@ -4020,9 +4336,16 @@ mod tests {
             "a present-but-broken rocky.toml must refuse the gate"
         );
 
-        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
-            .await
-            .expect("a missing rocky.toml must not refuse a review");
+        let out = compute_review_with_state_path(
+            root,
+            &config_path,
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect("a missing rocky.toml must not refuse a review");
         assert!(out.marker_written, "the marker must still be written");
         assert!(review_marker_path(root, &plan_id).exists());
         Ok(())
@@ -4052,19 +4375,27 @@ mod tests {
                 .is_some()
         );
 
-        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
-            .await
-            .expect("an unset credential var must not refuse a review");
+        let out = compute_review_with_state_path(
+            root,
+            &config_path,
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect("an unset credential var must not refuse a review");
         assert!(out.marker_written, "the marker must still be written");
         Ok(())
     }
 
-    /// The marker-only kinds short-circuit before any config read, so they
-    /// still approve on a broken config. Deliberate: they change no model
-    /// definitions, so there is no breaking-change gate to degrade. Pinned so
-    /// the carve-out is a decision on the record, not an oversight.
+    /// The marker-only kinds have no breaking-change gate, but since C2-P0
+    /// an approval records a ledger row, and the row needs the `[state]`
+    /// backend the config names. So a present config that does not load
+    /// refuses the approval, with no row and no marker. Pinned so the change
+    /// from the earlier carve-out is a decision on the record.
     #[tokio::test]
-    async fn marker_only_kinds_still_approve_on_an_unloadable_config() -> anyhow::Result<()> {
+    async fn marker_only_kinds_refuse_approval_on_an_unloadable_config() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let plan_id =
@@ -4072,10 +4403,22 @@ mod tests {
         let config_path = root.join("rocky.toml");
         std::fs::write(&config_path, BROKEN_CONFIG_1680)?;
 
-        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
-            .await
-            .expect("a gc plan carries no breaking-change gate to degrade");
-        assert!(out.marker_written);
+        let out = compute_review_with_state_path(
+            root,
+            &config_path,
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect_err("the ledger row's backend cannot be resolved");
+        assert!(
+            format!("{out:#}").contains("refusing to approve"),
+            "{out:#}"
+        );
+        assert!(!review_marker_path(root, &plan_id).exists());
+        assert!(!root.join("state.redb").exists());
         Ok(())
     }
 
@@ -5237,5 +5580,409 @@ mod tests {
         let out = compute_review_queue(root, &cfg, &state_path, &root.join("models"))
             .expect("an unset ${VAR} in adapter credentials must not refuse the queue");
         assert_eq!(out.total, 1);
+    }
+}
+
+/// C2-P0: `rocky review --approve` records one approval row in the
+/// policy-decision ledger before it writes the review marker.
+#[cfg(test)]
+mod approval_ledger_tests {
+    use super::*;
+    use rocky_core::state::DecisionKind;
+
+    fn gc_plan(root: &Path) -> String {
+        crate::plan_store::write_plan(root, PlanKind::Gc, &serde_json::json!({})).unwrap()
+    }
+
+    fn rows_at(state: &Path) -> Vec<PolicyDecisionRecord> {
+        if !state.exists() {
+            return Vec::new();
+        }
+        StateStore::open_read_only(state)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap()
+    }
+
+    fn approvals(rows: &[PolicyDecisionRecord]) -> Vec<&PolicyDecisionRecord> {
+        rows.iter()
+            .filter(|d| d.kind() == DecisionKind::Approval)
+            .collect()
+    }
+
+    async fn approve(root: &Path, state: &Path, plan_id: &str) -> Result<ReviewOutput> {
+        compute_review_with_state_path(
+            root,
+            Path::new("rocky.toml"),
+            Some(state),
+            plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+    }
+
+    fn winner() -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            approval: None,
+            seq: 0,
+            keys_recorded: false,
+            fail_closed: false,
+            models: Vec::new(),
+            timestamp: Utc::now(),
+            plan_id: "existing-run-winner".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "winner".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "remote winner".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: None,
+        }
+    }
+
+    const CAS_STATE: &str = "[state]
+backend = \"s3\"
+s3_bucket = \"test\"
+concurrency_control = \"cas\"
+on_upload_failure = \"skip\"
+
+[state.retry]
+max_retries = 0
+";
+
+    /// Test 1. The row goes first. With the marker path blocked by a
+    /// directory, the approval fails, the row is in the ledger, the marker is
+    /// absent, apply stays blocked, and the review queue still lists the
+    /// plan: the approval row's label does not supersede the escalation.
+    /// Mutation: write the marker before the row and the ledger stays empty.
+    #[tokio::test]
+    async fn the_row_lands_before_the_marker_and_a_failed_marker_keeps_apply_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plan_id = gc_plan(root);
+        let state = root.join("state.redb");
+        record_plan_review_escalation(
+            &state,
+            &plan_id,
+            PolicyPrincipal::Agent,
+            &PrincipalRef::unnamed(),
+            PolicyCapability::Gc,
+            "gc: 1 artifact(s)",
+            vec!["orders".to_string()],
+            "gc needs review",
+        );
+        let marker = review_marker_path(root, &plan_id);
+        std::fs::create_dir_all(marker.join("blocker")).unwrap();
+
+        let err = approve(root, &state, &plan_id)
+            .await
+            .expect_err("a marker that cannot be written fails the approval");
+        let text = format!("{err:#}");
+        assert!(text.contains("approval recorded as"), "{text}");
+        assert!(text.contains("stays blocked"), "{text}");
+
+        let rows = rows_at(&state);
+        let recorded = approvals(&rows);
+        assert_eq!(recorded.len(), 1, "the row committed first: {rows:?}");
+        let row = recorded[0];
+        assert_eq!(row.plan_id, plan_id);
+        assert_eq!(row.effect, PolicyEffect::Allow);
+        assert_eq!(row.capability, PolicyCapability::Gc);
+        assert_eq!(row.principal, PolicyPrincipal::Human);
+        assert_eq!(row.principal_ref, Some(PrincipalRef::unnamed()));
+        assert!(text.contains(&rocky_core::state::policy_decision_key(
+            &row.timestamp,
+            &row.plan_id,
+            &row.model
+        )));
+
+        assert!(!ai_plan_is_reviewed(root, &plan_id), "apply stays blocked");
+        let (outstanding, _) =
+            select_outstanding(&rows, |p| ai_plan_is_reviewed(root, p), |_| true);
+        assert!(
+            outstanding
+                .iter()
+                .any(|d| d.plan_id == plan_id && d.effect == PolicyEffect::RequireReview),
+            "the escalation is still outstanding: {outstanding:?}"
+        );
+
+        std::fs::remove_dir_all(&marker).unwrap();
+        let out = approve(root, &state, &plan_id).await.unwrap();
+        assert!(out.marker_written);
+        assert!(out.decision_ref.is_some());
+        assert_eq!(
+            approvals(&rows_at(&state)).len(),
+            2,
+            "a re-run records a second row"
+        );
+        let rows = rows_at(&state);
+        let (outstanding, _) =
+            select_outstanding(&rows, |p| ai_plan_is_reviewed(root, p), |_| true);
+        assert!(outstanding.is_empty(), "the marker clears the queue");
+    }
+
+    /// Test 2. A remote `[state]` ledger that cannot be reached refuses the
+    /// approval: no row and no marker, locally or anywhere. Mutation: record
+    /// the row with a local open and the approval succeeds.
+    #[tokio::test]
+    async fn an_unreachable_remote_ledger_writes_no_row_and_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), "[state]\nbackend = \"s3\"\n").unwrap();
+        let plan_id = gc_plan(root);
+        let state = root.join("state.redb");
+
+        let err = approve(root, &state, &plan_id)
+            .await
+            .expect_err("an unreachable remote ledger refuses the approval");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("failed to record the approval") && text.contains("fail-closed"),
+            "{text}"
+        );
+        assert!(!review_marker_path(root, &plan_id).exists());
+        assert!(!state.exists(), "no local row either");
+    }
+
+    /// Test 3. A marker-only approval on a `rocky.toml` that is present and
+    /// does not load refuses before anything is written. A dry run still
+    /// reads no config. Mutation: fall back to the local store on a load
+    /// error and the approval records a row the next download would erase.
+    #[tokio::test]
+    async fn a_broken_config_refuses_a_marker_only_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), "this is [not toml").unwrap();
+        let plan_id = gc_plan(root);
+        let state = root.join("state.redb");
+
+        let err = approve(root, &state, &plan_id)
+            .await
+            .expect_err("a broken config refuses the approval");
+        assert!(
+            format!("{err:#}").contains("refusing to approve"),
+            "{err:#}"
+        );
+        assert!(!review_marker_path(root, &plan_id).exists());
+        assert!(!state.exists(), "no row");
+
+        let dry = compute_review_with_state_path(
+            root,
+            Path::new("rocky.toml"),
+            Some(&state),
+            &plan_id,
+            "HEAD",
+            None,
+        )
+        .await
+        .expect("a dry run reads no config");
+        assert!(!dry.approved);
+        assert_eq!(dry.decision_ref, None);
+    }
+
+    /// No `rocky.toml` at all: the local store, as before.
+    #[tokio::test]
+    async fn no_config_records_to_the_local_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plan_id = gc_plan(root);
+        let state = root.join("state.redb");
+        let out = approve(root, &state, &plan_id).await.unwrap();
+        assert!(out.marker_written);
+        let rows = rows_at(&state);
+        assert_eq!(approvals(&rows).len(), 1);
+        assert_eq!(
+            out.decision_ref,
+            Some(rocky_core::state::policy_decision_key(
+                &rows[0].timestamp,
+                &rows[0].plan_id,
+                &rows[0].model
+            ))
+        );
+    }
+
+    /// Test 4. Under CAS, two conflicts replay the transition: one approval
+    /// row lands next to the remote winner, and one marker. Three conflicts
+    /// exhaust the seam: the command fails, no marker, and the remote keeps
+    /// only the winner. Each attempt starts from a fresh download, so the
+    /// attempt must write the row every time. Mutation: write the row on the
+    /// first attempt only and the committed replay holds no approval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cas_conflicts_replay_to_one_row_and_exhaustion_writes_no_marker() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        {
+            let store = harness.open_store(&harness.pod_b);
+            store.record_policy_decision(&winner()).unwrap();
+        }
+        harness.upload(&harness.pod_b).await.unwrap();
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        let remote_rows = || async {
+            let verify = tempfile::tempdir().unwrap();
+            let path = verify.path().join("verify.redb");
+            let _authority =
+                rocky_core::state_sync::download_state(&harness.pod_b.cfg, &path, false)
+                    .await
+                    .unwrap();
+            StateStore::open(&path)
+                .unwrap()
+                .list_policy_decisions()
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), CAS_STATE).unwrap();
+
+        let exhausted = gc_plan(root);
+        harness.faults.arm_precondition_failures(&object_key, 3);
+        let err = approve(root, &harness.pod_a.state_path, &exhausted)
+            .await
+            .expect_err("three conflicts fail the approval");
+        assert!(format!("{err:#}").contains("fail-closed"), "{err:#}");
+        assert!(!review_marker_path(root, &exhausted).exists());
+        harness.faults.clear();
+        let rows = remote_rows().await;
+        assert!(rows.iter().any(|r| r.plan_id == "existing-run-winner"));
+        assert!(approvals(&rows).is_empty(), "nothing committed: {rows:?}");
+
+        let replayed =
+            crate::plan_store::write_plan(root, PlanKind::Gc, &serde_json::json!({ "n": 2 }))
+                .unwrap();
+        harness.faults.arm_precondition_failures(&object_key, 2);
+        let out = approve(root, &harness.pod_a.state_path, &replayed)
+            .await
+            .expect("the third attempt commits");
+        assert!(out.marker_written);
+        harness.faults.clear();
+        let rows = remote_rows().await;
+        assert!(rows.iter().any(|r| r.plan_id == "existing-run-winner"));
+        let recorded = approvals(&rows);
+        assert_eq!(recorded.len(), 1, "one row across the replays: {rows:?}");
+        assert_eq!(recorded[0].plan_id, replayed);
+    }
+
+    /// Test 5. Across the v32 -> v33 bump: only `v32/state.redb` holds the
+    /// shared ledger. The approval carries it forward, writes `v33/` with the
+    /// old rows and the approval, and never writes `v32/`. Mutation: record
+    /// the row in the local store instead of through the seam and no `v33/`
+    /// key is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_carries_the_previous_version_ledger_forward() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let current = rocky_core::state::current_schema_version();
+        let seed_dir = tempfile::tempdir().unwrap();
+        let seed = seed_dir.path().join("seed.redb");
+        StateStore::open(&seed)
+            .unwrap()
+            .record_policy_decision(&winner())
+            .unwrap();
+        rocky_core::state::force_schema_version(&seed, &(current - 1).to_string());
+        let old_bytes = std::fs::read(&seed).unwrap();
+        let old_key = format!("v{}/state.redb", current - 1);
+        let new_key = format!("v{current}/state.redb");
+        harness
+            .provider
+            .put(&old_key, old_bytes.clone().into())
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), CAS_STATE).unwrap();
+        let plan_id = gc_plan(root);
+        approve(root, &harness.pod_a.state_path, &plan_id)
+            .await
+            .unwrap();
+
+        let new_bytes = harness.provider.get(&new_key).await.unwrap();
+        let check = seed_dir.path().join("check.redb");
+        std::fs::write(&check, &new_bytes).unwrap();
+        // A replicated blob carries only the replicated tables; the
+        // read-write open adds the local ones.
+        let rows = StateStore::open(&check)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(rows.iter().any(|r| r.plan_id == "existing-run-winner"));
+        assert_eq!(approvals(&rows).len(), 1, "{rows:?}");
+        assert_eq!(
+            harness.provider.get(&old_key).await.unwrap().to_vec(),
+            old_bytes,
+            "the previous version's key is never written"
+        );
+    }
+
+    /// An approval with no state path is refused before anything is written.
+    #[tokio::test]
+    async fn an_approval_without_a_state_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plan_id = gc_plan(root);
+        let err = compute_review(
+            root,
+            Path::new("rocky.toml"),
+            &plan_id,
+            "HEAD",
+            test_approval(),
+        )
+        .await
+        .expect_err("no state path");
+        assert!(
+            format!("{err:#}").contains("explicit state path"),
+            "{err:#}"
+        );
+        assert!(!review_marker_path(root, &plan_id).exists());
+    }
+
+    /// Test 10. `rocky audit` and `rocky audit --for <plan_id>` show the row
+    /// as an approval with the approver's id and channel. Mutation: drop
+    /// `kind` from the audit entry and the row reads as a bare `allow`.
+    #[tokio::test]
+    async fn audit_shows_the_approval_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plan_id = gc_plan(root);
+        let state = root.join("state.redb");
+        approve(root, &state, &plan_id).await.unwrap();
+
+        let out = crate::commands::audit::compute_audit(
+            &state,
+            None,
+            &crate::commands::audit::AuditQuery::default(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&out).unwrap();
+        let entry = &json["decisions"][0];
+        assert_eq!(entry["kind"], "approval", "{entry}");
+        assert_eq!(entry["effect"], "allow", "{entry}");
+        assert_eq!(entry["principal_id"], "unnamed", "{entry}");
+        assert_eq!(entry["principal_id_source"], "default", "{entry}");
+        assert!(entry["approval_channel"].is_string(), "{entry}");
+
+        let chain = crate::commands::audit::compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state,
+            &root.join("models"),
+            &plan_id,
+        )
+        .unwrap();
+        assert_eq!(chain.decisions.total, 1);
+        assert_eq!(
+            chain.decisions.entries[0].kind,
+            crate::output::BriefDecisionKind::Approval
+        );
     }
 }

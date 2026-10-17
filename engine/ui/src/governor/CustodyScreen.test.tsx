@@ -28,6 +28,7 @@ const CHAIN: AuditForOutput = {
         reason: "<script>alert(1)</script> hostile reason",
         principal_id: null,
         principal_id_verified: false,
+        kind: "evaluation",
       },
     ],
   },
@@ -68,6 +69,29 @@ const CHAIN: AuditForOutput = {
 };
 
 describe("CustodyScreen", () => {
+  it("shows an approval row as an approval, not a policy allow, and an evaluation by its effect", async () => {
+    const [evaluation] = CHAIN.decisions.entries;
+    const approval = {
+      ...evaluation,
+      plan_id: "e".repeat(64),
+      effect: "allow" as const,
+      kind: "approval" as const,
+      approval_channel: "http_api" as const,
+    };
+    const chain = {
+      ...CHAIN,
+      decisions: { ...CHAIN.decisions, total: 2, entries: [evaluation, approval] },
+    };
+    render(<CustodyScreen subject="fct_orders" load={vi.fn(async () => chain)} now={NOW} />);
+    const decisions = await screen.findByRole("region", { name: "Decisions" });
+    const [evalRow, approvalRow] = within(decisions).getAllByRole("row").slice(1);
+    expect(within(evalRow).getByText("evaluation")).toBeInTheDocument();
+    expect(within(evalRow).getByText("require_review")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval")).toBeInTheDocument();
+    expect(within(approvalRow).getByText("approval (http_api) [effect allow]")).toBeInTheDocument();
+    expect(within(approvalRow).queryByText("allow")).toBeNull();
+  });
+
   it("renders the five links by availability with every id as text", async () => {
     const load = vi.fn(async () => CHAIN);
     render(<CustodyScreen subject="fct_orders" load={load} now={NOW} />);

@@ -25,11 +25,12 @@
 //! ```
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -84,6 +85,81 @@ pub struct RpcError {
 }
 
 // ---------------------------------------------------------------------------
+// Limits and typed errors
+// ---------------------------------------------------------------------------
+
+/// Default for [`ProcessLimits::init_timeout`]: 60 seconds.
+pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default for [`ProcessLimits::call_timeout`]: 1 hour. A call can run
+/// warehouse SQL, so this bounds a hung adapter, not a slow query.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Default for [`ProcessLimits::stop_grace`]: 5 seconds.
+pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Default for [`ProcessLimits::max_response_bytes`]: 64 MiB.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounds on one adapter process: how long Rocky waits and how much it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessLimits {
+    /// How long the `initialize` exchange in [`ProcessAdapter::spawn`] may take.
+    pub init_timeout: Duration,
+    /// How long one [`ProcessAdapter::call`] may take, request write and
+    /// response read together.
+    pub call_timeout: Duration,
+    /// How long a stopping adapter has to exit after `SIGTERM` (Unix) before
+    /// its process group gets `SIGKILL`. Also bounds the `shutdown` call that
+    /// `close` sends.
+    pub stop_grace: Duration,
+    /// The most bytes Rocky reads for one response line, newline excluded.
+    pub max_response_bytes: usize,
+}
+
+impl Default for ProcessLimits {
+    fn default() -> Self {
+        Self {
+            init_timeout: DEFAULT_INIT_TIMEOUT,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            stop_grace: DEFAULT_STOP_GRACE,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
+/// A process adapter failure that stopped the adapter process.
+///
+/// Returned inside an [`AdapterError`]; reach it with
+/// `err.inner().downcast_ref::<ProcessAdapterError>()`.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProcessAdapterError {
+    /// The adapter did not answer within the limit, so Rocky stopped it.
+    #[error("adapter did not answer `{method}` within {after:?}; the adapter process was stopped")]
+    Timeout {
+        /// The JSON-RPC method that was in flight.
+        method: String,
+        /// The limit that expired.
+        after: Duration,
+    },
+    /// The adapter's response line was longer than the limit, so Rocky
+    /// stopped it instead of buffering the rest.
+    #[error(
+        "adapter response to `{method}` is longer than {max_bytes} bytes; the adapter process was stopped"
+    )]
+    ResponseTooLarge {
+        /// The JSON-RPC method that was in flight.
+        method: String,
+        /// The limit that was exceeded.
+        max_bytes: usize,
+    },
+    /// An earlier timeout or oversized response stopped the adapter process.
+    #[error("the adapter process was stopped after an earlier failure; spawn a new adapter")]
+    Stopped,
+}
+
+// ---------------------------------------------------------------------------
 // Process adapter
 // ---------------------------------------------------------------------------
 
@@ -96,6 +172,11 @@ pub struct RpcError {
 ///
 /// The process adapter implements `WarehouseAdapter` by translating each
 /// method call into a JSON-RPC request/response exchange.
+///
+/// Every exchange is bounded by [`ProcessLimits`]. On Unix the adapter leads
+/// its own process group, so stopping it also stops what it started. The
+/// adapter is stopped on a timeout, on an oversized response, in `close`, and
+/// when the `ProcessAdapter` is dropped.
 pub struct ProcessAdapter {
     /// The child process.
     child: Mutex<Child>,
@@ -112,8 +193,14 @@ pub struct ProcessAdapter {
     /// can therefore swap responses (caller A reads B's reply). Holding this
     /// lock across the entire write→read pair makes `call` linearizable.
     call_lock: Mutex<()>,
+    /// Set once the child was stopped after a timeout or an oversized
+    /// response. The stream may then hold half a message, so every later
+    /// call fails with [`ProcessAdapterError::Stopped`].
+    stopped: AtomicBool,
     /// Monotonically increasing request ID.
     next_id: AtomicU64,
+    /// Time and size bounds for this adapter.
+    limits: ProcessLimits,
     /// The adapter's manifest, received during initialization.
     manifest: AdapterManifest,
     /// A minimal dialect proxy for the process adapter.
@@ -124,12 +211,31 @@ impl std::fmt::Debug for ProcessAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessAdapter")
             .field("manifest", &self.manifest)
+            .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
 }
 
+/// Stops the adapter's whole process group if it is still running.
+///
+/// `Drop` cannot wait, so there is no `SIGTERM` grace here: the group gets
+/// `SIGKILL`. `kill_on_drop` on the `Command` still covers the adapter itself
+/// where there is no process group.
+impl Drop for ProcessAdapter {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // `id()` is `None` once tokio has reaped the child. While it is
+            // `Some`, the child is unreaped, so its id still names its group.
+            if let Some(pgid) = self.child.get_mut().id() {
+                let _ = signal_group(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 impl ProcessAdapter {
-    /// Spawn an adapter process and initialize it.
+    /// Spawn an adapter process and initialize it, with [`ProcessLimits::default`].
     ///
     /// 1. Starts the child process
     /// 2. Sends an `initialize` request with the provided config
@@ -138,6 +244,21 @@ impl ProcessAdapter {
         command: &str,
         args: &[&str],
         config: &serde_json::Value,
+    ) -> Result<Self, AdapterError> {
+        Self::spawn_with_limits(command, args, config, ProcessLimits::default()).await
+    }
+
+    /// Spawn an adapter process and initialize it, bounded by `limits`.
+    ///
+    /// An `initialize` exchange that runs past `limits.init_timeout`, or
+    /// answers with a line longer than `limits.max_response_bytes`, stops
+    /// the process and returns a [`ProcessAdapterError`]. Any other failure
+    /// after the spawn also stops the process.
+    pub async fn spawn_with_limits(
+        command: &str,
+        args: &[&str],
+        config: &serde_json::Value,
+        limits: ProcessLimits,
     ) -> Result<Self, AdapterError> {
         let mut command_builder = Command::new(command);
         for (key, _) in std::env::vars_os() {
@@ -149,89 +270,55 @@ impl ProcessAdapter {
                 command_builder.env_remove(key);
             }
         }
-        let mut child = command_builder
+        command_builder
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // let adapter log to stderr
-            .spawn()
-            .map_err(|e| {
-                AdapterError::msg(format!("failed to spawn adapter process '{command}': {e}"))
-            })?;
+            .kill_on_drop(true);
+        // Lead a new process group, so stopping the adapter reaches what it
+        // started, and a signal sent to its group never reaches Rocky.
+        #[cfg(unix)]
+        command_builder.process_group(0);
+        let mut child = command_builder.spawn().map_err(|e| {
+            AdapterError::msg(format!("failed to spawn adapter process '{command}': {e}"))
+        })?;
 
-        let child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AdapterError::msg("failed to capture adapter stdin"))?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AdapterError::msg("failed to capture adapter stdout"))?;
-
-        let stdin = ChildStdinWriter::new(child_stdin)
-            .map_err(|e| AdapterError::msg(format!("failed to set up adapter stdin: {e}")))?;
-        let stdout = Mutex::new(BufReader::new(child_stdout));
-        let next_id = AtomicU64::new(1);
-
-        // Send initialize request.
-        let init_request = RpcRequest::new(
-            next_id.fetch_add(1, Ordering::SeqCst),
-            "initialize",
-            serde_json::json!({ "config": config }),
-        );
-
-        let mut request_line = serde_json::to_vec(&init_request).map_err(AdapterError::new)?;
-        request_line.push(b'\n');
-        stdin
-            .write_all(request_line)
-            .await
-            .map_err(|e| AdapterError::msg(format!("failed to write to adapter stdin: {e}")))?;
-
-        // Read initialize response.
-        let response = {
-            let mut reader = stdout.lock().await;
-            let mut line = String::new();
-            reader.read_line(&mut line).await.map_err(|e| {
-                AdapterError::msg(format!("failed to read from adapter stdout: {e}"))
-            })?;
-            let resp: RpcResponse = serde_json::from_str(line.trim())
-                .map_err(|e| AdapterError::msg(format!("failed to parse adapter response: {e}")))?;
-            resp
-        };
-
-        if let Some(err) = response.error {
-            return Err(AdapterError::msg(format!(
-                "adapter initialization failed: {} ({})",
-                err.message, err.code
-            )));
+        match initialize(&mut child, config, limits).await {
+            Ok((stdin, stdout, manifest)) => {
+                let dialect = ProcessDialect {
+                    name: manifest.dialect.clone(),
+                };
+                Ok(Self {
+                    child: Mutex::new(child),
+                    stdin,
+                    stdout: Mutex::new(stdout),
+                    call_lock: Mutex::new(()),
+                    stopped: AtomicBool::new(false),
+                    // `initialize` used id 1.
+                    next_id: AtomicU64::new(2),
+                    limits,
+                    manifest,
+                    dialect,
+                })
+            }
+            Err(e) => {
+                // A failed initialize leaves no `ProcessAdapter` whose `Drop`
+                // would stop the group, so stop it here.
+                stop_child(&mut child, limits.stop_grace).await;
+                Err(e)
+            }
         }
-
-        let result = response
-            .result
-            .ok_or_else(|| AdapterError::msg("adapter returned empty initialize response"))?;
-
-        let manifest: AdapterManifest =
-            serde_json::from_value(result.get("manifest").cloned().unwrap_or(result.clone()))
-                .map_err(|e| AdapterError::msg(format!("failed to parse adapter manifest: {e}")))?;
-
-        let dialect = ProcessDialect {
-            name: manifest.dialect.clone(),
-        };
-
-        Ok(Self {
-            child: Mutex::new(child),
-            stdin,
-            stdout,
-            call_lock: Mutex::new(()),
-            next_id,
-            manifest,
-            dialect,
-        })
     }
 
     /// Get the adapter's manifest.
     pub fn manifest(&self) -> &AdapterManifest {
         &self.manifest
+    }
+
+    /// The limits this adapter was spawned with.
+    pub fn limits(&self) -> &ProcessLimits {
+        &self.limits
     }
 
     /// Send a JSON-RPC request and wait for the response.
@@ -244,10 +331,26 @@ impl ProcessAdapter {
     /// across the entire write→read pair to keep the protocol
     /// linearizable. If you need parallel adapter calls, spawn multiple
     /// [`ProcessAdapter`] instances rather than sharing one.
+    ///
+    /// **Limits:** the write→read pair must finish within
+    /// [`ProcessLimits::call_timeout`], and the response line must fit in
+    /// [`ProcessLimits::max_response_bytes`]. Otherwise the adapter process
+    /// is stopped and this returns a [`ProcessAdapterError`]; every later
+    /// call returns [`ProcessAdapterError::Stopped`].
     pub async fn call(
         &self,
         method: &str,
         params: serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.call_within(method, params, self.limits.call_timeout)
+            .await
+    }
+
+    async fn call_within(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
     ) -> Result<serde_json::Value, AdapterError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = RpcRequest::new(id, method, params);
@@ -262,27 +365,32 @@ impl ProcessAdapter {
         // id mismatch surfaces as a hard error rather than corruption.
         let _guard = self.call_lock.lock().await;
 
-        // Write request.
-        self.stdin
-            .write_all(request_line)
-            .await
-            .map_err(|e| AdapterError::msg(format!("failed to write to adapter: {e}")))?;
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(AdapterError::new(ProcessAdapterError::Stopped));
+        }
 
-        // Read response.
-        let mut line = String::new();
-        {
+        let exchanged = {
             let mut reader = self.stdout.lock().await;
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| AdapterError::msg(format!("failed to read from adapter: {e}")))?;
-        }
-
-        if line.is_empty() {
-            return Err(AdapterError::msg(
-                "adapter process closed stdout (process may have crashed)",
-            ));
-        }
+            bounded_exchange(
+                &self.stdin,
+                &mut *reader,
+                request_line,
+                method,
+                timeout,
+                self.limits.max_response_bytes,
+            )
+            .await
+        };
+        let line = match exchanged {
+            Ok(line) => line,
+            Err(ExchangeFailure::Stop(e)) => {
+                self.stopped.store(true, Ordering::SeqCst);
+                let mut child = self.child.lock().await;
+                stop_child(&mut child, self.limits.stop_grace).await;
+                return Err(AdapterError::new(e));
+            }
+            Err(ExchangeFailure::Other(e)) => return Err(e),
+        };
 
         let response: RpcResponse = serde_json::from_str(line.trim())
             .map_err(|e| AdapterError::msg(format!("failed to parse adapter response: {e}")))?;
@@ -305,6 +413,236 @@ impl ProcessAdapter {
             .result
             .ok_or_else(|| AdapterError::msg("adapter returned empty result"))
     }
+}
+
+/// Take the child's pipes, send `initialize` with request id 1, and read the
+/// manifest, bounded by `limits`.
+async fn initialize(
+    child: &mut Child,
+    config: &serde_json::Value,
+    limits: ProcessLimits,
+) -> Result<(ChildStdinWriter, BufReader<ChildStdout>, AdapterManifest), AdapterError> {
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AdapterError::msg("failed to capture adapter stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AdapterError::msg("failed to capture adapter stdout"))?;
+    let stdin = ChildStdinWriter::new(child_stdin)
+        .map_err(|e| AdapterError::msg(format!("failed to set up adapter stdin: {e}")))?;
+    let mut stdout = BufReader::new(child_stdout);
+
+    let init_request = RpcRequest::new(1, "initialize", serde_json::json!({ "config": config }));
+    let mut request_line = serde_json::to_vec(&init_request).map_err(AdapterError::new)?;
+    request_line.push(b'\n');
+
+    let line = bounded_exchange(
+        &stdin,
+        &mut stdout,
+        request_line,
+        "initialize",
+        limits.init_timeout,
+        limits.max_response_bytes,
+    )
+    .await
+    .map_err(ExchangeFailure::into_error)?;
+
+    let response: RpcResponse = serde_json::from_str(line.trim())
+        .map_err(|e| AdapterError::msg(format!("failed to parse adapter response: {e}")))?;
+
+    if let Some(err) = response.error {
+        return Err(AdapterError::msg(format!(
+            "adapter initialization failed: {} ({})",
+            err.message, err.code
+        )));
+    }
+
+    let result = response
+        .result
+        .ok_or_else(|| AdapterError::msg("adapter returned empty initialize response"))?;
+
+    let manifest: AdapterManifest =
+        serde_json::from_value(result.get("manifest").cloned().unwrap_or(result.clone()))
+            .map_err(|e| AdapterError::msg(format!("failed to parse adapter manifest: {e}")))?;
+
+    Ok((stdin, stdout, manifest))
+}
+
+// ---------------------------------------------------------------------------
+// Bounded exchange and process-group stop
+// ---------------------------------------------------------------------------
+
+/// Why one request/response exchange did not produce a line.
+enum ExchangeFailure {
+    /// Timeout or oversized response: the stream may hold half a message,
+    /// so the caller stops the adapter.
+    Stop(ProcessAdapterError),
+    /// Any other failure; the stream is left as it is.
+    Other(AdapterError),
+}
+
+impl ExchangeFailure {
+    fn into_error(self) -> AdapterError {
+        match self {
+            Self::Stop(e) => AdapterError::new(e),
+            Self::Other(e) => e,
+        }
+    }
+}
+
+/// Write one request line and read one response line, within `timeout`,
+/// reading at most `max_bytes` (newline excluded) for the response.
+///
+/// The timeout covers the write too: a child that does not read its stdin
+/// fills the pipe, and the write then blocks.
+async fn bounded_exchange<R: AsyncBufRead + Unpin>(
+    stdin: &ChildStdinWriter,
+    reader: &mut R,
+    request_line: Vec<u8>,
+    method: &str,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<String, ExchangeFailure> {
+    let exchange = async {
+        stdin.write_all(request_line).await.map_err(|e| {
+            ExchangeFailure::Other(AdapterError::msg(format!(
+                "failed to write to adapter: {e}"
+            )))
+        })?;
+        match read_bounded_line(reader, max_bytes).await {
+            Ok(Some(line)) if line.is_empty() => Err(ExchangeFailure::Other(AdapterError::msg(
+                "adapter process closed stdout (process may have crashed)",
+            ))),
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => Err(ExchangeFailure::Stop(
+                ProcessAdapterError::ResponseTooLarge {
+                    method: method.to_string(),
+                    max_bytes,
+                },
+            )),
+            Err(e) => Err(ExchangeFailure::Other(AdapterError::msg(format!(
+                "failed to read from adapter: {e}"
+            )))),
+        }
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ExchangeFailure::Stop(ProcessAdapterError::Timeout {
+            method: method.to_string(),
+            after: timeout,
+        })),
+    }
+}
+
+/// Read one line of at most `max_bytes` bytes, newline excluded.
+///
+/// Returns `Ok(None)` when the line is longer, after reading `max_bytes + 1`
+/// bytes and no more. Returns an empty string at end of file.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    // `+ 1` leaves room for the newline that ends a line of exactly
+    // `max_bytes` bytes.
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut buf = Vec::new();
+    (&mut *reader)
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if buf.last() != Some(&b'\n') && buf.len() > max_bytes {
+        return Ok(None);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Stop the adapter and reap it.
+///
+/// On Unix: `SIGTERM` to the adapter's process group, up to `grace` for the
+/// adapter to exit, then `SIGKILL` to the group. The adapter stays unreaped
+/// until after the `SIGKILL`, so its id cannot name another process group
+/// when it is signalled. Elsewhere: kill the adapter alone.
+async fn stop_child(child: &mut Child, grace: Duration) {
+    #[cfg(unix)]
+    if let Some(pgid) = child.id() {
+        let _ = signal_group(pgid, libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline && !leader_has_exited(pgid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = signal_group(pgid, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = grace;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Send `signal` to process group `pgid`. Refuses group 0 (the caller's own)
+/// and 1 (`init`).
+#[cfg(unix)]
+fn signal_group(pgid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let pgid = libc::pid_t::try_from(pgid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process group id out of range",
+        )
+    })?;
+    if pgid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to signal process group 0 or 1",
+        ));
+    }
+    // SAFETY: `killpg` takes two integers and touches no memory of this
+    // process. `pgid` is above 1, so it never names this process's own group
+    // or `init`. Callers pass the id of a child that is not yet reaped and
+    // that leads its own group (`process_group(0)`), so the id cannot have
+    // been reused. A group that no longer exists returns `ESRCH`.
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Whether the child `pid` has exited, without reaping it (`WNOWAIT`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn leader_has_exited(pid: u32) -> bool {
+    // `id_t` is `u32` on both Linux and macOS.
+    let id = libc::id_t::from(pid);
+    // SAFETY: `siginfo_t` is plain data, and all zeroes is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable `siginfo_t` that outlives the call.
+    // `WNOWAIT` leaves the child waitable, so tokio still reaps it later.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        // `ECHILD`: nothing left to wait for.
+        return true;
+    }
+    // SAFETY: `waitid` succeeded and wrote `info`. With `WNOHANG`, `si_pid`
+    // stays 0 when the child has not exited.
+    unsafe { info.si_pid() != 0 }
+}
+
+/// Without `waitid`, wait out the full grace before `SIGKILL`.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn leader_has_exited(_pid: u32) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -369,11 +707,13 @@ impl WarehouseAdapter for ProcessAdapter {
 
     async fn close(&self) -> AdapterResult<()> {
         // Send shutdown, ignore errors (process may already be gone).
-        let _ = self.call("shutdown", serde_json::json!({})).await;
+        let _ = self
+            .call_within("shutdown", serde_json::json!({}), self.limits.stop_grace)
+            .await;
 
-        // Wait for the child to exit.
+        // Give the adapter the grace to exit, then stop its whole group.
         let mut child = self.child.lock().await;
-        let _ = child.kill().await;
+        stop_child(&mut child, self.limits.stop_grace).await;
 
         Ok(())
     }
@@ -787,5 +1127,356 @@ for line in sys.stdin:
         assert_ne!(ida, idb, "request ids must be distinct");
 
         let _ = adapter.close().await;
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_accepts_the_limit_and_refuses_one_byte_more() {
+        let line = format!("{}\n", "x".repeat(8));
+        let mut reader = tokio::io::BufReader::new(line.as_bytes());
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).await.unwrap().as_deref(),
+            Some(line.as_str())
+        );
+
+        let line = format!("{}\n", "x".repeat(9));
+        let mut reader = tokio::io::BufReader::new(line.as_bytes());
+        assert_eq!(read_bounded_line(&mut reader, 8).await.unwrap(), None);
+
+        let mut reader = tokio::io::BufReader::new(&b""[..]);
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).await.unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    /// A Python adapter for the limit tests.
+    ///
+    /// - `initialize`: answers with a manifest, unless `ROCKY_TEST_SILENT_INIT`
+    ///   is in the config, then never answers.
+    /// - `ping`: answers `{"pong": true}`.
+    /// - `spawn`: starts `sleep 1000` and answers with its pid and the
+    ///   adapter's own pid.
+    /// - `hang`: never answers.
+    /// - `big`: answers with one line of `params.size` bytes.
+    ///
+    /// The adapter ignores `SIGTERM`, and so does the `sleep` it starts (an
+    /// ignored signal stays ignored across `exec`), so only a `SIGKILL` to the
+    /// whole group stops both.
+    #[cfg(unix)]
+    const LIMITS_ADAPTER: &str = r#"
+import json, os, signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+manifest = {
+    "name": "limits", "version": "0.0.0", "sdk_version": "0.0.0",
+    "dialect": "limits",
+    "capabilities": {
+        "warehouse": True, "discovery": False, "governance": False,
+        "batch_checks": False, "create_catalog": False, "create_schema": False,
+        "merge": False, "tablesample": False, "file_load": False,
+    },
+    "auth_methods": [], "config_schema": {},
+}
+for line in sys.stdin:
+    req = json.loads(line)
+    method, rid, params = req.get("method"), req.get("id"), req.get("params", {})
+    if method == "initialize":
+        if params.get("config", {}).get("ROCKY_TEST_SILENT_INIT"):
+            while True:
+                time.sleep(1000)
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"manifest": manifest}})
+    elif method == "ping":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"pong": True}})
+    elif method == "spawn":
+        p = subprocess.Popen(["sleep", "1000"])
+        emit({"jsonrpc": "2.0", "id": rid,
+              "result": {"adapter": os.getpid(), "descendant": p.pid}})
+    elif method == "hang":
+        while True:
+            time.sleep(1000)
+    elif method == "big":
+        sys.stdout.write("x" * params["size"] + "\n")
+        sys.stdout.flush()
+    elif method == "shutdown":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        break
+"#;
+
+    #[cfg(unix)]
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .args(["-c", "pass"])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[cfg(unix)]
+    fn test_limits() -> ProcessLimits {
+        ProcessLimits {
+            init_timeout: Duration::from_secs(5),
+            call_timeout: Duration::from_secs(1),
+            stop_grace: Duration::from_millis(200),
+            max_response_bytes: 1024,
+        }
+    }
+
+    /// Whether `pid` has gone: no such process, or a zombie its new parent
+    /// has not reaped yet.
+    #[cfg(unix)]
+    fn process_is_gone(pid: u64) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        stat.is_empty() || stat.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_gone(pid: u64) -> bool {
+        for _ in 0..100 {
+            if process_is_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Ask the adapter to start a descendant; returns `(adapter, descendant)`.
+    #[cfg(unix)]
+    async fn spawn_descendant(adapter: &ProcessAdapter) -> (u64, u64) {
+        let pids = adapter
+            .call("spawn", serde_json::json!({}))
+            .await
+            .expect("spawn call");
+        let adapter_pid = pids["adapter"].as_u64().expect("adapter pid");
+        let descendant = pids["descendant"].as_u64().expect("descendant pid");
+        assert!(!process_is_gone(descendant), "descendant should be running");
+        (adapter_pid, descendant)
+    }
+
+    /// A call the adapter never answers fails with `Timeout` after
+    /// `call_timeout`, and the adapter and its descendant are both gone,
+    /// even though both ignore `SIGTERM`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_past_the_timeout_stops_the_whole_process_group() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            let adapter = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", LIMITS_ADAPTER],
+                &serde_json::json!({}),
+                test_limits(),
+            )
+            .await
+            .expect("adapter should initialize");
+
+            // A normal call still works under the limits.
+            let pong = adapter.call("ping", serde_json::json!({})).await.unwrap();
+            assert_eq!(pong["pong"], true);
+
+            let (adapter_pid, descendant) = spawn_descendant(&adapter).await;
+
+            let err = adapter
+                .call("hang", serde_json::json!({}))
+                .await
+                .expect_err("a hung call must time out");
+            match err.inner().downcast_ref::<ProcessAdapterError>() {
+                Some(ProcessAdapterError::Timeout { method, after }) => {
+                    assert_eq!(method, "hang");
+                    assert_eq!(*after, Duration::from_secs(1));
+                }
+                other => panic!("expected a Timeout, got {other:?} ({err})"),
+            }
+            assert!(wait_until_gone(adapter_pid).await, "adapter still running");
+            assert!(
+                wait_until_gone(descendant).await,
+                "the adapter's descendant survived the timeout"
+            );
+
+            // The stream may hold half a message, so later calls refuse.
+            let err = adapter
+                .call("ping", serde_json::json!({}))
+                .await
+                .expect_err("a stopped adapter must refuse calls");
+            assert!(matches!(
+                err.inner().downcast_ref::<ProcessAdapterError>(),
+                Some(ProcessAdapterError::Stopped)
+            ));
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the timeout test itself hung");
+    }
+
+    /// A response line longer than `max_response_bytes` fails with
+    /// `ResponseTooLarge`, and the adapter is stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_response_is_refused_and_stops_the_adapter() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            let adapter = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", LIMITS_ADAPTER],
+                &serde_json::json!({}),
+                ProcessLimits {
+                    call_timeout: Duration::from_secs(10),
+                    ..test_limits()
+                },
+            )
+            .await
+            .expect("adapter should initialize");
+            let (adapter_pid, descendant) = spawn_descendant(&adapter).await;
+
+            let err = adapter
+                .call("big", serde_json::json!({ "size": 4096 }))
+                .await
+                .expect_err("an oversized response must be refused");
+            match err.inner().downcast_ref::<ProcessAdapterError>() {
+                Some(ProcessAdapterError::ResponseTooLarge { method, max_bytes }) => {
+                    assert_eq!(method, "big");
+                    assert_eq!(*max_bytes, 1024);
+                }
+                other => panic!("expected ResponseTooLarge, got {other:?} ({err})"),
+            }
+            assert!(wait_until_gone(adapter_pid).await, "adapter still running");
+            assert!(
+                wait_until_gone(descendant).await,
+                "descendant still running"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the size-cap test itself hung");
+    }
+
+    /// An adapter that never answers `initialize` fails `spawn` with a
+    /// `Timeout`, instead of blocking `rocky adapter list` forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_initialize_times_out() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            let err = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", LIMITS_ADAPTER],
+                &serde_json::json!({ "ROCKY_TEST_SILENT_INIT": true }),
+                ProcessLimits {
+                    init_timeout: Duration::from_millis(500),
+                    ..test_limits()
+                },
+            )
+            .await
+            .expect_err("a silent initialize must time out");
+            assert!(
+                matches!(
+                    err.inner().downcast_ref::<ProcessAdapterError>(),
+                    Some(ProcessAdapterError::Timeout { method, .. }) if method == "initialize"
+                ),
+                "expected an initialize Timeout, got {err}"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the init-timeout test itself hung");
+    }
+
+    /// Dropping a `ProcessAdapter` without `close` stops its whole group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_adapter_stops_its_descendants() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            let adapter = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", LIMITS_ADAPTER],
+                &serde_json::json!({}),
+                test_limits(),
+            )
+            .await
+            .expect("adapter should initialize");
+            let (adapter_pid, descendant) = spawn_descendant(&adapter).await;
+            drop(adapter);
+            assert!(wait_until_gone(adapter_pid).await, "adapter still running");
+            assert!(
+                wait_until_gone(descendant).await,
+                "the adapter's descendant survived the drop"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the drop test itself hung");
+    }
+
+    /// An adapter that exits on `SIGTERM` is not made to wait out the grace:
+    /// the stop path sees the leader exit and returns at once. The adapters
+    /// above ignore `SIGTERM`, so they reach `SIGKILL` even when the exit
+    /// check never fires. With a 5 s grace, a check that never fires would
+    /// take about 6 s here and fail the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_leader_that_exits_on_sigterm_does_not_wait_out_the_grace() {
+        if !python3_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let run = async {
+            // The same adapter, minus the line that ignores `SIGTERM`.
+            let script =
+                LIMITS_ADAPTER.replace("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n", "");
+            assert_ne!(script, LIMITS_ADAPTER, "the SIGTERM line should be gone");
+            let adapter = ProcessAdapter::spawn_with_limits(
+                "python3",
+                &["-c", &script],
+                &serde_json::json!({}),
+                ProcessLimits {
+                    call_timeout: Duration::from_secs(1),
+                    stop_grace: Duration::from_secs(5),
+                    ..test_limits()
+                },
+            )
+            .await
+            .expect("adapter should initialize");
+
+            let started = std::time::Instant::now();
+            let err = adapter
+                .call("hang", serde_json::json!({}))
+                .await
+                .expect_err("a hung call must time out");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(
+                    err.inner().downcast_ref::<ProcessAdapterError>(),
+                    Some(ProcessAdapterError::Timeout { .. })
+                ),
+                "expected a Timeout, got {err}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(2500),
+                "the stop path waited out the grace: {elapsed:?}"
+            );
+            eprintln!("sigterm-exit call returned in {elapsed:?}");
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the grace test itself hung");
     }
 }

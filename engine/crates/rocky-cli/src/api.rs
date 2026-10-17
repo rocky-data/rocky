@@ -1925,7 +1925,7 @@ async fn review_diff(
         Some(&state_path),
         &plan_id,
         "HEAD",
-        false,
+        None,
     )
     .await
     {
@@ -4878,6 +4878,15 @@ fn job_subprocess_command(
     if kind == JobKind::Promote {
         cmd.env_remove(crate::commands::APPROVAL_SKIP_ENV);
     }
+    // An approval records the approver in the shared policy-decision ledger.
+    // The server's own `ROCKY_PRINCIPAL_ID` / `ROCKY_PRINCIPAL` name the
+    // operator who started `rocky serve`, not the person who clicked approve,
+    // so the child drops them: the row then reads `unnamed` over `http_api`,
+    // which is true, until named tokens can name the browser user.
+    if kind == JobKind::Approve {
+        cmd.env_remove("ROCKY_PRINCIPAL_ID");
+        cmd.env_remove("ROCKY_PRINCIPAL");
+    }
     // The child runs in the project root: the directory of the bound
     // `rocky.toml`, the same root the review and product GET routes read
     // (`project_root_for`). `plan`, `review --approve` and `apply` keep their
@@ -6535,7 +6544,7 @@ mod tests {
         let text = resp.text().await.unwrap();
         let expected = {
             let _gate = store_gate(&state).await;
-            crate::commands::compute_review(&root, &config, &gated, "HEAD", false)
+            crate::commands::compute_review(&root, &config, &gated, "HEAD", None)
                 .await
                 .expect("the core computes the same diff")
         };
@@ -6567,7 +6576,7 @@ mod tests {
             &serde_json::json!({ "models": ["orders"] }),
         )?;
         let review =
-            crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await?;
+            crate::commands::compute_review(&root, &config, &plan_id, "HEAD", None).await?;
         assert!(!review.approved);
         assert_eq!(
             serde_json::to_value(&review)?["conditional_drops"],
@@ -6806,6 +6815,7 @@ mod tests {
             .expect("run recorded");
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                approval: None,
                 seq: 0,
                 keys_recorded: false,
                 fail_closed: false,
@@ -7140,6 +7150,7 @@ mod tests {
         StateStore::open(&state_path)
             .unwrap()
             .record_policy_decision(&PolicyDecisionRecord {
+                approval: None,
                 seq: 0,
                 keys_recorded: false,
                 fail_closed: false,
@@ -7233,6 +7244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, _) = governor_fixture(dir.path());
         let row = |plan: &str, day: u32, month: u32, who: Option<&str>| PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,

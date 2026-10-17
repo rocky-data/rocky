@@ -76,7 +76,7 @@ Without Docker, the script shows config validation only.
     orders  2026-04-01 00:01:00  ...
 
 === S3 state after run 1 (MinIO bucket) ===
-    [DATE]  8.0K playground/v32/state.redb
+    [DATE]  8.0K playground/v33/state.redb
 
 === Append delta (25 new rows, later timestamps) ===
     source rows: 125
@@ -87,7 +87,7 @@ Without Docker, the script shows config validation only.
     orders  2026-05-01 00:25:00  ...
 
 === S3 state after run 2 ===
-    [DATE]  8.0K playground/v32/state.redb
+    [DATE]  8.0K playground/v33/state.redb
 
 === Round-trip test: delete local state, re-download from S3 ===
     local state deleted: ls: .rocky-state.redb: No such file or directory
@@ -101,7 +101,7 @@ Without Docker, the script shows config validation only.
 POC complete: S3 state sync (upload + download) via MinIO.
 ```
 
-The object key includes the state schema version (`v32` in engine 1.80.0).
+The object key includes the state schema version (`v33` since the state schema bump after engine 1.86.0).
 
 Key observation: after deleting the local state and re-running, the target
 still has exactly 125 rows (not 225). The watermark was restored from S3,

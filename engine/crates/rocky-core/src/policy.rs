@@ -1699,6 +1699,7 @@ mod tests {
     /// A plain evaluation row: winning `rule_id`, empty `verify_after`.
     fn plain_row(plan_id: &str, rule_id: Option<usize>, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1721,6 +1722,7 @@ mod tests {
     /// means the post-apply verification FAILED (burns budget).
     fn verify_fail_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1742,6 +1744,7 @@ mod tests {
     /// A passing verify-after custody row — must NOT burn budget.
     fn verify_pass_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -1767,6 +1770,7 @@ mod tests {
         ts: DateTime<Utc>,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq: 0,
             keys_recorded: false,
             fail_closed: false,
@@ -2082,6 +2086,7 @@ mod tests {
 
     fn seq_row(prefix: &str, seq: u64, ts: DateTime<Utc>) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            approval: None,
             seq,
             ..freeze_row(prefix, PolicyPrincipal::Agent, "any", ts)
         }
