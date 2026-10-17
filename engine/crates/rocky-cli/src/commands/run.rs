@@ -12159,6 +12159,11 @@ pub(crate) async fn execute_backfill_set(
                 print_json(&output)?;
                 capture_run_output_for_test(&run_id, &output);
             }
+            // An interrupted backfill (#1606) exits 130 even with a hard
+            // `[budget]` breach, as `rocky run` does: the cancel ended it.
+            if output.interrupted {
+                return Err(anyhow::Error::new(Interrupted));
+            }
             budget_result?;
             run_status_exit_result(&output, &run_id, custody)?;
             // A backfill's session is `Durable` (governed), so a lost record on a
