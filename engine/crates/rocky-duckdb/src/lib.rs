@@ -97,6 +97,45 @@ pub struct ExtensionOptions {
     pub offline: bool,
 }
 
+impl ExtensionOptions {
+    /// The extension settings of one `type = "duckdb"` adapter block.
+    ///
+    /// A relative `extension_directory` stays relative: DuckDB resolves it
+    /// against the process working directory.
+    #[must_use]
+    pub fn from_adapter(cfg: &rocky_core::config::AdapterConfig) -> Self {
+        Self {
+            directory: cfg
+                .extension_directory
+                .as_ref()
+                .map(|d| PathBuf::from(d.expose())),
+            offline: cfg.offline,
+        }
+    }
+
+    /// The extension settings for a connection that no single adapter owns,
+    /// such as the in-memory database `rocky test` runs models in.
+    ///
+    /// Reads every `type = "duckdb"` block. The connection is offline when
+    /// any block sets `offline = true`, so one offline adapter is never
+    /// overridden by another. The directory is the first one a block sets.
+    /// A config with no DuckDB adapter gives the defaults.
+    #[must_use]
+    pub fn from_adapters<'a>(
+        adapters: impl IntoIterator<Item = &'a rocky_core::config::AdapterConfig>,
+    ) -> Self {
+        let mut merged = Self::default();
+        for cfg in adapters.into_iter().filter(|a| a.adapter_type == "duckdb") {
+            let one = Self::from_adapter(cfg);
+            merged.offline |= one.offline;
+            if merged.directory.is_none() {
+                merged.directory = one.directory;
+            }
+        }
+        merged
+    }
+}
+
 /// Quotes `value` as a SQL string literal.
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))

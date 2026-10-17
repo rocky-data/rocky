@@ -657,7 +657,10 @@ pub fn create_local_functions(
 }
 
 /// Compile and execute a project locally.
-pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult> {
+pub fn compile_and_execute(
+    models_dir: &Path,
+    extensions: &rocky_duckdb::ExtensionOptions,
+) -> anyhow::Result<ExecutionResult> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -671,7 +674,7 @@ pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult>
         anyhow::bail!("compilation has errors — cannot execute");
     }
 
-    let db = DuckDbConnector::in_memory()?;
+    let db = DuckDbConnector::in_memory_with(extensions)?;
     Ok(execute_locally(&compile_result, &db))
 }
 

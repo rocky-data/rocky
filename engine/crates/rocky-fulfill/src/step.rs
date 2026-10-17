@@ -826,7 +826,7 @@ impl Runner {
 
     #[cfg(feature = "duckdb")]
     fn scoped_tests_green(&self, model: &str, detail: &mut Vec<String>) -> bool {
-        match fulfill_api::test_output(&self.models_dir, None, Some(model)) {
+        match fulfill_api::test_output(&self.models_dir, None, Some(model), &self.config_path) {
             Ok(output) => {
                 if output.failed > 0 {
                     let rendered: Vec<String> = output

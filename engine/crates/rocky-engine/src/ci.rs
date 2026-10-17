@@ -65,6 +65,7 @@ pub fn run_ci(
         inlined_gates: None,
         strict_contracts: false,
         target_dialects: Default::default(),
+        extensions: rocky_duckdb::ExtensionOptions::default(),
     })
 }
 

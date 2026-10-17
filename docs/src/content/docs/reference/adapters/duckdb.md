@@ -12,9 +12,8 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
-
-| `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directory` to it at connect. Every extension Rocky loads uses this one directory. |
-| `offline` | bool | No | `false` | Never fetch an extension from the network. See [Offline mode](#offline-mode). |
+| `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directory` to it at connect. Every extension Rocky loads uses this one directory. A relative path resolves against the working directory of the `rocky` process, not against `rocky.toml`. |
+| `offline` | bool | No | `false` | Rocky never runs `INSTALL` and turns DuckDB's auto-install off. See [Offline mode](#offline-mode). |
 
 Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
 
@@ -52,6 +51,12 @@ Fill the directory once, on a machine with network access:
 SET extension_directory = '/opt/rocky/duckdb-extensions';
 INSTALL icu;
 ```
+
+Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter itself, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed it runs for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. These read the settings of the `type = "duckdb"` adapters in `rocky.toml`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found.
+
+Offline mode limits what Rocky does. It does not sandbox a model's own SQL: a model that runs `INSTALL` or `SET autoinstall_known_extensions = true` can still reach the network. `rocky validate` warns with `V059` when `extension_directory` or `offline` is set on an adapter whose `type` is not `duckdb`, because no other adapter reads them.
+
+One path stays online. `rocky playground` seeds its new project database before a `rocky.toml` exists, so it uses DuckDB's defaults.
 
 Then copy the directory to the offline machine. DuckDB stores files under `<version>/<platform>/`, so the directory must come from the same DuckDB build that Rocky runs. The connect error prints the version and platform it expects.
 
