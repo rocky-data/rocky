@@ -135,6 +135,18 @@ rocky product status revenue_daily
 
 Reports: the spec's identity (or its parse error), the committed lowering phase, byte-verification of every committed artifact against the manifest, whether a crashed commit's journal is pending (the next `compile` resolves it), the approval record with snapshot integrity, whether the working spec still matches the approved revision, and the persisted fulfillment state with its journal row count.
 
+When the spec declares `deliver_by`, status also reports `delivery`:
+
+| Field | Meaning |
+|---|---|
+| `on_time`, `late_by_seconds` | Whether the latest production delivery met the deadline it served, and by how much it missed. `null` until a run records a deadline. |
+| `last_due_at`, `last_delivered_at` | That deadline, and when the output model finished. |
+| `next_due_at` | The deadline the next delivery must meet. A time in the past means it is already late. |
+| `at_risk` | `true` when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`. |
+| `estimate` | `state` (`known` or `unknown`), `n`, `window` (20), `p50_ms`, `p90_ms`, `growth`. |
+
+The estimate times each of the last 20 successful production deliveries from run start to the output model's finish. With fewer than 5, it is `unknown` and gives no verdict. When the newest 5 all ran slower than the p90 of the older ones, `growth` is `true` and `p90_ms` is the slowest of those 5.
+
 ### JSON output
 
 `ProductStatusOutput` — every field above, machine-readable.

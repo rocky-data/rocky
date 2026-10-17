@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The generated `ProductSpec` model gains `deliver_by` and `timezone`, the optional delivery deadline of a product spec.
+- The generated `ProductStatusOutput` and `SchedulePipelineStatus` models gain an optional `delivery` (`DeliveryStatus`, with a `DurationEstimateStatus` estimate). Both are exported from `rocky_sdk.types_generated`.
 
 ## [0.26.0] — 2026-10-17
 

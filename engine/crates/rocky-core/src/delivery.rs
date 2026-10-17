@@ -224,6 +224,67 @@ pub fn deadline_served(
     covered_by(deliver_by, finished)
 }
 
+/// The delivery state a status surface reports for one deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryVerdict {
+    /// The deadline the latest delivery served, when the run recorded one.
+    pub last_due_at: Option<DateTime<Utc>>,
+    /// When the latest delivery finished.
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    /// Whether the latest delivery met its deadline. `None` when no
+    /// delivery recorded a deadline.
+    pub on_time: Option<bool>,
+    /// How late the latest delivery was, in seconds; `0` when on time.
+    /// `None` when no delivery recorded a deadline.
+    pub late_by_seconds: Option<u64>,
+    /// The deadline the next delivery must meet: the one still open after
+    /// the latest delivery, or the first at or after `now` when nothing was
+    /// delivered yet. A time in the past means the next delivery is already
+    /// late.
+    pub next_due_at: Option<DateTime<Utc>>,
+    /// Whether the p90 duration is longer than the time left before
+    /// `next_due_at`. `None` when the estimate has no band (fewer than
+    /// [`ESTIMATE_MIN_RUNS`] runs). A deadline that already passed leaves
+    /// less than no time, so it reads `true`.
+    pub at_risk: Option<bool>,
+}
+
+/// Judge one deadline from the latest delivery and a duration estimate.
+///
+/// `on_time` and `late_by_seconds` are facts about the latest delivery and
+/// need no estimate. Only `at_risk` rests on the estimate.
+#[must_use]
+pub fn delivery_verdict(
+    deliver_by: &DeliverBy,
+    last: Option<LastDelivery>,
+    estimate: &DurationEstimate,
+    now: DateTime<Utc>,
+) -> DeliveryVerdict {
+    let late = last.and_then(|last| {
+        last.due_at
+            .map(|due| (last.finished_at - due).num_seconds())
+    });
+    let next_due_at = match last {
+        Some(last) => open_deadline_after(deliver_by, last),
+        None => covered_by(deliver_by, now),
+    };
+    let at_risk = match (estimate.band, next_due_at) {
+        (Some(band), Some(due)) => {
+            let left_ms = (due - now).num_milliseconds();
+            Some(i128::from(band.p90_ms) > i128::from(left_ms))
+        }
+        (None, _) | (_, None) => None,
+    };
+    DeliveryVerdict {
+        last_due_at: last.and_then(|last| last.due_at),
+        last_delivered_at: last.map(|last| last.finished_at),
+        on_time: late.map(|late| late <= 0),
+        late_by_seconds: late.map(|late| u64::try_from(late).unwrap_or(0)),
+        next_due_at,
+        at_risk,
+    }
+}
+
 /// Milliseconds from `from` to `to`, or `None` when `to` is earlier.
 fn elapsed_ms(from: DateTime<Utc>, to: DateTime<Utc>) -> Option<u64> {
     (to - from)
@@ -509,6 +570,94 @@ mod tests {
             deadline_served(&d, unrecorded, utc(2026, 5, 2, 7, 30)),
             Some(utc(2026, 5, 2, 6, 0))
         );
+    }
+
+    // ----- the verdict -----
+
+    fn known(p90_ms: u64) -> DurationEstimate {
+        DurationEstimate {
+            n: 5,
+            window: ESTIMATE_WINDOW,
+            band: Some(DurationBand {
+                p50_ms: p90_ms / 2,
+                p90_ms,
+                growth: false,
+            }),
+        }
+    }
+
+    fn delivered(finished: DateTime<Utc>, due: DateTime<Utc>) -> Option<LastDelivery> {
+        Some(LastDelivery {
+            finished_at: finished,
+            due_at: Some(due),
+        })
+    }
+
+    #[test]
+    fn verdict_on_time() {
+        let verdict = delivery_verdict(
+            &six_am(),
+            delivered(utc(2026, 5, 1, 5, 40), utc(2026, 5, 1, 6, 0)),
+            &known(60_000),
+            utc(2026, 5, 1, 12, 0),
+        );
+        assert_eq!(verdict.on_time, Some(true));
+        assert_eq!(verdict.late_by_seconds, Some(0));
+        assert_eq!(verdict.next_due_at, Some(utc(2026, 5, 2, 6, 0)));
+        assert_eq!(verdict.at_risk, Some(false));
+    }
+
+    #[test]
+    fn verdict_late() {
+        let verdict = delivery_verdict(
+            &six_am(),
+            delivered(utc(2026, 5, 1, 7, 30), utc(2026, 5, 1, 6, 0)),
+            &known(60_000),
+            utc(2026, 5, 1, 12, 0),
+        );
+        assert_eq!(verdict.on_time, Some(false));
+        assert_eq!(verdict.late_by_seconds, Some(5_400));
+    }
+
+    #[test]
+    fn verdict_at_risk_when_p90_exceeds_time_left() {
+        // Delivered on day 1, so the open deadline is day 2 06:00. It is
+        // 05:30 on day 2 and the p90 is one hour.
+        let verdict = delivery_verdict(
+            &six_am(),
+            delivered(utc(2026, 5, 1, 5, 40), utc(2026, 5, 1, 6, 0)),
+            &known(3_600_000),
+            utc(2026, 5, 2, 5, 30),
+        );
+        assert_eq!(verdict.next_due_at, Some(utc(2026, 5, 2, 6, 0)));
+        assert_eq!(verdict.at_risk, Some(true));
+    }
+
+    #[test]
+    fn a_delivery_that_already_landed_today_is_not_at_risk() {
+        // Delivered at 05:20 on day 2; at 05:30 the open deadline is day 3.
+        let verdict = delivery_verdict(
+            &six_am(),
+            delivered(utc(2026, 5, 2, 5, 20), utc(2026, 5, 2, 6, 0)),
+            &known(3_600_000),
+            utc(2026, 5, 2, 5, 30),
+        );
+        assert_eq!(verdict.next_due_at, Some(utc(2026, 5, 3, 6, 0)));
+        assert_eq!(verdict.at_risk, Some(false));
+    }
+
+    #[test]
+    fn no_band_means_no_risk_verdict() {
+        let verdict = delivery_verdict(
+            &six_am(),
+            None,
+            &estimate_durations(&[1, 2, 3]),
+            utc(2026, 5, 2, 5, 59),
+        );
+        assert_eq!(verdict.at_risk, None);
+        assert_eq!(verdict.on_time, None);
+        assert_eq!(verdict.late_by_seconds, None);
+        assert_eq!(verdict.next_due_at, Some(utc(2026, 5, 2, 6, 0)));
     }
 
     fn bare_record(started: DateTime<Utc>, submission_id: Option<&str>) -> RunRecord {
