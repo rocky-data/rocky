@@ -559,6 +559,7 @@ fn config_error_diagnostic(
         ConfigError::DuplicateCheckName { pipeline, .. } => {
             ("V046", Some(format!("pipeline.{pipeline}.checks")))
         }
+        ConfigError::CostPriceInvalid { key, .. } => ("V046", Some(format!("cost.{key}"))),
         _ => ("V046", None),
     };
 

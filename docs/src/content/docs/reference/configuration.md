@@ -938,8 +938,11 @@ Tell `rocky optimize` what your warehouse costs, so its materialization recommen
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `storage_cost_per_gb_month` | float | `0.023` | Storage cost per GB-month. |
-| `compute_cost_per_dbu` | float | `0.40` | Compute cost per DBU. |
+| `storage_cost_per_gb_month` | float | `0.023` | Storage price in USD per GB-month. Must be a finite number, 0 or more. |
+| `compute_cost_per_dbu` | float | `0.40` | Compute price in USD per DBU (Databricks). Must be a finite number, 0 or more. |
+| `compute_cost_per_machine_hour` | float | unset | Compute price in USD per machine-hour, for engines that bill by machine time. Must be a finite number, 0 or more. Read by no cost command yet. |
+| `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB across regions. Must be a finite number, 0 or more. Read by no cost command yet. |
+| `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. Must be a finite number, 0 or more. Read by no cost command yet. |
 | `warehouse_size` | string | `"Medium"` | Warehouse size for cost estimation (e.g., `"Small"`, `"Medium"`, `"Large"`). |
 | `min_history_runs` | integer | `5` | Runs Rocky needs in history before it makes a cost recommendation. |
 

@@ -2154,6 +2154,7 @@ mod tests {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             })
             .collect();
@@ -2982,6 +2983,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    stored_bytes: None,
                     output_target: None,
                 }],
                 trigger: RunTrigger::Manual,

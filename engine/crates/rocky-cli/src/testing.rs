@@ -399,6 +399,9 @@ pub(crate) enum FailingWriteKind {
     /// TIMESTAMP)` and `observed_table_version` answers `Some(42)`. Drives a
     /// `snapshot` pipeline, whose SCD2 SQL DuckDB rejects, through `run()`.
     AcceptAll,
+    /// Fails nothing but `stored_tables_bytes`, which errors. The run must
+    /// still succeed and record unknown stored bytes.
+    StoredBytesFail,
 }
 
 #[cfg(feature = "duckdb")]
@@ -436,6 +439,10 @@ impl FailingWriteWarehouseAdapter {
                 id: "injected".to_string(),
                 message: "injected DESCRIBE HISTORY failure".to_string(),
             },
+            FailingWriteKind::StoredBytesFail => ConnectorError::StatementFailed {
+                id: "injected".to_string(),
+                message: "injected stored-bytes failure".to_string(),
+            },
         };
         AdapterError::new(error)
     }
@@ -457,6 +464,7 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
             FailingWriteKind::ContentOk
                 | FailingWriteKind::ObserveVersion
                 | FailingWriteKind::ObserveFail
+                | FailingWriteKind::StoredBytesFail
         ) {
             if sql.starts_with("MSCK REPAIR TABLE ") {
                 return Ok(());
@@ -529,6 +537,16 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
             FailingWriteKind::ObserveVersion | FailingWriteKind::AcceptAll => Ok(Some(42)),
             FailingWriteKind::ObserveFail => Err(self.injected_error()),
             _ => self.inner.observed_table_version(table).await,
+        }
+    }
+
+    async fn stored_tables_bytes(
+        &self,
+        tables: &[TableRef],
+    ) -> AdapterResult<Vec<Option<rocky_core::state::StoredBytes>>> {
+        match self.failure {
+            FailingWriteKind::StoredBytesFail => Err(self.injected_error()),
+            _ => self.inner.stored_tables_bytes(tables).await,
         }
     }
 }

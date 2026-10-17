@@ -1031,6 +1031,17 @@ dollar allocation. A configured DuckDB adapter reports the local `$0.00`
 model. An unreadable configuration is an error. Missing BigQuery bytes is
 `null`, not zero.
 
+### Stored bytes
+
+Each `per_model` entry can carry `stored_bytes`: the bytes the model's output table stored right after the run wrote it. `stored_bytes_basis` says how Rocky measured it:
+
+| Basis | Where | What it is |
+|---|---|---|
+| `allocated_blocks` | DuckDB file database | An estimate. Rocky runs `CHECKPOINT`, then counts the table's storage blocks and multiplies by the block size (262,144 bytes by default). A small table reads as one whole block. |
+| `data_files` | Content-addressed models | Exact. The summed size of the table's Parquet data files, without table-format metadata. |
+
+The field is omitted when the size is unknown: a view, a replicated table, a `time_interval` partition, an in-memory DuckDB database, or any other adapter. There is no run total, because the two bases do not add up to one figure. The table output marks an estimate `(est)`.
+
 ### Related Commands
 
 - [`rocky replay`](#rocky-replay) -- same `RunRecord`, shown as a per-model execution dump
