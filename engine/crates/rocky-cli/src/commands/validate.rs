@@ -330,8 +330,9 @@ enum FreshnessRemedy<'a> {
     /// Product `max_lag` with `severity = "error"`. The old lowering
     /// dropped the severity, so this text grades differently.
     ErrorNowFails(&'a str),
-    /// A zero threshold: the duration grammar takes only positive values.
-    Zero,
+    /// A zero threshold at this level key: the duration grammar takes
+    /// only positive values.
+    Zero(&'static str),
 }
 
 impl<'a> FreshnessRemedy<'a> {
@@ -340,8 +341,8 @@ impl<'a> FreshnessRemedy<'a> {
         thresholds: &rocky_core::source_freshness::FreshnessThresholds,
         replacement: &'a str,
     ) -> Self {
-        if thresholds.has_zero() {
-            Self::Zero
+        if let Some(level) = thresholds.zero_level() {
+            Self::Zero(level)
         } else {
             Self::Same(replacement)
         }
@@ -365,17 +366,18 @@ fn freshness_deprecation_message(
         .collect::<Vec<_>>()
         .join(" and ");
     let remedy = match remedy {
-        FreshnessRemedy::Same("") => {
-            "Delete them: with no lag value they set nothing.".to_string()
-        }
+        FreshnessRemedy::Same("") => "Delete them: with no lag value they set nothing.".to_string(),
         FreshnessRemedy::Same(replacement) => {
-            format!("Write `{replacement}` instead; it behaves the same.")
+            format!(
+                "Write `{replacement}` instead; it grades the same. Plan ids change once, because the block serializes differently."
+            )
         }
         FreshnessRemedy::ErrorNowFails(replacement) => format!(
             "Write `{replacement}` instead. It does not behave the same: the old form graded this as a warning, and `error_after` makes it fail at error, as `severity = \"error\"` asked."
         ),
-        FreshnessRemedy::Zero => "A zero threshold has no spelling in the new form: `warn_after` and `error_after` take a positive duration. Keep the old key, or write the smallest duration, `\"1s\"`, which is not the same check."
-            .to_string(),
+        FreshnessRemedy::Zero(level) => format!(
+            "A zero threshold has no spelling in the new form: `warn_after` and `error_after` take a positive duration. Keep the old key, or write `{level} = \"1s\"`, the smallest duration, which is not the same check."
+        ),
     };
     ValidateMessage {
         severity: "warn".into(),
@@ -407,8 +409,8 @@ fn freshness_deprecations(
             config_file.clone(),
             deprecated.field,
             &deprecated.keys,
-            if deprecated.zero_threshold {
-                FreshnessRemedy::Zero
+            if let Some(level) = deprecated.zero_level {
+                FreshnessRemedy::Zero(level)
             } else {
                 FreshnessRemedy::Same(&deprecated.replacement)
             },
@@ -2313,9 +2315,7 @@ agent = "propose_only"
     /// Write a project whose every freshness block uses `old` or `new`
     /// spelling, and validate it.
     fn freshness_project(old: bool) -> (tempfile::TempDir, ValidateOutput) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let (project, check, sidecar, defaults, spec) = if old {
+        let blocks = if old {
             (
                 "expected_lag_seconds = 3600",
                 "threshold_seconds = 86400\nseverity = \"warning\"",
@@ -2332,6 +2332,18 @@ agent = "propose_only"
                 r#"freshness = { warn_after = "24h", time_column = "id" }"#,
             )
         };
+        freshness_project_with(blocks)
+    }
+
+    /// Write a project with these freshness blocks, in order: the project
+    /// `[freshness]`, the pipeline check, a model sidecar (also an inline
+    /// frontmatter model and a product-generated sidecar), a
+    /// `_defaults.toml` and a product spec line. Then validate it.
+    fn freshness_project_with(
+        (project, check, sidecar, defaults, spec): (&str, &str, &str, &str, &str),
+    ) -> (tempfile::TempDir, ValidateOutput) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         std::fs::write(
             root.join("rocky.toml"),
             format!(
@@ -2485,7 +2497,7 @@ agent = "propose_only"
         assert!(message.contains("error_after = \"1d\""), "{message}");
         assert!(message.contains("does not behave the same"), "{message}");
         assert!(message.contains("graded this as a warning"), "{message}");
-        assert!(!message.contains("it behaves the same"), "{message}");
+        assert!(!message.contains("it grades the same"), "{message}");
 
         // Without `severity = "error"` the move is a pure rename.
         let plain = MINIMAL_SPEC.replace("NAME", "alpha").replace(
@@ -2495,7 +2507,7 @@ agent = "propose_only"
         let (_dir, out) = project_with_products(&[("alpha.toml", &plain)]);
         let w058 = w058_messages(&out);
         assert_eq!(w058.len(), 1, "{w058:#?}");
-        assert!(w058[0].message.contains("it behaves the same"), "{w058:#?}");
+        assert!(w058[0].message.contains("it grades the same"), "{w058:#?}");
     }
 
     #[test]
@@ -2512,9 +2524,50 @@ agent = "propose_only"
             assert_eq!(w058.len(), 1, "{block}: {w058:#?}");
             let message = &w058[0].message;
             assert!(!message.contains("0s"), "{block}: {message}");
-            assert!(!message.contains("behaves the same"), "{block}: {message}");
+            assert!(!message.contains("grades the same"), "{block}: {message}");
             assert!(message.contains("zero threshold"), "{block}: {message}");
         }
+    }
+
+    #[test]
+    fn a_zero_threshold_names_its_level_on_every_path() {
+        let (_dir, out) = freshness_project_with((
+            "warn_after = \"1h\"",
+            // `severity` defaults to `error` on the pipeline check.
+            "threshold_seconds = 0",
+            "max_lag_seconds = 0",
+            "expected_lag_seconds = 0\nseverity = \"error\"",
+            r#"freshness = { warn_after = "24h", time_column = "id" }"#,
+        ));
+        let w058 = w058_messages(&out);
+        let message_for = |file_suffix: &str, field: &str| {
+            let found: Vec<&str> = w058
+                .iter()
+                .filter(|m| {
+                    m.file.as_deref().is_some_and(|f| f.ends_with(file_suffix))
+                        && m.field.as_deref() == Some(field)
+                })
+                .map(|m| m.message.as_str())
+                .collect();
+            assert_eq!(found.len(), 1, "{file_suffix} {field}: {w058:#?}");
+            found[0]
+        };
+        for (file, field, level) in [
+            ("rocky.toml", "pipeline.raw.checks.freshness", "error_after"),
+            ("own.toml", "freshness", "warn_after"),
+            ("inline.sql", "freshness", "warn_after"),
+            ("_defaults.toml", "freshness", "error_after"),
+        ] {
+            let message = message_for(file, field);
+            assert!(message.contains("zero threshold"), "{file}: {message}");
+            assert!(
+                message.contains(&format!("`{level} = \"1s\"`")),
+                "{file}: {message}"
+            );
+            assert!(!message.contains("0s"), "{file}: {message}");
+            assert!(!message.contains("grades the same"), "{file}: {message}");
+        }
+        assert_eq!(w058.len(), 4, "{w058:#?}");
     }
 
     #[test]

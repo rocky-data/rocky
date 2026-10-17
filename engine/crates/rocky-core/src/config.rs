@@ -8168,8 +8168,9 @@ pub struct DeprecatedFreshness {
     pub keys: Vec<&'static str>,
     /// The `warn_after` / `error_after` text that replaces them.
     pub replacement: String,
-    /// A level is zero seconds, which the new grammar cannot spell.
-    pub zero_threshold: bool,
+    /// The key of a level that is zero seconds, which the new grammar
+    /// cannot spell.
+    pub zero_level: Option<&'static str>,
 }
 
 /// Every freshness block in `config` that uses a deprecated spelling: the
@@ -8185,7 +8186,7 @@ pub fn deprecated_freshness_spellings(config: &RockyConfig) -> Vec<DeprecatedFre
             field: "freshness".to_string(),
             keys: project_keys,
             replacement: crate::source_freshness::replacement_for(&config.freshness.thresholds()),
-            zero_threshold: config.freshness.thresholds().has_zero(),
+            zero_level: config.freshness.thresholds().zero_level(),
         });
     }
     for (name, pipeline) in &config.pipelines {
@@ -8200,7 +8201,7 @@ pub fn deprecated_freshness_spellings(config: &RockyConfig) -> Vec<DeprecatedFre
             field: format!("pipeline.{name}.checks.freshness"),
             keys,
             replacement: crate::source_freshness::replacement_for(&freshness.thresholds()),
-            zero_threshold: freshness.thresholds().has_zero(),
+            zero_level: freshness.thresholds().zero_level(),
         });
     }
     out

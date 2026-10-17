@@ -1162,7 +1162,7 @@ time_column = "updated_at"
 
 ### Deprecated freshness spellings
 
-These older keys still parse and behave as before. `rocky validate` warns with `W058`, which names the file, the key and the replacement. Rocky also logs a warning at load.
+These older keys still parse and behave as before. `rocky validate` warns with `W058`, which names the file, the key and the replacement. Loading one logs only a debug line.
 
 | Old spelling | Where | Replacement |
 |---|---|---|
