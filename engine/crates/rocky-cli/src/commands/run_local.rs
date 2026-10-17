@@ -830,8 +830,16 @@ pub async fn run_quality(
                     cancel.cancel();
                 }
                 // Cancel (#1606): start no quarantine after a signal. Its
-                // statements are never cut once started.
-                if cancel.is_cancelled() {
+                // statements are never cut once started. Only where a
+                // quarantine would run: a signal after the last table's checks
+                // skipped nothing, so it keeps the gate verdict.
+                if pipeline
+                    .checks
+                    .quarantine
+                    .as_ref()
+                    .is_some_and(|q_cfg| q_cfg.enabled)
+                    && cancel.is_cancelled()
+                {
                     output.interrupted = true;
                     break 'targets;
                 }

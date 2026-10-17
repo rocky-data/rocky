@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A signal during a quality, snapshot or load pipeline in `rocky run` now settles the run (#1606). Before, the listener cancelled a token nothing read, so the 5 s grace cut the run mid-statement with no run record. The run exits 130.
   - Quality starts no new table and no new quarantine. Checks already run stay in the record; the check gate does not fire.
   - Snapshot checks once, before any warehouse work, because its `MERGE` and `INSERT` share no transaction. A snapshot that has started runs to completion.
-  - Load starts no new file. Loaded files keep their ledger rows and the remote state is still uploaded. The load JSON lists only the files that ran. `rocky load` on its own has no signal handling, as before.
+  - Load starts no new file. Loaded files keep their ledger rows and the remote state is still uploaded. The load JSON lists only the files that ran. An interrupted load exits 130 even when an earlier file failed. `rocky load` on its own has no signal handling, as before.
   - Quality and snapshot record the run as interrupted and release the remote-state session without upload, as a transformation run does.
 
 ## [1.86.0] — 2026-10-17
