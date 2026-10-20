@@ -1419,17 +1419,31 @@ Data here means the schema (column names and types), the statistics or the value
 
 A model is in the region of the `target` of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads can run on any pipeline, so it is in the `target` region of every pipeline.
 
-A table that is not a Rocky model, such as a source table from the schema cache, takes its region from the replication, snapshot or load pipeline that writes it:
+A table that is not a Rocky model, such as a table from the schema cache, takes its region from the pipelines that write it or read it as their source. Rocky reads the table name as `<schema>.<table>`, with an optional catalog part in front.
 
-- A replication pipeline writes every table in a schema that its `target.schema_template` makes. Each `{placeholder}` in the template stands for any text. So `schema_template = "raw__{source}"` matches the table `raw__crm.orders`.
+A pipeline writes these tables (its target side):
+
+- A replication pipeline writes every table in a schema that its `target.schema_template` makes. Each `{placeholder}` in the template stands for any text without a dot. The rest of the template must match as written. So `schema_template = "raw__{source}"` matches the table `raw__crm.orders`, but not `raw__a.b.orders`.
 - A snapshot pipeline writes the one table that its `target.schema` and `target.table` name.
 - A load pipeline writes the table that its `target.schema` and `target.table` name. With no `target.table`, it writes every table in `target.schema`.
-- The table takes the `target` region of that pipeline. For a replication or snapshot, it takes the `source` region too, because the target holds data copied from the source.
-- Rocky compares the schema and table names without regard to case. It does not compare the catalog. A table that two pipelines match takes the regions of both.
+- A table a pipeline writes takes the `target` region of that pipeline. For a replication or snapshot, it takes the `source` region too, because the target holds data copied from the source.
 
-A table that no replication, snapshot or load pipeline writes has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+A pipeline reads these tables (its source side). `rocky discover --with-schemas` and `rocky run` put such tables in the schema cache:
 
-- `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes.
+- A replication pipeline reads every table in a schema that its `source.schema_pattern` accepts. Rocky uses the same match as discovery: the schema starts with `prefix`, and the rest splits on `separator` into at least one part per component. So `prefix = "src__"`, `separator = "__"` and `components = ["tenant", "regions...", "source"]` match the table `src__acme__eu__shopify.orders`.
+- A snapshot pipeline reads the one table that its `source.schema` and `source.table` name.
+- A load pipeline reads files, not tables. It has no source side.
+- A table a pipeline reads takes only the `source` region of that pipeline.
+
+For both sides:
+
+- Rocky compares the schema and table names without regard to case, because the schema cache stores them in lowercase. It does not compare the catalog. A table that two pipelines match takes the regions of both.
+- A `source` or `target` block with no `region` gives the table "no region" next to its other regions. For example, a replicated table whose `source` has no label has the `target` region and no region. Without `enforce` the label that is there decides. With `enforce = true`, the missing label refuses the request with a `V062` error.
+- A `source.schema_pattern` whose `components` Rocky cannot parse (an empty entry, for example) matches every table. Discovery refuses such a pipeline, so Rocky cannot say which tables it would read.
+
+A table that no pipeline writes or reads has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+
+- `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes or reads.
 - `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads such a table directly.
 
 `rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. The warning is a hint, not an error. It says that Rocky would refuse an AI request that carries data with that label. It does not check that any AI feature carries that data: a project may never make an AI request, and `rocky run` never does. The check that refuses a request is the one Rocky makes when it builds the AI client.
