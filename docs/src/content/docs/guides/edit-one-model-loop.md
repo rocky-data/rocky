@@ -2,7 +2,7 @@
 title: Edit One Model, Rebuild Only It
 description: The fast local loop. Edit one model, and Rocky rebuilds that model and its downstream models, and skips the rest. Uses --skip-unchanged, --watch and --defer. No new command.
 sidebar:
-  order: 12
+  order: 22
 ---
 
 This guide shows the local development loop for a transformation pipeline. You edit one model. Rocky rebuilds only that model and the models that read it. You can follow it in about a minute.
@@ -17,7 +17,7 @@ There is no special command. The loop uses three flags of `rocky run` that alrea
 | `--watch` | Runs the pipeline again each time you save a file. |
 | `--defer` | Builds only the model you pick. Reads its upstream models from production. |
 
-A skipped model is not rebuilt. A model that reads a rebuilt model is always rebuilt. The [safety contract](/guides/skip-and-defer/#the-skip-unchanged-safety-contract) lists the models that never skip.
+A skipped model is not rebuilt. A model that reads a rebuilt model is always rebuilt. The [safety contract](/guides/skip-and-defer/#the-skip-unchanged-safety-contract) lists the main cases of models that never skip. The list is not complete: a model that calls a user-defined function, or that sets `[skip] eligible = false`, also always rebuilds.
 
 ## The example project
 
@@ -42,7 +42,9 @@ skip_unchanged = true
 skip_rowcount_fallback = true
 ```
 
-The second line is for raw tables that have no timestamp column. Rocky then compares the row count of the raw table. A row count is a weaker signal than a timestamp. It can miss an `UPDATE` that keeps the same number of rows. Leave it off if your raw tables have a tracked timestamp.
+Rocky must prove that a raw table did not change. It probes `MAX(<timestamp>)` only for an `incremental` or `microbatch` model, because only those name a timestamp column. A `full_refresh`, `table` or `view` model has no timestamp to probe. All five models in this example are `full_refresh`. Without the second line, the two staging models never skip, and so nothing downstream of them skips.
+
+With the second line, Rocky compares the row count of the raw table instead. A row count is a weaker signal than a timestamp. It can miss an `UPDATE` that keeps the same number of rows. If your models are `incremental` with a `timestamp_column`, you do not need it.
 
 ## Step 2: build once, then edit one model
 
@@ -79,8 +81,8 @@ Rocky runs once when it starts. Then it runs again about 200 ms after each save.
 
 Two limits apply:
 
-- Pass `--models models` (the models directory). Without it, `--watch` watches `rocky.toml` only, and a model edit does not start a run. Checked with this version.
-- `--watch` cannot be combined with `--model`, `--dag`, `--resume`, `--resume-latest` or `--idempotency-key`. The skip gate does the narrowing instead.
+- Pass `--models models` (the models directory). Without it, `--watch` watches `rocky.toml` only, and a model edit does not start a run. Checked with Rocky 1.86.0.
+- `--watch` cannot be combined with `--model`, `--select`, `--exclude`, `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, `--contracts`, `--keep-shadow`, `--refuse-hooks` or `--assume-fresh-state`. The skip gate does the narrowing instead.
 
 With `-o json`, each run prints one JSON object to stdout. Banner lines go to stderr.
 
@@ -94,19 +96,19 @@ rocky run --model daily_revenue --defer --defer-to prod
 
 Rocky builds `daily_revenue`. It reads `stg_orders` from the `prod` schema. It does not build `stg_orders`. Without `--defer`, the same command fails, because the local `stg_orders` does not exist.
 
-If your development config names different schemas than production, point Rocky at a copy of production's state file instead:
+If production writes to different schemas than your development config, point Rocky at a copy of production's state file instead. The state file records where each model was written:
 
 ```bash
 rocky run --model daily_revenue --defer --defer-to-state ./prod-state.redb
 ```
 
-`--defer-to` and `--defer-to-state` cannot be used together. `--defer` does nothing without `--model`. Read the [defer section](/guides/skip-and-defer/#--defer-develop-against-production-upstreams) for the SQL constructs that `--defer` cannot rewrite.
+The POC builds a copy of the project into the `prod` schema, keeps its state file, and checks that the command fails without `--defer-to-state` and works with it. `--defer-to` and `--defer-to-state` cannot be used together. `--defer` does nothing without `--model`. Read the [defer section](/guides/skip-and-defer/#--defer-develop-against-production-upstreams) for the SQL constructs that `--defer` cannot rewrite.
 
 ## How much time it saves
 
 The time you save is the build time of the models Rocky skips. A small project saves nothing, because the fixed cost of starting Rocky is about 140 ms.
 
-We measured on a laptop, with a release build of `rocky` and a local DuckDB file. Each figure is the median of 10 runs. The command was:
+We measured on a laptop, with a release build of `rocky` and a local DuckDB file. Each figure is the median of 10 runs. The full-run baseline uses `--force-rebuild`, which turns the skip gate off, so every model builds. The command was:
 
 ```bash
 rocky --state-path state.redb -c rocky.toml -o json run [--force-rebuild]
@@ -115,9 +117,9 @@ rocky --state-path state.redb -c rocky.toml -o json run [--force-rebuild]
 | Orders in the raw table | Full run (`--force-rebuild`, 5 of 5 build) | No edit (0 of 5 build) | Edit `stg_orders` (3 of 5 build) | Edit `daily_revenue` (1 of 5 build) |
 |---|---|---|---|---|
 | 500 (the POC seed) | 148 ms | 140 ms | 150 ms | 144 ms |
-| 20,000,000 | 351 ms | 142 ms | 350 ms | 159 ms |
+| 20,000,000 (one-off scratch run) | 351 ms | 142 ms | 350 ms | 159 ms |
 
-Read the table with care:
+The 500-row figures use the POC seed. The 20-million-row figures come from one scratch copy of the POC, with `generate_series(1, 500)` in `data/seed.sql` changed to `generate_series(1, 20000000)`. The POC does not ship that variant. Read the table with care:
 
 - At 500 rows, no run saves time. All the time is start-up.
 - At 20 million rows, an edit to a leaf model is 2.2 times faster than a full run. An edit to `stg_orders` saves nothing, because the expensive models read `stg_orders` and must rebuild.
