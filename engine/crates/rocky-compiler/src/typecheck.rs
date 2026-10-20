@@ -3119,6 +3119,12 @@ fn infer_binary_op_type(
         // Division and modulo by zero return NULL in several dialects (DuckDB,
         // Spark with ANSI mode off), so the result is nullable even over
         // non-null operands (#2295).
+        //
+        // `over_cap` is dropped at both sites because it can only make the
+        // result nullable, and it already is. `/` is always `Unknown` with
+        // no bit. `%` is over the cap only when an operand is: its result
+        // has `min` integer digits and `max` scale, which is no wider than
+        // the operand with the larger scale.
         ast::BinaryOperator::Divide => (
             arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type).ty,
             true,
@@ -3891,6 +3897,20 @@ pub(crate) struct SelectInference {
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
+    /// For a set operation, one entry per output column: every branch's
+    /// type, so the next combine unifies the whole set at once (ADR-TYPES
+    /// §3, line 184). Empty for a query that is not a set operation.
+    set_branches: Vec<SetBranches>,
+}
+
+/// The branches of one set-operation column, see
+/// [`SelectInference::set_branches`].
+#[derive(Debug, Clone)]
+struct SetBranches {
+    /// The type of each branch, in order.
+    types: Vec<RockyType>,
+    /// Whether any branch is nullable, before the over-cap bit is added.
+    nullable: bool,
 }
 
 impl SelectInference {
@@ -4236,11 +4256,13 @@ fn infer_set_expr_types(body: &SetExpr, env: InferEnv<'_, '_>) -> Result<SelectI
 /// Combine the two branches of `UNION` / `INTERSECT` / `EXCEPT` column by
 /// position (#2303). Names come from the left branch.
 ///
-/// - **Nullable** when either branch is nullable. `INTERSECT` and `EXCEPT`
-///   could be tighter, but "any branch" is always sound.
-/// - **Type** is the common supertype, `Unknown` when a branch is `Unknown`
-///   or the types have none. (`common_supertype` treats `Unknown` as
-///   compatible with anything; here that would claim a type we cannot back.)
+/// - **Nullable** when any branch is nullable, or when the branch set is
+///   over the decimal cap. `INTERSECT` and `EXCEPT` could be tighter, but
+///   "any branch" is always sound.
+/// - **Type** is [`common_supertype_of`] over every branch so far, `Unknown`
+///   when a branch is `Unknown` or the types have none. A nested set
+///   operation passes its branches up in [`SelectInference::set_branches`],
+///   so the result does not depend on branch order or grouping.
 /// - A type is *exact* only when both branches are exact and agree, since a
 ///   widened result (`INT` with `BIGINT`) or a literal branch is a guess.
 ///
@@ -4255,20 +4277,22 @@ fn combine_set_operation(
     let mut exact_type_outputs = HashSet::new();
     let mut relation_inexact = HashSet::new();
     let mut count_outputs = HashSet::new();
+    let mut set_branches = Vec::with_capacity(left.columns.len());
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
             left.exact_type_outputs.contains(&index) && right.exact_type_outputs.contains(&index);
         let same_type = l.data_type == r.data_type;
-        // A pair over 38 digits is `Unknown` and nullable (ADR-TYPES §1):
-        // the warehouse casts both branches to one type, and a value that
+        // Unify every branch so far as one set, not the two sides' results:
+        // a side that is already `Unknown` has lost its branches' digits.
+        // A set over 38 digits is `Unknown` and nullable (ADR-TYPES §1):
+        // the warehouse casts every branch to one type, and a value that
         // does not fit can overflow to NULL with ANSI mode off.
-        let (data_type, over_cap) =
-            if l.data_type == RockyType::Unknown || r.data_type == RockyType::Unknown {
-                (RockyType::Unknown, false)
-            } else {
-                crate::types::common_supertype(&l.data_type, &r.data_type)
-                    .map_or((RockyType::Unknown, false), |sup| (sup.ty, sup.over_cap))
-            };
+        let mut branches = set_branches_of(&left.set_branches, index, l);
+        let right_branches = set_branches_of(&right.set_branches, index, r);
+        branches.types.extend(right_branches.types);
+        branches.nullable |= right_branches.nullable;
+        let inferred = common_supertype_of(&branches.types);
+        let data_type = inferred.ty;
         if both_exact && same_type && data_type != RockyType::Unknown {
             exact_type_outputs.insert(index);
         }
@@ -4282,7 +4306,10 @@ fn combine_set_operation(
             count_outputs.insert(index);
         }
         l.data_type = data_type;
-        l.nullable |= r.nullable || over_cap;
+        // Set, not `|=`: a side's own bit came from part of the set, and
+        // only the whole set's bit is order-independent.
+        l.nullable = branches.nullable || inferred.over_cap;
+        set_branches.push(branches);
     }
     Ok(SelectInference {
         columns: left.columns,
@@ -4293,6 +4320,16 @@ fn combine_set_operation(
         // single cast target.
         cast_outputs: HashSet::new(),
         set_operation: true,
+        set_branches,
+    })
+}
+
+/// The branches behind column `index` of one side of a set operation: the
+/// side's own branches when it is a set operation, else the column alone.
+fn set_branches_of(sides: &[SetBranches], index: usize, column: &TypedColumn) -> SetBranches {
+    sides.get(index).cloned().unwrap_or_else(|| SetBranches {
+        types: vec![column.data_type.clone()],
+        nullable: column.nullable,
     })
 }
 
@@ -10218,6 +10255,92 @@ mod tests {
             (&union.data_type, union.nullable),
             (&RockyType::Unknown, true)
         );
+    }
+
+    /// The over-cap bit of a branch set does not depend on branch order,
+    /// and an `Unknown` branch does not hide it (ADR-TYPES §3, line 184).
+    /// `m` is a non-null column Rocky cannot type. `w` with `z` needs 60
+    /// digits, so every order of `[w, z, m]` is nullable, for `UNION ALL`
+    /// and for `COALESCE`. Before, a `UNION ALL` fold that met `m` before
+    /// `z` lost `w`'s digits, and `COALESCE` with `m` was never flagged.
+    #[test]
+    fn decimal_over_cap_is_order_independent_with_an_unknown_branch() {
+        let d = |precision, scale| RockyType::Decimal { precision, scale };
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[
+                ("w", d(30, 0), false),
+                ("z", d(30, 30), false),
+                ("m", RockyType::Unknown, false),
+            ]),
+        )]);
+        let permutations = [
+            ["w", "z", "m"],
+            ["w", "m", "z"],
+            ["z", "w", "m"],
+            ["z", "m", "w"],
+            ["m", "w", "z"],
+            ["m", "z", "w"],
+        ];
+        let mut models = Vec::new();
+        for (index, [a, b, c]) in permutations.iter().enumerate() {
+            models.push((
+                format!("u{index}"),
+                format!(
+                    "SELECT {a} AS c FROM raw.t UNION ALL SELECT {b} FROM raw.t \
+                     UNION ALL SELECT {c} FROM raw.t"
+                ),
+            ));
+            // Parenthesised: the inner set operation keeps its branches.
+            models.push((
+                format!("p{index}"),
+                format!(
+                    "SELECT {a} AS c FROM raw.t UNION ALL \
+                     (SELECT {b} FROM raw.t UNION ALL SELECT {c} FROM raw.t)"
+                ),
+            ));
+            models.push((
+                format!("k{index}"),
+                format!(
+                    "SELECT CAST(CONCAT(COALESCE({a}, {b}, {c}), 'x') AS STRING) AS c FROM raw.t"
+                ),
+            ));
+        }
+        let model_refs: Vec<(&str, &str)> = models
+            .iter()
+            .map(|(name, sql)| (name.as_str(), sql.as_str()))
+            .collect();
+        let result = compile_typed(&model_refs, sources);
+        for (name, sql) in &models {
+            let col = column(&result, name, "c");
+            assert!(col.nullable, "{name}: {sql}: {col:?}");
+        }
+        // Control: without `z` the set is within the cap, so no order makes
+        // it nullable.
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[("w", d(30, 0), false), ("m", RockyType::Unknown, false)]),
+        )]);
+        let result = compile_typed(
+            &[
+                (
+                    "a",
+                    "SELECT w AS c FROM raw.t UNION ALL SELECT m FROM raw.t \
+                     UNION ALL SELECT w FROM raw.t",
+                ),
+                // `m` is not first: a cast's lineage edge reads the first
+                // column, and a cast from `Unknown` is nullable on its own.
+                (
+                    "b",
+                    "SELECT CAST(CONCAT(COALESCE(w, m, w), 'x') AS STRING) AS c FROM raw.t",
+                ),
+            ],
+            sources,
+        );
+        for name in ["a", "b"] {
+            let col = column(&result, name, "c");
+            assert!(!col.nullable, "{name}: {col:?}");
+        }
     }
 
     /// `REAL op REAL` is now `DOUBLE` (ADR-TYPES §3: a float operand gives

@@ -429,8 +429,10 @@ fn unify_exact_numerics(members: &[&RockyType]) -> InferredType {
 /// `(integer_digits, scale)` space, so no integer digit is dropped (§3,
 /// line 184): `Decimal(10,0)` with `Decimal(10,10)` is `Decimal(20,10)`.
 /// A pair that needs more than [`MAX_INFERRED_PRECISION`] digits is
-/// `Unknown` with [`InferredType::over_cap`] set. For a whole branch set,
-/// use [`common_supertype_of`].
+/// `Unknown` with [`InferredType::over_cap`] set. An `Unknown` side leaves
+/// one known type, and one type is never over the cap, so that early return
+/// drops no bit. For a whole branch set, use [`common_supertype_of`]: a
+/// pairwise fold loses the digits of a member once it meets an `Unknown`.
 pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<InferredType> {
     if a == b {
         return Some(InferredType::typed(a.clone()));
@@ -479,6 +481,8 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<InferredType> {
 ///
 /// - Any `Unknown` branch gives `Unknown` (§2, line 146). The caller drops a
 ///   `NULL` literal first: it adds only nullability, not a type.
+///   [`InferredType::over_cap`] is still read from the other branches, so
+///   `[w, z, unknown]` is over the cap when `[w, z]` is, in any order.
 /// - A set of one repeated type is that type.
 /// - Exact numerics with a decimal: as [`common_supertype`], over the set.
 ///   Above [`MAX_INFERRED_PRECISION`]: `Unknown` with
@@ -495,7 +499,19 @@ pub fn common_supertype_of(branches: &[RockyType]) -> InferredType {
         return InferredType::typed(RockyType::Unknown);
     };
     if branches.contains(&RockyType::Unknown) {
-        return InferredType::typed(RockyType::Unknown);
+        // The type is `Unknown`, but the known branches still need their
+        // digits: the warehouse casts them to one type, and above the cap
+        // that can overflow to NULL whatever the `Unknown` branch is. So
+        // the bit is the known branches' bit, and no order can hide it.
+        let known: Vec<RockyType> = branches
+            .iter()
+            .filter(|t| **t != RockyType::Unknown)
+            .cloned()
+            .collect();
+        return InferredType {
+            ty: RockyType::Unknown,
+            over_cap: common_supertype_of(&known).over_cap,
+        };
     }
     if branches.iter().all(|t| t == first) {
         return InferredType::typed(first.clone());
@@ -1282,6 +1298,27 @@ mod tests {
         );
         assert_eq!(
             common_supertype_of(&[RockyType::Float64, dec(10, 2)]),
+            typed(RockyType::Unknown)
+        );
+        // An `Unknown` branch does not hide the known branches' bit, in any
+        // order. Without `dec(30, 30)` the known branches fit.
+        let (w, z, m) = (dec(30, 0), dec(30, 30), RockyType::Unknown);
+        for set in [
+            [w.clone(), z.clone(), m.clone()],
+            [w.clone(), m.clone(), z.clone()],
+            [z.clone(), w.clone(), m.clone()],
+            [z.clone(), m.clone(), w.clone()],
+            [m.clone(), w.clone(), z.clone()],
+            [m.clone(), z.clone(), w.clone()],
+        ] {
+            assert_eq!(common_supertype_of(&set), over, "{set:?}");
+        }
+        assert_eq!(
+            common_supertype_of(&[w.clone(), m.clone(), w.clone()]),
+            typed(RockyType::Unknown)
+        );
+        assert_eq!(
+            common_supertype_of(&[m.clone(), m]),
             typed(RockyType::Unknown)
         );
         // The bit and the type agree on the whole lattice: over the cap is
