@@ -205,13 +205,37 @@ fn pipeline_model_names(
 /// - A pipeline whose model set cannot be read adds its region to every
 ///   model (fail closed).
 ///
+/// A table that is not a model takes its regions from the replication and
+/// snapshot pipelines that write it ([`Self::for_table`]).
+///
 /// `None` in a list is a target with no label. Used to decide whether an AI
-/// request about a model may go to the `[ai]` endpoint
+/// request about a model or table may go to the `[ai]` endpoint
 /// ([`rocky_core::config::check_ai_residency`]).
 pub struct ModelRegions {
     by_model: HashMap<String, Vec<Option<String>>>,
     unclaimed: Vec<Option<String>>,
     everywhere: Vec<Option<String>>,
+    writers: Vec<TableWriter>,
+}
+
+/// The tables one replication or snapshot pipeline writes, and the regions
+/// of their data.
+struct TableWriter {
+    /// Matches the schema part of a table name.
+    schema: SchemaMatch,
+    /// The exact table name, for a snapshot. `None` for a replication,
+    /// whose table names come from the source at run time.
+    table: Option<String>,
+    /// The target's region, and the source's for data copied from it.
+    regions: Vec<Option<String>>,
+}
+
+enum SchemaMatch {
+    /// A snapshot's `target.schema`.
+    Exact(String),
+    /// A replication's `target.schema_template`, each `{placeholder}` a
+    /// wildcard.
+    Template(regex::Regex),
 }
 
 impl ModelRegions {
@@ -226,9 +250,13 @@ impl ModelRegions {
         let mut by_model: HashMap<String, Vec<Option<String>>> = HashMap::new();
         let mut everywhere = Vec::new();
         let mut unclaimed = Vec::new();
+        let mut writers = Vec::new();
         for (_, pipeline) in &pipelines {
             let region = pipeline.target_region().map(str::to_string);
             push_unique_region(&mut unclaimed, &region);
+            if let Some(writer) = TableWriter::of(pipeline) {
+                writers.push(writer);
+            }
             let Some(tx) = pipeline.as_transformation() else {
                 continue;
             };
@@ -245,6 +273,7 @@ impl ModelRegions {
             by_model,
             unclaimed,
             everywhere,
+            writers,
         }
     }
 
@@ -264,10 +293,329 @@ impl ModelRegions {
         }
         out
     }
+
+    /// The regions of `table`, a table that is not a project model, named
+    /// `<schema>.<table>` or `<catalog>.<schema>.<table>`.
+    ///
+    /// A replication pipeline writes every table in a schema its
+    /// `target.schema_template` renders, each `{placeholder}` standing for
+    /// any text. A snapshot pipeline writes its `target.schema` and
+    /// `target.table`. Each pipeline that writes `table` adds its target
+    /// region, and its source region, because the target holds data copied
+    /// from the source. The catalog part is not compared, so a name can match
+    /// more pipelines than really write it: that adds regions, which can only
+    /// refuse more. Names compare without regard to case.
+    ///
+    /// `[None]` when no pipeline writes `table`, or for a name with no schema
+    /// part: Rocky knows no region for it.
+    pub fn for_table(&self, table: &str) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        let parts: Vec<&str> = table.split('.').collect();
+        if let [.., schema, name] = parts.as_slice() {
+            for writer in &self.writers {
+                if writer.writes(schema, name) {
+                    for region in &writer.regions {
+                        push_unique_region(&mut out, region);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(None);
+        }
+        out
+    }
+}
+
+impl TableWriter {
+    /// The tables `pipeline` writes, or `None` for a pipeline type that
+    /// writes models (transformation) or no table Rocky can name.
+    fn of(pipeline: &rocky_core::config::PipelineConfig) -> Option<Self> {
+        let (schema, table) = if let Some(r) = pipeline.as_replication() {
+            (
+                SchemaMatch::Template(schema_template_regex(&r.target.schema_template)?),
+                None,
+            )
+        } else if let Some(s) = pipeline.as_snapshot() {
+            (
+                SchemaMatch::Exact(s.target.schema.clone()),
+                Some(s.target.table.clone()),
+            )
+        } else {
+            return None;
+        };
+        let mut regions = Vec::new();
+        push_unique_region(&mut regions, &pipeline.target_region().map(str::to_string));
+        if let Some(source) = pipeline.source_region() {
+            push_unique_region(&mut regions, &source.map(str::to_string));
+        }
+        Some(Self {
+            schema,
+            table,
+            regions,
+        })
+    }
+
+    fn writes(&self, schema: &str, table: &str) -> bool {
+        let schema_matches = match &self.schema {
+            SchemaMatch::Exact(s) => s.eq_ignore_ascii_case(schema),
+            SchemaMatch::Template(re) => re.is_match(schema),
+        };
+        schema_matches
+            && self
+                .table
+                .as_deref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(table))
+    }
+}
+
+/// A case-insensitive regex for the schema names `template` can render.
+/// Each `{...}` placeholder matches any text with no `.`; the rest matches
+/// as written. `None` only if the regex does not build.
+fn schema_template_regex(template: &str) -> Option<regex::Regex> {
+    let mut pattern = String::from("(?i)^");
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else {
+            break;
+        };
+        pattern.push_str(&regex::escape(&rest[..open]));
+        pattern.push_str("[^.]*");
+        rest = &rest[open + close + 1..];
+    }
+    pattern.push_str(&regex::escape(rest));
+    pattern.push('$');
+    regex::Regex::new(&pattern).ok()
 }
 
 fn push_unique_region(list: &mut Vec<Option<String>>, region: &Option<String>) {
     if !list.contains(region) {
         list.push(region.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, contents).expect("write");
+    }
+
+    /// A valid model with a target, so it loads cleanly.
+    fn write_model(dir: &Path, name: &str) {
+        write(&dir.join(format!("{name}.sql")), "SELECT 1 AS id\n");
+        write(
+            &dir.join(format!("{name}.toml")),
+            &format!(
+                "name = \"{name}\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        );
+    }
+
+    /// Write `rocky.toml` (an adapter plus `pipelines`) under `root` and
+    /// resolve its regions.
+    fn resolve(root: &Path, pipelines: &str) -> ModelRegions {
+        let path = root.join("rocky.toml");
+        write(
+            &path,
+            &format!("[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n{pipelines}"),
+        );
+        let config = rocky_core::config::load_rocky_config(&path).expect("config");
+        ModelRegions::resolve(&config, &path)
+    }
+
+    fn label(region: &str) -> Option<String> {
+        Some(region.to_string())
+    }
+
+    fn transformation(name: &str, glob: &str, region: Option<&str>) -> String {
+        let region = region.map_or(String::new(), |r| format!("region = \"{r}\"\n"));
+        format!(
+            "[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"{glob}\"\n\
+             [pipeline.{name}.target]\nadapter = \"default\"\n{region}\n"
+        )
+    }
+
+    fn replication(
+        name: &str,
+        schema_template: &str,
+        target: Option<&str>,
+        source: Option<&str>,
+    ) -> String {
+        let line = |r: Option<&str>| r.map_or(String::new(), |r| format!("region = \"{r}\"\n"));
+        format!(
+            "[pipeline.{name}]\ntype = \"replication\"\n\n\
+             [pipeline.{name}.source]\n{}\n\
+             [pipeline.{name}.source.schema_pattern]\nprefix = \"src__\"\n\
+             separator = \"__\"\ncomponents = [\"source\"]\n\n\
+             [pipeline.{name}.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"{schema_template}\"\n{}\n",
+            line(source),
+            line(target)
+        )
+    }
+
+    fn snapshot(name: &str, schema: &str, table: &str, region: &str) -> String {
+        format!(
+            "[pipeline.{name}]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
+             updated_at = \"updated_at\"\n\n\
+             [pipeline.{name}.source]\ncatalog = \"wh\"\nschema = \"raw\"\ntable = \"c\"\n\n\
+             [pipeline.{name}.target]\ncatalog = \"wh\"\nschema = \"{schema}\"\n\
+             table = \"{table}\"\nregion = \"{region}\"\n\n"
+        )
+    }
+
+    #[test]
+    fn a_claimed_model_takes_its_pipeline_target_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        let regions = resolve(
+            tmp.path(),
+            &transformation("xf", "models/**", Some("eu")),
+        );
+        assert_eq!(regions.for_model("orders"), vec![label("eu")]);
+    }
+
+    #[test]
+    fn a_claimed_model_of_an_unlabelled_pipeline_has_no_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        let regions = resolve(tmp.path(), &transformation("xf", "models/**", None));
+        assert_eq!(regions.for_model("orders"), vec![None]);
+    }
+
+    /// Two pipelines load one model: it has both regions, so an AI request
+    /// about it is judged against each.
+    #[test]
+    fn a_model_two_pipelines_load_has_both_regions() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        let pipelines = format!(
+            "{}{}",
+            transformation("a", "models/**", Some("eu")),
+            transformation("b", "models/**", Some("us"))
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(regions.for_model("orders"), vec![label("eu"), label("us")]);
+    }
+
+    /// A model no pipeline loads can run on any pipeline: it takes every
+    /// pipeline's target region, the replication's included.
+    #[test]
+    fn an_unclaimed_model_takes_every_pipeline_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        let pipelines = format!(
+            "{}{}",
+            transformation("xf", "models/**", Some("eu")),
+            replication("bronze", "raw__{source}", Some("us"), None)
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(regions.for_model("orders"), vec![label("eu")]);
+        assert_eq!(regions.for_model("adhoc"), vec![label("us"), label("eu")]);
+    }
+
+    /// A pipeline whose models do not load adds its region to every model
+    /// (fail closed).
+    #[test]
+    fn a_pipeline_whose_models_do_not_load_adds_its_region_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        write(&tmp.path().join("broken").join("bad.sql"), "SELECT 1\n");
+        write(&tmp.path().join("broken").join("bad.toml"), "name = [\n");
+        let pipelines = format!(
+            "{}{}",
+            transformation("bad", "broken/**", Some("us")),
+            transformation("good", "models/**", Some("eu"))
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(regions.for_model("orders"), vec![label("eu"), label("us")]);
+    }
+
+    #[test]
+    fn no_pipeline_gives_no_known_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regions = resolve(tmp.path(), "");
+        assert_eq!(regions.for_model("orders"), vec![None]);
+        assert_eq!(regions.for_table("raw.orders"), vec![None]);
+    }
+
+    /// A table a replication writes: its schema matches the target
+    /// `schema_template`, with or without a catalog part, in any case.
+    #[test]
+    fn a_replicated_table_takes_the_replication_target_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regions = resolve(
+            tmp.path(),
+            &replication("bronze", "raw__{source}", Some("eu"), None),
+        );
+        assert_eq!(regions.for_table("raw__crm.orders"), vec![label("eu"), None]);
+        assert_eq!(
+            regions.for_table("wh.raw__crm.orders"),
+            vec![label("eu"), None]
+        );
+        assert_eq!(regions.for_table("RAW__CRM.orders"), vec![label("eu"), None]);
+        // Another schema, and a bare name, are not this pipeline's.
+        assert_eq!(regions.for_table("staging.orders"), vec![None]);
+        assert_eq!(regions.for_table("orders"), vec![None]);
+        // The literal text around the placeholder must match as written.
+        assert_eq!(regions.for_table("rawXXcrm.orders"), vec![None]);
+    }
+
+    /// The target holds data copied from the source, so a replicated table
+    /// carries the source region too: an unlabelled target does not hide an
+    /// EU source.
+    #[test]
+    fn a_replicated_table_also_takes_the_source_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regions = resolve(
+            tmp.path(),
+            &replication("bronze", "raw__{source}", None, Some("eu")),
+        );
+        assert_eq!(regions.for_table("raw__crm.orders"), vec![None, label("eu")]);
+    }
+
+    #[test]
+    fn a_snapshot_table_matches_its_exact_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regions = resolve(
+            tmp.path(),
+            &snapshot("hist", "silver", "customers_history", "eu"),
+        );
+        assert_eq!(
+            regions.for_table("silver.customers_history"),
+            vec![label("eu"), None]
+        );
+        assert_eq!(regions.for_table("silver.orders"), vec![None]);
+    }
+
+    /// Two writers match one table: it takes both regions (fail closed).
+    #[test]
+    fn a_table_two_pipelines_write_has_both_regions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipelines = format!(
+            "{}{}",
+            replication("a", "raw__{source}", Some("eu"), Some("eu")),
+            replication("b", "{tenant}__{source}", Some("us"), Some("us"))
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(
+            regions.for_table("raw__crm.orders"),
+            vec![label("eu"), label("us")]
+        );
+    }
+
+    #[test]
+    fn schema_template_regex_escapes_literals_and_wildcards_placeholders() {
+        let re = schema_template_regex("raw.x__{source}").unwrap();
+        assert!(!re.is_match("rawXx__crm"), "the `.` is a literal");
+        let re = schema_template_regex("raw__{source}_{regions:_}").unwrap();
+        assert!(re.is_match("raw__crm_eu_us"));
+        assert!(!re.is_match("raw__crm"));
+        assert!(!re.is_match("x_raw__crm_eu"));
     }
 }

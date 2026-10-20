@@ -15,8 +15,10 @@
 //! What counts as data: the schema (column names and types), statistics or
 //! values of a table. The SQL or config text a user wrote is not data here.
 //! A model's data is in the region of the target of each pipeline that loads
-//! it ([`ModelRegions`]). A table that is not a project model (a source the
-//! schema cache knows) has no known region.
+//! it ([`ModelRegions`]). A table that is not a project model takes the
+//! target and source regions of each replication or snapshot pipeline that
+//! writes it ([`ModelRegions::for_table`]). Any other table has no known
+//! region.
 
 use std::path::Path;
 
@@ -56,9 +58,10 @@ impl AiResidency {
 /// project models.
 ///
 /// Each model contributes one item per region of the pipelines that load it
-/// (see [`ModelRegions`]); each other table contributes one item of no known
-/// region. With no `config` nothing carries a label, so this returns no
-/// items.
+/// (see [`ModelRegions`]). Each other table contributes one item per region
+/// of the replication or snapshot pipelines that write it, or one item of no
+/// known region when none does ([`ModelRegions::for_table`]). With no
+/// `config` nothing carries a label, so this returns no items.
 pub fn data_regions(
     config: Option<&RockyConfig>,
     config_path: &Path,
@@ -79,10 +82,12 @@ pub fn data_regions(
         }
     }
     for table in tables {
-        out.push(AiDataRegion {
-            data: format!("the schema of table `{table}`"),
-            region: None,
-        });
+        for region in regions.for_table(table) {
+            out.push(AiDataRegion {
+                data: format!("the schema of table `{table}`"),
+                region,
+            });
+        }
     }
     out
 }
@@ -163,6 +168,69 @@ region = "eu"
                 },
             ]
         );
+    }
+
+    /// A table that is not a model but that a replication or snapshot
+    /// pipeline writes takes that pipeline's regions. Without this, an EU
+    /// replicated table's schema went to a US AI endpoint unchecked.
+    #[test]
+    fn a_table_a_replication_or_snapshot_target_writes_takes_its_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = cfg(
+            dir.path(),
+            r#"
+[pipeline.bronze]
+type = "replication"
+
+[pipeline.bronze.source]
+region = "eu"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+region = "eu"
+
+[pipeline.hist]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.hist.source]
+catalog = "wh"
+schema = "raw__crm"
+table = "customers"
+region = "eu"
+
+[pipeline.hist.target]
+catalog = "wh"
+schema = "silver__scd"
+table = "customers_history"
+region = "eu"
+
+[ai]
+region = "us"
+"#,
+        );
+        let path = dir.path().join("rocky.toml");
+        for table in ["raw__crm.orders", "silver__scd.customers_history"] {
+            let data = data_regions(Some(&config), &path, &[], &[table]);
+            assert!(
+                !data.is_empty() && data.iter().all(|d| d.region.as_deref() == Some("eu")),
+                "{table}: {data:?}"
+            );
+            let err = check_ai_residency(Some(&config), &data)
+                .expect_err("an EU replicated table to a US endpoint");
+            assert!(err.to_string().starts_with("V062"), "{err}");
+        }
+        // A table no pipeline writes still has no known region.
+        let data = data_regions(Some(&config), &path, &[], &["other.orders"]);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].region, None);
     }
 
     #[test]
