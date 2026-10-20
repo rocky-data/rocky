@@ -870,11 +870,19 @@ fn build_http_client() -> reqwest::Client {
 /// On Unix this is `sh -c <command>`; on Windows there is no `sh`, so it
 /// is `cmd /C <command>`. Returning a `tokio::process::Command` lets the
 /// caller wire up stdio / env without duplicating the cfg branch.
+///
+/// On Windows the command reaches `cmd` as written (#2447), as
+/// `cmd /S /C "<command>"`. `arg` would quote it by the MSVC rules, which turn
+/// `"` into `\"`, and `cmd` does not read that back. `/S` makes `cmd` strip
+/// exactly the outer pair of quotes added here and keep the rest, so a
+/// command that starts with a quoted program path keeps its quotes too. The
+/// string is the user's own `rocky.toml` text either way; no run data is put
+/// into it.
 fn shell_command(command: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
         let mut cmd = tokio::process::Command::new("cmd");
-        cmd.args(["/C", command]);
+        cmd.args(["/S", "/C"]).raw_arg(format!("\"{command}\""));
         cmd
     }
     #[cfg(unix)]
@@ -1014,7 +1022,61 @@ mod tests {
         let cmd = shell_command("echo hi");
         assert_eq!(cmd.as_std().get_program(), "cmd");
         let args: Vec<_> = cmd.as_std().get_args().collect();
-        assert_eq!(args, ["/C", "echo hi"]);
+        assert_eq!(args, ["/S", "/C", "\"echo hi\""]);
+    }
+
+    /// #2447: a hook command with a quoted path runs as written on Windows.
+    /// The path has a space, so the quotes are needed. Before the fix the
+    /// quotes reached `cmd` as `\"` and the file was never written. The
+    /// weekly `windows-settle` job runs this.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_hook_with_a_quoted_path_runs_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("with space");
+        std::fs::create_dir(&out_dir).unwrap();
+        let out = out_dir.join("out.txt");
+        let hook = HookConfig {
+            command: format!("echo fired> \"{}\"", out.display()),
+            timeout_ms: 5000,
+            on_failure: FailureAction::Abort,
+            env: HashMap::new(),
+        };
+        execute_hook(&hook, "{}")
+            .await
+            .expect("the quoted hook must succeed");
+        assert!(
+            out.exists(),
+            "the hook must write to the quoted path: {}",
+            out.display()
+        );
+    }
+
+    /// #2447: a command that starts with a quoted program path and has more
+    /// quotes after it. Without `/S`, `cmd /C` strips the first and the last
+    /// quote of such a command and runs something else.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_hook_that_starts_with_a_quoted_program_runs_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("with space");
+        std::fs::create_dir(&out_dir).unwrap();
+        let out = out_dir.join("out.txt");
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        let hook = HookConfig {
+            command: format!("\"{comspec}\" /C echo fired> \"{}\"", out.display()),
+            timeout_ms: 5000,
+            on_failure: FailureAction::Abort,
+            env: HashMap::new(),
+        };
+        execute_hook(&hook, "{}")
+            .await
+            .expect("the hook must succeed");
+        assert!(
+            out.exists(),
+            "the hook must write to the quoted path: {}",
+            out.display()
+        );
     }
 
     /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919),
