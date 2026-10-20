@@ -49,7 +49,7 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 | `2` | **Partial success** — some models materialized, some failed, or an error-severity check failed on a run that had already copied its data. Also: `rocky fulfill` is blocked and needs a human, and `rocky product verify` failed | `rocky run`, `rocky tick`, `rocky fulfill`, `rocky product verify` |
 | `3` | A Critical health check. Also: `rocky fulfill` is parked at `applying_unknown` | `rocky doctor`, `rocky fulfill` |
 | `4` | `rocky fulfill` applied a plan whose output fails a check the product declared | `rocky fulfill` |
-| `130` | Interrupted by SIGINT or SIGTERM | `rocky run` |
+| `130` | Interrupted: SIGINT or SIGTERM on Unix; Ctrl-C, Ctrl-Break, console close, logoff or shutdown on Windows | `rocky run` |
 
 A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. A quality pipeline's failed check gate returns `1`, not `2`. Codes `3` and `4` come from `rocky doctor` and `rocky fulfill`. Run `rocky doctor` as a pre-flight (below) or in CI.
 

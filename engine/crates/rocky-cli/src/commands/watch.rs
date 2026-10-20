@@ -80,6 +80,10 @@ pub async fn run_watch(
     #[cfg(unix)]
     let mut sigterm_stream =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    // Windows (#2440): Ctrl-Break, console close, logoff and shutdown take the
+    // SIGTERM arm's place; `ctrl_c_signal` above keeps Ctrl-C.
+    #[cfg(windows)]
+    let mut windows_stops = super::run_cancel::WindowsStopEvents::register(false);
 
     // Debounce + recompile loop.
     loop {
@@ -118,7 +122,11 @@ pub async fn run_watch(
                         None => std::future::pending().await,
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    windows_stops.recv().await
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     std::future::pending().await
                 }
