@@ -311,10 +311,12 @@ impl ModelRegions {
     /// The regions of `table`, a table that is not a project model, named
     /// `<schema>.<table>` or `<catalog>.<schema>.<table>`.
     ///
-    /// The last two dot-separated parts are the schema and the table, so a
+    /// The last dot-separated part is the table. Every run of parts just
+    /// before it is tried as the schema (`b.c` and `c` for `a.b.c.t`), so a
     /// schema name that holds a `.` (a `source.schema_pattern` with
-    /// `separator = "."`, for example) is not matched. The
-    /// name is compared as given: no quote is removed. The names the AI
+    /// `separator = "."`, for example) is matched too. A split that is not
+    /// the real one can only add regions. The name is compared as given: no
+    /// quote is removed. The names the AI
     /// commands pass come from the schema cache, whose keys are the
     /// warehouse's own names, lowercased and unquoted.
     ///
@@ -334,7 +336,9 @@ impl ModelRegions {
     /// Tables a pipeline reads (its source side):
     ///
     /// - A replication reads every table in a schema its
-    ///   `source.schema_pattern` parses, the same match discovery makes.
+    ///   `source.schema_pattern` parses, with the parser discovery uses. The
+    ///   match ignores case and catalog, so it is at least as wide as
+    ///   discovery's.
     /// - A snapshot reads its `source.schema` and `source.table`.
     /// - A load reads files, not tables, so it has no source side.
     ///
@@ -349,11 +353,16 @@ impl ModelRegions {
     pub fn for_table(&self, table: &str) -> Vec<Option<String>> {
         let mut out = Vec::new();
         let parts: Vec<&str> = table.split('.').collect();
-        if let [.., schema, name] = parts.as_slice() {
-            for rule in self.targets.iter().chain(&self.sources) {
-                if rule.covers(schema, name) {
-                    for region in &rule.regions {
-                        push_unique_region(&mut out, region);
+        if let [front @ .., name] = parts.as_slice() {
+            // Every run of parts that ends just before the table name is a
+            // candidate schema, so a schema that holds a `.` is matched too.
+            for start in 0..front.len() {
+                let schema = front[start..].join(".");
+                for rule in self.targets.iter().chain(&self.sources) {
+                    if rule.covers(&schema, name) {
+                        for region in &rule.regions {
+                            push_unique_region(&mut out, region);
+                        }
                     }
                 }
             }
@@ -912,5 +921,59 @@ mod tests {
             regions.for_table("silver.c_history"),
             vec![label("us"), label("eu")]
         );
+    }
+
+    /// `separator = "."` is allowed, so a source schema can hold a dot:
+    /// discovery caches `cat.acme.shopify.orders`, which reaches `for_table`
+    /// as `acme.shopify.orders`. Taking only `shopify` as the schema missed
+    /// it and gave no region (fail open).
+    #[test]
+    fn a_source_schema_that_holds_a_dot_takes_the_source_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipeline = "[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"\"\n\
+             separator = \".\"\ncomponents = [\"tenant\", \"source\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\nregion = \"eu\"\n";
+        let regions = resolve(tmp.path(), pipeline);
+        assert_eq!(regions.for_table("acme.shopify.orders"), vec![label("eu")]);
+        assert_eq!(
+            regions.for_table("cat.acme.shopify.orders"),
+            vec![label("eu")]
+        );
+    }
+
+    /// Two replications whose source patterns both accept one schema: the
+    /// table takes both source regions.
+    #[test]
+    fn a_source_table_two_replications_read_has_both_regions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipelines = format!(
+            "{}{}",
+            replication("a", "raw__{source}", Some("eu"), Some("eu")),
+            replication("b", "stage__{source}", Some("us"), Some("us"))
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(
+            regions.for_table("src__shopify.orders"),
+            vec![label("eu"), label("us")]
+        );
+    }
+
+    /// A load reads files, so no table is on its source side: only its
+    /// target schema has its region.
+    #[test]
+    fn a_load_pipeline_has_no_source_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regions = resolve(
+            tmp.path(),
+            "[pipeline.ingest]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+             [pipeline.ingest.target]\ncatalog = \"wh\"\nschema = \"landing\"\n\
+             region = \"eu\"\n",
+        );
+        assert_eq!(regions.sources.len(), 0);
+        assert_eq!(regions.for_table("data.orders"), vec![None]);
+        assert_eq!(regions.for_table("landing.orders"), vec![label("eu")]);
     }
 }
