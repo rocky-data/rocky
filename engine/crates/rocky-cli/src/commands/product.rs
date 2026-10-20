@@ -4999,6 +4999,7 @@ pub(crate) mod delivery_tests {
             consumed_column_baseline: None,
             output_version: None,
             output_target: None,
+            stored_bytes: None,
         });
         let audit = crate::commands::run::audit_to_record(
             &crate::commands::run_audit::AuditContext::detect(None, None, None),

@@ -122,8 +122,9 @@ pub fn build_freshness_fix_prompt(
     let system = "You are an expert Rocky data-pipeline reviewer. Your task is to \
                  propose a TOML `[freshness]` block for a model's sidecar `.toml` so \
                  the model declares a time-to-live after which it is considered \
-                 stale. Set `expected_lag_seconds` to a sensible TTL for the model \
-                 (e.g. 3600 for hourly data, 86400 for daily). Set `time_column` to \
+                 stale. Set `warn_after` to a sensible TTL for the model as a duration \
+                 string: a positive integer and one unit of s, h or d, never minutes \
+                 (e.g. \"1h\" for hourly data, \"1d\" for daily). Set `time_column` to \
                  the most appropriate timestamp/date column from the supplied \
                  candidates. Output ONLY the new TOML block inside a single ```toml \
                  fenced block — no commentary, no explanation, no diff. The block \
@@ -135,7 +136,7 @@ pub fn build_freshness_fix_prompt(
         "Model: `{model_name}`\n\
          Candidate temporal columns: {candidates}\n\n\
          Current sidecar `.toml`:\n```toml\n{sidecar_text}\n```\n\n\
-         Emit a `[freshness]` block with `expected_lag_seconds` and a \
+         Emit a `[freshness]` block with `warn_after` and a \
          `time_column` chosen from the candidates. Do not duplicate or modify \
          any existing block."
     );
@@ -238,7 +239,7 @@ mod tests {
         );
         // System half: the role + output-format constraint.
         assert!(system.contains("[freshness]"));
-        assert!(system.contains("expected_lag_seconds"));
+        assert!(system.contains("warn_after"));
         assert!(system.contains("time_column"));
         assert!(system.contains("```toml"));
         // User half: the per-call context (model + candidates + sidecar).

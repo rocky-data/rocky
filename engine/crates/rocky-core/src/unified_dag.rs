@@ -2270,6 +2270,7 @@ mod tests {
                 compute_cost_per_dbu: 0.40,
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
+                ..Default::default()
             },
             budget: Default::default(),
             schema_evolution: Default::default(),

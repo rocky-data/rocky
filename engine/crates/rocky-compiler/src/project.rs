@@ -1182,6 +1182,7 @@ mod tests {
             expected_lag_seconds: Some(1800),
             time_column: Some("updated_at".to_string()),
             severity: None,
+            ..Default::default()
         };
         let models = load_dir_models(d, Some(&project)).unwrap();
 
@@ -1195,7 +1196,7 @@ mod tests {
                 .freshness
                 .as_ref()
                 .unwrap_or_else(|| panic!("{name} must inherit the project [freshness] block"));
-            assert_eq!(f.max_lag_seconds, 1800);
+            assert_eq!(f.max_lag_seconds, Some(1800));
             assert_eq!(f.time_column.as_deref(), Some("updated_at"));
         }
 

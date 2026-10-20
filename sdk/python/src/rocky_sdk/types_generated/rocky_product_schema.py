@@ -56,17 +56,25 @@ class FreshnessSpec(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    max_lag: str
+    error_after: str | None = None
     """
-    Lag budget in the duration grammar (`"24h"`).
+    Age above which the output reports `error`. Must not be shorter than `warn_after`.
+    """
+    max_lag: str | None = None
+    """
+    Deprecated: write `warn_after` / `error_after`. Lag budget in the duration grammar (`"24h"`).
     """
     severity: FreshnessSeverity1 | FreshnessSeverity2 | None = None
     """
-    Optional severity for the staleness report.
+    Deprecated, only with `max_lag`: severity for the staleness report.
     """
     time_column: str
     """
     The timestamp column the staleness check reads.
+    """
+    warn_after: str | None = None
+    """
+    Age above which the output reports `warn` (`"12h"`).
     """
 
 

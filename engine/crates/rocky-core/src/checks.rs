@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::column_map;
 
+use crate::source_freshness::FreshnessThresholds;
 use crate::sql_gen::SqlGenError;
 use crate::tests::TestSeverity;
 use crate::traits::SqlDialect;
@@ -655,6 +656,33 @@ pub fn check_freshness(lag_seconds: u64, threshold_seconds: u64) -> CheckResult 
     }
 }
 
+/// Grade a measured lag against a `[checks.freshness]` block's levels.
+///
+/// ```text
+///   lag > error_after -> failed, severity error,   threshold error_after
+///   lag > warn_after  -> failed, severity warning, threshold warn_after
+///   otherwise         -> passed, at the lowest level present
+/// ```
+///
+/// A deprecated `threshold_seconds` + `severity` block has exactly one
+/// level (see [`crate::config::FreshnessConfig::thresholds`]), so it grades
+/// exactly as before: failed past the threshold, at the configured
+/// severity, and the reported threshold is the configured one.
+pub fn grade_freshness(lag_seconds: u64, levels: &FreshnessThresholds) -> CheckResult {
+    let (passed, severity, threshold_seconds) =
+        match (levels.warn_after_seconds, levels.error_after_seconds) {
+            (_, Some(error)) if lag_seconds > error => (false, TestSeverity::Error, error),
+            (Some(warn), _) if lag_seconds > warn => (false, TestSeverity::Warning, warn),
+            (Some(warn), _) => (true, TestSeverity::Warning, warn),
+            (None, Some(error)) => (true, TestSeverity::Error, error),
+            (None, None) => (true, TestSeverity::Error, 0),
+        };
+    let mut check = check_freshness(lag_seconds, threshold_seconds);
+    check.passed = passed;
+    check.severity = severity;
+    check
+}
+
 /// A freshness check the engine could not evaluate: the `MAX(timestamp)`
 /// query failed, or its cell did not read as a timestamp. Always fails;
 /// `lag_seconds` is a placeholder.
@@ -942,6 +970,59 @@ mod tests {
     fn test_freshness_fail() {
         let r = check_freshness(100000, 86400);
         assert!(!r.passed);
+    }
+
+    /// The `[checks.freshness]` outcome table, for both spellings. A
+    /// deprecated block must grade exactly as `check_freshness` +
+    /// "configured severity" did before the levels existed.
+    #[test]
+    fn grade_freshness_outcome_table() {
+        use crate::config::FreshnessConfig;
+        let parse = |toml_text: &str| -> FreshnessConfig {
+            toml::from_str(toml_text).expect("freshness block parses")
+        };
+        let grade = |cfg: &FreshnessConfig, lag: u64| {
+            let r = grade_freshness(lag, &cfg.thresholds());
+            let CheckDetails::Freshness {
+                threshold_seconds, ..
+            } = r.details
+            else {
+                panic!("freshness details");
+            };
+            (r.passed, r.severity, threshold_seconds)
+        };
+        use TestSeverity::{Error, Warning};
+
+        let both = parse("warn_after = \"1h\"\nerror_after = \"2h\"");
+        assert_eq!(grade(&both, 60), (true, Warning, 3_600));
+        assert_eq!(grade(&both, 3_600), (true, Warning, 3_600));
+        assert_eq!(grade(&both, 3_601), (false, Warning, 3_600));
+        assert_eq!(grade(&both, 7_200), (false, Warning, 3_600));
+        assert_eq!(grade(&both, 7_201), (false, Error, 7_200));
+        let error_only = parse("error_after = \"1h\"");
+        assert_eq!(grade(&error_only, 3_600), (true, Error, 3_600));
+        assert_eq!(grade(&error_only, 3_601), (false, Error, 3_600));
+        let warn_only = parse("warn_after = \"1h\"");
+        assert_eq!(grade(&warn_only, 3_601), (false, Warning, 3_600));
+
+        // Every deprecated block grades as before: passed iff lag <=
+        // threshold, at the configured severity (default error), with the
+        // configured threshold reported.
+        for (text, severity) in [
+            ("threshold_seconds = 3600", Error),
+            ("threshold_seconds = 3600\nseverity = \"error\"", Error),
+            ("threshold_seconds = 3600\nseverity = \"warning\"", Warning),
+        ] {
+            let old = parse(text);
+            for lag in [0, 3_599, 3_600, 3_601, 1_000_000] {
+                let before = check_freshness(lag, 3_600);
+                assert_eq!(
+                    grade(&old, lag),
+                    (before.passed, severity, 3_600),
+                    "{text} at lag {lag}"
+                );
+            }
+        }
     }
 
     #[test]

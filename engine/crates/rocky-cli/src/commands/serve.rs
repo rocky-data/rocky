@@ -704,8 +704,9 @@ fn pair_token_with_scope(
     }
 }
 
-/// Resolve when the process should begin draining: a SIGTERM (unix) or a ctrl-c
-/// (SIGINT, all platforms). Mirrors the two-signal handling `rocky run` uses.
+/// Resolve when the process should begin draining: a SIGTERM (unix), a ctrl-c
+/// (SIGINT, all platforms), or on Windows a Ctrl-Break, console close, logoff
+/// or shutdown (#2440). Mirrors the two-signal handling `rocky run` uses.
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
@@ -723,7 +724,13 @@ async fn wait_for_shutdown() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = super::run_cancel::WindowsStopEvents::register(true)
+            .recv()
+            .await;
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

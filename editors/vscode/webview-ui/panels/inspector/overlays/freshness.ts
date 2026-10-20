@@ -1,3 +1,4 @@
+import { freshnessBudgetSeconds } from "../viewModel";
 import type { LineageOverlay } from "./types";
 
 function compactLag(seconds: number): string {
@@ -13,9 +14,11 @@ export const freshnessOverlay: LineageOverlay = {
   decorate(node) {
     const freshness = node.data.freshness;
     if (!freshness) return undefined;
+    const budget = freshnessBudgetSeconds(freshness);
+    if (budget === null) return undefined;
     return [
       {
-        text: `≤ ${compactLag(freshness.max_lag_seconds)}`,
+        text: `≤ ${compactLag(budget)}`,
         color: "var(--vscode-charts-blue)",
         title: `freshness policy${freshness.severity ? ` (${freshness.severity})` : ""}`,
       },

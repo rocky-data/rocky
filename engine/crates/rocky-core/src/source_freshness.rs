@@ -19,8 +19,8 @@
 //!
 //! `rocky freshness` reads `MAX(loaded_at_field)` per declared source and
 //! grades its age against the two thresholds. The same grading applies to a
-//! model's own `[freshness]` block (`max_lag_seconds` + `severity`), see
-//! [`FreshnessThresholds::from_model`].
+//! model's own `[freshness]` block, see
+//! [`crate::models::ModelFreshnessConfig::thresholds`].
 //!
 //! The durations reuse the product-spec grammar
 //! ([`crate::product::spec::parse_max_lag`]): a positive integer followed by
@@ -94,21 +94,163 @@ pub struct FreshnessThresholds {
 }
 
 impl FreshnessThresholds {
-    /// The thresholds a model `[freshness]` block implies: its one TTL is the
-    /// error threshold when `severity = "error"`, else the warn threshold.
-    /// Severity defaults to `warning`, matching the field's documentation.
-    pub fn from_model(config: &crate::models::ModelFreshnessConfig) -> Self {
-        match config.severity {
-            Some(crate::tests::TestSeverity::Error) => Self {
+    /// The thresholds one deprecated scalar TTL implies: the error threshold
+    /// when its severity is `error`, else the warn threshold.
+    ///
+    /// Every deprecated spelling (`threshold_seconds`, `max_lag_seconds`,
+    /// `expected_lag_seconds`, `max_lag`) maps through this one rule, so the
+    /// old forms behave exactly as they did. The caller passes the severity
+    /// the site resolves to, default included: `error` for
+    /// `[checks.freshness]`, `warning` for a model, project or product block.
+    pub fn from_single(seconds: u64, severity: crate::tests::TestSeverity) -> Self {
+        match severity {
+            crate::tests::TestSeverity::Error => Self {
                 warn_after_seconds: None,
-                error_after_seconds: Some(config.max_lag_seconds),
+                error_after_seconds: Some(seconds),
             },
-            _ => Self {
-                warn_after_seconds: Some(config.max_lag_seconds),
+            crate::tests::TestSeverity::Warning => Self {
+                warn_after_seconds: Some(seconds),
                 error_after_seconds: None,
             },
         }
     }
+
+    /// The smaller of the levels present: the age at which the first level
+    /// trips. `None` only when neither level is set.
+    ///
+    /// This is a model's schedule budget, and the one number a single-value
+    /// surface (the discover projection, the docs site) reports.
+    pub fn budget_seconds(&self) -> Option<u64> {
+        match (self.warn_after_seconds, self.error_after_seconds) {
+            (Some(w), Some(e)) => Some(w.min(e)),
+            (Some(w), None) => Some(w),
+            (None, Some(e)) => Some(e),
+            (None, None) => None,
+        }
+    }
+}
+
+impl FreshnessThresholds {
+    /// The key of a level that is zero seconds, `error_after` first. A
+    /// deprecated scalar TTL may be zero, but the duration grammar takes
+    /// only positive values, so such a block has no `warn_after` /
+    /// `error_after` spelling.
+    pub fn zero_level(&self) -> Option<&'static str> {
+        if self.error_after_seconds == Some(0) {
+            Some("error_after")
+        } else if self.warn_after_seconds == Some(0) {
+            Some("warn_after")
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse and cross-check a `warn_after` / `error_after` pair.
+///
+/// The one grammar every freshness block shares: each value is a duration
+/// [`crate::product::spec::parse_max_lag`] accepts, at least one is set, and
+/// `error_after` is not shorter than `warn_after`. Returns every problem,
+/// not the first.
+pub fn parse_levels(
+    warn_after: Option<&str>,
+    error_after: Option<&str>,
+) -> Result<FreshnessThresholds, Vec<FreshnessConfigProblem>> {
+    let mut problems = Vec::new();
+    let mut parse = |field: &'static str, raw: Option<&str>| -> Option<u64> {
+        let raw = raw?;
+        match crate::product::spec::parse_max_lag(raw) {
+            Ok(secs) => Some(secs),
+            Err(_) => {
+                problems.push(FreshnessConfigProblem::BadDuration {
+                    field,
+                    raw: raw.to_string(),
+                });
+                None
+            }
+        }
+    };
+    let warn = parse("warn_after", warn_after);
+    let error = parse("error_after", error_after);
+    if warn_after.is_none() && error_after.is_none() {
+        problems.push(FreshnessConfigProblem::NoThreshold);
+    }
+    if let (Some(w), Some(e)) = (warn, error)
+        && e < w
+    {
+        problems.push(FreshnessConfigProblem::ErrorBeforeWarn {
+            warn_after: warn_after.unwrap_or_default().to_string(),
+            error_after: error_after.unwrap_or_default().to_string(),
+        });
+    }
+    if problems.is_empty() {
+        Ok(FreshnessThresholds {
+            warn_after_seconds: warn,
+            error_after_seconds: error,
+        })
+    } else {
+        Err(problems)
+    }
+}
+
+/// The levels of a block that [`parse_levels`] already accepted when it was
+/// deserialized. A value that does not parse (only reachable through a
+/// struct built in code) reads as absent.
+pub fn levels_of(warn_after: Option<&str>, error_after: Option<&str>) -> FreshnessThresholds {
+    let parse = |raw: Option<&str>| raw.and_then(|r| crate::product::spec::parse_max_lag(r).ok());
+    FreshnessThresholds {
+        warn_after_seconds: parse(warn_after),
+        error_after_seconds: parse(error_after),
+    }
+}
+
+/// Join [`parse_levels`] problems into one deserializer message.
+pub fn problems_message(problems: &[FreshnessConfigProblem]) -> String {
+    problems
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Render seconds in the duration grammar, in the largest exact unit
+/// (`86400` -> `"1d"`, `3600` -> `"1h"`, `90` -> `"90s"`).
+pub fn format_duration(seconds: u64) -> String {
+    if seconds > 0 && seconds.is_multiple_of(86_400) {
+        format!("{}d", seconds / 86_400)
+    } else if seconds > 0 && seconds.is_multiple_of(3_600) {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The `warn_after` / `error_after` text that replaces a deprecated block
+/// with these thresholds, e.g. `error_after = "24h"`.
+pub fn replacement_for(thresholds: &FreshnessThresholds) -> String {
+    let mut parts = Vec::new();
+    if let Some(w) = thresholds.warn_after_seconds {
+        parts.push(format!("warn_after = \"{}\"", format_duration(w)));
+    }
+    if let Some(e) = thresholds.error_after_seconds {
+        parts.push(format!("error_after = \"{}\"", format_duration(e)));
+    }
+    parts.join(", ")
+}
+
+/// Refusal for a freshness block that mixes a deprecated key with
+/// `warn_after` / `error_after`.
+pub fn mixed_spelling_message(old_keys: &[&str]) -> String {
+    let old = old_keys
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "this freshness block mixes the deprecated {old} with `warn_after` / `error_after`. \
+         Write only `warn_after` and/or `error_after`: the level a value sits on replaces \
+         `severity`, so the old keys have no meaning beside them"
+    )
 }
 
 /// One problem with a [`SourceFreshnessConfig`]. Compile reports each as E050.
@@ -149,7 +291,7 @@ impl std::fmt::Display for FreshnessConfigProblem {
             } => write!(
                 f,
                 "freshness `error_after` (\"{error_after}\") is shorter than `warn_after` \
-                 (\"{warn_after}\"), so the source would error before it ever warns"
+                 (\"{warn_after}\"), so it would error before it ever warns"
             ),
             Self::BadLoadedAtField(field) => write!(
                 f,
@@ -521,22 +663,65 @@ mod tests {
 
     #[test]
     fn model_thresholds_follow_severity() {
-        let mut m = crate::models::ModelFreshnessConfig {
-            max_lag_seconds: 60,
-            time_column: None,
-            severity: None,
-            declared_in_sidecar: true,
-        };
-        assert_eq!(
-            FreshnessThresholds::from_model(&m).warn_after_seconds,
-            Some(60)
-        );
+        let mut m = crate::models::ModelFreshnessConfig::legacy(60, None, None);
+        assert_eq!(m.thresholds().warn_after_seconds, Some(60));
         m.severity = Some(crate::tests::TestSeverity::Error);
-        let t = FreshnessThresholds::from_model(&m);
+        let t = m.thresholds();
         assert_eq!(
             (t.warn_after_seconds, t.error_after_seconds),
             (None, Some(60))
         );
+    }
+
+    #[test]
+    fn budget_is_the_smaller_level_present() {
+        let t = |w, e| FreshnessThresholds {
+            warn_after_seconds: w,
+            error_after_seconds: e,
+        };
+        assert_eq!(t(Some(60), Some(30)).budget_seconds(), Some(30));
+        assert_eq!(t(Some(60), Some(90)).budget_seconds(), Some(60));
+        assert_eq!(t(None, Some(90)).budget_seconds(), Some(90));
+        assert_eq!(t(Some(60), None).budget_seconds(), Some(60));
+        assert_eq!(t(None, None).budget_seconds(), None);
+    }
+
+    #[test]
+    fn parse_levels_enforces_the_one_grammar() {
+        let ok = parse_levels(Some("12h"), Some("1d")).expect("valid pair");
+        assert_eq!(
+            (ok.warn_after_seconds, ok.error_after_seconds),
+            (Some(43_200), Some(86_400))
+        );
+        assert_eq!(
+            parse_levels(None, None).unwrap_err(),
+            vec![FreshnessConfigProblem::NoThreshold]
+        );
+        assert!(matches!(
+            parse_levels(Some("2h"), Some("1h")).unwrap_err()[..],
+            [FreshnessConfigProblem::ErrorBeforeWarn { .. }]
+        ));
+        // Minutes stay rejected.
+        assert!(matches!(
+            parse_levels(Some("30m"), None).unwrap_err()[..],
+            [FreshnessConfigProblem::BadDuration {
+                field: "warn_after",
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn format_duration_picks_the_largest_exact_unit() {
+        assert_eq!(format_duration(86_400), "1d");
+        assert_eq!(format_duration(7_200), "2h");
+        assert_eq!(format_duration(90), "90s");
+        for secs in [1, 59, 3_600, 90_000, 172_800] {
+            assert_eq!(
+                crate::product::spec::parse_max_lag(&format_duration(secs)).unwrap(),
+                secs
+            );
+        }
     }
 
     #[test]

@@ -201,7 +201,7 @@ pub(crate) fn content_addressed_output_version(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
     use rocky_ir::ColumnInfo;
@@ -384,13 +384,13 @@ mod tests {
     // --- Through the real `run()` entry point ----------------------------
 
     #[cfg(feature = "duckdb")]
-    mod through_run {
+    pub(crate) mod through_run {
         use super::super::super::run::{DeferOptions, PartitionRunOptions, SkipRunOptions, run};
         use rocky_core::state::{OutputVersion, StateStore, UnversionedReason};
 
         /// Write a transformation project, run it, and return the recorded
         /// executions of the newest run, keyed by model name.
-        async fn run_project(
+        pub(crate) async fn run_project(
             adapter_toml: &str,
             models: &[(&str, &str, &str)],
             setup: impl FnOnce(&std::path::Path),
@@ -544,7 +544,7 @@ mod tests {
 
         const MAIN: &str = "[target]\ncatalog = \"\"\nschema = \"main\"\n";
 
-        fn strategy(kind: &str) -> String {
+        pub(crate) fn strategy(kind: &str) -> String {
             format!("[strategy]\ntype = \"{kind}\"\n\n{MAIN}")
         }
 
@@ -808,6 +808,15 @@ mod tests {
                 })
             );
             assert_eq!(artifact.commit_version, 1);
+            // Stored bytes are the exact size of the one Parquet file written.
+            assert!(artifact.size_bytes > 0);
+            assert_eq!(
+                execs["m"].stored_bytes,
+                Some(rocky_core::state::StoredBytes {
+                    bytes: artifact.size_bytes,
+                    basis: rocky_core::state::StoredBytesBasis::DataFiles,
+                })
+            );
         }
     }
 }

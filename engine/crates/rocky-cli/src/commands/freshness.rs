@@ -9,8 +9,8 @@
 //! - **Models.** Every model with a `[freshness]` block. With a
 //!   `time_column`, Rocky reads `MAX(time_column)` from the model's target
 //!   table. Without one, it reads the model's last successful build from the
-//!   state store. The model's one TTL (`max_lag_seconds`) is the warn
-//!   threshold, or the error threshold under `severity = "error"`.
+//!   state store. The model's `warn_after` / `error_after` levels grade it, as
+//!   for a source (a deprecated `max_lag_seconds` is one of the two levels).
 //!
 //! ```text
 //!   age = now - max_loaded_at
@@ -395,7 +395,7 @@ fn model_shell(pipeline: &str, model: &rocky_core::models::Model) -> FreshnessCh
         .config
         .freshness
         .as_ref()
-        .map(FreshnessThresholds::from_model)
+        .map(rocky_core::models::ModelFreshnessConfig::thresholds)
         .unwrap_or_default();
     FreshnessCheckResult {
         name: model.config.name.clone(),
@@ -438,7 +438,7 @@ async fn check_model_column(
         .as_ref()
         .expect("filtered to freshness");
     let column = freshness.time_column.as_deref().expect("checked by caller");
-    let thresholds = FreshnessThresholds::from_model(freshness);
+    let thresholds = freshness.thresholds();
     let t = &model.config.target;
     let mut result = model_shell(pipeline, model);
     let read = read_max(adapter, &t.catalog, &t.schema, &t.table, column, None).await;
@@ -484,7 +484,7 @@ fn check_model_state(
         .freshness
         .as_ref()
         .expect("filtered to freshness");
-    let thresholds = FreshnessThresholds::from_model(freshness);
+    let thresholds = freshness.thresholds();
     let mut result = model_shell(pipeline, model);
     result.measured_from = "state_store".to_string();
     result.loaded_at_field = None;

@@ -965,7 +965,7 @@ The age is the check time minus the newest load time. Rocky grades it:
 | `error` | The age is greater than `error_after`. |
 | `runtime_error` | Rocky could not measure: invalid config, a failed query, or a value that does not read as a timestamp. |
 
-A table with no rows, or with only NULL load times, counts as never loaded. The worst threshold it declares applies. A model's `max_lag_seconds` is its warn threshold. Under `severity = "error"` it is the error threshold instead.
+A table with no rows, or with only NULL load times, counts as never loaded. The worst threshold it declares applies. A model's `warn_after` is its warn threshold. Its `error_after` is its error threshold.
 
 **Exit code.** `1` when any check is `error` or `runtime_error`. `0` otherwise, including when checks only `warn`.
 

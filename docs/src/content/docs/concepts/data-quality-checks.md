@@ -222,7 +222,7 @@ Configure these per pipeline in `rocky.toml`. They run after each table is repli
 enabled = true
 row_count = true
 column_match = true
-freshness = { threshold_seconds = 86400 }
+freshness = { error_after = "24h" }
 ```
 
 ### Row count
@@ -260,7 +260,7 @@ A failed read is retried once, only when the adapter classifies the failure as r
 
 ### Freshness
 
-Compares `MAX(timestamp_column)` against the current time. A table with nothing new within the threshold fails. The result carries `lag_seconds` and `threshold_seconds`. If freshness matters for a table, confirm its `timestamp_column` is populated.
+Compares `MAX(timestamp_column)` against the current time. A table older than `error_after` fails at error severity. A table older than `warn_after` fails at warning severity. Both levels use a duration such as `"12h"` (see [Freshness durations](/reference/configuration/#freshness-durations)). The result carries `lag_seconds` and `threshold_seconds`. If freshness matters for a table, confirm its `timestamp_column` is populated.
 
 Rocky does not always measure freshness:
 

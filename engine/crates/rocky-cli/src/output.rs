@@ -174,6 +174,9 @@ pub struct ResolvedCheckNameOutput {
 /// ever read it, so it was removed rather than exposed here (#1620).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FreshnessConfigOutput {
+    /// The age in seconds at which the check first fails: the smaller of
+    /// `warn_after` / `error_after` (the deprecated `threshold_seconds`
+    /// when the block uses it).
     pub threshold_seconds: u64,
 }
 
@@ -1401,6 +1404,18 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub output_version: Option<rocky_core::state::OutputVersion>,
+    /// The bytes the output table stores, measured in one batch after the
+    /// run's last model (`run_stored_bytes::PendingStoredBytes`). `None` is
+    /// unknown. [`RunOutput::to_run_record`]
+    /// copies it onto the persisted
+    /// [`rocky_core::state::ModelExecution::stored_bytes`]; `rocky cost`
+    /// shows it.
+    ///
+    /// Never serialized and never part of the JSON schema (via `#[serde(skip)]`
+    /// and `#[schemars(skip)]`), so the `rocky run` output is unchanged.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub stored_bytes: Option<rocky_core::state::StoredBytes>,
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -5999,7 +6014,7 @@ impl ChecksConfigOutput {
         use rocky_core::checks::CheckKind;
 
         let freshness = cfg.freshness.as_ref().map(|f| FreshnessConfigOutput {
-            threshold_seconds: f.threshold_seconds,
+            threshold_seconds: f.thresholds().budget_seconds().unwrap_or(0),
         });
 
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
@@ -6561,6 +6576,9 @@ impl RunOutput {
                 output_target: mat.output_target.clone(),
                 due_at: None,
                 wait_for_upstream_ms: None,
+                // The output table's stored bytes, measured at the execution
+                // site right after the write. `None` is unknown.
+                stored_bytes: mat.stored_bytes,
             });
         }
 
@@ -6603,6 +6621,7 @@ impl RunOutput {
                 // A failed execution recorded no output version ("not
                 // recorded"); it may have written nothing at all.
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -8042,6 +8061,7 @@ mod cost_finalize_tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -8191,6 +8211,7 @@ mod cost_finalize_tests {
             compute_cost_per_dbu: 0.40,
             warehouse_size: "Medium".to_string(),
             min_history_runs: 5,
+            ..Default::default()
         };
         out.populate_cost_summary("databricks", &cost_cfg);
 
@@ -8220,6 +8241,7 @@ mod cost_finalize_tests {
                 compute_cost_per_dbu: 0.40,
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
+                ..Default::default()
             },
         );
         let budget = BudgetConfig {
@@ -8338,6 +8360,7 @@ mod run_record_tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -11825,6 +11848,25 @@ pub struct PerModelCostHistorical {
     /// `bytes_scanned`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// The bytes the model's output table stored right after this
+    /// execution wrote it, read back from the persisted
+    /// `rocky_core::state::ModelExecution::stored_bytes`. Read
+    /// `stored_bytes_basis` to tell an exact figure from an estimate.
+    ///
+    /// `None` (and omitted from JSON) means unknown: a view, a
+    /// replicated table, a `time_interval` partition, an adapter that
+    /// cannot measure it (every adapter except DuckDB today), an
+    /// in-memory DuckDB database, a failed measurement, or a run
+    /// recorded before this field existed. There is no run total: the
+    /// bases differ, so a sum would mix exact and estimated figures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+    /// How `stored_bytes` was measured: `data_files` (exact Parquet
+    /// data-file bytes, content-addressed outputs) or `allocated_blocks`
+    /// (an estimate: DuckDB storage blocks times the block size, which
+    /// overstates a small table). Present exactly when `stored_bytes` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes_basis: Option<rocky_core::state::StoredBytesBasis>,
 }
 
 // ---------------------------------------------------------------------------

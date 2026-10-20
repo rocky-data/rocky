@@ -945,7 +945,7 @@ pub fn resolve_schedules_detailed(
     member_budgets: &BTreeMap<String, Vec<u64>>,
 ) -> BTreeMap<String, Result<ResolvedSchedule, ScheduleConfigError>> {
     let default_tz = config.schedule.timezone.as_str();
-    let project_lag = config.freshness.expected_lag_seconds;
+    let project_lag = config.freshness.budget_seconds();
     let mut out = BTreeMap::new();
     for (name, pipeline) in &config.pipelines {
         if let Some(f) = filter
