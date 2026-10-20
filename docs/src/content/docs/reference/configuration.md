@@ -1430,7 +1430,7 @@ A pipeline writes these tables (its target side):
 
 A pipeline reads these tables (its source side). `rocky discover --with-schemas` and `rocky run` put such tables in the schema cache:
 
-- A replication pipeline reads every table in a schema that its `source.schema_pattern` accepts. Rocky uses the same match as discovery: the schema starts with `prefix`, and the rest splits on `separator` into at least one part per component. So `prefix = "src__"`, `separator = "__"` and `components = ["tenant", "regions...", "source"]` match the table `src__acme__eu__shopify.orders`.
+- A replication pipeline reads every table in a schema that its `source.schema_pattern` accepts. Rocky uses the parser that discovery uses: the schema starts with `prefix`, and the rest splits on `separator` into at least one part per component. Rocky ignores case and the catalog here, so its match is at least as wide as discovery's. A wider match can only add regions. So `prefix = "src__"`, `separator = "__"` and `components = ["tenant", "regions...", "source"]` match the table `src__acme__eu__shopify.orders`.
 - A snapshot pipeline reads the one table that its `source.schema` and `source.table` name.
 - A load pipeline reads files, not tables. It has no source side.
 - A table a pipeline reads takes only the `source` region of that pipeline.
@@ -1440,12 +1440,12 @@ For both sides:
 - Rocky compares the schema and table names without regard to case, because the schema cache stores them in lowercase. It does not compare the catalog. A table that two pipelines match takes the regions of both.
 - A `source` or `target` block with no `region` gives the table "no region" next to its other regions. For example, a replicated table whose `source` has no label has the `target` region and no region. Without `enforce` the label that is there decides. With `enforce = true`, the missing label refuses the request with a `V062` error.
 - A `source.schema_pattern` whose `components` Rocky cannot parse (an empty entry, for example) matches every table. Discovery refuses such a pipeline, so Rocky cannot say which tables it would read.
-- Rocky takes the last two dot-separated parts of the name as the schema and the table. So a schema name that contains a dot is not matched, and its tables have no region. For example, a `source.schema_pattern` with `separator = "."` makes such names.
+- Rocky takes the last dot-separated part of the name as the table. It tries every run of parts before it as the schema: for `a.b.c.orders`, the schemas `a.b.c`, `b.c` and `c`. So a schema name that contains a dot, such as one a `source.schema_pattern` with `separator = "."` makes, is matched too. A split that is not the real one can only add regions.
 
 A table that no pipeline writes or reads has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
 
 - `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes or reads.
-- `rocky ai-explain` and `rocky ai-sync` are refused for a model that lists such a table in its `depends_on`. A table the model's SQL reads by a qualified name, but that `depends_on` does not list, is not one of its upstreams, so the request does not carry its schema.
+- `rocky ai-explain` and `rocky ai-sync` are refused for a model that lists such a table in its `depends_on`. Rocky also derives upstreams from the SQL, but only from a bare table name (no `.`) that names another model. So a table that is not a model is an upstream only when `depends_on` lists it. A table the SQL reads but `depends_on` does not list is not an upstream, and the request does not carry its schema.
 
 `rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. The warning is a hint, not an error. It says that Rocky would refuse an AI request that carries data with that label. It does not check that any AI feature carries that data: a project may never make an AI request, and `rocky run` never does. The check that refuses a request is the one Rocky makes when it builds the AI client.
 
