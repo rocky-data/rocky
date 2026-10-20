@@ -427,7 +427,8 @@ impl RockyLsp {
     /// The AI base URL for this project: `[ai] base_url`, else
     /// `ROCKY_AI_BASE_URL`, else `None` (the default endpoint). Resolves the
     /// same way as `rocky ai`. Fails when `rocky.toml` exists but does not
-    /// load, so the key is never sent to the default host by mistake.
+    /// load, so the key is never sent to the default host by mistake. This
+    /// gates every AI arm, the `.rocky` syntax fix included.
     async fn ai_base_url(&self) -> std::result::Result<Option<String>, String> {
         let models_dir = self.models_dir.read().await;
         let toml_path = models_dir
@@ -436,25 +437,41 @@ impl RockyLsp {
         rocky_ai::client::resolve_project_base_url(toml_path.as_deref()).map_err(|e| e.to_string())
     }
 
-    /// The project config the AI code actions judge residency against
-    /// (V062), and its path. `(None, _)` when there is no `rocky.toml`.
-    /// Fails when `rocky.toml` exists but does not load.
-    async fn ai_project(
+    /// The V062 verdict for an AI code action whose prompt carries the
+    /// schemas of `models` (project models) and `tables` (other tables),
+    /// judged against this project's `rocky.toml`. No `rocky.toml` judges
+    /// against nothing, so nothing is refused.
+    ///
+    /// Fails when `rocky.toml` exists but does not load. There is no
+    /// fallback here: judging warehouse data against an empty config would
+    /// let it through, even under `[residency] enforce`. Only the arms whose
+    /// prompt carries warehouse data call this; the `.rocky` syntax fix does
+    /// not, so this read never stops it.
+    async fn ai_residency_for(
         &self,
-    ) -> std::result::Result<
-        (
-            Option<rocky_core::config::RockyConfig>,
-            Option<std::path::PathBuf>,
-        ),
-        String,
-    > {
-        let models_dir = self.models_dir.read().await;
-        let toml_path = models_dir
-            .as_deref()
-            .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)));
-        let config = rocky_core::config::load_optional_project_config(toml_path.as_deref())
+        models: &[&str],
+        tables: &[&str],
+    ) -> std::result::Result<rocky_ai::residency::AiResidency, String> {
+        let toml_path = {
+            let models_dir = self.models_dir.read().await;
+            models_dir
+                .as_deref()
+                .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)))
+        };
+        let project = rocky_core::config::load_optional_project_config(toml_path.as_deref())
             .map_err(|e| e.to_string())?;
-        Ok((config, toml_path))
+        let data = rocky_ai::residency::data_regions(
+            project.as_ref(),
+            toml_path
+                .as_deref()
+                .unwrap_or(std::path::Path::new("rocky.toml")),
+            models,
+            tables,
+        );
+        Ok(rocky_ai::residency::AiResidency::for_data(
+            project.as_ref(),
+            &data,
+        ))
     }
 
     /// The project-level compiler inputs, read from `rocky.toml`.
@@ -2665,29 +2682,10 @@ impl LanguageServer for RockyLsp {
                 return Ok(action);
             }
         };
-        let (project, project_path) = match self.ai_project().await {
-            Ok(p) => p,
-            Err(message) => {
-                tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
-                action.data = Some(data);
-                return Ok(action);
-            }
-        };
-        // What each action's prompt carries from the warehouse: the schemas
-        // of `models` (project models) and `tables` (other tables). V062
-        // refuses the client, before any request, when that data may not go
-        // to the AI endpoint's region.
-        let residency_for = |models: &[&str], tables: &[&str]| {
-            let data = rocky_ai::residency::data_regions(
-                project.as_ref(),
-                project_path
-                    .as_deref()
-                    .unwrap_or(std::path::Path::new("rocky.toml")),
-                models,
-                tables,
-            );
-            rocky_ai::residency::AiResidency::for_data(project.as_ref(), &data)
-        };
+        // Each arm whose prompt carries warehouse data names it to
+        // `ai_residency_for`: the schemas of `models` (project models) and
+        // `tables` (other tables). V062 refuses the client, before any
+        // request, when that data may not go to the AI endpoint's region.
 
         match kind.as_str() {
             AI_CONTRACT_FIX_KIND => {
@@ -2713,7 +2711,8 @@ impl LanguageServer for RockyLsp {
                     .map(|r| r.type_check.typed_models.clone())
                     .unwrap_or_default();
                 // The prompt carries the model's upstream schemas: a project
-                // model has its pipeline's region, any other table none.
+                // model has its pipeline's region, any other table the
+                // regions of the replication or snapshot that writes it.
                 let (up_models, up_tables): (Vec<&str>, Vec<&str>) = resolved_data
                     .upstream_models
                     .iter()
@@ -2725,7 +2724,14 @@ impl LanguageServer for RockyLsp {
                 drop(lock);
                 let mut models = up_models;
                 models.push(resolved_data.model_name.as_str());
-                let residency = residency_for(&models, &up_tables);
+                let residency = match self.ai_residency_for(&models, &up_tables).await {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
 
                 let outcome =
                     resolve_ai_contract_action(&resolved_data, &typed_models, base_url, residency)
@@ -2744,7 +2750,17 @@ impl LanguageServer for RockyLsp {
                     }
                 };
                 // The prompt names a column of the model.
-                let residency = residency_for(&[resolved_data.model_name.as_str()], &[]);
+                let residency = match self
+                    .ai_residency_for(&[resolved_data.model_name.as_str()], &[])
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
                 let outcome =
                     resolve_ai_classification_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
@@ -2780,7 +2796,17 @@ impl LanguageServer for RockyLsp {
                     }
                 };
                 // The prompt carries the model's temporal column names.
-                let residency = residency_for(&[resolved_data.model_name.as_str()], &[]);
+                let residency = match self
+                    .ai_residency_for(&[resolved_data.model_name.as_str()], &[])
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
                 let outcome =
                     resolve_ai_freshness_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
@@ -6061,6 +6087,56 @@ mod tests {
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
         }
+    }
+
+    /// The V062 lookup of the AI code actions: a broken `rocky.toml` stops
+    /// the arms that carry warehouse data (no fallback that would judge the
+    /// data against an empty config and let it through), and an EU model is
+    /// refused for a US endpoint. No `rocky.toml` refuses nothing.
+    #[tokio::test]
+    async fn ai_residency_for_refuses_on_a_broken_config_and_judges_a_loaded_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let (service, _socket) = LspService::new(test_lsp);
+        let lsp = service.inner();
+        *lsp.models_dir.write().await = Some(models.display().to_string());
+        let client = |residency| {
+            rocky_ai::client::LlmClient::new(
+                rocky_ai::client::AiConfig {
+                    provider: "anthropic".to_string(),
+                    model: "test-model".to_string(),
+                    api_key: rocky_core::redacted::RedactedString::new("k".to_string()),
+                    default_format: "rocky".to_string(),
+                    max_attempts: 1,
+                    max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+                    base_url: None,
+                },
+                residency,
+            )
+        };
+
+        // No `rocky.toml`: nothing carries a label.
+        let residency = lsp.ai_residency_for(&["orders"], &[]).await.unwrap();
+        assert!(client(residency).is_ok());
+
+        let toml = tmp.path().join("rocky.toml");
+        std::fs::write(&toml, "[adapter\n").unwrap();
+        assert!(lsp.ai_residency_for(&["orders"], &[]).await.is_err());
+
+        std::fs::write(
+            &toml,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.xf]\ntype = \"transformation\"\n\n\
+             [pipeline.xf.target]\nadapter = \"default\"\nregion = \"eu\"\n\n\
+             [ai]\nregion = \"us\"\n",
+        )
+        .unwrap();
+        let residency = lsp.ai_residency_for(&["orders"], &[]).await.unwrap();
+        let Err(err) = client(residency) else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        assert!(err.to_string().contains("V062"), "{err}");
     }
 
     /// A newer compile that FAILS built nothing and cleared nothing, so an
