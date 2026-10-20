@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rocky lsp`: an AI fix on a project whose `rocky.toml` does not load now tells the editor why it does nothing. The server sends a `window/showMessage` warning, `rocky.toml did not load; AI fix disabled: <load error>`. The refusal stays: with no loaded `rocky.toml` the AI host is unknown, so Rocky still sends no request and never sends the API key to the default host. Before, the only trace was a line in the LSP log (#2451).
 - DuckDB `offline` and `extension_directory` now reach the local connections that did not read them. `rocky test`, `rocky ci`, the seed run of `rocky compile` and `rocky publish-ir --with-seed`, and `rocky replay --execute` opened DuckDB with defaults, so they ran `INSTALL icu` from the network even when the project said `offline = true`. They now read the `type = "duckdb"` adapters in `rocky.toml` (offline when any sets `offline = true`). `rocky replay --execute` now loads `rocky.toml` and refuses one that exists and does not load. `rocky_test` calls from MCP and the fulfill loop now load `rocky.toml` too, so a `rocky.toml` that fails to load fails them. `rocky playground` seeds before a `rocky.toml` exists and stays on defaults. `rocky validate` warns with `V059` when either setting is on a non-DuckDB adapter.
 
 ## [1.87.0] — 2026-10-20

@@ -2677,7 +2677,20 @@ impl LanguageServer for RockyLsp {
         let base_url = match self.ai_base_url().await {
             Ok(url) => url,
             Err(message) => {
+                // The refusal stays: without a loaded `rocky.toml` the
+                // project's AI host is unknown, and the key must never go
+                // to the default host by mistake. But a log line alone
+                // left the user clicking a fix that did nothing (#2451),
+                // so the editor is told why. This runs in a request
+                // handler the client is waiting on, never inside the
+                // startup compile, so the send cannot stall the handshake.
                 tracing::warn!(error = %message, "code_action_resolve: AI base URL unresolved");
+                self.client
+                    .show_message(
+                        tower_lsp::lsp_types::MessageType::WARNING,
+                        format!("Rocky: rocky.toml did not load; AI fix disabled: {message}"),
+                    )
+                    .await;
                 action.data = Some(data);
                 return Ok(action);
             }
@@ -6137,6 +6150,98 @@ mod tests {
             panic!("an EU model to a US endpoint must be refused");
         };
         assert!(err.to_string().contains("V062"), "{err}");
+    }
+
+    /// #2451: a resolve against a `rocky.toml` that does not load keeps the
+    /// refusal (the action comes back unresolved, so no AI request ran) and
+    /// tells the editor why with a `window/showMessage` warning. Before, the
+    /// only trace was a log line, and the fix did nothing in silence.
+    #[tokio::test]
+    async fn an_ai_fix_with_a_broken_config_shows_why_and_sends_no_request() {
+        use futures::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(tmp.path().join("rocky.toml"), "[adapter\n").unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        let shown: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = shown.clone();
+        tokio::spawn(async move {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "window/showMessage" {
+                    sink.lock()
+                        .unwrap()
+                        .push(outgoing.params().cloned().unwrap_or_default());
+                }
+            }
+        });
+        // The client drops notifications until the session is initialized.
+        // The root has no `models`, so there is no startup compile.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_uri = Url::from_directory_path(empty.path()).unwrap();
+        for request in [
+            tower_lsp::jsonrpc::Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": empty_uri }))
+                .finish(),
+            tower_lsp::jsonrpc::Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            tower::ServiceExt::ready(&mut service).await.unwrap();
+            tower::Service::call(&mut service, request).await.unwrap();
+        }
+        let lsp = service.inner();
+        *lsp.models_dir.write().await = Some(models.display().to_string());
+
+        let uri = Url::from_file_path(models.join("bad.rocky")).unwrap();
+        let data = serde_json::to_value(AiDslActionData {
+            kind: AI_DSL_FIX_KIND.to_string(),
+            diagnostic_message: "unexpected token".to_string(),
+            rocky_source: "selct !!".to_string(),
+            uri,
+        })
+        .unwrap();
+        let action = CodeAction {
+            title: "Fix with AI".to_string(),
+            data: Some(data.clone()),
+            ..Default::default()
+        };
+        let resolved = lsp.code_action_resolve(action).await.unwrap();
+        // Any AI arm that ran would have set an edit or appended a
+        // disabled reason to the title; the refusal returns it untouched.
+        assert!(resolved.edit.is_none(), "no fix was produced");
+        assert_eq!(resolved.title, "Fix with AI", "no AI outcome was applied");
+        assert_eq!(resolved.data, Some(data), "the payload is handed back");
+
+        let messages = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let seen = shown.lock().unwrap().clone();
+                if !seen.is_empty() {
+                    return seen;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the editor must be told why the AI fix did nothing");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(
+            messages[0]["type"],
+            serde_json::json!(2),
+            "MessageType::WARNING: {:?}",
+            messages[0]
+        );
+        let text = messages[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("rocky.toml did not load; AI fix disabled"),
+            "{text}"
+        );
+        assert!(
+            text.len() > "Rocky: rocky.toml did not load; AI fix disabled: ".len(),
+            "the load error is included: {text}"
+        );
     }
 
     /// A newer compile that FAILS built nothing and cleared nothing, so an
