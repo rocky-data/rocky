@@ -1299,9 +1299,13 @@ mod tests {
     }
 
     /// ADR-TYPES §3: the order of the branches cannot change the result. The
-    /// first triple is the case a pairwise fold gets wrong: with `Unknown` as
-    /// the fold's identity, `DEC(30,0), DEC(30,30), DEC(5,2)` folds to
-    /// `DECIMAL(5,2)`, three integer digits where the first branch needs 30.
+    /// first triple needs 60 digits, so the set is `Unknown`. A pairwise fold
+    /// that applies the cap and starts from `Unknown` would depend on the
+    /// order: `DEC(30,0), DEC(30,30)` reaches `Unknown`, and `DEC(5,2)` then
+    /// replaces it with `DECIMAL(5,2)`, three integer digits where the first
+    /// branch needs 30. Main's fold had no cap: it took `max(precision)` and
+    /// `max(scale)`, giving `DECIMAL(30,30)` in every order, which is
+    /// independent of the order but holds no integer digit.
     #[test]
     fn common_supertype_of_is_order_independent() {
         let triples = [
