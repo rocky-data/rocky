@@ -42,7 +42,7 @@ skip_unchanged = true
 skip_rowcount_fallback = true
 ```
 
-Rocky must prove that a raw table did not change. It probes `MAX(<timestamp>)` only for an `incremental` or `microbatch` model, because only those name a timestamp column. A `full_refresh`, `table` or `view` model has no timestamp to probe. All five models in this example are `full_refresh`. Without the second line, the two staging models never skip, and so nothing downstream of them skips.
+Rocky must prove that a raw table did not change. It probes `MAX(<timestamp>)` only for an `incremental` or `microbatch` model that sets a timestamp column. A model with any other strategy, `full_refresh` included, has no timestamp to probe. All five models in this example are `full_refresh`. Without the second line, the two staging models never skip, and so nothing downstream of them skips.
 
 With the second line, Rocky compares the row count of the raw table instead. A row count is a weaker signal than a timestamp. It can miss an `UPDATE` that keeps the same number of rows. If your models are `incremental` with a `timestamp_column`, you do not need it.
 
