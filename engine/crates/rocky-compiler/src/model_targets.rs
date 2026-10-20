@@ -311,8 +311,8 @@ impl ModelRegions {
     /// The regions of `table`, a table that is not a project model, named
     /// `<schema>.<table>` or `<catalog>.<schema>.<table>`.
     ///
-    /// The last dot-separated part is the table. Every run of parts just
-    /// before it is tried as the schema (`b.c` and `c` for `a.b.c.t`), so a
+    /// The last dot-separated part is the table. Every tail of the parts
+    /// before it is tried as the schema (`a.b.c`, `b.c` and `c` for `a.b.c.t`), so a
     /// schema name that holds a `.` (a `source.schema_pattern` with
     /// `separator = "."`, for example) is matched too. A split that is not
     /// the real one can only add regions. The name is compared as given: no
