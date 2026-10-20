@@ -371,6 +371,33 @@ pub async fn run_ai_sync(
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
     let setup = ai_setup(config_path)?;
+    run_ai_sync_with(
+        &setup,
+        state_path,
+        models_dir,
+        apply,
+        model_filter,
+        with_intent,
+        output_json,
+        cache_ttl_override,
+    )
+    .await
+}
+
+/// [`run_ai_sync`] with the AI settings already read, so a test can supply
+/// them without `ANTHROPIC_API_KEY`.
+#[allow(clippy::too_many_arguments)]
+async fn run_ai_sync_with(
+    setup: &AiSetup,
+    state_path: &Path,
+    models_dir: &str,
+    apply: bool,
+    model_filter: Option<&str>,
+    with_intent: bool,
+    output_json: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<()> {
+    let config_path = setup.config_path.as_path();
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_with_intent: Vec<&rocky_core::models::Model> = result
@@ -404,6 +431,10 @@ pub async fn run_ai_sync(
         return Ok(());
     }
 
+    // Each prompt carries the model's upstream schemas. Built before the
+    // baseline below is written, so a V062 refusal leaves nothing on disk.
+    let client = setup.client_for_models(&result, &models_with_intent, true)?;
+
     // Diff each model's upstream schemas against the baseline stored next to
     // the state store. A model with no baseline (first sync) proceeds on
     // intent alone, and its current upstream schemas become the baseline.
@@ -425,8 +456,6 @@ pub async fn run_ai_sync(
         save_ai_sync_snapshot(&snapshot_path, &snapshot)?;
     }
 
-    // Each prompt carries the model's upstream schemas.
-    let client = setup.client_for_models(&result, &models_with_intent, true)?;
     let mut proposals = Vec::new();
 
     for (model, diff) in models_with_intent.iter().zip(&diffs) {
@@ -990,6 +1019,43 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// A V062 refusal in `ai-sync` writes nothing: the client is refused
+    /// before the first-run baseline is saved, and no request is sent.
+    #[tokio::test]
+    async fn ai_sync_refusal_writes_no_baseline() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let models = ai_sync_project(tmp.path(), "SELECT 1 AS id, 'a' AS name");
+        let setup = residency_setup(tmp.path(), "eu", "", server.uri());
+        let state_path = tmp.path().join("state.redb");
+
+        let Err(err) = run_ai_sync_with(
+            &setup,
+            &state_path,
+            models.to_str().unwrap(),
+            false,
+            None,
+            false,
+            true,
+            None,
+        )
+        .await
+        else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        assert!(format!("{err:#}").starts_with("V062"), "{err:#}");
+        assert!(
+            !ai_sync_snapshot_path(&state_path).exists(),
+            "a refused ai-sync must not write its baseline"
+        );
+        server.verify().await;
     }
 
     #[test]
