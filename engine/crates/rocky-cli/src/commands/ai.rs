@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use rocky_ai::client::{AiConfig, DEFAULT_MAX_TOKENS, LlmClient};
 use rocky_ai::generate;
+use rocky_ai::residency::AiResidency;
 use rocky_ai::sidecar::{SidecarMaterialization, SidecarTarget, write_model_files};
 use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
 use rocky_compiler::types::TypedColumn;
@@ -32,7 +33,9 @@ fn proposed_source_format(file_path: &std::path::Path) -> &'static str {
     }
 }
 
-/// Create an LLM client from environment + project config.
+/// Read the AI settings from environment + project config. The client is
+/// built later by [`AiSetup::client`], once the caller knows which data its
+/// requests carry (V062).
 ///
 /// Reads `[ai] max_tokens` from `rocky.toml`. A project with NO `rocky.toml`
 /// falls back to [`DEFAULT_MAX_TOKENS`], so `rocky ai` keeps working in a
@@ -53,7 +56,7 @@ fn proposed_source_format(file_path: &std::path::Path) -> &'static str {
 ///
 /// `api_key` is wrapped in [`RedactedString`] so any future `?config` /
 /// `{:?}` formatting in trace output prints `***` instead of the secret.
-fn make_client(config_path: &Path) -> Result<LlmClient> {
+fn ai_setup(config_path: &Path) -> Result<AiSetup> {
     // The config is read BEFORE the API key, deliberately. A broken
     // `rocky.toml` is a project-level fault the operator must fix either way,
     // and reading it first is what makes this refusal reachable from a unit
@@ -61,13 +64,12 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
     // `unsafe` on edition 2024 and racy across test threads). The only
     // behaviour this reorders is the message a user with NEITHER a key NOR a
     // loadable config sees: the config error rather than the key error.
-    let ai_section = rocky_core::config::load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?
-        .map(|cfg| cfg.ai);
-    let max_tokens = ai_section
-        .as_ref()
-        .map_or(DEFAULT_MAX_TOKENS, |ai| ai.max_tokens);
-    let base_url = rocky_ai::client::resolve_base_url(ai_section.and_then(|ai| ai.base_url));
+    let project = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let ai_section = project.as_ref().map(|cfg| &cfg.ai);
+    let max_tokens = ai_section.map_or(DEFAULT_MAX_TOKENS, |ai| ai.max_tokens);
+    let base_url =
+        rocky_ai::client::resolve_base_url(ai_section.and_then(|ai| ai.base_url.clone()));
 
     let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
         .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.")?;
@@ -82,7 +84,64 @@ fn make_client(config_path: &Path) -> Result<LlmClient> {
         base_url,
     };
 
-    LlmClient::new(config).map_err(|e| anyhow::anyhow!("{e}"))
+    Ok(AiSetup {
+        project,
+        config_path: config_path.to_path_buf(),
+        ai: config,
+    })
+}
+
+/// The AI settings of one `rocky ai*` command, read before its compile.
+struct AiSetup {
+    project: Option<rocky_core::config::RockyConfig>,
+    config_path: PathBuf,
+    ai: AiConfig,
+}
+
+impl AiSetup {
+    /// Build the client for requests that carry the schemas of `models`
+    /// (project models) and `tables` (other tables). Refuses with V062,
+    /// before any request is sent, when that data may not go to the `[ai]`
+    /// endpoint's region. Each command builds one client for all its
+    /// requests, so one refused item refuses every request of the command.
+    fn client(&self, models: &[&str], tables: &[&str]) -> Result<LlmClient> {
+        let data = rocky_ai::residency::data_regions(
+            self.project.as_ref(),
+            &self.config_path,
+            models,
+            tables,
+        );
+        let residency = AiResidency::for_data(self.project.as_ref(), &data);
+        LlmClient::new(self.ai.clone(), residency).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// [`Self::client`] for requests about `models`: each model's own schema
+    /// and the schemas of its direct upstreams (`with_upstreams`).
+    fn client_for_models(
+        &self,
+        result: &CompileResult,
+        models: &[&rocky_core::models::Model],
+        with_upstreams: bool,
+    ) -> Result<LlmClient> {
+        let mut model_names: Vec<String> = Vec::new();
+        let mut tables: Vec<String> = Vec::new();
+        for model in models {
+            model_names.push(model.config.name.clone());
+            if with_upstreams {
+                let (up_models, up_tables) =
+                    rocky_ai::residency::upstream_schemas(result, &model.config.name);
+                model_names.extend(up_models);
+                tables.extend(up_tables);
+            }
+        }
+        model_names.sort();
+        model_names.dedup();
+        tables.sort();
+        tables.dedup();
+        let model_refs: Vec<&str> = model_names.iter().map(String::as_str).collect();
+        let table_refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+        self.client(&model_refs, &table_refs)
+    }
 }
 
 /// Compile the project from a models directory.
@@ -176,7 +235,7 @@ pub async fn run_ai(
     target: Option<&str>,
     overwrite: bool,
 ) -> Result<()> {
-    let client = make_client(config_path)?;
+    let setup = ai_setup(config_path)?;
     let fmt = format.unwrap_or("rocky");
 
     // Validate sidecar inputs up-front — failing here costs no LLM tokens.
@@ -208,6 +267,14 @@ pub async fn run_ai(
     let (model_schemas, source_tables) = match &compile_result {
         Some(r) => build_schema_context(r),
         None => (Vec::new(), Vec::new()),
+    };
+
+    // The prompt carries every schema above: the client refuses (V062)
+    // before any request when one of them may not go to the AI endpoint.
+    let client = {
+        let models: Vec<&str> = model_schemas.iter().map(|(n, _)| n.as_str()).collect();
+        let tables: Vec<&str> = source_tables.iter().map(|(n, _)| n.as_str()).collect();
+        setup.client(&models, &tables)?
     };
 
     // Missing (not implemented): validation gets empty `source_schemas`
@@ -304,7 +371,34 @@ pub async fn run_ai_sync(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client(config_path)?;
+    let setup = ai_setup(config_path)?;
+    run_ai_sync_with(
+        &setup,
+        state_path,
+        models_dir,
+        apply,
+        model_filter,
+        with_intent,
+        output_json,
+        cache_ttl_override,
+    )
+    .await
+}
+
+/// [`run_ai_sync`] with the AI settings already read, so a test can supply
+/// them without `ANTHROPIC_API_KEY`.
+#[allow(clippy::too_many_arguments)]
+async fn run_ai_sync_with(
+    setup: &AiSetup,
+    state_path: &Path,
+    models_dir: &str,
+    apply: bool,
+    model_filter: Option<&str>,
+    with_intent: bool,
+    output_json: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<()> {
+    let config_path = setup.config_path.as_path();
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_with_intent: Vec<&rocky_core::models::Model> = result
@@ -337,6 +431,10 @@ pub async fn run_ai_sync(
         }
         return Ok(());
     }
+
+    // Each prompt carries the model's upstream schemas. Built before the
+    // baseline below is written, so a V062 refusal leaves nothing on disk.
+    let client = setup.client_for_models(&result, &models_with_intent, true)?;
 
     // Diff each model's upstream schemas against the baseline stored next to
     // the state store. A model with no baseline (first sync) proceeds on
@@ -623,7 +721,7 @@ pub async fn run_ai_explain(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client(config_path)?;
+    let setup = ai_setup(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_explain: Vec<&rocky_core::models::Model> = result
@@ -646,6 +744,8 @@ pub async fn run_ai_explain(
         return Ok(());
     }
 
+    // Each prompt carries the model's schema and its upstream schemas.
+    let client = setup.client_for_models(&result, &models_to_explain, true)?;
     let mut explanations: Vec<AiExplanation> = Vec::new();
 
     for model in &models_to_explain {
@@ -693,7 +793,7 @@ pub async fn run_ai_test(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    let client = make_client(config_path)?;
+    let setup = ai_setup(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
     let models_to_test: Vec<&rocky_core::models::Model> = result
@@ -716,6 +816,8 @@ pub async fn run_ai_test(
         return Ok(());
     }
 
+    // Each prompt carries the model's own schema.
+    let client = setup.client_for_models(&result, &models_to_test, false)?;
     let mut all_results: Vec<AiTestModelResult> = Vec::new();
 
     for model in &models_to_test {
@@ -769,6 +871,132 @@ pub async fn run_ai_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `AiSetup` for a project whose only pipeline writes to `target`, with
+    /// `[ai] region = "us"`, pointed at a mock endpoint.
+    fn residency_setup(dir: &Path, target: &str, extra: &str, base_url: String) -> AiSetup {
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                 [pipeline.xf]\ntype = \"transformation\"\n\n\
+                 [pipeline.xf.target]\nadapter = \"default\"\nregion = \"{target}\"\n\n\
+                 [ai]\nregion = \"us\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        let project = rocky_core::config::load_optional_project_config(Some(&config_path))
+            .expect("loads")
+            .expect("present");
+        AiSetup {
+            project: Some(project),
+            config_path,
+            ai: AiConfig {
+                provider: "anthropic".to_string(),
+                model: "test-model".to_string(),
+                api_key: RedactedString::new("test-key".to_string()),
+                default_format: "rocky".to_string(),
+                max_attempts: 1,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                base_url: Some(base_url),
+            },
+        }
+    }
+
+    /// V062 on the `rocky ai*` path: a request about an EU model to a US
+    /// endpoint is refused when the client is built, and no request reaches
+    /// the endpoint. A source table of unknown region passes without
+    /// `enforce`, and `allow` lets the EU model through.
+    #[tokio::test]
+    async fn ai_client_refuses_an_eu_model_for_a_us_endpoint_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let setup = residency_setup(tmp.path(), "eu", "", server.uri());
+        let Err(err) = setup.client(&["orders"], &[]) else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("V062") && rendered.contains("`orders`"),
+            "{rendered}"
+        );
+        assert!(setup.client(&[], &["raw.orders"]).is_ok());
+
+        let allowed = residency_setup(
+            tmp.path(),
+            "eu",
+            "\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+            server.uri(),
+        );
+        assert!(allowed.client(&["orders"], &[]).is_ok());
+        server.verify().await;
+    }
+
+    /// V062 for a SOURCE table from the schema cache. `discover
+    /// --with-schemas` caches a replication's source tables under
+    /// `schema_cache_key(source_catalog, schema, table)`, and `rocky ai`
+    /// puts every cached table in its prompt. An EU source table must be
+    /// refused for a US endpoint, without `enforce`. Before the fix it had no
+    /// known region and went.
+    ///
+    /// Also pins the name form that reaches the residency check: the cache
+    /// key lowercased, its catalog part dropped, and no quotes.
+    #[test]
+    fn ai_client_refuses_an_eu_replication_source_table_from_the_schema_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        ai_sync_project(tmp.path(), "SELECT 1 AS id");
+        let setup = residency_setup(
+            tmp.path(),
+            "us",
+            "\n[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"src__\"\n\
+             separator = \"__\"\ncomponents = [\"tenant\", \"regions...\", \"source\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\nregion = \"eu\"\n",
+            "http://127.0.0.1:9".to_string(),
+        );
+        {
+            let store =
+                rocky_core::state::StateStore::open(&tmp.path().join("state.redb")).unwrap();
+            let key = rocky_core::schema_cache::schema_cache_key(
+                "Src_Cat",
+                "Src__Acme__EU__Shopify",
+                "Orders",
+            );
+            let entry = rocky_core::schema_cache::SchemaCacheEntry {
+                columns: vec![rocky_core::schema_cache::StoredColumn {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: false,
+                }],
+                cached_at: chrono::Utc::now(),
+            };
+            store.write_schema_cache_entry(&key, &entry).unwrap();
+        }
+
+        let result = ai_sync_compile(tmp.path());
+        let (models, tables) = build_schema_context(&result);
+        let tables: Vec<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(tables, vec!["src__acme__eu__shopify.orders"]);
+        let models: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
+
+        let Err(err) = setup.client(&models, &tables) else {
+            panic!("an EU source table to a US endpoint must be refused");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("V062") && rendered.contains("src__acme__eu__shopify.orders"),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn proposed_source_format_detects_rocky_and_sql() {
@@ -851,6 +1079,43 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// A V062 refusal in `ai-sync` writes nothing: the client is refused
+    /// before the first-run baseline is saved, and no request is sent.
+    #[tokio::test]
+    async fn ai_sync_refusal_writes_no_baseline() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let models = ai_sync_project(tmp.path(), "SELECT 1 AS id, 'a' AS name");
+        let setup = residency_setup(tmp.path(), "eu", "", server.uri());
+        let state_path = tmp.path().join("state.redb");
+
+        let Err(err) = run_ai_sync_with(
+            &setup,
+            &state_path,
+            models.to_str().unwrap(),
+            false,
+            None,
+            false,
+            true,
+            None,
+        )
+        .await
+        else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        assert!(format!("{err:#}").starts_with("V062"), "{err:#}");
+        assert!(
+            !ai_sync_snapshot_path(&state_path).exists(),
+            "a refused ai-sync must not write its baseline"
+        );
+        server.verify().await;
     }
 
     #[test]
@@ -956,9 +1221,9 @@ mod tests {
     // #1680 — the two config reads `rocky ai` makes.
     //
     // `compile_project` is #1667's converted caller (its shared-loader test
-    // stays green if `.ok()` comes back here). `make_client` is the `[ai]`
+    // stays green if `.ok()` comes back here). `ai_setup` is the `[ai]`
     // secondary read, and it matters most for `rocky ai generate`, whose own
-    // compile is `compile_project(..).ok()` — so `make_client` is the ONLY
+    // compile is `compile_project(..).ok()` — so `ai_setup` is the ONLY
     // place that subcommand can see a broken config at all.
     // ------------------------------------------------------------------
 
@@ -1034,14 +1299,14 @@ mod tests {
     /// The `[ai]` secondary read: a present-but-unloadable `rocky.toml` refuses
     /// the client build instead of silently falling back to
     /// `DEFAULT_MAX_TOKENS`. Asserted without touching `ANTHROPIC_API_KEY`,
-    /// which `make_client` reads only after the config.
+    /// which `ai_setup` reads only after the config.
     #[test]
-    fn ai_make_client_refuses_a_present_but_unloadable_config() {
+    fn ai_setup_refuses_a_present_but_unloadable_config() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("rocky.toml");
         std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
 
-        let Err(err) = make_client(&cfg) else {
+        let Err(err) = ai_setup(&cfg) else {
             panic!("a present but unloadable rocky.toml must refuse the ai client");
         };
         let rendered = format!("{err:#}");
@@ -1060,7 +1325,7 @@ mod tests {
     /// site used before, that config silently discarded a configured
     /// `[ai] max_tokens`; the tolerant loader honours it.
     #[test]
-    fn ai_make_client_tolerates_an_unset_credential_var() {
+    fn ai_setup_tolerates_an_unset_credential_var() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("rocky.toml");
         std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1680).unwrap();
@@ -1076,8 +1341,8 @@ mod tests {
                 .is_some()
         );
 
-        // `make_client` gets past the config and stops only at the API key.
-        match make_client(&cfg) {
+        // `ai_setup` gets past the config and stops only at the API key.
+        match ai_setup(&cfg) {
             Ok(_) => {}
             Err(e) => {
                 let rendered = format!("{e:#}");

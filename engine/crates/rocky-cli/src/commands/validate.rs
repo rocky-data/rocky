@@ -74,6 +74,17 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         out.push(config_error_diagnostic(&err, config_path));
     }
 
+    // V062: a pipeline region label that an AI request could not carry to
+    // the `[ai]` endpoint. A hint, not an error. It says only that an AI
+    // request carrying data with that label would be refused. It does not
+    // check that any AI feature carries that data (a source label reaches
+    // one only through `ai-contract` or a replicated table), and the project
+    // may never make an AI request; `rocky run` never does. The refusal
+    // itself happens when the AI client is built, before any request.
+    for err in rocky_core::config::ai_cross_region_labels(&cfg) {
+        out.push(ai_residency_warning(&err, config_path));
+    }
+
     // V002: a document with no `[adapter*]` and no `[pipeline.*]` at all has
     // nothing for `rocky run`/`plan`/`discover` to act on — every one of
     // them would exit having done nothing, silently. V010/V020 below already
@@ -499,7 +510,7 @@ fn freshness_deprecations(
 /// A project without a `products/` directory emits nothing — the block
 /// is silent rather than noisy for the majority that don't use specs.
 fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
-    let root = config_path.parent().unwrap_or(Path::new("."));
+    let root = crate::commands::product::product_command_root(config_path);
     let products_dir = root.join("products");
     let Ok(entries) = std::fs::read_dir(&products_dir) else {
         return;
@@ -673,7 +684,9 @@ fn transformation_model_selections(
 /// Codes are a public contract, so the two pre-existing ones keep their exact
 /// meaning — V032 for `[adapter.*]` `kind` invariants, V033 for pipeline
 /// adapter-role mismatches — V057 covers a `manual` adapter's `schemas` list
-/// (#1994), and everything else the chain rejects lands on
+/// (#1994), V060 a `region` label missing under `[residency] enforce` or not
+/// well-formed, V061 a pipeline whose source and target regions differ, and
+/// everything else the chain rejects lands on
 /// V046 rather than the V001 parse code, which already carries both the "Config
 /// syntax valid" ok message and the "Failed to parse config" error.
 fn config_error_diagnostic(
@@ -748,6 +761,11 @@ fn config_error_diagnostic(
         ConfigError::DuplicateCheckName { pipeline, .. } => {
             ("V046", Some(format!("pipeline.{pipeline}.checks")))
         }
+        ConfigError::ResidencyRegionMissing { field }
+        | ConfigError::ResidencyRegionMalformed { field, .. } => ("V060", Some(field.clone())),
+        ConfigError::ResidencyCrossRegion { pipeline, .. } => {
+            ("V061", Some(format!("pipeline.{pipeline}.target.region")))
+        }
         ConfigError::CostPriceInvalid { key, .. } => ("V046", Some(format!("cost.{key}"))),
         _ => ("V046", None),
     };
@@ -758,6 +776,21 @@ fn config_error_diagnostic(
         message: err.to_string(),
         file: Some(config_path.display().to_string()),
         field,
+    }
+}
+
+/// A V062 warning for one pipeline region that an AI request could not
+/// carry to the `[ai]` endpoint, pointing at `ai.region`.
+fn ai_residency_warning(
+    err: &rocky_core::config::ConfigError,
+    config_path: &Path,
+) -> ValidateMessage {
+    ValidateMessage {
+        severity: "warn".into(),
+        code: "V062".into(),
+        message: err.to_string(),
+        file: Some(config_path.display().to_string()),
+        field: Some("ai.region".into()),
     }
 }
 
@@ -1061,6 +1094,29 @@ fn validate_adapter(
                     message,
                     file: None,
                     field: Some(format!("adapter.{name}.type")),
+                });
+            }
+        }
+    }
+
+    // V059: `extension_directory` and `offline` are DuckDB settings. On any
+    // other adapter type nothing reads them, so a project that relies on
+    // `offline = true` to keep a run off the network is not protected.
+    if adapter.adapter_type != "duckdb" {
+        for (key, set) in [
+            ("extension_directory", adapter.extension_directory.is_some()),
+            ("offline", adapter.offline),
+        ] {
+            if set {
+                msgs.push(ValidateMessage {
+                    severity: "warn".into(),
+                    code: "V059".into(),
+                    message: format!(
+                        "adapter.{name}: `{key}` is set on a '{}' adapter. Only `type = \"duckdb\"` adapters read it, so it has no effect here. Remove it, or move it to the DuckDB adapter.",
+                        adapter.adapter_type
+                    ),
+                    file: None,
+                    field: Some(format!("adapter.{name}.{key}")),
                 });
             }
         }
@@ -3295,6 +3351,28 @@ schema_template = "demo"
         );
     }
 
+    #[test]
+    fn duckdb_settings_on_another_adapter_type_warn_v059() {
+        let out = validate_toml(
+            "[adapter.default]\ntype = \"duckdb\"\noffline = true\n\n\
+             [adapter.wh]\ntype = \"databricks\"\nhost = \"h\"\nhttp_path = \"/p\"\n\
+             token = \"t\"\nextension_directory = \"/x\"\noffline = true\n\n\
+             [pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\
+             [pipeline.p.source]\nadapter = \"default\"\n\
+             [pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"s\"]\n\
+             [pipeline.p.target]\nadapter = \"wh\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n",
+        );
+        let hits: Vec<_> = out.messages.iter().filter(|m| m.code == "V059").collect();
+        let fields: Vec<_> = hits.iter().filter_map(|m| m.field.as_deref()).collect();
+        assert_eq!(
+            fields,
+            ["adapter.wh.extension_directory", "adapter.wh.offline"],
+            "{:?}",
+            out.messages
+        );
+        assert!(hits.iter().all(|m| m.severity == "warn"));
+    }
+
     /// #2005 case 5: a DuckDB adapter with no `path` used as a pipeline's
     /// discovery adapter runs discovery against an in-memory database and
     /// silently finds nothing. A single-adapter project auto-wires
@@ -3950,6 +4028,185 @@ schema_template = "staging__{{source}}"
             .filter(|m| m.code == code && m.severity == severity)
             .map(|m| m.message.clone())
             .collect()
+    }
+
+    /// `[residency] enforce = true` with an unlabelled target and `[ai]` is
+    /// one V060 error per missing label, each pointing at its key. A labelled
+    /// source raises nothing.
+    #[test]
+    fn residency_missing_region_is_v060_error_per_field() {
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[residency]
+enforce = true
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "eu"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        assert!(!out.valid);
+        let mut fields: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V060" && m.severity == "error")
+            .map(|m| m.field.clone().unwrap_or_default())
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["ai.region", "pipeline.p.target.region"],
+            "{:?}",
+            out.messages
+        );
+    }
+
+    /// A malformed `region` is a V060 error at its key even with no
+    /// `[residency]` block, and is never folded into the V046 catch-all.
+    #[test]
+    fn residency_malformed_region_is_v060_error() {
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "EU"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+"#,
+        );
+        assert!(!out.valid);
+        let v060: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V060" && m.severity == "error")
+            .collect();
+        assert_eq!(v060.len(), 1, "{:?}", out.messages);
+        assert_eq!(v060[0].field.as_deref(), Some("pipeline.p.source.region"));
+        assert!(v060[0].message.contains("\"EU\""), "{}", v060[0].message);
+    }
+
+    /// An EU source with a US target is a V061 error at the target's region
+    /// key, found offline. `[residency] allow` for that direction clears it.
+    #[test]
+    fn residency_cross_region_is_v061_error() {
+        let toml = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source]
+region = "eu"
+
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+region = "us"
+"#;
+        let out = validate_toml(toml);
+        assert!(!out.valid);
+        let v061: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V061" && m.severity == "error")
+            .collect();
+        assert_eq!(v061.len(), 1, "{:?}", out.messages);
+        assert_eq!(v061[0].field.as_deref(), Some("pipeline.p.target.region"));
+
+        let allowed = format!("{toml}\n[residency]\nallow = [{{ from = \"eu\", to = \"us\" }}]\n");
+        let out = validate_toml(&allowed);
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V061"),
+            "{:?}",
+            out.messages
+        );
+    }
+
+    /// A labelled pipeline target in another region than `[ai]` is a V062
+    /// warning at `ai.region`; the config stays valid. `[residency] allow`
+    /// for that direction clears it, and so does a matching region.
+    #[test]
+    fn ai_cross_region_label_is_v062_warning() {
+        let toml = |target: &str, extra: &str| {
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.xf]
+type = "transformation"
+
+[pipeline.xf.target]
+adapter = "default"
+region = "{target}"
+
+[ai]
+region = "us"
+{extra}"#
+            )
+        };
+        let v062 = |out: &ValidateOutput| -> Vec<ValidateMessage> {
+            out.messages
+                .iter()
+                .filter(|m| m.code == "V062")
+                .cloned()
+                .collect()
+        };
+
+        let out = validate_toml(&toml("eu", ""));
+        assert!(out.valid, "{:?}", out.messages);
+        let warnings = v062(&out);
+        assert_eq!(warnings.len(), 1, "{:?}", out.messages);
+        assert_eq!(warnings[0].severity, "warn");
+        assert_eq!(warnings[0].field.as_deref(), Some("ai.region"));
+        assert!(
+            warnings[0].message.contains("pipeline.xf.target"),
+            "{}",
+            warnings[0].message
+        );
+
+        let allowed = toml(
+            "eu",
+            "\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        );
+        assert!(v062(&validate_toml(&allowed)).is_empty());
+        assert!(v062(&validate_toml(&toml("us", ""))).is_empty());
     }
 
     /// #1994: a manual adapter that lists schemas is valid, with no V057

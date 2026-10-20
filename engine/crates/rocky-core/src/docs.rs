@@ -831,6 +831,7 @@ mod tests {
         use indexmap::IndexMap;
 
         let config = RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: IndexMap::new(),
@@ -938,6 +939,7 @@ mod tests {
         use std::collections::HashMap;
 
         let config = RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: IndexMap::new(),
@@ -1046,6 +1048,7 @@ mod tests {
         use indexmap::IndexMap;
 
         let config = RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: IndexMap::new(),

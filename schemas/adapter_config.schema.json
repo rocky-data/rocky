@@ -468,6 +468,13 @@
         "null"
       ]
     },
+    "extension_directory": {
+      "description": "Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "extra": {
       "additionalProperties": true,
       "description": "Escape hatch for adapter-specific keys this struct doesn't model.\n\n`AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.\n\nAuthors of such adapters declare the keys under a nested `[extra]` table:\n\n```toml [adapter.my_trino] type = \"trino\" host = \"https://trino.example.com\" token = \"${TRINO_JWT}\"\n\n[adapter.my_trino.extra] default_schema = \"analytics\" x_trino_user = \"service-account\" ```\n\nTop-level typos still error (`tooken = \"...\"` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get(\"...\")` and validate them themselves — Rocky doesn't schema-check the contents.\n\nValues are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.",
@@ -514,6 +521,10 @@
         }
       ],
       "description": "OAuth access token (pre-obtained from an IdP)."
+    },
+    "offline": {
+      "description": "When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.",
+      "type": "boolean"
     },
     "password": {
       "anyOf": [

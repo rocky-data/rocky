@@ -1849,6 +1849,8 @@ mod tests {
                         output_version: None,
                         stored_bytes: None,
                         output_target: None,
+                        due_at: None,
+                        wait_for_upstream_ms: None,
                     }],
                     trigger: RunTrigger::Manual,
                     config_hash: "cfg".to_string(),
@@ -1867,6 +1869,7 @@ mod tests {
                     verify_after_failed: false,
                     rocky_branch: None,
                     run_scope: Some(rocky_core::state::RunScope::Production),
+                    queued_ms: None,
                 })
                 .unwrap();
         }
@@ -3208,6 +3211,8 @@ mod tests {
                             output_version: None,
                             stored_bytes: None,
                             output_target: None,
+                            due_at: None,
+                            wait_for_upstream_ms: None,
                         }],
                         trigger: RunTrigger::Manual,
                         config_hash: "cfg".to_string(),
@@ -3226,6 +3231,7 @@ mod tests {
                         verify_after_failed: false,
                         rocky_branch: None,
                         run_scope: Some(rocky_core::state::RunScope::Production),
+                        queued_ms: None,
                     })
                     .unwrap();
 

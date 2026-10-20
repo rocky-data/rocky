@@ -5880,6 +5880,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 .await
             } else if execute {
                 rocky_cli::commands::run_replay_execute(
+                    &cli.config,
                     &state_path,
                     &run_ref,
                     model.as_deref(),

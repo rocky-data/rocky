@@ -450,6 +450,73 @@ pub enum ConfigError {
     )]
     StateFreezeMarkerWritesUnsupportedBackend { backend: EnvString },
 
+    /// `[residency] enforce = true`, and a source, target or `[ai]` block
+    /// has no `region` (or an empty one). `field` is the dotted key path,
+    /// e.g. `pipeline.bronze.target.region`.
+    #[error(
+        "V060: [residency] enforce = true requires a region label, but `{field}` is not set. \
+         Set it to the region where that data lives (e.g. \"eu-west-1\"), \
+         or set `[residency] enforce = false`."
+    )]
+    ResidencyRegionMissing { field: String },
+
+    /// A `region` label is set but is not lowercase letters, digits and
+    /// hyphens, starting with a letter or digit. Checked whether or not
+    /// `[residency] enforce` is on: labels compare as exact text, so `"EU"`
+    /// and `" eu"` would otherwise count as regions other than `"eu"`.
+    #[error(
+        "V060: `{field}` = {value:?} is not a valid region label. \
+         A region label uses only lowercase letters, digits and hyphens, \
+         and starts with a letter or digit (e.g. \"eu-west-1\")."
+    )]
+    ResidencyRegionMalformed { field: String, value: String },
+
+    /// A pipeline's source and target both carry a region label, the labels
+    /// differ, and `[residency] allow` has no `{ from, to }` entry for that
+    /// direction. Checked whether or not `enforce` is on: two labels that
+    /// disagree declare a cross-region move.
+    #[error(
+        "V061: pipeline `{pipeline}` reads from region {from:?} \
+         (`pipeline.{pipeline}.source.region`) and writes to region {to:?} \
+         (`pipeline.{pipeline}.target.region`). Rocky refuses a plan that moves \
+         data from one region to another. If the move is deliberate, add \
+         `{{ from = {from:?}, to = {to:?} }}` to `[residency] allow`."
+    )]
+    ResidencyCrossRegion {
+        pipeline: String,
+        from: String,
+        to: String,
+    },
+
+    /// An AI request would carry data from region `from` to an AI endpoint
+    /// whose `[ai] region` is `to`, and `[residency] allow` has no
+    /// `{ from, to }` entry. Raised at call time, before any request is sent,
+    /// by [`check_ai_residency`]; `rocky validate` reports the same pairs as
+    /// warnings. `data` names what the request carries, e.g. "model `orders`".
+    #[error(
+        "V062: the AI request carries {data}, which is in region {from:?}, and the AI \
+         endpoint is in region {to:?} (`ai.region`). Rocky refuses to send data from one \
+         region to an AI endpoint in another. If this is deliberate, add \
+         `{{ from = {from:?}, to = {to:?} }}` to `[residency] allow`."
+    )]
+    ResidencyAiCrossRegion {
+        data: String,
+        from: String,
+        to: String,
+    },
+
+    /// `[residency] enforce = true`, and an AI request would carry data that
+    /// has no region label, so Rocky cannot show that the data may go to the
+    /// AI endpoint. Raised at call time by [`check_ai_residency`].
+    #[error(
+        "V062: [residency] enforce = true, and the AI request carries {data}, which has no \
+         known region. Rocky refuses to send data of unknown region to the AI endpoint. \
+         A model takes the `region` of the target of each pipeline that loads it. A table \
+         that is not a Rocky model takes the regions of the replication, snapshot or \
+         load pipeline that writes it, and has no region when no pipeline does."
+    )]
+    ResidencyAiRegionUnknown { data: String },
+
     /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
     /// infinite. Detection compares a deviation against the threshold, and
     /// every comparison with NaN is false, so a NaN threshold flagged nothing
@@ -3375,6 +3442,12 @@ pub struct RockyConfig {
     /// see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
     #[serde(default)]
     pub resilience: ResilienceConfig,
+
+    /// `[residency]` — require region labels. Absent ⇒ no requirement, and
+    /// the key is not serialized, so a project without the block keeps its
+    /// config snapshot byte-identical. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residency: Option<ResidencyConfig>,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.
@@ -4449,6 +4522,234 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// Is `label` a well-formed region label: `^[a-z0-9][a-z0-9-]*$`?
+fn is_well_formed_region(label: &str) -> bool {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    ok(first) && chars.all(|c| ok(c) || c == '-')
+}
+
+/// Every `region` slot in the config, with its dotted key path:
+/// `(field, label)`. Pipeline sources and targets first, then `[ai]`.
+fn region_slots(config: &RockyConfig) -> Vec<(String, Option<&str>)> {
+    let mut slots = Vec::new();
+    for (name, pipeline) in &config.pipelines {
+        if let Some(source) = pipeline.source_region() {
+            slots.push((format!("pipeline.{name}.source.region"), source));
+        }
+        slots.push((
+            format!("pipeline.{name}.target.region"),
+            pipeline.target_region(),
+        ));
+    }
+    slots.push(("ai.region".to_string(), config.ai.region.as_deref()));
+    slots
+}
+
+/// Validates every `region` label and `[residency]`.
+///
+/// - A set label must be well-formed (`^[a-z0-9][a-z0-9-]*$`), whether or not
+///   `enforce` is on: [`ConfigError::ResidencyRegionMalformed`]. Rocky does
+///   not normalize labels, so `"EU"` is refused rather than read as `"eu"`.
+/// - With `[residency] enforce = true`, every pipeline source block, every
+///   pipeline target block and `[ai]` must carry a non-empty label:
+///   [`ConfigError::ResidencyRegionMissing`]. A blank label under `enforce`
+///   is reported as missing, not malformed.
+///
+/// - A replication or snapshot pipeline whose source and target labels are
+///   both set and differ is refused, whether or not `enforce` is on, unless
+///   `[residency] allow` lists that `{ from, to }` direction:
+///   [`ConfigError::ResidencyCrossRegion`] (V061).
+///
+/// A load pipeline has no source block (it reads `source_dir`), so only its
+/// target is checked.
+///
+/// Errors come in this order: label shape and missing labels, then the
+/// `allow` labels, then cross-region pipelines. The fail-fast load reports
+/// the first one.
+pub fn validate_residency(config: &RockyConfig) -> Vec<ConfigError> {
+    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
+    let mut errors = Vec::new();
+    for (field, label) in region_slots(config) {
+        match label {
+            Some(label) if enforce && label.trim().is_empty() => {
+                errors.push(ConfigError::ResidencyRegionMissing { field });
+            }
+            Some(label) if !is_well_formed_region(label) => {
+                errors.push(ConfigError::ResidencyRegionMalformed {
+                    field,
+                    value: label.to_string(),
+                });
+            }
+            Some(_) => {}
+            None if enforce => errors.push(ConfigError::ResidencyRegionMissing { field }),
+            None => {}
+        }
+    }
+    let allow = config
+        .residency
+        .as_ref()
+        .map_or(&[][..], |r| r.allow.as_slice());
+    for (i, entry) in allow.iter().enumerate() {
+        for (end, label) in [("from", &entry.from), ("to", &entry.to)] {
+            if !is_well_formed_region(label) {
+                errors.push(ConfigError::ResidencyRegionMalformed {
+                    field: format!("residency.allow[{i}].{end}"),
+                    value: label.clone(),
+                });
+            }
+        }
+    }
+    errors.extend(
+        cross_region_edges(config)
+            .into_iter()
+            .filter_map(|(pipeline, from, to)| {
+                let allowed = allow.iter().any(|a| a.from == from && a.to == to);
+                (!allowed).then(|| ConfigError::ResidencyCrossRegion {
+                    pipeline: pipeline.clone(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                })
+            }),
+    );
+    errors
+}
+
+/// One item an AI request carries from the warehouse, and its region.
+///
+/// Built by the AI callers and judged by [`check_ai_residency`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiDataRegion {
+    /// What the item is, for the refusal message, e.g. "model `orders`".
+    pub data: String,
+    /// Its region label. `None` when Rocky knows no region for it.
+    pub region: Option<String>,
+}
+
+/// May an AI request that carries `data` go to the `[ai]` endpoint?
+///
+/// The same rule as V061, with the AI endpoint as the target:
+///
+/// ```text
+///   data region   ai.region   enforce   result
+///   "eu"          "eu"        any       ok
+///   "eu"          "us"        any       V062 unless allow { from = "eu", to = "us" }
+///   none          any         true      V062 (unknown region)
+///   any           none        true      V060 (ai.region missing)
+///   none or any   none / any  false     ok when either side has no label
+/// ```
+///
+/// `config` is `None` for a project with no `rocky.toml`: nothing carries a
+/// label, so nothing is refused. Returns the first refusal, in `data` order.
+/// Call it before any request is sent.
+pub fn check_ai_residency(
+    config: Option<&RockyConfig>,
+    data: &[AiDataRegion],
+) -> Result<(), ConfigError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let enforce = config.residency.as_ref().is_some_and(|r| r.enforce);
+    let allow = config
+        .residency
+        .as_ref()
+        .map_or(&[][..], |r| r.allow.as_slice());
+    let ai_region = config.ai.region.as_deref().filter(|r| !r.trim().is_empty());
+    for item in data {
+        let region = item.region.as_deref().filter(|r| !r.trim().is_empty());
+        match (region, ai_region) {
+            (Some(from), Some(to)) => {
+                let allowed = from == to || allow.iter().any(|a| a.from == from && a.to == to);
+                if !allowed {
+                    return Err(ConfigError::ResidencyAiCrossRegion {
+                        data: item.data.clone(),
+                        from: from.to_string(),
+                        to: to.to_string(),
+                    });
+                }
+            }
+            (None, _) if enforce => {
+                return Err(ConfigError::ResidencyAiRegionUnknown {
+                    data: item.data.clone(),
+                });
+            }
+            (_, None) if enforce => {
+                return Err(ConfigError::ResidencyRegionMissing {
+                    field: "ai.region".to_string(),
+                });
+            }
+            (None, _) | (_, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every pipeline region label that an AI request could not carry to the
+/// `[ai]` endpoint: the label differs from `[ai] region` and `[residency]
+/// allow` lists no such direction. One [`ConfigError::ResidencyAiCrossRegion`]
+/// per pipeline source or target block.
+///
+/// `rocky validate` reports these as warnings, a hint and not a load error.
+/// An AI request that carried data with such a label would be refused, but
+/// this does not check that any AI feature carries that data, or that the
+/// project ever makes an AI request. The refusal itself is
+/// [`check_ai_residency`], when the AI client is built.
+pub fn ai_cross_region_labels(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut out = Vec::new();
+    for (name, pipeline) in &config.pipelines {
+        let mut slots = Vec::new();
+        if let Some(source) = pipeline.source_region() {
+            slots.push(("source", source));
+        }
+        slots.push(("target", pipeline.target_region()));
+        for (end, region) in slots {
+            let Some(region) = region.filter(|r| is_well_formed_region(r)) else {
+                continue;
+            };
+            let item = AiDataRegion {
+                data: format!("data of `pipeline.{name}.{end}`"),
+                region: Some(region.to_string()),
+            };
+            // Only the cross-region case: an unknown region under `enforce`
+            // is already a V060 load error.
+            if let Err(e @ ConfigError::ResidencyAiCrossRegion { .. }) =
+                check_ai_residency(Some(config), std::slice::from_ref(&item))
+            {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// Every pipeline whose source and target both carry a well-formed region
+/// label, and the labels differ: `(pipeline, source region, target region)`.
+///
+/// Only replication and snapshot pipelines have a source block. The SQL
+/// inputs of a transformation, the `tables` of a quality pipeline, a load
+/// pipeline's `source_dir` and a Fivetran `source.discovery` carry no region,
+/// so they form no edge here. Neither does a pipeline-level `depends_on`: it
+/// orders pipelines and does not say what one reads from another. A
+/// malformed label forms no edge; it is already a V060 error.
+fn cross_region_edges(config: &RockyConfig) -> Vec<(&String, &str, &str)> {
+    config
+        .pipelines
+        .iter()
+        .filter_map(|(name, pipeline)| {
+            let from = pipeline
+                .source_region()?
+                .filter(|r| is_well_formed_region(r))?;
+            let to = pipeline
+                .target_region()
+                .filter(|r| is_well_formed_region(r))?;
+            (from != to).then_some((name, from, to))
+        })
+        .collect()
+}
+
 /// Validate that every `[cost]` price is finite and not negative.
 pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
     let cost = &config.cost;
@@ -5096,6 +5397,9 @@ pub struct AiSection {
     /// environment variable is the fallback when this key is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Region label of the AI endpoint. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 impl Default for AiSection {
@@ -5103,8 +5407,49 @@ impl Default for AiSection {
         Self {
             max_tokens: DEFAULT_AI_MAX_TOKENS,
             base_url: None,
+            region: None,
         }
     }
+}
+
+/// `[residency]` — data-residency settings.
+///
+/// A region is a label (`"eu-west-1"`, `"eu"`) set on pipeline sources,
+/// pipeline targets and `[ai]`: lowercase letters, digits and hyphens.
+///
+/// ```toml
+/// [residency]
+/// enforce = true
+/// ```
+///
+/// With `enforce = true`, [`validate_residency`] requires a non-empty
+/// `region` on every pipeline source block, every pipeline target block and
+/// `[ai]`.
+///
+/// Whether or not `enforce` is on, a pipeline whose source and target labels
+/// differ is refused (V061) unless `allow` lists that direction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResidencyConfig {
+    /// Require a `region` label on every source, target and `[ai]`.
+    #[serde(default)]
+    pub enforce: bool,
+
+    /// Cross-region moves that are deliberate. Each entry permits one
+    /// direction, from a source region to a target region. Labels compare as
+    /// exact text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<ResidencyAllow>,
+}
+
+/// One permitted cross-region direction in `[residency] allow`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResidencyAllow {
+    /// Region label of the source.
+    pub from: String,
+    /// Region label of the target.
+    pub to: String,
 }
 
 /// Default value for [`AiSection::max_tokens`]. Mirrors
@@ -5321,6 +5666,22 @@ pub struct AdapterConfig {
     /// A persistent path is required when the same DuckDB adapter is also used
     /// as a discovery source — discovery and warehouse share the same database.
     pub path: Option<EnvString>,
+    /// Directory DuckDB keeps its extensions in (DuckDB's
+    /// `extension_directory` setting). When unset, DuckDB uses its own
+    /// default under the home directory. Every extension Rocky loads reads
+    /// from, and installs into, this one directory.
+    // Skipped when unset, so the config digest a plan records stays the same
+    // for a project that does not use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_directory: Option<EnvString>,
+    /// When `true`, Rocky never runs `INSTALL` for a DuckDB extension and
+    /// turns DuckDB's extension auto-install off. It loads `icu` from the
+    /// extension directory only, and refuses to connect if `icu` is missing
+    /// there. For `rocky compile`, a missing extension only logs a warning.
+    /// A model's own SQL can still install an extension. Default
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline: bool,
 
     // -- Manual discovery fields --
     /// The source schemas and tables a `type = "manual"` discovery adapter
@@ -5449,6 +5810,8 @@ impl std::fmt::Debug for AdapterConfig {
             .field("project_id", &self.project_id)
             .field("location", &self.location)
             .field("path", &self.path)
+            .field("extension_directory", &self.extension_directory)
+            .field("offline", &self.offline)
             .field("schemas", &self.schemas)
             .field("retry", &self.retry)
             .field("cache", &self.cache)
@@ -6438,6 +6801,28 @@ impl PipelineConfig {
         }
     }
 
+    /// The target block's `region` label, regardless of variant.
+    pub fn target_region(&self) -> Option<&str> {
+        match self {
+            Self::Replication(r) => r.target.region.as_deref(),
+            Self::Transformation(t) => t.target.region.as_deref(),
+            Self::Quality(q) => q.target.region.as_deref(),
+            Self::Snapshot(s) => s.target.region.as_deref(),
+            Self::Load(l) => l.target.region.as_deref(),
+        }
+    }
+
+    /// The source block's `region` label. The outer `None` means the
+    /// pipeline type has no source block (transformation, quality, load);
+    /// `Some(None)` means it has one with no label.
+    pub fn source_region(&self) -> Option<Option<&str>> {
+        match self {
+            Self::Replication(r) => Some(r.source.region.as_deref()),
+            Self::Snapshot(s) => Some(s.source.region.as_deref()),
+            Self::Transformation(_) | Self::Quality(_) | Self::Load(_) => None,
+        }
+    }
+
     /// Returns the target adapter name regardless of variant.
     pub fn target_adapter(&self) -> &str {
         match self {
@@ -7172,6 +7557,11 @@ pub struct TransformationTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 // ---- Quality pipeline ----
@@ -7229,6 +7619,11 @@ pub struct QualityTargetConfig {
     /// Name of the adapter to use (references a key in `[adapter.*]`).
     #[serde(default = "default_adapter_name")]
     pub adapter: String,
+
+    /// Region label where the checked data lives. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// A reference to a specific catalog/schema/table for quality checks
@@ -7315,6 +7710,9 @@ pub struct SnapshotSourceConfig {
     pub catalog: String,
     pub schema: String,
     pub table: String,
+    /// Region label where the source data lives. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Target table for a snapshot pipeline (explicit single-table reference + governance).
@@ -7329,6 +7727,10 @@ pub struct SnapshotTargetConfig {
     pub table: String,
     #[serde(default)]
     pub governance: GovernanceConfig,
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 // ---- Load pipeline (file ingestion) ----
@@ -7442,6 +7844,11 @@ pub struct LoadTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Load-specific options parsed from TOML.
@@ -7530,6 +7937,10 @@ pub struct PipelineSourceConfig {
     /// Optional discovery configuration.
     #[serde(default)]
     pub discovery: Option<DiscoveryConfig>,
+
+    /// Region label where the source data lives. See [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Action when `rocky discover` detects a cross-source collision — the same
@@ -7602,6 +8013,11 @@ pub struct PipelineTargetConfig {
     /// Governance settings for the target.
     #[serde(default)]
     pub governance: GovernanceConfig,
+
+    /// Region label where the target stores the data. See
+    /// [`ResidencyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// Collects every `kind`-field and pipeline-role issue in a parsed
@@ -8512,6 +8928,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_freeze_marker_writes,
     validate_checks,
     validate_metadata_columns,
+    validate_residency,
     validate_cost_prices,
 ];
 
@@ -13822,6 +14239,8 @@ table = "customers_history"
             project_id: None,
             location: None,
             path: None,
+            extension_directory: None,
+            offline: false,
             schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
@@ -16712,6 +17131,23 @@ adapter = "default"
         toml::from_str(body).expect("adapter block parses")
     }
 
+    /// The DuckDB extension settings parse, and are absent by default.
+    #[test]
+    fn duckdb_extension_settings_parse_and_default_off() {
+        let plain = adapter_from_toml("type = \"duckdb\"\n");
+        assert!(plain.extension_directory.is_none());
+        assert!(!plain.offline);
+
+        let set = adapter_from_toml(
+            "type = \"duckdb\"\nextension_directory = \"/opt/duckdb-ext\"\noffline = true\n",
+        );
+        assert_eq!(
+            set.extension_directory.expose_opt(),
+            Some("/opt/duckdb-ext")
+        );
+        assert!(set.offline);
+    }
+
     /// Every credential and principal field an adapter block can carry,
     /// each with a value distinctive enough to grep for.
     const CREDENTIAL_FIELDS: &str = r#"
@@ -17520,5 +17956,522 @@ schema_template = "demo"
             "omitting [checks] must not zero the anomaly threshold, which \
              disables detection"
         );
+    }
+
+    /// Every pipeline type that has a source or target block, with no
+    /// `region` anywhere. `extra` is appended verbatim.
+    fn residency_project(extra: &str) -> String {
+        format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+
+[pipeline.xf]
+type = "transformation"
+
+[pipeline.xf.target]
+adapter = "default"
+
+[pipeline.qa]
+type = "quality"
+
+[pipeline.qa.target]
+adapter = "default"
+
+[pipeline.qa.checks]
+row_count = true
+
+[pipeline.snap]
+type = "snapshot"
+unique_key = ["id"]
+updated_at = "updated_at"
+
+[pipeline.snap.source]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[pipeline.snap.target]
+catalog = "c"
+schema = "s"
+table = "t_hist"
+
+[pipeline.ld]
+type = "load"
+source_dir = "data"
+
+[pipeline.ld.target]
+catalog = "c"
+schema = "s"
+{extra}"#
+        )
+    }
+
+    fn parse(raw: &str) -> RockyConfig {
+        parse_rocky_config_str(raw).expect("residency test config parses")
+    }
+
+    fn missing_region_fields(cfg: &RockyConfig) -> Vec<String> {
+        validate_residency(cfg)
+            .into_iter()
+            .map(|e| match e {
+                ConfigError::ResidencyRegionMissing { field } => field,
+                other => panic!("unexpected error {other:?}"),
+            })
+            .collect()
+    }
+
+    /// No `[residency]`, or `enforce = false`, requires nothing.
+    #[test]
+    fn residency_not_enforced_requires_no_region() {
+        assert!(missing_region_fields(&parse(&residency_project(""))).is_empty());
+        let off = parse(&residency_project("\n[residency]\nenforce = false\n"));
+        assert!(missing_region_fields(&off).is_empty());
+    }
+
+    /// `enforce = true` names every source block, every target block and
+    /// `[ai]` that lacks a region. An empty label counts as missing.
+    #[test]
+    fn residency_enforced_names_every_missing_region() {
+        let cfg = parse(&residency_project(
+            "\n[residency]\nenforce = true\n\n[ai]\nregion = \"  \"\n",
+        ));
+        let mut got = missing_region_fields(&cfg);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "ai.region",
+                "pipeline.ld.target.region",
+                "pipeline.qa.target.region",
+                "pipeline.repl.source.region",
+                "pipeline.repl.target.region",
+                "pipeline.snap.source.region",
+                "pipeline.snap.target.region",
+                "pipeline.xf.target.region",
+            ]
+        );
+    }
+
+    /// With every label set, `enforce = true` passes, the labels round-trip
+    /// through serde, and the load path accepts the file.
+    #[test]
+    fn residency_enforced_passes_when_every_region_is_set() {
+        let toml = residency_project(
+            r#"
+[residency]
+enforce = true
+
+[ai]
+region = "us"
+"#,
+        );
+        // Add a region line to each source/target table header.
+        let toml = toml
+            .replace(
+                "[pipeline.repl.target]\n",
+                "[pipeline.repl.target]\nregion = \"eu-west-1\"\n",
+            )
+            .replace(
+                "[pipeline.xf.target]\n",
+                "[pipeline.xf.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.qa.target]\n",
+                "[pipeline.qa.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.snap.source]\n",
+                "[pipeline.snap.source]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.snap.target]\n",
+                "[pipeline.snap.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.ld.target]\n",
+                "[pipeline.ld.target]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.repl.source.schema_pattern]\n",
+                "[pipeline.repl.source]\nregion = \"eu-west-1\"\n\n[pipeline.repl.source.schema_pattern]\n",
+            );
+        let cfg = parse(&toml);
+        assert!(
+            missing_region_fields(&cfg).is_empty(),
+            "{:?}",
+            missing_region_fields(&cfg)
+        );
+        let PipelineConfig::Replication(repl) = &cfg.pipelines["repl"] else {
+            panic!("repl is a replication pipeline");
+        };
+        assert_eq!(repl.source.region.as_deref(), Some("eu-west-1"));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"region\":\"eu-west-1\""), "{json}");
+        assert!(json.contains("\"residency\":{\"enforce\":true}"), "{json}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, &toml).unwrap();
+        load_rocky_config(&path).expect("a fully labelled project loads");
+    }
+
+    /// The load path refuses a missing label with the V060 message, so
+    /// `plan` and `run` cannot proceed on an unlabelled project.
+    #[test]
+    fn residency_enforced_missing_region_refuses_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, residency_project("\n[residency]\nenforce = true\n")).unwrap();
+        let err = load_rocky_config(&path).expect_err("an unlabelled source must refuse");
+        assert!(
+            matches!(err, ConfigError::ResidencyRegionMissing { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("V060:"), "{err}");
+    }
+
+    /// The `(field, value)` of every malformed-label error.
+    fn malformed_region_fields(cfg: &RockyConfig) -> Vec<(String, String)> {
+        validate_residency(cfg)
+            .into_iter()
+            .filter_map(|e| match e {
+                ConfigError::ResidencyRegionMalformed { field, value } => Some((field, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A set label must be lowercase letters, digits and hyphens, starting
+    /// with a letter or digit, even with no `[residency]` block. Each bad
+    /// shape is refused with V060, naming the field and the value as written.
+    /// Rocky never normalizes, so `"EU"` is not read as `"eu"`.
+    #[test]
+    fn residency_refuses_every_malformed_region_label() {
+        for bad in [
+            "EU", "Eu", " eu", "eu ", "", " ", "-eu", "eu_west", "eu.west", "eu west", "eu\t",
+            "\u{e9}u",
+        ] {
+            let toml = residency_project("").replace(
+                "[pipeline.xf.target]\n",
+                &format!("[pipeline.xf.target]\nregion = {bad:?}\n"),
+            );
+            let cfg = parse(&toml);
+            assert_eq!(
+                malformed_region_fields(&cfg),
+                vec![("pipeline.xf.target.region".to_string(), bad.to_string())],
+                "label {bad:?} must be refused"
+            );
+            let err = validate_residency(&cfg).remove(0);
+            let msg = err.to_string();
+            assert!(msg.starts_with("V060:"), "{msg}");
+            assert!(msg.contains("pipeline.xf.target.region"), "{msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rocky.toml");
+            std::fs::write(&path, &toml).unwrap();
+            let err = load_rocky_config(&path).expect_err("a malformed label refuses the load");
+            assert!(
+                matches!(err, ConfigError::ResidencyRegionMalformed { .. }),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// Well-formed labels pass, with or without `enforce`.
+    #[test]
+    fn residency_accepts_well_formed_region_labels() {
+        for good in ["eu", "eu-west-1", "us", "1", "a-", "europe-west4"] {
+            let toml = residency_project("").replace(
+                "[pipeline.xf.target]\n",
+                &format!("[pipeline.xf.target]\nregion = {good:?}\n"),
+            );
+            assert!(
+                validate_residency(&parse(&toml)).is_empty(),
+                "label {good:?} must pass"
+            );
+        }
+    }
+
+    /// Under `enforce`, a blank label is reported once, as missing, and
+    /// a malformed `[ai] region` is malformed, not missing.
+    #[test]
+    fn residency_enforced_blank_is_missing_and_bad_case_is_malformed() {
+        let cfg = parse(&residency_project(
+            "\n[residency]\nenforce = true\n\n[ai]\nregion = \"US\"\n",
+        ));
+        assert_eq!(
+            malformed_region_fields(&cfg),
+            vec![("ai.region".to_string(), "US".to_string())]
+        );
+        assert!(!validate_residency(&cfg).iter().any(
+            |e| matches!(e, ConfigError::ResidencyRegionMissing { field } if field == "ai.region")
+        ));
+    }
+
+    /// `[residency]` rejects an unknown key rather than ignoring it.
+    #[test]
+    fn residency_rejects_an_unknown_key() {
+        let value: toml::Value =
+            toml::from_str("[residency]\nenforce = true\npermit = [\"eu->us\"]\n").unwrap();
+        assert!(value.try_into::<RockyConfig>().is_err());
+        let value: toml::Value =
+            toml::from_str("[residency]\nallow = [{ from = \"eu\", to = \"us\", via = \"x\" }]\n")
+                .unwrap();
+        assert!(value.try_into::<RockyConfig>().is_err());
+    }
+
+    /// A replication pipeline reading `source_region` and writing
+    /// `target_region`, with `extra` appended verbatim.
+    fn cross_region_project(source_region: &str, target_region: &str, extra: &str) -> String {
+        format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.bronze.source]
+region = "{source_region}"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+region = "{target_region}"
+{extra}"#
+        )
+    }
+
+    fn load_str(toml: &str) -> Result<RockyConfig, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, toml).unwrap();
+        load_rocky_config(&path)
+    }
+
+    /// Acceptance: a plan with an EU source and a US target is refused with
+    /// V061 at config load, the funnel `rocky plan`, `rocky run` and
+    /// `rocky apply` all go through. No `[residency]` block is needed: two
+    /// labels that differ are enough.
+    #[test]
+    fn residency_cross_region_pipeline_refuses_the_load() {
+        let err = load_str(&cross_region_project("eu", "us", ""))
+            .expect_err("an EU source with a US target must refuse");
+        let ConfigError::ResidencyCrossRegion { pipeline, from, to } = &err else {
+            panic!("expected V061, got {err:?}");
+        };
+        assert_eq!(
+            (pipeline.as_str(), from.as_str(), to.as_str()),
+            ("bronze", "eu", "us")
+        );
+        let msg = err.to_string();
+        assert!(msg.starts_with("V061:"), "{msg}");
+        assert!(msg.contains("{ from = \"eu\", to = \"us\" }"), "{msg}");
+
+        // `rocky run` / `rocky apply` load through the fingerprinted loader,
+        // offline compile paths through the credential-tolerant one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, cross_region_project("eu", "us", "")).unwrap();
+        assert!(matches!(
+            load_rocky_config_fingerprinted(&path),
+            Err(ConfigError::ResidencyCrossRegion { .. })
+        ));
+        assert!(matches!(
+            load_rocky_config_credential_tolerant(&path),
+            Err(ConfigError::ResidencyCrossRegion { .. })
+        ));
+
+        // Same under `enforce = true` (with `[ai] region` set so V060 stays quiet).
+        let err = load_str(&cross_region_project(
+            "eu",
+            "us",
+            "\n[residency]\nenforce = true\n\n[ai]\nregion = \"us\"\n",
+        ))
+        .expect_err("enforce does not relax the cross-region check");
+        assert!(
+            matches!(err, ConfigError::ResidencyCrossRegion { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A snapshot pipeline is a source → target edge too.
+    #[test]
+    fn residency_cross_region_snapshot_is_refused() {
+        let toml = residency_project("")
+            .replace(
+                "[pipeline.snap.source]\n",
+                "[pipeline.snap.source]\nregion = \"eu\"\n",
+            )
+            .replace(
+                "[pipeline.snap.target]\n",
+                "[pipeline.snap.target]\nregion = \"us\"\n",
+            );
+        let errs = validate_residency(&parse(&toml));
+        assert!(
+            matches!(
+                errs.as_slice(),
+                [ConfigError::ResidencyCrossRegion { pipeline, .. }] if pipeline == "snap"
+            ),
+            "{errs:?}"
+        );
+    }
+
+    /// The same region on both ends, or a label on only one end, is no edge.
+    #[test]
+    fn residency_same_region_or_one_label_passes() {
+        load_str(&cross_region_project("eu", "eu", "")).expect("same region loads");
+        let one_end = cross_region_project("eu", "us", "").replace(
+            "[pipeline.bronze.source]\nregion = \"eu\"\n",
+            "[pipeline.bronze.source]\n",
+        );
+        assert!(!one_end.contains("\"eu\""), "{one_end}");
+        load_str(&one_end).expect("an unlabelled source is no edge without enforce");
+    }
+
+    /// `[residency] allow` lets one direction through, and only that one.
+    #[test]
+    fn residency_allow_permits_one_direction() {
+        let allow = "\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n";
+        let cfg =
+            load_str(&cross_region_project("eu", "us", allow)).expect("an allowed direction loads");
+        assert_eq!(
+            cfg.residency.as_ref().unwrap().allow,
+            vec![ResidencyAllow {
+                from: "eu".into(),
+                to: "us".into()
+            }]
+        );
+        let err = load_str(&cross_region_project("us", "eu", allow))
+            .expect_err("the reverse direction is not allowed");
+        assert!(
+            matches!(&err, ConfigError::ResidencyCrossRegion { from, to, .. } if from == "us" && to == "eu"),
+            "{err:?}"
+        );
+    }
+
+    /// A malformed `allow` label is V060 at its key, and an empty `allow`
+    /// does not serialize.
+    #[test]
+    fn residency_allow_labels_are_checked_and_empty_allow_is_not_serialized() {
+        let cfg = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[residency]\nallow = [{ from = \"EU\", to = \"us\" }]\n",
+        ));
+        assert_eq!(
+            malformed_region_fields(&cfg),
+            vec![("residency.allow[0].from".to_string(), "EU".to_string())]
+        );
+        let cfg = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[residency]\nenforce = false\n",
+        ));
+        let json = serde_json::to_string(&cfg.residency).unwrap();
+        assert_eq!(json, r#"{"enforce":false}"#);
+    }
+
+    fn ai_item(region: Option<&str>) -> AiDataRegion {
+        AiDataRegion {
+            data: "the schema of model `m`".to_string(),
+            region: region.map(str::to_string),
+        }
+    }
+
+    /// V062, case by case: the table in [`check_ai_residency`]'s doc.
+    #[test]
+    fn check_ai_residency_follows_the_v061_rule() {
+        let eu_us = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n",
+        ));
+        let err = check_ai_residency(Some(&eu_us), &[ai_item(Some("eu"))])
+            .expect_err("eu data to a us endpoint");
+        assert!(
+            matches!(&err, ConfigError::ResidencyAiCrossRegion { from, to, .. } if from == "eu" && to == "us"),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("V062"), "{err}");
+        assert!(check_ai_residency(Some(&eu_us), &[ai_item(Some("us"))]).is_ok());
+        assert!(check_ai_residency(Some(&eu_us), &[ai_item(None)]).is_ok());
+        assert!(check_ai_residency(None, &[ai_item(Some("eu"))]).is_ok());
+
+        let allowed = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        ));
+        assert!(check_ai_residency(Some(&allowed), &[ai_item(Some("eu"))]).is_ok());
+
+        let enforced = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"eu\"\n\n[residency]\nenforce = true\n",
+        ));
+        assert!(check_ai_residency(Some(&enforced), &[ai_item(Some("eu"))]).is_ok());
+        assert!(matches!(
+            check_ai_residency(Some(&enforced), &[ai_item(None)]),
+            Err(ConfigError::ResidencyAiRegionUnknown { .. })
+        ));
+
+        // `enforce` with no `[ai] region` (only reachable on a config that
+        // skipped the V060 load check) refuses as V060 at `ai.region`.
+        let no_ai = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[residency]\nenforce = true\n",
+        ));
+        assert!(matches!(
+            check_ai_residency(Some(&no_ai), &[ai_item(Some("eu"))]),
+            Err(ConfigError::ResidencyRegionMissing { field }) if field == "ai.region"
+        ));
+    }
+
+    /// The `rocky validate` V062 warnings: one per labelled pipeline block
+    /// in another region than `[ai]`, none when `allow` lists it.
+    #[test]
+    fn ai_cross_region_labels_names_each_block() {
+        let cfg = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n",
+        ));
+        let data: Vec<String> = ai_cross_region_labels(&cfg)
+            .into_iter()
+            .map(|e| match e {
+                ConfigError::ResidencyAiCrossRegion { data, .. } => data,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            data,
+            vec![
+                "data of `pipeline.bronze.source`",
+                "data of `pipeline.bronze.target`"
+            ]
+        );
+        let allowed = parse(&cross_region_project(
+            "eu",
+            "eu",
+            "\n[ai]\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
+        ));
+        assert!(ai_cross_region_labels(&allowed).is_empty());
     }
 }

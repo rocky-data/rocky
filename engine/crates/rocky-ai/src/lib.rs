@@ -9,6 +9,7 @@ pub mod contract;
 pub mod explain;
 pub mod generate;
 pub mod prompt;
+pub mod residency;
 pub mod sidecar;
 pub mod sync;
 pub mod testgen;

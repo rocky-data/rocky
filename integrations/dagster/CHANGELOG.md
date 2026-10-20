@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The re-exported `ProductStatusOutput` gains an optional `delivery`, and `ProductSpec` gains `deliver_by` and `timezone`. These come from the generated `rocky-sdk` models; nothing in the resource reads them yet.
+
 ## [1.72.0] — 2026-10-20
 
 Pairs with engine 1.87.0. Needs `rocky-sdk>=0.27.0`, so the floor rises from `0.26.0`.

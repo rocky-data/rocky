@@ -427,13 +427,51 @@ impl RockyLsp {
     /// The AI base URL for this project: `[ai] base_url`, else
     /// `ROCKY_AI_BASE_URL`, else `None` (the default endpoint). Resolves the
     /// same way as `rocky ai`. Fails when `rocky.toml` exists but does not
-    /// load, so the key is never sent to the default host by mistake.
+    /// load, so the key is never sent to the default host by mistake. This
+    /// gates every AI arm, the `.rocky` syntax fix included.
     async fn ai_base_url(&self) -> std::result::Result<Option<String>, String> {
         let models_dir = self.models_dir.read().await;
         let toml_path = models_dir
             .as_deref()
             .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)));
         rocky_ai::client::resolve_project_base_url(toml_path.as_deref()).map_err(|e| e.to_string())
+    }
+
+    /// The V062 verdict for an AI code action whose prompt carries the
+    /// schemas of `models` (project models) and `tables` (other tables),
+    /// judged against this project's `rocky.toml`. No `rocky.toml` judges
+    /// against nothing, so nothing is refused.
+    ///
+    /// Fails when `rocky.toml` exists but does not load. There is no
+    /// fallback here: judging warehouse data against an empty config would
+    /// let it through, even under `[residency] enforce`. Only the arms whose
+    /// prompt carries warehouse data call this; the `.rocky` syntax fix does
+    /// not, so this read never stops it.
+    async fn ai_residency_for(
+        &self,
+        models: &[&str],
+        tables: &[&str],
+    ) -> std::result::Result<rocky_ai::residency::AiResidency, String> {
+        let toml_path = {
+            let models_dir = self.models_dir.read().await;
+            models_dir
+                .as_deref()
+                .and_then(|dir| Self::project_config_path(std::path::Path::new(dir)))
+        };
+        let project = rocky_core::config::load_optional_project_config(toml_path.as_deref())
+            .map_err(|e| e.to_string())?;
+        let data = rocky_ai::residency::data_regions(
+            project.as_ref(),
+            toml_path
+                .as_deref()
+                .unwrap_or(std::path::Path::new("rocky.toml")),
+            models,
+            tables,
+        );
+        Ok(rocky_ai::residency::AiResidency::for_data(
+            project.as_ref(),
+            &data,
+        ))
     }
 
     /// The project-level compiler inputs, read from `rocky.toml`.
@@ -827,7 +865,21 @@ impl RockyLsp {
         let schema_cache_config = models_dir
             .parent()
             .map(|root| root.join("rocky.toml"))
-            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
+            .and_then(|toml_path| {
+                if !toml_path.exists() {
+                    return None;
+                }
+                // A config the CLI refuses (V060, V061, a parse error) still
+                // falls back to defaults here, but says why.
+                rocky_core::config::load_rocky_config(&toml_path)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            path = %toml_path.display(),
+                            "rocky.toml did not load, so the schema cache uses its defaults: {e}"
+                        );
+                    })
+                    .ok()
+            })
             .map(|c| c.cache.schemas)
             .unwrap_or_default();
 
@@ -2630,6 +2682,10 @@ impl LanguageServer for RockyLsp {
                 return Ok(action);
             }
         };
+        // Each arm whose prompt carries warehouse data names it to
+        // `ai_residency_for`: the schemas of `models` (project models) and
+        // `tables` (other tables). V062 refuses the client, before any
+        // request, when that data may not go to the AI endpoint's region.
 
         match kind.as_str() {
             AI_CONTRACT_FIX_KIND => {
@@ -2654,10 +2710,32 @@ impl LanguageServer for RockyLsp {
                     .as_ref()
                     .map(|r| r.type_check.typed_models.clone())
                     .unwrap_or_default();
+                // The prompt carries the model's upstream schemas: a project
+                // model has its pipeline's region, any other table the
+                // regions of the replication, snapshot or load that writes it.
+                let (up_models, up_tables): (Vec<&str>, Vec<&str>) = resolved_data
+                    .upstream_models
+                    .iter()
+                    .map(String::as_str)
+                    .partition(|name| {
+                        lock.as_ref()
+                            .is_some_and(|r| r.project.model(name).is_some())
+                    });
                 drop(lock);
+                let mut models = up_models;
+                models.push(resolved_data.model_name.as_str());
+                let residency = match self.ai_residency_for(&models, &up_tables).await {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
 
                 let outcome =
-                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url).await;
+                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url, residency)
+                        .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_CLASSIFICATION_FIX_KIND => {
@@ -2671,7 +2749,20 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_classification_action(&resolved_data, base_url).await;
+                // The prompt names a column of the model.
+                let residency = match self
+                    .ai_residency_for(&[resolved_data.model_name.as_str()], &[])
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+                let outcome =
+                    resolve_ai_classification_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
             }
             AI_DSL_FIX_KIND => {
@@ -2683,7 +2774,14 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_dsl_action(&resolved_data, base_url).await;
+                // The prompt carries the `.rocky` source and a parse
+                // diagnostic: text the user wrote, no warehouse data.
+                let outcome = resolve_ai_dsl_action(
+                    &resolved_data,
+                    base_url,
+                    rocky_ai::residency::AiResidency::no_warehouse_data(),
+                )
+                .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_FRESHNESS_FIX_KIND => {
@@ -2697,7 +2795,20 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
-                let outcome = resolve_ai_freshness_action(&resolved_data, base_url).await;
+                // The prompt carries the model's temporal column names.
+                let residency = match self
+                    .ai_residency_for(&[resolved_data.model_name.as_str()], &[])
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "code_action_resolve: project config unresolved");
+                        action.data = Some(data);
+                        return Ok(action);
+                    }
+                };
+                let outcome =
+                    resolve_ai_freshness_action(&resolved_data, base_url, residency).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
             }
             _ => {
@@ -3497,6 +3608,7 @@ async fn resolve_ai_contract_action(
     data: &AiContractActionData,
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3536,7 +3648,7 @@ async fn resolve_ai_contract_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -3740,6 +3852,7 @@ pub(crate) fn build_ai_classification_action(
 async fn resolve_ai_classification_action(
     data: &AiClassificationActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3767,7 +3880,7 @@ async fn resolve_ai_classification_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -3929,6 +4042,7 @@ pub(crate) fn build_ai_freshness_action(
 async fn resolve_ai_freshness_action(
     data: &AiFreshnessActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -3955,7 +4069,7 @@ async fn resolve_ai_freshness_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -4046,6 +4160,7 @@ pub(crate) fn build_ai_dsl_action(
 async fn resolve_ai_dsl_action(
     data: &AiDslActionData,
     base_url: Option<String>,
+    residency: rocky_ai::residency::AiResidency,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4069,7 +4184,7 @@ async fn resolve_ai_dsl_action(
         base_url,
     };
 
-    let client = match rocky_ai::client::LlmClient::new(ai_config) {
+    let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
     };
@@ -5974,6 +6089,56 @@ mod tests {
         }
     }
 
+    /// The V062 lookup of the AI code actions: a broken `rocky.toml` stops
+    /// the arms that carry warehouse data (no fallback that would judge the
+    /// data against an empty config and let it through), and an EU model is
+    /// refused for a US endpoint. No `rocky.toml` refuses nothing.
+    #[tokio::test]
+    async fn ai_residency_for_refuses_on_a_broken_config_and_judges_a_loaded_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let (service, _socket) = LspService::new(test_lsp);
+        let lsp = service.inner();
+        *lsp.models_dir.write().await = Some(models.display().to_string());
+        let client = |residency| {
+            rocky_ai::client::LlmClient::new(
+                rocky_ai::client::AiConfig {
+                    provider: "anthropic".to_string(),
+                    model: "test-model".to_string(),
+                    api_key: rocky_core::redacted::RedactedString::new("k".to_string()),
+                    default_format: "rocky".to_string(),
+                    max_attempts: 1,
+                    max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+                    base_url: None,
+                },
+                residency,
+            )
+        };
+
+        // No `rocky.toml`: nothing carries a label.
+        let residency = lsp.ai_residency_for(&["orders"], &[]).await.unwrap();
+        assert!(client(residency).is_ok());
+
+        let toml = tmp.path().join("rocky.toml");
+        std::fs::write(&toml, "[adapter\n").unwrap();
+        assert!(lsp.ai_residency_for(&["orders"], &[]).await.is_err());
+
+        std::fs::write(
+            &toml,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.xf]\ntype = \"transformation\"\n\n\
+             [pipeline.xf.target]\nadapter = \"default\"\nregion = \"eu\"\n\n\
+             [ai]\nregion = \"us\"\n",
+        )
+        .unwrap();
+        let residency = lsp.ai_residency_for(&["orders"], &[]).await.unwrap();
+        let Err(err) = client(residency) else {
+            panic!("an EU model to a US endpoint must be refused");
+        };
+        assert!(err.to_string().contains("V062"), "{err}");
+    }
+
     /// A newer compile that FAILS built nothing and cleared nothing, so an
     /// older compile that succeeds and finishes after it is the last good
     /// result: it is published and stored. Dropping it left `compile_result`
@@ -7581,7 +7746,13 @@ mod tests {
             upstream_models: vec!["upstream".into()],
         };
         let typed: IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> = IndexMap::new();
-        let outcome = resolve_ai_contract_action(&data, &typed, None).await;
+        let outcome = resolve_ai_contract_action(
+            &data,
+            &typed,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await;
         match outcome {
             AiResolveOutcome::Disabled(reason) => {
                 assert!(
@@ -7688,7 +7859,13 @@ mod tests {
             rocky_toml_uri: tower_lsp::lsp_types::Url::parse("file:///proj/rocky.toml").unwrap(),
             rocky_toml_text: "[adapter]\ntype = \"duckdb\"\n".into(),
         };
-        match resolve_ai_classification_action(&data, None).await {
+        match resolve_ai_classification_action(
+            &data,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await
+        {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"
@@ -7793,7 +7970,13 @@ mod tests {
             rocky_source: "from upstream\nselct { id }\n".into(),
             uri: tower_lsp::lsp_types::Url::parse("file:///tmp/m/broken.rocky").unwrap(),
         };
-        match resolve_ai_dsl_action(&data, None).await {
+        match resolve_ai_dsl_action(
+            &data,
+            None,
+            rocky_ai::residency::AiResidency::no_warehouse_data(),
+        )
+        .await
+        {
             AiResolveOutcome::Disabled(reason) => assert!(
                 reason.contains(AI_API_KEY_ENV),
                 "disabled reason should name the missing env var, got `{reason}`"

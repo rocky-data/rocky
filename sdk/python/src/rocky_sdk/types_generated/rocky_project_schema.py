@@ -106,6 +106,10 @@ class AiSection(BaseModel):
     """
     Per-request `max_tokens` and cumulative output-token budget across retries. Default [`DEFAULT_AI_MAX_TOKENS`].
     """
+    region: str | None = None
+    """
+    Region label of the AI endpoint. See [`ResidencyConfig`].
+    """
 
 
 class AllowedTypeChange(BaseModel):
@@ -1373,6 +1377,10 @@ class QualityTargetConfig(BaseModel):
     """
     Name of the adapter to use (references a key in `[adapter.*]`).
     """
+    region: str | None = None
+    """
+    Region label where the checked data lives. See [`ResidencyConfig`].
+    """
 
 
 class QuarantineMode1(StrEnum):
@@ -1409,6 +1417,50 @@ class RequiredColumn(BaseModel):
     type: str
     """
     Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type string here that the normalizer does not recognise is reported in `ContractResult::warnings` and not compared — it is yours to correct, and presence and nullability still apply. An unrecognised *landed* type is different: it refuses the load (#1721).
+    """
+
+
+class ResidencyAllow(BaseModel):
+    """
+    One permitted cross-region direction in `[residency] allow`.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    from_: str = Field(..., alias="from")
+    """
+    Region label of the source.
+    """
+    to: str
+    """
+    Region label of the target.
+    """
+
+
+class ResidencyConfig(BaseModel):
+    """
+    `[residency]` — data-residency settings.
+
+    A region is a label (`"eu-west-1"`, `"eu"`) set on pipeline sources, pipeline targets and `[ai]`: lowercase letters, digits and hyphens.
+
+    ```toml [residency] enforce = true ```
+
+    With `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`.
+
+    Whether or not `enforce` is on, a pipeline whose source and target labels differ is refused (V061) unless `allow` lists that direction.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    allow: list[ResidencyAllow] | None = None
+    """
+    Cross-region moves that are deliberate. Each entry permits one direction, from a source region to a target region. Labels compare as exact text.
+    """
+    enforce: bool | None = False
+    """
+    Require a `region` label on every source, target and `[ai]`.
     """
 
 
@@ -1732,6 +1784,10 @@ class SnapshotSourceConfig(BaseModel):
     Name of the adapter to use (references a key in `[adapter.*]`).
     """
     catalog: str
+    region: str | None = None
+    """
+    Region label where the source data lives. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     table: str
 
@@ -2063,6 +2119,10 @@ class AdapterConfig(BaseModel):
     Default database for the session.
     """
     destination_id: str | None = None
+    extension_directory: str | None = None
+    """
+    Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+    """
     extra: dict[str, Any] | None = None
     """
     Escape hatch for adapter-specific keys this struct doesn't model.
@@ -2092,6 +2152,10 @@ class AdapterConfig(BaseModel):
     oauth_token: str | None = None
     """
     OAuth access token (pre-obtained from an IdP).
+    """
+    offline: bool | None = None
+    """
+    When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.
     """
     password: str | None = None
     """
@@ -2454,6 +2518,10 @@ class PipelineSourceConfig(BaseModel):
     discovery: DiscoveryConfig | None = None
     """
     Optional discovery configuration.
+    """
+    region: str | None = None
+    """
+    Region label where the source data lives. See [`ResidencyConfig`].
     """
     schema_pattern: SchemaPatternConfig
     """
@@ -3328,6 +3396,10 @@ class LoadTargetConfig(BaseModel):
     """
     Governance settings for the target.
     """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     """
     Target schema name.
@@ -3368,6 +3440,10 @@ class PipelineTargetConfig(BaseModel):
     )
     """
     Governance settings for the target.
+    """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
     """
     schema_template: str
     """
@@ -3588,6 +3664,10 @@ class SnapshotTargetConfig(BaseModel):
         },
         validate_default=True,
     )
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
+    """
     schema_: str = Field(..., alias="schema")
     table: str
 
@@ -3731,6 +3811,10 @@ class TransformationTargetConfig(BaseModel):
     )
     """
     Governance settings for the target.
+    """
+    region: str | None = None
+    """
+    Region label where the target stores the data. See [`ResidencyConfig`].
     """
 
 
@@ -4158,6 +4242,10 @@ class RockyConfig(BaseModel):
     )
     """
     Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
+    """
+    residency: ResidencyConfig | None = None
+    """
+    `[residency]` — require region labels. Absent ⇒ no requirement, and the key is not serialized, so a project without the block keeps its config snapshot byte-identical. See [`ResidencyConfig`].
     """
     resilience: ResilienceConfig | None = Field(
         {

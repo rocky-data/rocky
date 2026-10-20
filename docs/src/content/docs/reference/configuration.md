@@ -158,7 +158,7 @@ Rocky prints the placeholder, not the value. Some fields print `${DATABRICKS_TOK
 | The policy-decision ledger | A `verify_after` check name and its outcome text are stored as `${NAME}`, so a later reader never needs the value. |
 | `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section is stored beside it, so `rocky apply` still refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |
 | Config errors and model-file errors | Every value of 8 bytes or more that the error quotes, including a TOML parse error in a sidecar, `_defaults.toml` or frontmatter. |
-| Adapter connection fields | The DuckDB `path`; the Databricks `host`, `http_path` and `client_id`; the Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role` and `database`; the BigQuery `project_id` and `location`; the Fivetran `destination_id`. Rocky holds these with their placeholder, so a log line or error that quotes one (for example a DuckDB file that fails to open) prints `${NAME}` when the value is 8 bytes or more (a shorter one, such as a `location` of `US`, prints as itself). Only the adapter connect path reads the value. |
+| Adapter connection fields | The DuckDB `path` and `extension_directory`; the Databricks `host`, `http_path` and `client_id`; the Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role` and `database`; the BigQuery `project_id` and `location`; the Fivetran `destination_id`. Rocky holds these with their placeholder, so a log line or error that quotes one (for example a DuckDB file that fails to open) prints `${NAME}` when the value is 8 bytes or more (a shorter one, such as a `location` of `US`, prints as itself). Only the adapter connect path reads the value. |
 
 A value shorter than 8 bytes is not treated as a secret and prints as itself. The literal in `${VAR:-default}` is already in the file, so it prints as itself too. A value inside a TOML basic string that the parser unescapes (for example `\u0041` or `\t`) is matched in its unescaped form too.
 
@@ -336,6 +336,7 @@ Point the pipeline at the system it reads from.
 |-------|------|----------|-------------|
 | `adapter` | string | Yes | Name of the adapter that reads the source rows. Must match a `[adapter.NAME]` key, and that adapter must move data. A discovery-only adapter such as Fivetran goes in [`source.discovery`](#pipelinenamesourcediscovery) instead. |
 | `catalog` | string | No | Source catalog name (used by warehouse-resident sources like Databricks). |
+| `region` | string | No | The region where the source data lives, for example `"eu-west-1"` or `"eu"`. Lowercase letters, digits and hyphens. Required when [`[residency] enforce = true`](#residency). A `source.discovery` block has no `region` of its own. |
 
 Fivetran lands its tables in your warehouse. The warehouse adapter reads the rows, and the Fivetran adapter (`kind = "discovery"`) only lists what exists. Set it in `source.discovery`.
 
@@ -385,6 +386,7 @@ Say where the pipeline writes. The two templates build the catalog and schema na
 | `adapter` | string | Yes | Name of the warehouse adapter. Must match a `[adapter.NAME]` key. |
 | `catalog_template` | string | Yes | Template for the target catalog name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
 | `schema_template` | string | Yes | Template for the target schema name. Uses `{component}` placeholders (or `{component:SEP}` to pin the join separator for variadic components). |
+| `region` | string | No | The region where the target warehouse stores the data. Lowercase letters, digits and hyphens. Required when [`[residency] enforce = true`](#residency). |
 
 A template without a placeholder (`warehouse`) is static. The two blocks work as one path. `schema_pattern` takes a source schema apart, and the target templates put a destination name back together from the pieces:
 
@@ -903,6 +905,7 @@ Cap what an AI generation can spend, and choose where requests go. The block app
 |-------|------|---------|-------------|
 | `max_tokens` | integer | `4096` | Per-request `max_tokens` sent to the Anthropic Messages API **and** the cumulative output-token budget enforced across the compile-verify retry loop. When the running total of `output_tokens` returned by the LLM across attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of issuing another retry. Increase only when generations legitimately need more headroom (large model surfaces, verbose tests). |
 | `base_url` | string | `https://api.anthropic.com` | Base URL of the Anthropic-compatible API. Rocky sends requests to `{base_url}/v1/messages`. A trailing slash is ignored. The URL must use `https`. Plain `http` works only for loopback hosts (`localhost`, `127.0.0.1`, `::1`), so a local model server works. Rocky refuses any other `http` URL. If the key is unset, Rocky reads the `ROCKY_AI_BASE_URL` environment variable. |
+| `region` | string | None | The region of the AI endpoint, for example `"us"`. Lowercase letters, digits and hyphens. Required when [`[residency] enforce = true`](#residency). |
 
 Every `rocky ai*` command reads this block. Rocky never reads the API key from `rocky.toml`. It comes from the `ANTHROPIC_API_KEY` environment variable instead, so the key never lands on disk in a project file.
 
@@ -1364,6 +1367,134 @@ scope = { classifications = ["pii"] }
 ```
 
 Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `rocky policy test` in CI. A later policy edit then cannot open a hole unnoticed. See [Testing policies](/guides/testing-policies/) for the scenario fields, and [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) for where the gates sit.
+
+---
+
+## `[residency]`
+
+Say which region each pipeline and the AI endpoint is in, and stop a plan or an AI request that moves data from one region to another.
+
+A region is a label, such as `"eu-west-1"` or `"eu"`. It uses only lowercase letters, digits and hyphens, and starts with a letter or digit. Rocky compares labels as exact text, so `"eu"` and `"eu-west-1"` are two different regions. Pick one spelling and keep it. Rocky does not correct a label: `"EU"` or `" eu"` is a `V060` error, whether or not `enforce` is on.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enforce` | bool | `false` | Require a `region` label on every source, target and the `[ai]` block. |
+| `allow` | array of `{ from, to }` | `[]` | Cross-region moves you mean to make. Each entry lets data move from the `from` region to the `to` region, in that direction only. |
+
+```toml
+[residency]
+enforce = true
+allow = [{ from = "eu-west-1", to = "us-east-1" }]
+
+[ai]
+region = "us-east-1"
+
+[pipeline.bronze.source]
+region = "eu-west-1"
+
+[pipeline.bronze.target]
+region = "eu-west-1"
+```
+
+### Cross-region pipelines (`V061`)
+
+A replication or snapshot pipeline reads its `source` and writes its `target`. When both blocks set `region` and the labels differ, Rocky refuses the pipeline with a `V061` error. The check runs whether or not `enforce` is on, because two labels that differ already say the data moves.
+
+```text
+[pipeline.bronze.source] region = "eu"   ──▶   [pipeline.bronze.target] region = "us"
+                                         V061 unless allow has { from = "eu", to = "us" }
+```
+
+`rocky validate` reports `V061` offline, with no warehouse access. Rocky runs the check when it loads the config, so every command that loads it (`plan`, `run`, `apply`, `discover`) refuses the project, not only `plan` and `run`. To let one direction through, add it to `allow`. The reverse direction needs its own entry.
+
+Rocky checks only a pipeline's own source and target. These carry no region, so Rocky does not check them:
+
+- the SQL inputs of a transformation pipeline's models,
+- the `tables` of a quality pipeline,
+- the `source_dir` of a load pipeline,
+- a `source.discovery` block (for example Fivetran),
+- a pipeline-level `depends_on`. It orders pipelines, but it does not say that one reads the other's tables.
+
+So a transformation in `"us"` that reads a table another pipeline wrote in `"eu"` is not refused.
+
+### AI requests (`V062`)
+
+Rocky compares `[ai] region` with the region of the data that an AI request carries. The rule is the same as for `V061`, with the AI endpoint as the target:
+
+```text
+data in region "eu"   ──▶   [ai] region = "us"
+                      V062 unless allow has { from = "eu", to = "us" }
+```
+
+- Data and endpoint in the same region: the request goes.
+- Different regions: Rocky refuses the request with a `V062` error, unless `allow` has an entry from the data's region to the `[ai]` region. The check runs whether or not `enforce` is on.
+- No label on the data or on `[ai]`, and `enforce` is off: the request goes.
+
+Rocky makes the check when it builds the AI client. That is before it profiles the warehouse and before it sends any request, so a refused request sends nothing. `rocky ai-sync` also makes the check before it writes its upstream schema baseline, so a refused run writes no file.
+
+One command builds one AI client, for all the data that its requests carry. So one refused item stops the whole command. For example, `rocky ai-explain --all` over an `"eu"` model and a `"us"` model, with `[ai] region = "us"`, sends no request at all, not even the one for the `"us"` model. Name one model (`rocky ai-explain <model>`, `rocky ai-test <model>`, `rocky ai-sync --model <model>`) to run the models that may go.
+
+Data here means the schema (column names and types), the statistics or the values of a table. The SQL, `.rocky` source or `rocky.toml` text you wrote is not data. Each AI feature carries this data:
+
+| Feature | What the request carries | Region of that data |
+|---------|--------------------------|---------------------|
+| `rocky ai-contract`, MCP `ai_contract` | Statistics of the model's table (row, null and distinct counts; with `--with-data`, also min, max and sample values) | The `target` of the project's pipeline, and its `source` for a replication or snapshot pipeline |
+| `rocky ai-explain`, `rocky ai-sync`, MCP `explain_model`, the editor's contract fix | The model's schema and the schemas of its direct upstreams | The model's region; see below |
+| `rocky ai-test`, MCP `ai_test` | The model's schema | The model's region |
+| `rocky ai "<intent>"` | The schema of every compiled model and source table | The model's region; see below |
+| MCP `suggest_freshness_block`, the editor's freshness and classification fixes | The model's column names | The model's region |
+| The editor's `.rocky` syntax fix | The `.rocky` source and the parse error only | No data, so no check |
+
+A model is in the region of the `target` of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads can run on any pipeline, so it is in the `target` region of every pipeline.
+
+A table that is not a Rocky model, such as a table from the schema cache, takes its region from the pipelines that write it or read it as their source. Rocky reads the table name as `<schema>.<table>`, with an optional catalog part in front.
+
+A pipeline writes these tables (its target side):
+
+- A replication pipeline writes every table in a schema that its `target.schema_template` makes. Each `{placeholder}` in the template stands for any text without a dot. The rest of the template must match as written. So `schema_template = "raw__{source}"` matches the table `raw__crm.orders`, but not `raw__a.b.orders`.
+- A snapshot pipeline writes the one table that its `target.schema` and `target.table` name.
+- A load pipeline writes the table that its `target.schema` and `target.table` name. With no `target.table`, it writes every table in `target.schema`.
+- A table a pipeline writes takes the `target` region of that pipeline. For a replication or snapshot, it takes the `source` region too, because the target holds data copied from the source.
+
+A pipeline reads these tables (its source side). `rocky discover --with-schemas` and `rocky run` put such tables in the schema cache:
+
+- A replication pipeline reads every table in a schema that its `source.schema_pattern` accepts. Rocky uses the parser that discovery uses: the schema starts with `prefix`, and the rest splits on `separator` into at least one part per component. Rocky ignores case and the catalog here, so its match is at least as wide as discovery's. A wider match can only add regions. So `prefix = "src__"`, `separator = "__"` and `components = ["tenant", "regions...", "source"]` match the table `src__acme__eu__shopify.orders`.
+- A snapshot pipeline reads the one table that its `source.schema` and `source.table` name.
+- A load pipeline reads files, not tables. It has no source side.
+- A table a pipeline reads takes only the `source` region of that pipeline.
+
+For both sides:
+
+- Rocky compares the schema and table names without regard to case, because the schema cache stores them in lowercase. It does not compare the catalog. A table that two pipelines match takes the regions of both.
+- A `source` or `target` block with no `region` gives the table "no region" next to its other regions. For example, a replicated table whose `source` has no label has the `target` region and no region. Without `enforce` the label that is there decides. With `enforce = true`, the missing label refuses the request with a `V062` error.
+- A `source.schema_pattern` whose `components` Rocky cannot parse (an empty entry, for example) matches every table. Discovery refuses such a pipeline, so Rocky cannot say which tables it would read.
+- Rocky takes the last dot-separated part of the name as the table. It tries every tail of the parts before it as the schema: for `a.b.c.orders`, the schemas `a.b.c`, `b.c` and `c`. So a schema name that contains a dot, such as one a `source.schema_pattern` with `separator = "."` makes, is matched too. A split that is not the real one can only add regions.
+
+A table that no pipeline writes or reads has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+
+- `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes or reads.
+- `rocky ai-explain` and `rocky ai-sync` are refused for a model that lists such a table in its `depends_on`. Rocky also derives upstreams from the SQL, but only from a bare table name (no `.`) that binds to a model. So a table that is not a model is an upstream only when `depends_on` lists it. A table the SQL reads but `depends_on` does not list is not an upstream, and the request does not carry its schema.
+
+`rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. The warning is a hint, not an error. It says that Rocky would refuse an AI request that carries data with that label. It does not check that any AI feature carries that data: a project may never make an AI request, and `rocky run` never does. The check that refuses a request is the one Rocky makes when it builds the AI client.
+
+`ROCKY_AI_BASE_URL` changes where AI requests go, but not `[ai] region`. Keep the label in step with the endpoint you use.
+
+### Required labels (`V060`)
+
+With `enforce = true`, Rocky requires `region` on each of these blocks:
+
+| Pipeline type | Blocks that need `region` |
+|---------------|---------------------------|
+| `replication` | `source`, `target` |
+| `snapshot` | `source`, `target` |
+| `transformation` | `target` |
+| `quality` | `target` |
+| `load` | `target` |
+| (any) | `[ai]` |
+
+Rocky requires `[ai] region` even when the project never runs `rocky ai`. An empty string counts as missing. A missing label is a `V060` error in `rocky validate`. Every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message.
+
+The `regions...` component in a `schema_pattern` is a different thing: it names part of a source schema, not where the data lives.
 
 ---
 

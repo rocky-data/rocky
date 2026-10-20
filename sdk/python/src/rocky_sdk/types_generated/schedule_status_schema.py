@@ -8,6 +8,38 @@ from enum import StrEnum
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class EstimateBasis3(StrEnum):
+    """
+    From run start to the product's output model finishing.
+    """
+
+    model_delivery = "model_delivery"
+
+
+class EstimateBasis4(StrEnum):
+    """
+    From run start to run finish, for the whole pipeline.
+    """
+
+    pipeline_run = "pipeline_run"
+
+
+class EstimateState3(StrEnum):
+    """
+    At least 5 runs: the band is reported.
+    """
+
+    known = "known"
+
+
+class EstimateState4(StrEnum):
+    """
+    Fewer than 5 runs: no band, no verdict.
+    """
+
+    unknown = "unknown"
+
+
 class ScheduleClaimStatus(BaseModel):
     """
     One claim recorded against a pipeline.
@@ -133,6 +165,41 @@ class TickLockState4(StrEnum):
     wedged = "wedged"
 
 
+class DurationEstimateStatus(BaseModel):
+    """
+    A p50/p90 duration estimate and the sample behind it.
+    """
+
+    basis: EstimateBasis3 | EstimateBasis4
+    """
+    What was timed: `model_delivery` (run start to the model's finish) or `pipeline_run` (run start to run finish).
+    """
+    growth: bool
+    """
+    True when the newest 5 runs were all slower than the p90 of the older ones, so `p90_ms` is the slowest of those 5.
+    """
+    n: conint(ge=0)
+    """
+    How many production runs the estimate read.
+    """
+    p50_ms: conint(ge=0) | None = None
+    """
+    Median duration in milliseconds, when `known`.
+    """
+    p90_ms: conint(ge=0) | None = None
+    """
+    90th-percentile duration in milliseconds, when `known`.
+    """
+    state: EstimateState3 | EstimateState4
+    """
+    `known` with at least 5 runs; `unknown` below that, and then no verdict rests on the estimate.
+    """
+    window: conint(ge=0)
+    """
+    The most runs it reads (the newest 20).
+    """
+
+
 class ScheduleLockStatus(BaseModel):
     """
     The tick lock's state.
@@ -145,6 +212,59 @@ class ScheduleLockStatus(BaseModel):
     state: TickLockState1 | TickLockState2 | TickLockState3 | TickLockState4
     """
     Lock state. Note `free` is the normal steady state — see [`TickLockState`].
+    """
+
+
+class DeliveryStatus(BaseModel):
+    """
+    Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.
+
+    Reported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.
+    """
+
+    at_risk: bool | None = None
+    """
+    True when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`: no verdict.
+    """
+    deliver_by: str
+    """
+    The product's `deliver_by` cron expression.
+    """
+    estimate: DurationEstimateStatus
+    """
+    The duration estimate `at_risk` rests on.
+    """
+    last_delivered_at: AwareDatetime | None = None
+    """
+    When the latest production delivery finished.
+    """
+    last_due_at: AwareDatetime | None = None
+    """
+    The deadline the latest delivery served, when its run recorded one.
+    """
+    late_by_seconds: conint(ge=0) | None = None
+    """
+    How late the latest delivery was, in seconds; `0` when on time. `null` when no delivery recorded a deadline.
+    """
+    next_due_at: AwareDatetime | None = None
+    """
+    The deadline the next delivery must meet. A time in the past means the next delivery is already late.
+    """
+    on_time: bool | None = None
+    """
+    Whether the latest delivery met its deadline. `null` when no delivery recorded a deadline.
+    """
+    output_model: str
+    """
+    The model the product delivers.
+    """
+    product: str
+    """
+    The product whose deadline this is.
+    """
+    timezone: str
+    """
+    The timezone `deliver_by` is read in.
     """
 
 
@@ -180,6 +300,10 @@ class SchedulePipelineStatus(BaseModel):
     cron: str | None = None
     """
     The cron expression, when one is configured.
+    """
+    delivery: DeliveryStatus | None = None
+    """
+    Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline's newest production run that built any such model built. The estimate times the whole pipeline run. Absent when no production run of the pipeline built a product with a deadline.
     """
     enabled: bool
     """

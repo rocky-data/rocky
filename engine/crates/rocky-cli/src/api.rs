@@ -1634,10 +1634,7 @@ fn project_root_for(state: &ServerState) -> Result<std::path::PathBuf, ApiError>
         .config_path
         .as_deref()
         .ok_or_else(ApiError::engine_not_ready)?;
-    Ok(match config.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    })
+    Ok(crate::commands::product::product_command_root(config))
 }
 
 /// `GET /api/v1/products` — canonical [`ProductListOutput`].
@@ -2363,7 +2360,11 @@ fn is_bare_product_name(name: &str) -> bool {
 ///
 /// Reports stored cursors, claims and tick-lock state. It deliberately does
 /// **not** evaluate demand — `rocky tick --dry-run` is the evaluation — so it
-/// stays side-effect free and `O(pipelines)` rather than `O(runs × pipelines)`.
+/// stays side-effect free. With no product declaring `deliver_by` it is
+/// `O(pipelines)`. With one, each pipeline's delivery state reads run history:
+/// the ordering-key walk is `O(pipelines × runs)`, but full-record decoding is
+/// capped at a fixed window of the newest runs per pipeline; see
+/// `commands::schedule_status`.
 async fn schedule_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ScheduleStatusOutput>, ApiError> {
@@ -6794,6 +6795,8 @@ mod tests {
                     output_version: None,
                     stored_bytes: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 }],
                 trigger: RunTrigger::Manual,
                 config_hash: "c".to_string(),
@@ -6812,6 +6815,7 @@ mod tests {
                 verify_after_failed: false,
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
+                queued_ms: None,
             })
             .expect("run recorded");
         store

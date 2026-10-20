@@ -84,6 +84,13 @@
             "null"
           ]
         },
+        "extension_directory": {
+          "description": "Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "extra": {
           "additionalProperties": true,
           "description": "Escape hatch for adapter-specific keys this struct doesn't model.\n\n`AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.\n\nAuthors of such adapters declare the keys under a nested `[extra]` table:\n\n```toml [adapter.my_trino] type = \"trino\" host = \"https://trino.example.com\" token = \"${TRINO_JWT}\"\n\n[adapter.my_trino.extra] default_schema = \"analytics\" x_trino_user = \"service-account\" ```\n\nTop-level typos still error (`tooken = \"...\"` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get(\"...\")` and validate them themselves — Rocky doesn't schema-check the contents.\n\nValues are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.",
@@ -130,6 +137,10 @@
             }
           ],
           "description": "OAuth access token (pre-obtained from an IdP)."
+        },
+        "offline": {
+          "description": "When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.",
+          "type": "boolean"
         },
         "password": {
           "anyOf": [
@@ -411,6 +422,13 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "region": {
+          "description": "Region label of the AI endpoint. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -1925,6 +1943,13 @@
           },
           "description": "Governance settings for the target."
         },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema": {
           "description": "Target schema name.",
           "type": "string"
@@ -2237,6 +2262,13 @@
           "default": null,
           "description": "Optional discovery configuration."
         },
+        "region": {
+          "description": "Region label where the source data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema_pattern": {
           "allOf": [
             {
@@ -2315,6 +2347,13 @@
             "tags": {}
           },
           "description": "Governance settings for the target."
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "schema_template": {
           "description": "Template for the target schema name.",
@@ -3267,6 +3306,13 @@
           "default": "default",
           "description": "Name of the adapter to use (references a key in `[adapter.*]`).",
           "type": "string"
+        },
+        "region": {
+          "description": "Region label where the checked data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -3479,6 +3525,44 @@
         "name",
         "type"
       ],
+      "type": "object"
+    },
+    "ResidencyAllow": {
+      "additionalProperties": false,
+      "description": "One permitted cross-region direction in `[residency] allow`.",
+      "properties": {
+        "from": {
+          "description": "Region label of the source.",
+          "type": "string"
+        },
+        "to": {
+          "description": "Region label of the target.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "ResidencyConfig": {
+      "additionalProperties": false,
+      "description": "`[residency]` — data-residency settings.\n\nA region is a label (`\"eu-west-1\"`, `\"eu\"`) set on pipeline sources, pipeline targets and `[ai]`: lowercase letters, digits and hyphens.\n\n```toml [residency] enforce = true ```\n\nWith `enforce = true`, [`validate_residency`] requires a non-empty `region` on every pipeline source block, every pipeline target block and `[ai]`.\n\nWhether or not `enforce` is on, a pipeline whose source and target labels differ is refused (V061) unless `allow` lists that direction.",
+      "properties": {
+        "allow": {
+          "description": "Cross-region moves that are deliberate. Each entry permits one direction, from a source region to a target region. Labels compare as exact text.",
+          "items": {
+            "$ref": "#/definitions/ResidencyAllow"
+          },
+          "type": "array"
+        },
+        "enforce": {
+          "default": false,
+          "description": "Require a `region` label on every source, target and `[ai]`.",
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "ResilienceConfig": {
@@ -3988,6 +4072,13 @@
         "catalog": {
           "type": "string"
         },
+        "region": {
+          "description": "Region label where the source data lives. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "schema": {
           "type": "string"
         },
@@ -4029,6 +4120,13 @@
             "tag_prefix": null,
             "tags": {}
           }
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "schema": {
           "type": "string"
@@ -4622,6 +4720,13 @@
             "tags": {}
           },
           "description": "Governance settings for the target."
+        },
+        "region": {
+          "description": "Region label where the target stores the data. See [`ResidencyConfig`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -4954,6 +5059,17 @@
         "target_dialect": null
       },
       "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
+    },
+    "residency": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ResidencyConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[residency]` — require region labels. Absent ⇒ no requirement, and the key is not serialized, so a project without the block keeps its config snapshot byte-identical. See [`ResidencyConfig`]."
     },
     "resilience": {
       "allOf": [

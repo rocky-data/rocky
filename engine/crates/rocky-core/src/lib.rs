@@ -20,6 +20,7 @@ pub mod cross_engine;
 pub mod dag_executor;
 pub mod dag_status;
 pub mod dedup_analysis;
+pub mod delivery;
 pub mod docs;
 pub mod docs_site;
 pub mod drift;

@@ -494,6 +494,8 @@ fn test_run_history_flow() {
                 output_version: None,
                 stored_bytes: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             },
             ModelExecution {
                 model_name: "customers".to_string(),
@@ -518,6 +520,8 @@ fn test_run_history_flow() {
                 output_version: None,
                 stored_bytes: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             },
         ],
         trigger: RunTrigger::Manual,
@@ -537,6 +541,7 @@ fn test_run_history_flow() {
         verify_after_failed: false,
         rocky_branch: None,
         run_scope: Some(rocky_core::state::RunScope::Production),
+        queued_ms: None,
     };
 
     store.record_run(&run).unwrap();
@@ -2077,5 +2082,222 @@ mod merge_strategy_e2e {
             result.is_err(),
             "DuckDB MERGE with update_columns = All must error in sql_gen"
         );
+    }
+}
+
+// ===========================================================================
+// Delivery timing: due time and lateness recorded per run
+// ===========================================================================
+//
+// A real DuckDB build of a product's output model, timed by an injected
+// clock. Each run is stamped by `stamp_delivery_timing` (the function the CLI
+// calls before it writes a run record), written to the state store, and read
+// back. The first delivery lands before its 06:00 deadline. The second starts
+// after the next day's deadline and must still serve it, so it records late.
+
+mod delivery_timing_e2e {
+    use chrono::{DateTime, TimeZone, Utc};
+    use rocky_core::delivery::{ProductDeadline, stamp_delivery_timing};
+    use rocky_core::product::spec::DeliverBy;
+    use rocky_core::state::{
+        ModelExecution, RecordedTarget, RunRecord, RunScope, RunStatus, RunTrigger, SessionSource,
+        StateStore,
+    };
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use tempfile::TempDir;
+
+    /// The injected clock: every instant the test uses comes from here.
+    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, day, hour, minute, 0).unwrap()
+    }
+
+    fn deadline() -> ProductDeadline {
+        ProductDeadline {
+            product: "revenue_daily".to_string(),
+            output_model: "revenue_daily".to_string(),
+            deliver_by: DeliverBy {
+                cron: "0 6 * * *".to_string(),
+                tz: chrono_tz::Tz::UTC,
+            },
+        }
+    }
+
+    /// Build the model in DuckDB and return the rows it wrote.
+    async fn build(adapter: &DuckDbWarehouseAdapter) -> u64 {
+        adapter
+            .execute_statement(
+                "CREATE OR REPLACE TABLE main.revenue_daily AS \
+                 SELECT client_id, SUM(amount) AS revenue \
+                 FROM main.charges GROUP BY client_id",
+            )
+            .await
+            .expect("build revenue_daily");
+        let result = adapter
+            .execute_query("SELECT COUNT(*) AS n FROM main.revenue_daily")
+            .await
+            .expect("count rows");
+        let cell = &result.rows[0][0];
+        cell.as_u64()
+            .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
+            .expect("a row count")
+    }
+
+    fn run_record(
+        run_id: &str,
+        started: DateTime<Utc>,
+        model_started: DateTime<Utc>,
+        model_finished: DateTime<Utc>,
+        rows: u64,
+        scope: RunScope,
+    ) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            started_at: started,
+            finished_at: model_finished,
+            status: RunStatus::Success,
+            models_executed: vec![ModelExecution {
+                model_name: "revenue_daily".to_string(),
+                started_at: model_started,
+                finished_at: model_finished,
+                duration_ms: u64::try_from((model_finished - model_started).num_milliseconds())
+                    .unwrap(),
+                rows_affected: Some(rows),
+                status: "success".to_string(),
+                sql_hash: "h".to_string(),
+                skip_hash: None,
+                upstream_freshness: None,
+                bytes_scanned: None,
+                bytes_written: None,
+                tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
+                output_column_hashes: None,
+                attempts: Vec::new(),
+                output_version: None,
+                stored_bytes: None,
+                output_target: Some(RecordedTarget {
+                    model: "revenue_daily".to_string(),
+                    catalog: String::new(),
+                    schema: "main".to_string(),
+                    table: "revenue_daily".to_string(),
+                }),
+                due_at: None,
+                wait_for_upstream_ms: None,
+            }],
+            trigger: RunTrigger::Schedule,
+            config_hash: "cfg".to_string(),
+            triggering_identity: None,
+            session_source: SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "e2e".to_string(),
+            rocky_version: "0.0.0-e2e".to_string(),
+            check_outcomes: Vec::new(),
+            pipeline: Some("revenue".to_string()),
+            submission_id: None,
+            check_gate_failed: false,
+            verify_after_failed: false,
+            rocky_branch: None,
+            run_scope: Some(scope),
+            queued_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn records_lateness_for_an_on_time_run_and_a_late_run() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().expect("open in-memory duckdb");
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.charges AS SELECT * FROM (VALUES \
+                 (1, 100.0), (1, 50.0), (2, 75.0)) AS t(client_id, amount)",
+            )
+            .await
+            .expect("seed charges");
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let deadlines = [deadline()];
+
+        // Day 1: the run starts 05:30, the model starts 05:32, lands 05:40.
+        let rows = build(&adapter).await;
+        assert_eq!(rows, 2, "the build really ran");
+        let mut on_time = run_record(
+            "run-day1",
+            at(1, 5, 30),
+            at(1, 5, 32),
+            at(1, 5, 40),
+            rows,
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut on_time, &store, &deadlines).unwrap();
+        store.record_run(&on_time).unwrap();
+
+        // Day 2: the run starts 07:00, after the day-2 deadline; lands 07:30.
+        let rows = build(&adapter).await;
+        let mut late = run_record(
+            "run-day2",
+            at(2, 7, 0),
+            at(2, 7, 5),
+            at(2, 7, 30),
+            rows,
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut late, &store, &deadlines).unwrap();
+        store.record_run(&late).unwrap();
+
+        let day1 = store.get_run("run-day1").unwrap().expect("day 1 recorded");
+        let exec = &day1.models_executed[0];
+        assert_eq!(exec.due_at, Some(at(1, 6, 0)));
+        assert_eq!(exec.late_by_seconds(), Some(-20 * 60), "20 minutes early");
+        assert_eq!(exec.wait_for_upstream_ms, Some(2 * 60 * 1000));
+
+        let day2 = store.get_run("run-day2").unwrap().expect("day 2 recorded");
+        let exec = &day2.models_executed[0];
+        assert_eq!(
+            exec.due_at,
+            Some(at(2, 6, 0)),
+            "a run that starts after the deadline still serves it"
+        );
+        assert_eq!(exec.late_by_seconds(), Some(90 * 60), "90 minutes late");
+        assert_eq!(exec.wait_for_upstream_ms, Some(5 * 60 * 1000));
+
+        // Day 3: late again. The late day-2 delivery covered day 2 only, so
+        // this one serves day 3 06:00, not day 4.
+        let rows = build(&adapter).await;
+        let mut late_again = run_record(
+            "run-day3",
+            at(3, 7, 0),
+            at(3, 7, 0),
+            at(3, 7, 15),
+            rows,
+            RunScope::Production,
+        );
+        stamp_delivery_timing(&mut late_again, &store, &deadlines).unwrap();
+        store.record_run(&late_again).unwrap();
+        let day3 = store.get_run("run-day3").unwrap().expect("day 3 recorded");
+        assert_eq!(day3.models_executed[0].due_at, Some(at(3, 6, 0)));
+        assert_eq!(day3.models_executed[0].late_by_seconds(), Some(75 * 60));
+    }
+
+    #[tokio::test]
+    async fn a_shadow_run_records_no_deadline() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut shadow = run_record(
+            "run-shadow",
+            at(1, 5, 30),
+            at(1, 5, 30),
+            at(1, 7, 0),
+            1,
+            RunScope::Shadow { schema: None },
+        );
+        stamp_delivery_timing(&mut shadow, &store, &[deadline()]).unwrap();
+        assert_eq!(shadow.models_executed[0].due_at, None);
+        assert_eq!(shadow.models_executed[0].wait_for_upstream_ms, Some(0));
     }
 }
