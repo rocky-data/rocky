@@ -2712,7 +2712,7 @@ impl LanguageServer for RockyLsp {
                     .unwrap_or_default();
                 // The prompt carries the model's upstream schemas: a project
                 // model has its pipeline's region, any other table the
-                // regions of the replication or snapshot that writes it.
+                // regions of the replication, snapshot or load that writes it.
                 let (up_models, up_tables): (Vec<&str>, Vec<&str>) = resolved_data
                     .upstream_models
                     .iter()

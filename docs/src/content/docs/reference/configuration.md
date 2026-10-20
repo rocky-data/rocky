@@ -1419,14 +1419,15 @@ Data here means the schema (column names and types), the statistics or the value
 
 A model is in the region of the `target` of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads can run on any pipeline, so it is in the `target` region of every pipeline.
 
-A table that is not a Rocky model, such as a source table from the schema cache, takes its region from the replication or snapshot pipeline that writes it:
+A table that is not a Rocky model, such as a source table from the schema cache, takes its region from the replication, snapshot or load pipeline that writes it:
 
 - A replication pipeline writes every table in a schema that its `target.schema_template` makes. Each `{placeholder}` in the template stands for any text. So `schema_template = "raw__{source}"` matches the table `raw__crm.orders`.
 - A snapshot pipeline writes the one table that its `target.schema` and `target.table` name.
-- The table takes the `target` region of that pipeline, and its `source` region too, because the target holds data copied from the source.
+- A load pipeline writes the table that its `target.schema` and `target.table` name. With no `target.table`, it writes every table in `target.schema`.
+- The table takes the `target` region of that pipeline. For a replication or snapshot, it takes the `source` region too, because the target holds data copied from the source.
 - Rocky compares the schema and table names without regard to case. It does not compare the catalog. A table that two pipelines match takes the regions of both.
 
-A table that no replication or snapshot pipeline writes has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+A table that no replication, snapshot or load pipeline writes has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
 
 - `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes.
 - `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads such a table directly.

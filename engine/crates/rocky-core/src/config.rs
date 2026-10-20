@@ -510,8 +510,8 @@ pub enum ConfigError {
         "V062: [residency] enforce = true, and the AI request carries {data}, which has no \
          known region. Rocky refuses to send data of unknown region to the AI endpoint. \
          A model takes the `region` of the target of each pipeline that loads it. A table \
-         that is not a Rocky model takes the regions of the replication or snapshot \
-         pipeline that writes it, and has no region when no pipeline does."
+         that is not a Rocky model takes the regions of the replication, snapshot or \
+         load pipeline that writes it, and has no region when no pipeline does."
     )]
     ResidencyAiRegionUnknown { data: String },
 

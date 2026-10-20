@@ -205,8 +205,8 @@ fn pipeline_model_names(
 /// - A pipeline whose model set cannot be read adds its region to every
 ///   model (fail closed).
 ///
-/// A table that is not a model takes its regions from the replication and
-/// snapshot pipelines that write it ([`Self::for_table`]).
+/// A table that is not a model takes its regions from the replication,
+/// snapshot and load pipelines that write it ([`Self::for_table`]).
 ///
 /// `None` in a list is a target with no label. Used to decide whether an AI
 /// request about a model or table may go to the `[ai]` endpoint
@@ -218,7 +218,7 @@ pub struct ModelRegions {
     writers: Vec<TableWriter>,
 }
 
-/// The tables one replication or snapshot pipeline writes, and the regions
+/// The tables one replication, snapshot or load pipeline writes, and the regions
 /// of their data.
 struct TableWriter {
     /// Matches the schema part of a table name.
@@ -236,6 +236,9 @@ enum SchemaMatch {
     /// A replication's `target.schema_template`, each `{placeholder}` a
     /// wildcard.
     Template(regex::Regex),
+    /// A replication template Rocky could not turn into a pattern: it
+    /// matches every schema (fail closed).
+    Any,
 }
 
 impl ModelRegions {
@@ -300,9 +303,11 @@ impl ModelRegions {
     /// A replication pipeline writes every table in a schema its
     /// `target.schema_template` renders, each `{placeholder}` standing for
     /// any text. A snapshot pipeline writes its `target.schema` and
-    /// `target.table`. Each pipeline that writes `table` adds its target
-    /// region, and its source region, because the target holds data copied
-    /// from the source. The catalog part is not compared, so a name can match
+    /// `target.table`. A load pipeline writes its `target.schema` and
+    /// `target.table`, or every table in that schema when `table` is unset.
+    /// Each pipeline that writes `table` adds its target region, and its
+    /// source region (replication and snapshot), because the target holds
+    /// data copied from the source. The catalog part is not compared, so a name can match
     /// more pipelines than really write it: that adds regions, which can only
     /// refuse more. Names compare without regard to case.
     ///
@@ -328,21 +333,27 @@ impl ModelRegions {
 }
 
 impl TableWriter {
-    /// The tables `pipeline` writes, or `None` for a pipeline type that
-    /// writes models (transformation) or no table Rocky can name.
+    /// The tables `pipeline` writes that are not models, or `None` for a
+    /// pipeline type that writes only models (transformation) or no table
+    /// (quality).
     fn of(pipeline: &rocky_core::config::PipelineConfig) -> Option<Self> {
-        let (schema, table) = if let Some(r) = pipeline.as_replication() {
-            (
-                SchemaMatch::Template(schema_template_regex(&r.target.schema_template)?),
+        use rocky_core::config::PipelineConfig;
+        let (schema, table) = match pipeline {
+            PipelineConfig::Replication(r) => (
+                schema_template_regex(&r.target.schema_template)
+                    .map_or(SchemaMatch::Any, SchemaMatch::Template),
                 None,
-            )
-        } else if let Some(s) = pipeline.as_snapshot() {
-            (
+            ),
+            PipelineConfig::Snapshot(s) => (
                 SchemaMatch::Exact(s.target.schema.clone()),
                 Some(s.target.table.clone()),
-            )
-        } else {
-            return None;
+            ),
+            // A load with no `target.table` names each table after its file.
+            PipelineConfig::Load(l) => (
+                SchemaMatch::Exact(l.target.schema.clone()),
+                l.target.table.clone(),
+            ),
+            PipelineConfig::Transformation(_) | PipelineConfig::Quality(_) => return None,
         };
         let mut regions = Vec::new();
         push_unique_region(&mut regions, &pipeline.target_region().map(str::to_string));
@@ -360,6 +371,7 @@ impl TableWriter {
         let schema_matches = match &self.schema {
             SchemaMatch::Exact(s) => s.eq_ignore_ascii_case(schema),
             SchemaMatch::Template(re) => re.is_match(schema),
+            SchemaMatch::Any => true,
         };
         schema_matches
             && self
@@ -597,6 +609,27 @@ mod tests {
             vec![label("eu"), None]
         );
         assert_eq!(regions.for_table("silver.orders"), vec![None]);
+    }
+
+    /// A load pipeline writes its `target.table`, or with no `table`, every
+    /// table in its `target.schema`. It has no source block.
+    #[test]
+    fn a_loaded_table_takes_the_load_target_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let load = |table: &str| {
+            format!(
+                "[pipeline.ingest]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+                 [pipeline.ingest.target]\ncatalog = \"wh\"\nschema = \"landing\"\n\
+                 {table}region = \"eu\"\n"
+            )
+        };
+        let regions = resolve(tmp.path(), &load(""));
+        assert_eq!(regions.for_table("landing.orders"), vec![label("eu")]);
+        assert_eq!(regions.for_table("staging.orders"), vec![None]);
+
+        let regions = resolve(tmp.path(), &load("table = \"orders\"\n"));
+        assert_eq!(regions.for_table("landing.orders"), vec![label("eu")]);
+        assert_eq!(regions.for_table("landing.other"), vec![None]);
     }
 
     /// Two writers match one table: it takes both regions (fail closed).

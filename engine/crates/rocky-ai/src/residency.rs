@@ -16,8 +16,8 @@
 //! values of a table. The SQL or config text a user wrote is not data here.
 //! A model's data is in the region of the target of each pipeline that loads
 //! it ([`ModelRegions`]). A table that is not a project model takes the
-//! target and source regions of each replication or snapshot pipeline that
-//! writes it ([`ModelRegions::for_table`]). Any other table has no known
+//! target and source regions of each replication, snapshot or load pipeline
+//! that writes it ([`ModelRegions::for_table`]). Any other table has no known
 //! region.
 
 use std::path::Path;
@@ -59,7 +59,7 @@ impl AiResidency {
 ///
 /// Each model contributes one item per region of the pipelines that load it
 /// (see [`ModelRegions`]). Each other table contributes one item per region
-/// of the replication or snapshot pipelines that write it, or one item of no
+/// of the replication, snapshot or load pipelines that write it, or one item of no
 /// known region when none does ([`ModelRegions::for_table`]). With no
 /// `config` nothing carries a label, so this returns no items.
 pub fn data_regions(
