@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.87.0] — 2026-10-20
+
+### Upgrade notes
+
+- **State schema v33.** Upgrade every machine and pod that shares a local state file at the same time.
+- **Do not roll back to 1.86.0 on the same local state.** With the default `[state] on_schema_mismatch = "recreate"`, 1.86.0 deletes the local state file and does a full refresh. It does not touch remote state. If you must roll back, restore the state file from a backup, or rebuild it from remote state. 1.86.0 reads the `v32/` remote key, which holds the state from before the upgrade, so runs after the upgrade are not in it.
+- To make an older binary refuse a newer state file instead, set `[state] on_schema_mismatch = "fail"` before you upgrade.
+- An approval made over HTTP (the browser UI's approve job) records the principal `unnamed`, until named tokens ship.
+
 ### Added
 
 - `rocky run` now records the bytes each model's output table stores, and `rocky cost` shows them. `PerModelCostHistorical` gains `stored_bytes` and `stored_bytes_basis`; the table output gains a `stored_bytes` column. An unknown size is omitted, never guessed. There is no run total, because the two bases below do not add up to one honest figure.

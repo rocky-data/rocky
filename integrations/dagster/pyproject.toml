@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.71.0"
+version = "1.72.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -57,7 +57,10 @@ dependencies = [
     # Release rocky-sdk 0.18.0 BEFORE dagster-rocky 1.69.0.
     # 0.26.0: state_path defaults to None. An older SDK sends
     # `--state-path None`. Release rocky-sdk 0.26.0 BEFORE dagster-rocky 1.71.0.
-    "rocky-sdk>=0.26.0",
+    # 0.27.0: `freshness.py` imports `freshness_budget_seconds` and reads
+    # `warn_after` / `error_after`, which 0.26.0 does not have.
+    # Release rocky-sdk 0.27.0 BEFORE dagster-rocky 1.72.0.
+    "rocky-sdk>=0.27.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.

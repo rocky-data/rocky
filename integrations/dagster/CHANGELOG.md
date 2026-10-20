@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.72.0] — 2026-10-20
+
+Pairs with engine 1.87.0. Needs `rocky-sdk>=0.27.0`, so the floor rises from `0.26.0`.
+
+### Changed
+
+- `freshness_policy_from_model` reads the engine's new freshness grammar. A model's `FreshnessPolicy` window is the smaller of its `warn_after` and `error_after`, or the deprecated `max_lag_seconds`. A model with no usable level gets no policy.
+- The scaffolded `rocky.toml` comments out `error_after = "24h"` for pipeline freshness, in place of `threshold_seconds = 86400`.
+
 ## [1.71.0] — 2026-10-17
 
 ### Changed

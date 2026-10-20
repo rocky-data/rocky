@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-20
+
+Pairs with engine 1.87.0.
+
+### Added
+
+- `ModelFreshnessConfig` gains `warn_after`, `error_after`, `time_column` and `severity`, and a `budget_seconds()` method. The new module-level `freshness_budget_seconds()` returns the seconds until a model first reports stale: the smaller of `warn_after` and `error_after`, or the deprecated `max_lag_seconds`. It mirrors the engine's freshness grammar (an integer and one unit of `s`, `h` or `d`).
+- Generated models for the engine 1.87.0 outputs: stored bytes per model in `rocky cost`, approval rows in `rocky audit` and `rocky brief` (`kind`, `approval_channel`), `ReviewOutput.decision_ref`, and a model's `warn_after` / `error_after` in the compile and dag outputs.
+- The generated config models gain `warn_after` / `error_after` on pipeline, project and product freshness, and the three new `[cost]` prices: `compute_cost_per_machine_hour`, `cross_region_transfer_cost_per_gb` and `ai_cost_per_million_tokens`.
+
+### Changed
+
+- These fields are now optional, because a block written with `warn_after` / `error_after` does not carry them. Code that read them as always set must handle `None`.
+  - `ModelFreshnessConfig.max_lag_seconds`.
+  - `threshold_seconds` on the generated pipeline and project freshness models.
+  - `max_lag` on the generated product freshness model.
+
 ## [0.26.0] — 2026-10-17
 
 ### Changed
