@@ -1440,11 +1440,12 @@ For both sides:
 - Rocky compares the schema and table names without regard to case, because the schema cache stores them in lowercase. It does not compare the catalog. A table that two pipelines match takes the regions of both.
 - A `source` or `target` block with no `region` gives the table "no region" next to its other regions. For example, a replicated table whose `source` has no label has the `target` region and no region. Without `enforce` the label that is there decides. With `enforce = true`, the missing label refuses the request with a `V062` error.
 - A `source.schema_pattern` whose `components` Rocky cannot parse (an empty entry, for example) matches every table. Discovery refuses such a pipeline, so Rocky cannot say which tables it would read.
+- Rocky takes the last two dot-separated parts of the name as the schema and the table. So a schema name that contains a dot is not matched, and its tables have no region. For example, a `source.schema_pattern` with `separator = "."` makes such names.
 
 A table that no pipeline writes or reads has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
 
 - `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes or reads.
-- `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads such a table directly.
+- `rocky ai-explain` and `rocky ai-sync` are refused for a model that lists such a table in its `depends_on`. A table the model's SQL reads by a qualified name, but that `depends_on` does not list, is not one of its upstreams, so the request does not carry its schema.
 
 `rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. The warning is a hint, not an error. It says that Rocky would refuse an AI request that carries data with that label. It does not check that any AI feature carries that data: a project may never make an AI request, and `rocky run` never does. The check that refuses a request is the one Rocky makes when it builds the AI client.
 
