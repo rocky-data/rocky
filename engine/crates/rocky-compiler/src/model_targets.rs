@@ -473,10 +473,7 @@ mod tests {
     fn a_claimed_model_takes_its_pipeline_target_region() {
         let tmp = tempfile::tempdir().unwrap();
         write_model(&tmp.path().join("models"), "orders");
-        let regions = resolve(
-            tmp.path(),
-            &transformation("xf", "models/**", Some("eu")),
-        );
+        let regions = resolve(tmp.path(), &transformation("xf", "models/**", Some("eu")));
         assert_eq!(regions.for_model("orders"), vec![label("eu")]);
     }
 
@@ -553,12 +550,18 @@ mod tests {
             tmp.path(),
             &replication("bronze", "raw__{source}", Some("eu"), None),
         );
-        assert_eq!(regions.for_table("raw__crm.orders"), vec![label("eu"), None]);
+        assert_eq!(
+            regions.for_table("raw__crm.orders"),
+            vec![label("eu"), None]
+        );
         assert_eq!(
             regions.for_table("wh.raw__crm.orders"),
             vec![label("eu"), None]
         );
-        assert_eq!(regions.for_table("RAW__CRM.orders"), vec![label("eu"), None]);
+        assert_eq!(
+            regions.for_table("RAW__CRM.orders"),
+            vec![label("eu"), None]
+        );
         // Another schema, and a bare name, are not this pipeline's.
         assert_eq!(regions.for_table("staging.orders"), vec![None]);
         assert_eq!(regions.for_table("orders"), vec![None]);
@@ -576,7 +579,10 @@ mod tests {
             tmp.path(),
             &replication("bronze", "raw__{source}", None, Some("eu")),
         );
-        assert_eq!(regions.for_table("raw__crm.orders"), vec![None, label("eu")]);
+        assert_eq!(
+            regions.for_table("raw__crm.orders"),
+            vec![None, label("eu")]
+        );
     }
 
     #[test]
