@@ -10,6 +10,11 @@
 //! first marker appears. The run checks its cancel token before the next
 //! layer, so it must stop there, inside the 5 s settle grace.
 //!
+//! The hook writes its markers by bare file name into its working
+//! directory, the fixture directory it inherits from rocky. It has no double
+//! quotes: `cmd /C` receives the command through Rust's argument quoting,
+//! which turns `"` into `\"`, and `cmd` does not read that back.
+//!
 //! The hook's `cmd` and `ping` share rocky's process group, so the break
 //! reaches them too. `ping` reports and continues on Ctrl-Break. If the break
 //! ends the hook early anyway, the run races its listener to the next layer;
@@ -43,7 +48,7 @@ unsafe extern "system" {
 }
 
 /// Two models in two layers: `first`, then `after`, which depends on it.
-fn rocky_toml(marker: &Path, done: &Path) -> String {
+fn rocky_toml() -> String {
     format!(
         r#"
 [adapter]
@@ -60,13 +65,15 @@ adapter = "default"
 concurrency = 1
 
 [hook.on_after_model_run]
-command = 'echo fired> "{}" & ping -n 3 127.0.0.1 > nul & echo done> "{}"'
+command = 'echo fired>{MARKER} & ping -n 3 127.0.0.1 > nul & echo done>{DONE}'
 timeout_ms = 60000
-"#,
-        marker.display(),
-        done.display()
+"#
     )
 }
+
+/// File names the hook writes in the fixture directory.
+const MARKER: &str = "hook-fired.txt";
+const DONE: &str = "hook-done.txt";
 
 const FIRST_SQL: &str = "SELECT 1 AS id\n";
 const AFTER_SQL: &str = "SELECT id FROM staging.first\n";
@@ -95,14 +102,14 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().to_path_buf();
-        let marker = dir.join("hook-fired.txt");
-        let done = dir.join("hook-done.txt");
+        let marker = dir.join(MARKER);
+        let done = dir.join(DONE);
         {
             let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
             conn.execute_batch("CREATE SCHEMA IF NOT EXISTS staging;")
                 .expect("seed sql");
         }
-        fs::write(dir.join("rocky.toml"), rocky_toml(&marker, &done)).expect("write rocky.toml");
+        fs::write(dir.join("rocky.toml"), rocky_toml()).expect("write rocky.toml");
         let models = dir.join("models");
         fs::create_dir(&models).expect("mkdir models");
         fs::write(models.join("first.sql"), FIRST_SQL).expect("write model");
@@ -126,7 +133,8 @@ impl Fixture {
             .arg("--output")
             .arg("json")
             .current_dir(&self.dir)
-            .env("RUST_LOG", "error");
+            // `warn`, so a hook that fails shows in the transcript.
+            .env("RUST_LOG", "warn");
         cmd
     }
 }
