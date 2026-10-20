@@ -191,6 +191,10 @@ jobs:
         # cancel and interrupt tests. No step here continues on error: a red
         # job is the signal, and the job is not a required check.
         run: cargo test -p rocky-cli --lib -- cancel interrupt
+      - name: Hook commands run as written (#2447)
+        # A hook command with a quoted path, through `cmd /C`.
+        if: ${{ !cancelled() }}
+        run: cargo test -p rocky-core --lib -- hooks::tests::shell_command hooks::tests::a_windows_hook
       - name: Ctrl-Break settles a run (end to end)
         # Sends a real CTRL_BREAK_EVENT to a child `rocky run` and checks exit
         # 130, the interrupted record, the released idempotency claim, and
