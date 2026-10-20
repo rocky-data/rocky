@@ -53,6 +53,7 @@ pub fn run_ci(
                     project_config.as_ref(),
                     config_path,
                 ),
+                extensions: crate::registry::duckdb_extensions_from(project_config.as_ref()),
             })
         },
     )?;

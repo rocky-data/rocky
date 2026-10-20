@@ -223,9 +223,28 @@ impl DuckDbWarehouseAdapter {
         })
     }
 
+    /// Create an in-memory adapter with explicit extension settings.
+    pub fn in_memory_with(opts: &crate::ExtensionOptions) -> Result<Self, crate::DuckDbError> {
+        let connector = DuckDbConnector::in_memory_with(opts)?;
+        Ok(Self {
+            connector: Arc::new(Mutex::new(connector)),
+            dialect: DuckDbSqlDialect,
+            concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
+        })
+    }
+
     /// Create an adapter wrapping a persistent DuckDB database file.
     pub fn open(path: &std::path::Path) -> Result<Self, crate::DuckDbError> {
-        let connector = DuckDbConnector::open(path)?;
+        Self::open_with(path, &crate::ExtensionOptions::default())
+    }
+
+    /// Create a persistent adapter with explicit extension settings.
+    pub fn open_with(
+        path: &std::path::Path,
+        opts: &crate::ExtensionOptions,
+    ) -> Result<Self, crate::DuckDbError> {
+        let connector = DuckDbConnector::open_with(path, opts)?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,

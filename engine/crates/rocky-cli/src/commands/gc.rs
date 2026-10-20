@@ -2545,6 +2545,8 @@ auto_create_schemas = true
             output_version: None,
             stored_bytes: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         };
         store
             .record_run(&RunRecord {
@@ -2570,6 +2572,7 @@ auto_create_schemas = true
                 verify_after_failed: false,
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
+                queued_ms: None,
             })
             .unwrap();
     }

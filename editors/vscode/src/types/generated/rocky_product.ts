@@ -28,6 +28,10 @@ export interface SpecFile {
  */
 export interface ProductSpec {
   /**
+   * When the output must be delivered: a standard 5-field cron expression, read in `timezone`. Each occurrence is a deadline. Absent means the product declares no deadline, and no lateness is recorded for it.
+   */
+  deliver_by?: string | null;
+  /**
    * Plain-language statement of what the product is for.
    */
   intent: string;
@@ -43,6 +47,10 @@ export interface ProductSpec {
    * Where the data comes from.
    */
   source: SourceSpec;
+  /**
+   * The IANA timezone `deliver_by` is read in (`"Europe/Lisbon"`). Defaults to UTC when omitted. Valid only beside `deliver_by`.
+   */
+  timezone?: string | null;
   /**
    * How much the agent is trusted.
    */

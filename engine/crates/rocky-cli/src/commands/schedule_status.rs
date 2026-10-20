@@ -2,9 +2,22 @@
 //!
 //! A pure read of config + stored cursors + claims + the tick lock. It
 //! deliberately does **not** evaluate demand: `rocky tick --dry-run` is the
-//! evaluation, and duplicating it here would mean a status request could do
-//! history scans and cron searches per pipeline, and could disagree with the
-//! reconciler about what is due.
+//! evaluation, and duplicating it here could make the status disagree with
+//! the reconciler about what is due.
+//!
+//! It does read run history for one thing: delivery state. When any product
+//! declares a `deliver_by` deadline, it reads, per pipeline, the pipeline's
+//! newest production run that built a deadlined model. For a pipeline that
+//! delivers such a product it
+//! also reads the product's latest delivery and the pipeline's last 20
+//! production runs for the duration estimate. Each of those history reads
+//! walks the ordering key of every recorded run (cheap), and decodes full
+//! records only until it finds what it needs. The search for the newest
+//! deadlined build decodes at most [`DELIVERY_LOOKUP_WINDOW`] runs per
+//! pipeline, so full-record decoding is `O(pipelines × window)`; the key walk
+//! stays `O(pipelines × runs)`. A deadlined build older than the window reads
+//! as no delivery. With no product declaring `deliver_by`, it reads no run
+//! history at all.
 //!
 //! The scheduled set comes from [`resolve_schedules_detailed`], the
 //! reconciler's own resolution — not from iterating `config.pipelines` and
@@ -24,8 +37,9 @@ use rocky_core::state::StateStore;
 
 use crate::commands::tick::build_member_budgets;
 use crate::output::{
-    ScheduleClaimStatus, ScheduleLockStatus, SchedulePipelineStatus, ScheduleStatusCounts,
-    ScheduleStatusOutput, ScheduleThrottleKind, ScheduleThrottleStatus, TickLockState,
+    DeliveryStatus, EstimateBasis, ScheduleClaimStatus, ScheduleLockStatus, SchedulePipelineStatus,
+    ScheduleStatusCounts, ScheduleStatusOutput, ScheduleThrottleKind, ScheduleThrottleStatus,
+    TickLockState,
 };
 
 /// Why a schedule-status read failed.
@@ -85,13 +99,17 @@ pub fn schedule_status_output(
     };
 
     let claims_by_pipeline = collect_claims(store.as_ref())?;
+    // The project root every product reader shares: the config's directory.
+    let project_root = crate::commands::product::product_command_root(config_path);
+    let deadlines = crate::commands::product::product_deadlines_in(&project_root);
     let pipelines = build_pipelines(
         &config,
         config_path,
         store.as_ref(),
         &claims_by_pipeline,
+        &deadlines,
         now,
-    );
+    )?;
     let counts = count(&pipelines, now);
 
     Ok(ScheduleStatusOutput {
@@ -170,13 +188,109 @@ fn collect_claims(store: Option<&StateStore>) -> Result<ClaimsByPipeline, Schedu
     Ok(out)
 }
 
+/// How many of the newest recorded runs the delivery lookup decodes per
+/// pipeline.
+///
+/// A window, not a history search: a pipeline whose newest deadlined build is
+/// older than this many runs (of any pipeline) reads as delivering nothing.
+/// It stops a pipeline that never builds a deadlined model from decoding the
+/// whole, never-pruned history on every request.
+const DELIVERY_LOOKUP_WINDOW: usize = 500;
+
+/// The delivery state of the most urgent product deadline `pipeline`
+/// delivers.
+///
+/// The pipeline delivers the products whose output models its newest
+/// production run that built any deadlined model built. With several, the one
+/// whose next deadline comes first wins. `None` without a store, or when no
+/// production run of the pipeline, within the newest [`DELIVERY_LOOKUP_WINDOW`]
+/// runs, built a deadlined model.
+///
+/// # Errors
+///
+/// A run-history read failure is an error, never `None`: `None` says the
+/// pipeline delivers no product with a deadline, which an unread history
+/// cannot show.
+fn pipeline_delivery(
+    pipeline: &str,
+    store: Option<&StateStore>,
+    deadlines: &[rocky_core::delivery::ProductDeadline],
+    now: DateTime<Utc>,
+) -> Result<Option<DeliveryStatus>, ScheduleStatusError> {
+    use rocky_core::state::UnrecordedScope;
+
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    if deadlines.is_empty() {
+        return Ok(None);
+    }
+    // The newest production run of this pipeline that built any deadlined
+    // model. Not simply the newest run: a `--model` run, or a run that failed
+    // before the output model, would otherwise make the pipeline read as
+    // delivering nothing.
+    let latest = store
+        .list_runs_matching_within(1, DELIVERY_LOOKUP_WINDOW, |run| {
+            run.pipeline.as_deref() == Some(pipeline)
+                && run.counts_as_production(UnrecordedScope::Exclude)
+                && run.models_executed.iter().any(|execution| {
+                    deadlines
+                        .iter()
+                        .any(|deadline| deadline.output_model == execution.rocky_model_name())
+                })
+        })
+        .map_err(anyhow::Error::from)?;
+    let Some(run) = latest.first() else {
+        return Ok(None);
+    };
+    let built: std::collections::BTreeSet<&str> = run
+        .models_executed
+        .iter()
+        .map(rocky_core::state::ModelExecution::rocky_model_name)
+        .collect();
+    let delivered: Vec<_> = deadlines
+        .iter()
+        .filter(|deadline| built.contains(deadline.output_model.as_str()))
+        .collect();
+    if delivered.is_empty() {
+        return Ok(None);
+    }
+    let estimate = store
+        .get_pipeline_duration_estimate(pipeline, UnrecordedScope::Exclude)
+        .map_err(anyhow::Error::from)?;
+    let mut most_urgent: Option<DeliveryStatus> = None;
+    for deadline in delivered {
+        let status = DeliveryStatus::judge(
+            deadline,
+            Some(store),
+            &estimate,
+            EstimateBasis::PipelineRun,
+            now,
+        )
+        .map_err(anyhow::Error::from)?;
+        let sooner = match &most_urgent {
+            None => true,
+            Some(current) => match (status.next_due_at, current.next_due_at) {
+                (Some(candidate), Some(held)) => candidate < held,
+                (Some(_), None) => true,
+                (None, Some(_) | None) => false,
+            },
+        };
+        if sooner {
+            most_urgent = Some(status);
+        }
+    }
+    Ok(most_urgent)
+}
+
 fn build_pipelines(
     config: &RockyConfig,
     config_path: &Path,
     store: Option<&StateStore>,
     claims: &ClaimsByPipeline,
+    deadlines: &[rocky_core::delivery::ProductDeadline],
     now: DateTime<Utc>,
-) -> Vec<SchedulePipelineStatus> {
+) -> Result<Vec<SchedulePipelineStatus>, ScheduleStatusError> {
     let member_budgets = build_member_budgets(config, config_path, None);
     let mut out = Vec::new();
 
@@ -186,6 +300,7 @@ fn build_pipelines(
             .unwrap_or_default();
 
         let claims_here = claims.get(&name).cloned().unwrap_or_default();
+        let delivery = pipeline_delivery(&name, store, deadlines, now)?;
 
         let common = |config_error: Option<String>,
                       enabled: bool,
@@ -213,6 +328,7 @@ fn build_pipelines(
                 throttle,
                 claims: claims_here.clone(),
                 config_error,
+                delivery: delivery.clone(),
             }
         };
 
@@ -259,7 +375,7 @@ fn build_pipelines(
             ),
         });
     }
-    out
+    Ok(out)
 }
 
 /// The throttle to report, matching only what the reconciler actually honors.
@@ -415,6 +531,152 @@ mod side_effect_free_tests {
             "the read-only status must not materialize the state file"
         );
         drop(out);
+    }
+}
+
+#[cfg(test)]
+mod delivery_state_tests {
+    use super::*;
+    use crate::commands::product::delivery_tests::{
+        at, seed_delivery, seed_five_on_time, spec_with_deadline, write,
+    };
+
+    /// A project scheduling pipeline `revenue`, whose product declares a
+    /// 06:00 deadline, with the state store open for seeding.
+    fn project() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        StateStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        let config_path = root.join("rocky.toml");
+        write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.revenue]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.revenue.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.revenue.schedule]\ncron = \"0 5 * * *\"\ntimezone = \"UTC\"\n",
+        );
+        let state_path = root.join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        (dir, config_path, state_path, store)
+    }
+
+    /// The `delivery` object of pipeline `revenue` in the status JSON.
+    fn delivery_json(
+        config_path: &Path,
+        state_path: &Path,
+        now: DateTime<Utc>,
+    ) -> serde_json::Value {
+        let rocky_dir = config_path.parent().unwrap().join(".rocky");
+        let output =
+            schedule_status_output(config_path, state_path, &rocky_dir, now).expect("status");
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["pipelines"][0]["pipeline"], "revenue");
+        json["pipelines"][0]["delivery"].clone()
+    }
+
+    #[test]
+    fn schedule_status_reports_an_on_time_delivery() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(5, 12, 0));
+        assert_eq!(delivery["product"], "revenue_daily");
+        assert_eq!(delivery["on_time"], true);
+        assert_eq!(delivery["late_by_seconds"], 0);
+        assert_eq!(delivery["next_due_at"], "2026-05-06T06:00:00Z");
+        assert_eq!(delivery["at_risk"], false);
+        assert_eq!(delivery["estimate"]["basis"], "pipeline_run");
+        assert_eq!(delivery["estimate"]["state"], "known");
+        assert_eq!(delivery["estimate"]["n"], 5);
+        assert_eq!(delivery["estimate"]["window"], 20);
+        assert_eq!(delivery["estimate"]["p50_ms"], 600_000);
+        assert_eq!(delivery["estimate"]["p90_ms"], 600_000);
+    }
+
+    #[test]
+    fn schedule_status_reports_a_late_delivery() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        seed_delivery(&store, dir.path(), "run-6", at(6, 7, 20), at(6, 7, 30));
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(6, 12, 0));
+        assert_eq!(delivery["on_time"], false);
+        assert_eq!(delivery["late_by_seconds"], 90 * 60);
+    }
+
+    #[test]
+    fn schedule_status_reports_an_at_risk_delivery() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(6, 5, 55));
+        assert_eq!(delivery["at_risk"], true);
+    }
+
+    #[test]
+    fn schedule_status_gives_no_risk_verdict_below_five_runs() {
+        let (dir, config_path, state_path, store) = project();
+        seed_delivery(&store, dir.path(), "run-1", at(1, 5, 0), at(1, 5, 10));
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(2, 5, 55));
+        assert_eq!(delivery["estimate"]["state"], "unknown");
+        assert!(delivery["at_risk"].is_null(), "{delivery}");
+    }
+
+    #[test]
+    fn a_newer_run_without_the_output_model_keeps_the_delivery() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        // A newer production run of the same pipeline that built another
+        // model only, as `--model other` would.
+        let other: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "run-other",
+            "started_at": at(5, 9, 0),
+            "finished_at": at(5, 9, 5),
+            "status": rocky_core::state::RunStatus::Success,
+            "models_executed": [{
+                "model_name": "other",
+                "started_at": at(5, 9, 0),
+                "finished_at": at(5, 9, 5),
+                "duration_ms": 300_000,
+                "rows_affected": 1,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+            }],
+            "trigger": rocky_core::state::RunTrigger::Manual,
+            "config_hash": "c",
+            "pipeline": "revenue",
+            "run_scope": rocky_core::state::RunScope::Production,
+        }))
+        .unwrap();
+        store.record_run(&other).unwrap();
+        drop(store);
+
+        let delivery = delivery_json(&config_path, &state_path, at(5, 12, 0));
+        assert_eq!(delivery["product"], "revenue_daily", "{delivery}");
+        assert_eq!(delivery["on_time"], true);
+    }
+
+    #[test]
+    fn a_pipeline_that_delivers_no_product_reports_no_delivery() {
+        let (_dir, config_path, state_path, store) = project();
+        drop(store);
+        let delivery = delivery_json(&config_path, &state_path, at(2, 5, 55));
+        assert!(delivery.is_null(), "never ran: no delivery, got {delivery}");
     }
 }
 

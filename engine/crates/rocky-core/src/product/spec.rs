@@ -470,6 +470,26 @@ pub struct ProductSpec {
     pub output: OutputSpec,
     /// How much the agent is trusted.
     pub trust: TrustSpec,
+    /// When the output must be delivered: a standard 5-field cron
+    /// expression, read in `timezone`. Each occurrence is a
+    /// deadline. Absent means the product declares no deadline, and no
+    /// lateness is recorded for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_by: Option<String>,
+    /// The IANA timezone `deliver_by` is read in (`"Europe/Lisbon"`).
+    /// Defaults to UTC when omitted. Valid only beside `deliver_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// A parsed delivery deadline: the cron expression and the timezone it is
+/// read in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverBy {
+    /// The cron expression, exactly as the spec wrote it.
+    pub cron: String,
+    /// The timezone each occurrence resolves in.
+    pub tz: chrono_tz::Tz,
 }
 
 impl ProductSpec {
@@ -480,6 +500,20 @@ impl ProductSpec {
     /// faithful image of the file it came from.
     pub fn output_model(&self) -> &str {
         self.output.model.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The delivery deadline, when the spec declares one.
+    ///
+    /// Parsing already validated both values, so a parsed spec with
+    /// `deliver_by` always yields `Some`. A hand-built spec with a bad
+    /// timezone yields `None` rather than a guessed zone.
+    pub fn deliver_by(&self) -> Option<DeliverBy> {
+        let cron = self.deliver_by.clone()?;
+        let tz = match self.timezone.as_deref() {
+            None => chrono_tz::Tz::UTC,
+            Some(name) => name.parse().ok()?,
+        };
+        Some(DeliverBy { cron, tz })
     }
 }
 
@@ -931,7 +965,15 @@ fn parse_product(value: &toml::Value, path: &str) -> SpecResult<ProductSpec> {
     let table = as_table(value, path)?;
     reject_unknown_keys(
         table,
-        &["name", "intent", "source", "output", "trust"],
+        &[
+            "name",
+            "intent",
+            "source",
+            "output",
+            "trust",
+            "deliver_by",
+            "timezone",
+        ],
         path,
     )?;
     let name = as_string(require(table, "name", path)?, &path_join(path, "name"))?;
@@ -939,6 +981,7 @@ fn parse_product(value: &toml::Value, path: &str) -> SpecResult<ProductSpec> {
     let source = parse_source(require(table, "source", path)?, &path_join(path, "source"))?;
     let output = parse_output(require(table, "output", path)?, &path_join(path, "output"))?;
     let trust = parse_trust(require(table, "trust", path)?, &path_join(path, "trust"))?;
+    let (deliver_by, timezone) = parse_delivery(table, path)?;
 
     if !is_bare_identifier(&name) {
         return Err(SpecRejected::new(
@@ -972,7 +1015,55 @@ fn parse_product(value: &toml::Value, path: &str) -> SpecResult<ProductSpec> {
         source,
         output,
         trust,
+        deliver_by,
+        timezone,
     })
+}
+
+/// Read and validate `deliver_by` and `timezone`.
+///
+/// The cron expression goes through the scheduler's own parser, so a
+/// deadline the scheduler could not evaluate is refused here. A timezone on
+/// its own is refused too: it would read as a deadline that does not exist.
+fn parse_delivery(table: &toml::Table, path: &str) -> SpecResult<(Option<String>, Option<String>)> {
+    let deliver_by = match table.get("deliver_by") {
+        Some(raw) => Some(as_string(raw, &path_join(path, "deliver_by"))?),
+        None => None,
+    };
+    let timezone = match table.get("timezone") {
+        Some(raw) => Some(as_string(raw, &path_join(path, "timezone"))?),
+        None => None,
+    };
+    if let Some(cron) = &deliver_by {
+        crate::schedule::occurrence::parse_cron(cron).map_err(|err| {
+            SpecRejected::new(
+                "deliver-by-unparseable",
+                format!(
+                    "product.deliver_by '{cron}' is not a cron expression the scheduler \
+                     accepts: {err}"
+                ),
+            )
+        })?;
+    }
+    if let Some(name) = &timezone {
+        if deliver_by.is_none() {
+            return Err(SpecRejected::new(
+                "timezone-without-deliver-by",
+                "product.timezone is set but product.deliver_by is not: a timezone only \
+                 reads a delivery deadline",
+            ));
+        }
+        if name.parse::<chrono_tz::Tz>().is_err() {
+            return Err(SpecRejected::new(
+                "timezone-unknown",
+                format!(
+                    "product.timezone '{name}' is not an IANA timezone name \
+                     (for example \"UTC\" or \"Europe/Lisbon\")"
+                ),
+            ));
+        }
+    }
+    Ok((deliver_by, timezone))
 }
 
 /// Parse spec bytes and digest those same bytes.
@@ -1508,5 +1599,67 @@ include = ["stripe.*"]"#,
         std::fs::create_dir(&path).expect("mkdir");
         let reject = parse_spec_file(&path).expect_err("must reject");
         assert_eq!(reject.code, "spec-file-unreadable");
+    }
+
+    // ----- delivery deadline -----
+
+    fn with_product_keys(keys: &str) -> String {
+        VALID.replacen("intent = \"Daily", &format!("{keys}\nintent = \"Daily"), 1)
+    }
+
+    #[test]
+    fn deliver_by_and_timezone_are_read() {
+        let parsed = parse(&with_product_keys(
+            "deliver_by = \"0 6 * * *\"\ntimezone = \"Europe/Lisbon\"",
+        ))
+        .expect("valid");
+        let deadline = parsed.product().deliver_by().expect("a deadline");
+        assert_eq!(deadline.cron, "0 6 * * *");
+        assert_eq!(deadline.tz, chrono_tz::Tz::Europe__Lisbon);
+    }
+
+    #[test]
+    fn deliver_by_without_timezone_reads_in_utc() {
+        let parsed = parse(&with_product_keys("deliver_by = \"30 5 * * 1-5\"")).expect("valid");
+        assert_eq!(
+            parsed.product().deliver_by().expect("a deadline").tz,
+            chrono_tz::Tz::UTC
+        );
+        assert_eq!(parsed.product().timezone, None);
+    }
+
+    #[test]
+    fn a_spec_without_deliver_by_has_no_deadline() {
+        assert!(
+            parse(VALID)
+                .expect("valid")
+                .product()
+                .deliver_by()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reject_unparseable_deliver_by() {
+        expect_reject(
+            &with_product_keys("deliver_by = \"every morning\""),
+            "deliver-by-unparseable",
+        );
+    }
+
+    #[test]
+    fn reject_unknown_timezone() {
+        expect_reject(
+            &with_product_keys("deliver_by = \"0 6 * * *\"\ntimezone = \"Mars/Olympus\""),
+            "timezone-unknown",
+        );
+    }
+
+    #[test]
+    fn reject_timezone_without_deliver_by() {
+        expect_reject(
+            &with_product_keys("timezone = \"UTC\""),
+            "timezone-without-deliver-by",
+        );
     }
 }

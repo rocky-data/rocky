@@ -82,7 +82,7 @@ type Location = (String, String);
 /// [`rocky_core::models::apply_surrogate_keys`] — this path materializes each
 /// model from its compiled SQL alone. A model that declares a `[[surrogate_key]]`
 /// block is built here *without* the surrogate column. This backs `rocky test`'s
-/// model-execution check ([`crate::test_runner::run_tests`]), so a test that
+/// model-execution check ([`crate::test_runner::run_tests_with`]), so a test that
 /// depends on a surrogate column (e.g. a `unique` assertion on it) would behave
 /// differently from a real run. Aligning the two would change existing
 /// `rocky test` outcomes, so it is left as a known divergence pending a decision
@@ -657,7 +657,10 @@ pub fn create_local_functions(
 }
 
 /// Compile and execute a project locally.
-pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult> {
+pub fn compile_and_execute(
+    models_dir: &Path,
+    extensions: &rocky_duckdb::ExtensionOptions,
+) -> anyhow::Result<ExecutionResult> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
@@ -671,7 +674,7 @@ pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult>
         anyhow::bail!("compilation has errors — cannot execute");
     }
 
-    let db = DuckDbConnector::in_memory()?;
+    let db = DuckDbConnector::in_memory_with(extensions)?;
     Ok(execute_locally(&compile_result, &db))
 }
 

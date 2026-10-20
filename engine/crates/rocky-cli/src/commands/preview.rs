@@ -3785,6 +3785,8 @@ mod tests {
             output_version: None,
             stored_bytes: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         }
     }
 
@@ -3822,6 +3824,7 @@ mod tests {
             // selection tests use `sample_run()` instead.
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 

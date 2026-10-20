@@ -620,6 +620,7 @@ async fn replay_execute_model(
     run_id: &str,
     model_name: &str,
     verify: bool,
+    extensions: &rocky_duckdb::ExtensionOptions,
 ) -> ReplayExecuteModelOutput {
     // Reuse the read-only `--check` classifier: it establishes provenance
     // exists, the embedded IR parses, and every declared input resolves.
@@ -702,7 +703,7 @@ async fn replay_execute_model(
     // `!upstreams.is_empty()` guard above already rejected any recorded
     // upstream), so no pre-materialized upstream tables are needed. Any failure
     // is fail-closed to non_replayable — never diverged, never bit_exact.
-    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory() {
+    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory_with(extensions) {
         Ok(a) => a,
         Err(e) => {
             return non_replayable_exec(
@@ -1081,6 +1082,7 @@ async fn replay_execute_dag(
     store: &StateStore,
     record: &RunRecord,
     verify: bool,
+    extensions: &rocky_duckdb::ExtensionOptions,
 ) -> Vec<ReplayExecuteModelOutput> {
     use std::collections::{HashMap, HashSet};
 
@@ -1095,7 +1097,7 @@ async fn replay_execute_dag(
 
     // --- Execute in order on ONE shared engine. Upstream outputs are
     // materialised so downstreams read the replayed bytes. ---
-    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory() {
+    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory_with(extensions) {
         Ok(a) => a,
         Err(e) => {
             // Engine start failed: every candidate is non_replayable. Directly
@@ -1345,6 +1347,7 @@ fn assemble(
 /// resolved; callers inspect `verdict` / `bit_exact_count`.
 #[cfg(feature = "duckdb")]
 pub async fn run_replay_execute(
+    config_path: &Path,
     state_path: &Path,
     target: &str,
     model_filter: Option<&str>,
@@ -1355,13 +1358,21 @@ pub async fn run_replay_execute(
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
+    let extensions = crate::registry::duckdb_extensions_for(config_path)?;
 
     let models: Vec<ReplayExecuteModelOutput> = if let Some(name) = model_filter {
         let mut v: Vec<ReplayExecuteModelOutput> = Vec::new();
         for exec in &record.models_executed {
             if exec.model_name == name {
                 v.push(
-                    replay_execute_model(&store, &record.run_id, &exec.model_name, verify).await,
+                    replay_execute_model(
+                        &store,
+                        &record.run_id,
+                        &exec.model_name,
+                        verify,
+                        &extensions,
+                    )
+                    .await,
                 );
             }
         }
@@ -1370,7 +1381,7 @@ pub async fn run_replay_execute(
         }
         v
     } else {
-        replay_execute_dag(&store, &record, verify).await
+        replay_execute_dag(&store, &record, verify, &extensions).await
     };
 
     let bit_exact_count = models.iter().filter(|m| m.verdict == "bit_exact").count();
@@ -2110,6 +2121,7 @@ pub async fn run_replay_execute_warehouse(
 /// engine to run the recipe against.
 #[cfg(not(feature = "duckdb"))]
 pub async fn run_replay_execute(
+    _config_path: &Path,
     _state_path: &Path,
     _target: &str,
     _model_filter: Option<&str>,
@@ -2156,6 +2168,8 @@ mod tests {
                 output_version: None,
                 stored_bytes: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             })
             .collect();
         RunRecord {
@@ -2181,6 +2195,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 
@@ -2470,7 +2485,7 @@ mod tests {
             .await
             .unwrap();
         seed(&store, "r", "root", sql, &[], &real, true);
-        let v = replay_execute_model(&store, "r", "root", true).await;
+        let v = replay_execute_model(&store, "r", "root", true, &Default::default()).await;
         assert_eq!(v.verdict, "bit_exact");
         assert_eq!(v.computed_hash.as_deref(), Some(real.as_str()));
         assert_eq!(v.recorded_hash.as_deref(), Some(real.as_str()));
@@ -2503,7 +2518,7 @@ mod tests {
             &hash_one,
             true,
         );
-        let v = replay_execute_model(&store, "r", "root", true).await;
+        let v = replay_execute_model(&store, "r", "root", true, &Default::default()).await;
         assert_eq!(v.verdict, "diverged");
         assert_eq!(v.recorded_hash.as_deref(), Some(hash_one.as_str()));
         assert_ne!(v.computed_hash.as_deref(), Some(hash_one.as_str()));
@@ -2533,7 +2548,7 @@ mod tests {
             HB,
             true,
         );
-        let v = replay_execute_model(&store, "r", "leaf", true).await;
+        let v = replay_execute_model(&store, "r", "leaf", true, &Default::default()).await;
         assert_eq!(v.verdict, "non_replayable");
         assert!(v.computed_hash.is_none());
         assert!(
@@ -2551,7 +2566,7 @@ mod tests {
         let sql = "SELECT CAST(3 AS BIGINT) AS id";
         // The recorded hash is irrelevant here — no comparison is made.
         seed(&store, "r", "root", sql, &[], HA, true);
-        let v = replay_execute_model(&store, "r", "root", false).await;
+        let v = replay_execute_model(&store, "r", "root", false, &Default::default()).await;
         assert_eq!(v.verdict, "executed");
         assert!(v.computed_hash.is_some());
         assert_eq!(v.rows, Some(1));
@@ -2985,6 +3000,8 @@ mod tests {
                     output_version: None,
                     stored_bytes: None,
                     output_target: None,
+                    due_at: None,
+                    wait_for_upstream_ms: None,
                 }],
                 trigger: RunTrigger::Manual,
                 config_hash: "cfg".to_string(),
@@ -3003,6 +3020,7 @@ mod tests {
                 verify_after_failed: false,
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
+                queued_ms: None,
             };
             store.record_run(&record).unwrap();
 

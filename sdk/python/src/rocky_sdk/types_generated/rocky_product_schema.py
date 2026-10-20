@@ -152,6 +152,10 @@ class ProductSpec(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
+    deliver_by: str | None = None
+    """
+    When the output must be delivered: a standard 5-field cron expression, read in `timezone`. Each occurrence is a deadline. Absent means the product declares no deadline, and no lateness is recorded for it.
+    """
     intent: str
     """
     Plain-language statement of what the product is for.
@@ -167,6 +171,10 @@ class ProductSpec(BaseModel):
     source: SourceSpec
     """
     Where the data comes from.
+    """
+    timezone: str | None = None
+    """
+    The IANA timezone `deliver_by` is read in (`"Europe/Lisbon"`). Defaults to UTC when omitted. Valid only beside `deliver_by`.
     """
     trust: TrustSpec
     """

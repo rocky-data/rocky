@@ -5665,6 +5665,8 @@ fn seed_run_history(models_dir: &Path) {
             output_version: None,
             stored_bytes: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         }],
         trigger: RunTrigger::Manual,
         config_hash: "cfg".to_string(),
@@ -5683,6 +5685,7 @@ fn seed_run_history(models_dir: &Path) {
         verify_after_failed: false,
         rocky_branch: None,
         run_scope: Some(rocky_core::state::RunScope::Production),
+        queued_ms: None,
     };
     store.record_run(&run).expect("record run");
 

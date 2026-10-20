@@ -669,6 +669,12 @@ pub fn spec_field_paths(spec: &SpecFile) -> BTreeSet<String> {
     }
     paths.insert("product.output.classifications".to_string());
     paths.insert("product.trust.agent".to_string());
+    if spec.product.deliver_by.is_some() {
+        paths.insert("product.deliver_by".to_string());
+    }
+    if spec.product.timezone.is_some() {
+        paths.insert("product.timezone".to_string());
+    }
     paths
 }
 
@@ -870,6 +876,8 @@ spec_version = 0
 [product]
 name = "tiny"
 intent = "x"
+deliver_by = "0 6 * * *"
+timezone = "UTC"
 
 [product.source]
 tables = ["c.s.t"]

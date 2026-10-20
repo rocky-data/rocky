@@ -1,6 +1,191 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "DeliveryStatus": {
+      "description": "Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.\n\nReported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.",
+      "properties": {
+        "at_risk": {
+          "description": "True when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`: no verdict.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "deliver_by": {
+          "description": "The product's `deliver_by` cron expression.",
+          "type": "string"
+        },
+        "estimate": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DurationEstimateStatus"
+            }
+          ],
+          "description": "The duration estimate `at_risk` rests on."
+        },
+        "last_delivered_at": {
+          "description": "When the latest production delivery finished.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_due_at": {
+          "description": "The deadline the latest delivery served, when its run recorded one.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "late_by_seconds": {
+          "description": "How late the latest delivery was, in seconds; `0` when on time. `null` when no delivery recorded a deadline.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_due_at": {
+          "description": "The deadline the next delivery must meet. A time in the past means the next delivery is already late.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_time": {
+          "description": "Whether the latest delivery met its deadline. `null` when no delivery recorded a deadline.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_model": {
+          "description": "The model the product delivers.",
+          "type": "string"
+        },
+        "product": {
+          "description": "The product whose deadline this is.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "The timezone `deliver_by` is read in.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deliver_by",
+        "estimate",
+        "output_model",
+        "product",
+        "timezone"
+      ],
+      "type": "object"
+    },
+    "DurationEstimateStatus": {
+      "description": "A p50/p90 duration estimate and the sample behind it.",
+      "properties": {
+        "basis": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EstimateBasis"
+            }
+          ],
+          "description": "What was timed: `model_delivery` (run start to the model's finish) or `pipeline_run` (run start to run finish)."
+        },
+        "growth": {
+          "description": "True when the newest 5 runs were all slower than the p90 of the older ones, so `p90_ms` is the slowest of those 5.",
+          "type": "boolean"
+        },
+        "n": {
+          "description": "How many production runs the estimate read.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "p50_ms": {
+          "description": "Median duration in milliseconds, when `known`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "p90_ms": {
+          "description": "90th-percentile duration in milliseconds, when `known`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EstimateState"
+            }
+          ],
+          "description": "`known` with at least 5 runs; `unknown` below that, and then no verdict rests on the estimate."
+        },
+        "window": {
+          "description": "The most runs it reads (the newest 20).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "basis",
+        "growth",
+        "n",
+        "state",
+        "window"
+      ],
+      "type": "object"
+    },
+    "EstimateBasis": {
+      "description": "What a duration estimate timed.",
+      "oneOf": [
+        {
+          "description": "From run start to the product's output model finishing.",
+          "enum": [
+            "model_delivery"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "From run start to run finish, for the whole pipeline.",
+          "enum": [
+            "pipeline_run"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EstimateState": {
+      "description": "Whether a duration estimate has enough runs to judge from.",
+      "oneOf": [
+        {
+          "description": "At least 5 runs: the band is reported.",
+          "enum": [
+            "known"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Fewer than 5 runs: no band, no verdict.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ProductApprovalOutput": {
       "description": "The approval record, as echoed by compile/status output.",
       "properties": {
@@ -69,6 +254,17 @@
         "string",
         "null"
       ]
+    },
+    "delivery": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DeliveryStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Delivery state, when the spec declares `deliver_by`: whether the latest production delivery was on time, how late, and whether the next delivery is at risk. The estimate times run start to the output model's finish."
     },
     "fulfill_state": {
       "description": "The persisted fulfillment state tag, when one exists.",

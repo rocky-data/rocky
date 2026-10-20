@@ -6574,6 +6574,8 @@ impl RunOutput {
                 output_version: mat.output_version.clone(),
                 // Where this model wrote, for `rocky run --defer-state`.
                 output_target: mat.output_target.clone(),
+                due_at: None,
+                wait_for_upstream_ms: None,
                 // The output table's stored bytes, measured at the execution
                 // site right after the write. `None` is unknown.
                 stored_bytes: mat.stored_bytes,
@@ -6621,6 +6623,8 @@ impl RunOutput {
                 output_version: None,
                 stored_bytes: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             });
         }
 
@@ -6677,6 +6681,7 @@ impl RunOutput {
             // `fail_on_error = false`), so deriving one from the other fails
             // open (#1732).
             verify_after_failed: self.verify_after_failed,
+            queued_ms: None,
         }
     }
 
@@ -7371,6 +7376,13 @@ pub struct SchedulePipelineStatus {
     /// this is why an otherwise-configured pipeline is silent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
+    /// Delivery state of the most urgent product deadline this pipeline
+    /// delivers: a product whose spec declares `deliver_by` and whose output
+    /// model the pipeline's newest production run that built any such model
+    /// built. The estimate times the whole pipeline run. Absent when no
+    /// production run of the pipeline built a product with a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryStatus>,
 }
 
 /// An active backoff window.
@@ -7428,6 +7440,160 @@ pub struct ScheduleStatusCounts {
     pub overdue: usize,
     /// How many declare a schedule that cannot be resolved.
     pub config_errors: usize,
+}
+
+/// Delivery state of one product deadline: was the latest delivery on time,
+/// and is the next one at risk.
+///
+/// Reported by `rocky product status` and, per pipeline, by the scheduler
+/// status. `on_time` and `late_by_seconds` are facts about the latest
+/// delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null`
+/// whenever the estimate is `unknown`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeliveryStatus {
+    /// The product whose deadline this is.
+    pub product: String,
+    /// The model the product delivers.
+    pub output_model: String,
+    /// The product's `deliver_by` cron expression.
+    pub deliver_by: String,
+    /// The timezone `deliver_by` is read in.
+    pub timezone: String,
+    /// The deadline the latest delivery served, when its run recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_due_at: Option<DateTime<Utc>>,
+    /// When the latest production delivery finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    /// Whether the latest delivery met its deadline. `null` when no
+    /// delivery recorded a deadline.
+    pub on_time: Option<bool>,
+    /// How late the latest delivery was, in seconds; `0` when on time.
+    /// `null` when no delivery recorded a deadline.
+    pub late_by_seconds: Option<u64>,
+    /// The deadline the next delivery must meet. A time in the past means
+    /// the next delivery is already late.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_due_at: Option<DateTime<Utc>>,
+    /// True when the p90 duration is longer than the time left before
+    /// `next_due_at`. `null` when the estimate is `unknown`: no verdict.
+    pub at_risk: Option<bool>,
+    /// The duration estimate `at_risk` rests on.
+    pub estimate: DurationEstimateStatus,
+}
+
+/// A p50/p90 duration estimate and the sample behind it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DurationEstimateStatus {
+    /// `known` with at least 5 runs; `unknown` below that, and then no
+    /// verdict rests on the estimate.
+    pub state: EstimateState,
+    /// What was timed: `model_delivery` (run start to the model's finish)
+    /// or `pipeline_run` (run start to run finish).
+    pub basis: EstimateBasis,
+    /// How many production runs the estimate read.
+    pub n: usize,
+    /// The most runs it reads (the newest 20).
+    pub window: usize,
+    /// Median duration in milliseconds, when `known`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<u64>,
+    /// 90th-percentile duration in milliseconds, when `known`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p90_ms: Option<u64>,
+    /// True when the newest 5 runs were all slower than the p90 of the
+    /// older ones, so `p90_ms` is the slowest of those 5.
+    pub growth: bool,
+}
+
+/// Whether a duration estimate has enough runs to judge from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateState {
+    /// At least 5 runs: the band is reported.
+    Known,
+    /// Fewer than 5 runs: no band, no verdict.
+    Unknown,
+}
+
+/// What a duration estimate timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateBasis {
+    /// From run start to the product's output model finishing.
+    ModelDelivery,
+    /// From run start to run finish, for the whole pipeline.
+    PipelineRun,
+}
+
+impl DurationEstimateStatus {
+    /// Project a core estimate onto the output shape.
+    pub fn from_estimate(
+        estimate: &rocky_core::delivery::DurationEstimate,
+        basis: EstimateBasis,
+    ) -> Self {
+        let band = estimate.band;
+        Self {
+            state: match band {
+                Some(_) => EstimateState::Known,
+                None => EstimateState::Unknown,
+            },
+            basis,
+            n: estimate.n,
+            window: estimate.window,
+            p50_ms: band.map(|band| band.p50_ms),
+            p90_ms: band.map(|band| band.p90_ms),
+            growth: band.is_some_and(|band| band.growth),
+        }
+    }
+}
+
+impl DeliveryStatus {
+    /// Judge `deadline` from the store and build the output row.
+    ///
+    /// Reads the latest production delivery of the deadline's model. Uses
+    /// `estimate` for `at_risk`. Without a store there is no delivery and no
+    /// estimate, so every verdict is `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when run history cannot be read.
+    pub fn judge(
+        deadline: &rocky_core::delivery::ProductDeadline,
+        store: Option<&rocky_core::state::StateStore>,
+        estimate: &rocky_core::delivery::DurationEstimate,
+        basis: EstimateBasis,
+        now: DateTime<Utc>,
+    ) -> Result<Self, rocky_core::state::StateError> {
+        let last = match store {
+            Some(store) => store
+                .last_delivery(
+                    &deadline.output_model,
+                    rocky_core::state::UnrecordedScope::Exclude,
+                    None,
+                )?
+                .map(|execution| rocky_core::delivery::LastDelivery {
+                    finished_at: execution.finished_at,
+                    due_at: execution.due_at,
+                }),
+            None => None,
+        };
+        let verdict =
+            rocky_core::delivery::delivery_verdict(&deadline.deliver_by, last, estimate, now);
+        Ok(Self {
+            product: deadline.product.clone(),
+            output_model: deadline.output_model.clone(),
+            deliver_by: deadline.deliver_by.cron.clone(),
+            timezone: deadline.deliver_by.tz.name().to_string(),
+            last_due_at: verdict.last_due_at,
+            last_delivered_at: verdict.last_delivered_at,
+            on_time: verdict.on_time,
+            late_by_seconds: verdict.late_by_seconds,
+            next_due_at: verdict.next_due_at,
+            at_risk: verdict.at_risk,
+            estimate: DurationEstimateStatus::from_estimate(estimate, basis),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -152,6 +152,13 @@
       "additionalProperties": false,
       "description": "The `[product]` table.",
       "properties": {
+        "deliver_by": {
+          "description": "When the output must be delivered: a standard 5-field cron expression, read in `timezone`. Each occurrence is a deadline. Absent means the product declares no deadline, and no lateness is recorded for it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "intent": {
           "description": "Plain-language statement of what the product is for.",
           "type": "string"
@@ -175,6 +182,13 @@
             }
           ],
           "description": "Where the data comes from."
+        },
+        "timezone": {
+          "description": "The IANA timezone `deliver_by` is read in (`\"Europe/Lisbon\"`). Defaults to UTC when omitted. Valid only beside `deliver_by`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "trust": {
           "allOf": [

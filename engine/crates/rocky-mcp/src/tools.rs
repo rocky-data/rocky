@@ -2806,21 +2806,26 @@ impl RockyMcpServer {
                 }),
             }));
         }
-        let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
-            .map_err(|e| {
-                // Preserve the stable taxonomy the way `compile` and
-                // `plan_preview` do: an unknown `model` filter is
-                // `model_not_found` (with its "list the models, retry" hint),
-                // not the generic internal bucket.
-                match e.downcast_ref::<commands::ModelNotFound>() {
-                    Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
-                    None => ToolError::internal(
-                        format!("{e:#}"),
-                        "The local test runner could not execute; confirm the project compiles \
+        let output = commands::test_output(
+            &self.models_dir,
+            None,
+            params.0.model.as_deref(),
+            &self.config_path,
+        )
+        .map_err(|e| {
+            // Preserve the stable taxonomy the way `compile` and
+            // `plan_preview` do: an unknown `model` filter is
+            // `model_not_found` (with its "list the models, retry" hint),
+            // not the generic internal bucket.
+            match e.downcast_ref::<commands::ModelNotFound>() {
+                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                None => ToolError::internal(
+                    format!("{e:#}"),
+                    "The local test runner could not execute; confirm the project compiles \
                          (the `compile` tool) and any `data/seed.sql` the tests need is present.",
-                    ),
-                }
-            })?;
+                ),
+            }
+        })?;
         // BOTH suites, aggregated. `test_output` records the fixture
         // `[[test]]` run in a SEPARATE `unit_tests` summary, and this result
         // used to drop it: a project whose models all execute but whose

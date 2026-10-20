@@ -6,11 +6,9 @@
 //! 3. `rocky test` — execute every model on that seed
 //! 4. Report results with exit code
 
-use std::path::Path;
-
 use tracing::info;
 
-use crate::test_runner::{TestModels, TestRunInputs};
+use crate::test_runner::TestRunInputs;
 
 /// CI run result.
 #[derive(Debug)]
@@ -45,27 +43,6 @@ impl CiResult {
     pub fn exit_code(&self) -> i32 {
         if self.passed() { 0 } else { 1 }
     }
-}
-
-/// Run the full CI pipeline on the models at `models_dir`, with the seed
-/// file at `data/seed.sql` beside it. See [`run_ci_with`].
-pub fn run_ci(
-    models_dir: &Path,
-    contracts_dir: Option<&Path>,
-    run_vars: &rocky_core::run_vars::RunVars,
-) -> anyhow::Result<CiResult> {
-    run_ci_with(TestRunInputs {
-        models_dir,
-        project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
-        models: TestModels::Dir,
-        contracts_dir,
-        model_filter: None,
-        run_vars,
-        gates: None,
-        inlined_gates: None,
-        strict_contracts: false,
-        target_dialects: Default::default(),
-    })
 }
 
 /// Run the full CI pipeline: compile, typed from the project's seed file,
@@ -111,6 +88,29 @@ pub fn run_ci_with(inputs: TestRunInputs<'_>) -> anyhow::Result<CiResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// Test helper: [`run_ci_with`] on `models_dir` with default extension
+    /// options. Lives here so production code cannot reach DuckDB's autoinstall.
+    fn run_ci(
+        models_dir: &Path,
+        contracts_dir: Option<&Path>,
+        run_vars: &rocky_core::run_vars::RunVars,
+    ) -> anyhow::Result<CiResult> {
+        run_ci_with(TestRunInputs {
+            models_dir,
+            project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+            models: crate::test_runner::TestModels::Dir,
+            contracts_dir,
+            model_filter: None,
+            run_vars,
+            gates: None,
+            inlined_gates: None,
+            strict_contracts: false,
+            target_dialects: Default::default(),
+            extensions: rocky_duckdb::ExtensionOptions::default(),
+        })
+    }
 
     /// `rocky ci` fails on a bad consumer record (E060) but reports it as a
     /// diagnostic: the model tests ran and passed, and no model failed.

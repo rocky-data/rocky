@@ -2264,6 +2264,8 @@ mod tests {
             project_id: None,
             location: None,
             path: None,
+            extension_directory: None,
+            offline: false,
             schemas: Vec::new(),
             retry: rocky_core::config::RetryConfig::default(),
             cache: None,

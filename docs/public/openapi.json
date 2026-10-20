@@ -83,6 +83,13 @@
               "null"
             ]
           },
+          "extension_directory": {
+            "description": "Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "extra": {
             "additionalProperties": true,
             "description": "Escape hatch for adapter-specific keys this struct doesn't model.\n\n`AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.\n\nAuthors of such adapters declare the keys under a nested `[extra]` table:\n\n```toml [adapter.my_trino] type = \"trino\" host = \"https://trino.example.com\" token = \"${TRINO_JWT}\"\n\n[adapter.my_trino.extra] default_schema = \"analytics\" x_trino_user = \"service-account\" ```\n\nTop-level typos still error (`tooken = \"...\"` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get(\"...\")` and validate them themselves — Rocky doesn't schema-check the contents.\n\nValues are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.",
@@ -129,6 +136,10 @@
               }
             ],
             "description": "OAuth access token (pre-obtained from an IdP)."
+          },
+          "offline": {
+            "description": "When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.",
+            "type": "boolean"
           },
           "password": {
             "anyOf": [
@@ -7105,6 +7116,90 @@
         ],
         "type": "object"
       },
+      "DeliveryStatus": {
+        "description": "Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.\n\nReported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.",
+        "properties": {
+          "at_risk": {
+            "description": "True when the p90 duration is longer than the time left before `next_due_at`. `null` when the estimate is `unknown`: no verdict.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "deliver_by": {
+            "description": "The product's `deliver_by` cron expression.",
+            "type": "string"
+          },
+          "estimate": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DurationEstimateStatus"
+              }
+            ],
+            "description": "The duration estimate `at_risk` rests on."
+          },
+          "last_delivered_at": {
+            "description": "When the latest production delivery finished.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_due_at": {
+            "description": "The deadline the latest delivery served, when its run recorded one.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "late_by_seconds": {
+            "description": "How late the latest delivery was, in seconds; `0` when on time. `null` when no delivery recorded a deadline.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "next_due_at": {
+            "description": "The deadline the next delivery must meet. A time in the past means the next delivery is already late.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_time": {
+            "description": "Whether the latest delivery met its deadline. `null` when no delivery recorded a deadline.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "output_model": {
+            "description": "The model the product delivers.",
+            "type": "string"
+          },
+          "product": {
+            "description": "The product whose deadline this is.",
+            "type": "string"
+          },
+          "timezone": {
+            "description": "The timezone `deliver_by` is read in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deliver_by",
+          "estimate",
+          "output_model",
+          "product",
+          "timezone"
+        ],
+        "type": "object"
+      },
       "Diagnostic": {
         "description": "A compiler diagnostic (error, warning, or informational message).\n\n`code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.",
         "properties": {
@@ -7512,6 +7607,69 @@
         ],
         "type": "object"
       },
+      "DurationEstimateStatus": {
+        "description": "A p50/p90 duration estimate and the sample behind it.",
+        "properties": {
+          "basis": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EstimateBasis"
+              }
+            ],
+            "description": "What was timed: `model_delivery` (run start to the model's finish) or `pipeline_run` (run start to run finish)."
+          },
+          "growth": {
+            "description": "True when the newest 5 runs were all slower than the p90 of the older ones, so `p90_ms` is the slowest of those 5.",
+            "type": "boolean"
+          },
+          "n": {
+            "description": "How many production runs the estimate read.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "p50_ms": {
+            "description": "Median duration in milliseconds, when `known`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "p90_ms": {
+            "description": "90th-percentile duration in milliseconds, when `known`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EstimateState"
+              }
+            ],
+            "description": "`known` with at least 5 runs; `unknown` below that, and then no verdict rests on the estimate."
+          },
+          "window": {
+            "description": "The most runs it reads (the newest 20).",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "basis",
+          "growth",
+          "n",
+          "state",
+          "window"
+        ],
+        "type": "object"
+      },
       "EdgeConfidence": {
         "description": "Confidence grading for a [`CatalogEdge`].\n\nCoarse-grained on purpose: every consumer threshold-checks at \"good enough\", and a 3-bucket enum is simpler than a numeric score. A numeric `confidence_score` field can be added alongside this enum later without breaking callers.",
         "enum": [
@@ -7615,6 +7773,25 @@
         ],
         "type": "object"
       },
+      "EstimateBasis": {
+        "description": "What a duration estimate timed.",
+        "oneOf": [
+          {
+            "description": "From run start to the product's output model finishing.",
+            "enum": [
+              "model_delivery"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "From run start to run finish, for the whole pipeline.",
+            "enum": [
+              "pipeline_run"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "EstimateOutput": {
         "description": "JSON output for `rocky estimate`.\n\n`estimates` is empty when the project declares no models; `message` is populated in that case to explain why, mirroring [`OptimizeOutput`]. An unknown `--model` is an error, not an empty result.",
         "properties": {
@@ -7658,6 +7835,25 @@
           "version"
         ],
         "type": "object"
+      },
+      "EstimateState": {
+        "description": "Whether a duration estimate has enough runs to judge from.",
+        "oneOf": [
+          {
+            "description": "At least 5 runs: the band is reported.",
+            "enum": [
+              "known"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Fewer than 5 runs: no band, no verdict.",
+            "enum": [
+              "unknown"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "ExcludedTableOutput": {
         "description": "A table that the discovery adapter reported but that is missing from the source warehouse, so the run skipped it. Tracked separately from `errors` because it is not a runtime failure — the row never made it past the pre-flight existence check.",
@@ -17501,6 +17697,13 @@
         "additionalProperties": false,
         "description": "The `[product]` table.",
         "properties": {
+          "deliver_by": {
+            "description": "When the output must be delivered: a standard 5-field cron expression, read in `timezone`. Each occurrence is a deadline. Absent means the product declares no deadline, and no lateness is recorded for it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "intent": {
             "description": "Plain-language statement of what the product is for.",
             "type": "string"
@@ -17524,6 +17727,13 @@
               }
             ],
             "description": "Where the data comes from."
+          },
+          "timezone": {
+            "description": "The IANA timezone `deliver_by` is read in (`\"Europe/Lisbon\"`). Defaults to UTC when omitted. Valid only beside `deliver_by`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "trust": {
             "allOf": [
@@ -17581,6 +17791,17 @@
               "string",
               "null"
             ]
+          },
+          "delivery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Delivery state, when the spec declares `deliver_by`: whether the latest production delivery was on time, how late, and whether the next delivery is at risk. The estimate times run start to the output model's finish."
           },
           "fulfill_state": {
             "description": "The persisted fulfillment state tag, when one exists.",
@@ -22065,6 +22286,17 @@
               "string",
               "null"
             ]
+          },
+          "delivery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline's newest production run that built any such model built. The estimate times the whole pipeline run. Absent when no production run of the pipeline built a product with a deadline."
           },
           "enabled": {
             "description": "False when the schedule declares `enabled = false`.",

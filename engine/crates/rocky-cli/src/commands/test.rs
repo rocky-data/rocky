@@ -77,13 +77,23 @@ pub fn test_output(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
+    config_path: &Path,
 ) -> Result<TestOutput> {
-    let result = rocky_engine::test_runner::run_tests(
-        models_dir,
-        contracts_dir,
-        model_filter,
-        &rocky_core::run_vars::RunVars::new(),
-    )?;
+    let extensions = crate::registry::duckdb_extensions_for(config_path)?;
+    let result =
+        rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
+            models_dir,
+            project_root: models_dir.parent().unwrap_or_else(|| Path::new(".")),
+            models: rocky_engine::test_runner::TestModels::Dir,
+            contracts_dir,
+            model_filter,
+            run_vars: &rocky_core::run_vars::RunVars::new(),
+            gates: None,
+            inlined_gates: None,
+            strict_contracts: false,
+            target_dialects: Default::default(),
+            extensions: extensions.clone(),
+        })?;
     reject_unknown_model(model_filter, &result.all_models)?;
     let failures: Vec<TestFailure> = result
         .failures
@@ -97,7 +107,8 @@ pub fn test_output(
     let mut output = TestOutput::new(result.total, result.passed, failures)
         .with_model_results(model_results)
         .with_diagnostics(result.diagnostics.clone());
-    let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    let unit_run =
+        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
     }
@@ -193,6 +204,7 @@ pub fn run_test_with_selection(
             .with_context(|| format!("failed to load config from {}", path.display()))?,
         None => None,
     };
+    let extensions = crate::registry::duckdb_extensions_from(project_config.as_ref());
     let mut result = super::ci::with_project_gates(
         project_config.as_ref(),
         config_path.unwrap_or_else(|| Path::new("rocky.toml")),
@@ -213,6 +225,7 @@ pub fn run_test_with_selection(
                     project_config.as_ref(),
                     config_path.unwrap_or_else(|| Path::new("rocky.toml")),
                 ),
+                extensions: extensions.clone(),
             })
         },
     )?;
@@ -220,7 +233,8 @@ pub fn run_test_with_selection(
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.
     reject_unknown_model(model_filter, &result.all_models)?;
-    let mut unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    let mut unit_run =
+        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
     if let Some(set) = &selected {
         retain_selected(&mut result, &mut unit_run, set);
     }
@@ -1440,15 +1454,27 @@ mod tests {
     #[test]
     fn a_scoped_test_still_reports_the_consumer_error() {
         let (_tmp, models) = project_with_a_bad_consumer();
-        let mut result = rocky_engine::test_runner::run_tests(
+        let mut result =
+            rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
+                models_dir: &models,
+                project_root: models.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                models: rocky_engine::test_runner::TestModels::Dir,
+                contracts_dir: None,
+                model_filter: None,
+                run_vars: &rocky_core::run_vars::RunVars::new(),
+                gates: None,
+                inlined_gates: None,
+                strict_contracts: false,
+                target_dialects: Default::default(),
+                extensions: Default::default(),
+            })
+            .expect("run");
+        let mut unit_run = rocky_engine::test_runner::run_unit_tests(
             &models,
             None,
-            None,
-            &rocky_core::run_vars::RunVars::new(),
+            &rocky_duckdb::ExtensionOptions::default(),
         )
-        .expect("run");
-        let mut unit_run =
-            rocky_engine::test_runner::run_unit_tests(&models, None).expect("unit run");
+        .expect("unit run");
         let selected = std::collections::BTreeSet::from(["good_mart".to_string()]);
         super::retain_selected(&mut result, &mut unit_run, &selected);
         assert!(

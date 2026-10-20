@@ -759,6 +759,8 @@ mod tests {
                 output_version: None,
                 stored_bytes: None,
                 output_target: None,
+                due_at: None,
+                wait_for_upstream_ms: None,
             }],
             trigger: RunTrigger::Manual,
             config_hash: "cfg-hash".to_string(),
@@ -781,6 +783,7 @@ mod tests {
             run_scope: Some(rocky_core::state::RunScope::Branch {
                 name: "pr-preview-governance".to_string(),
             }),
+            queued_ms: None,
         }
     }
 
@@ -916,6 +919,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
+            queued_ms: None,
         }
     }
 
@@ -996,6 +1000,8 @@ mod tests {
             output_version: None,
             stored_bytes: None,
             output_target: None,
+            due_at: None,
+            wait_for_upstream_ms: None,
         }
     }
 
