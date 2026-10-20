@@ -2402,7 +2402,7 @@ pub fn check_freshness_coverage(
         );
         let suggestion = format!(
             "add a `[freshness]` block to the model sidecar, e.g. \
-             `[freshness] expected_lag_seconds = 3600, time_column = \"{}\"`",
+             `[freshness] warn_after = \"1h\", time_column = \"{}\"`",
             temporal_columns[0],
         );
         diagnostics.push(
@@ -9844,7 +9844,7 @@ mod tests {
         // The suggestion must name the public-facing field + a candidate column.
         let help = d.suggestion.as_deref().unwrap_or("");
         assert!(
-            help.contains("expected_lag_seconds"),
+            help.contains("warn_after"),
             "suggestion missing TTL hint: {help}"
         );
         assert!(
@@ -9872,10 +9872,12 @@ mod tests {
     fn w005_model_freshness_block_suppresses_diagnostic() {
         let mut model = make_model("events", "SELECT 1");
         model.config.freshness = Some(rocky_core::models::ModelFreshnessConfig {
-            max_lag_seconds: 3600,
-            time_column: Some("event_ts".to_string()),
-            severity: None,
             declared_in_sidecar: true,
+            ..rocky_core::models::ModelFreshnessConfig::levels(
+                Some("1h"),
+                None,
+                Some("event_ts".to_string()),
+            )
         });
         let models = vec![model];
         let typed = typed_models_for("events", &[("event_ts", RockyType::Timestamp)]);

@@ -100,6 +100,8 @@ error_after     = "24h"            # must be >= warn_after (else E050)
 filter          = "status <> 'test'"   # optional WHERE predicate; no `;`
 ```
 
+The same `warn_after` / `error_after` grammar applies to a model sidecar `[freshness]` (plus `time_column`) and the project `[freshness]`. Old keys `max_lag_seconds` / `expected_lag_seconds` still parse; `rocky validate` warns `W058`.
+
 ## Quality pipeline
 
 ```toml

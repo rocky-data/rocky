@@ -174,6 +174,9 @@ pub struct ResolvedCheckNameOutput {
 /// ever read it, so it was removed rather than exposed here (#1620).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FreshnessConfigOutput {
+    /// The age in seconds at which the check first fails: the smaller of
+    /// `warn_after` / `error_after` (the deprecated `threshold_seconds`
+    /// when the block uses it).
     pub threshold_seconds: u64,
 }
 
@@ -5999,7 +6002,7 @@ impl ChecksConfigOutput {
         use rocky_core::checks::CheckKind;
 
         let freshness = cfg.freshness.as_ref().map(|f| FreshnessConfigOutput {
-            threshold_seconds: f.threshold_seconds,
+            threshold_seconds: f.thresholds().budget_seconds().unwrap_or(0),
         });
 
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();

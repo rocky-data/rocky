@@ -105,17 +105,25 @@ export interface ColumnSpec {
  */
 export interface FreshnessSpec {
   /**
-   * Lag budget in the duration grammar (`"24h"`).
+   * Age above which the output reports `error`. Must not be shorter than `warn_after`.
    */
-  max_lag: string;
+  error_after?: string | null;
   /**
-   * Optional severity for the staleness report.
+   * Deprecated: write `warn_after` / `error_after`. Lag budget in the duration grammar (`"24h"`).
+   */
+  max_lag?: string | null;
+  /**
+   * Deprecated, only with `max_lag`: severity for the staleness report.
    */
   severity?: FreshnessSeverity | null;
   /**
    * The timestamp column the staleness check reads.
    */
   time_column: string;
+  /**
+   * Age above which the output reports `warn` (`"12h"`).
+   */
+  warn_after?: string | null;
 }
 /**
  * Grounding sources: exact `catalog.schema.table` triples only.

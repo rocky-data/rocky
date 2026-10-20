@@ -420,7 +420,13 @@ const COVERED_LEAF_FIELDS: &[(&str, &[&str])] = &[
     ("product.output.columns", &["name", "nullable", "type"]),
     (
         "product.output.freshness",
-        &["max_lag", "severity", "time_column"],
+        &[
+            "error_after",
+            "max_lag",
+            "severity",
+            "time_column",
+            "warn_after",
+        ],
     ),
 ];
 
@@ -1019,7 +1025,13 @@ agent = "propose_only"
         );
         assert_eq!(
             derived["product.output.freshness"],
-            leaves(&["max_lag", "severity", "time_column"])
+            leaves(&[
+                "error_after",
+                "max_lag",
+                "severity",
+                "time_column",
+                "warn_after"
+            ])
         );
         assert_leaf_coverage().expect("the claim passes");
     }

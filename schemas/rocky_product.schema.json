@@ -49,9 +49,19 @@
       "additionalProperties": false,
       "description": "Declared freshness: the lag budget plus the column that witnesses it.\n\n`time_column` is required. Without it the observation-phase staleness check (`MAX(time_column)` against the budget) has nothing to read, and freshness would be a claim with no witness.",
       "properties": {
+        "error_after": {
+          "description": "Age above which the output reports `error`. Must not be shorter than `warn_after`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_lag": {
-          "description": "Lag budget in the duration grammar (`\"24h\"`).",
-          "type": "string"
+          "description": "Deprecated: write `warn_after` / `error_after`. Lag budget in the duration grammar (`\"24h\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "severity": {
           "anyOf": [
@@ -62,15 +72,21 @@
               "type": "null"
             }
           ],
-          "description": "Optional severity for the staleness report."
+          "description": "Deprecated, only with `max_lag`: severity for the staleness report."
         },
         "time_column": {
           "description": "The timestamp column the staleness check reads.",
           "type": "string"
+        },
+        "warn_after": {
+          "description": "Age above which the output reports `warn` (`\"12h\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "max_lag",
         "time_column"
       ],
       "type": "object"

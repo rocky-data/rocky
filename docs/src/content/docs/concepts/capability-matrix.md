@@ -142,8 +142,8 @@ section "How apply works", and graded in the
 **Checked on demand by `rocky freshness`; not a gate on `rocky run`.** Two
 declarations describe how stale data may get:
 
-- A model's `[freshness]` block (`expected_lag_seconds`, `time_column`,
-  `severity`).
+- A model's `[freshness]` block (`warn_after`, `error_after`,
+  `time_column`).
 - A transformation pipeline's `[[pipeline.<name>.sources]]` entry with a
   `freshness` block (`loaded_at_field`, `warn_after`, `error_after`,
   `filter`). A source is a table the models read but do not build.
@@ -179,7 +179,7 @@ does not skip a model downstream of a stale source. To gate a run, call
 evaluate them.
 
 One separate, opt-in run-time check exists, for replication pipelines only:
-`[checks] freshness = { threshold_seconds = ... }` measures the real lag with
+`[checks] freshness = { error_after = "..." }` measures the real lag with
 SQL after the pipeline runs, and records the check as failed when the lag
 exceeds the threshold. Other pipeline types do not execute that check today;
 `rocky validate` flags it there as inert (V034). It is a pipeline check with

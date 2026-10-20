@@ -667,6 +667,15 @@ pub const W056: &str = "W056";
 /// extension, a UDF created outside Rocky), so this never fails a compile on
 /// its own. Escalate with `rocky compile --deny-warnings W057`.
 pub const W057: &str = "W057";
+/// A freshness block uses a deprecated spelling: `threshold_seconds` in
+/// `[checks.freshness]`, `max_lag_seconds` / `expected_lag_seconds` in a
+/// model sidecar, `_defaults.toml` or the project `[freshness]`, `max_lag`
+/// in a product spec, or `severity` beside any of them.
+///
+/// Emitted by `rocky validate`, never `rocky compile`. The old keys still
+/// work and behave as before; the message names the `warn_after` /
+/// `error_after` line that replaces them.
+pub const W058: &str = "W058";
 
 /// Every warning code the compile pipeline can emit: the `W###` codes above
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
@@ -677,10 +686,11 @@ pub const WARNING_CODES: &[&str] = &[
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so
-/// `--deny-warnings` does not accept them: [`W055`] (`rocky package`).
+/// `--deny-warnings` does not accept them: [`W055`] (`rocky package`) and
+/// [`W058`] (`rocky validate`).
 /// The registry test requires every `W###` constant in exactly one of this
 /// list and [`WARNING_CODES`].
-pub const NON_COMPILE_WARNING_CODES: &[&str] = &[W055];
+pub const NON_COMPILE_WARNING_CODES: &[&str] = &[W055, W058];
 
 /// Whether `code` (case-insensitive, surrounding spaces ignored) is a
 /// warning code in [`WARNING_CODES`].

@@ -464,7 +464,7 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `fail_on_error` | bool | `true` | When `false`, downgrades every `error`-severity assertion to a non-fatal result. |
 | `row_count` | bool | `false` | Compare row counts between source and target. |
 | `column_match` | bool | `false` | Verify source and target have the same column sets. |
-| `freshness` | table | | `{ threshold_seconds = N }`. Every table is checked against the single `threshold_seconds`. There is no per-schema override. |
+| `freshness` | table | | `{ warn_after = "12h", error_after = "24h" }`. Set at least one. Every table is checked against the same levels. There is no per-schema override. An age above `error_after` fails the check at error severity and gates the run. An age above `warn_after` fails it at warning severity. See [Freshness durations](#freshness-durations). |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. Must be a finite number: `nan` and `inf` are refused when the config loads. |
@@ -615,7 +615,7 @@ Run one `rocky tick` timer per project. Schedule state is per-machine. A remote 
 | `cron` | string | — | Standard 5-field cron expression (`minute hour day-of-month month day-of-week`). Due at each occurrence. First-ever evaluation anchors at "now" and waits for the next occurrence rather than firing immediately. |
 | `timezone` | string | project `[schedule].timezone`, else `"UTC"` | IANA timezone name (e.g. `"Europe/Lisbon"`) the `cron` occurrences are evaluated in. DST transitions are handled: a skipped wall-clock hour fires at the next valid instant once, a repeated hour fires on the first occurrence only. |
 | `after` | array of strings | `[]` | Upstream pipeline names. Due once **every** listed pipeline has a successful run that completed after this pipeline's own latest success *started*. A partial-success (exit 2) upstream run does **not** count. Cycles are a validation error. |
-| `freshness` | bool | `false` | When `true`, the pipeline is due once its own run-staleness exceeds its freshness budget. That budget is the minimum of its member models' `max_lag_seconds`, falling back to the project [`[freshness]`](#freshness) `expected_lag_seconds`. This is run-staleness, **not** a warehouse data-freshness probe; the reconciler issues no queries. `freshness = true` with no resolvable budget is a validation error. |
+| `freshness` | bool | `false` | When `true`, the pipeline is due once its own run-staleness exceeds its freshness budget. That budget is the minimum over its member models, falling back to the project [`[freshness]`](#freshness) block. A block's budget is the smaller of its `warn_after` and `error_after`. This is run-staleness, **not** a warehouse data-freshness probe; the reconciler issues no queries. `freshness = true` with no resolvable budget is a validation error. |
 | `catchup` | string | `"latest"` | Policy when more than one cron occurrence elapsed since the last fire. `"latest"` fires one demand at the most recent missed occurrence; `"skip"` advances the anchor and runs nothing. `"all"` is **rejected** at validation — Rocky runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost with no extra data. |
 | `retry` | table | `{ max = 0 }` | In-tick retry on failure. `retry.max` is the number of *additional* immediate re-submissions after the first attempt fails. The reconciler never sleeps between attempts; minutes-scale spacing between ticks is the always-on cross-tick backoff, not this knob. Partial (exit 2) runs are never retried. |
 | `timeout_minutes` | integer | `0` | Scheduler-level timeout for a launched run. `0` means none — the run's own limits apply. On elapse the child is terminated gracefully, then forcibly. |
@@ -1129,9 +1129,11 @@ Set a project-wide staleness budget, so you do not repeat the same threshold in 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `expected_lag_seconds` | integer | (unset) | Maximum lag before a model counts as stale. This is the field that makes the block active: without it, Rocky treats the project as having no freshness default and inherits nothing. |
-| `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) reads `MAX(time_column)` from the model's target table. |
-| `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. Under `"error"`, a stale model makes `rocky freshness` exit 1. |
+| `warn_after` | duration | (unset) | Age above which a model counts as stale at warning severity. |
+| `error_after` | duration | (unset) | Age above which a model counts as stale at error severity. Under `rocky freshness`, a model past this level makes the command exit 1. It must not be shorter than `warn_after`. |
+| `time_column` | string | (unset) | Timestamp column to measure age from. Inherited by a model that declares no `[freshness]` block. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) reads `MAX(time_column)` from the model's target table. |
+
+Set at least one of `warn_after` and `error_after`. They make the block active: without a level, Rocky treats the project as having no freshness default and inherits nothing.
 
 A model that declares no `[freshness]` block of its own inherits this one, whole. Precedence, first match wins:
 
@@ -1139,13 +1141,36 @@ A model that declares no `[freshness]` block of its own inherits this one, whole
 model sidecar [freshness]   ->  models/_defaults.toml [freshness]  ->  project [freshness]
 ```
 
-Inheritance is whole-block, not field by field. A model that declares its own `[freshness]` keeps exactly what it wrote; it does not pick up `time_column` or `severity` from here for the fields it left out. A project block with no `expected_lag_seconds` supplies nothing at all, so `time_column` or `severity` on their own are still inert.
+Inheritance is whole-block, not field by field. A model that declares its own `[freshness]` keeps exactly what it wrote; it does not pick up `time_column` or a level from here for the fields it left out. A project block with no level supplies nothing at all, so `time_column` on its own is still inert.
 
-The compiler raises `W005` on a model that has at least one temporal output column (`DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and no `freshness` declaration in scope. A model with no temporal column never raises it. Setting `expected_lag_seconds` here puts a declaration in scope for every model at once, which silences the warning project-wide; a per-model `[freshness]` block silences it for that model.
+The compiler raises `W005` on a model that has at least one temporal output column (`DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and no `freshness` declaration in scope. A model with no temporal column never raises it. Setting a level here puts a declaration in scope for every model at once, which silences the warning project-wide; a per-model `[freshness]` block silences it for that model.
 
-The scheduler uses it as the staleness budget for a pipeline that sets [`[pipeline.NAME.schedule]`](#pipelinenameschedule) `freshness = true`. For a transformation pipeline, a member model's own `max_lag_seconds` wins: the budget is the smallest one the members declare. When no member declares one, this project value applies. Every other pipeline type loads no member models, so this value is its only budget.
+The scheduler uses it as the staleness budget for a pipeline that sets [`[pipeline.NAME.schedule]`](#pipelinenameschedule) `freshness = true`. For a transformation pipeline, a member model's own levels win: the budget is the smallest level the members declare. When no member declares one, this project value applies. Every other pipeline type loads no member models, so this value is its only budget.
 
-This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) freshness check, which runs as part of the data-quality pipeline and has its own `threshold_seconds`.
+This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) freshness check, which runs as part of the data-quality pipeline and has its own `warn_after` / `error_after`.
+
+### Freshness durations
+
+Every freshness level is a duration string. Write a positive integer and one unit: `s`, `h` or `d`. Examples: `"3600s"`, `"12h"`, `"7d"`. Rocky rejects minutes, uppercase units, zero and leading zeros. The same grammar applies to the pipeline check, the model sidecar, this project block, the product spec and the per-source `freshness` block.
+
+```toml
+[freshness]
+warn_after  = "1h"
+error_after = "6h"
+time_column = "updated_at"
+```
+
+### Deprecated freshness spellings
+
+These older keys still parse and behave as before. `rocky validate` warns with `W058`, which names the file, the key and the replacement. Loading one logs only a debug line.
+
+| Old spelling | Where | Replacement |
+|---|---|---|
+| `threshold_seconds = N` with `severity` (default `"error"`) | pipeline check | `error_after = "<N>s"`, or `warn_after` when `severity = "warning"` |
+| `max_lag_seconds` or `expected_lag_seconds = N` with `severity` (default `"warning"`) | model sidecar and project block | `warn_after = "<N>s"`, or `error_after` when `severity = "error"` |
+| `max_lag = "24h"` with `severity` | product spec | same rule as the model sidecar |
+
+A block that mixes an old key (`severity` included) with `warn_after` or `error_after` is rejected. Rocky keeps these keys as deprecated aliases on purpose, although it normally drops old spellings before 2.0.
 
 ---
 
@@ -1420,7 +1445,7 @@ binding_type = "READ_WRITE"
 enabled = true
 row_count = true
 column_match = true
-freshness = { threshold_seconds = 86400 }
+freshness = { error_after = "24h" }
 
 [pipeline.bronze.execution]
 concurrency = 8

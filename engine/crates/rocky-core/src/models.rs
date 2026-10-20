@@ -343,35 +343,43 @@ pub struct ModelConfig {
 /// the model plus the optional timestamp column used by the runtime
 /// freshness check.
 ///
-/// `rocky freshness` enforces the TTL at run time: it reads
-/// `MAX(time_column)` from the model's target table (or, without a
-/// `time_column`, the model's last successful build in the state store) and
-/// reports `warn`, or `error` when `severity = "error"`. `rocky run` does not
-/// gate on it. The compiler checks the `time_column` (E050 when absent from a
+/// `rocky freshness` enforces it at run time: it reads `MAX(time_column)`
+/// from the model's target table (or, without a `time_column`, the model's
+/// last successful build in the state store) and reports `warn` past
+/// `warn_after`, `error` past `error_after`. `rocky run` does not gate on
+/// it. The compiler checks the `time_column` (E050 when absent from a
 /// provably complete output, W050 when not temporal), and soft-warns (W005)
 /// when a model has at least one temporal output column but no `freshness`
 /// declaration anywhere in scope (per-model or project-level default).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// `max_lag_seconds` (alias `expected_lag_seconds`) + `severity` is the
+/// deprecated spelling. It still parses and behaves as before (`rocky
+/// validate` reports W058): the one value is the error level under
+/// `severity = "error"`, else the warn level. It is stored as written, never
+/// converted, because each model's whole config is hashed into plan ids.
+/// Read the levels through [`Self::thresholds`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ModelFreshnessConfig {
-    /// Maximum lag in seconds before the model is considered stale.
+    /// Deprecated: write `warn_after` / `error_after`. Maximum lag in
+    /// seconds before the model is considered stale.
     ///
-    /// Accepts both `max_lag_seconds` (legacy field name, preserved for
-    /// existing sidecar fixtures + dagster Pydantic + VS Code bindings)
-    /// and `expected_lag_seconds` (the documented public-facing name
-    /// matching dbt freshness + SQLMesh defaults). Both deserialize to
-    /// the same field; the serialized name stays `max_lag_seconds` so
-    /// existing JSON/codegen consumers keep working unchanged.
-    #[serde(alias = "expected_lag_seconds")]
-    pub max_lag_seconds: u64,
+    /// Accepts both `max_lag_seconds` and `expected_lag_seconds`. Both
+    /// deserialize to this field; the serialized name stays
+    /// `max_lag_seconds` so existing JSON/codegen consumers keep working.
+    #[serde(
+        alias = "expected_lag_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_lag_seconds: Option<u64>,
     /// Optional timestamp column used to evaluate freshness at runtime
     /// (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When
     /// unset the runtime falls back to the model's last-materialization
     /// timestamp from the state store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
-    /// Severity reported when the freshness check trips. Default
-    /// `warning` keeps the runtime check non-blocking — switch to
-    /// `error` to fail the pipeline on stale data.
+    /// Deprecated, only with `max_lag_seconds`: severity reported when the
+    /// freshness check trips. Default `warning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
     /// True only when the model's own sidecar declares this block. False when
@@ -383,9 +391,159 @@ pub struct ModelFreshnessConfig {
     #[serde(skip)]
     #[schemars(skip)]
     pub declared_in_sidecar: bool,
+    /// The key the file spelled the deprecated lag with (`max_lag_seconds`
+    /// or `expected_lag_seconds`), so W058 names what the user wrote. Not
+    /// serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub lag_key: Option<&'static str>,
+    /// Age above which the model reports `warn` (`"1h"`, `"7d"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_after: Option<String>,
+    /// Age above which the model reports `error` and `rocky freshness`
+    /// exits 1. Must not be shorter than `warn_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_after: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ModelFreshnessConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // No `deny_unknown_fields`: the derived impl this replaces had none,
+        // and an unchanged sidecar must keep parsing.
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            max_lag_seconds: Option<u64>,
+            #[serde(default)]
+            expected_lag_seconds: Option<u64>,
+            #[serde(default)]
+            time_column: Option<String>,
+            #[serde(default)]
+            severity: Option<crate::tests::TestSeverity>,
+            #[serde(default)]
+            warn_after: Option<String>,
+            #[serde(default)]
+            error_after: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // The two spellings were one aliased field, which refused both at
+        // once as a duplicate; that stays refused.
+        let (max_lag_seconds, lag_key) = match (raw.max_lag_seconds, raw.expected_lag_seconds) {
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::duplicate_field("max_lag_seconds"));
+            }
+            (Some(v), None) => (Some(v), Some("max_lag_seconds")),
+            (None, Some(v)) => (Some(v), Some("expected_lag_seconds")),
+            (None, None) => (None, None),
+        };
+        let mut old = Vec::new();
+        if let Some(key) = lag_key {
+            old.push(key);
+        }
+        if raw.severity.is_some() {
+            old.push("severity");
+        }
+        let new_form = raw.warn_after.is_some() || raw.error_after.is_some();
+        if new_form && !old.is_empty() {
+            return Err(serde::de::Error::custom(
+                crate::source_freshness::mixed_spelling_message(&old),
+            ));
+        }
+        if max_lag_seconds.is_none()
+            && let Err(problems) = crate::source_freshness::parse_levels(
+                raw.warn_after.as_deref(),
+                raw.error_after.as_deref(),
+            )
+        {
+            return Err(serde::de::Error::custom(format!(
+                "[freshness]: {}",
+                crate::source_freshness::problems_message(&problems)
+            )));
+        }
+        Ok(ModelFreshnessConfig {
+            max_lag_seconds,
+            time_column: raw.time_column,
+            severity: raw.severity,
+            declared_in_sidecar: false,
+            lag_key,
+            warn_after: raw.warn_after,
+            error_after: raw.error_after,
+        })
+    }
 }
 
 impl ModelFreshnessConfig {
+    /// A block in the deprecated spelling. For tests and in-code builders.
+    pub fn legacy(
+        max_lag_seconds: u64,
+        time_column: Option<String>,
+        severity: Option<crate::tests::TestSeverity>,
+    ) -> Self {
+        Self {
+            max_lag_seconds: Some(max_lag_seconds),
+            time_column,
+            severity,
+            declared_in_sidecar: false,
+            lag_key: None,
+            warn_after: None,
+            error_after: None,
+        }
+    }
+
+    /// A block in the current grammar.
+    pub fn levels(
+        warn_after: Option<&str>,
+        error_after: Option<&str>,
+        time_column: Option<String>,
+    ) -> Self {
+        Self {
+            max_lag_seconds: None,
+            time_column,
+            severity: None,
+            declared_in_sidecar: false,
+            lag_key: None,
+            warn_after: warn_after.map(str::to_string),
+            error_after: error_after.map(str::to_string),
+        }
+    }
+
+    /// The levels this block grades against — the one shape every consumer
+    /// reads, whichever spelling the block used.
+    ///
+    /// The deprecated `max_lag_seconds` is the error level under
+    /// `severity = "error"`, else the warn level: the rule `rocky freshness`
+    /// always applied.
+    pub fn thresholds(&self) -> crate::source_freshness::FreshnessThresholds {
+        match self.max_lag_seconds {
+            Some(seconds) => crate::source_freshness::FreshnessThresholds::from_single(
+                seconds,
+                self.severity.unwrap_or(crate::tests::TestSeverity::Warning),
+            ),
+            None => crate::source_freshness::levels_of(
+                self.warn_after.as_deref(),
+                self.error_after.as_deref(),
+            ),
+        }
+    }
+
+    /// The model's schedule budget: the smaller level present.
+    pub fn budget_seconds(&self) -> Option<u64> {
+        self.thresholds().budget_seconds()
+    }
+
+    /// The deprecated keys this block uses, spelled as the file wrote them
+    /// (`max_lag_seconds` when the spelling is unknown, e.g. a block built
+    /// in code).
+    pub fn legacy_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.max_lag_seconds.is_some() {
+            keys.push(self.lag_key.unwrap_or("max_lag_seconds"));
+        }
+        if self.severity.is_some() {
+            keys.push("severity");
+        }
+        keys
+    }
     /// Construct from a project-level default (see
     /// [`crate::config::ProjectFreshnessConfig`]).
     ///
@@ -393,18 +551,33 @@ impl ModelFreshnessConfig {
     /// precedence chain, for a model that declares no `[freshness]` block of
     /// its own and sits under no `_defaults.toml` that declares one.
     ///
-    /// Returns `None` when the project block carries no
-    /// `expected_lag_seconds`: a model freshness block needs a TTL, so
-    /// a project `[freshness]` that sets only `time_column` or `severity`
-    /// supplies nothing.
+    /// Returns `None` when the project block carries no level: a model
+    /// freshness block needs a threshold, so a project `[freshness]` that
+    /// sets only `time_column` or `severity` supplies nothing.
+    ///
+    /// The inherited block keeps the project's spelling. A deprecated
+    /// `expected_lag_seconds` becomes `max_lag_seconds` with the project
+    /// `severity`, byte for byte what inheritance produced before.
     pub fn from_project_default(default: &crate::config::ProjectFreshnessConfig) -> Option<Self> {
-        let max_lag_seconds = default.expected_lag_seconds?;
-        Some(Self {
-            max_lag_seconds,
-            time_column: default.time_column.clone(),
-            severity: default.severity,
-            declared_in_sidecar: false,
-        })
+        if let Some(max_lag_seconds) = default.expected_lag_seconds {
+            return Some(Self {
+                max_lag_seconds: Some(max_lag_seconds),
+                time_column: default.time_column.clone(),
+                severity: default.severity,
+                declared_in_sidecar: false,
+                lag_key: Some("expected_lag_seconds"),
+                warn_after: None,
+                error_after: None,
+            });
+        }
+        if default.warn_after.is_none() && default.error_after.is_none() {
+            return None;
+        }
+        Some(Self::levels(
+            default.warn_after.as_deref(),
+            default.error_after.as_deref(),
+            default.time_column.clone(),
+        ))
     }
 }
 
@@ -955,7 +1128,26 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
             path: path.display().to_string().into(),
             error: e,
         })?;
+    if let Some(f) = &defaults.freshness {
+        warn_deprecated_freshness(&path.display().to_string(), f);
+    }
     Ok(defaults)
+}
+
+/// Log a deprecated `[freshness]` spelling at debug level on load. Loads
+/// repeat (the language server, each compile), so the user-facing surface
+/// is W058 from `rocky validate`.
+fn warn_deprecated_freshness(location: &str, freshness: &ModelFreshnessConfig) {
+    let keys = freshness.legacy_keys();
+    if keys.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        location,
+        keys = %keys.join(", "),
+        replacement = %crate::source_freshness::replacement_for(&freshness.thresholds()),
+        "deprecated [freshness] spelling (W058); it still works, write warn_after / error_after instead"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,6 +1575,9 @@ fn resolve_model_config(
     // `[freshness]`. The project step is the one #1435 was missing: the
     // block parsed and validated, and no model ever saw it. (`group` carries
     // no freshness today, unlike `strategy` above.)
+    if let Some(f) = &raw.freshness {
+        warn_deprecated_freshness(&format!("model '{name}'"), f);
+    }
     let freshness = raw
         .freshness
         .map(|f| ModelFreshnessConfig {
@@ -3136,6 +3331,7 @@ table = "fct_orders"
             expected_lag_seconds: Some(3600),
             time_column: Some("updated_at".to_string()),
             severity: Some(crate::tests::TestSeverity::Warning),
+            ..Default::default()
         }
     }
 
@@ -3170,7 +3366,7 @@ table = "fct_orders"
             .freshness
             .as_ref()
             .expect("the project [freshness] block must reach a model with no sidecar block");
-        assert_eq!(freshness.max_lag_seconds, 3600);
+        assert_eq!(freshness.max_lag_seconds, Some(3600));
         assert_eq!(freshness.time_column.as_deref(), Some("updated_at"));
         assert_eq!(
             freshness.severity,
@@ -3196,7 +3392,8 @@ table = "fct_orders"
 
         let freshness = models[0].config.freshness.as_ref().expect("sidecar block");
         assert_eq!(
-            freshness.max_lag_seconds, 60,
+            freshness.max_lag_seconds,
+            Some(60),
             "the sidecar value must survive project inheritance"
         );
         assert_eq!(freshness.time_column.as_deref(), Some("event_ts"));
@@ -3229,7 +3426,7 @@ table = "fct_orders"
                 .as_ref()
                 .expect("defaults block")
                 .max_lag_seconds,
-            900
+            Some(900)
         );
     }
 
@@ -3261,6 +3458,7 @@ table = "fct_orders"
             expected_lag_seconds: None,
             time_column: Some("updated_at".to_string()),
             severity: Some(crate::tests::TestSeverity::Error),
+            ..Default::default()
         };
         let models = load_models_from_dir(dir.path(), Some(&project)).unwrap();
         assert!(models[0].config.freshness.is_none());

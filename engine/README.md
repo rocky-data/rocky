@@ -15,7 +15,7 @@ manifest file, and no separate parse step.
                           ▼
                    rocky compile ───────► diagnostics
                           │               E001-E060  errors
-                          ▼               W001-W057  warnings
+                          ▼               W001-W058  warnings
                       typed IR            P001-P002  lints
               (every column's type)       I001-I003  information
                           │
@@ -218,7 +218,7 @@ stable code, so you can grep for it and gate on it.
 | Prefix | Codes | What it means |
 |---|---|---|
 | `E` | E001-E060 | Error. `rocky compile` exits non-zero. |
-| `W` | W001-W057 | Warning. Compilation still succeeds. |
+| `W` | W001-W058 | Warning. Compilation still succeeds. |
 | `P` | P001-P002 | Lint. P001 flags SQL that does not port to your target dialect. P002 warns on a `SELECT *` whose downstream consumers name specific columns. |
 | `I` | I001-I003 | Information. I003 flags a contract column whose type Rocky could not infer, so its declared type went unchecked. |
 

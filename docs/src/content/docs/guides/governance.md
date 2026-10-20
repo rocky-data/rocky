@@ -636,7 +636,7 @@ Rocky runs data quality checks inside a replication run. Each check executes as 
 enabled = true
 row_count = true
 column_match = true
-freshness = { threshold_seconds = 86400 }
+freshness = { error_after = "24h" }
 anomaly_threshold_pct = 50.0
 null_rate = { columns = ["email", "phone"], threshold = 0.05, sample_percent = 10 }
 
@@ -650,7 +650,7 @@ threshold = 0
 |---|---|
 | Row count | `COUNT(*)` on the source against the target. Rocky batches tables into `UNION ALL` queries, 200 per batch. |
 | Column match | Source and target column sets, ignoring case. Reports missing and extra columns. Costs two extra metadata queries per table. |
-| Freshness | `MAX(timestamp_column)` against now. Fails when the newest row is older than `threshold_seconds`. |
+| Freshness | `MAX(timestamp_column)` against now. Fails when the newest row is older than `error_after` (error severity) or `warn_after` (warning severity). |
 | Null rate | Null percentage per column, from a `TABLESAMPLE`. `sample_percent` keeps it fast on a large table. |
 | Anomaly | Row count against a moving average of past runs. Flags a change above `anomaly_threshold_pct`. |
 | Custom | Your SQL, with a `{target}` placeholder. Passes when the result is at most `threshold`. |

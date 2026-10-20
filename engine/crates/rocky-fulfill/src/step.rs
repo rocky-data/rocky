@@ -1515,7 +1515,7 @@ impl Runner {
         let staleness_ok = match &spec.parsed.product().output.freshness {
             None => None,
             Some(freshness) => {
-                let budget_seconds = match freshness.max_lag_seconds() {
+                let budget_seconds = match freshness.budget_seconds() {
                     Ok(seconds) => seconds,
                     Err(reject) => {
                         detail.push(format!("freshness budget unparseable: {reject}"));

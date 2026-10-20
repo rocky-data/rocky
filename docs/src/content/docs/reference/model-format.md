@@ -97,7 +97,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `adapter` | string | No | An `[adapter.NAME]` key from `rocky.toml`. Runs this model on that adapter instead of the pipeline's. |
 | `intent` | string | No | A plain-language description of what the model does. `rocky ai-sync` reads it. |
 
-More sidecar blocks: `[freshness]` (`max_lag_seconds`, `time_column`, `severity`; see [`[freshness]`](/reference/configuration/#freshness)), `[budget]` (a per-model override of the project [`[budget]`](/reference/configuration/#budget), checked at compile time as `E027`), and the adapter-specific [`[redshift]`](/reference/adapters/redshift/#table-distribution-and-sort-keys) and [`[clickhouse]`](/reference/adapters/clickhouse/#table-engine-partitions-and-sort-key) blocks.
+More sidecar blocks: `[freshness]` (`warn_after`, `error_after`, `time_column`; see [`[freshness]`](/reference/configuration/#freshness)), `[budget]` (a per-model override of the project [`[budget]`](/reference/configuration/#budget), checked at compile time as `E027`), and the adapter-specific [`[redshift]`](/reference/adapters/redshift/#table-distribution-and-sort-keys) and [`[clickhouse]`](/reference/adapters/clickhouse/#table-engine-partitions-and-sort-key) blocks.
 
 :::caution[Unknown top-level keys are ignored]
 Rocky does not refuse an unknown top-level key in a sidecar. A typo such as `depends_onn = ["x"]` loads without an error, and the setting has no effect. Check each key against this page.
