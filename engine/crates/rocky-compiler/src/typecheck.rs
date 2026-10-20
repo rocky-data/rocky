@@ -10258,89 +10258,180 @@ mod tests {
     }
 
     /// The over-cap bit of a branch set does not depend on branch order,
-    /// and an `Unknown` branch does not hide it (ADR-TYPES §3, line 184).
-    /// `m` is a non-null column Rocky cannot type. `w` with `z` needs 60
-    /// digits, so every order of `[w, z, m]` is nullable, for `UNION ALL`
-    /// and for `COALESCE`. Before, a `UNION ALL` fold that met `m` before
-    /// `z` lost `w`'s digits, and `COALESCE` with `m` was never flagged.
+    /// and no other branch hides it (ADR-TYPES §3, line 184). `w` with `z`
+    /// needs 60 digits. The third branch is `m`, a non-null column Rocky
+    /// cannot type; `s`, a `DECIMAL` of unknown precision; or `f`, a
+    /// `DOUBLE`. Every order of `[w, z, third]` is nullable, for `UNION ALL`,
+    /// a parenthesised `UNION ALL` and `COALESCE`. Before, a `UNION ALL` fold
+    /// that met the third branch before `z` lost `w`'s digits, and a
+    /// `COALESCE` with any of the three was never flagged.
     #[test]
     fn decimal_over_cap_is_order_independent_with_an_unknown_branch() {
         let d = |precision, scale| RockyType::Decimal { precision, scale };
-        let sources = HashMap::from([(
-            "raw.t".to_string(),
-            source_schema(&[
+        let schema = |with_z: bool| {
+            let mut cols = vec![
                 ("w", d(30, 0), false),
-                ("z", d(30, 30), false),
                 ("m", RockyType::Unknown, false),
-            ]),
-        )]);
-        let permutations = [
-            ["w", "z", "m"],
-            ["w", "m", "z"],
-            ["z", "w", "m"],
-            ["z", "m", "w"],
-            ["m", "w", "z"],
-            ["m", "z", "w"],
-        ];
+                ("s", RockyType::DecimalUnsized { scale: None }, false),
+                ("f", RockyType::Float64, false),
+            ];
+            if with_z {
+                cols.push(("z", d(30, 30), false));
+            }
+            HashMap::from([("raw.t".to_string(), source_schema(&cols))])
+        };
         let mut models = Vec::new();
-        for (index, [a, b, c]) in permutations.iter().enumerate() {
-            models.push((
-                format!("u{index}"),
-                format!(
-                    "SELECT {a} AS c FROM raw.t UNION ALL SELECT {b} FROM raw.t \
-                     UNION ALL SELECT {c} FROM raw.t"
-                ),
-            ));
-            // Parenthesised: the inner set operation keeps its branches.
-            models.push((
-                format!("p{index}"),
-                format!(
-                    "SELECT {a} AS c FROM raw.t UNION ALL \
-                     (SELECT {b} FROM raw.t UNION ALL SELECT {c} FROM raw.t)"
-                ),
-            ));
-            models.push((
-                format!("k{index}"),
-                format!(
-                    "SELECT CAST(CONCAT(COALESCE({a}, {b}, {c}), 'x') AS STRING) AS c FROM raw.t"
-                ),
-            ));
+        for third in ["m", "s", "f"] {
+            let permutations = [
+                ["w", "z", third],
+                ["w", third, "z"],
+                ["z", "w", third],
+                ["z", third, "w"],
+                [third, "w", "z"],
+                [third, "z", "w"],
+            ];
+            for (index, [a, b, c]) in permutations.iter().enumerate() {
+                models.push((
+                    format!("u_{third}{index}"),
+                    format!(
+                        "SELECT {a} AS c FROM raw.t UNION ALL SELECT {b} FROM raw.t \
+                         UNION ALL SELECT {c} FROM raw.t"
+                    ),
+                ));
+                // Parenthesised: the inner set operation keeps its branches.
+                models.push((
+                    format!("p_{third}{index}"),
+                    format!(
+                        "SELECT {a} AS c FROM raw.t UNION ALL \
+                         (SELECT {b} FROM raw.t UNION ALL SELECT {c} FROM raw.t)"
+                    ),
+                ));
+                models.push((
+                    format!("k_{third}{index}"),
+                    format!(
+                        "SELECT CAST(CONCAT(COALESCE({a}, {b}, {c}), 'x') AS STRING) AS c \
+                         FROM raw.t"
+                    ),
+                ));
+            }
         }
         let model_refs: Vec<(&str, &str)> = models
             .iter()
             .map(|(name, sql)| (name.as_str(), sql.as_str()))
             .collect();
-        let result = compile_typed(&model_refs, sources);
+        let result = compile_typed(&model_refs, schema(true));
         for (name, sql) in &models {
             let col = column(&result, name, "c");
             assert!(col.nullable, "{name}: {sql}: {col:?}");
         }
         // Control: without `z` the set is within the cap, so no order makes
-        // it nullable.
-        let sources = HashMap::from([(
-            "raw.t".to_string(),
-            source_schema(&[("w", d(30, 0), false), ("m", RockyType::Unknown, false)]),
-        )]);
-        let result = compile_typed(
-            &[
-                (
-                    "a",
-                    "SELECT w AS c FROM raw.t UNION ALL SELECT m FROM raw.t \
-                     UNION ALL SELECT w FROM raw.t",
+        // it nullable. The third branch is not first in `COALESCE`: a cast's
+        // lineage edge reads the first column, and a cast from `Unknown` is
+        // nullable on its own.
+        let mut controls = Vec::new();
+        for third in ["m", "s", "f"] {
+            controls.push((
+                format!("a_{third}"),
+                format!(
+                    "SELECT w AS c FROM raw.t UNION ALL SELECT {third} FROM raw.t \
+                     UNION ALL SELECT w FROM raw.t"
                 ),
-                // `m` is not first: a cast's lineage edge reads the first
-                // column, and a cast from `Unknown` is nullable on its own.
-                (
-                    "b",
-                    "SELECT CAST(CONCAT(COALESCE(w, m, w), 'x') AS STRING) AS c FROM raw.t",
+            ));
+            controls.push((
+                format!("b_{third}"),
+                format!(
+                    "SELECT CAST(CONCAT(COALESCE(w, {third}, w), 'x') AS STRING) AS c FROM raw.t"
                 ),
-            ],
-            sources,
-        );
-        for name in ["a", "b"] {
-            let col = column(&result, name, "c");
-            assert!(!col.nullable, "{name}: {col:?}");
+            ));
         }
+        let control_refs: Vec<(&str, &str)> = controls
+            .iter()
+            .map(|(name, sql)| (name.as_str(), sql.as_str()))
+            .collect();
+        let result = compile_typed(&control_refs, schema(false));
+        for (name, sql) in &controls {
+            let col = column(&result, name, "c");
+            assert!(!col.nullable, "{name}: {sql}: {col:?}");
+        }
+    }
+
+    /// A set operation unifies all its branches at once with
+    /// `common_supertype_of`. Before, it folded two at a time with
+    /// `common_supertype`, an `Unknown` side or an incompatible pair giving
+    /// `Unknown`. Within the cap both give the same type for every ordered
+    /// triple of these types.
+    #[test]
+    fn set_operation_types_match_the_pairwise_fold_within_the_cap() {
+        let d = |precision, scale| RockyType::Decimal { precision, scale };
+        let columns = [
+            ("i", RockyType::Int32),
+            ("l", RockyType::Int64),
+            ("d", d(10, 2)),
+            ("e", d(5, 0)),
+            ("s", RockyType::DecimalUnsized { scale: Some(2) }),
+            ("g", RockyType::Float32),
+            ("h", RockyType::Float64),
+            ("b", RockyType::Boolean),
+            ("n", RockyType::String),
+            ("m", RockyType::Unknown),
+        ];
+        let cols: Vec<(&str, RockyType, bool)> = columns
+            .iter()
+            .map(|(name, ty)| (*name, ty.clone(), false))
+            .collect();
+        let sources = HashMap::from([("t".to_string(), source_schema(&cols))]);
+        let base_fold = |types: [&RockyType; 3]| -> RockyType {
+            types[1..].iter().fold(types[0].clone(), |acc, ty| {
+                if acc == RockyType::Unknown || **ty == RockyType::Unknown {
+                    RockyType::Unknown
+                } else {
+                    crate::types::common_supertype(&acc, ty)
+                        .map_or(RockyType::Unknown, |sup| sup.ty)
+                }
+            })
+        };
+        let mut failures = Vec::new();
+        let mut order_dependent = 0;
+        for (a, ta) in &columns {
+            for (b, tb) in &columns {
+                for (c, tc) in &columns {
+                    let sql = format!(
+                        "SELECT {a} AS c FROM t UNION ALL SELECT {b} FROM t \
+                         UNION ALL SELECT {c} FROM t"
+                    );
+                    let got = infer_select_types(&sql, &sources, "m").unwrap()[0]
+                        .data_type
+                        .clone();
+                    // Where the old fold gave one type for every order, the
+                    // type is unchanged. Where it depended on the order
+                    // (`d e s`: two decimal scales, then an unsized scale),
+                    // the set's answer is the one with no order.
+                    let orders = [
+                        [ta, tb, tc],
+                        [ta, tc, tb],
+                        [tb, ta, tc],
+                        [tb, tc, ta],
+                        [tc, ta, tb],
+                        [tc, tb, ta],
+                    ];
+                    let mut base = orders.iter().map(|order| base_fold(*order));
+                    let first = base.next().unwrap();
+                    let want = if base.all(|other| other == first) {
+                        first
+                    } else {
+                        order_dependent += 1;
+                        common_supertype_of(&[ta.clone(), tb.clone(), tc.clone()]).ty
+                    };
+                    if got != want {
+                        failures.push(format!("{a} {b} {c}: got {got:?}, want {want:?}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        // The old fold depended on the order only for the six orders of
+        // `d e s`.
+        assert_eq!(order_dependent, 6);
     }
 
     /// `REAL op REAL` is now `DOUBLE` (ADR-TYPES §3: a float operand gives

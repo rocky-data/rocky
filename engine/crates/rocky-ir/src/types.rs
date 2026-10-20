@@ -384,19 +384,39 @@ pub fn arithmetic_result_type(op: DecimalOp, a: &RockyType, b: &RockyType) -> In
     }
 }
 
+/// Whether the members whose digits are known (integers and sized
+/// decimals, [`decimal_parts_of`]) need more than [`MAX_INFERRED_PRECISION`]
+/// digits together: `max(integer_digits) + max(scale)`. Every other member
+/// is skipped, so it cannot hide the bit. Read over the whole set, so the
+/// order of the members cannot change it.
+fn known_digits_over_cap<'a>(members: impl IntoIterator<Item = &'a RockyType>) -> bool {
+    let (mut max_integer_digits, mut max_scale) = (0u32, 0u32);
+    for (integer_digits, scale) in members.into_iter().filter_map(decimal_parts_of) {
+        max_integer_digits = max_integer_digits.max(integer_digits);
+        max_scale = max_scale.max(scale);
+    }
+    decimal_from_parts(max_integer_digits, max_scale).over_cap
+}
+
 /// Unify exact numerics, at least one a decimal (ADR-TYPES §2 line 151,
 /// §3 line 184).
 ///
-/// With a `DecimalUnsized` member the result is `DecimalUnsized`, which
-/// claims no precision, so no cap applies. It keeps a scale only when every
-/// decimal member has that same known scale; integers have no fraction
-/// digits to disagree with. Otherwise the result is `max(integer_digits)`
-/// and `max(scale)`, with no carry digit; `Unknown` for a malformed
-/// decimal; or `Unknown` with [`InferredType::over_cap`] set above
-/// [`MAX_INFERRED_PRECISION`]. A warehouse casts every branch to the common
-/// type, and a branch that does not fit can overflow to NULL just as
-/// arithmetic can.
+/// First the cap: when the integers and sized decimals need more than
+/// [`MAX_INFERRED_PRECISION`] digits together, the result is `Unknown` with
+/// [`InferredType::over_cap`] set, even with a `DecimalUnsized` member. A
+/// warehouse casts every branch to the common type, and a branch that does
+/// not fit can overflow to NULL just as arithmetic can.
+///
+/// Otherwise, with a `DecimalUnsized` member the result is
+/// `DecimalUnsized`, which claims no precision. It keeps a scale only when
+/// every decimal member has that same known scale; integers have no
+/// fraction digits to disagree with. Without one, the result is
+/// `max(integer_digits)` and `max(scale)`, with no carry digit, or
+/// `Unknown` for a malformed decimal.
 fn unify_exact_numerics(members: &[&RockyType]) -> InferredType {
+    if known_digits_over_cap(members.iter().copied()) {
+        return InferredType::over_cap();
+    }
     if members
         .iter()
         .any(|member| matches!(member, RockyType::DecimalUnsized { .. }))
@@ -432,7 +452,8 @@ fn unify_exact_numerics(members: &[&RockyType]) -> InferredType {
 /// `Unknown` with [`InferredType::over_cap`] set. An `Unknown` side leaves
 /// one known type, and one type is never over the cap, so that early return
 /// drops no bit. For a whole branch set, use [`common_supertype_of`]: a
-/// pairwise fold loses the digits of a member once it meets an `Unknown`.
+/// pairwise fold loses the digits of a member once it meets an `Unknown`,
+/// `DecimalUnsized` or float member.
 pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<InferredType> {
     if a == b {
         return Some(InferredType::typed(a.clone()));
@@ -479,11 +500,14 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<InferredType> {
 /// promise that once a cap exists. Each step here reads the whole set
 /// (`any`, `all`, `max`), never an accumulator.
 ///
+/// - A set of one repeated type is that type.
+/// - When the integers and sized decimals in the set need more than
+///   [`MAX_INFERRED_PRECISION`] digits together: `Unknown` with
+///   [`InferredType::over_cap`] set, whatever the other branches are. So
+///   `[w, z, x]` is over the cap when `[w, z]` is, for an `Unknown`,
+///   `DecimalUnsized`, float or any other `x`, in any order.
 /// - Any `Unknown` branch gives `Unknown` (§2, line 146). The caller drops a
 ///   `NULL` literal first: it adds only nullability, not a type.
-///   [`InferredType::over_cap`] is still read from the other branches, so
-///   `[w, z, unknown]` is over the cap when `[w, z]` is, in any order.
-/// - A set of one repeated type is that type.
 /// - Exact numerics with a decimal: as [`common_supertype`], over the set.
 ///   Above [`MAX_INFERRED_PRECISION`]: `Unknown` with
 ///   [`InferredType::over_cap`] set.
@@ -498,23 +522,16 @@ pub fn common_supertype_of(branches: &[RockyType]) -> InferredType {
     let Some(first) = branches.first() else {
         return InferredType::typed(RockyType::Unknown);
     };
-    if branches.contains(&RockyType::Unknown) {
-        // The type is `Unknown`, but the known branches still need their
-        // digits: the warehouse casts them to one type, and above the cap
-        // that can overflow to NULL whatever the `Unknown` branch is. So
-        // the bit is the known branches' bit, and no order can hide it.
-        let known: Vec<RockyType> = branches
-            .iter()
-            .filter(|t| **t != RockyType::Unknown)
-            .cloned()
-            .collect();
-        return InferredType {
-            ty: RockyType::Unknown,
-            over_cap: common_supertype_of(&known).over_cap,
-        };
-    }
     if branches.iter().all(|t| t == first) {
         return InferredType::typed(first.clone());
+    }
+    // Before any other rule: an `Unknown`, unsized or float branch must not
+    // hide the digits the sized branches need together.
+    if known_digits_over_cap(branches) {
+        return InferredType::over_cap();
+    }
+    if branches.contains(&RockyType::Unknown) {
+        return InferredType::typed(RockyType::Unknown);
     }
     if branches.iter().all(RockyType::is_numeric) {
         let any_float = branches.iter().any(RockyType::is_float);
@@ -1300,22 +1317,33 @@ mod tests {
             common_supertype_of(&[RockyType::Float64, dec(10, 2)]),
             typed(RockyType::Unknown)
         );
-        // An `Unknown` branch does not hide the known branches' bit, in any
-        // order. Without `dec(30, 30)` the known branches fit.
+        // An `Unknown`, unsized or float branch does not hide the sized
+        // branches' bit, in any order. Without `dec(30, 30)` they fit.
         let (w, z, m) = (dec(30, 0), dec(30, 30), RockyType::Unknown);
-        for set in [
-            [w.clone(), z.clone(), m.clone()],
-            [w.clone(), m.clone(), z.clone()],
-            [z.clone(), w.clone(), m.clone()],
-            [z.clone(), m.clone(), w.clone()],
-            [m.clone(), w.clone(), z.clone()],
-            [m.clone(), z.clone(), w.clone()],
-        ] {
-            assert_eq!(common_supertype_of(&set), over, "{set:?}");
+        let unsized_decimal = RockyType::DecimalUnsized { scale: None };
+        for x in [m.clone(), unsized_decimal.clone(), RockyType::Float64] {
+            for set in [
+                [w.clone(), z.clone(), x.clone()],
+                [w.clone(), x.clone(), z.clone()],
+                [z.clone(), w.clone(), x.clone()],
+                [z.clone(), x.clone(), w.clone()],
+                [x.clone(), w.clone(), z.clone()],
+                [x.clone(), z.clone(), w.clone()],
+            ] {
+                assert_eq!(common_supertype_of(&set), over, "{set:?}");
+            }
         }
+        assert_eq!(
+            unify_exact_numerics(&[&w, &unsized_decimal, &z]),
+            over.clone()
+        );
         assert_eq!(
             common_supertype_of(&[w.clone(), m.clone(), w.clone()]),
             typed(RockyType::Unknown)
+        );
+        assert_eq!(
+            common_supertype_of(&[w.clone(), unsized_decimal.clone(), w.clone()]),
+            typed(RockyType::DecimalUnsized { scale: None })
         );
         assert_eq!(
             common_supertype_of(&[m.clone(), m]),
