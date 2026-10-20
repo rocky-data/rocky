@@ -1044,8 +1044,35 @@ mod tests {
     /// Not a registration denylist: refusing to register a colliding value
     /// would leave a real secret unredacted everywhere for the life of the
     /// process.
+    ///
+    /// Run in a child test process. The registry has no unregister, so
+    /// registering the envelope's own text here would send every later refusal
+    /// in this process with no body. `cargo llvm-cov` runs the lib tests as
+    /// threads of one process, and the serve sweep, which asserts the
+    /// envelope, then failed.
     #[tokio::test]
     async fn a_refusal_that_would_carry_a_value_is_sent_with_no_body() {
+        const CHILD: &str = "ROCKY_ENVELOPE_COLLIDE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("a_refusal_that_would_carry_a_value_is_sent_with_no_body")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated collision test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("1 passed; 0 failed;"),
+                "child must run exactly this test: {stdout}"
+            );
+            return;
+        }
+
         register_substitution("ROCKY_ENVELOPE_COLLIDE", "secret_redaction_unavailable");
 
         let response = redaction_unavailable();
