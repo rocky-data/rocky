@@ -1,0 +1,8 @@
+depends_on = ["stg_orders"]
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "main"

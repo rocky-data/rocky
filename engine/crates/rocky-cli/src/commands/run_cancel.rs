@@ -5,8 +5,9 @@
 //! own settle step before the process exits 130: the run record is persisted
 //! and the idempotency claim released. The remote-state session is finalized
 //! (model-only, replication `--all` model phase), checkpointed then released
-//! (replication fan-out), or released without upload (transformation
-//! pipeline).
+//! (replication fan-out), or finalized by the dispatcher when the record
+//! landed and released without upload when it did not (transformation,
+//! quality and snapshot pipelines, #2442).
 //!
 //! ```text
 //!   signal ──▶ token.cancel()
