@@ -2114,7 +2114,7 @@ mod tests {
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 {skip_block}
 [pipeline.t]
 type = "transformation"
@@ -2158,11 +2158,11 @@ auto_create_schemas = true
                 r#"
 [adapter.silver_wh]
 type = "duckdb"
-path = "{silver}"
+path = '{silver}'
 
 [adapter.gold_wh]
 type = "duckdb"
-path = "{gold}"
+path = '{gold}'
 
 [pipeline.silver]
 type = "transformation"
@@ -2353,11 +2353,11 @@ auto_create_schemas = true
                 r#"
 [adapter.silver_wh]
 type = "duckdb"
-path = "{silver}"
+path = '{silver}'
 
 [adapter.gold_wh]
 type = "duckdb"
-path = "{gold}"
+path = '{gold}'
 
 [pipeline.silver]
 type = "transformation"
@@ -4251,7 +4251,7 @@ auto_create_schemas = true
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [pipeline.dq]\ntype = \"quality\"\n\n\
                  [pipeline.dq.target]\nadapter = \"default\"\n\n\
                  [[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
@@ -4413,7 +4413,7 @@ auto_create_schemas = true
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [pipeline.snap]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
                  updated_at = \"updated_at\"\n\n\
                  [pipeline.snap.source]\ncatalog = \"\"\nschema = \"main\"\ntable = \"src\"\n\n\

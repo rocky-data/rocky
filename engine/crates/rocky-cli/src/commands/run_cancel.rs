@@ -1,6 +1,7 @@
 //! The one cancellation token a `rocky run` observes (#1606).
 //!
-//! A shutdown signal (SIGINT, or SIGTERM on Unix) cancels the token. Each run
+//! A shutdown signal cancels the token: SIGINT or SIGTERM on Unix; Ctrl-C,
+//! Ctrl-Break, console close, logoff or shutdown on Windows (#2440). Each run
 //! phase checks it before it starts new warehouse work, so the run reaches its
 //! own settle step before the process exits 130: the run record is persisted
 //! and the idempotency claim released. The remote-state session is finalized
@@ -238,8 +239,8 @@ pub(crate) fn for_run() -> RunCancel {
 
 /// Spawn the signal listener for a token this run owns.
 ///
-/// The Unix streams are registered here, before the spawn, so a signal that
-/// lands before the task is first polled is latched rather than lost.
+/// The streams are registered here, before the spawn, so a signal that lands
+/// before the task is first polled is latched rather than lost.
 fn spawn_signal_listener(
     token: CancellationToken,
     unbounded: Arc<AtomicUsize>,
@@ -249,6 +250,8 @@ fn spawn_signal_listener(
     #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(windows)]
+    let mut stops = WindowsStopEvents::register(true);
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -258,7 +261,13 @@ fn spawn_signal_listener(
                 else => return,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if stops.recv().await.is_none() {
+                return;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = tokio::signal::ctrl_c().await;
         }
@@ -278,7 +287,13 @@ fn spawn_signal_listener(
                     else => std::future::pending::<()>().await,
                 }
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                if stops.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
@@ -297,6 +312,94 @@ fn spawn_signal_listener(
         }
         std::process::exit(130);
     })
+}
+
+/// The Windows console events that stop a run (#2440): Ctrl-C, Ctrl-Break,
+/// closing the console window, logoff and shutdown.
+///
+/// Registered eagerly, like the Unix streams, so an event that lands before
+/// the first poll is latched. For close, logoff and shutdown, tokio's handler
+/// never returns, so Windows waits out its own timeout (about 5 s for a
+/// console close) before it ends the process: the run settles if it can
+/// within that time. Logoff and shutdown reach a console process only when
+/// Windows delivers them to it.
+#[cfg(windows)]
+pub(crate) struct WindowsStopEvents {
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    ctrl_logoff: Option<tokio::signal::windows::CtrlLogoff>,
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+#[cfg(windows)]
+impl WindowsStopEvents {
+    /// Every stop event. `with_ctrl_c = false` leaves Ctrl-C out for a
+    /// caller that already listens for it.
+    pub(crate) fn register(with_ctrl_c: bool) -> Self {
+        use tokio::signal::windows;
+        Self {
+            ctrl_c: if with_ctrl_c {
+                windows::ctrl_c().ok()
+            } else {
+                None
+            },
+            ctrl_break: windows::ctrl_break().ok(),
+            ctrl_close: windows::ctrl_close().ok(),
+            ctrl_logoff: windows::ctrl_logoff().ok(),
+            ctrl_shutdown: windows::ctrl_shutdown().ok(),
+        }
+    }
+
+    /// The next stop event. `None` when no stream is left to deliver one; a
+    /// stream that could not be registered waits forever instead.
+    pub(crate) async fn recv(&mut self) -> Option<()> {
+        let Self {
+            ctrl_c,
+            ctrl_break,
+            ctrl_close,
+            ctrl_logoff,
+            ctrl_shutdown,
+        } = self;
+        let ctrl_c = async {
+            match ctrl_c.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let ctrl_break = async {
+            match ctrl_break.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let ctrl_close = async {
+            match ctrl_close.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let ctrl_logoff = async {
+            match ctrl_logoff.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let ctrl_shutdown = async {
+            match ctrl_shutdown.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            Some(()) = ctrl_c => Some(()),
+            Some(()) = ctrl_break => Some(()),
+            Some(()) = ctrl_close => Some(()),
+            Some(()) = ctrl_logoff => Some(()),
+            Some(()) = ctrl_shutdown => Some(()),
+            else => None,
+        }
+    }
 }
 
 /// Receive from `stream`, or wait forever when it could not be registered.

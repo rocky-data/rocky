@@ -1086,7 +1086,7 @@ create_table = true
             r#"
 [adapter.default]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.ingest]
 type = "load"

@@ -297,6 +297,14 @@ pub(crate) static STALL_COPY_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// A hook command that runs for about two minutes in the shell hooks use:
+/// `sh -c` on Unix, `cmd /C` on Windows, which has no `sleep`. The weekly
+/// Windows job runs the tests that use it (#2440).
+#[cfg(all(test, unix))]
+pub(crate) const SLOW_HOOK_COMMAND_FOR_TEST: &str = "sleep 120";
+#[cfg(all(test, windows))]
+pub(crate) const SLOW_HOOK_COMMAND_FOR_TEST: &str = "ping -n 121 127.0.0.1 > nul";
+
 /// `run_id/table` keys whose replication copy cancels the run as it starts and
 /// then completes (#2441): a copy that is collected after the cancel.
 #[cfg(test)]
@@ -21601,7 +21609,7 @@ schema_template = "staging"
     /// one when no `path` is given.
     fn test_duckdb_adapter(path: Option<&std::path::Path>) -> rocky_core::config::AdapterConfig {
         let body = match path {
-            Some(path) => format!("type = \"duckdb\"\npath = \"{}\"\n", path.display()),
+            Some(path) => format!("type = \"duckdb\"\npath = '{}'\n", path.display()),
             None => "type = \"duckdb\"\n".to_string(),
         };
         toml::from_str(&body).unwrap()
@@ -24030,7 +24038,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n\
                  [pipeline.dq]\ntype = \"quality\"\n\n\
                  [pipeline.dq.target]\nadapter = \"default\"\n\n\
@@ -24099,7 +24107,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let state_path = dir.path().join("state.redb");
         let config_text = |db: &std::path::Path| {
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n\
                  [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
                  [pipeline.t.target]\nadapter = \"default\"\n",
@@ -24167,7 +24175,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -24230,7 +24238,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -24446,7 +24454,7 @@ auto_create_schemas = true
             std::fs::write(
                 &config_path,
                 format!(
-                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\
+                    "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\
                      [state]\nbackend = \"local\"\n\
                      [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
                      [pipeline.transform.target]\nadapter = \"default\"\n",
@@ -24659,7 +24667,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
@@ -27009,7 +27017,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -27163,7 +27171,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -27499,7 +27507,7 @@ adapter = "default"
                 std::fs::write(
                     &config_path,
                     format!(
-                        "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                        "[adapter]\ntype = \"test-fail-write\"\npath = '{failure}'\n\n\
                          [state]\nbackend = \"local\"\n\n\
                          [resilience]\ncontain_failures = {contain_failures}\n\n\
                          [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
@@ -27689,7 +27697,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "test-fail-write"
-path = "{failure}"
+path = '{failure}'
 
 [state]
 backend = "local"
@@ -27836,7 +27844,7 @@ adapter = "default"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
                  models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
                 dir.join("wh.duckdb").display(),
@@ -27911,7 +27919,7 @@ adapter = "default"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                "[adapter]\ntype = \"test-fail-write\"\npath = '{failure}'\n\n\
                  [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
                  models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
                 models.join("**").display(),
@@ -27994,7 +28002,7 @@ type = "duckdb"
 
 [adapter.fail]
 type = "test-fail-write"
-path = "{failure}"
+path = '{failure}'
 
 [state]
 backend = "local"
@@ -28272,7 +28280,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.t]
 type = "transformation"
@@ -28366,7 +28374,7 @@ schema = "mart"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.r]
 type = "replication"
@@ -33004,7 +33012,7 @@ timestamp_column = "ts"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.repro]
 strategy = "incremental"
@@ -33577,7 +33585,7 @@ backend = "local"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
@@ -33785,9 +33793,10 @@ row_count = true
         let dir = tempfile::tempdir().unwrap();
         let config = write_hold_back_project(dir.path()).await;
         let mut toml = std::fs::read_to_string(&config).unwrap();
-        toml.push_str(
-            "\n[hook.on_after_materialize]\ncommand = \"sleep 120\"\ntimeout_ms = 300000\n",
-        );
+        toml.push_str(&format!(
+            "\n[hook.on_after_materialize]\ncommand = \"{}\"\ntimeout_ms = 300000\n",
+            super::SLOW_HOOK_COMMAND_FOR_TEST
+        ));
         std::fs::write(&config, toml).unwrap();
         let state_path = dir.path().join("state.redb");
         super::CANCEL_AT_COPY_FOR_TEST
@@ -34015,7 +34024,7 @@ row_count = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.repro]
 strategy = "incremental"
@@ -50217,7 +50226,7 @@ timestamp_column = "ts"
         hooks_cfg.hooks.insert(
             "on_after_materialize".to_string(),
             rocky_core::hooks::HookConfigOrList::Single(rocky_core::hooks::HookConfig {
-                command: "sleep 120".to_string(),
+                command: super::SLOW_HOOK_COMMAND_FOR_TEST.to_string(),
                 timeout_ms: 300_000,
                 on_failure: Default::default(),
                 env: Default::default(),
@@ -50544,7 +50553,7 @@ timestamp_column = "ts"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
