@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import dagster as dg
 
-from .types import ChecksConfig
+from .types import ChecksConfig, freshness_budget_seconds
 
 if TYPE_CHECKING:
     from .types import (
@@ -85,7 +85,7 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     :func:`freshness_policy_from_model` while this predicate is ``False``. That
     policy is Dagster's own staleness evaluation. The engine never emits a
     ``freshness`` ``CheckResult`` for it during ``rocky run`` — per-model
-    ``max_lag_seconds`` is read by ``rocky tick``, ``rocky validate`` and the
+    ``[freshness]`` is read by ``rocky tick``, ``rocky validate`` and the
     separate ``rocky freshness`` command (see
     :func:`freshness_check_results`), not by the run's check runner — so it
     does not change the answer here.
@@ -124,17 +124,20 @@ def freshness_policy_from_model(
     """Build a Dagster ``FreshnessPolicy`` from a per-model freshness config.
 
     Mirrors :func:`freshness_policy_from_checks` but for the per-model
-    case: ``ModelConfig.freshness`` projects to a single
-    ``max_lag_seconds`` value, which becomes the ``fail_window`` of a
+    case: the model's smaller ``warn_after`` / ``error_after`` level (or the
+    deprecated ``max_lag_seconds``) becomes the ``fail_window`` of a
     :meth:`dagster.FreshnessPolicy.time_window`.
 
     Returns ``None`` when the model has no freshness frontmatter.
     """
     if freshness is None:
         return None
+    budget = freshness_budget_seconds(freshness)
+    if budget is None:
+        return None
 
     return dg.FreshnessPolicy.time_window(
-        fail_window=timedelta(seconds=freshness.max_lag_seconds),
+        fail_window=timedelta(seconds=budget),
     )
 
 

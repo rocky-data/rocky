@@ -1,6 +1,6 @@
 # Same project as rocky.toml, plus a project-wide [freshness] default. Point
 # `rocky -c rocky-project-freshness.toml compile` at this to show that declaring
-# `expected_lag_seconds` at the project level suppresses W005 for every model.
+# `warn_after` at the project level suppresses W005 for every model.
 
 [adapter]
 type = "duckdb"
@@ -17,12 +17,11 @@ components = ["source"]
 catalog_template = "poc"
 schema_template = "demo"
 
-# Project-wide freshness default. Declaring `expected_lag_seconds` here makes the
+# Project-wide freshness default. Declaring `warn_after` here makes the
 # project "freshness-covered": W005 is suppressed for every model that doesn't
 # carry its own [freshness] block. Per-model blocks still win field-by-field.
 # (This is distinct from `[pipeline.poc.checks.freshness]`, the runtime
 # data-quality check — see 02-inline-checks.)
 [freshness]
-expected_lag_seconds = 86400
+warn_after = "24h"
 time_column = "order_ts"
-severity = "warning"

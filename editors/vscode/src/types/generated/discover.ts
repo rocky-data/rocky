@@ -73,6 +73,9 @@ export interface ResolvedCheckNameOutput {
  * Just the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).
  */
 export interface FreshnessConfigOutput {
+  /**
+   * The age in seconds at which the check first fails: the smaller of `warn_after` / `error_after` (the deprecated `threshold_seconds` when the block uses it).
+   */
   threshold_seconds: number;
   [k: string]: unknown;
 }

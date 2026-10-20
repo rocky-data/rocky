@@ -22,7 +22,7 @@
       "message": "model 'raw_orders' has temporal column(s) (order_date) but no `freshness` block declared",
       "span": null,
       "model": "raw_orders",
-      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"order_date\"`"
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] warn_after = \"1h\", time_column = \"order_date\"`"
     },
     {
       "severity": "Warning",
@@ -30,7 +30,7 @@
       "message": "model 'revenue_summary' has temporal column(s) (first_order) but no `freshness` block declared",
       "span": null,
       "model": "revenue_summary",
-      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"first_order\"`"
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] warn_after = \"1h\", time_column = \"first_order\"`"
     },
     {
       "severity": "Warning",
@@ -38,7 +38,7 @@
       "message": "model 'customer_orders' has temporal column(s) (first_order) but no `freshness` block declared",
       "span": null,
       "model": "customer_orders",
-      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] expected_lag_seconds = 3600, time_column = \"first_order\"`"
+      "suggestion": "add a `[freshness]` block to the model sidecar, e.g. `[freshness] warn_after = \"1h\", time_column = \"first_order\"`"
     }
   ],
   "has_errors": false,

@@ -1192,8 +1192,9 @@ enum Command {
         /// Re-run the pipeline whenever a watched model file changes;
         /// Ctrl-C to stop.
         ///
-        /// Watches the rocky.toml and the resolved models directory (when
-        /// present). Filesystem events are debounced for ~200 ms so a
+        /// Watches the rocky.toml. It also watches the directory passed
+        /// with `--models`, when that directory exists; without `--models`,
+        /// a model edit does not start a re-run. Filesystem events are debounced for ~200 ms so a
         /// quick burst of editor saves triggers exactly one re-run. With
         /// `--output json`, each iteration emits one `RunOutput` JSON
         /// object on stdout (newline-delimited stream); banner / change

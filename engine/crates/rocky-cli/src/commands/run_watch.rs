@@ -227,6 +227,10 @@ pub async fn run_watch(
     #[cfg(unix)]
     let mut sigterm_stream =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    // Windows (#2440): Ctrl-Break, console close, logoff and shutdown take the
+    // SIGTERM arm's place; `ctrl_c_signal` above keeps Ctrl-C.
+    #[cfg(windows)]
+    let mut windows_stops = super::run_cancel::WindowsStopEvents::register(false);
 
     // First run is immediate so the user gets feedback without having to
     // touch a file.
@@ -298,7 +302,11 @@ pub async fn run_watch(
                         None => std::future::pending().await,
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    windows_stops.recv().await
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     std::future::pending().await
                 }
@@ -341,7 +349,11 @@ pub async fn run_watch(
                         None => std::future::pending().await,
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    windows_stops.recv().await
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     std::future::pending().await
                 }
@@ -424,7 +436,11 @@ pub async fn run_watch(
                                 None => std::future::pending().await,
                             }
                         }
-                        #[cfg(not(unix))]
+                        #[cfg(windows)]
+                        {
+                            windows_stops.recv().await
+                        }
+                        #[cfg(not(any(unix, windows)))]
                         {
                             std::future::pending().await
                         }
@@ -491,6 +507,8 @@ async fn stop_iteration<F: std::future::Future>(
             #[cfg(unix)]
             let mut second_sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            #[cfg(windows)]
+            let mut second_stop = super::run_cancel::WindowsStopEvents::register(true);
             cancel.cancel();
             eprintln!(
                 "\n[watch] shutdown signal received — letting the run settle (up to {}s); press \
@@ -519,7 +537,11 @@ async fn stop_iteration<F: std::future::Future>(
                         else => None,
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    second_stop.recv().await
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     tokio::signal::ctrl_c().await.ok()
                 }
@@ -599,6 +621,8 @@ async fn stop_interrupted_iteration<F: std::future::Future>(
     #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(windows)]
+    let mut stops = super::run_cancel::WindowsStopEvents::register(true);
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -620,7 +644,13 @@ async fn stop_interrupted_iteration<F: std::future::Future>(
                 else => std::future::pending::<()>().await,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if stops.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = tokio::signal::ctrl_c().await;
         }

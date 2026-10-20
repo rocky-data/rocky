@@ -420,7 +420,7 @@ pub async fn run_transformation(
     // An interrupted run (#1606) exits 130 even when it also breached a
     // hard `[budget]`: the cancel is what ended it.
     if output.interrupted {
-        return Err(anyhow::Error::new(super::run::Interrupted));
+        return Err(anyhow::Error::new(super::run::Interrupted { custody }));
     }
     budget_result?;
 
@@ -825,7 +825,9 @@ pub async fn run_quality(
                 if CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST
                     .lock()
                     .ok()
-                    .is_some_and(|mut ids| ids.remove(run_id))
+                    .is_some_and(|mut ids| {
+                        ids.remove(run_id) || ids.remove(&format!("{run_id}/{table_name}"))
+                    })
                 {
                     cancel.cancel();
                 }
@@ -1890,6 +1892,7 @@ pub async fn run_snapshot(
 
 /// Run ids whose quality run cancels its token right after a table's checks
 /// (#1606): a deterministic "signal between the checks and the quarantine".
+/// A `run_id/table` key cancels after that table's checks only (#2442).
 #[cfg(test)]
 pub(crate) static CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1897,10 +1900,11 @@ pub(crate) static CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST: std::sync::LazyLock<
 
 /// The result of a run a signal cut short (#1606), once its record is written.
 ///
-/// `Interrupted` (exit 130) only when the record landed. The dispatcher abandons
-/// the remote-state session on it, as the transformation arm does, so nothing
-/// is uploaded. A record that did not land is an untyped error, so nothing
-/// claims it exists.
+/// `Interrupted` (exit 130) only when the record landed, with `Persisted`
+/// custody, so the dispatcher finalizes the remote-state session and the record
+/// and any quarantine ownership rows are uploaded (#2442). A record that did not
+/// land is an untyped error, so nothing claims it exists, and the session is
+/// abandoned.
 fn interrupted_result(recorded: bool, run_id: &str) -> Result<()> {
     if !recorded {
         anyhow::bail!(
@@ -1908,7 +1912,10 @@ fn interrupted_result(recorded: bool, run_id: &str) -> Result<()> {
              could not be written to the state store"
         );
     }
-    Err(super::run::Interrupted.into())
+    Err(super::run::Interrupted {
+        custody: super::run::RecordCustody::Persisted,
+    }
+    .into())
 }
 
 /// Persist the record of a run cancelled before it did any work (#1606).
@@ -2119,7 +2126,7 @@ mod tests {
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 {skip_block}
 [pipeline.t]
 type = "transformation"
@@ -2163,11 +2170,11 @@ auto_create_schemas = true
                 r#"
 [adapter.silver_wh]
 type = "duckdb"
-path = "{silver}"
+path = '{silver}'
 
 [adapter.gold_wh]
 type = "duckdb"
-path = "{gold}"
+path = '{gold}'
 
 [pipeline.silver]
 type = "transformation"
@@ -2358,11 +2365,11 @@ auto_create_schemas = true
                 r#"
 [adapter.silver_wh]
 type = "duckdb"
-path = "{silver}"
+path = '{silver}'
 
 [adapter.gold_wh]
 type = "duckdb"
-path = "{gold}"
+path = '{gold}'
 
 [pipeline.silver]
 type = "transformation"
@@ -4256,7 +4263,7 @@ auto_create_schemas = true
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [pipeline.dq]\ntype = \"quality\"\n\n\
                  [pipeline.dq.target]\nadapter = \"default\"\n\n\
                  [[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
@@ -4418,7 +4425,7 @@ auto_create_schemas = true
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [pipeline.snap]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
                  updated_at = \"updated_at\"\n\n\
                  [pipeline.snap.source]\ncatalog = \"\"\nschema = \"main\"\ntable = \"src\"\n\n\

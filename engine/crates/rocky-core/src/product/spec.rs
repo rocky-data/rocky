@@ -329,25 +329,81 @@ pub enum FreshnessSeverity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessSpec {
-    /// Lag budget in the duration grammar (`"24h"`).
-    pub max_lag: String,
+    /// Deprecated: write `warn_after` / `error_after`. Lag budget in the
+    /// duration grammar (`"24h"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag: Option<String>,
     /// The timestamp column the staleness check reads.
     pub time_column: String,
-    /// Optional severity for the staleness report.
+    /// Deprecated, only with `max_lag`: severity for the staleness report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<FreshnessSeverity>,
+    /// Age above which the output reports `warn` (`"12h"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_after: Option<String>,
+    /// Age above which the output reports `error`. Must not be shorter than
+    /// `warn_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_after: Option<String>,
 }
 
 impl FreshnessSpec {
-    /// The lag budget in seconds.
+    /// The levels this block declares, whichever spelling it used. A
+    /// deprecated `max_lag` is the error level under `severity = "error"`,
+    /// else the warn level.
     ///
     /// # Errors
     ///
-    /// Returns `max-lag-unparseable` when the budget is outside the grammar.
+    /// Returns `max-lag-unparseable` when a duration is outside the grammar.
     /// Parsing validates this at spec-parse time, so a parsed spec always
     /// yields `Ok`.
-    pub fn max_lag_seconds(&self) -> SpecResult<u64> {
-        parse_max_lag(&self.max_lag)
+    pub fn thresholds(&self) -> SpecResult<crate::source_freshness::FreshnessThresholds> {
+        if let Some(max_lag) = &self.max_lag {
+            let severity = match self.severity {
+                Some(FreshnessSeverity::Error) => crate::tests::TestSeverity::Error,
+                Some(FreshnessSeverity::Warning) | None => crate::tests::TestSeverity::Warning,
+            };
+            return Ok(crate::source_freshness::FreshnessThresholds::from_single(
+                parse_max_lag(max_lag)?,
+                severity,
+            ));
+        }
+        crate::source_freshness::parse_levels(
+            self.warn_after.as_deref(),
+            self.error_after.as_deref(),
+        )
+        .map_err(|problems| {
+            SpecRejected::new(
+                "freshness-invalid-levels",
+                crate::source_freshness::problems_message(&problems),
+            )
+        })
+    }
+
+    /// The staleness budget in seconds: the smaller level present.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::thresholds`].
+    pub fn budget_seconds(&self) -> SpecResult<u64> {
+        self.thresholds()?.budget_seconds().ok_or_else(|| {
+            SpecRejected::new(
+                "freshness-missing-threshold",
+                "freshness declares neither `warn_after` nor `error_after`",
+            )
+        })
+    }
+
+    /// The deprecated keys this block uses.
+    pub fn legacy_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.max_lag.is_some() {
+            keys.push("max_lag");
+        }
+        if self.severity.is_some() {
+            keys.push("severity");
+        }
+        keys
     }
 }
 
@@ -592,11 +648,53 @@ fn parse_column(value: &toml::Value, path: &str) -> SpecResult<ColumnSpec> {
 
 fn parse_freshness(value: &toml::Value, path: &str) -> SpecResult<FreshnessSpec> {
     let table = as_table(value, path)?;
-    reject_unknown_keys(table, &["max_lag", "time_column", "severity"], path)?;
-    let max_lag = as_string(
-        require(table, "max_lag", path)?,
-        &path_join(path, "max_lag"),
+    reject_unknown_keys(
+        table,
+        &[
+            "max_lag",
+            "time_column",
+            "severity",
+            "warn_after",
+            "error_after",
+        ],
+        path,
     )?;
+    let optional_string = |key: &str| -> SpecResult<Option<String>> {
+        table
+            .get(key)
+            .map(|raw| as_string(raw, &path_join(path, key)))
+            .transpose()
+    };
+    let max_lag = optional_string("max_lag")?;
+    let warn_after = optional_string("warn_after")?;
+    let error_after = optional_string("error_after")?;
+    let new_form = warn_after.is_some() || error_after.is_some();
+    let mut old_keys = Vec::new();
+    if max_lag.is_some() {
+        old_keys.push("max_lag");
+    }
+    if table.contains_key("severity") {
+        old_keys.push("severity");
+    }
+    if new_form && !old_keys.is_empty() {
+        return Err(SpecRejected::new(
+            "freshness-mixed-spelling",
+            format!(
+                "{} ('{path}')",
+                crate::source_freshness::mixed_spelling_message(&old_keys)
+            ),
+        ));
+    }
+    if !new_form && max_lag.is_none() {
+        return Err(SpecRejected::new(
+            "missing-key",
+            format!(
+                "required key '{}' or '{}' is missing",
+                path_join(path, "warn_after"),
+                path_join(path, "error_after")
+            ),
+        ));
+    }
     let time_column = match table.get("time_column") {
         Some(raw) => as_string(raw, &path_join(path, "time_column"))?,
         None => {
@@ -632,17 +730,40 @@ fn parse_freshness(value: &toml::Value, path: &str) -> SpecResult<FreshnessSpec>
     };
 
     // Reject an unparseable budget at parse time rather than at observation.
-    parse_max_lag(&max_lag)?;
+    if let Some(max_lag) = &max_lag {
+        parse_max_lag(max_lag)?;
+    }
+    if new_form
+        && let Err(problems) =
+            crate::source_freshness::parse_levels(warn_after.as_deref(), error_after.as_deref())
+    {
+        return Err(SpecRejected::new(
+            "freshness-invalid-levels",
+            format!(
+                "{} ('{path}')",
+                crate::source_freshness::problems_message(&problems)
+            ),
+        ));
+    }
     if time_column.is_empty() {
         return Err(SpecRejected::new(
             "freshness-missing-time-column",
             "freshness.time_column must be a non-empty column name",
         ));
     }
+    if max_lag.is_some() {
+        tracing::debug!(
+            path,
+            keys = %old_keys.join(", "),
+            "deprecated product freshness spelling (W058); it still works, write warn_after / error_after instead"
+        );
+    }
     Ok(FreshnessSpec {
         max_lag,
         time_column,
         severity,
+        warn_after,
+        error_after,
     })
 }
 
@@ -1135,6 +1256,61 @@ include = ["stripe.*"]"#,
         expect_reject(&text, "max-lag-unparseable");
     }
 
+    const OLD_FRESHNESS: &str =
+        r#"freshness = { max_lag = "24h", time_column = "date", severity = "error" }"#;
+
+    #[test]
+    fn spec_freshness_parses_the_new_form() {
+        let text = VALID.replace(
+            OLD_FRESHNESS,
+            r#"freshness = { warn_after = "12h", error_after = "1d", time_column = "date" }"#,
+        );
+        let parsed = parse(&text).expect("new form parses");
+        let freshness = parsed.product().output.freshness.clone().expect("block");
+        assert_eq!(freshness.max_lag, None);
+        assert_eq!(freshness.budget_seconds().expect("budget"), 43_200);
+        let levels = freshness.thresholds().expect("levels");
+        assert_eq!(levels.error_after_seconds, Some(86_400));
+    }
+
+    #[test]
+    fn spec_freshness_old_form_maps_by_severity() {
+        let parsed = parse(VALID).expect("old form parses");
+        let freshness = parsed.product().output.freshness.clone().expect("block");
+        let levels = freshness.thresholds().expect("levels");
+        assert_eq!(
+            (levels.warn_after_seconds, levels.error_after_seconds),
+            (None, Some(86_400))
+        );
+        assert_eq!(freshness.legacy_keys(), vec!["max_lag", "severity"]);
+    }
+
+    #[test]
+    fn spec_freshness_refuses_mixed_inverted_and_empty() {
+        let mixed = VALID.replace(
+            OLD_FRESHNESS,
+            r#"freshness = { max_lag = "24h", warn_after = "1h", time_column = "date" }"#,
+        );
+        expect_reject(&mixed, "freshness-mixed-spelling");
+        let mixed_severity = VALID.replace(
+            OLD_FRESHNESS,
+            r#"freshness = { error_after = "1h", severity = "error", time_column = "date" }"#,
+        );
+        expect_reject(&mixed_severity, "freshness-mixed-spelling");
+        let inverted = VALID.replace(
+            OLD_FRESHNESS,
+            r#"freshness = { warn_after = "2d", error_after = "1d", time_column = "date" }"#,
+        );
+        expect_reject(&inverted, "freshness-invalid-levels");
+        let minutes = VALID.replace(
+            OLD_FRESHNESS,
+            r#"freshness = { warn_after = "30m", time_column = "date" }"#,
+        );
+        expect_reject(&minutes, "freshness-invalid-levels");
+        let empty = VALID.replace(OLD_FRESHNESS, r#"freshness = { time_column = "date" }"#);
+        expect_reject(&empty, "missing-key");
+    }
+
     #[test]
     fn reject_grain_column_not_declared() {
         let text = VALID.replace(r#"grain = ["client_id", "date"]"#, r#"grain = ["nope"]"#);
@@ -1286,7 +1462,7 @@ include = ["stripe.*"]"#,
         assert_eq!(product.output.columns[0].type_name, "Int64");
         assert!(!product.output.columns[0].nullable);
         let freshness = product.output.freshness.as_ref().expect("freshness");
-        assert_eq!(freshness.max_lag_seconds().expect("parses"), 86_400);
+        assert_eq!(freshness.budget_seconds().expect("parses"), 86_400);
         assert_eq!(freshness.severity, Some(FreshnessSeverity::Error));
         assert_eq!(product.trust.agent, "propose_only");
     }

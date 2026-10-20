@@ -49,7 +49,7 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 | `2` | **Partial success** — some models materialized, some failed, or an error-severity check failed on a run that had already copied its data. Also: `rocky fulfill` is blocked and needs a human, and `rocky product verify` failed | `rocky run`, `rocky tick`, `rocky fulfill`, `rocky product verify` |
 | `3` | A Critical health check. Also: `rocky fulfill` is parked at `applying_unknown` | `rocky doctor`, `rocky fulfill` |
 | `4` | `rocky fulfill` applied a plan whose output fails a check the product declared | `rocky fulfill` |
-| `130` | Interrupted by SIGINT or SIGTERM | `rocky run` |
+| `130` | Interrupted: SIGINT or SIGTERM on Unix; Ctrl-C, Ctrl-Break, console close, logoff or shutdown on Windows | `rocky run` |
 
 A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. A quality pipeline's failed check gate returns `1`, not `2`. Codes `3` and `4` come from `rocky doctor` and `rocky fulfill`. Run `rocky doctor` as a pre-flight (below) or in CI.
 
@@ -449,7 +449,7 @@ It is the same reconciler as `rocky tick`. Same `[schedule]` declarations, same 
 - **Runs show up as jobs.** Each scheduled run is recorded through the same jobs model as `POST /api/v1/jobs/run`. So `GET /api/v1/jobs/{submission_id}` reports it, and a restarted server reports honest status for what it launched.
 - **It coordinates with API mutations.** A scheduler tick and an API `run` or `apply` never collide on the state store. Whichever arrives second gets a clean `409 mutation_in_progress`. The scheduler instead skips the tick and re-evaluates next time, rather than racing the writer lock.
 - **Config is re-read every tick.** Edit `rocky.toml` under a running server and the next tick picks it up. A parse error on one tick is logged and skipped. The loop never dies on a bad edit, and it never runs a stale schedule.
-- **Shutdown drains.** On `SIGTERM` or `Ctrl-C` the server stops starting new work. A run already in flight gets up to `--drain-timeout-seconds` to finish on its own, but never beyond that run's own `timeout_minutes`, and is then terminated. In-flight HTTP requests drain in the same window before the process exits. A run cut short by the drain is recorded as failed, and is not retried until its next occurrence. The scheduler also holds its first tick until the server has finished starting up: its job sweep and listener bind. So a scheduled run never starts before the server is up, and never outlives a failed startup.
+- **Shutdown drains.** On `SIGTERM` or `Ctrl-C` (on Windows also Ctrl-Break, console close, logoff or shutdown) the server stops starting new work. A run already in flight gets up to `--drain-timeout-seconds` to finish on its own, but never beyond that run's own `timeout_minutes`, and is then terminated. In-flight HTTP requests drain in the same window before the process exits. A run cut short by the drain is recorded as failed, and is not retried until its next occurrence. The scheduler also holds its first tick until the server has finished starting up: its job sweep and listener bind. So a scheduled run never starts before the server is up, and never outlives a failed startup.
 
 You can read the scheduler's state over HTTP:
 

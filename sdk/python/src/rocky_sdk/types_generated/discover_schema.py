@@ -87,6 +87,9 @@ class FreshnessConfigOutput(BaseModel):
     """
 
     threshold_seconds: conint(ge=0)
+    """
+    The age in seconds at which the check first fails: the smaller of `warn_after` / `error_after` (the deprecated `threshold_seconds` when the block uses it).
+    """
 
 
 class ResolvedCheckNameOutput(BaseModel):

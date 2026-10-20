@@ -3711,17 +3711,17 @@ async fn draft_metadata_writes_freshness_and_classifications() {
     // The sidecar re-parses and carries the patch AND the prior config.
     let sidecar = dir.path().join("models").join("orders.toml");
     let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    // Written in the current grammar: the lag lands on the level its
+    // severity names, and no deprecated key is written.
     assert_eq!(
-        parsed["freshness"]["expected_lag_seconds"],
-        toml::Value::Integer(86400)
+        parsed["freshness"]["error_after"],
+        toml::Value::String("1d".to_string())
     );
+    assert!(parsed["freshness"].get("expected_lag_seconds").is_none());
+    assert!(parsed["freshness"].get("severity").is_none());
     assert_eq!(
         parsed["freshness"]["time_column"],
         toml::Value::String("status".to_string())
-    );
-    assert_eq!(
-        parsed["freshness"]["severity"],
-        toml::Value::String("error".to_string())
     );
     assert_eq!(
         parsed["classification"]["status"],
@@ -3805,8 +3805,12 @@ async fn draft_metadata_merges_over_appended_checks_and_replaces_freshness() {
     assert_eq!(tests.len(), 1, "exactly the one appended check: {text}");
     // [freshness] was REPLACED, not duplicated or unioned.
     assert_eq!(
-        parsed["freshness"]["expected_lag_seconds"],
-        toml::Value::Integer(7200)
+        parsed["freshness"]["warn_after"],
+        toml::Value::String("2h".to_string())
+    );
+    assert!(
+        parsed["freshness"].get("error_after").is_none(),
+        "replace semantics: no level lingers from a prior patch"
     );
     assert!(
         parsed["freshness"].get("time_column").is_none(),

@@ -3,13 +3,13 @@
 > **Category:** 01-quality
 > **Credentials:** none (compile-time only, no warehouse)
 > **Runtime:** < 5s
-> **Rocky features:** `[freshness]` config block (per-model + project default), `expected_lag_seconds` alias, **W005** freshness-coverage diagnostic
+> **Rocky features:** `[freshness]` config block (per-model + project default), `warn_after` / `error_after`, **W005** freshness-coverage diagnostic
 
 ## What it shows
 
 A model can declare a freshness SLA (a TTL after which it's considered stale)
-via a per-model `[freshness]` sidecar block (`expected_lag_seconds`, optional
-`time_column`, optional `severity`), or project-wide via a top-level
+via a per-model `[freshness]` sidecar block (`warn_after`, `error_after`, optional
+`time_column`), or project-wide via a top-level
 `[freshness]` block in `rocky.toml`. The compiler raises the soft-warn **W005**
 for any model that emits a temporal output column (DATE / TIMESTAMP) but has no
 freshness declaration in scope, neither a per-model block nor a project-level
@@ -26,9 +26,9 @@ temporal; without source types it would degrade to `Unknown` and stay silent).
   runtime-only check bolted on after the fact. W005 only fires on models that
   actually emit a temporal column, so the nudge is targeted: no noise on pure
   dimensions like `dim_customer`.
-- `expected_lag_seconds` matches the dbt/SQLMesh public field name while
-  aliasing Rocky's legacy `max_lag_seconds`, so the declaration is portable and
-  surrounding fixtures keep working.
+- `warn_after` and `error_after` take a duration such as `"1h"` or `"24h"`
+  (a positive integer plus `s`, `h` or `d`). It is the same grammar the
+  per-source `freshness` block uses.
 - This is the *coverage* diagnostic, distinct from the runtime freshness *check*
   under `[pipeline.poc.checks.freshness]` (see [`02-inline-checks`](../02-inline-checks/)).
 
@@ -71,7 +71,7 @@ temporal; without source types it would degrade to `Unknown` and stay silent).
     W005 count: 1
 
 === Step 2: compile with -c rocky-project-freshness.toml (project default set) ===
-    project [freshness] expected_lag_seconds -> W005 suppressed for every model
+    project [freshness] warn_after -> W005 suppressed for every model
     W005 count: 0
 ```
 
@@ -87,7 +87,7 @@ temporal; without source types it would degrade to `Unknown` and stay silent).
 3. `dim_customer` has no temporal output column, so W005 never applies; the
    diagnostic is targeted, not blanket.
 4. **Step 2** points `rocky compile` at `rocky-project-freshness.toml`, whose
-   top-level `[freshness]` block declares `expected_lag_seconds`. That marks the
+   top-level `[freshness]` block declares `warn_after`. That marks the
    whole project freshness-covered and suppresses W005 for every model.
 
 W005 also surfaces in the editor via `rocky lsp`, where it carries an AI

@@ -125,6 +125,7 @@
       "description": "Freshness check configuration projected into the discover output.\n\nJust the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).",
       "properties": {
         "threshold_seconds": {
+          "description": "The age in seconds at which the check first fails: the smaller of `warn_after` / `error_after` (the deprecated `threshold_seconds` when the block uses it).",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"

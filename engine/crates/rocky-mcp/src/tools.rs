@@ -1988,7 +1988,7 @@ pub struct DraftMetadataArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FreshnessPatch {
     /// Maximum lag in seconds before the model counts as stale. Written to
-    /// the sidecar as `expected_lag_seconds`.
+    /// the sidecar as `warn_after`, or `error_after` under `severity = "error"`.
     pub expected_lag_seconds: u64,
     /// Timestamp column used to evaluate freshness at runtime. When unset
     /// the runtime falls back to the last-materialization timestamp.
@@ -3315,7 +3315,7 @@ impl RockyMcpServer {
 
     #[tool(
         description = "Draft a `[freshness]` TOML block for a model with temporal columns (the \
-         W005 fix): an LLM picks a sensible `expected_lag_seconds` TTL and a `time_column` from \
+         W005 fix): an LLM picks a sensible `warn_after` duration and a `time_column` from \
          the supplied candidates. Returns the ready-to-paste block directly (NOT a TextEdit); the \
          caller appends it to the model's sidecar. Requires ANTHROPIC_API_KEY in the server \
          environment — without it, `freshness_block` is null and `message` explains why."
@@ -7943,17 +7943,33 @@ fn build_freshness_table(patch: &FreshnessPatch) -> Result<toml::Table, Json<Too
             "Pass the maximum acceptable staleness in seconds (e.g. 86400 for 24h).",
         ));
     }
-    let lag: i64 = patch.expected_lag_seconds.try_into().map_err(|_| {
+    i64::try_from(patch.expected_lag_seconds).map_err(|_| {
         ToolError::invalid_argument(
             "freshness.expected_lag_seconds exceeds the TOML integer range",
             "Pass a realistic lag in seconds (TOML integers are 64-bit signed).",
         )
     })?;
+    let error_level = match patch.severity.as_deref() {
+        None | Some("warning") => false,
+        Some("error") => true,
+        Some(severity) => {
+            return Err(ToolError::invalid_argument(
+                format!("freshness.severity '{severity}' is not a valid severity"),
+                "Pass \"warning\" (non-blocking, the engine default) or \"error\".",
+            ));
+        }
+    };
+    // Written in the current grammar: the lag lands on the level its
+    // severity names, so the sidecar grades exactly as the patch asked and
+    // `rocky validate` has no deprecated spelling to report (W058).
+    let duration = rocky_core::source_freshness::format_duration(patch.expected_lag_seconds);
+    let level = if error_level {
+        "error_after"
+    } else {
+        "warn_after"
+    };
     let mut table = toml::Table::new();
-    table.insert(
-        "expected_lag_seconds".to_string(),
-        toml::Value::Integer(lag),
-    );
+    table.insert(level.to_string(), toml::Value::String(duration));
     if let Some(time_column) = &patch.time_column {
         if time_column.trim().is_empty() {
             return Err(ToolError::invalid_argument(
@@ -7965,18 +7981,6 @@ fn build_freshness_table(patch: &FreshnessPatch) -> Result<toml::Table, Json<Too
         table.insert(
             "time_column".to_string(),
             toml::Value::String(time_column.clone()),
-        );
-    }
-    if let Some(severity) = &patch.severity {
-        if severity != "warning" && severity != "error" {
-            return Err(ToolError::invalid_argument(
-                format!("freshness.severity '{severity}' is not a valid severity"),
-                "Pass \"warning\" (non-blocking, the engine default) or \"error\".",
-            ));
-        }
-        table.insert(
-            "severity".to_string(),
-            toml::Value::String(severity.clone()),
         );
     }
     Ok(table)

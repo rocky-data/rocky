@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**89 of 101 POCs run with no external credentials.** See each POC's README for prerequisites.
+**90 of 102 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -90,7 +90,7 @@ How Rocky catches bad data. These POCs cover contracts, inline checks, named and
 | [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` runs the models in an in-memory DuckDB (auto-loads `data/seed.sql`); full set and `--model` targeting |
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
-| [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
+| [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`warn_after` / `error_after`); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
 | [08-cross-source-overlap](pocs/01-quality/08-cross-source-overlap) | The same data arriving via two sibling sources — `cross_source_overlap` flags a business key shared across siblings (which per-table `unique` can't see) + `unique_expr` catches a derived-key duplicate, both at replication time |
 | [09-named-tests](pocs/01-quality/09-named-tests) | Define a check once in `test_definitions.toml`, apply it across models via `[[use_test]]` (column/severity overrides) alongside inline `[[tests]]` |
 | [10-unit-tests](pocs/01-quality/10-unit-tests) | Fixture-driven `[[test]]` blocks (`given` rows → `expect` rows) run by `rocky test` — multiset by default, positional with `ordered` |
@@ -169,7 +169,7 @@ How a run starts, where its state lives, and what happens when it fails. Some PO
 | [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
 | [12-webhook-ingress](pocs/05-orchestration/12-webhook-ingress) | `rocky serve --scheduler` exposes `POST /api/v1/hooks/trigger/{pipeline}`; an `X-Rocky-Signature` HMAC-SHA256 body signature queues a durable at-most-once run demand, and an `X-Rocky-Delivery` id deduplicates a redelivery |
 
-### 06 — Developer Experience (21 POCs · DuckDB)
+### 06 — Developer Experience (22 POCs · DuckDB)
 
 The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt import, and the plain-SQL exit path.
 
@@ -196,6 +196,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [19-import-dbt-unit-tests](pocs/06-developer-experience/19-import-dbt-unit-tests) | `rocky import-dbt --manifest` walks `manifest.unit_tests` into Rocky `[[test]]` sidecars; `data_tests:` accepted as alias for `tests:` on column tests (dbt 1.7+) |
 | [20-defer-against-prod](pocs/06-developer-experience/20-defer-against-prod) | `rocky run --model <name> --defer --defer-to <schema>` — build only the changed model locally, resolve its unbuilt upstream `ref()`s against a production schema (default-off dev convenience) |
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
+| [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
 ### 07 — Adapters (7 POCs · mixed)
 

@@ -105,7 +105,7 @@ A hash that stands in for a whole definition. Rocky's `recipe_hash` is a BLAKE3 
 
 ### Freshness
 
-How far behind the newest row in a table is. Declare `expected_lag_seconds` and a `time_column`, and Rocky reports a table that has fallen behind. Set it per model, or project-wide under `[freshness]`. See [`[freshness]`](/reference/configuration/#freshness).
+How far behind the newest row in a table is. Declare `warn_after` or `error_after` and a `time_column`, and Rocky reports a table that has fallen behind. Set it per model, or project-wide under `[freshness]`. See [`[freshness]`](/reference/configuration/#freshness).
 
 ### Idempotent
 
