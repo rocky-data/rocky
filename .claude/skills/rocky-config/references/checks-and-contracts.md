@@ -16,7 +16,7 @@ executes.
 enabled      = true
 row_count    = true                                      # source vs target row count
 column_match = true                                      # source vs target column list
-freshness    = { threshold_seconds = 86400 }             # max staleness of newest row
+freshness    = { warn_after = "12h", error_after = "24h" } # max age of newest row; one of the two is enough
 null_rate    = { columns = ["email"], threshold = 0.05, sample_percent = 10 }
 
 [[pipeline.<name>.checks.custom]]
@@ -24,6 +24,8 @@ name      = "no_future_dates"
 sql       = "SELECT COUNT(*) FROM {target} WHERE created_at > CURRENT_TIMESTAMP()"
 threshold = 0                                            # max failing rows
 ```
+
+Freshness levels are `<N>s` / `<N>h` / `<N>d`; `error_after` must be >= `warn_after`. Deprecated spellings (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, `severity`) still parse; `rocky validate` warns `W058`. Never mix them with `warn_after` / `error_after` in one block.
 
 ## Contracts
 

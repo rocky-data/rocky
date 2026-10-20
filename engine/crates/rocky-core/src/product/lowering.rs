@@ -34,6 +34,12 @@
 //! `severity`. Writing a severity the engine ignores would dress the
 //! file up as enforcement that does not exist. The freshness guarantee
 //! is the runner's staleness observation, not an engine gate.
+//!
+//! That reasoning is about the deprecated `max_lag` + `severity` spelling,
+//! and its lowering stays byte-identical so an unchanged spec emits an
+//! unchanged sidecar. A spec written with `warn_after` / `error_after`
+//! lowers them verbatim: the level a value sits on is its severity, and
+//! `rocky freshness` reads it (`ModelFreshnessConfig::thresholds`).
 
 use std::collections::BTreeMap;
 
@@ -325,22 +331,40 @@ pub fn merge_sidecar_text(
     }
 
     if let Some(freshness) = &product.output.freshness {
-        let seconds = freshness.max_lag_seconds()?;
-        let seconds = i64::try_from(seconds).map_err(|_| {
-            SpecRejected::new(
-                "max-lag-unrepresentable",
-                format!(
-                    "freshness.max_lag '{}' is {seconds} seconds, which no TOML integer can \
-                     hold — the sidecar would not parse back",
-                    freshness.max_lag
-                ),
-            )
-        })?;
         let mut block = TomlTable::new();
-        block.insert(
-            "expected_lag_seconds".to_string(),
-            TomlValue::Integer(seconds),
-        );
+        if let Some(max_lag) = &freshness.max_lag {
+            // Deprecated spelling: lowers byte for byte as it always did.
+            let seconds = crate::product::spec::parse_max_lag(max_lag)?;
+            let seconds = i64::try_from(seconds).map_err(|_| {
+                SpecRejected::new(
+                    "max-lag-unrepresentable",
+                    format!(
+                        "freshness.max_lag '{max_lag}' is {seconds} seconds, which no TOML \
+                         integer can hold — the sidecar would not parse back",
+                    ),
+                )
+            })?;
+            block.insert(
+                "expected_lag_seconds".to_string(),
+                TomlValue::Integer(seconds),
+            );
+        } else {
+            // The levels carry their own severity, so they are copied
+            // verbatim: the sidecar grades exactly as the spec declares.
+            freshness.thresholds()?;
+            if let Some(warn_after) = &freshness.warn_after {
+                block.insert(
+                    "warn_after".to_string(),
+                    TomlValue::string(warn_after.clone()),
+                );
+            }
+            if let Some(error_after) = &freshness.error_after {
+                block.insert(
+                    "error_after".to_string(),
+                    TomlValue::string(error_after.clone()),
+                );
+            }
+        }
         block.insert(
             "time_column".to_string(),
             TomlValue::string(freshness.time_column.clone()),
@@ -537,19 +561,29 @@ fn field_rows(parsed: &ParsedSpec, phase: Phase) -> BTreeMap<String, FieldRow> {
             },
         ),
     );
-    if product.output.freshness.is_some() {
+    if let Some(freshness) = &product.output.freshness {
+        // The deprecated `max_lag` row is unchanged, so an unchanged spec
+        // publishes an unchanged manifest.
+        let (location, disposition) = if freshness.max_lag.is_some() {
+            (
+                "[freshness] expected_lag_seconds + time_column",
+                "declared metadata plus runner observation — not an engine gate; severity is \
+                 accepted for the runner's observation phase and NOT written to the sidecar \
+                 (no engine path reads it; see the module docstring trace)",
+            )
+        } else {
+            (
+                "[freshness] warn_after / error_after + time_column",
+                "declared metadata plus runner observation — not an engine gate; the levels \
+                 are copied verbatim, so `rocky freshness` grades the model as the spec declares",
+            )
+        };
         rows.insert(
             "product.output.freshness".to_string(),
             row(
                 Vec::new(),
-                vec![Location::new(
-                    &sidecar,
-                    "[freshness] expected_lag_seconds + time_column",
-                    LocationPhase::B,
-                )],
-                "declared metadata plus runner observation — not an engine gate; severity is \
-                 accepted for the runner's observation phase and NOT written to the sidecar \
-                 (no engine path reads it; see the module docstring trace)",
+                vec![Location::new(&sidecar, location, LocationPhase::B)],
+                disposition,
             ),
         );
     }
@@ -1505,6 +1539,38 @@ agent = "propose_only"
         assert_eq!(
             *document["target"].as_table().expect("target"),
             test_entry(&[("catalog", "poc")])
+        );
+    }
+
+    #[test]
+    fn a_new_form_spec_lowers_its_levels_verbatim() {
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace(
+                r#"freshness = { max_lag = "24h", time_column = "date", severity = "error" }"#,
+                r#"freshness = { warn_after = "12h", error_after = "1d", time_column = "date" }"#,
+            );
+        let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid");
+        let document = merged_document(&parsed, &drafted_sidecar_text());
+        let freshness = document["freshness"].as_table().expect("freshness");
+        assert_eq!(freshness.get("expected_lag_seconds"), None);
+        assert_eq!(freshness["warn_after"], TomlValue::string("12h"));
+        assert_eq!(freshness["error_after"], TomlValue::string("1d"));
+        assert_eq!(freshness["time_column"], TomlValue::string("date"));
+        // The lowered sidecar parses back to the levels the spec declared.
+        let sidecar: crate::models::ModelFreshnessConfig =
+            toml::from_str("warn_after = \"12h\"\nerror_after = \"1d\"\ntime_column = \"date\"")
+                .expect("parses");
+        assert_eq!(
+            sidecar.thresholds(),
+            parsed
+                .product()
+                .output
+                .freshness
+                .as_ref()
+                .expect("block")
+                .thresholds()
+                .expect("levels")
         );
     }
 

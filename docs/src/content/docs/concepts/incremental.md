@@ -100,9 +100,13 @@ The filter is a strict `>`. The hold-back above keeps a late row with the same t
 
 ### Recovering an interrupted replication
 
-For DuckDB, Databricks, Snowflake, and BigQuery, Rocky records recovery intent
-before copying. It records the source, target, timestamp column, and prior
-watermark. These adapters commit each INSERT atomically.
+For DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, and SQL Server, Rocky
+records recovery intent before copying. It records the source, target, timestamp
+column, and prior watermark. These adapters commit each INSERT atomically.
+Fabric Warehouse uses the SQL Server adapter, so it recovers too, but no
+live test covers it.
+Redshift, ClickHouse, Spark, Trino, and process adapters do not recover: after
+an interrupted copy, the next run can append the same rows again.
 Snowflake recovery requires a pinned database or catalog. Fresh runs with an
 unpinned session-default namespace warn and disable recovery.
 

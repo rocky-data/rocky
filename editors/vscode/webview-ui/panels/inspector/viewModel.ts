@@ -23,13 +23,53 @@ export function formatDuration(seconds: number): string {
   return `${Math.round(seconds / 86400)}d`;
 }
 
-/** Short freshness label ("≤ 2h (warning)"), or null when undeclared. */
+const DURATION_UNITS: Record<string, number> = { s: 1, h: 3600, d: 86400 };
+
+/**
+ * Seconds in a freshness duration ("12h", "7d"): a positive integer and one
+ * unit of s, h or d, the engine's grammar. Null for anything else.
+ */
+export function durationSeconds(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const match = /^([1-9][0-9]*)([shd])$/.exec(raw);
+  if (!match) return null;
+  return Number(match[1]) * DURATION_UNITS[match[2]];
+}
+
+/**
+ * Seconds until a model first reports stale: the smaller of `warn_after` /
+ * `error_after`, or the deprecated `max_lag_seconds` when the block uses it.
+ * Mirrors the engine's `FreshnessThresholds::budget_seconds`.
+ */
+export function freshnessBudgetSeconds(
+  freshness: ModelFreshnessConfig,
+): number | null {
+  if (freshness.max_lag_seconds != null) return freshness.max_lag_seconds;
+  const levels = [
+    durationSeconds(freshness.warn_after),
+    durationSeconds(freshness.error_after),
+  ].filter((s): s is number => s !== null);
+  return levels.length > 0 ? Math.min(...levels) : null;
+}
+
+/**
+ * Short freshness label ("≤ 2h (warning)", or "≤ 1h (warning) · ≤ 6h (error)"
+ * for a block with both levels), or null when undeclared.
+ */
 export function freshnessLabel(
   freshness: ModelFreshnessConfig | null,
 ): string | null {
   if (!freshness) return null;
-  const lag = formatDuration(freshness.max_lag_seconds);
-  return `≤ ${lag}${freshness.severity ? ` (${freshness.severity})` : ""}`;
+  if (freshness.max_lag_seconds != null) {
+    const lag = formatDuration(freshness.max_lag_seconds);
+    return `≤ ${lag}${freshness.severity ? ` (${freshness.severity})` : ""}`;
+  }
+  const parts: string[] = [];
+  const warn = durationSeconds(freshness.warn_after);
+  const error = durationSeconds(freshness.error_after);
+  if (warn !== null) parts.push(`≤ ${formatDuration(warn)} (warning)`);
+  if (error !== null) parts.push(`≤ ${formatDuration(error)} (error)`);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 /** Compact integer count ("1.2k", "3.4M"). */

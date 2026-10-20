@@ -91,15 +91,20 @@ echo "Binary under test: $ROCKY_BIN (rocky $ENGINE_VERSION, also what bare 'rock
 # such a file by running some other rocky, so one line here is a POC that did
 # not test the binary the header names. Only release-shaped strings count: a
 # plan file's `version: 1` is a schema version, not an engine.
+#
+# A file can hold several JSON documents (`run --watch` writes one per run),
+# so each document's version is checked on its own line.
 version_mismatches() {
     local dir="$1" marker="$2" f v
     [ -d "$dir/expected" ] || return 0
     find "$dir/expected" -maxdepth 1 -name '*.json' -newer "$marker" 2>/dev/null |
         while IFS= read -r f; do
-            v="$(jq -r 'if type == "object" then (.version // empty | tostring) else empty end' "$f" 2>/dev/null || true)"
-            case "$v" in
-                *.*.*) [ "$v" = "$ENGINE_VERSION" ] || echo "${f#"$dir/"} reports rocky $v";;
-            esac
+            { jq -r 'if type == "object" then (.version // empty | tostring) else empty end' "$f" 2>/dev/null || true; } |
+                while IFS= read -r v; do
+                    case "$v" in
+                        *.*.*) [ "$v" = "$ENGINE_VERSION" ] || echo "${f#"$dir/"} reports rocky $v";;
+                    esac
+                done
         done
 }
 

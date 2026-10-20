@@ -165,6 +165,20 @@ def test_freshness_policy_from_model_builds_time_window_policy():
     assert policy.fail_window.to_timedelta().total_seconds() == 3600
 
 
+def test_freshness_policy_from_model_uses_the_smaller_level():
+    from dagster_rocky import freshness_policy_from_model
+    from dagster_rocky.types import ModelFreshnessConfig
+
+    policy = freshness_policy_from_model(
+        ModelFreshnessConfig.model_validate({"warn_after": "2h", "error_after": "1d"})
+    )
+    assert policy is not None
+    assert policy.fail_window.to_timedelta().total_seconds() == 7200
+    only_error = freshness_policy_from_model(ModelFreshnessConfig(error_after="3d"))
+    assert only_error is not None
+    assert only_error.fail_window.to_timedelta().total_seconds() == 3 * 86_400
+
+
 def test_per_model_freshness_policies_indexes_by_model_name():
     from dagster_rocky import per_model_freshness_policies
     from dagster_rocky.types import (

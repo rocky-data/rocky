@@ -48,7 +48,8 @@ pub struct DocSource {
 /// Freshness expectation declared on (or inherited by) a model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocFreshness {
-    /// Maximum lag in seconds before the model is stale.
+    /// Age in seconds at which the model first reports stale: the smaller
+    /// of its `warn_after` / `error_after` levels.
     pub max_lag_seconds: u64,
     /// Timestamp column the check reads, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,10 +222,23 @@ impl ProjectDocs {
                 .unwrap_or(&model.file_path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let freshness = model.config.freshness.as_ref().map(|f| DocFreshness {
-                max_lag_seconds: f.max_lag_seconds,
-                time_column: f.time_column.clone(),
-                severity: f.severity.map(|s| format!("{s:?}").to_lowercase()),
+            let freshness = model.config.freshness.as_ref().and_then(|f| {
+                let levels = f.thresholds();
+                // A deprecated block reports the severity it wrote, as
+                // before. A `warn_after` / `error_after` block reports the
+                // level its budget (the smaller level) sits on.
+                let severity = if f.max_lag_seconds.is_some() {
+                    f.severity.map(|s| format!("{s:?}").to_lowercase())
+                } else if levels.budget_seconds() == levels.warn_after_seconds {
+                    Some("warning".to_string())
+                } else {
+                    Some("error".to_string())
+                };
+                Some(DocFreshness {
+                    max_lag_seconds: levels.budget_seconds()?,
+                    time_column: f.time_column.clone(),
+                    severity,
+                })
             });
             details.insert(
                 model.config.name.clone(),

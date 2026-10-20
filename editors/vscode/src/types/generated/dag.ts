@@ -334,23 +334,33 @@ export interface DagNodeOutput {
  *
  * Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
  *
- * `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+ * `rocky freshness` enforces it at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn` past `warn_after`, `error` past `error_after`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+ *
+ * `max_lag_seconds` (alias `expected_lag_seconds`) + `severity` is the deprecated spelling. It still parses and behaves as before (`rocky validate` reports W058): the one value is the error level under `severity = "error"`, else the warn level. It is stored as written, never converted, because each model's whole config is hashed into plan ids. Read the levels through [`Self::thresholds`].
  */
 export interface ModelFreshnessConfig {
   /**
-   * Maximum lag in seconds before the model is considered stale.
-   *
-   * Accepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.
+   * Age above which the model reports `error` and `rocky freshness` exits 1. Must not be shorter than `warn_after`.
    */
-  max_lag_seconds: number;
+  error_after?: string | null;
   /**
-   * Severity reported when the freshness check trips. Default `warning` keeps the runtime check non-blocking — switch to `error` to fail the pipeline on stale data.
+   * Deprecated: write `warn_after` / `error_after`. Maximum lag in seconds before the model is considered stale.
+   *
+   * Accepts both `max_lag_seconds` and `expected_lag_seconds`. Both deserialize to this field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working.
+   */
+  max_lag_seconds?: number | null;
+  /**
+   * Deprecated, only with `max_lag_seconds`: severity reported when the freshness check trips. Default `warning`.
    */
   severity?: TestSeverity | null;
   /**
    * Optional timestamp column used to evaluate freshness at runtime (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When unset the runtime falls back to the model's last-materialization timestamp from the state store.
    */
   time_column?: string | null;
+  /**
+   * Age above which the model reports `warn` (`"1h"`, `"7d"`).
+   */
+  warn_after?: string | null;
   [k: string]: unknown;
 }
 /**

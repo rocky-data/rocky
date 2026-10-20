@@ -1,9 +1,9 @@
 name: engine-weekly
 
 # Expensive-but-advisory jobs that don't need to run on every PR.
-# Coverage (tarpaulin), the security audit, the POC smoke suite and a
-# Windows compile check run weekly on main and can be triggered manually
-# for one-off checks.
+# Coverage (tarpaulin), the security audit, the POC smoke suite, a
+# Windows compile check and the Windows settle tests run weekly on main and
+# can be triggered manually for one-off checks.
 
 on:
   schedule:
@@ -159,6 +159,45 @@ jobs:
             Remove-SmbShare -Name $share -Force -ErrorAction SilentlyContinue
             Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
           }
+
+  windows-settle:
+    name: Windows settle (#2440)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    # Advisory, like every job here. PR CI runs on Linux only, so this is the
+    # one place `rocky run`'s cancel and settle code runs on Windows. Its own
+    # job because these tests build rocky-duckdb, and `windows-check`
+    # deliberately avoids DuckDB's C++ compile.
+    env:
+      # A debug `rocky.exe` overflows Windows' default 1 MB main-thread stack
+      # at startup (seen on the first run of this job, 2026-10-20). Set for
+      # the whole job so both steps share one build.
+      RUSTFLAGS: -C link-arg=/STACK:8388608
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned like windows-check. Bump deliberately.
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine
+          # Restore only, matching the other weekly jobs.
+          save-if: false
+      - name: In-process cancel and settle tests
+        # The run_cancel module tests, and the run tests that cancel a run
+        # through its token. No console events; these check the settle itself.
+        # The filter matches module paths too, so it also selects other
+        # cancel and interrupt tests. No step here continues on error: a red
+        # job is the signal, and the job is not a required check.
+        run: cargo test -p rocky-cli --lib -- cancel interrupt
+      - name: Ctrl-Break settles a run (end to end)
+        # Sends a real CTRL_BREAK_EVENT to a child `rocky run` and checks exit
+        # 130, the interrupted record, the released idempotency claim, and
+        # that no further model ran. The test fails loudly if the runner
+        # cannot deliver the event.
+        if: ${{ !cancelled() }}
+        run: cargo test -p rocky --test run_cancel_windows -- --ignored --nocapture
 
   coverage:
     name: Coverage
