@@ -2962,6 +2962,66 @@ pub struct ModelExecution {
     /// byte-identical. State-internal: not part of any `*Output` JSON schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_target: Option<RecordedTarget>,
+
+    // --- Stored bytes (no schema bump) ------------------------------------
+    /// The bytes the output table stores, measured right after this
+    /// execution wrote it. See [`StoredBytes`] for what each basis means.
+    ///
+    /// `None` means unknown: a failed execution, a strategy with no stored
+    /// table (a view), an adapter that cannot measure it, a failed
+    /// measurement, or a record written by a binary that predates this field.
+    /// Never a guess.
+    ///
+    /// Added without a schema bump, like [`Self::output_version`]. Omitted
+    /// when `None`, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical. Read leniently: a value this binary cannot parse reads
+    /// as `None` instead of failing the whole run-history read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stored_bytes_lenient"
+    )]
+    pub stored_bytes: Option<StoredBytes>,
+}
+
+/// The bytes one output table stores, and how the number was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredBytes {
+    /// The measured size in bytes.
+    pub bytes: u64,
+    /// How `bytes` was measured. Tells an exact figure from an estimate.
+    pub basis: StoredBytesBasis,
+}
+
+/// How a [`StoredBytes`] figure was measured.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredBytesBasis {
+    /// Exact: the summed size of the table's live Parquet data files, as
+    /// Rocky wrote them. Excludes table-format metadata (the Delta log,
+    /// Iceberg manifests).
+    DataFiles,
+    /// Estimate: the number of storage blocks the table's column segments
+    /// occupy, times the block size (DuckDB). It is file space allocated to
+    /// the table, not payload bytes. It overstates a small table (a partly
+    /// filled block counts in full), counts a block shared with another
+    /// table once for each table, and leaves out table metadata blocks.
+    AllocatedBlocks,
+}
+
+/// Lenient reader for [`ModelExecution::stored_bytes`]: any value that does
+/// not parse as a [`StoredBytes`] (a later binary's new basis, or a corrupt
+/// value) reads as `None` ("unknown").
+fn deserialize_stored_bytes_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<StoredBytes>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Where one successful model execution wrote its output.
@@ -9588,6 +9648,7 @@ pub fn run_with_output_versions(
                 attempts: Vec::new(),
                 output_version: version.clone(),
                 output_target: None,
+                stored_bytes: None,
             })
             .collect(),
         trigger: RunTrigger::Manual,
@@ -11744,6 +11805,7 @@ mod tests {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             }],
         );
@@ -11944,6 +12006,7 @@ mod tests {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             })
             .collect();
@@ -12243,6 +12306,7 @@ mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -12336,6 +12400,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    stored_bytes: None,
                     output_target: None,
                 },
                 ModelExecution {
@@ -12359,6 +12424,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    stored_bytes: None,
                     output_target: None,
                 },
             ],
@@ -12397,6 +12463,7 @@ mod tests {
                     output_column_hashes: None,
                     attempts: Vec::new(),
                     output_version: None,
+                    stored_bytes: None,
                     output_target: None,
                 }],
             );
@@ -12551,6 +12618,52 @@ mod tests {
         let back: ModelExecution =
             serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
         assert_eq!(back.output_target, exec.output_target);
+    }
+
+    /// `stored_bytes`: absent reads as `None` and `None` is omitted on write
+    /// (older ledger bytes stay byte-identical); a `Some` round-trips with its
+    /// basis; a basis this binary does not know reads as `None` instead of
+    /// failing the whole record.
+    #[test]
+    fn test_model_execution_stored_bytes_forward_compat_round_trip_and_lenient_read() {
+        let blob = |extra: &str| {
+            format!(
+                r#"{{
+                "model_name": "orders",
+                "started_at": "2024-01-01T12:00:00Z",
+                "finished_at": "2024-01-01T12:00:02Z",
+                "duration_ms": 2000,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null{extra}
+            }}"#
+            )
+        };
+        let mut exec: ModelExecution =
+            serde_json::from_str(&blob("")).expect("pre-field record must read");
+        assert_eq!(exec.stored_bytes, None);
+        let written = serde_json::to_string(&exec).unwrap();
+        assert!(!written.contains("stored_bytes"), "{written}");
+
+        exec.stored_bytes = Some(StoredBytes {
+            bytes: 262_144,
+            basis: StoredBytesBasis::AllocatedBlocks,
+        });
+        let written = serde_json::to_string(&exec).unwrap();
+        assert!(
+            written.contains(r#""stored_bytes":{"bytes":262144,"basis":"allocated_blocks"}"#),
+            "{written}"
+        );
+        let back: ModelExecution = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.stored_bytes, exec.stored_bytes);
+
+        let future: ModelExecution = serde_json::from_str(&blob(
+            r#", "stored_bytes": {"bytes": 5, "basis": "a_later_basis"}"#,
+        ))
+        .expect("an unknown basis must not fail the record");
+        assert_eq!(future.stored_bytes, None);
     }
 
     /// v10 → v11 forward-compat: a `ModelExecution` blob written before the
@@ -12761,6 +12874,7 @@ mod tests {
             }]),
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let json = serde_json::to_string(&exec).unwrap();
@@ -12815,6 +12929,7 @@ mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();

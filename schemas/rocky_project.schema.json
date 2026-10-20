@@ -793,11 +793,35 @@
       "additionalProperties": false,
       "description": "Cost estimation configuration.\n\nControls pricing assumptions used by [`crate::optimize::recommend_strategy`] when analyzing materialization costs and generating recommendations.",
       "properties": {
+        "ai_cost_per_million_tokens": {
+          "description": "Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "compute_cost_per_dbu": {
           "default": 0.4,
           "description": "Cost per DBU (default: $0.40).",
           "format": "double",
           "type": "number"
+        },
+        "compute_cost_per_machine_hour": {
+          "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cross_region_transfer_cost_per_gb": {
+          "description": "Price of moving one GB of data across regions, in USD per GB. Unset by default. Config only for now: no cost path reads it yet.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "min_history_runs": {
           "default": 5,

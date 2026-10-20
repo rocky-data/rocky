@@ -659,6 +659,46 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// The bytes each of these tables stores, read once after every model
+    /// of the run has finished.
+    ///
+    /// The answer has one entry per input table, in the same order. The
+    /// runner records each as [`crate::state::ModelExecution::stored_bytes`]
+    /// and `rocky cost` shows it. An answer must be a measurement, never a
+    /// guess: an entry the adapter cannot measure is `None`, which reads as
+    /// unknown.
+    ///
+    /// - **DuckDB:** one plain `CHECKPOINT` per distinct file database in the
+    ///   batch (never `FORCE CHECKPOINT`), then, per table, the distinct
+    ///   storage blocks its column segments occupy, times the block size
+    ///   ([`crate::state::StoredBytesBasis::AllocatedBlocks`], an estimate).
+    ///   `None` for an in-memory database, and for every table of a database
+    ///   whose checkpoint fails.
+    /// - **Every other adapter:** all `None`, the default.
+    ///
+    /// The runner calls this at most once per model execution phase, after
+    /// the last model, so no model's write is in flight. The content-addressed
+    /// path does not call it: it records the exact size of the Parquet files
+    /// it wrote.
+    ///
+    /// Like [`Self::observed_table_version`], the read is optional: make
+    /// **one attempt**, with no retries and no draw from the run's retry
+    /// budget. An implementation may flush data the warehouse would flush
+    /// anyway (DuckDB writes its WAL into the database file), but must not
+    /// change table contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` only if the whole measurement fails. The runner
+    /// then records every table as `None` and logs. A failed read never fails
+    /// the run.
+    async fn stored_tables_bytes(
+        &self,
+        tables: &[TableRef],
+    ) -> AdapterResult<Vec<Option<crate::state::StoredBytes>>> {
+        Ok(vec![None; tables.len()])
+    }
+
     /// Refuse a watermark filter the session would read in a zone other than
     /// UTC (#2395).
     ///

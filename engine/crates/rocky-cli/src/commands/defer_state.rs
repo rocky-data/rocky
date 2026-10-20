@@ -307,6 +307,7 @@ pub(crate) mod tests {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: target.map(|(schema, table)| RecordedTarget {
                 model: name.to_string(),
                 catalog: String::new(),

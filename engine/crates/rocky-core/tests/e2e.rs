@@ -492,6 +492,7 @@ fn test_run_history_flow() {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             },
             ModelExecution {
@@ -515,6 +516,7 @@ fn test_run_history_flow() {
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             },
         ],

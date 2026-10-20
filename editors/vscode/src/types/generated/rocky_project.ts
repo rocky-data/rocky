@@ -1064,9 +1064,21 @@ export interface ContractsConfig {
  */
 export interface CostSection {
   /**
+   * Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.
+   */
+  ai_cost_per_million_tokens?: number | null;
+  /**
    * Cost per DBU (default: $0.40).
    */
   compute_cost_per_dbu?: number;
+  /**
+   * Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.
+   */
+  compute_cost_per_machine_hour?: number | null;
+  /**
+   * Price of moving one GB of data across regions, in USD per GB. Unset by default. Config only for now: no cost path reads it yet.
+   */
+  cross_region_transfer_cost_per_gb?: number | null;
   /**
    * Minimum runs before making cost recommendations.
    */

@@ -5663,6 +5663,7 @@ fn seed_run_history(models_dir: &Path) {
             output_column_hashes: None,
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }],
         trigger: RunTrigger::Manual,

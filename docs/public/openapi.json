@@ -6242,11 +6242,35 @@
         "additionalProperties": false,
         "description": "Cost estimation configuration.\n\nControls pricing assumptions used by [`crate::optimize::recommend_strategy`] when analyzing materialization costs and generating recommendations.",
         "properties": {
+          "ai_cost_per_million_tokens": {
+            "description": "Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "compute_cost_per_dbu": {
             "default": 0.4,
             "description": "Cost per DBU (default: $0.40).",
             "format": "double",
             "type": "number"
+          },
+          "compute_cost_per_machine_hour": {
+            "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cross_region_transfer_cost_per_gb": {
+            "description": "Price of moving one GB of data across regions, in USD per GB. Unset by default. Config only for now: no cost path reads it yet.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "min_history_runs": {
             "default": 5,
@@ -14394,6 +14418,26 @@
           },
           "status": {
             "type": "string"
+          },
+          "stored_bytes": {
+            "description": "The bytes the model's output table stored right after this execution wrote it, read back from the persisted `rocky_core::state::ModelExecution::stored_bytes`. Read `stored_bytes_basis` to tell an exact figure from an estimate.\n\n`None` (and omitted from JSON) means unknown: a view, a replicated table, a `time_interval` partition, an adapter that cannot measure it (every adapter except DuckDB today), an in-memory DuckDB database, a failed measurement, or a run recorded before this field existed. There is no run total: the bases differ, so a sum would mix exact and estimated figures.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stored_bytes_basis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StoredBytesBasis"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How `stored_bytes` was measured: `data_files` (exact Parquet data-file bytes, content-addressed outputs) or `allocated_blocks` (an estimate: DuckDB storage blocks times the block size, which overstates a small table). Present exactly when `stored_bytes` is."
           },
           "tenant": {
             "description": "Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.",
@@ -23820,6 +23864,25 @@
           "success"
         ],
         "type": "object"
+      },
+      "StoredBytesBasis": {
+        "description": "How a [`StoredBytes`] figure was measured.",
+        "oneOf": [
+          {
+            "description": "Exact: the summed size of the table's live Parquet data files, as Rocky wrote them. Excludes table-format metadata (the Delta log, Iceberg manifests).",
+            "enum": [
+              "data_files"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Estimate: the number of storage blocks the table's column segments occupy, times the block size (DuckDB). It is file space allocated to the table, not payload bytes. It overstates a small table (a partly filled block counts in full), counts a block shared with another table once for each table, and leaves out table metadata blocks.",
+            "enum": [
+              "allocated_blocks"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "StrategyConfig": {
         "description": "Materialization strategy for a model, defaulting to full refresh.",

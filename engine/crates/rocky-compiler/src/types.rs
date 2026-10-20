@@ -9,4 +9,7 @@
 //! depends on `rocky-core` (one-way), so the typed-column primitives must
 //! live in `rocky-core` for that to work.
 
-pub use rocky_ir::types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};
+pub use rocky_ir::types::{
+    DecimalOp, InferredType, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn,
+    arithmetic_result_type, common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
+};

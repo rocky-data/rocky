@@ -61,4 +61,7 @@ pub use snapshot::{
     SnapshotMetaColumns, SnapshotSpec,
 };
 pub use time_grain::TimeGrain;
-pub use types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};
+pub use types::{
+    DecimalOp, InferredType, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn,
+    arithmetic_result_type, common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
+};

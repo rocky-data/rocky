@@ -880,6 +880,9 @@ impl AdapterRegistry {
                         Some("observe-version") => crate::testing::FailingWriteKind::ObserveVersion,
                         Some("observe-fail") => crate::testing::FailingWriteKind::ObserveFail,
                         Some("accept-all") => crate::testing::FailingWriteKind::AcceptAll,
+                        Some("stored-bytes-fail") => {
+                            crate::testing::FailingWriteKind::StoredBytesFail
+                        }
                         other => bail!("adapters.{name}: unknown test failure {other:?}"),
                     };
                     let adapter = Arc::new(crate::testing::FailingWriteWarehouseAdapter::new(

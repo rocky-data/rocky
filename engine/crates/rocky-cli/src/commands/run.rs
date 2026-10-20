@@ -12772,9 +12772,90 @@ pub(crate) async fn execute_models(
     .await
 }
 
+/// Compile and execute the transformation models, then measure the stored
+/// bytes of the tables they wrote in one batch.
+///
+/// Every path that executes transformation models funnels through here, and
+/// a run calls it once, so the adapter's measurement (on DuckDB, one
+/// `CHECKPOINT` per database) runs once per run, after the last model. The
+/// body measures at its normal end, before a shadow cleanup can drop the
+/// tables; this wrapper measures whatever an early return left noted. The
+/// measurement is best-effort and never changes the result.
 #[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models_with_explicit_contracts(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    output: &mut RunOutput,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    schema_cache_config: &rocky_core::config::SchemaCacheConfig,
+    auto_create_schemas: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    defer_opts: &DeferOptions,
+    skip_gate: SkipGateConfig,
+    reuse_enabled: bool,
+    column_level_enabled: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+    resilience: rocky_core::config::ResilienceConfig,
+    strict_scheduling: bool,
+    retry_policy_allows: bool,
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
+    reconciles_masks: bool,
+    contracts: Option<RunContracts<'_>>,
+    strict_contracts: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<GovernanceSnapshot> {
+    let mut stored_bytes = super::run_stored_bytes::PendingStoredBytes::default();
+    // Boxed so this wrapper does not add the whole phase future to the
+    // caller's stack: the apply tests overflowed a 2 MiB test thread without it.
+    let result = Box::pin(execute_models_phase(
+        models_dir,
+        models_glob,
+        warehouse,
+        state_store,
+        partition_opts,
+        run_id,
+        model_name_filter,
+        model_set,
+        output,
+        hook_registry,
+        pipeline_name,
+        schema_cache_config,
+        auto_create_schemas,
+        shadow_config,
+        defer_opts,
+        skip_gate,
+        reuse_enabled,
+        column_level_enabled,
+        run_vars,
+        resilience,
+        strict_scheduling,
+        retry_policy_allows,
+        exec_fp_gate,
+        freeze_fence,
+        reconciles_masks,
+        contracts,
+        strict_contracts,
+        cancel,
+        &mut stored_bytes,
+    ))
+    .await;
+    stored_bytes
+        .measure(warehouse, &mut output.materializations, cancel)
+        .await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_models_phase(
     models_dir: &Path,
     models_glob: Option<&str>,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -12887,6 +12968,9 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // model starts, `output.interrupted` is set and this returns `Ok` so the
     // caller's terminal persist + settle runs (the freeze fence's shape).
     cancel: &tokio_util::sync::CancellationToken,
+    // The outputs whose stored bytes are measured after the last model. The
+    // body notes each measured write and measures at its normal end.
+    stored_bytes: &mut super::run_stored_bytes::PendingStoredBytes,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -14237,6 +14321,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                             materialization.skip_internal = Some(state);
                         }
                         gate.record(name, super::skip_gate::Verdict::Built);
+                        stored_bytes.note(
+                            &matched[idx].2.to_model_ir().materialization,
+                            output.materializations.len(),
+                            &materialization.asset_key,
+                        );
                         output.materializations.push(materialization);
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
@@ -14577,6 +14666,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                                 ),
                             ),
                             output_target: Some(recorded_output_target(&model_ir)),
+                            // Exact: the sizes of the Parquet files just
+                            // committed or referenced.
+                            stored_bytes: Some(
+                                super::run_stored_bytes::content_addressed_stored_bytes(&summary),
+                            ),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -14902,6 +14996,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     // output instead of having to infer them from check /
                     // drift records. Mirrors the time_interval and
                     // replication paths.
+                    stored_bytes.note(
+                        &model.to_model_ir().materialization,
+                        output.materializations.len(),
+                        &materialization.asset_key,
+                    );
                     output.materializations.push(materialization);
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
@@ -14965,6 +15064,13 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             );
         }
     }
+
+    // Every model has finished: measure the noted outputs' stored bytes in
+    // one batch, before a shadow cleanup below can drop them. The wrapper
+    // measures anything an early return left behind.
+    stored_bytes
+        .measure(warehouse, &mut output.materializations, cancel)
+        .await;
 
     if let Some(config) = shadow_config
         && config.branch.is_none()
@@ -16490,6 +16596,8 @@ async fn execute_one_plain_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(&model_ir)),
+        // Measured once after the last model: `PendingStoredBytes`.
+        stored_bytes: None,
     })
 }
 
@@ -16763,6 +16871,8 @@ async fn execute_snapshot_model(
         consumed_column_baseline: None,
         output_version: Some(output_version),
         output_target: Some(recorded_output_target(model_ir)),
+        // Measured once after the last model: `PendingStoredBytes`.
+        stored_bytes: None,
     })
 }
 
@@ -17422,6 +17532,8 @@ async fn run_one_partition(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: Some(recorded_output_target(&tplan_ir)),
+            // Not measured per partition: see `run_stored_bytes::measures_stored_bytes`.
+            stored_bytes: None,
         })),
     }
 }
@@ -19039,6 +19151,9 @@ async fn process_table(
             consumed_column_baseline: None,
             output_version: Some(output_version),
             output_target: None,
+            // Replicated tables are not measured, so replication sends no
+            // extra query.
+            stored_bytes: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -25729,6 +25844,7 @@ auto_create_schemas = true
             output_column_hashes: None,
             consumed_column_baseline: None,
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         }
     }
@@ -42092,6 +42208,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
@@ -44504,6 +44621,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let run = rocky_core::state::RunRecord {
@@ -44706,6 +44824,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
             output_version: None,
+            stored_bytes: None,
             output_target: None,
         };
         let base_run = rocky_core::state::RunRecord {
@@ -44839,6 +44958,7 @@ auto_create_schemas = true
             hash_scheme: Some(identity.hash_scheme.clone()),
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
+            stored_bytes: None,
             attempts: Vec::new(),
             output_target: None,
         };
@@ -44984,6 +45104,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
@@ -45968,6 +46089,7 @@ auto_create_schemas = true
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             };
             let run = rocky_core::state::RunRecord {
@@ -46275,6 +46397,7 @@ auto_create_schemas = true
                 output_column_hashes: None,
                 attempts: Vec::new(),
                 output_version: None,
+                stored_bytes: None,
                 output_target: None,
             };
             store

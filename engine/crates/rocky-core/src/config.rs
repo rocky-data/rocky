@@ -389,6 +389,8 @@ pub enum ConfigError {
         rule_index: usize,
         window: EnvString,
     },
+    #[error("[cost] {key} = {value} is not a valid price: it must be a finite number, 0 or more")]
+    CostPriceInvalid { key: &'static str, value: f64 },
     #[error(
         "[checks] assertion name {name:?} on table {table:?} is reserved: it \
          collides with the engine's own {reserved:?} result. Dagster maps \
@@ -2398,6 +2400,19 @@ pub struct CostSection {
     /// Minimum runs before making cost recommendations.
     #[serde(default = "default_min_history_runs")]
     pub min_history_runs: usize,
+    /// Price of one machine-hour of compute, in USD per hour. For engines
+    /// that bill by machine time instead of DBUs. Unset by default. Config
+    /// only for now: no cost path reads it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_cost_per_machine_hour: Option<f64>,
+    /// Price of moving one GB of data across regions, in USD per GB. Unset
+    /// by default. Config only for now: no cost path reads it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_region_transfer_cost_per_gb: Option<f64>,
+    /// Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by
+    /// default. Config only for now: no cost path reads it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_cost_per_million_tokens: Option<f64>,
 }
 
 fn default_storage_cost() -> f64 {
@@ -2420,6 +2435,9 @@ impl Default for CostSection {
             compute_cost_per_dbu: default_compute_cost_per_dbu(),
             warehouse_size: default_warehouse_size(),
             min_history_runs: default_min_history_runs(),
+            compute_cost_per_machine_hour: None,
+            cross_region_transfer_cost_per_gb: None,
+            ai_cost_per_million_tokens: None,
         }
     }
 }
@@ -4429,6 +4447,36 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
         }
     }
     errors
+}
+
+/// Validate that every `[cost]` price is finite and not negative.
+pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
+    let cost = &config.cost;
+    let prices = [
+        (
+            "storage_cost_per_gb_month",
+            Some(cost.storage_cost_per_gb_month),
+        ),
+        ("compute_cost_per_dbu", Some(cost.compute_cost_per_dbu)),
+        (
+            "compute_cost_per_machine_hour",
+            cost.compute_cost_per_machine_hour,
+        ),
+        (
+            "cross_region_transfer_cost_per_gb",
+            cost.cross_region_transfer_cost_per_gb,
+        ),
+        (
+            "ai_cost_per_million_tokens",
+            cost.ai_cost_per_million_tokens,
+        ),
+    ];
+    prices
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value?)))
+        .filter(|(_, value)| !value.is_finite() || *value < 0.0)
+        .map(|(key, value)| ConfigError::CostPriceInvalid { key, value })
+        .collect()
 }
 
 /// Validate the `[state] freeze_marker_writes` flag against the backend.
@@ -8464,6 +8512,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_freeze_marker_writes,
     validate_checks,
     validate_metadata_columns,
+    validate_cost_prices,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -12161,6 +12210,94 @@ schema_template = "raw"
         assert!((config.cost.compute_cost_per_dbu - 0.75).abs() < f64::EPSILON);
         assert_eq!(config.cost.warehouse_size, "Large");
         assert_eq!(config.cost.min_history_runs, 10);
+    }
+
+    #[test]
+    fn cost_price_table_parses_all_keys() {
+        let config: RockyConfig = toml::from_str(
+            "[cost]\ncompute_cost_per_machine_hour = 1.5\ncross_region_transfer_cost_per_gb = 0.02\nai_cost_per_million_tokens = 3.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.cost.compute_cost_per_machine_hour, Some(1.5));
+        assert_eq!(config.cost.cross_region_transfer_cost_per_gb, Some(0.02));
+        assert_eq!(config.cost.ai_cost_per_million_tokens, Some(3.0));
+        assert!(validate_cost_prices(&config).is_empty());
+    }
+
+    #[test]
+    fn cost_price_table_defaults_to_none() {
+        let config: RockyConfig = toml::from_str("[cost]\n").unwrap();
+        assert_eq!(config.cost.compute_cost_per_machine_hour, None);
+        assert_eq!(config.cost.cross_region_transfer_cost_per_gb, None);
+        assert_eq!(config.cost.ai_cost_per_million_tokens, None);
+    }
+
+    #[test]
+    fn cost_price_negative_is_rejected() {
+        for key in [
+            "storage_cost_per_gb_month",
+            "compute_cost_per_dbu",
+            "compute_cost_per_machine_hour",
+            "cross_region_transfer_cost_per_gb",
+            "ai_cost_per_million_tokens",
+        ] {
+            let config: RockyConfig = toml::from_str(&format!("[cost]\n{key} = -0.5\n")).unwrap();
+            let errors = validate_cost_prices(&config);
+            assert!(
+                matches!(errors.as_slice(), [ConfigError::CostPriceInvalid { key: k, .. }] if *k == key),
+                "{key}: {errors:?}"
+            );
+            assert!(errors[0].to_string().contains(key));
+        }
+    }
+
+    /// TOML accepts `nan` and `inf`; neither is a price.
+    #[test]
+    fn cost_price_non_finite_is_rejected() {
+        for literal in ["nan", "inf", "-inf"] {
+            let config: RockyConfig =
+                toml::from_str(&format!("[cost]\ncompute_cost_per_dbu = {literal}\n")).unwrap();
+            let errors = validate_cost_prices(&config);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [ConfigError::CostPriceInvalid {
+                        key: "compute_cost_per_dbu",
+                        ..
+                    }]
+                ),
+                "{literal}: {errors:?}"
+            );
+        }
+    }
+
+    /// Zero is a valid price (a free tier, a sunk cost).
+    #[test]
+    fn cost_price_zero_is_accepted() {
+        let config: RockyConfig =
+            toml::from_str("[cost]\ncompute_cost_per_machine_hour = 0.0\n").unwrap();
+        assert!(validate_cost_prices(&config).is_empty());
+    }
+
+    /// The check runs when a project loads, not only when called directly.
+    #[test]
+    fn load_rocky_config_rejects_a_negative_price() {
+        let (_d, path) =
+            write_cfg("[adapter]\ntype = \"duckdb\"\n\n[cost]\nstorage_cost_per_gb_month = -1.0\n");
+        let err = load_rocky_config(&path).expect_err("a negative price must not load");
+        assert!(
+            format!("{err:#}").contains("storage_cost_per_gb_month"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn cost_section_unset_prices_are_not_serialized() {
+        let json = serde_json::to_value(CostSection::default()).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("compute_cost_per_machine_hour"));
+        assert!(!obj.contains_key("cross_region_transfer_cost_per_gb"));
+        assert!(!obj.contains_key("ai_cost_per_million_tokens"));
     }
 
     // --- workspace binding config tests ---
