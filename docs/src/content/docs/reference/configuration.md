@@ -1402,7 +1402,9 @@ data in region "eu"   ──▶   [ai] region = "us"
 - Different regions: Rocky refuses the request with a `V062` error, unless `allow` has an entry from the data's region to the `[ai]` region. The check runs whether or not `enforce` is on.
 - No label on the data or on `[ai]`, and `enforce` is off: the request goes.
 
-Rocky makes the check when it builds the AI client. That is before it profiles the warehouse and before it sends any request, so a refused request sends nothing.
+Rocky makes the check when it builds the AI client. That is before it profiles the warehouse and before it sends any request, so a refused request sends nothing. `rocky ai-sync` also makes the check before it writes its upstream schema baseline, so a refused run writes no file.
+
+One command builds one AI client, for all the data that its requests carry. So one refused item stops the whole command. For example, `rocky ai-explain --all` over an `"eu"` model and a `"us"` model, with `[ai] region = "us"`, sends no request at all, not even the one for the `"us"` model. Name one model (`rocky ai-explain <model>`, `rocky ai-test <model>`, `rocky ai-sync --model <model>`) to run the models that may go.
 
 Data here means the schema (column names and types), the statistics or the values of a table. The SQL, `.rocky` source or `rocky.toml` text you wrote is not data. Each AI feature carries this data:
 
@@ -1417,12 +1419,19 @@ Data here means the schema (column names and types), the statistics or the value
 
 A model is in the region of the `target` of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads can run on any pipeline, so it is in the `target` region of every pipeline.
 
-A table that is not a Rocky model, such as a source table from the schema cache, has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+A table that is not a Rocky model, such as a source table from the schema cache, takes its region from the replication or snapshot pipeline that writes it:
 
-- `rocky ai "<intent>"` is refused when the source schema cache holds any table.
-- `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads a source table directly.
+- A replication pipeline writes every table in a schema that its `target.schema_template` makes. Each `{placeholder}` in the template stands for any text. So `schema_template = "raw__{source}"` matches the table `raw__crm.orders`.
+- A snapshot pipeline writes the one table that its `target.schema` and `target.table` name.
+- The table takes the `target` region of that pipeline, and its `source` region too, because the target holds data copied from the source.
+- Rocky compares the schema and table names without regard to case. It does not compare the catalog. A table that two pipelines match takes the regions of both.
 
-`rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. It is a warning, not an error: an AI request over that data is certain to be refused, but the project may never make one, and `rocky run` never does.
+A table that no replication or snapshot pipeline writes has no region. Without `enforce`, a request that carries its schema goes. With `enforce = true`, Rocky refuses it with a `V062` error, because it cannot show that the data may go to the AI endpoint. So, under `enforce`:
+
+- `rocky ai "<intent>"` is refused when the source schema cache holds a table that no pipeline writes.
+- `rocky ai-explain` and `rocky ai-sync` are refused for a model that reads such a table directly.
+
+`rocky validate` reports a `V062` warning for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. The warning is a hint, not an error. It says that Rocky would refuse an AI request that carries data with that label. It does not check that any AI feature carries that data: a project may never make an AI request, and `rocky run` never does. The check that refuses a request is the one Rocky makes when it builds the AI client.
 
 `ROCKY_AI_BASE_URL` changes where AI requests go, but not `[ai] region`. Keep the label in step with the endpoint you use.
 

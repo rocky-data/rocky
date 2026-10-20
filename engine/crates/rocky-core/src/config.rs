@@ -4445,9 +4445,11 @@ pub fn check_ai_residency(
 /// allow` lists no such direction. One [`ConfigError::ResidencyAiCrossRegion`]
 /// per pipeline source or target block.
 ///
-/// `rocky validate` reports these as warnings: it is certain that an AI
-/// request over that data would be refused, but not that the project ever
-/// makes one, so it is not a load error.
+/// `rocky validate` reports these as warnings, a hint and not a load error.
+/// An AI request that carried data with such a label would be refused, but
+/// this does not check that any AI feature carries that data, or that the
+/// project ever makes an AI request. The refusal itself is
+/// [`check_ai_residency`], when the AI client is built.
 pub fn ai_cross_region_labels(config: &RockyConfig) -> Vec<ConfigError> {
     let mut out = Vec::new();
     for (name, pipeline) in &config.pipelines {

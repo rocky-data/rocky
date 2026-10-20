@@ -75,10 +75,12 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     }
 
     // V062: a pipeline region label that an AI request could not carry to
-    // the `[ai]` endpoint. A warning, not an error: the refusal is certain
-    // for any AI request over that data (the comparison needs only config),
-    // but the project may never make one, and `rocky run` never does. The
-    // refusal itself happens when the AI client is built, before any request.
+    // the `[ai]` endpoint. A hint, not an error. It says only that an AI
+    // request carrying data with that label would be refused. It does not
+    // check that any AI feature carries that data (a source label reaches
+    // one only through `ai-contract` or a replicated table), and the project
+    // may never make an AI request; `rocky run` never does. The refusal
+    // itself happens when the AI client is built, before any request.
     for err in rocky_core::config::ai_cross_region_labels(&cfg) {
         out.push(ai_residency_warning(&err, config_path));
     }

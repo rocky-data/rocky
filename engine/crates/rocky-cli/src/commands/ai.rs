@@ -102,7 +102,8 @@ impl AiSetup {
     /// Build the client for requests that carry the schemas of `models`
     /// (project models) and `tables` (other tables). Refuses with V062,
     /// before any request is sent, when that data may not go to the `[ai]`
-    /// endpoint's region.
+    /// endpoint's region. Each command builds one client for all its
+    /// requests, so one refused item refuses every request of the command.
     fn client(&self, models: &[&str], tables: &[&str]) -> Result<LlmClient> {
         let data = rocky_ai::residency::data_regions(
             self.project.as_ref(),
