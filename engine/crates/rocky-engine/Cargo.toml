@@ -1,6 +1,6 @@
 [package]
 name = "rocky-engine"
-version = "1.86.0"
+version = "1.87.0"
 description = "Rocky local execution engine: DuckDB-based testing, branching, CI"
 edition.workspace = true
 license.workspace = true

@@ -101,7 +101,7 @@ Without Docker, the script shows config validation only.
 POC complete: S3 state sync (upload + download) via MinIO.
 ```
 
-The object key includes the state schema version (`v33` since the state schema bump after engine 1.86.0).
+The object key includes the state schema version (`v33` since engine 1.87.0).
 
 Key observation: after deleting the local state and re-running, the target
 still has exactly 125 rows (not 225). The watermark was restored from S3,
