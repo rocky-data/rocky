@@ -17,8 +17,9 @@
 //! A model's data is in the region of the target of each pipeline that loads
 //! it ([`ModelRegions`]). A table that is not a project model takes the
 //! target and source regions of each replication, snapshot or load pipeline
-//! that writes it ([`ModelRegions::for_table`]). Any other table has no known
-//! region.
+//! that writes it, and the source region of each replication or snapshot
+//! pipeline that reads it as its source ([`ModelRegions::for_table`]). Any
+//! other table has no known region.
 
 use std::path::Path;
 
@@ -59,8 +60,8 @@ impl AiResidency {
 ///
 /// Each model contributes one item per region of the pipelines that load it
 /// (see [`ModelRegions`]). Each other table contributes one item per region
-/// of the replication, snapshot or load pipelines that write it, or one item of no
-/// known region when none does ([`ModelRegions::for_table`]). With no
+/// of the pipelines that write it or read it as their source, or one item of
+/// no known region when none does ([`ModelRegions::for_table`]). With no
 /// `config` nothing carries a label, so this returns no items.
 pub fn data_regions(
     config: Option<&RockyConfig>,

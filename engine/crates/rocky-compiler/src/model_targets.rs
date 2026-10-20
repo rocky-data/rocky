@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig, TransformationPipelineConfig};
+use rocky_core::schema::{PatternComponent, SchemaPattern};
 
 use crate::models_loader;
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
@@ -205,39 +206,48 @@ fn pipeline_model_names(
 /// - A pipeline whose model set cannot be read adds its region to every
 ///   model (fail closed).
 ///
-/// A table that is not a model takes its regions from the replication,
-/// snapshot and load pipelines that write it ([`Self::for_table`]).
+/// A table that is not a model takes its regions from the pipelines that
+/// write it or read it as their source ([`Self::for_table`]).
 ///
-/// `None` in a list is a target with no label. Used to decide whether an AI
-/// request about a model or table may go to the `[ai]` endpoint
+/// `None` in a list is a region block with no label. Used to decide whether
+/// an AI request about a model or table may go to the `[ai]` endpoint
 /// ([`rocky_core::config::check_ai_residency`]).
 pub struct ModelRegions {
     by_model: HashMap<String, Vec<Option<String>>>,
     unclaimed: Vec<Option<String>>,
     everywhere: Vec<Option<String>>,
-    writers: Vec<TableWriter>,
+    /// The tables replication, snapshot and load pipelines write.
+    targets: Vec<TableRule>,
+    /// The tables replication and snapshot pipelines read as their source.
+    sources: Vec<TableRule>,
 }
 
-/// The tables one replication, snapshot or load pipeline writes, and the regions
-/// of their data.
-struct TableWriter {
+/// The tables one side (target or source) of one pipeline covers, and the
+/// regions of their data.
+struct TableRule {
     /// Matches the schema part of a table name.
     schema: SchemaMatch,
-    /// The exact table name, for a snapshot. `None` for a replication,
-    /// whose table names come from the source at run time.
+    /// The exact table name, when the pipeline names one. `None` when the
+    /// rule covers every table in a matching schema.
     table: Option<String>,
-    /// The target's region, and the source's for data copied from it.
+    /// The regions of the data in these tables.
     regions: Vec<Option<String>>,
 }
 
 enum SchemaMatch {
-    /// A snapshot's `target.schema`.
+    /// A snapshot's or load's `target.schema`, or a snapshot's
+    /// `source.schema`.
     Exact(String),
-    /// A replication's `target.schema_template`, each `{placeholder}` a
-    /// wildcard.
-    Template(regex::Regex),
-    /// A replication template Rocky could not turn into a pattern: it
-    /// matches every schema (fail closed).
+    /// A replication's `target.schema_template`.
+    Template(SchemaTemplate),
+    /// A replication's `source.schema_pattern`, matched the way discovery
+    /// matches it ([`SchemaPattern::parse`]). Its prefix and separator are
+    /// lowercased, and so is the schema it is tested against.
+    SourcePattern(SchemaPattern),
+    /// A replication `source.schema_pattern` whose `components` do not parse:
+    /// it matches every schema (fail closed). Discovery refuses such a
+    /// pipeline, so it reads no table, but Rocky cannot say which schemas it
+    /// would have read.
     Any,
 }
 
@@ -253,13 +263,13 @@ impl ModelRegions {
         let mut by_model: HashMap<String, Vec<Option<String>>> = HashMap::new();
         let mut everywhere = Vec::new();
         let mut unclaimed = Vec::new();
-        let mut writers = Vec::new();
+        let mut targets = Vec::new();
+        let mut sources = Vec::new();
         for (_, pipeline) in &pipelines {
             let region = pipeline.target_region().map(str::to_string);
             push_unique_region(&mut unclaimed, &region);
-            if let Some(writer) = TableWriter::of(pipeline) {
-                writers.push(writer);
-            }
+            targets.extend(TableRule::target_of(pipeline));
+            sources.extend(TableRule::source_of(pipeline));
             let Some(tx) = pipeline.as_transformation() else {
                 continue;
             };
@@ -276,7 +286,8 @@ impl ModelRegions {
             by_model,
             unclaimed,
             everywhere,
-            writers,
+            targets,
+            sources,
         }
     }
 
@@ -300,26 +311,46 @@ impl ModelRegions {
     /// The regions of `table`, a table that is not a project model, named
     /// `<schema>.<table>` or `<catalog>.<schema>.<table>`.
     ///
-    /// A replication pipeline writes every table in a schema its
-    /// `target.schema_template` renders, each `{placeholder}` standing for
-    /// any text. A snapshot pipeline writes its `target.schema` and
-    /// `target.table`. A load pipeline writes its `target.schema` and
-    /// `target.table`, or every table in that schema when `table` is unset.
-    /// Each pipeline that writes `table` adds its target region, and its
-    /// source region (replication and snapshot), because the target holds
-    /// data copied from the source. The catalog part is not compared, so a name can match
-    /// more pipelines than really write it: that adds regions, which can only
-    /// refuse more. Names compare without regard to case.
+    /// The last two dot-separated parts are the schema and the table. The
+    /// name is compared as given: no quote is removed. The names the AI
+    /// commands pass come from the schema cache, whose keys are the
+    /// warehouse's own names, lowercased and unquoted.
     ///
-    /// `[None]` when no pipeline writes `table`, or for a name with no schema
+    /// Tables a pipeline writes (its target side):
+    ///
+    /// - A replication writes every table in a schema its
+    ///   `target.schema_template` renders. Each `{placeholder}` stands for any
+    ///   text with no `.` in it.
+    /// - A snapshot writes its `target.schema` and `target.table`.
+    /// - A load writes its `target.table` in its `target.schema`, or every
+    ///   table in that schema when `table` is unset.
+    ///
+    /// Such a table takes the pipeline's target region, and its source region
+    /// (replication and snapshot), because the target holds data copied from
+    /// the source.
+    ///
+    /// Tables a pipeline reads (its source side):
+    ///
+    /// - A replication reads every table in a schema its
+    ///   `source.schema_pattern` parses, the same match discovery makes.
+    /// - A snapshot reads its `source.schema` and `source.table`.
+    /// - A load reads files, not tables, so it has no source side.
+    ///
+    /// Such a table takes the pipeline's source region only.
+    ///
+    /// The catalog part is not compared, so a name can match more pipelines
+    /// than really write or read it: that adds regions, which can only
+    /// refuse more. Names compare without regard to ASCII case.
+    ///
+    /// `[None]` when no pipeline covers `table`, or for a name with no schema
     /// part: Rocky knows no region for it.
     pub fn for_table(&self, table: &str) -> Vec<Option<String>> {
         let mut out = Vec::new();
         let parts: Vec<&str> = table.split('.').collect();
         if let [.., schema, name] = parts.as_slice() {
-            for writer in &self.writers {
-                if writer.writes(schema, name) {
-                    for region in &writer.regions {
+            for rule in self.targets.iter().chain(&self.sources) {
+                if rule.covers(schema, name) {
+                    for region in &rule.regions {
                         push_unique_region(&mut out, region);
                     }
                 }
@@ -332,16 +363,15 @@ impl ModelRegions {
     }
 }
 
-impl TableWriter {
+impl TableRule {
     /// The tables `pipeline` writes that are not models, or `None` for a
     /// pipeline type that writes only models (transformation) or no table
     /// (quality).
-    fn of(pipeline: &rocky_core::config::PipelineConfig) -> Option<Self> {
+    fn target_of(pipeline: &rocky_core::config::PipelineConfig) -> Option<Self> {
         use rocky_core::config::PipelineConfig;
         let (schema, table) = match pipeline {
             PipelineConfig::Replication(r) => (
-                schema_template_regex(&r.target.schema_template)
-                    .map_or(SchemaMatch::Any, SchemaMatch::Template),
+                SchemaMatch::Template(SchemaTemplate::new(&r.target.schema_template)),
                 None,
             ),
             PipelineConfig::Snapshot(s) => (
@@ -367,10 +397,40 @@ impl TableWriter {
         })
     }
 
-    fn writes(&self, schema: &str, table: &str) -> bool {
+    /// The tables `pipeline` reads as its source, or `None` for a pipeline
+    /// type with no source tables: a load reads files, and a transformation
+    /// or quality pipeline has no source block.
+    fn source_of(pipeline: &rocky_core::config::PipelineConfig) -> Option<Self> {
+        use rocky_core::config::PipelineConfig;
+        let (schema, table, region) = match pipeline {
+            PipelineConfig::Replication(r) => {
+                let schema = match r.source.schema_pattern.to_schema_pattern() {
+                    Ok(pattern) => SchemaMatch::SourcePattern(lowercase_pattern(pattern)),
+                    Err(_) => SchemaMatch::Any,
+                };
+                (schema, None, &r.source.region)
+            }
+            PipelineConfig::Snapshot(s) => (
+                SchemaMatch::Exact(s.source.schema.clone()),
+                Some(s.source.table.clone()),
+                &s.source.region,
+            ),
+            PipelineConfig::Load(_)
+            | PipelineConfig::Transformation(_)
+            | PipelineConfig::Quality(_) => return None,
+        };
+        Some(Self {
+            schema,
+            table,
+            regions: vec![region.clone()],
+        })
+    }
+
+    fn covers(&self, schema: &str, table: &str) -> bool {
         let schema_matches = match &self.schema {
             SchemaMatch::Exact(s) => s.eq_ignore_ascii_case(schema),
-            SchemaMatch::Template(re) => re.is_match(schema),
+            SchemaMatch::Template(t) => t.matches(schema),
+            SchemaMatch::SourcePattern(p) => p.parse(&schema.to_ascii_lowercase()).is_ok(),
             SchemaMatch::Any => true,
         };
         schema_matches
@@ -381,23 +441,77 @@ impl TableWriter {
     }
 }
 
-/// A case-insensitive regex for the schema names `template` can render.
-/// Each `{...}` placeholder matches any text with no `.`; the rest matches
-/// as written. `None` only if the regex does not build.
-fn schema_template_regex(template: &str) -> Option<regex::Regex> {
-    let mut pattern = String::from("(?i)^");
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let Some(close) = rest[open..].find('}') else {
-            break;
-        };
-        pattern.push_str(&regex::escape(&rest[..open]));
-        pattern.push_str("[^.]*");
-        rest = &rest[open + close + 1..];
+/// `pattern` with its literal text lowercased, so it matches a lowercased
+/// schema name the way the original matches the name as the source reports
+/// it.
+fn lowercase_pattern(pattern: SchemaPattern) -> SchemaPattern {
+    SchemaPattern {
+        prefix: pattern.prefix.to_ascii_lowercase(),
+        separator: pattern.separator.to_ascii_lowercase(),
+        components: pattern
+            .components
+            .into_iter()
+            .map(|c| match c {
+                PatternComponent::Fixed(text) => PatternComponent::Fixed(text.to_ascii_lowercase()),
+                other @ (PatternComponent::Variable { .. }
+                | PatternComponent::VariableLength { .. }
+                | PatternComponent::Terminal { .. }) => other,
+            })
+            .collect(),
     }
-    pattern.push_str(&regex::escape(rest));
-    pattern.push('$');
-    regex::Regex::new(&pattern).ok()
+}
+
+/// The schema names a replication `target.schema_template` can render.
+///
+/// Each `{...}` placeholder matches any text with no `.` in it, and the text
+/// between placeholders matches as written, ignoring ASCII case. A `{` with
+/// no `}` after it is literal text, as rendering treats it.
+///
+/// A hand-written matcher, not a regex, so building one cannot fail: every
+/// template has a pattern, and no fallback is needed.
+struct SchemaTemplate {
+    /// The literal text around the placeholders, lowercased. `n` pieces have
+    /// `n - 1` placeholders between them.
+    literals: Vec<String>,
+}
+
+impl SchemaTemplate {
+    fn new(template: &str) -> Self {
+        let mut literals = Vec::new();
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            let Some(close) = rest[open..].find('}') else {
+                break;
+            };
+            literals.push(rest[..open].to_ascii_lowercase());
+            rest = &rest[open + close + 1..];
+        }
+        literals.push(rest.to_ascii_lowercase());
+        Self { literals }
+    }
+
+    fn matches(&self, schema: &str) -> bool {
+        matches_literals(&self.literals, &schema.to_ascii_lowercase())
+    }
+}
+
+/// Whether `text` is `literals[0]`, then for each later literal a run of
+/// text with no `.` followed by that literal.
+fn matches_literals(literals: &[String], text: &str) -> bool {
+    let Some((first, later)) = literals.split_first() else {
+        return text.is_empty();
+    };
+    let Some(rest) = text.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    if later.is_empty() {
+        return rest.is_empty();
+    }
+    // The placeholder takes `rest[..end]`: any prefix with no `.`.
+    let limit = rest.find('.').unwrap_or(rest.len());
+    (0..=limit)
+        .filter(|&end| rest.is_char_boundary(end))
+        .any(|end| matches_literals(later, &rest[end..]))
 }
 
 fn push_unique_region(list: &mut Vec<Option<String>>, region: &Option<String>) {
@@ -562,6 +676,10 @@ mod tests {
             tmp.path(),
             &replication("bronze", "raw__{source}", Some("eu"), None),
         );
+        // The `None` is deliberate: the source block has no `region`, and the
+        // target holds data copied from that source. Under `[residency]
+        // enforce`, this `None` refuses the table even though its target is
+        // labelled.
         assert_eq!(
             regions.for_table("raw__crm.orders"),
             vec![label("eu"), None]
@@ -649,12 +767,116 @@ mod tests {
     }
 
     #[test]
-    fn schema_template_regex_escapes_literals_and_wildcards_placeholders() {
-        let re = schema_template_regex("raw.x__{source}").unwrap();
-        assert!(!re.is_match("rawXx__crm"), "the `.` is a literal");
-        let re = schema_template_regex("raw__{source}_{regions:_}").unwrap();
-        assert!(re.is_match("raw__crm_eu_us"));
-        assert!(!re.is_match("raw__crm"));
-        assert!(!re.is_match("x_raw__crm_eu"));
+    fn a_schema_template_matches_literals_as_written_and_placeholders_without_a_dot() {
+        let t = SchemaTemplate::new("raw.x__{source}");
+        assert!(t.matches("raw.x__crm"));
+        assert!(!t.matches("rawXx__crm"), "the `.` is a literal");
+        let t = SchemaTemplate::new("raw__{source}_{regions:_}");
+        assert!(t.matches("raw__crm_eu_us"));
+        assert!(t.matches("RAW__Crm_EU"), "ASCII case is ignored");
+        assert!(!t.matches("raw__crm"));
+        assert!(!t.matches("x_raw__crm_eu"));
+        let t = SchemaTemplate::new("raw__{source}_v1");
+        assert!(t.matches("raw__crm_v1"));
+        assert!(!t.matches("raw__crm_v1x"), "the last literal ends the name");
+        // A placeholder never takes a `.`.
+        let t = SchemaTemplate::new("{tenant}__{source}");
+        assert!(t.matches("acme__crm"));
+        assert!(t.matches("__"), "a placeholder can be empty");
+        assert!(!t.matches("a.b__crm"));
+        assert!(!t.matches("acme__c.rm"));
+        // A `{` with no `}` is literal text.
+        let t = SchemaTemplate::new("raw__{source");
+        assert!(t.matches("raw__{source"));
+        assert!(!t.matches("raw__crm"));
+        // No placeholder: the whole name is literal.
+        assert!(SchemaTemplate::new("raw").matches("RAW"));
+        assert!(!SchemaTemplate::new("raw").matches("raw2"));
+    }
+
+    /// The scenario of the red-team finding: a replication copies EU
+    /// sources into a US target. `discover --with-schemas` caches the
+    /// SOURCE tables, so a model's AI request can carry
+    /// `src__acme__eu__shopify.orders`. That table is in the source region,
+    /// not in no known region.
+    #[test]
+    fn a_replication_source_table_takes_the_source_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipeline = "[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"src__\"\n\
+             separator = \"__\"\ncomponents = [\"tenant\", \"regions...\", \"source\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n";
+        let regions = resolve(tmp.path(), pipeline);
+        // The source side takes only the source region, with or without a
+        // catalog part.
+        for name in [
+            "src__acme__eu__shopify.orders",
+            "src_cat.src__acme__eu__shopify.orders",
+            "src__acme__eu_west__eu_north__shopify.orders",
+        ] {
+            assert_eq!(regions.for_table(name), vec![label("eu")], "{name}");
+        }
+        // Too few segments for the pattern, or another prefix: not a source.
+        assert_eq!(regions.for_table("src__acme.orders"), vec![None]);
+        assert_eq!(regions.for_table("other__acme__eu__x.orders"), vec![None]);
+        // The target side is unchanged: target and source regions.
+        assert_eq!(
+            regions.for_table("raw__shopify.orders"),
+            vec![label("us"), label("eu")]
+        );
+    }
+
+    /// The schema cache lowercases its keys, and discovery matches the
+    /// pattern against the name the source reports, in its own case. A
+    /// mixed-case prefix must still match the lowercased cache key.
+    #[test]
+    fn a_source_pattern_matches_without_regard_to_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipeline = "[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"Src__\"\n\
+             separator = \"__\"\ncomponents = [\"source\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\n";
+        let regions = resolve(tmp.path(), pipeline);
+        assert_eq!(regions.for_table("src__shopify.orders"), vec![label("eu")]);
+        assert_eq!(regions.for_table("SRC__Shopify.Orders"), vec![label("eu")]);
+    }
+
+    /// A source `schema_pattern` whose components do not parse matches every
+    /// table (fail closed): Rocky cannot say which schemas it would read.
+    #[test]
+    fn a_source_pattern_that_does_not_parse_matches_every_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipeline = "[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"src__\"\n\
+             separator = \"__\"\ncomponents = [\"\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\nregion = \"eu\"\n";
+        let regions = resolve(tmp.path(), pipeline);
+        assert_eq!(regions.for_table("anything.orders"), vec![label("eu")]);
+    }
+
+    /// A snapshot reads its exact `source.schema` and `source.table`; that
+    /// table takes the source region only.
+    #[test]
+    fn a_snapshot_source_table_takes_the_source_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipeline = "[pipeline.hist]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
+             updated_at = \"updated_at\"\n\n\
+             [pipeline.hist.source]\ncatalog = \"wh\"\nschema = \"raw\"\ntable = \"c\"\n\
+             region = \"eu\"\n\n\
+             [pipeline.hist.target]\ncatalog = \"wh\"\nschema = \"silver\"\n\
+             table = \"c_history\"\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n";
+        let regions = resolve(tmp.path(), pipeline);
+        assert_eq!(regions.for_table("RAW.C"), vec![label("eu")]);
+        assert_eq!(regions.for_table("raw.other"), vec![None]);
+        assert_eq!(
+            regions.for_table("silver.c_history"),
+            vec![label("us"), label("eu")]
+        );
     }
 }
