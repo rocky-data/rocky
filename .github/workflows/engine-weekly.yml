@@ -182,13 +182,16 @@ jobs:
       - name: In-process cancel and settle tests
         # The run_cancel module tests, and the run tests that cancel a run
         # through its token. No console events; these check the settle itself.
-        continue-on-error: true
+        # The filter matches module paths too, so it also selects other
+        # cancel and interrupt tests. No step here continues on error: a red
+        # job is the signal, and the job is not a required check.
         run: cargo test -p rocky-cli --lib -- cancel interrupt
       - name: Ctrl-Break settles a run (end to end)
         # Sends a real CTRL_BREAK_EVENT to a child `rocky run` and checks exit
-        # 130, the interrupted record, and that no further model ran. The test
-        # fails loudly if the runner cannot deliver the event.
-        continue-on-error: true
+        # 130, the interrupted record, the released idempotency claim, and
+        # that no further model ran. The test fails loudly if the runner
+        # cannot deliver the event.
+        if: ${{ !cancelled() }}
         run: cargo test -p rocky --test run_cancel_windows -- --ignored --nocapture
 
   coverage:

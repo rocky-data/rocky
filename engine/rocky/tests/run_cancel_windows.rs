@@ -6,9 +6,14 @@
 //! the run left behind, as `run_cancel.rs` does with SIGTERM on Unix.
 //!
 //! The stall is an `on_after_model_run` hook: it writes a marker, then waits
-//! about 3 s. The test sends Ctrl-Break when the marker appears. The run
-//! checks its cancel token before the next layer, so it must stop there,
-//! inside the 5 s settle grace.
+//! about 2 s, then writes a second marker. The test sends Ctrl-Break when the
+//! first marker appears. The run checks its cancel token before the next
+//! layer, so it must stop there, inside the 5 s settle grace.
+//!
+//! The hook's `cmd` and `ping` share rocky's process group, so the break
+//! reaches them too. `ping` reports and continues on Ctrl-Break. If the break
+//! ends the hook early anyway, the run races its listener to the next layer;
+//! the second marker is missing then, and the failure messages say so.
 //!
 //! `#[ignore]`: it needs a console to send the event through. The weekly
 //! `windows-settle` job in `engine-weekly.yml` runs it with `--ignored`.
@@ -38,7 +43,7 @@ unsafe extern "system" {
 }
 
 /// Two models in two layers: `first`, then `after`, which depends on it.
-fn rocky_toml(marker: &Path) -> String {
+fn rocky_toml(marker: &Path, done: &Path) -> String {
     format!(
         r#"
 [adapter]
@@ -55,10 +60,11 @@ adapter = "default"
 concurrency = 1
 
 [hook.on_after_model_run]
-command = 'echo fired> "{}" & ping -n 4 127.0.0.1 > nul'
+command = 'echo fired> "{}" & ping -n 3 127.0.0.1 > nul & echo done> "{}"'
 timeout_ms = 60000
 "#,
-        marker.display()
+        marker.display(),
+        done.display()
     )
 }
 
@@ -81,6 +87,8 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     dir: PathBuf,
     marker: PathBuf,
+    /// Written when the hook's stall ends. Missing if the break ended it.
+    done: PathBuf,
 }
 
 impl Fixture {
@@ -88,12 +96,13 @@ impl Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().to_path_buf();
         let marker = dir.join("hook-fired.txt");
+        let done = dir.join("hook-done.txt");
         {
             let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
             conn.execute_batch("CREATE SCHEMA IF NOT EXISTS staging;")
                 .expect("seed sql");
         }
-        fs::write(dir.join("rocky.toml"), rocky_toml(&marker)).expect("write rocky.toml");
+        fs::write(dir.join("rocky.toml"), rocky_toml(&marker, &done)).expect("write rocky.toml");
         let models = dir.join("models");
         fs::create_dir(&models).expect("mkdir models");
         fs::write(models.join("first.sql"), FIRST_SQL).expect("write model");
@@ -104,6 +113,7 @@ impl Fixture {
             _tmp: tmp,
             dir,
             marker,
+            done,
         }
     }
 
@@ -192,7 +202,7 @@ fn ctrl_break_during_a_transformation_run_settles_the_run() {
     // Its own process group, so the event reaches the child and not this test.
     let mut child = fx
         .rocky()
-        .arg("run")
+        .args(["run", "--idempotency-key", "k-2440"])
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -230,7 +240,11 @@ fn ctrl_break_during_a_transformation_run_settles_the_run() {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let transcript = drain(&stderr);
+    let mut transcript = drain(&stderr);
+    transcript.push_str(&format!(
+        "[test] the hook's stall ran to the end: {}\n",
+        fx.done.exists()
+    ));
     let stdout = stdout.join().expect("stdout reader");
     let status = status.unwrap_or_else(|| panic!("rocky did not exit.\nstderr:\n{transcript}"));
     assert!(
@@ -249,13 +263,20 @@ fn ctrl_break_during_a_transformation_run_settles_the_run() {
         "a cancelled run must start no further model.\nstderr:\n{transcript}"
     );
 
-    let payload: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout is one JSON RunOutput ({e}):\n{stdout}"));
+    // An empty stdout with exit 130 means the listener's grace ran out and it
+    // exited without the settle.
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout is one JSON RunOutput ({e}); empty means the run did not settle within \
+             the grace:\n{stdout}\nstderr:\n{transcript}"
+        )
+    });
     assert_eq!(
         payload["interrupted"],
         serde_json::Value::Bool(true),
         "{payload}"
     );
+    assert_eq!(payload["status"], "PartialFailure", "{payload}");
 
     // The run record landed.
     let history = fx
@@ -272,4 +293,27 @@ fn ctrl_break_during_a_transformation_run_settles_the_run() {
         "the interrupted run must leave its record: {history}"
     );
     assert_eq!(runs[0]["status"], "PartialFailure", "{history}");
+
+    // The idempotency claim was released: the same key runs again instead of
+    // being skipped as in flight.
+    let rerun = fx
+        .rocky()
+        .args(["run", "--idempotency-key", "k-2440"])
+        .output()
+        .expect("rerun rocky");
+    let rerun_stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert!(
+        rerun.status.success(),
+        "rerun under the same key must run.\nstdout:\n{rerun_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let rerun_payload: serde_json::Value =
+        serde_json::from_str(rerun_stdout.trim()).expect("rerun stdout is JSON");
+    assert!(
+        rerun_payload
+            .get("skipped_by_run_id")
+            .is_none_or(serde_json::Value::is_null),
+        "the interrupted run's claim must not dedup the rerun: {rerun_payload}"
+    );
+    assert!(table_exists(&fx.dir, "after"));
 }
