@@ -14,6 +14,7 @@ auto_create_schemas = true
 [run]
 # Turn the skip gate on for every `rocky run` in this project.
 skip_unchanged = true
-# The two raw tables have no tracked timestamp column. Use the weaker
-# COUNT(*) signal so Rocky can prove the raw data did not change.
+# Only incremental and microbatch models probe MAX(<timestamp>) on a raw table.
+# These models are full_refresh, so they need the weaker COUNT(*) signal to
+# prove the raw data did not change. Without it, the staging models never skip.
 skip_rowcount_fallback = true

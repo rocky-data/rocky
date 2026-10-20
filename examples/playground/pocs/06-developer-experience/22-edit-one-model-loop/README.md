@@ -7,7 +7,7 @@
 
 ## What it shows
 
-The fast inner loop. You edit one model. Rocky rebuilds that model and the models downstream of it. It skips every model that is not affected. `run.sh` proves each step from the `model_decisions` array in the JSON output, and exits 1 when a claim does not hold.
+The fast inner loop. You edit one model. Rocky rebuilds that model and the models downstream of it. It skips every model that is not affected. `run.sh` checks steps 1 to 4 against the `model_decisions` array in the JSON output. It checks steps 5 and 6 against the `materializations` array. It exits 1 when a claim does not hold.
 
 ```
 raw__shop.orders ──► stg_orders ──┬──► daily_revenue
@@ -28,6 +28,7 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
 .
 ├── README.md
 ├── rocky.toml        DuckDB transformation pipeline, [run] skip_unchanged = true
+├── expected/         run output (gitignored JSON)
 ├── run.sh            seed, edit, rebuild, watch, defer; fails loudly
 ├── data/seed.sql     50 customers, 500 orders (byte-stable)
 └── models/           5 models: 2 staging, 3 downstream
@@ -60,6 +61,8 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
     after the save: built|skipped = daily_revenue|customer_orders,region_summary,stg_customers,stg_orders
 === 5. --defer: build one model, read its upstream from a base copy ===
     with --defer --defer-to prod: built = daily_revenue
+=== 6. --defer-to-state: find the upstream from a saved production state ===
+    with --defer --defer-to-state: built = daily_revenue
 ```
 
 ## What happened
@@ -68,8 +71,8 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
 2. The second run changes nothing. All 5 models skip.
 3. The edit changes the SQL of `stg_orders`. Its hash differs, so it builds. `daily_revenue` and `customer_orders` read it, so they build too. `stg_customers` and `region_summary` do not depend on it, so they skip.
 4. `rocky run --watch --models models` re-runs when you save a file. `--watch` cannot be combined with `--model`. The skip gate does the narrowing.
-5. `--model daily_revenue --defer --defer-to prod` builds one model. It reads `stg_orders` from the `prod` schema. The local `stg_orders` is absent, and stays absent.
-6. `--defer-to-state` does the same lookup from a saved state file.
+5. `--model daily_revenue` fails, because the local `stg_orders` is gone. `--model daily_revenue --defer --defer-to prod` builds one model. It reads `stg_orders` from the `prod` schema. The local `stg_orders` stays absent.
+6. The script builds a copy of the project into the `prod` schema and keeps its state file. The local `stg_orders` is still absent. `--model daily_revenue` fails. With `--defer --defer-to-state <file>` it builds only `daily_revenue`, and the state file says where to read `stg_orders`.
 
 ## Related
 
