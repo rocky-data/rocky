@@ -21606,7 +21606,7 @@ schema_template = "staging"
     /// one when no `path` is given.
     fn test_duckdb_adapter(path: Option<&std::path::Path>) -> rocky_core::config::AdapterConfig {
         let body = match path {
-            Some(path) => format!("type = \"duckdb\"\npath = \"{}\"\n", path.display()),
+            Some(path) => format!("type = \"duckdb\"\npath = '{}'\n", path.display()),
             None => "type = \"duckdb\"\n".to_string(),
         };
         toml::from_str(&body).unwrap()
@@ -24035,7 +24035,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n\
                  [pipeline.dq]\ntype = \"quality\"\n\n\
                  [pipeline.dq.target]\nadapter = \"default\"\n\n\
@@ -24104,7 +24104,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let state_path = dir.path().join("state.redb");
         let config_text = |db: &std::path::Path| {
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n\
                  [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
                  [pipeline.t.target]\nadapter = \"default\"\n",
@@ -24172,7 +24172,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -24235,7 +24235,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -24451,7 +24451,7 @@ auto_create_schemas = true
             std::fs::write(
                 &config_path,
                 format!(
-                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\
+                    "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\
                      [state]\nbackend = \"local\"\n\
                      [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
                      [pipeline.transform.target]\nadapter = \"default\"\n",
@@ -24664,7 +24664,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
@@ -27014,7 +27014,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -27168,7 +27168,7 @@ auto_create_schemas = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [state]
 backend = "local"
@@ -27504,7 +27504,7 @@ adapter = "default"
                 std::fs::write(
                     &config_path,
                     format!(
-                        "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                        "[adapter]\ntype = \"test-fail-write\"\npath = '{failure}'\n\n\
                          [state]\nbackend = \"local\"\n\n\
                          [resilience]\ncontain_failures = {contain_failures}\n\n\
                          [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
@@ -27694,7 +27694,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "test-fail-write"
-path = "{failure}"
+path = '{failure}'
 
 [state]
 backend = "local"
@@ -27841,7 +27841,7 @@ adapter = "default"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
                  [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
                  models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
                 dir.join("wh.duckdb").display(),
@@ -27916,7 +27916,7 @@ adapter = "default"
         std::fs::write(
             &config_path,
             format!(
-                "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                "[adapter]\ntype = \"test-fail-write\"\npath = '{failure}'\n\n\
                  [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
                  models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
                 models.join("**").display(),
@@ -27999,7 +27999,7 @@ type = "duckdb"
 
 [adapter.fail]
 type = "test-fail-write"
-path = "{failure}"
+path = '{failure}'
 
 [state]
 backend = "local"
@@ -28277,7 +28277,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.t]
 type = "transformation"
@@ -28371,7 +28371,7 @@ schema = "mart"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.r]
 type = "replication"
@@ -33009,7 +33009,7 @@ timestamp_column = "ts"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.repro]
 strategy = "incremental"
@@ -33582,7 +33582,7 @@ backend = "local"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
@@ -34021,7 +34021,7 @@ row_count = true
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.repro]
 strategy = "incremental"
@@ -50503,7 +50503,7 @@ timestamp_column = "ts"
                 r#"
 [adapter]
 type = "duckdb"
-path = "{db}"
+path = '{db}'
 
 [state]
 backend = "local"
