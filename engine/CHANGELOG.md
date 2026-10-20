@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `duckdb` and `libduckdb-sys` crates move from 1.10506.0 to 1.10506.1, which takes `zip` from 6.0.0 to 9.0.5. This clears `cargo audit` advisories RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369. `zip` was a build dependency only, used to unpack a downloaded DuckDB library, and Rocky's `bundled` build never ran that code. The bundled DuckDB source is unchanged.
 - A process adapter (an out-of-process adapter that talks JSON-RPC over stdin and stdout) can no longer block Rocky forever, fill its memory, or outlive it. `ProcessAdapter` now bounds every exchange and stops the adapter when a bound is hit.
   - A call that gets no answer within 1 hour fails with `ProcessAdapterError::Timeout`. The `initialize` exchange in `ProcessAdapter::spawn` has a 60-second limit, so one hung `rocky-*` binary no longer blocks `rocky adapter list`. The timeout also covers writing the request.
   - A response line longer than 64 MiB fails with `ProcessAdapterError::ResponseTooLarge`. Rocky reads one byte past the limit and no more.
