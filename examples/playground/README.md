@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**89 of 101 POCs run with no external credentials.** See each POC's README for prerequisites.
+**90 of 102 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -169,7 +169,7 @@ How a run starts, where its state lives, and what happens when it fails. Some PO
 | [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
 | [12-webhook-ingress](pocs/05-orchestration/12-webhook-ingress) | `rocky serve --scheduler` exposes `POST /api/v1/hooks/trigger/{pipeline}`; an `X-Rocky-Signature` HMAC-SHA256 body signature queues a durable at-most-once run demand, and an `X-Rocky-Delivery` id deduplicates a redelivery |
 
-### 06 — Developer Experience (21 POCs · DuckDB)
+### 06 — Developer Experience (22 POCs · DuckDB)
 
 The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt import, and the plain-SQL exit path.
 
@@ -196,6 +196,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [19-import-dbt-unit-tests](pocs/06-developer-experience/19-import-dbt-unit-tests) | `rocky import-dbt --manifest` walks `manifest.unit_tests` into Rocky `[[test]]` sidecars; `data_tests:` accepted as alias for `tests:` on column tests (dbt 1.7+) |
 | [20-defer-against-prod](pocs/06-developer-experience/20-defer-against-prod) | `rocky run --model <name> --defer --defer-to <schema>` — build only the changed model locally, resolve its unbuilt upstream `ref()`s against a production schema (default-off dev convenience) |
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
+| [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
 ### 07 — Adapters (7 POCs · mixed)
 
