@@ -24,7 +24,7 @@ use crate::diagnostic::{
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{
-    DecimalOp, RockyType, TypedColumn, arithmetic_result_type, common_supertype_of,
+    DecimalOp, InferredType, RockyType, TypedColumn, arithmetic_result_type, common_supertype_of,
 };
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
@@ -3102,27 +3102,29 @@ fn infer_binary_op_type(
         // that is not a number gives `Unknown`: date arithmetic is
         // dialect-dependent (`DATE - DATE` is a BIGINT in DuckDB and an
         // INTERVAL in Databricks), and an `Unknown` operand may be a date.
-        ast::BinaryOperator::Plus => (
-            arithmetic_result_type(DecimalOp::Add, &left_type, &right_type),
-            nullable,
-        ),
-        ast::BinaryOperator::Minus => (
-            arithmetic_result_type(DecimalOp::Subtract, &left_type, &right_type),
-            nullable,
-        ),
-        ast::BinaryOperator::Multiply => (
-            arithmetic_result_type(DecimalOp::Multiply, &left_type, &right_type),
-            nullable,
-        ),
+        // A result over 38 digits is also nullable (ADR-TYPES §1): Databricks
+        // with ANSI mode off writes NULL for a decimal overflow.
+        ast::BinaryOperator::Plus => {
+            let result = arithmetic_result_type(DecimalOp::Add, &left_type, &right_type);
+            (result.ty, nullable || result.over_cap)
+        }
+        ast::BinaryOperator::Minus => {
+            let result = arithmetic_result_type(DecimalOp::Subtract, &left_type, &right_type);
+            (result.ty, nullable || result.over_cap)
+        }
+        ast::BinaryOperator::Multiply => {
+            let result = arithmetic_result_type(DecimalOp::Multiply, &left_type, &right_type);
+            (result.ty, nullable || result.over_cap)
+        }
         // Division and modulo by zero return NULL in several dialects (DuckDB,
         // Spark with ANSI mode off), so the result is nullable even over
         // non-null operands (#2295).
         ast::BinaryOperator::Divide => (
-            arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type),
+            arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type).ty,
             true,
         ),
         ast::BinaryOperator::Modulo => (
-            arithmetic_result_type(DecimalOp::Modulo, &left_type, &right_type),
+            arithmetic_result_type(DecimalOp::Modulo, &left_type, &right_type).ty,
             true,
         ),
         ast::BinaryOperator::DuckIntegerDivide | ast::BinaryOperator::MyIntegerDivide => {
@@ -3285,8 +3287,8 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             (arg_type, true)
         }
         "COALESCE" => {
-            let (result_type, nullable) = infer_branch_set_type(function_branches(func), scope);
-            (result_type, nullable.all)
+            let (result, nullable) = infer_branch_set_type(function_branches(func), scope);
+            (result.ty, nullable.all || result.over_cap)
         }
 
         // Ranking window functions → always Int64
@@ -3359,8 +3361,8 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             (arg_type, true) // always nullable
         }
         "GREATEST" | "LEAST" => {
-            let (result_type, _) = infer_branch_set_type(function_branches(func), scope);
-            (result_type, true)
+            let (result, _) = infer_branch_set_type(function_branches(func), scope);
+            (result.ty, true)
         }
 
         "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
@@ -3399,11 +3401,12 @@ struct BranchNullability {
 ///
 /// A `NULL` literal adds only nullability, not a type (ADR-TYPES §2), so it
 /// is left out of the unification. A branch Rocky does not read is
-/// `Unknown`, which absorbs the set.
+/// `Unknown`, which absorbs the set. A set over 38 digits has
+/// [`InferredType::over_cap`] set, and the caller makes it nullable.
 fn infer_branch_set_type<'a>(
     branches: impl IntoIterator<Item = Option<&'a Expr>>,
     scope: &TypeScope,
-) -> (RockyType, BranchNullability) {
+) -> (InferredType, BranchNullability) {
     let mut types = Vec::new();
     let mut nullability = BranchNullability {
         any: false,
@@ -3441,9 +3444,12 @@ fn infer_case_type(
         .iter()
         .map(|case_when| Some(&case_when.result))
         .chain(else_result.as_deref().map(Some));
-    let (result_type, nullable) = infer_branch_set_type(branches, scope);
-    // No ELSE → nullable
-    (result_type, nullable.any || else_result.is_none())
+    let (result, nullable) = infer_branch_set_type(branches, scope);
+    // No ELSE, or a set over 38 digits → nullable
+    (
+        result.ty,
+        nullable.any || else_result.is_none() || result.over_cap,
+    )
 }
 
 /// Whether `sql` contains a `UNION`, `INTERSECT` or `EXCEPT` keyword as a
@@ -4253,11 +4259,16 @@ fn combine_set_operation(
         let both_exact =
             left.exact_type_outputs.contains(&index) && right.exact_type_outputs.contains(&index);
         let same_type = l.data_type == r.data_type;
-        let data_type = if l.data_type == RockyType::Unknown || r.data_type == RockyType::Unknown {
-            RockyType::Unknown
-        } else {
-            crate::types::common_supertype(&l.data_type, &r.data_type).unwrap_or(RockyType::Unknown)
-        };
+        // A pair over 38 digits is `Unknown` and nullable (ADR-TYPES §1):
+        // the warehouse casts both branches to one type, and a value that
+        // does not fit can overflow to NULL with ANSI mode off.
+        let (data_type, over_cap) =
+            if l.data_type == RockyType::Unknown || r.data_type == RockyType::Unknown {
+                (RockyType::Unknown, false)
+            } else {
+                crate::types::common_supertype(&l.data_type, &r.data_type)
+                    .map_or((RockyType::Unknown, false), |sup| (sup.ty, sup.over_cap))
+            };
         if both_exact && same_type && data_type != RockyType::Unknown {
             exact_type_outputs.insert(index);
         }
@@ -4271,7 +4282,7 @@ fn combine_set_operation(
             count_outputs.insert(index);
         }
         l.data_type = data_type;
-        l.nullable |= r.nullable;
+        l.nullable |= r.nullable || over_cap;
     }
     Ok(SelectInference {
         columns: left.columns,
@@ -10153,6 +10164,90 @@ mod tests {
             (&RockyType::Float64, false)
         );
         assert!(column(&result, "m", "int_cast").nullable);
+    }
+
+    /// ADR-TYPES §1: a result over 38 digits is `(Unknown, true)`, because
+    /// Databricks with ANSI mode off writes NULL for a decimal overflow. The
+    /// nullable bit reaches a typed column through a non-null-preserving
+    /// function: `CONCAT` is non-null only when every argument is, and a
+    /// cast to `STRING` cannot fail. Before, `w * w` was non-null here, so
+    /// the column was a non-null `STRING` that Databricks can write NULL to.
+    #[test]
+    fn decimal_overflow_past_the_cap_makes_a_typed_column_nullable() {
+        let d = |precision, scale| RockyType::Decimal { precision, scale };
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[("w", d(30, 0), false), ("z", d(30, 30), false)]),
+        )]);
+        let result = compile_typed(
+            &[
+                (
+                    "m",
+                    "SELECT CAST(CONCAT(w * w, 'x') AS STRING) AS product, \
+                     CAST(CONCAT(w + z, 'x') AS STRING) AS mixed_sum, \
+                     CAST(CONCAT(COALESCE(w, z), 'x') AS STRING) AS branches, \
+                     CAST(CONCAT(w + w, 'x') AS STRING) AS within_cap \
+                     FROM raw.t",
+                ),
+                (
+                    "u",
+                    "SELECT w AS c FROM raw.t UNION ALL SELECT z AS c FROM raw.t",
+                ),
+            ],
+            sources,
+        );
+        for name in ["product", "mixed_sum", "branches"] {
+            let col = column(&result, "m", name);
+            assert_eq!(
+                (&col.data_type, col.nullable),
+                (&RockyType::String, true),
+                "{name}"
+            );
+        }
+        // Control: `w + w` is `DECIMAL(31,0)`, within the cap, so the column
+        // stays non-null.
+        let within_cap = column(&result, "m", "within_cap");
+        assert_eq!(
+            (&within_cap.data_type, within_cap.nullable),
+            (&RockyType::String, false)
+        );
+        // A set operation casts both branches to one type, so it overflows
+        // the same way.
+        let union = column(&result, "u", "c");
+        assert_eq!(
+            (&union.data_type, union.nullable),
+            (&RockyType::Unknown, true)
+        );
+    }
+
+    /// `REAL op REAL` is now `DOUBLE` (ADR-TYPES §3: a float operand gives
+    /// `Float64`), so a cast of it back to `REAL` can fail and the column is
+    /// nullable. It was non-null when the product was `REAL`. `REAL` is
+    /// `Float32` only on a known dialect, so this compiles for DuckDB.
+    #[test]
+    fn real_arithmetic_is_double_so_a_cast_back_to_real_is_nullable() {
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[("r", RockyType::Float32, false)]),
+        )]);
+        let result = compile_typed_on(
+            &[(
+                "m",
+                "SELECT CAST(r * r AS REAL) AS narrowed, CAST(r * r AS DOUBLE) AS kept FROM raw.t",
+            )],
+            sources,
+            duckdb(),
+        );
+        let narrowed = column(&result, "m", "narrowed");
+        assert_eq!(
+            (&narrowed.data_type, narrowed.nullable),
+            (&RockyType::Float32, true)
+        );
+        let kept = column(&result, "m", "kept");
+        assert_eq!(
+            (&kept.data_type, kept.nullable),
+            (&RockyType::Float64, false)
+        );
     }
 
     #[test]

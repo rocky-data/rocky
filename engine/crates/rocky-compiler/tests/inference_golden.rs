@@ -69,10 +69,12 @@ fn inferred_types_match_the_golden_corpus() {
         ("i + d", dec(13, 2), false),
         ("b + d", dec(22, 2), false),
         ("i * g", dec(15, 2), false),
-        // Above 38 digits: no type, never a clamped scale.
+        // Above 38 digits: no type, never a clamped scale, and nullable
+        // (ADR-TYPES §1): an overflow is NULL on Databricks with ANSI off.
         ("w + w", dec(31, 0), false),
-        ("w * w", RockyType::Unknown, false),
-        ("w + z", RockyType::Unknown, false),
+        ("w * w", RockyType::Unknown, true),
+        ("w + z", RockyType::Unknown, true),
+        ("w - z", RockyType::Unknown, true),
         // Integer pairs.
         ("i + j", RockyType::Int64, true),
         ("i * i", RockyType::Int64, false),
@@ -81,6 +83,7 @@ fn inferred_types_match_the_golden_corpus() {
         // A float on either side.
         ("x * d", RockyType::Float64, false),
         ("r + i", RockyType::Float64, false),
+        ("r * r", RockyType::Float64, false),
         ("x / i", RockyType::Float64, true),
         // A decimal of unknown precision stays unsized.
         ("u + d", unsized_none.clone(), true),
@@ -110,6 +113,13 @@ fn inferred_types_match_the_golden_corpus() {
         ("CASE WHEN i > 0 THEN d END", dec(10, 2), true),
         ("GREATEST(e, f)", dec(20, 10), true),
         ("LEAST(i, d)", dec(12, 2), true),
+        // A branch set above 38 digits: no type, and nullable, as above.
+        ("COALESCE(w, z)", RockyType::Unknown, true),
+        (
+            "CASE WHEN i > 0 THEN w ELSE z END",
+            RockyType::Unknown,
+            true,
+        ),
     ];
     let mut failures = Vec::new();
     for (expr, ty, nullable) in corpus {
@@ -122,10 +132,14 @@ fn inferred_types_match_the_golden_corpus() {
 }
 
 /// ADR-TYPES §3: branches are unified as a set, so the order of the
-/// arguments cannot change the result. `w`, `z` and `g` are the case a fold
-/// from `Unknown` gets wrong: `DECIMAL(30,0)` with `DECIMAL(30,30)` needs 60
-/// digits, so the fold reaches `Unknown` and `g` then replaces it with
-/// `DECIMAL(5,2)` in one order and not in another.
+/// arguments cannot change the result. `w`, `z` and `g` need 60 digits
+/// (`DECIMAL(30,0)` with `DECIMAL(30,30)`), so the set is `Unknown` in every
+/// order. Main's pairwise fold takes `max(precision)` and `max(scale)`, so
+/// it gives `DECIMAL(30,30)` in every order: independent of the order, but
+/// wrong, because `DECIMAL(30,30)` has no integer digits and cannot hold
+/// `w`. A fold that applies the cap and starts from `Unknown` would depend
+/// on the order: it reaches `Unknown` after `w, z`, and `g` then replaces
+/// it with `DECIMAL(5,2)`.
 #[test]
 fn branch_sets_do_not_depend_on_argument_order() {
     let sets: [([&str; 3], RockyType); 3] = [

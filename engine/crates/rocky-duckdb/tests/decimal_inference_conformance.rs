@@ -7,9 +7,11 @@
 //!
 //! # What this asserts, and what it deliberately does not
 //!
-//! The primary assertion is against the **exact mathematical bound**, which the
-//! test recomputes from first principles rather than reading back from the
-//! implementation:
+//! The primary assertion is against the **exact mathematical bound**. The
+//! test writes that bound out again (`exact_bound`) with the same formulas
+//! the implementation uses, so it is a restatement, not independent proof.
+//! The independent proof is `arithmetic_result_type_bounds_the_exact_result`
+//! in `rocky-ir`, which checks exact results of boundary values:
 //!
 //! ```text
 //! rocky is Unknown  OR  (int_digits(rocky) >= exact_int_digits
@@ -112,8 +114,13 @@ fn duckdb_result_type(conn: &DuckDbConnector, a: &str, op: &str, b: &str) -> Str
         .to_string()
 }
 
-/// The exact bound on `a op b`, derived independently of the implementation so
-/// this test is evidence rather than a restatement.
+/// The exact bound on `a op b`.
+///
+/// This restates the formulas in `arithmetic_result_type`, so on its own it
+/// is not independent evidence that they hold. That evidence is
+/// `arithmetic_result_type_bounds_the_exact_result` in `rocky-ir`, which
+/// computes the exact result of boundary values with integers. What this
+/// suite adds is the comparison with a real DuckDB.
 ///
 /// Returns `None` for division, whose exact quotient is generally
 /// non-terminating and has no `(integer_digits, scale)` bound.
@@ -174,7 +181,7 @@ fn rocky_decimal_inference_bounds_the_exact_result() {
                 continue;
             }
             for op in ops {
-                let rocky = arithmetic_result_type(op, a, b);
+                let rocky = arithmetic_result_type(op, a, b).ty;
                 if rocky == RockyType::Unknown {
                     degraded += 1;
                     continue; // conservative degradation is always allowed
@@ -210,11 +217,18 @@ fn rocky_decimal_inference_bounds_the_exact_result() {
                     // `DECIMAL(10,2) % DECIMAL(38,0)`, where its own formula has
                     // no wider decimal left to widen into.
                     //
-                    // This is NOT a Rocky defect. Assertion (1) above already
-                    // proved Rocky's decimal holds the exact result, so Rocky is
-                    // both sound and strictly more precise than DuckDB here.
-                    // Counted rather than asserted on, because which pairs land
-                    // in this class is a DuckDB implementation detail.
+                    // A known divergence, not a settled non-issue. Assertion
+                    // (1) above proved Rocky's decimal holds the exact result,
+                    // but the warehouse writes a DOUBLE where Rocky infers a
+                    // decimal, so Rocky's type family is wrong for this
+                    // engine. It is confined today: arithmetic never reaches a
+                    // model's typed columns (it is never exact), and `%` is
+                    // always nullable. It becomes live under ADR-TYPES Open
+                    // question C, option 2, which routes every output column
+                    // through expression inference; this pair then needs a
+                    // dialect-aware rule or `Unknown`. Counted rather than
+                    // asserted on, because which pairs land in this class is a
+                    // DuckDB implementation detail.
                     family_diverged += 1;
                     compared += 1;
                     continue;
@@ -314,7 +328,8 @@ fn duckdb_reference_results_match_the_design_table() {
                 precision: 10,
                 scale: 2
             },
-        ),
+        )
+        .ty,
         RockyType::Unknown
     );
 }
@@ -334,7 +349,7 @@ fn rocky_modulo_is_tighter_than_duckdb_and_sound() {
 
     let duck = duckdb_result_type(&conn, &operand_sql(10, 2), "%", &operand_sql(10, 0));
     let (duck_int, _) = duckdb_parts(&duck).expect("decimal");
-    let rocky = arithmetic_result_type(DecimalOp::Modulo, &dec(10, 2), &dec(10, 0));
+    let rocky = arithmetic_result_type(DecimalOp::Modulo, &dec(10, 2), &dec(10, 0)).ty;
     let (rocky_int, rocky_scale) = decimal_parts_of(&rocky).expect("decimal");
 
     assert_eq!(rocky, dec(10, 2));
@@ -366,7 +381,7 @@ fn duckdb_under_provisions_where_rocky_is_deliberately_wider() {
     // Multiply: the exact product of two DECIMAL(10,2) needs 16 integer digits.
     let duck = duckdb_result_type(&conn, &operand_sql(10, 2), "*", &operand_sql(10, 2));
     let (duck_int, _) = duckdb_parts(&duck).expect("decimal");
-    let rocky = arithmetic_result_type(DecimalOp::Multiply, &dec(10, 2), &dec(10, 2));
+    let rocky = arithmetic_result_type(DecimalOp::Multiply, &dec(10, 2), &dec(10, 2)).ty;
     let (rocky_int, _) = decimal_parts_of(&rocky).expect("decimal");
     assert_eq!(rocky, dec(20, 4));
     assert!(
@@ -384,7 +399,7 @@ fn duckdb_under_provisions_where_rocky_is_deliberately_wider() {
         "premise: DuckDB under-provisions integer digits here (got {duck})"
     );
     assert_eq!(
-        arithmetic_result_type(DecimalOp::Add, &dec(10, 0), &dec(10, 10)),
+        arithmetic_result_type(DecimalOp::Add, &dec(10, 0), &dec(10, 10)).ty,
         dec(21, 10),
         "Rocky preserves all 10 integer digits plus the carry"
     );

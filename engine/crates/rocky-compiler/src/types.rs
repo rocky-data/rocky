@@ -10,6 +10,6 @@
 //! live in `rocky-core` for that to work.
 
 pub use rocky_ir::types::{
-    DecimalOp, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn, arithmetic_result_type,
-    common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
+    DecimalOp, InferredType, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn,
+    arithmetic_result_type, common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
 };

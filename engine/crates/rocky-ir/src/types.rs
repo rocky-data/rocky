@@ -208,9 +208,53 @@ impl RockyType {
 /// Widest precision Rocky claims for an **inferred** decimal.
 ///
 /// ADR-TYPES §3, "Caps" (line 163): a rule that needs more digits gives
-/// [`RockyType::Unknown`]. Rocky never clamps the scale to fit, because a
-/// clamped type cannot hold the inputs.
+/// [`RockyType::Unknown`], and the result is nullable ([`InferredType`]).
+/// Rocky never clamps the scale to fit, because a clamped type cannot hold
+/// the inputs.
 pub const MAX_INFERRED_PRECISION: u32 = 38;
+
+/// An inferred type, and whether the rule that built it went over
+/// [`MAX_INFERRED_PRECISION`].
+///
+/// ADR-TYPES §1: when Rocky cannot prove a bound, the answer is
+/// `(Unknown, true)`. A result over the cap has no proven bound, and a
+/// warehouse that caps decimals at 38 digits may not hold it: Databricks
+/// with `ANSI_MODE = off` writes NULL for a decimal overflow (Open question
+/// B, not ratified). So an over-cap result is `Unknown` *and* nullable, even
+/// over non-null operands.
+///
+/// The bit is set where the cap is applied and travels with the type, so a
+/// caller cannot take the `Unknown` without it. Every other `Unknown` here
+/// (a non-numeric operand, `/`) has `over_cap: false`: its nullability is
+/// the caller's rule, not this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct InferredType {
+    /// The inferred type: a sound bound, or [`RockyType::Unknown`].
+    pub ty: RockyType,
+    /// `true` when the rule needed more than [`MAX_INFERRED_PRECISION`]
+    /// digits. `ty` is then [`RockyType::Unknown`], and the caller must make
+    /// the result nullable whatever its operands are.
+    pub over_cap: bool,
+}
+
+impl InferredType {
+    /// A type built within the cap.
+    fn typed(ty: RockyType) -> Self {
+        Self {
+            ty,
+            over_cap: false,
+        }
+    }
+
+    /// A result that needs more than [`MAX_INFERRED_PRECISION`] digits.
+    fn over_cap() -> Self {
+        Self {
+            ty: RockyType::Unknown,
+            over_cap: true,
+        }
+    }
+}
 
 /// An arithmetic operator whose result type [`arithmetic_result_type`]
 /// derives.
@@ -225,24 +269,28 @@ pub enum DecimalOp {
     Modulo,
 }
 
-/// Build an inferred [`RockyType::Decimal`] from `(integer_digits, scale)`,
-/// or [`RockyType::Unknown`] when the precision is zero or above
-/// [`MAX_INFERRED_PRECISION`].
+/// Build an inferred [`RockyType::Decimal`] from `(integer_digits, scale)`.
 ///
-/// The one construction site for an inferred decimal (ADR-TYPES §3,
-/// line 159). The `u8` narrowing happens only after the range check, so no
-/// value can wrap.
-fn decimal_from_parts(integer_digits: u32, scale: u32) -> RockyType {
+/// The one construction site for an inferred decimal, and the one place the
+/// cap is applied (ADR-TYPES §3, line 159). Above
+/// [`MAX_INFERRED_PRECISION`] the result is `Unknown` with
+/// [`InferredType::over_cap`] set, so it is nullable. A precision of zero is
+/// `Unknown` with no overflow. The `u8` narrowing happens only after the
+/// range check, so no value can wrap.
+fn decimal_from_parts(integer_digits: u32, scale: u32) -> InferredType {
     let Some(precision) = integer_digits.checked_add(scale) else {
-        return RockyType::Unknown;
+        return InferredType::over_cap();
     };
-    if precision == 0 || precision > MAX_INFERRED_PRECISION {
-        return RockyType::Unknown;
+    if precision > MAX_INFERRED_PRECISION {
+        return InferredType::over_cap();
+    }
+    if precision == 0 {
+        return InferredType::typed(RockyType::Unknown);
     }
     let (Ok(precision), Ok(scale)) = (u8::try_from(precision), u8::try_from(scale)) else {
-        return RockyType::Unknown;
+        return InferredType::over_cap();
     };
-    RockyType::Decimal { precision, scale }
+    InferredType::typed(RockyType::Decimal { precision, scale })
 }
 
 /// The `(integer_digits, scale)` pair of an exact numeric whose digits are
@@ -295,43 +343,44 @@ pub fn decimal_parts_of(ty: &RockyType) -> Option<(u32, u32)> {
 /// | a float and a number | `Float64` | `Float64` | `Float64` | `Float64` |
 /// | a non-numeric or `Unknown` | `Unknown` | `Unknown` | `Unknown` | `Unknown` |
 ///
-/// A sized result above [`MAX_INFERRED_PRECISION`] is `Unknown`. An
+/// A sized result above [`MAX_INFERRED_PRECISION`] is `Unknown` with
+/// [`InferredType::over_cap`] set, so the caller makes it nullable. An
 /// unsized operand keeps the result unsized with no scale: a warehouse that
 /// caps the precision may cut the scale (ADR-TYPES §2, line 151). `Int64`
 /// for an `Int64` operand is the published interim under-bound of Open
 /// question A (line 180).
-pub fn arithmetic_result_type(op: DecimalOp, a: &RockyType, b: &RockyType) -> RockyType {
+pub fn arithmetic_result_type(op: DecimalOp, a: &RockyType, b: &RockyType) -> InferredType {
     if !a.is_numeric() || !b.is_numeric() {
-        return RockyType::Unknown;
+        return InferredType::typed(RockyType::Unknown);
     }
     if a.is_float() || b.is_float() {
-        return RockyType::Float64;
+        return InferredType::typed(RockyType::Float64);
     }
     if a.is_integer() && b.is_integer() {
-        return match op {
+        return InferredType::typed(match op {
             DecimalOp::Add | DecimalOp::Subtract | DecimalOp::Multiply | DecimalOp::Modulo => {
                 RockyType::Int64
             }
             DecimalOp::Divide => RockyType::Unknown,
-        };
+        });
     }
     // At least one operand is a decimal, sized or not.
     if op == DecimalOp::Divide {
-        return RockyType::Unknown;
+        return InferredType::typed(RockyType::Unknown);
     }
     if matches!(a, RockyType::DecimalUnsized { .. })
         || matches!(b, RockyType::DecimalUnsized { .. })
     {
-        return RockyType::DecimalUnsized { scale: None };
+        return InferredType::typed(RockyType::DecimalUnsized { scale: None });
     }
     let (Some((i1, s1)), Some((i2, s2))) = (decimal_parts_of(a), decimal_parts_of(b)) else {
-        return RockyType::Unknown;
+        return InferredType::typed(RockyType::Unknown);
     };
     match op {
         DecimalOp::Add | DecimalOp::Subtract => decimal_from_parts(i1.max(i2) + 1, s1.max(s2)),
         DecimalOp::Multiply => decimal_from_parts(i1 + i2, s1 + s2),
         DecimalOp::Modulo => decimal_from_parts(i1.min(i2), s1.max(s2)),
-        DecimalOp::Divide => RockyType::Unknown,
+        DecimalOp::Divide => InferredType::typed(RockyType::Unknown),
     }
 }
 
@@ -342,9 +391,12 @@ pub fn arithmetic_result_type(op: DecimalOp, a: &RockyType, b: &RockyType) -> Ro
 /// claims no precision, so no cap applies. It keeps a scale only when every
 /// decimal member has that same known scale; integers have no fraction
 /// digits to disagree with. Otherwise the result is `max(integer_digits)`
-/// and `max(scale)`, with no carry digit, or `Unknown` above
-/// [`MAX_INFERRED_PRECISION`] or for a malformed decimal.
-fn unify_exact_numerics(members: &[&RockyType]) -> RockyType {
+/// and `max(scale)`, with no carry digit; `Unknown` for a malformed
+/// decimal; or `Unknown` with [`InferredType::over_cap`] set above
+/// [`MAX_INFERRED_PRECISION`]. A warehouse casts every branch to the common
+/// type, and a branch that does not fit can overflow to NULL just as
+/// arithmetic can.
+fn unify_exact_numerics(members: &[&RockyType]) -> InferredType {
     if members
         .iter()
         .any(|member| matches!(member, RockyType::DecimalUnsized { .. }))
@@ -355,12 +407,12 @@ fn unify_exact_numerics(members: &[&RockyType]) -> RockyType {
             .map(|member| member.decimal_scale());
         let first = decimal_scales.next().flatten();
         let scale = first.filter(|s| decimal_scales.all(|other| other == Some(*s)));
-        return RockyType::DecimalUnsized { scale };
+        return InferredType::typed(RockyType::DecimalUnsized { scale });
     }
     let (mut max_integer_digits, mut max_scale) = (0u32, 0u32);
     for member in members {
         let Some((integer_digits, scale)) = decimal_parts_of(member) else {
-            return RockyType::Unknown;
+            return InferredType::typed(RockyType::Unknown);
         };
         max_integer_digits = max_integer_digits.max(integer_digits);
         max_scale = max_scale.max(scale);
@@ -376,45 +428,46 @@ fn unify_exact_numerics(members: &[&RockyType]) -> RockyType {
 /// the pair (ADR-TYPES §2, line 146). Exact numerics unify in
 /// `(integer_digits, scale)` space, so no integer digit is dropped (§3,
 /// line 184): `Decimal(10,0)` with `Decimal(10,10)` is `Decimal(20,10)`.
-/// For a whole branch set, use [`common_supertype_of`].
-pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
+/// A pair that needs more than [`MAX_INFERRED_PRECISION`] digits is
+/// `Unknown` with [`InferredType::over_cap`] set. For a whole branch set,
+/// use [`common_supertype_of`].
+pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<InferredType> {
     if a == b {
-        return Some(a.clone());
+        return Some(InferredType::typed(a.clone()));
     }
 
     if *a == RockyType::Unknown || *b == RockyType::Unknown {
-        return Some(RockyType::Unknown);
+        return Some(InferredType::typed(RockyType::Unknown));
     }
 
     // Numeric promotion
-    match (a, b) {
+    let supertype = match (a, b) {
         // Int32 widens to Int64
         (RockyType::Int32, RockyType::Int64) | (RockyType::Int64, RockyType::Int32) => {
-            Some(RockyType::Int64)
+            RockyType::Int64
         }
         // Float32 widens to Float64
         (RockyType::Float32, RockyType::Float64) | (RockyType::Float64, RockyType::Float32) => {
-            Some(RockyType::Float64)
+            RockyType::Float64
         }
         // Int → Float
-        (i, RockyType::Float64) | (RockyType::Float64, i) if i.is_integer() => {
-            Some(RockyType::Float64)
-        }
+        (i, RockyType::Float64) | (RockyType::Float64, i) if i.is_integer() => RockyType::Float64,
         (i, RockyType::Float32) | (RockyType::Float32, i) if i.is_integer() => {
-            Some(RockyType::Float64) // promote to Float64 for safety
+            RockyType::Float64 // promote to Float64 for safety
         }
         // An integer or a decimal with a decimal, sized or not (#2356,
         // #2398). A float with a decimal stays incompatible: `is_assignable`
         // falls through to this function, and a decimal does not fit a float.
         (a, b) if (a.is_integer() || a.is_decimal()) && (b.is_integer() || b.is_decimal()) => {
-            Some(unify_exact_numerics(&[a, b]))
+            return Some(unify_exact_numerics(&[a, b]));
         }
         // Timestamp variants
         (RockyType::Timestamp, RockyType::TimestampNtz)
-        | (RockyType::TimestampNtz, RockyType::Timestamp) => Some(RockyType::Timestamp),
+        | (RockyType::TimestampNtz, RockyType::Timestamp) => RockyType::Timestamp,
 
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(InferredType::typed(supertype))
 }
 
 /// Unify a whole branch set: `COALESCE`, `CASE`, `GREATEST`, `LEAST`.
@@ -428,6 +481,8 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
 ///   `NULL` literal first: it adds only nullability, not a type.
 /// - A set of one repeated type is that type.
 /// - Exact numerics with a decimal: as [`common_supertype`], over the set.
+///   Above [`MAX_INFERRED_PRECISION`]: `Unknown` with
+///   [`InferredType::over_cap`] set.
 /// - `Int32` with `Int64`: `Int64`. Integers with floats, or two float
 ///   widths: `Float64`.
 /// - `Timestamp` with `TimestampNtz`: `Timestamp`, as [`common_supertype`].
@@ -435,24 +490,24 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
 ///   incompatible: `Unknown`.
 ///
 /// An empty set is `Unknown`.
-pub fn common_supertype_of(branches: &[RockyType]) -> RockyType {
+pub fn common_supertype_of(branches: &[RockyType]) -> InferredType {
     let Some(first) = branches.first() else {
-        return RockyType::Unknown;
+        return InferredType::typed(RockyType::Unknown);
     };
     if branches.contains(&RockyType::Unknown) {
-        return RockyType::Unknown;
+        return InferredType::typed(RockyType::Unknown);
     }
     if branches.iter().all(|t| t == first) {
-        return first.clone();
+        return InferredType::typed(first.clone());
     }
     if branches.iter().all(RockyType::is_numeric) {
         let any_float = branches.iter().any(RockyType::is_float);
         let any_decimal = branches.iter().any(RockyType::is_decimal);
         return match (any_float, any_decimal) {
-            (true, true) => RockyType::Unknown,
-            (true, false) => RockyType::Float64,
+            (true, true) => InferredType::typed(RockyType::Unknown),
+            (true, false) => InferredType::typed(RockyType::Float64),
             // Not all equal and no float: `Int32` with `Int64`.
-            (false, false) => RockyType::Int64,
+            (false, false) => InferredType::typed(RockyType::Int64),
             (false, true) => unify_exact_numerics(&branches.iter().collect::<Vec<_>>()),
         };
     }
@@ -460,9 +515,9 @@ pub fn common_supertype_of(branches: &[RockyType]) -> RockyType {
         .iter()
         .all(|t| matches!(t, RockyType::Timestamp | RockyType::TimestampNtz))
     {
-        return RockyType::Timestamp;
+        return InferredType::typed(RockyType::Timestamp);
     }
-    RockyType::Unknown
+    InferredType::typed(RockyType::Unknown)
 }
 
 /// Check if a value of type `from` can be assigned to a column of type `to`.
@@ -513,7 +568,7 @@ pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
             (from.is_integer() || from.is_decimal()) && fraction_fits
         }
         (RockyType::DecimalUnsized { .. }, _) => false,
-        _ => common_supertype(from, to).is_some_and(|sup| sup == *to),
+        _ => common_supertype(from, to).is_some_and(|sup| sup.ty == *to),
     }
 }
 
@@ -521,10 +576,26 @@ pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
 mod tests {
     use super::*;
 
+    /// The type half of [`common_supertype`]. The over-cap bit has its own
+    /// test, `over_cap_is_set_where_the_cap_is_applied`.
+    fn sup(a: &RockyType, b: &RockyType) -> Option<RockyType> {
+        common_supertype(a, b).map(|inferred| inferred.ty)
+    }
+
+    /// The type half of [`common_supertype_of`].
+    fn sup_of(branches: &[RockyType]) -> RockyType {
+        common_supertype_of(branches).ty
+    }
+
+    /// The type half of [`arithmetic_result_type`].
+    fn arith(op: DecimalOp, a: &RockyType, b: &RockyType) -> RockyType {
+        arithmetic_result_type(op, a, b).ty
+    }
+
     #[test]
     fn test_same_types() {
         assert_eq!(
-            common_supertype(&RockyType::Int64, &RockyType::Int64),
+            sup(&RockyType::Int64, &RockyType::Int64),
             Some(RockyType::Int64)
         );
     }
@@ -532,7 +603,7 @@ mod tests {
     #[test]
     fn test_int_widening() {
         assert_eq!(
-            common_supertype(&RockyType::Int32, &RockyType::Int64),
+            sup(&RockyType::Int32, &RockyType::Int64),
             Some(RockyType::Int64)
         );
     }
@@ -540,7 +611,7 @@ mod tests {
     #[test]
     fn test_float_widening() {
         assert_eq!(
-            common_supertype(&RockyType::Float32, &RockyType::Float64),
+            sup(&RockyType::Float32, &RockyType::Float64),
             Some(RockyType::Float64)
         );
     }
@@ -548,14 +619,14 @@ mod tests {
     #[test]
     fn test_int_to_float() {
         assert_eq!(
-            common_supertype(&RockyType::Int64, &RockyType::Float64),
+            sup(&RockyType::Int64, &RockyType::Float64),
             Some(RockyType::Float64)
         );
     }
 
     #[test]
     fn test_int_to_decimal() {
-        let result = common_supertype(
+        let result = sup(
             &RockyType::Int64,
             &RockyType::Decimal {
                 precision: 10,
@@ -574,14 +645,8 @@ mod tests {
 
     #[test]
     fn test_incompatible_types() {
-        assert_eq!(
-            common_supertype(&RockyType::String, &RockyType::Int64),
-            None
-        );
-        assert_eq!(
-            common_supertype(&RockyType::Boolean, &RockyType::Date),
-            None
-        );
+        assert_eq!(sup(&RockyType::String, &RockyType::Int64), None);
+        assert_eq!(sup(&RockyType::Boolean, &RockyType::Date), None);
     }
 
     /// ADR-TYPES §2: an `Unknown` side absorbs. It is compatible (`Some`),
@@ -589,11 +654,11 @@ mod tests {
     #[test]
     fn test_unknown_absorbs_in_unification() {
         assert_eq!(
-            common_supertype(&RockyType::Unknown, &RockyType::Int64),
+            sup(&RockyType::Unknown, &RockyType::Int64),
             Some(RockyType::Unknown)
         );
         assert_eq!(
-            common_supertype(&RockyType::String, &RockyType::Unknown),
+            sup(&RockyType::String, &RockyType::Unknown),
             Some(RockyType::Unknown)
         );
     }
@@ -618,6 +683,34 @@ mod tests {
         assert!(is_assignable(&RockyType::Int32, &decimal(12, 2)));
         assert!(!is_assignable(&RockyType::Int64, &decimal(19, 10)));
         assert!(is_assignable(&RockyType::Int64, &decimal(29, 10)));
+    }
+
+    /// A sized decimal is never assignable to an integer: the fallthrough
+    /// unifies them in `(integer_digits, scale)` space, and the union keeps
+    /// the decimal's digits, so it is never the integer itself. This holds
+    /// even for a scale-0 decimal that fits the integer's digits.
+    #[test]
+    fn test_is_assignable_decimal_to_integer_is_false() {
+        let decimal = |precision, scale| RockyType::Decimal { precision, scale };
+        for from in [
+            decimal(10, 2),
+            decimal(10, 0),
+            decimal(5, 0),
+            decimal(38, 0),
+        ] {
+            for to in [RockyType::Int32, RockyType::Int64] {
+                assert!(!is_assignable(&from, &to), "{from} -> {to}");
+            }
+        }
+        assert_eq!(
+            sup(&decimal(10, 2), &RockyType::Int64),
+            Some(decimal(21, 2))
+        );
+        assert_eq!(
+            sup(&decimal(10, 0), &RockyType::Int64),
+            Some(decimal(19, 0))
+        );
+        assert_eq!(sup(&decimal(5, 0), &RockyType::Int32), Some(decimal(10, 0)));
     }
 
     #[test]
@@ -697,22 +790,18 @@ mod tests {
             unsized_decimal.clone(),
         ] {
             assert_eq!(
-                common_supertype(&unsized_decimal, &other),
+                sup(&unsized_decimal, &other),
                 Some(unsized_decimal.clone()),
                 "{other:?}"
             );
             assert_eq!(
-                common_supertype(&other, &unsized_decimal),
+                sup(&other, &unsized_decimal),
                 Some(unsized_decimal.clone()),
                 "{other:?}"
             );
         }
         for other in [RockyType::String, RockyType::Float64, RockyType::Date] {
-            assert_eq!(
-                common_supertype(&unsized_decimal, &other),
-                None,
-                "{other:?}"
-            );
+            assert_eq!(sup(&unsized_decimal, &other), None, "{other:?}");
         }
 
         assert!(is_assignable(&d10_2, &unsized_decimal));
@@ -754,8 +843,8 @@ mod tests {
             (scale(None), d(10, 2), scale(None)),
         ];
         for (a, b, want) in cases {
-            assert_eq!(common_supertype(&a, &b), Some(want.clone()), "{a:?} {b:?}");
-            assert_eq!(common_supertype(&b, &a), Some(want), "{b:?} {a:?}");
+            assert_eq!(sup(&a, &b), Some(want.clone()), "{a:?} {b:?}");
+            assert_eq!(sup(&b, &a), Some(want), "{b:?} {a:?}");
         }
 
         assert_eq!(scale(Some(2)).to_string(), "DECIMAL(?,2)");
@@ -797,7 +886,7 @@ mod tests {
     #[test]
     fn test_timestamp_variants() {
         assert_eq!(
-            common_supertype(&RockyType::Timestamp, &RockyType::TimestampNtz),
+            sup(&RockyType::Timestamp, &RockyType::TimestampNtz),
             Some(RockyType::Timestamp)
         );
     }
@@ -951,7 +1040,7 @@ mod tests {
             (Add, dec(2, 4), dec(10, 2), RockyType::Unknown),
         ];
         for (op, a, b, want) in cases {
-            assert_eq!(arithmetic_result_type(op, &a, &b), want, "{a} {op:?} {b}");
+            assert_eq!(arith(op, &a, &b), want, "{a} {op:?} {b}");
         }
     }
 
@@ -969,8 +1058,12 @@ mod tests {
         for a in lattice() {
             for b in lattice() {
                 for op in ops {
-                    let result = arithmetic_result_type(op, &a, &b);
-                    assert_eq!(result, arithmetic_result_type(op, &b, &a), "{a} {op:?} {b}");
+                    assert_eq!(
+                        arithmetic_result_type(op, &a, &b),
+                        arithmetic_result_type(op, &b, &a),
+                        "{a} {op:?} {b}"
+                    );
+                    let result = arith(op, &a, &b);
                     if matches!(a, RockyType::DecimalUnsized { .. })
                         || matches!(b, RockyType::DecimalUnsized { .. })
                     {
@@ -1046,7 +1139,7 @@ mod tests {
                     DecimalOp::Multiply,
                     DecimalOp::Modulo,
                 ] {
-                    let result = arithmetic_result_type(op, a, b);
+                    let result = arith(op, a, b);
                     if result == RockyType::Unknown {
                         continue;
                     }
@@ -1089,40 +1182,120 @@ mod tests {
     /// ADR-TYPES §3 Unification and its Validation cases.
     #[test]
     fn unification_keeps_integer_digits_and_caps() {
-        assert_eq!(
-            common_supertype(&dec(10, 0), &dec(10, 10)),
-            Some(dec(20, 10))
-        );
-        assert_eq!(
-            common_supertype(&RockyType::Int32, &dec(5, 2)),
-            Some(dec(12, 2))
-        );
+        assert_eq!(sup(&dec(10, 0), &dec(10, 10)), Some(dec(20, 10)));
+        assert_eq!(sup(&RockyType::Int32, &dec(5, 2)), Some(dec(12, 2)));
         // No carry digit: unification is not arithmetic.
-        assert_eq!(common_supertype(&dec(10, 2), &dec(12, 2)), Some(dec(12, 2)));
+        assert_eq!(sup(&dec(10, 2), &dec(12, 2)), Some(dec(12, 2)));
         // Over the cap: compatible, but no type.
+        assert_eq!(sup(&dec(30, 0), &dec(30, 30)), Some(RockyType::Unknown));
         assert_eq!(
-            common_supertype(&dec(30, 0), &dec(30, 30)),
-            Some(RockyType::Unknown)
-        );
-        assert_eq!(
-            common_supertype_of(&[dec(10, 0), dec(10, 10), RockyType::Int32]),
+            sup_of(&[dec(10, 0), dec(10, 10), RockyType::Int32]),
             dec(20, 10)
         );
         // A float with a decimal stays incompatible.
-        assert_eq!(common_supertype(&RockyType::Float64, &dec(10, 2)), None);
+        assert_eq!(sup(&RockyType::Float64, &dec(10, 2)), None);
         assert_eq!(
-            common_supertype_of(&[RockyType::Float64, dec(10, 2)]),
+            sup_of(&[RockyType::Float64, dec(10, 2)]),
             RockyType::Unknown
         );
-        assert_eq!(common_supertype_of(&[]), RockyType::Unknown);
+        assert_eq!(sup_of(&[]), RockyType::Unknown);
         assert_eq!(
-            common_supertype_of(&[RockyType::Int32, RockyType::Float32]),
+            sup_of(&[RockyType::Int32, RockyType::Float32]),
             RockyType::Float64
         );
         assert_eq!(
-            common_supertype_of(&[RockyType::Int32, RockyType::Int64]),
+            sup_of(&[RockyType::Int32, RockyType::Int64]),
             RockyType::Int64
         );
+    }
+
+    /// ADR-TYPES §1: a result over the cap is `(Unknown, true)`. The
+    /// nullable half is `over_cap`, set by the one function that applies the
+    /// cap, so every public rule reports it. No other `Unknown` sets it.
+    #[test]
+    fn over_cap_is_set_where_the_cap_is_applied() {
+        use DecimalOp::{Add, Divide, Modulo, Multiply, Subtract};
+        let over = InferredType {
+            ty: RockyType::Unknown,
+            over_cap: true,
+        };
+        let typed = |ty| InferredType {
+            ty,
+            over_cap: false,
+        };
+        // Arithmetic.
+        assert_eq!(arithmetic_result_type(Add, &dec(38, 0), &dec(38, 0)), over);
+        assert_eq!(
+            arithmetic_result_type(Subtract, &dec(30, 0), &dec(30, 30)),
+            over
+        );
+        assert_eq!(
+            arithmetic_result_type(Multiply, &dec(30, 0), &dec(30, 0)),
+            over
+        );
+        assert_eq!(
+            arithmetic_result_type(Multiply, &dec(37, 0), &RockyType::Int32),
+            over
+        );
+        assert_eq!(
+            arithmetic_result_type(Add, &dec(37, 0), &dec(37, 0)),
+            typed(dec(38, 0))
+        );
+        // `%` keeps the smaller integer part, so it never goes over here.
+        assert_eq!(
+            arithmetic_result_type(Modulo, &dec(38, 0), &dec(38, 38)),
+            typed(dec(38, 38))
+        );
+        // Other `Unknown`s are not overflow.
+        for (op, a, b) in [
+            (Divide, dec(38, 0), dec(38, 0)),
+            (Add, RockyType::String, RockyType::Int32),
+            (Add, RockyType::Unknown, dec(10, 2)),
+            (Add, dec(2, 4), dec(10, 2)),
+        ] {
+            assert_eq!(
+                arithmetic_result_type(op, &a, &b),
+                typed(RockyType::Unknown),
+                "{a} {op:?} {b}"
+            );
+        }
+        // Unification, pair and set.
+        assert_eq!(
+            common_supertype(&dec(30, 0), &dec(30, 30)),
+            Some(over.clone())
+        );
+        assert_eq!(
+            common_supertype(&dec(38, 0), &dec(38, 38)),
+            Some(over.clone())
+        );
+        assert_eq!(
+            common_supertype_of(&[dec(30, 0), dec(30, 30), dec(5, 2)]),
+            over
+        );
+        assert_eq!(
+            common_supertype(&dec(10, 0), &dec(10, 10)),
+            Some(typed(dec(20, 10)))
+        );
+        assert_eq!(
+            common_supertype(&RockyType::Unknown, &dec(10, 2)),
+            Some(typed(RockyType::Unknown))
+        );
+        assert_eq!(
+            common_supertype_of(&[RockyType::Float64, dec(10, 2)]),
+            typed(RockyType::Unknown)
+        );
+        // The bit and the type agree on the whole lattice: over the cap is
+        // always `Unknown`.
+        for a in lattice() {
+            for b in lattice() {
+                for op in [Add, Subtract, Multiply, Divide, Modulo] {
+                    let result = arithmetic_result_type(op, &a, &b);
+                    assert!(!result.over_cap || result.ty == RockyType::Unknown);
+                }
+                let set = common_supertype_of(&[a.clone(), b.clone()]);
+                assert!(!set.over_cap || set.ty == RockyType::Unknown);
+            }
+        }
     }
 
     /// ADR-TYPES §3: the order of the branches cannot change the result. The
@@ -1145,7 +1318,7 @@ mod tests {
             ],
         ];
         for triple in triples {
-            let want = common_supertype_of(&triple);
+            let want = sup_of(&triple);
             for permutation in [
                 [0, 1, 2],
                 [0, 2, 1],
@@ -1155,19 +1328,19 @@ mod tests {
                 [2, 1, 0],
             ] {
                 let branches = permutation.map(|i| triple[i].clone());
-                assert_eq!(common_supertype_of(&branches), want, "{branches:?}");
+                assert_eq!(sup_of(&branches), want, "{branches:?}");
             }
         }
         assert_eq!(
-            common_supertype_of(&[dec(30, 0), dec(30, 30), dec(5, 2)]),
+            sup_of(&[dec(30, 0), dec(30, 30), dec(5, 2)]),
             RockyType::Unknown
         );
         assert_eq!(
-            common_supertype_of(&[unsized_dec(Some(2)), dec(10, 2), RockyType::Int64]),
+            sup_of(&[unsized_dec(Some(2)), dec(10, 2), RockyType::Int64]),
             unsized_dec(Some(2))
         );
         assert_eq!(
-            common_supertype_of(&[unsized_dec(Some(2)), dec(10, 2), dec(10, 4)]),
+            sup_of(&[unsized_dec(Some(2)), dec(10, 2), dec(10, 4)]),
             unsized_dec(None)
         );
     }
@@ -1180,11 +1353,11 @@ mod tests {
             for b in lattice() {
                 assert_eq!(
                     common_supertype_of(&[a.clone(), b.clone()]),
-                    common_supertype(&a, &b).unwrap_or(RockyType::Unknown),
+                    common_supertype(&a, &b).unwrap_or(InferredType::typed(RockyType::Unknown)),
                     "{a:?} {b:?}"
                 );
                 assert_eq!(
-                    common_supertype_of(&[a.clone(), RockyType::Unknown, b.clone()]),
+                    sup_of(&[a.clone(), RockyType::Unknown, b.clone()]),
                     RockyType::Unknown
                 );
             }

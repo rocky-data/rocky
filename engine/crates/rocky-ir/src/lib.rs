@@ -62,6 +62,6 @@ pub use snapshot::{
 };
 pub use time_grain::TimeGrain;
 pub use types::{
-    DecimalOp, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn, arithmetic_result_type,
-    common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
+    DecimalOp, InferredType, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn,
+    arithmetic_result_type, common_supertype, common_supertype_of, decimal_parts_of, is_assignable,
 };
