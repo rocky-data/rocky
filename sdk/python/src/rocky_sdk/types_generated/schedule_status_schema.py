@@ -40,6 +40,59 @@ class EstimateState4(StrEnum):
     unknown = "unknown"
 
 
+class LatestStartState1(StrEnum):
+    """
+    Every pipeline on the way has a p90: `at` is reported.
+    """
+
+    known = "known"
+
+
+class LatestStartState2(StrEnum):
+    """
+    Some pipeline on the way has fewer than 5 runs: no answer.
+    """
+
+    unknown = "unknown"
+
+
+class LatestStartStatus(BaseModel):
+    """
+    The latest start of a scheduled pipeline, derived from the product deadlines it feeds.
+
+    `latest_start(P) = min(next_due_at of a deadline P serves, latest_start of each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the pipeline's run time over its last 20 successful production runs. One pipeline on the way with fewer than 5 runs makes the answer `unknown`.
+    """
+
+    at: AwareDatetime | None = None
+    """
+    The latest start, when `known`.
+    """
+    cron_too_late: bool
+    """
+    True when the pipeline's next cron fire (`next_fire_at`) is later than `at`: the cron starts too late to meet the deadline. Rocky warns only; it never changes the cron. False when either time is unknown.
+    """
+    due_at: AwareDatetime | None = None
+    """
+    That product's next deadline, when `known`.
+    """
+    missing_estimate: list[str] | None = None
+    """
+    The pipelines on the way whose p90 is unknown, when `unknown`.
+    """
+    product: str | None = None
+    """
+    The product whose deadline gives the minimum, when `known`.
+    """
+    state: LatestStartState1 | LatestStartState2
+    """
+    `known` when every pipeline on every chain to a deadline has a p90; `unknown` otherwise, and then `at` is absent and nothing is judged.
+    """
+    warning: str | None = None
+    """
+    The warning text, when `cron_too_late`.
+    """
+
+
 class ScheduleClaimStatus(BaseModel):
     """
     One claim recorded against a pipeline.
@@ -328,6 +381,10 @@ class SchedulePipelineStatus(BaseModel):
     last_fire_logical_ts: AwareDatetime | None = None
     """
     The logical timestamp of the last occurrence that fired.
+    """
+    latest_start: LatestStartStatus | None = None
+    """
+    The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Absent when the pipeline feeds no deadline. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
     """
     next_fire_at: AwareDatetime | None = None
     """

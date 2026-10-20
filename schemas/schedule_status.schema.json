@@ -186,6 +186,84 @@
         }
       ]
     },
+    "LatestStartState": {
+      "description": "Whether a latest start could be derived.",
+      "oneOf": [
+        {
+          "description": "Every pipeline on the way has a p90: `at` is reported.",
+          "enum": [
+            "known"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Some pipeline on the way has fewer than 5 runs: no answer.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "LatestStartStatus": {
+      "description": "The latest start of a scheduled pipeline, derived from the product deadlines it feeds.\n\n`latest_start(P) = min(next_due_at of a deadline P serves, latest_start of each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the pipeline's run time over its last 20 successful production runs. One pipeline on the way with fewer than 5 runs makes the answer `unknown`.",
+      "properties": {
+        "at": {
+          "description": "The latest start, when `known`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cron_too_late": {
+          "description": "True when the pipeline's next cron fire (`next_fire_at`) is later than `at`: the cron starts too late to meet the deadline. Rocky warns only; it never changes the cron. False when either time is unknown.",
+          "type": "boolean"
+        },
+        "due_at": {
+          "description": "That product's next deadline, when `known`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "missing_estimate": {
+          "description": "The pipelines on the way whose p90 is unknown, when `unknown`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "product": {
+          "description": "The product whose deadline gives the minimum, when `known`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LatestStartState"
+            }
+          ],
+          "description": "`known` when every pipeline on every chain to a deadline has a p90; `unknown` otherwise, and then `at` is absent and nothing is judged."
+        },
+        "warning": {
+          "description": "The warning text, when `cron_too_late`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cron_too_late",
+        "state"
+      ],
+      "type": "object"
+    },
     "ScheduleClaimStatus": {
       "description": "One claim recorded against a pipeline.",
       "properties": {
@@ -356,6 +434,17 @@
             "string",
             "null"
           ]
+        },
+        "latest_start": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LatestStartStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Absent when the pipeline feeds no deadline. A deadline only derives this value: it never adds an `after` edge and never moves a cron."
         },
         "next_fire_at": {
           "description": "When the cron is next expected to fire.\n\n**A timestamp in the past means overdue.** The projection is anchored on the stored cursor, not on the clock, so a stalled timer reports the slot it missed rather than a healthy-looking future one. Null for `after`/`freshness` schedules, which have no projectable instant.",

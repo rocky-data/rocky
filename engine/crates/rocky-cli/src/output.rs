@@ -7383,6 +7383,106 @@ pub struct SchedulePipelineStatus {
     /// production run of the pipeline built a product with a deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryStatus>,
+    /// The latest time this pipeline can start and still meet every product
+    /// deadline it feeds, directly or through pipelines that run `after` it.
+    /// Absent when the pipeline feeds no deadline. A deadline only derives
+    /// this value: it never adds an `after` edge and never moves a cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_start: Option<LatestStartStatus>,
+}
+
+/// The latest start of a scheduled pipeline, derived from the product
+/// deadlines it feeds.
+///
+/// `latest_start(P) = min(next_due_at of a deadline P serves, latest_start of
+/// each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the
+/// pipeline's run time over its last 20 successful production runs. One
+/// pipeline on the way with fewer than 5 runs makes the answer `unknown`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LatestStartStatus {
+    /// `known` when every pipeline on every chain to a deadline has a p90;
+    /// `unknown` otherwise, and then `at` is absent and nothing is judged.
+    pub state: LatestStartState,
+    /// The latest start, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+    /// The product whose deadline gives the minimum, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    /// That product's next deadline, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    /// The pipelines on the way whose p90 is unknown, when `unknown`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_estimate: Vec<String>,
+    /// True when the pipeline's next cron fire (`next_fire_at`) is later than
+    /// `at`: the cron starts too late to meet the deadline. Rocky warns only;
+    /// it never changes the cron. False when either time is unknown.
+    pub cron_too_late: bool,
+    /// The warning text, when `cron_too_late`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// Whether a latest start could be derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LatestStartState {
+    /// Every pipeline on the way has a p90: `at` is reported.
+    Known,
+    /// Some pipeline on the way has fewer than 5 runs: no answer.
+    Unknown,
+}
+
+impl LatestStartStatus {
+    /// Project a core [`rocky_core::delivery::LatestStart`] onto the output
+    /// shape, and judge the cron against it.
+    pub fn from_latest_start(
+        latest: rocky_core::delivery::LatestStart,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        match latest {
+            rocky_core::delivery::LatestStart::Known {
+                at,
+                product,
+                due_at,
+            } => {
+                let cron_too_late = next_fire_at.is_some_and(|fire| fire > at);
+                let warning = match (cron_too_late, next_fire_at) {
+                    (true, Some(fire)) => {
+                        let ts =
+                            |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        Some(format!(
+                            "the cron starts too late to meet the deadline: the next fire at \
+                             {} is after the latest start {} for product `{product}`, due {}",
+                            ts(fire),
+                            ts(at),
+                            ts(due_at)
+                        ))
+                    }
+                    (true, None) | (false, _) => None,
+                };
+                Self {
+                    state: LatestStartState::Known,
+                    at: Some(at),
+                    product: Some(product),
+                    due_at: Some(due_at),
+                    missing_estimate: Vec::new(),
+                    cron_too_late,
+                    warning,
+                }
+            }
+            rocky_core::delivery::LatestStart::Unknown { missing_estimate } => Self {
+                state: LatestStartState::Unknown,
+                at: None,
+                product: None,
+                due_at: None,
+                missing_estimate,
+                cron_too_late: false,
+                warning: None,
+            },
+        }
+    }
 }
 
 /// An active backoff window.

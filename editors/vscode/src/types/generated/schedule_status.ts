@@ -14,6 +14,10 @@ export type EstimateBasis = "model_delivery" | "pipeline_run";
  */
 export type EstimateState = "known" | "unknown";
 /**
+ * Whether a latest start could be derived.
+ */
+export type LatestStartState = "known" | "unknown";
+/**
  * Why a demand is currently suppressed.
  */
 export type ScheduleThrottleKind = "failure_backoff" | "partial_backoff";
@@ -145,6 +149,10 @@ export interface SchedulePipelineStatus {
    */
   last_fire_logical_ts?: string | null;
   /**
+   * The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Absent when the pipeline feeds no deadline. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
+   */
+  latest_start?: LatestStartStatus | null;
+  /**
    * When the cron is next expected to fire.
    *
    * **A timestamp in the past means overdue.** The projection is anchored on the stored cursor, not on the clock, so a stalled timer reports the slot it missed rather than a healthy-looking future one. Null for `after`/`freshness` schedules, which have no projectable instant.
@@ -274,6 +282,42 @@ export interface DurationEstimateStatus {
    * The most runs it reads (the newest 20).
    */
   window: number;
+  [k: string]: unknown;
+}
+/**
+ * The latest start of a scheduled pipeline, derived from the product deadlines it feeds.
+ *
+ * `latest_start(P) = min(next_due_at of a deadline P serves, latest_start of each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the pipeline's run time over its last 20 successful production runs. One pipeline on the way with fewer than 5 runs makes the answer `unknown`.
+ */
+export interface LatestStartStatus {
+  /**
+   * The latest start, when `known`.
+   */
+  at?: string | null;
+  /**
+   * True when the pipeline's next cron fire (`next_fire_at`) is later than `at`: the cron starts too late to meet the deadline. Rocky warns only; it never changes the cron. False when either time is unknown.
+   */
+  cron_too_late: boolean;
+  /**
+   * That product's next deadline, when `known`.
+   */
+  due_at?: string | null;
+  /**
+   * The pipelines on the way whose p90 is unknown, when `unknown`.
+   */
+  missing_estimate?: string[];
+  /**
+   * The product whose deadline gives the minimum, when `known`.
+   */
+  product?: string | null;
+  /**
+   * `known` when every pipeline on every chain to a deadline has a p90; `unknown` otherwise, and then `at` is absent and nothing is judged.
+   */
+  state: LatestStartState;
+  /**
+   * The warning text, when `cron_too_late`.
+   */
+  warning?: string | null;
   [k: string]: unknown;
 }
 /**
