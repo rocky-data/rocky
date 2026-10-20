@@ -297,6 +297,13 @@ pub(crate) static STALL_COPY_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// `run_id/table` keys whose replication copy cancels the run as it starts and
+/// then completes (#2441): a copy that is collected after the cancel.
+#[cfg(test)]
+pub(crate) static CANCEL_AT_COPY_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 /// Persist the watermarks an interrupted replication run has collected (#1606).
 ///
 /// One redb transaction for the whole set (§P1.6). Called with the run
@@ -369,12 +376,19 @@ struct TableError {
 /// distinguish "interrupted" from a generic run failure. Every phase that
 /// observes the run's cancellation token (`run_cancel`) returns this only
 /// after the run settled: record persisted, claim released, state session
-/// finalized or released (#1606; the transformation pipeline releases it
-/// without upload). A second SIGINT bypasses this path entirely and calls
+/// finalized or released (#1606). A transformation, quality or snapshot
+/// pipeline uploads it when the record landed (#2442). A second SIGINT bypasses this path entirely and calls
 /// `std::process::exit(130)` directly from the signal listener.
+///
+/// `custody` says whether the interrupted run's record landed (#2442). A
+/// dispatcher arm still holding a remote-state session reads it through
+/// [`session_disposition`]: a persisted record finalizes, so the record and
+/// any quarantine ownership rows reach the remote `[state]` backend.
 #[derive(Debug, thiserror::Error)]
 #[error("run was interrupted by a shutdown signal")]
-pub struct Interrupted;
+pub struct Interrupted {
+    pub custody: RecordCustody,
+}
 
 /// Sentinel error signalling that `rocky run` completed with at least
 /// one successful materialization *and* at least one table failure
@@ -729,6 +743,27 @@ pub(crate) enum SessionDisposition {
     Abandon,
 }
 
+/// Finalize a held session after a failed dispatch whose record landed.
+///
+/// An interrupted run (#2442) keeps its exit code 130 when the upload fails:
+/// the cancel ended the run, and the local record is still written. The
+/// failure is logged, as the replication path logs its interrupted checkpoint
+/// upload. Every other error propagates the upload failure, as before.
+pub(crate) async fn finalize_after_error(
+    session: rocky_core::state_sync::RemoteStateSession,
+    error: &anyhow::Error,
+    context: &'static str,
+) -> Result<()> {
+    match session.finalize().await {
+        Ok(()) => Ok(()),
+        Err(upload) if error.is::<Interrupted>() => {
+            warn!(error = %upload, "interrupted run's state upload failed");
+            Ok(())
+        }
+        Err(upload) => Err(anyhow::Error::new(upload).context(context)),
+    }
+}
+
 /// Decide [`SessionDisposition`] for a failed dispatch (#1816, #1836).
 ///
 /// The typed post-terminal sentinels are the dispatcher's only evidence that a
@@ -748,7 +783,8 @@ pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
             error
                 .downcast_ref::<ShadowComparisonFailure>()
                 .map(|e| e.custody)
-        });
+        })
+        .or_else(|| error.downcast_ref::<Interrupted>().map(|e| e.custody));
     match custody {
         Some(RecordCustody::Persisted) => SessionDisposition::Finalize,
         Some(RecordCustody::Lost) | None => SessionDisposition::Abandon,
@@ -782,7 +818,7 @@ pub(crate) fn run_status_exit_result(
     // the exit code alone. Checked first so an interrupted run with a failed
     // model still reads as interrupted, not as a model failure.
     if output.interrupted {
-        return Err(anyhow::Error::new(Interrupted));
+        return Err(anyhow::Error::new(Interrupted { custody }));
     }
     if output.tables_failed == 0
         && !output.check_gate_failed
@@ -2841,10 +2877,7 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                     .as_ref()
                     .and_then(|scope| scope.target.as_ref())
                     .is_some_and(|target| {
-                        matches!(
-                            target.endpoint.adapter_type.to_ascii_lowercase().as_str(),
-                            "duckdb" | "databricks" | "snowflake" | "bigquery"
-                        )
+                        adapter_type_supports_watermark_recovery(&target.endpoint.adapter_type)
                     })
             {
                 "Run the pipeline without a resume flag. Rocky re-derives the \
@@ -4126,7 +4159,7 @@ pub async fn run_with_explicit_contracts(
         // An interrupted run (#1606) exits 130 even with a hard `[budget]`
         // breach: the cancel is what ended it.
         if output.interrupted {
-            return Err(anyhow::Error::new(Interrupted));
+            return Err(anyhow::Error::new(Interrupted { custody }));
         }
         budget_result?;
         // Same run-status exit contract as the transformation path: a
@@ -4522,10 +4555,13 @@ pub async fn run_with_explicit_contracts(
                     if let Some(session) = tx_session {
                         match session_disposition(&e) {
                             SessionDisposition::Finalize => {
-                                session.finalize().await.context(
+                                finalize_after_error(
+                                    session,
+                                    &e,
                                     "the run's recorded failure state could not be persisted \
                                      to the remote [state] backend",
-                                )?;
+                                )
+                                .await?;
                             }
                             SessionDisposition::Abandon => {
                                 session
@@ -4666,13 +4702,23 @@ pub async fn run_with_explicit_contracts(
                     // Abandoning here (the previous shape) uploaded nothing,
                     // so under a remote `[state]` backend every other pod
                     // kept reading the history from before the failed run
-                    // (#1816). Every other error is a pre-terminal hard exit:
-                    // abandon, never upload.
+                    // (#1816). An interrupted run whose record landed finalizes
+                    // too (#2442): its record and quarantine ownership rows
+                    // must reach the other pods. Every other error is a
+                    // pre-terminal hard exit: abandon, never upload.
                     if e.is::<QualityGateFailure>() {
                         session.finalize().await.context(
                             "the run's recorded check-gate failure could not be persisted to \
                              the remote [state] backend",
                         )?;
+                    } else if session_disposition(&e) == SessionDisposition::Finalize {
+                        finalize_after_error(
+                            session,
+                            &e,
+                            "the run's recorded state could not be persisted to the remote \
+                             [state] backend",
+                        )
+                        .await?;
                     } else {
                         session
                             .abandon("quality exited before terminal state writes")
@@ -4786,9 +4832,21 @@ pub async fn run_with_explicit_contracts(
                     );
                 }
                 Err(e) => {
-                    session
-                        .abandon("snapshot exited before terminal state writes")
-                        .await;
+                    // An interrupted run whose record landed finalizes (#2442),
+                    // as the quality arm does; every other error abandons.
+                    if session_disposition(&e) == SessionDisposition::Finalize {
+                        finalize_after_error(
+                            session,
+                            &e,
+                            "the run's recorded state could not be persisted to the remote \
+                             [state] backend",
+                        )
+                        .await?;
+                    } else {
+                        session
+                            .abandon("snapshot exited before terminal state writes")
+                            .await;
+                    }
                     return Err(e);
                 }
             }
@@ -6673,6 +6731,14 @@ pub async fn run_with_explicit_contracts(
                     &shared_run_id,
                     &mut total_completed,
                     &abort_policy,
+                    // The token is read once at the loop top, so a cancel that
+                    // lands during one table's hook reaches the next table
+                    // this drain collects (#2441).
+                    Some(&InterruptFlush {
+                        cancel: &cancel,
+                        recovery_tables: &recovery_tables,
+                        replacements: &replaced_recovery_runs,
+                    }),
                 )
                 .await;
                 if let DrainDecision::AbortRemaining(cause) = decision {
@@ -6733,6 +6799,10 @@ pub async fn run_with_explicit_contracts(
             keys.remove(&format!("{run_id}/{}", task.target_table_name))
         });
         #[cfg(test)]
+        let cancel_at_copy = CANCEL_AT_COPY_FOR_TEST.lock().ok().is_some_and(|mut keys| {
+            keys.remove(&format!("{run_id}/{}", task.target_table_name))
+        });
+        #[cfg(test)]
         let stall_cancel = cancel.clone();
         join_set.spawn(async move {
             let _permit = permit;
@@ -6740,6 +6810,10 @@ pub async fn run_with_explicit_contracts(
             if stall {
                 stall_cancel.cancel();
                 std::future::pending::<()>().await;
+            }
+            #[cfg(test)]
+            if cancel_at_copy {
+                stall_cancel.cancel();
             }
             let result =
                 process_table_with_replacement_recovery(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled, required_replacement, needs_orphan_checks).await;
@@ -6838,6 +6912,11 @@ pub async fn run_with_explicit_contracts(
                     total_completed - 1,
                     &shared_state,
                     &shared_run_id,
+                    Some(&InterruptFlush {
+                        cancel: &cancel,
+                        recovery_tables: &recovery_tables,
+                        replacements: &replaced_recovery_runs,
+                    }),
                 )
                 .await;
             }
@@ -7118,10 +7197,11 @@ pub async fn run_with_explicit_contracts(
         // PartialFailure / Failure and `rocky replay` can inspect what
         // got done before the SIGINT. `output.interrupted` was set
         // above so `derive_run_status` picks the right variant.
+        let mut custody = RecordCustody::Lost;
         {
             let state = shared_state.as_ref();
             if owed_checks_tracked {
-                persist_run_record(
+                custody = RecordCustody::from_persisted(persist_run_record(
                     Some(state),
                     &output,
                     &shared_run_id,
@@ -7129,7 +7209,7 @@ pub async fn run_with_explicit_contracts(
                     &config_hash,
                     &audit,
                     Some(pipeline_name),
-                );
+                ));
             }
             finalize_idempotency(
                 &mut idempotency_ctx,
@@ -7185,7 +7265,7 @@ pub async fn run_with_explicit_contracts(
             .await;
         let _ = hook_registry.wait_async_webhooks().await;
 
-        return Err(anyhow::Error::new(Interrupted));
+        return Err(anyhow::Error::new(Interrupted { custody }));
     }
 
     // Auto-retry failed tables
@@ -7277,6 +7357,11 @@ pub async fn run_with_explicit_contracts(
                             idx,
                             &shared_state,
                             &shared_run_id,
+                            Some(&InterruptFlush {
+                                cancel: &cancel,
+                                recovery_tables: &recovery_tables,
+                                replacements: &replaced_recovery_runs,
+                            }),
                         )
                         .await;
                         info!(table = task.target_table_name.as_str(), "retry succeeded");
@@ -8206,7 +8291,9 @@ pub async fn run_with_explicit_contracts(
             ))
             .await;
         let _ = hook_registry.wait_async_webhooks().await;
-        return Err(anyhow::Error::new(Interrupted));
+        return Err(anyhow::Error::new(Interrupted {
+            custody: record_custody,
+        }));
     }
 
     if !table_errors.is_empty() {
@@ -12227,7 +12314,7 @@ pub(crate) async fn execute_backfill_set(
             // An interrupted backfill (#1606) exits 130 even with a hard
             // `[budget]` breach, as `rocky run` does: the cancel ended it.
             if output.interrupted {
-                return Err(anyhow::Error::new(Interrupted));
+                return Err(anyhow::Error::new(Interrupted { custody }));
             }
             budget_result?;
             run_status_exit_result(&output, &run_id, custody)?;
@@ -17692,9 +17779,22 @@ pub(crate) fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
 /// Target-MAX recovery requires an atomic INSERT, not merely a SQL dialect
 /// resembling an approved warehouse. Process and Trino adapters are excluded.
 fn supports_watermark_recovery(adapter: &rocky_core::config::AdapterConfig) -> bool {
+    adapter_type_supports_watermark_recovery(&adapter.adapter_type)
+}
+
+/// The adapter types whose copy commits whole or not at all (#2441).
+///
+/// PostgreSQL runs a `;`-separated simple query as one implicit transaction
+/// (`rocky-postgres` connector), and SQL Server wraps every multi-statement
+/// write in `SET XACT_ABORT ON; BEGIN TRANSACTION; … COMMIT` (`rocky-sqlserver`
+/// dialect); the live tests in both crates pin a failed copy leaving no rows.
+/// Redshift shares the PostgreSQL connector but its multi-statement atomicity
+/// is unproven, so it stays out. ClickHouse commits per block, and Spark's
+/// atomicity depends on the table format.
+fn adapter_type_supports_watermark_recovery(adapter_type: &str) -> bool {
     matches!(
-        adapter.adapter_type.to_ascii_lowercase().as_str(),
-        "duckdb" | "databricks" | "snowflake" | "bigquery"
+        adapter_type.to_ascii_lowercase().as_str(),
+        "duckdb" | "databricks" | "snowflake" | "bigquery" | "postgres" | "sqlserver"
     )
 }
 
@@ -19211,6 +19311,20 @@ struct TableHookContext<'a> {
     pipeline_name: &'a str,
 }
 
+/// What an interrupted run needs to flush a watermark from inside the collector
+/// (#2441).
+///
+/// A copy collected after the run was cancelled has its watermark written
+/// before the per-table hooks fire. `after_materialize` can wait up to its
+/// hook timeout (30 s by default), and a cut in that wait (a second signal, or
+/// `--watch` dropping the iteration after the settle grace) would otherwise
+/// lose the watermark of a copy that already committed.
+struct InterruptFlush<'a> {
+    cancel: &'a tokio_util::sync::CancellationToken,
+    recovery_tables: &'a [WatermarkRecoveryTable],
+    replacements: &'a [ReplacementRecovery],
+}
+
 /// The ONE place a materialized [`TableResult`] is consumed (#1718).
 ///
 /// Called from the spawn loop's inline drain, the final collection loop and the
@@ -19244,6 +19358,7 @@ async fn collect_materialized_table(
     checkpoint_index: usize,
     state: &Arc<StateStore>,
     run_id: &str,
+    interrupt_flush: Option<&InterruptFlush<'_>>,
 ) {
     // Destructured exhaustively on purpose: a field added to `TableResult`
     // stops compiling here until this collector says what happens to it. That
@@ -19279,6 +19394,24 @@ async fn collect_materialized_table(
             t.on_success();
         }
         adjust_semaphore(t, signal.semaphore, signal.capacity);
+    }
+
+    if let Some(wm) = deferred_watermark {
+        sinks.deferred_watermarks.push(wm);
+    }
+    // Cancel (#2441): make this copy's watermark durable before a hook can
+    // hold the collector. The drain loop's own flush runs only after this
+    // returns.
+    if let Some(flush) = interrupt_flush
+        && flush.cancel.is_cancelled()
+    {
+        let _ = flush_interrupted_watermarks(
+            state,
+            run_id,
+            flush.recovery_tables,
+            flush.replacements,
+            sinks.deferred_watermarks,
+        );
     }
 
     // §P2.6 per-table emit: after_materialize on success.
@@ -19350,9 +19483,6 @@ async fn collect_materialized_table(
 
     if let Some(tags) = deferred_tags {
         sinks.deferred_tags.push(tags);
-    }
-    if let Some(wm) = deferred_watermark {
-        sinks.deferred_watermarks.push(wm);
     }
 
     // Checkpoint: record successful table progress.
@@ -19593,6 +19723,7 @@ async fn process_completed_result(
     shared_run_id: &str,
     total_completed: &mut usize,
     policy: &AbortPolicy,
+    interrupt_flush: Option<&InterruptFlush<'_>>,
 ) -> DrainDecision {
     *total_completed += 1;
     let mut failed = false;
@@ -19626,6 +19757,7 @@ async fn process_completed_result(
                 *total_completed - 1,
                 shared_state,
                 shared_run_id,
+                interrupt_flush,
             )
             .await;
         }
@@ -20441,6 +20573,138 @@ max_retries = 0
         assert!(
             record.check_gate_failed,
             "and it carries the gate the run failed on"
+        );
+    }
+
+    /// #2442. An interrupted quality run whose record landed must upload it,
+    /// with the quarantine ownership rows it wrote before the signal. Before,
+    /// the quality arm abandoned the session on every error but the gate, so
+    /// another pod saw neither: its history stopped before the run, and the
+    /// next tag run there refused Rocky's own label columns as a user's.
+    ///
+    /// Pod A quarantines `orders` (tag mode), then the signal lands after
+    /// `refunds`' checks and before its quarantine. Pod B downloads the shared
+    /// state and must find the interrupted record and `orders`' ownership row.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn an_interrupted_quality_run_uploads_its_record_and_ownership_rows() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+        use rocky_core::traits::WarehouseAdapter;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "quality-interrupted-under-remote-state";
+        let rt = remote_state_test_runtime();
+
+        let db = project.path().join("warehouse.duckdb");
+        rt.block_on(async {
+            let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            for table in ["orders", "refunds"] {
+                adapter
+                    .execute_statement(&format!(
+                        "CREATE TABLE main.{table} AS SELECT * FROM \
+                         (VALUES (1, 'ada'), (2, NULL)) t(id, name)"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let config_path = project.path().join("rocky.toml");
+        let mut toml = format!(
+            "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"default\"\n\n\
+             [pipeline.dq.checks]\nenabled = true\nfail_on_error = false\n\n\
+             [pipeline.dq.checks.quarantine]\nenabled = true\nmode = \"tag\"\n\n\
+             [state]\nbackend = \"s3\"\ns3_bucket = \"test\"\non_upload_failure = \"fail\"\n\n\
+             [state.retry]\nmax_retries = 0\n",
+            db.display()
+        );
+        for table in ["orders", "refunds"] {
+            toml.push_str(&format!(
+                "\n[[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
+                 table = \"{table}\"\n\n\
+                 [[pipeline.dq.checks.assertions]]\ntable = \"{table}\"\ntype = \"not_null\"\n\
+                 column = \"name\"\nseverity = \"error\"\n"
+            ));
+        }
+        std::fs::write(&config_path, toml).unwrap();
+        super::super::run_local::CANCEL_AFTER_QUALITY_CHECKS_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert(format!("{run_id}/refunds"));
+
+        let outcome = rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+                &rocky_core::config::PrincipalRef::unnamed(),
+            )
+            .await
+        });
+        let err = outcome.expect_err("an interrupted quality run must not report success");
+        assert!(err.is::<super::Interrupted>(), "{err:#}");
+
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::Authoritative
+            ),
+            "pod B found a remote object to download: {authority:?}"
+        );
+        let remote: StateStore = harness.open_store(&harness.pod_b);
+        let record = remote
+            .get_run(run_id)
+            .unwrap()
+            .expect("the interrupted quality run rode the terminal upload");
+        assert!(
+            matches!(record.status, RunStatus::Failure),
+            "{:?}",
+            record.status
+        );
+        assert!(
+            remote
+                .get_quarantine_ownership("warehouse.main.orders")
+                .unwrap()
+                .is_some(),
+            "the ownership row written before the signal must reach pod B"
+        );
+        assert!(
+            remote
+                .get_quarantine_ownership("warehouse.main.refunds")
+                .unwrap()
+                .is_none(),
+            "no quarantine started after the signal"
         );
     }
 
@@ -23602,6 +23866,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                     fail_fast: false,
                     error_rate_abort_pct: 0,
                 },
+                None,
             )
             .await;
         }
@@ -32130,6 +32395,7 @@ timestamp_column = "ts"
                 fail_fast: false,
                 error_rate_abort_pct: 0,
             },
+            None,
         )
         .await;
 
@@ -33505,6 +33771,51 @@ row_count = true
         );
     }
 
+    /// #2441: a copy collected after the cancel has its watermark written
+    /// before `after_materialize` fires. The hook here sleeps far past the
+    /// settle grace, and the test drops the run as the grace would; before
+    /// the fix the watermark was pushed only after the hook returned, so the
+    /// drop lost it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_hook_after_the_cancel_does_not_hold_back_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_hold_back_project(dir.path()).await;
+        let mut toml = std::fs::read_to_string(&config).unwrap();
+        toml.push_str(
+            "\n[hook.on_after_materialize]\ncommand = \"sleep 120\"\ntimeout_ms = 300000\n",
+        );
+        std::fs::write(&config, toml).unwrap();
+        let state_path = dir.path().join("state.redb");
+        super::CANCEL_AT_COPY_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert("slow-hook-2441/t00".to_string());
+        let sink = rocky_core::state_sync::DroppedSessionSink::new();
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut run = Box::pin(sink.scope(super::super::run_cancel::scope(
+            token,
+            checkpoint_ordering_run(&config, &state_path, "slow-hook-2441", false),
+        )));
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(15), run.as_mut()).await;
+        assert!(
+            dropped.is_err(),
+            "the slow hook must hold the run until it is dropped"
+        );
+        sink.arm();
+        drop(run);
+        sink.settle_all().await.unwrap();
+
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .get_watermark("warehouse.staging__acme.t00")
+                .unwrap()
+                .is_some(),
+            "the copy collected after the cancel must keep its watermark"
+        );
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_after_a_held_back_copy_keeps_the_cutoff_for_the_resume() {
@@ -33984,6 +34295,15 @@ backend = "local"
                 run_id: "r".to_string(),
                 custody,
             });
+            assert_eq!(super::session_disposition(&error), expected);
+        }
+        // #2442: an interrupted run whose record landed uploads it; one whose
+        // record did not land abandons, as every typed sentinel does.
+        for (custody, expected) in [
+            (RecordCustody::Persisted, SessionDisposition::Finalize),
+            (RecordCustody::Lost, SessionDisposition::Abandon),
+        ] {
+            let error = anyhow::Error::new(super::Interrupted { custody });
             assert_eq!(super::session_disposition(&error), expected);
         }
         assert_eq!(
@@ -49616,6 +49936,7 @@ timestamp_column = "ts"
                 "run-1",
                 &mut total_completed,
                 policy,
+                None,
             )
             .await
         }
@@ -49783,6 +50104,7 @@ timestamp_column = "ts"
                 fail_fast: false,
                 error_rate_abort_pct: 0,
             },
+            None,
         )
         .await;
 
@@ -49802,6 +50124,135 @@ timestamp_column = "ts"
             "materialize_error must fire from this drain too — an alerting \
              subscriber heard nothing about a table that failed under the \
              default concurrency mode"
+        );
+    }
+
+    /// #2441: the inline drain is the default collection path
+    /// (`ConcurrencyMode::Adaptive`). A table it collects after the cancel has
+    /// its watermark written before `after_materialize` runs. The hook here
+    /// sleeps far past the settle grace, and the test drops the drain as the
+    /// grace would.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_inline_drain_writes_the_watermark_before_a_slow_hook_after_the_cancel() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7)",
+        ] {
+            warehouse.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+        let outcome = process_table(&warehouse, &state, &pipeline, &task, false)
+            .await
+            .unwrap();
+        let TableOutcome::Materialized(mut result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let watermark_at = Utc::now();
+        result.deferred_watermark = Some(DeferredWatermark {
+            state_key: "warehouse.tgt.events".to_string(),
+            timestamp: watermark_at,
+        });
+
+        let mut hooks_cfg = rocky_core::hooks::HooksConfig::default();
+        hooks_cfg.hooks.insert(
+            "on_after_materialize".to_string(),
+            rocky_core::hooks::HookConfigOrList::Single(rocky_core::hooks::HookConfig {
+                command: "sleep 120".to_string(),
+                timeout_ms: 300_000,
+                on_failure: Default::default(),
+                env: Default::default(),
+            }),
+        );
+        let hook_registry = HookRegistry::from_config(&hooks_cfg);
+        let tasks = vec![task.clone()];
+        state
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let throttle = Some(AdaptiveThrottle::new(8, 1, 1));
+        let semaphore = Semaphore::new(8);
+        let mut semaphore_capacity = 8;
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let mut pending_checks = HashMap::new();
+        let (mut source_refs, mut target_refs, mut freshness_refs) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut batch_asset_keys = Vec::new();
+        let mut assertion_targets = Vec::new();
+        let mut row_count_cutoffs = HashMap::new();
+        let mut table_errors = Vec::new();
+        let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+        let mut total_completed = 0;
+
+        // One statement, so the borrowed temporaries live across the await.
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process_completed_result(
+                Ok((0, Ok(TableOutcome::Materialized(result)))),
+                &tasks,
+                &throttle,
+                &semaphore,
+                &mut semaphore_capacity,
+                &mut MaterializedSinks {
+                    output: &mut output,
+                    pending_checks: &mut pending_checks,
+                    source_batch_refs: &mut source_refs,
+                    target_batch_refs: &mut target_refs,
+                    freshness_batch_refs: &mut freshness_refs,
+                    batch_asset_keys: &mut batch_asset_keys,
+                    assertion_targets: &mut assertion_targets,
+                    row_count_cutoffs: &mut row_count_cutoffs,
+                    deferred_tags: &mut deferred_tags,
+                    deferred_watermarks: &mut deferred_watermarks,
+                },
+                &TableHookContext {
+                    registry: &hook_registry,
+                    run_id: "run-1",
+                    pipeline_name: "p1",
+                },
+                &mut table_errors,
+                &state,
+                "run-1",
+                &mut total_completed,
+                &AbortPolicy {
+                    fail_fast: false,
+                    error_rate_abort_pct: 0,
+                },
+                Some(&InterruptFlush {
+                    cancel: &cancel,
+                    recovery_tables: &[],
+                    replacements: &[],
+                }),
+            ),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the slow hook must hold the drain until it is dropped"
+        );
+
+        assert_eq!(
+            state
+                .get_watermark("warehouse.tgt.events")
+                .unwrap()
+                .map(|wm| wm.last_value),
+            Some(watermark_at),
+            "the table collected after the cancel must keep its watermark"
         );
     }
 
@@ -49860,6 +50311,7 @@ timestamp_column = "ts"
                 fail_fast: false,
                 error_rate_abort_pct: 0,
             },
+            None,
         )
         .await;
 
@@ -49937,6 +50389,7 @@ timestamp_column = "ts"
             1,
             &state,
             "run-1",
+            None,
         )
         .await;
 
@@ -50747,11 +51200,27 @@ timestamp_column = "ts"
     #[test]
     fn checkpoint_recovery_uses_adapter_identity_instead_of_sql_dialect() {
         let mut adapter = test_duckdb_adapter(None);
-        for kind in ["duckdb", "databricks", "snowflake", "bigquery", "DuckDB"] {
+        for kind in [
+            "duckdb",
+            "databricks",
+            "snowflake",
+            "bigquery",
+            "postgres",
+            "sqlserver",
+            "DuckDB",
+        ] {
             adapter.adapter_type = kind.to_string();
             assert!(supports_watermark_recovery(&adapter), "{kind}");
         }
-        for kind in ["trino", "process", "custom", "test-fail-write"] {
+        for kind in [
+            "redshift",
+            "clickhouse",
+            "spark",
+            "trino",
+            "process",
+            "custom",
+            "test-fail-write",
+        ] {
             adapter.adapter_type = kind.to_string();
             assert!(!supports_watermark_recovery(&adapter), "{kind}");
         }
