@@ -371,21 +371,19 @@ fn unify_exact_numerics(members: &[&RockyType]) -> RockyType {
 /// Compute the common supertype of two types (for `COALESCE`, `CASE`, join
 /// keys).
 ///
-/// Returns `None` if the types are incompatible. Exact numerics unify in
-/// `(integer_digits, scale)` space, so no integer digit is dropped
-/// (ADR-TYPES §3, line 184): `Decimal(10,0)` with `Decimal(10,10)` is
-/// `Decimal(20,10)`. For a whole branch set, use [`common_supertype_of`].
+/// Returns `None` if the types are incompatible. An `Unknown` side gives
+/// `Some(Unknown)`: Rocky has no bound for that side, so it has none for
+/// the pair (ADR-TYPES §2, line 146). Exact numerics unify in
+/// `(integer_digits, scale)` space, so no integer digit is dropped (§3,
+/// line 184): `Decimal(10,0)` with `Decimal(10,10)` is `Decimal(20,10)`.
+/// For a whole branch set, use [`common_supertype_of`].
 pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
     if a == b {
         return Some(a.clone());
     }
 
-    // Unknown is compatible with anything
-    if *a == RockyType::Unknown {
-        return Some(b.clone());
-    }
-    if *b == RockyType::Unknown {
-        return Some(a.clone());
+    if *a == RockyType::Unknown || *b == RockyType::Unknown {
+        return Some(RockyType::Unknown);
     }
 
     // Numeric promotion
@@ -586,15 +584,17 @@ mod tests {
         );
     }
 
+    /// ADR-TYPES §2: an `Unknown` side absorbs. It is compatible (`Some`),
+    /// so a join key is not reported as incompatible, but it claims no type.
     #[test]
-    fn test_unknown_compatible_with_all() {
+    fn test_unknown_absorbs_in_unification() {
         assert_eq!(
             common_supertype(&RockyType::Unknown, &RockyType::Int64),
-            Some(RockyType::Int64)
+            Some(RockyType::Unknown)
         );
         assert_eq!(
             common_supertype(&RockyType::String, &RockyType::Unknown),
-            Some(RockyType::String)
+            Some(RockyType::Unknown)
         );
     }
 
@@ -695,7 +695,6 @@ mod tests {
             RockyType::Int32,
             RockyType::Int64,
             unsized_decimal.clone(),
-            RockyType::Unknown,
         ] {
             assert_eq!(
                 common_supertype(&unsized_decimal, &other),
@@ -1173,16 +1172,12 @@ mod tests {
         );
     }
 
-    /// The set form and the pair form agree on every pair of the lattice
-    /// with a known type, and any `Unknown` branch absorbs the set
-    /// (ADR-TYPES §2). The pair form still treats `Unknown` as its identity.
+    /// The set form and the pair form agree on every pair of the lattice, and
+    /// any `Unknown` branch absorbs the set (ADR-TYPES §2).
     #[test]
     fn common_supertype_of_agrees_with_the_pair_form() {
         for a in lattice() {
             for b in lattice() {
-                if a == RockyType::Unknown || b == RockyType::Unknown {
-                    continue;
-                }
                 assert_eq!(
                     common_supertype_of(&[a.clone(), b.clone()]),
                     common_supertype(&a, &b).unwrap_or(RockyType::Unknown),

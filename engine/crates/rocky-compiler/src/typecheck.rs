@@ -23,7 +23,9 @@ use crate::diagnostic::{
 };
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
 use crate::semantic::{ModelSchema, SemanticGraph};
-use crate::types::{RockyType, TypedColumn};
+use crate::types::{
+    DecimalOp, RockyType, TypedColumn, arithmetic_result_type, common_supertype_of,
+};
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
 
@@ -3095,33 +3097,34 @@ fn infer_binary_op_type(
         // Boolean logic
         ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
 
-        // Date arithmetic is dialect-dependent: `DATE - DATE` is a BIGINT in
-        // DuckDB, an INTERVAL in Databricks, and `DATE - 5` is a DATE in
-        // DuckDB. `common_supertype` would call `DATE - DATE` a DATE.
-        // An `Unknown` operand may be a date too, so the result is unknown
-        // (`common_supertype` would take the other side's type).
-        ast::BinaryOperator::Plus | ast::BinaryOperator::Minus
-            if left_type.is_temporal()
-                || right_type.is_temporal()
-                || left_type == RockyType::Unknown
-                || right_type == RockyType::Unknown =>
-        {
-            (RockyType::Unknown, nullable)
-        }
-        // Arithmetic → numeric promotion
-        ast::BinaryOperator::Plus | ast::BinaryOperator::Minus | ast::BinaryOperator::Multiply => {
-            let result_type = crate::types::common_supertype(&left_type, &right_type)
-                .unwrap_or(RockyType::Unknown);
-            (result_type, nullable)
-        }
+        // Arithmetic: one rule per operator (ADR-TYPES §3). `+` adds a carry
+        // digit, `*` adds digits and scales, `/` is `Unknown`. Any operand
+        // that is not a number gives `Unknown`: date arithmetic is
+        // dialect-dependent (`DATE - DATE` is a BIGINT in DuckDB and an
+        // INTERVAL in Databricks), and an `Unknown` operand may be a date.
+        ast::BinaryOperator::Plus => (
+            arithmetic_result_type(DecimalOp::Add, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Minus => (
+            arithmetic_result_type(DecimalOp::Subtract, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Multiply => (
+            arithmetic_result_type(DecimalOp::Multiply, &left_type, &right_type),
+            nullable,
+        ),
         // Division and modulo by zero return NULL in several dialects (DuckDB,
         // Spark with ANSI mode off), so the result is nullable even over
         // non-null operands (#2295).
-        ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo => {
-            let result_type = crate::types::common_supertype(&left_type, &right_type)
-                .unwrap_or(RockyType::Unknown);
-            (result_type, true)
-        }
+        ast::BinaryOperator::Divide => (
+            arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type),
+            true,
+        ),
+        ast::BinaryOperator::Modulo => (
+            arithmetic_result_type(DecimalOp::Modulo, &left_type, &right_type),
+            true,
+        ),
         ast::BinaryOperator::DuckIntegerDivide | ast::BinaryOperator::MyIntegerDivide => {
             (RockyType::Unknown, true)
         }
@@ -3282,16 +3285,8 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             (arg_type, true)
         }
         "COALESCE" => {
-            let arg_types = all_arg_types(func, scope);
-            let result_type = arg_types
-                .iter()
-                .map(|(t, _)| t)
-                .try_fold(RockyType::Unknown, |acc, t| {
-                    crate::types::common_supertype(&acc, t)
-                })
-                .unwrap_or(RockyType::Unknown);
-            let all_nullable = arg_types.iter().all(|(_, n)| *n);
-            (result_type, all_nullable)
+            let (result_type, nullable) = infer_branch_set_type(function_branches(func), scope);
+            (result_type, nullable.all)
         }
 
         // Ranking window functions → always Int64
@@ -3364,14 +3359,7 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             (arg_type, true) // always nullable
         }
         "GREATEST" | "LEAST" => {
-            let arg_types = all_arg_types(func, scope);
-            let result_type = arg_types
-                .iter()
-                .map(|(t, _)| t)
-                .try_fold(RockyType::Unknown, |acc, t| {
-                    crate::types::common_supertype(&acc, t)
-                })
-                .unwrap_or(RockyType::Unknown);
+            let (result_type, _) = infer_branch_set_type(function_branches(func), scope);
             (result_type, true)
         }
 
@@ -3382,34 +3370,80 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
     }
 }
 
+/// The arguments of a function as branches of a set. An argument Rocky
+/// does not read as an expression (a named or wildcard argument) is `None`.
+fn function_branches(func: &ast::Function) -> Vec<Option<&Expr>> {
+    match &func.args {
+        ast::FunctionArguments::List(arg_list) => arg_list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Some(expr),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the branches of a set are nullable: `any` of them, or `all` of
+/// the ones Rocky reads.
+struct BranchNullability {
+    any: bool,
+    all: bool,
+}
+
+/// The type of a branch set (`COALESCE`, `CASE`, `GREATEST`, `LEAST`),
+/// unified as a set so the order of the branches cannot change it
+/// (ADR-TYPES §3, [`common_supertype_of`]).
+///
+/// A `NULL` literal adds only nullability, not a type (ADR-TYPES §2), so it
+/// is left out of the unification. A branch Rocky does not read is
+/// `Unknown`, which absorbs the set.
+fn infer_branch_set_type<'a>(
+    branches: impl IntoIterator<Item = Option<&'a Expr>>,
+    scope: &TypeScope,
+) -> (RockyType, BranchNullability) {
+    let mut types = Vec::new();
+    let mut nullability = BranchNullability {
+        any: false,
+        all: true,
+    };
+    for branch in branches {
+        let Some(expr) = branch else {
+            types.push(RockyType::Unknown);
+            continue;
+        };
+        let (ty, nullable) = infer_expr_type(expr, scope);
+        nullability.any |= nullable;
+        nullability.all &= nullable;
+        if !matches!(
+            strip_nested(expr),
+            Expr::Value(value) if matches!(value.value, ast::Value::Null)
+        ) {
+            types.push(ty);
+        }
+    }
+    (common_supertype_of(&types), nullability)
+}
+
 /// Infer the result type of a CASE WHEN expression.
 ///
-/// Folds the common supertype across all THEN branches and the optional
-/// ELSE branch. The result is nullable when any branch is nullable or
-/// when no ELSE clause is present.
+/// Unifies the THEN branches and the optional ELSE branch as a set. The
+/// result is nullable when any branch is nullable or when no ELSE clause is
+/// present.
 fn infer_case_type(
     conditions: &[ast::CaseWhen],
     else_result: &Option<Box<Expr>>,
     scope: &TypeScope,
 ) -> (RockyType, bool) {
-    let mut result_type = RockyType::Unknown;
-    let mut nullable = else_result.is_none(); // No ELSE → nullable
-
-    for case_when in conditions {
-        let (t, n) = infer_expr_type(&case_when.result, scope);
-        result_type =
-            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
-        nullable = nullable || n;
-    }
-
-    if let Some(else_expr) = else_result {
-        let (t, n) = infer_expr_type(else_expr, scope);
-        result_type =
-            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
-        nullable = nullable || n;
-    }
-
-    (result_type, nullable)
+    let branches = conditions
+        .iter()
+        .map(|case_when| Some(&case_when.result))
+        .chain(else_result.as_deref().map(Some));
+    let (result_type, nullable) = infer_branch_set_type(branches, scope);
+    // No ELSE → nullable
+    (result_type, nullable.any || else_result.is_none())
 }
 
 /// Whether `sql` contains a `UNION`, `INTERSECT` or `EXCEPT` keyword as a
@@ -3469,9 +3503,10 @@ fn cast_can_fail(
         ) => {
             // Safe only when no integer digit and no fractional digit is lost,
             // and only when the input's digits are read from the SQL: Rocky
-            // types `a * b` over two DECIMALs with the wider operand's digits,
-            // but the product can need more, and a non-ANSI cast of a value
-            // that does not fit returns NULL.
+            // types `a * b` over two DECIMALs with a bound on the exact
+            // product, which a warehouse may type narrower (DuckDB does, see
+            // `rocky-duckdb/tests/decimal_inference_conformance.rs`), and a
+            // non-ANSI cast of a value that does not fit returns NULL.
             let source_int_digits = i16::from(*sp) - i16::from(*ss);
             let target_int_digits = i16::from(*tp) - i16::from(*ts);
             !source_exact || target_int_digits < source_int_digits || ts < ss
@@ -6327,8 +6362,8 @@ mod tests {
             ("ABS(f)", RockyType::Float64, false),
             // not in the table: stay nullable
             ("NULLIF(x, 0)", i32t.clone(), true),
-            ("x / y", i32t.clone(), true),
-            ("x % y", i32t.clone(), true),
+            ("x / y", RockyType::Unknown, true),
+            ("x % y", RockyType::Int64, true),
             ("LEFT(n, 2)", s.clone(), true),
             ("REPLACE(n, 'a', 'b')", s.clone(), true),
             ("CONCAT_WS(',', n, n)", s.clone(), true),
@@ -10067,6 +10102,57 @@ mod tests {
             "{:?}",
             result.diagnostics
         );
+    }
+
+    /// The decimal algebra (ADR-TYPES §3) shapes expression inference, but
+    /// only exact types reach a model's typed columns: arithmetic is never
+    /// exact, and a `CASE` / `COALESCE` is exact only when its branches
+    /// already agree. So the new rules move no typed column type; they move
+    /// only the nullable bit of a cast over arithmetic (below).
+    #[test]
+    fn decimal_algebra_does_not_reach_typed_columns_through_arithmetic() {
+        let d = |precision, scale| RockyType::Decimal { precision, scale };
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[
+                ("a", d(10, 2), false),
+                ("b", d(10, 2), false),
+                ("e", d(10, 0), false),
+                ("f", d(10, 10), false),
+                ("i", RockyType::Int32, false),
+                ("x", RockyType::Float64, false),
+            ]),
+        )]);
+        let result = compile_typed(
+            &[(
+                "m",
+                "SELECT a * b AS product, a + b AS total, i + i AS ints, \
+                 COALESCE(e, f) AS widened, COALESCE(a, b) AS agreed, \
+                 CASE WHEN i > 0 THEN a ELSE NULL END AS a_or_null, \
+                 CAST(x * a AS DOUBLE) AS float_cast, CAST(i + i AS INT) AS int_cast \
+                 FROM raw.t",
+            )],
+            sources,
+        );
+        let ty = |name: &str| column(&result, "m", name).data_type.clone();
+        assert_eq!(ty("product"), RockyType::Unknown);
+        assert_eq!(ty("total"), RockyType::Unknown);
+        assert_eq!(ty("ints"), RockyType::Unknown);
+        assert_eq!(ty("widened"), RockyType::Unknown);
+        assert_eq!(ty("agreed"), d(10, 2));
+        assert_eq!(ty("a_or_null"), d(10, 2));
+        assert!(column(&result, "m", "a_or_null").nullable);
+        // The one place the algebra reaches a typed column: the nullable bit
+        // of a cast over arithmetic, through `cast_can_fail`. `DOUBLE *
+        // DECIMAL` is now `Float64` (it was `Unknown`), so a cast of it to
+        // `DOUBLE` cannot fail and the column is non-null (it was nullable).
+        // `INT + INT` is now `BIGINT`, so a cast of it to `INT` can fail.
+        let float_cast = column(&result, "m", "float_cast");
+        assert_eq!(
+            (&float_cast.data_type, float_cast.nullable),
+            (&RockyType::Float64, false)
+        );
+        assert!(column(&result, "m", "int_cast").nullable);
     }
 
     #[test]
