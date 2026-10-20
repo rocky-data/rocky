@@ -9,7 +9,7 @@
 //! It reads only `rocky.toml` and the model files: no adapter registry, so
 //! the adapter-free `rocky-lsp` binary can use it too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig, TransformationPipelineConfig};
@@ -311,7 +311,9 @@ impl ModelRegions {
     /// The regions of `table`, a table that is not a project model, named
     /// `<schema>.<table>` or `<catalog>.<schema>.<table>`.
     ///
-    /// The last two dot-separated parts are the schema and the table. The
+    /// The last two dot-separated parts are the schema and the table, so a
+    /// schema name that holds a `.` (a `source.schema_pattern` with
+    /// `separator = "."`, for example) is not matched. The
     /// name is compared as given: no quote is removed. The names the AI
     /// commands pass come from the schema cache, whose keys are the
     /// warehouse's own names, lowercased and unquoted.
@@ -468,10 +470,13 @@ fn lowercase_pattern(pattern: SchemaPattern) -> SchemaPattern {
 /// no `}` after it is literal text, as rendering treats it.
 ///
 /// A hand-written matcher, not a regex, so building one cannot fail: every
-/// template has a pattern, and no fallback is needed.
+/// template has a pattern, and no fallback is needed. The search remembers
+/// each `(literal, offset)` pair that failed, so it takes at most about
+/// `k * n^2` steps for `k` placeholders over a name of `n` bytes, not an
+/// exponential number.
 struct SchemaTemplate {
     /// The literal text around the placeholders, lowercased. `n` pieces have
-    /// `n - 1` placeholders between them.
+    /// `n - 1` placeholders between them. Never empty.
     literals: Vec<String>,
 }
 
@@ -491,27 +496,42 @@ impl SchemaTemplate {
     }
 
     fn matches(&self, schema: &str) -> bool {
-        matches_literals(&self.literals, &schema.to_ascii_lowercase())
+        let text = schema.to_ascii_lowercase();
+        let mut failed = HashSet::new();
+        matches_from(&self.literals, 0, &text, 0, &mut failed)
     }
 }
 
-/// Whether `text` is `literals[0]`, then for each later literal a run of
-/// text with no `.` followed by that literal.
-fn matches_literals(literals: &[String], text: &str) -> bool {
-    let Some((first, later)) = literals.split_first() else {
-        return text.is_empty();
-    };
-    let Some(rest) = text.strip_prefix(first.as_str()) else {
+/// Whether `text[at..]` is `literals[index]`, then for each later literal a
+/// run of text with no `.` followed by that literal. `index` is in bounds.
+/// Records each `(index, at)` that fails in `failed`, so no pair is searched
+/// twice.
+fn matches_from(
+    literals: &[String],
+    index: usize,
+    text: &str,
+    at: usize,
+    failed: &mut HashSet<(usize, usize)>,
+) -> bool {
+    if failed.contains(&(index, at)) {
         return false;
-    };
-    if later.is_empty() {
-        return rest.is_empty();
     }
-    // The placeholder takes `rest[..end]`: any prefix with no `.`.
-    let limit = rest.find('.').unwrap_or(rest.len());
-    (0..=limit)
-        .filter(|&end| rest.is_char_boundary(end))
-        .any(|end| matches_literals(later, &rest[end..]))
+    let found = match text[at..].strip_prefix(literals[index].as_str()) {
+        None => false,
+        Some(rest) if index + 1 == literals.len() => rest.is_empty(),
+        Some(rest) => {
+            let start = text.len() - rest.len();
+            // The placeholder takes `rest[..end]`: any prefix with no `.`.
+            let limit = rest.find('.').unwrap_or(rest.len());
+            (0..=limit)
+                .filter(|&end| rest.is_char_boundary(end))
+                .any(|end| matches_from(literals, index + 1, text, start + end, failed))
+        }
+    };
+    if !found {
+        failed.insert((index, at));
+    }
+    found
 }
 
 fn push_unique_region(list: &mut Vec<Option<String>>, region: &Option<String>) {
@@ -768,6 +788,8 @@ mod tests {
 
     #[test]
     fn a_schema_template_matches_literals_as_written_and_placeholders_without_a_dot() {
+        // The matcher alone. `for_table` splits a name on `.`, so it never
+        // passes a schema that holds a dot: such a schema is not matched.
         let t = SchemaTemplate::new("raw.x__{source}");
         assert!(t.matches("raw.x__crm"));
         assert!(!t.matches("rawXx__crm"), "the `.` is a literal");
@@ -792,6 +814,18 @@ mod tests {
         // No placeholder: the whole name is literal.
         assert!(SchemaTemplate::new("raw").matches("RAW"));
         assert!(!SchemaTemplate::new("raw").matches("raw2"));
+    }
+
+    /// Many placeholders over a long name that does not match. Without the
+    /// memo of failed `(literal, offset)` pairs, this search tries every way
+    /// to split the name and does not finish.
+    #[test]
+    fn a_schema_template_with_many_placeholders_fails_fast() {
+        let t = SchemaTemplate::new(&format!("{}!", "{p}_".repeat(30)));
+        assert!(!t.matches(&"_".repeat(200)));
+        let t = SchemaTemplate::new(&"{p}".repeat(30));
+        assert!(t.matches(&"x".repeat(200)));
+        assert!(!t.matches(&format!("{}.", "x".repeat(200))));
     }
 
     /// The scenario of the red-team finding: a replication copies EU
