@@ -47,7 +47,7 @@ Each derived-model asset gets:
   in asset selection: `dagster asset materialize --select tag:domain=finance`.
 - **Kinds:** `{"rocky", "model"}` for UI badges.
 - **Freshness policy:** from the model's `[freshness]` block
-  (`expected_lag_seconds`, or the legacy `max_lag_seconds`). See
+  (`warn_after` / `error_after`). See
   [Freshness policies](/dagster/freshness/#per-model-freshness).
 - **Partitions definition:** from the model's `time_interval` strategy
   via `partitions_def_for_model_detail`. `None` for every other strategy.

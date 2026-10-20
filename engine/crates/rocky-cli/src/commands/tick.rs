@@ -306,7 +306,12 @@ fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Res
     }
     Ok(models
         .iter()
-        .filter_map(|m| m.config.freshness.as_ref().map(|f| f.max_lag_seconds))
+        .filter_map(|m| {
+            m.config
+                .freshness
+                .as_ref()
+                .and_then(rocky_core::models::ModelFreshnessConfig::budget_seconds)
+        })
         .collect())
 }
 

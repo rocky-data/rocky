@@ -632,6 +632,7 @@ span, and sometimes a suggested fix.
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
+| `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

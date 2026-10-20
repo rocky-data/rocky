@@ -20,7 +20,7 @@ echo "    W005 count: $(w005_count expected/compile-warn.json)"
 echo
 
 echo "=== Step 2: compile with -c rocky-project-freshness.toml (project default set) ==="
-echo "    project [freshness] expected_lag_seconds -> W005 suppressed for every model"
+echo "    project [freshness] warn_after -> W005 suppressed for every model"
 rocky -c rocky-project-freshness.toml compile --with-seed --models models --output json \
     > expected/compile-clean.json 2>/dev/null
 echo "    W005 count: $(w005_count expected/compile-clean.json)"

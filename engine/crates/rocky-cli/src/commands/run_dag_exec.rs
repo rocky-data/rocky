@@ -656,7 +656,10 @@ pub async fn run_with_dag_and_contracts(
             "[rocky] DAG run interrupted: {not_started} of {} node(s) not started",
             result.total_nodes
         );
-        return Err(anyhow::Error::new(super::run::Interrupted));
+        // A DAG run writes no run record of its own.
+        return Err(anyhow::Error::new(super::run::Interrupted {
+            custody: super::run::RecordCustody::Lost,
+        }));
     }
     if result.had_failures() {
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);

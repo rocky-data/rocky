@@ -8525,8 +8525,15 @@
       },
       "FreshnessConfig": {
         "additionalProperties": false,
-        "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
+        "description": "Freshness check configuration.\n\n`warn_after` / `error_after` apply to every checked table: a table older than `error_after` fails the check at error severity, one older than `warn_after` fails it at warning severity.\n\n`threshold_seconds` + `severity` is the deprecated spelling. It still parses and behaves as before (`rocky validate` reports W058): the one value is the error level, or the warn level under `severity = \"warning\"`. Mixing it with `warn_after` / `error_after` is refused.\n\nThere used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).\n\nSerialization is hand-written so a deprecated block serializes exactly as it did before the new keys existed (plan ids hash it), and a new one carries no `severity` it never had.",
         "properties": {
+          "error_after": {
+            "description": "Age above which the check fails at error severity (`\"24h\"`). Must not be shorter than `warn_after`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "severity": {
             "allOf": [
               {
@@ -8534,23 +8541,32 @@
               }
             ],
             "default": "error",
-            "description": "Severity reported when freshness lag exceeds the threshold."
+            "description": "Deprecated, only with `threshold_seconds`: severity reported when freshness lag exceeds the threshold. Defaults to `error`."
           },
           "threshold_seconds": {
+            "description": "Deprecated: write `warn_after` / `error_after`. Maximum lag in seconds before the check fails.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "warn_after": {
+            "description": "Age above which the check fails at warning severity (`\"12h\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
-        "required": [
-          "threshold_seconds"
-        ],
         "type": "object"
       },
       "FreshnessConfigOutput": {
         "description": "Freshness check configuration projected into the discover output.\n\nJust the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).",
         "properties": {
           "threshold_seconds": {
+            "description": "The age in seconds at which the check first fails: the smaller of `warn_after` / `error_after` (the deprecated `threshold_seconds` when the block uses it).",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -8626,9 +8642,19 @@
         "additionalProperties": false,
         "description": "Declared freshness: the lag budget plus the column that witnesses it.\n\n`time_column` is required. Without it the observation-phase staleness check (`MAX(time_column)` against the budget) has nothing to read, and freshness would be a claim with no witness.",
         "properties": {
+          "error_after": {
+            "description": "Age above which the output reports `error`. Must not be shorter than `warn_after`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "max_lag": {
-            "description": "Lag budget in the duration grammar (`\"24h\"`).",
-            "type": "string"
+            "description": "Deprecated: write `warn_after` / `error_after`. Lag budget in the duration grammar (`\"24h\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "severity": {
             "anyOf": [
@@ -8639,15 +8665,21 @@
                 "type": "null"
               }
             ],
-            "description": "Optional severity for the staleness report."
+            "description": "Deprecated, only with `max_lag`: severity for the staleness report."
           },
           "time_column": {
             "description": "The timestamp column the staleness check reads.",
             "type": "string"
+          },
+          "warn_after": {
+            "description": "Age above which the output reports `warn` (`\"12h\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "max_lag",
           "time_column"
         ],
         "type": "object"
@@ -13033,13 +13065,23 @@
         "type": "object"
       },
       "ModelFreshnessConfig": {
-        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = \"error\"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
+        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces it at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn` past `warn_after`, `error` past `error_after`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).\n\n`max_lag_seconds` (alias `expected_lag_seconds`) + `severity` is the deprecated spelling. It still parses and behaves as before (`rocky validate` reports W058): the one value is the error level under `severity = \"error\"`, else the warn level. It is stored as written, never converted, because each model's whole config is hashed into plan ids. Read the levels through [`Self::thresholds`].",
         "properties": {
+          "error_after": {
+            "description": "Age above which the model reports `error` and `rocky freshness` exits 1. Must not be shorter than `warn_after`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "max_lag_seconds": {
-            "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
+            "description": "Deprecated: write `warn_after` / `error_after`. Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` and `expected_lag_seconds`. Both deserialize to this field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "severity": {
             "anyOf": [
@@ -13050,7 +13092,7 @@
                 "type": "null"
               }
             ],
-            "description": "Severity reported when the freshness check trips. Default `warning` keeps the runtime check non-blocking — switch to `error` to fail the pipeline on stale data."
+            "description": "Deprecated, only with `max_lag_seconds`: severity reported when the freshness check trips. Default `warning`."
           },
           "time_column": {
             "description": "Optional timestamp column used to evaluate freshness at runtime (`MAX(time_column) < NOW() - INTERVAL max_lag_seconds`). When unset the runtime falls back to the model's last-materialization timestamp from the state store.",
@@ -13058,11 +13100,15 @@
               "string",
               "null"
             ]
+          },
+          "warn_after": {
+            "description": "Age above which the model reports `warn` (`\"1h\"`, `\"7d\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
-        "required": [
-          "max_lag_seconds"
-        ],
         "type": "object"
       },
       "ModelHistoryOutput": {
@@ -17847,10 +17893,17 @@
       },
       "ProjectFreshnessConfig": {
         "additionalProperties": false,
-        "description": "Project-level freshness defaults.\n\nTop-level `[freshness]` block on `rocky.toml`. A model that declares no [`crate::models::ModelFreshnessConfig`] of its own, and sits under no `_defaults.toml` that declares one, inherits this block **whole** (see [`crate::models::ModelFreshnessConfig::from_project_default`]). Inheritance is not field-by-field: a model that declares its own block keeps exactly what it wrote. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).\n\nAll fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` supplies nothing at all: it is \"no project default\" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete TTL.",
+        "description": "Project-level freshness defaults.\n\nTop-level `[freshness]` block on `rocky.toml`. A model that declares no [`crate::models::ModelFreshnessConfig`] of its own, and sits under no `_defaults.toml` that declares one, inherits this block **whole** (see [`crate::models::ModelFreshnessConfig::from_project_default`]). Inheritance is not field-by-field: a model that declares its own block keeps exactly what it wrote. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).\n\nAll fields are optional. A project-level `[freshness]` with neither `warn_after` nor `error_after` (nor the deprecated `expected_lag_seconds`) supplies nothing at all: it is \"no project default\" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete threshold.\n\n`expected_lag_seconds` and `severity` are the deprecated spelling. They still parse and behave as before (`rocky validate` reports W058): the one value is the error level under `severity = \"error\"`, else the warn level. A block that mixes them with `warn_after` / `error_after` is refused.",
         "properties": {
+          "error_after": {
+            "description": "Default age above which a model reports `error` and `rocky freshness` exits 1. Must not be shorter than `warn_after`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expected_lag_seconds": {
-            "description": "Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value and the other fields alongside it. When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata, and the other two fields here are inherited by nobody.",
+            "description": "Deprecated: write `warn_after` / `error_after`. Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value and the other fields alongside it.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -17867,10 +17920,17 @@
                 "type": "null"
               }
             ],
-            "description": "Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1."
+            "description": "Deprecated, only with `expected_lag_seconds`: severity reported when the freshness check trips. Under `error`, a stale model makes `rocky freshness` exit 1."
           },
           "time_column": {
             "description": "Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warn_after": {
+            "description": "Default age above which a model reports `warn` (`\"12h\"`, `\"7d\"`). Inherited, with `error_after` and `time_column`, by every model with no `[freshness]` block of its own.",
             "type": [
               "string",
               "null"
@@ -20550,7 +20610,7 @@
               }
             ],
             "default": {},
-            "description": "Project-level freshness defaults. See [`ProjectFreshnessConfig`] for the TOML shape:\n\n```toml [freshness] expected_lag_seconds = 3600 time_column = \"updated_at\" severity = \"warning\" ```\n\nPrecedence, first match wins: a model's own `[freshness]` sidecar table, then its directory `_defaults.toml`, then this block. Inheritance is **whole-block**: a model that declares its own table keeps exactly what it wrote and picks up nothing from here. This block is inherited only when it carries an `expected_lag_seconds`."
+            "description": "Project-level freshness defaults. See [`ProjectFreshnessConfig`] for the TOML shape:\n\n```toml [freshness] warn_after = \"1h\" time_column = \"updated_at\" ```\n\nPrecedence, first match wins: a model's own `[freshness]` sidecar table, then its directory `_defaults.toml`, then this block. Inheritance is **whole-block**: a model that declares its own table keeps exactly what it wrote and picks up nothing from here. This block is inherited only when it carries a level (`warn_after`, `error_after`, or the deprecated `expected_lag_seconds`)."
           },
           "fulfill": {
             "allOf": [

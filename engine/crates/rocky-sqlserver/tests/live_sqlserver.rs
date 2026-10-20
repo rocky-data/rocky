@@ -487,6 +487,64 @@ async fn merge_upserts_with_cte_source() {
     assert_eq!(count(&a, &tgt).await, "4");
 }
 
+/// #2441: target-watermark recovery assumes a failed replication copy leaves
+/// no rows behind. The copy is the held-back INSERT that
+/// `sql_gen::generate_held_back_insert_sql` builds: one `INSERT … SELECT`,
+/// failed here on its last row. The target's row count and `MAX(ts)` must be
+/// what they were before, so the next run re-derives the old watermark.
+#[tokio::test]
+async fn a_failed_replication_copy_leaves_no_rows() {
+    let s = "rocky_live_copy_atomic";
+    let Some(a) = setup(s).await else {
+        return;
+    };
+    let d = a.dialect();
+    let src = d.format_table_ref("", s, "src").unwrap();
+    let tgt = d.format_table_ref("", s, "tgt").unwrap();
+    let bad = d.format_table_ref("", s, "src_bad").unwrap();
+    a.execute_statement(&format!(
+        "CREATE TABLE {src} (id INT, amount INT, _synced DATETIME2(7)); \
+         INSERT INTO {src} VALUES (1, 10, '2026-01-01'), (2, 20, '2026-01-02'), \
+         (3, 30, '2026-01-03'), (4, 40, '2026-01-04'), (5, 50, '2026-01-05'); \
+         SELECT * INTO {tgt} FROM {src} WHERE id = 1"
+    ))
+    .await
+    .unwrap();
+    // `CREATE VIEW` must be the only statement in its batch.
+    a.execute_statement(&format!(
+        "CREATE VIEW {bad} AS SELECT id, amount / (4 - id) AS amount, _synced FROM {src}"
+    ))
+    .await
+    .unwrap();
+    let watermark = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let held_max = watermark + chrono::Duration::days(4);
+    let select = d.select_clause(&ColumnSelection::All, &[]).unwrap();
+    let wh = d.watermark_where("_synced", Some(&watermark)).unwrap();
+    let bound = d
+        .watermark_hold_back(
+            "_synced",
+            &held_max,
+            rocky_core::traits::NullTimestamps::Exclude,
+        )
+        .unwrap();
+    // Rows 2 and 3 select cleanly; row 4 divides by zero.
+    let copy = d.insert_into(&tgt, &format!("{select}\nFROM {bad}\n{wh} AND {bound}"));
+    assert!(a.execute_statement(&copy).await.is_err());
+    assert_eq!(
+        count(&a, &tgt).await,
+        "1",
+        "a failed copy must leave no rows"
+    );
+    let max = scalar(&a, &format!("SELECT MAX(_synced) FROM {tgt}"))
+        .await
+        .unwrap();
+    assert!(max.starts_with("2026-01-01 00:00:00"), "{max}");
+}
+
 #[tokio::test]
 async fn delete_insert_and_time_interval_are_atomic() {
     let s = "rocky_live_di";

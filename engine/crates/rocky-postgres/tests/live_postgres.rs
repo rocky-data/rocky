@@ -634,6 +634,62 @@ async fn delete_insert_is_atomic() {
     );
 }
 
+/// #2441: target-watermark recovery assumes a failed replication copy leaves
+/// no rows behind. The copy is the held-back INSERT that
+/// `sql_gen::generate_held_back_insert_sql` builds: one `INSERT … SELECT`,
+/// failed here on its last row. The target's row count and `MAX(ts)` must be
+/// what they were before, so the next run re-derives the old watermark.
+#[tokio::test]
+async fn a_failed_replication_copy_leaves_no_rows() {
+    let s = "rocky_live_copy_atomic";
+    let Some(a) = setup(s, MergeMode::Merge).await else {
+        return;
+    };
+    a.execute_statement(&format!(
+        "CREATE TABLE {s}.src (id INTEGER, amount INTEGER, _synced TIMESTAMP); \
+         INSERT INTO {s}.src VALUES (1, 10, '2026-01-01'), (2, 20, '2026-01-02'), \
+         (3, 30, '2026-01-03'), (4, 40, '2026-01-04'), (5, 50, '2026-01-05'); \
+         CREATE TABLE {s}.tgt AS SELECT * FROM {s}.src WHERE id = 1; \
+         CREATE VIEW {s}.src_bad AS SELECT id, amount / (4 - id) AS amount, _synced FROM {s}.src"
+    ))
+    .await
+    .unwrap();
+    let d = a.dialect();
+    let tgt = d.format_table_ref("", s, "tgt").unwrap();
+    let src = d.format_table_ref("", s, "src_bad").unwrap();
+    let watermark = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let held_max = watermark + chrono::Duration::days(4);
+    let select = d.select_clause(&ColumnSelection::All, &[]).unwrap();
+    let wh = d.watermark_where("_synced", Some(&watermark)).unwrap();
+    let bound = d
+        .watermark_hold_back(
+            "_synced",
+            &held_max,
+            rocky_core::traits::NullTimestamps::Exclude,
+        )
+        .unwrap();
+    // Rows 2 and 3 select cleanly; row 4 divides by zero.
+    let copy = d.insert_into(&tgt, &format!("{select}\nFROM {src}\n{wh} AND {bound}"));
+    assert!(a.execute_statement(&copy).await.is_err());
+    assert_eq!(
+        scalar(&a, &format!("SELECT count(*) FROM {tgt}"))
+            .await
+            .as_deref(),
+        Some("1"),
+        "a failed copy must leave no rows"
+    );
+    assert_eq!(
+        scalar(&a, &format!("SELECT MAX(_synced) FROM {tgt}"))
+            .await
+            .as_deref(),
+        Some("2026-01-01 00:00:00")
+    );
+}
+
 /// The generic SCD2 snapshot SQL runs on PostgreSQL 15+: bootstrap, close a
 /// changed row, insert its new version, invalidate a hard delete.
 #[tokio::test]

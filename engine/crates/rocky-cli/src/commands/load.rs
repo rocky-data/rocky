@@ -498,8 +498,13 @@ pub async fn run_load(
     }
 
     // An interrupted load exits 130 whatever else failed, as `rocky run` does.
+    // A load writes no run record; its loaded-file ledger rides the upload
+    // above.
     if interrupted {
-        return Err(super::run::Interrupted.into());
+        return Err(super::run::Interrupted {
+            custody: super::run::RecordCustody::Lost,
+        }
+        .into());
     }
     if files_failed > 0 {
         bail!("{files_failed} file(s) failed to load");

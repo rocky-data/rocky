@@ -82,7 +82,7 @@ The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed tha
       "name": "fct_revenue",
       "strategy": { "type": "full_refresh" },
       "target": { "catalog": "acme_warehouse", "schema": "gold", "table": "fct_revenue" },
-      "freshness": { "max_lag_seconds": 86400, "time_column": "order_date", "severity": "warning" },
+      "freshness": { "time_column": "order_date", "warn_after": "24h" },
       "contract_source": "auto",
       "cost_hint": {
         "estimated_rows": 10000,

@@ -79,15 +79,18 @@ pub enum ScheduleConfigError {
     BadCatchup(String),
     /// `freshness = true` but no budget was resolvable anywhere.
     #[error(
-        "freshness is enabled but no budget is resolvable — set a model \
-         `max_lag_seconds` or the project `[freshness] expected_lag_seconds`"
+        "freshness is enabled but no budget is resolvable — set `warn_after` or \
+         `error_after` in a model `[freshness]` block or the project `[freshness]` block"
     )]
     FreshnessNoBudget,
 }
 
 /// Resolve the freshness budget for a pipeline: the minimum of its member
-/// models' declared `max_lag_seconds`, falling back to the project
-/// `expected_lag_seconds`. `member_max_lags` holds only the members that
+/// models' budgets, falling back to the project budget. A block's budget is
+/// the smaller of its `warn_after` / `error_after` levels
+/// ([`crate::source_freshness::FreshnessThresholds::budget_seconds`]); a
+/// deprecated `max_lag_seconds` / `expected_lag_seconds` is its one level, so
+/// its budget is that value, as before. `member_max_lags` holds only the members that
 /// declare a budget (empty for pipeline types with no such models, e.g.
 /// replication), so the project default is the honest budget there.
 pub fn resolve_freshness_budget(

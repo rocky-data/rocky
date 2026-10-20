@@ -768,9 +768,61 @@ class ModelFreshnessConfig(BaseModel):
     side. ``rocky freshness`` enforces it against the warehouse (see
     :meth:`rocky_sdk.RockyClient.freshness`); ``dagster-rocky`` also reads it
     from the compile JSON output to attach a ``FreshnessPolicy``.
+
+    A model written in the current grammar carries ``warn_after`` /
+    ``error_after`` duration strings (``"12h"``, ``"7d"``). One written in the
+    deprecated spelling carries ``max_lag_seconds`` instead. Read the one
+    number either way through :meth:`budget_seconds`.
     """
 
-    max_lag_seconds: int
+    max_lag_seconds: int | None = None
+    time_column: str | None = None
+    severity: str | None = None
+    warn_after: str | None = None
+    error_after: str | None = None
+
+    def budget_seconds(self) -> int | None:
+        """Seconds until the model first reports stale: the smaller level."""
+        return freshness_budget_seconds(self)
+
+
+def freshness_budget_seconds(freshness: object) -> int | None:
+    """Seconds until a model's ``[freshness]`` block first reports stale.
+
+    Mirrors ``FreshnessThresholds::budget_seconds`` in the engine: the smaller
+    of ``warn_after`` / ``error_after``, or the deprecated
+    ``max_lag_seconds`` when the block uses it. Takes the hand-written
+    :class:`ModelFreshnessConfig` or a generated model of the same shape.
+    """
+    max_lag_seconds = getattr(freshness, "max_lag_seconds", None)
+    if max_lag_seconds is not None:
+        return int(max_lag_seconds)
+    levels = [
+        seconds
+        for seconds in (
+            _duration_seconds(getattr(freshness, "warn_after", None)),
+            _duration_seconds(getattr(freshness, "error_after", None)),
+        )
+        if seconds is not None
+    ]
+    return min(levels) if levels else None
+
+
+_DURATION_UNITS = {"s": 1, "h": 3_600, "d": 86_400}
+
+
+def _duration_seconds(raw: str | None) -> int | None:
+    """Parse the engine's freshness duration grammar (``"12h"``) to seconds.
+
+    A positive integer and one unit of ``s``, ``h`` or ``d``. Anything else
+    is ``None``: the engine already refused it before writing the JSON.
+    """
+    if not raw or raw[-1] not in _DURATION_UNITS:
+        return None
+    digits = raw[:-1]
+    if not digits.isascii() or not digits.isdigit() or digits.startswith("0"):
+        return None
+    return int(digits) * _DURATION_UNITS[raw[-1]]
 
 
 class ModelDetail(BaseModel):

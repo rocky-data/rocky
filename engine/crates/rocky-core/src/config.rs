@@ -1635,19 +1635,24 @@ fn default_suffix_quarantine() -> String {
 /// [`ChecksConfig::freshness`](FreshnessConfig) check (which lives
 /// under `[checks.freshness]` and feeds the data-quality test pipeline).
 ///
-/// All fields are optional. A project-level `[freshness]` with no
-/// `expected_lag_seconds` supplies nothing at all: it is "no project
+/// All fields are optional. A project-level `[freshness]` with neither
+/// `warn_after` nor `error_after` (nor the deprecated
+/// `expected_lag_seconds`) supplies nothing at all: it is "no project
 /// default" for the W005 soft-warn, and it is not inherited, because a
-/// model freshness block needs a concrete TTL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+/// model freshness block needs a concrete threshold.
+///
+/// `expected_lag_seconds` and `severity` are the deprecated spelling. They
+/// still parse and behave as before (`rocky validate` reports W058): the one
+/// value is the error level under `severity = "error"`, else the warn
+/// level. A block that mixes them with `warn_after` / `error_after` is
+/// refused.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectFreshnessConfig {
-    /// Default maximum lag in seconds before models are considered
-    /// stale. When set, every model without its own `freshness` block
-    /// inherits this value and the other fields alongside it. When
-    /// `None`, no project-level default applies — per-model declarations
-    /// are the only source of freshness metadata, and the other two
-    /// fields here are inherited by nobody.
+    /// Deprecated: write `warn_after` / `error_after`. Default maximum lag in
+    /// seconds before models are considered stale. When set, every model
+    /// without its own `freshness` block inherits this value and the other
+    /// fields alongside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_lag_seconds: Option<u64>,
     /// Default timestamp column used to evaluate freshness at runtime.
@@ -1659,36 +1664,219 @@ pub struct ProjectFreshnessConfig {
     /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
-    /// Default severity reported when the freshness check trips.
-    /// Inherited on the same terms as `time_column`. Under `error`, a stale
-    /// model makes `rocky freshness` exit 1.
+    /// Deprecated, only with `expected_lag_seconds`: severity reported when
+    /// the freshness check trips. Under `error`, a stale model makes
+    /// `rocky freshness` exit 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
+    /// Default age above which a model reports `warn` (`"12h"`, `"7d"`).
+    /// Inherited, with `error_after` and `time_column`, by every model with
+    /// no `[freshness]` block of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_after: Option<String>,
+    /// Default age above which a model reports `error` and `rocky
+    /// freshness` exits 1. Must not be shorter than `warn_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_after: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ProjectFreshnessConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            expected_lag_seconds: Option<u64>,
+            #[serde(default)]
+            time_column: Option<String>,
+            #[serde(default)]
+            severity: Option<crate::tests::TestSeverity>,
+            #[serde(default)]
+            warn_after: Option<String>,
+            #[serde(default)]
+            error_after: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut old = Vec::new();
+        if raw.expected_lag_seconds.is_some() {
+            old.push("expected_lag_seconds");
+        }
+        if raw.severity.is_some() {
+            old.push("severity");
+        }
+        let new_form = raw.warn_after.is_some() || raw.error_after.is_some();
+        if new_form && !old.is_empty() {
+            return Err(serde::de::Error::custom(
+                crate::source_freshness::mixed_spelling_message(&old),
+            ));
+        }
+        // A project block with no level stays valid: it supplies nothing,
+        // exactly as a block without `expected_lag_seconds` always did.
+        if new_form
+            && let Err(problems) = crate::source_freshness::parse_levels(
+                raw.warn_after.as_deref(),
+                raw.error_after.as_deref(),
+            )
+        {
+            return Err(serde::de::Error::custom(
+                crate::source_freshness::problems_message(&problems),
+            ));
+        }
+        Ok(ProjectFreshnessConfig {
+            expected_lag_seconds: raw.expected_lag_seconds,
+            time_column: raw.time_column,
+            severity: raw.severity,
+            warn_after: raw.warn_after,
+            error_after: raw.error_after,
+        })
+    }
 }
 
 impl ProjectFreshnessConfig {
+    /// The default thresholds this block hands an inheriting model.
+    ///
+    /// The deprecated `expected_lag_seconds` maps through
+    /// [`crate::source_freshness::FreshnessThresholds::from_single`] with
+    /// the severity it is inherited with (`warning` when unset), which is
+    /// how `rocky freshness` graded an inheriting model before.
+    pub fn thresholds(&self) -> crate::source_freshness::FreshnessThresholds {
+        match self.expected_lag_seconds {
+            Some(seconds) => crate::source_freshness::FreshnessThresholds::from_single(
+                seconds,
+                self.severity.unwrap_or(crate::tests::TestSeverity::Warning),
+            ),
+            None => crate::source_freshness::levels_of(
+                self.warn_after.as_deref(),
+                self.error_after.as_deref(),
+            ),
+        }
+    }
+
+    /// The project schedule budget: the smaller level present.
+    pub fn budget_seconds(&self) -> Option<u64> {
+        self.thresholds().budget_seconds()
+    }
+
     /// True when the project carries an actionable freshness default
-    /// (an `expected_lag_seconds` value). The W005 compile-time soft
-    /// warn treats a model as covered if either the model itself or
-    /// the project supplies a TTL.
+    /// (a level, or the deprecated `expected_lag_seconds`). The W005
+    /// compile-time soft warn treats a model as covered if either the
+    /// model itself or the project supplies one.
     pub fn has_default(&self) -> bool {
-        self.expected_lag_seconds.is_some()
+        self.budget_seconds().is_some()
+    }
+
+    /// The deprecated keys this block uses, in the order they are reported.
+    pub fn legacy_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.expected_lag_seconds.is_some() {
+            keys.push("expected_lag_seconds");
+        }
+        if self.severity.is_some() {
+            keys.push("severity");
+        }
+        keys
     }
 }
 
 /// Freshness check configuration.
 ///
-/// A single scalar `threshold_seconds` applies to every checked table.
+/// `warn_after` / `error_after` apply to every checked table: a table older
+/// than `error_after` fails the check at error severity, one older than
+/// `warn_after` fails it at warning severity.
+///
+/// `threshold_seconds` + `severity` is the deprecated spelling. It still
+/// parses and behaves as before (`rocky validate` reports W058): the one
+/// value is the error level, or the warn level under `severity =
+/// "warning"`. Mixing it with `warn_after` / `error_after` is refused.
+///
 /// There used to be an `overrides` key for per-schema thresholds; it parsed
 /// and validated but nothing on the check path ever read it, so it is now
 /// refused with a message naming the remedy (#1620).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+///
+/// Serialization is hand-written so a deprecated block serializes exactly
+/// as it did before the new keys existed (plan ids hash it), and a new one
+/// carries no `severity` it never had.
+#[derive(Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessConfig {
-    pub threshold_seconds: u64,
-    /// Severity reported when freshness lag exceeds the threshold.
+    /// Deprecated: write `warn_after` / `error_after`. Maximum lag in
+    /// seconds before the check fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_seconds: Option<u64>,
+    /// Deprecated, only with `threshold_seconds`: severity reported when
+    /// freshness lag exceeds the threshold. Defaults to `error`.
     #[serde(default)]
     pub severity: crate::tests::TestSeverity,
+    /// Age above which the check fails at warning severity (`"12h"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_after: Option<String>,
+    /// Age above which the check fails at error severity (`"24h"`). Must
+    /// not be shorter than `warn_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_after: Option<String>,
+}
+
+impl Serialize for FreshnessConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.threshold_seconds {
+            Some(threshold_seconds) => {
+                let mut s = serializer.serialize_struct("FreshnessConfig", 2)?;
+                s.serialize_field("threshold_seconds", &threshold_seconds)?;
+                s.serialize_field("severity", &self.severity)?;
+                s.end()
+            }
+            None => {
+                let len = usize::from(self.warn_after.is_some())
+                    + usize::from(self.error_after.is_some());
+                let mut s = serializer.serialize_struct("FreshnessConfig", len)?;
+                if let Some(warn_after) = &self.warn_after {
+                    s.serialize_field("warn_after", warn_after)?;
+                }
+                if let Some(error_after) = &self.error_after {
+                    s.serialize_field("error_after", error_after)?;
+                }
+                s.end()
+            }
+        }
+    }
+}
+
+impl FreshnessConfig {
+    /// The levels the check grades against — the one shape `rocky run`
+    /// reads, whichever spelling the block used.
+    pub fn thresholds(&self) -> crate::source_freshness::FreshnessThresholds {
+        match self.threshold_seconds {
+            Some(seconds) => {
+                crate::source_freshness::FreshnessThresholds::from_single(seconds, self.severity)
+            }
+            None => crate::source_freshness::levels_of(
+                self.warn_after.as_deref(),
+                self.error_after.as_deref(),
+            ),
+        }
+    }
+
+    /// Build a block in the current grammar.
+    pub fn levels(warn_after: Option<&str>, error_after: Option<&str>) -> Self {
+        Self {
+            threshold_seconds: None,
+            severity: crate::tests::TestSeverity::default(),
+            warn_after: warn_after.map(str::to_string),
+            error_after: error_after.map(str::to_string),
+        }
+    }
+
+    /// The deprecated keys this block was written with. `severity` counts
+    /// only when the file wrote it, which the parsed struct cannot tell from
+    /// the default, so it is reported alongside `threshold_seconds`.
+    pub fn legacy_keys(&self) -> Vec<&'static str> {
+        if self.threshold_seconds.is_some() {
+            vec!["threshold_seconds"]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Message returned when a config still declares the removed
@@ -1710,20 +1898,61 @@ impl<'de> Deserialize<'de> for FreshnessConfig {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Raw {
-            threshold_seconds: u64,
+            #[serde(default)]
+            threshold_seconds: Option<u64>,
             #[serde(default)]
             overrides: Option<serde::de::IgnoredAny>,
             #[serde(default)]
-            severity: crate::tests::TestSeverity,
+            severity: Option<crate::tests::TestSeverity>,
+            #[serde(default)]
+            warn_after: Option<String>,
+            #[serde(default)]
+            error_after: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.overrides.is_some() {
             return Err(serde::de::Error::custom(FRESHNESS_OVERRIDES_REMOVED));
         }
-        Ok(FreshnessConfig {
-            threshold_seconds: raw.threshold_seconds,
-            severity: raw.severity,
-        })
+        let mut old = Vec::new();
+        if raw.threshold_seconds.is_some() {
+            old.push("threshold_seconds");
+        }
+        if raw.severity.is_some() {
+            old.push("severity");
+        }
+        let new_form = raw.warn_after.is_some() || raw.error_after.is_some();
+        if new_form && !old.is_empty() {
+            return Err(serde::de::Error::custom(
+                crate::source_freshness::mixed_spelling_message(&old),
+            ));
+        }
+        if let Some(threshold_seconds) = raw.threshold_seconds {
+            return Ok(FreshnessConfig {
+                threshold_seconds: Some(threshold_seconds),
+                severity: raw.severity.unwrap_or_default(),
+                warn_after: None,
+                error_after: None,
+            });
+        }
+        if raw.severity.is_some() {
+            return Err(serde::de::Error::custom(
+                "`[checks.freshness] severity` needs the deprecated `threshold_seconds`; \
+                 write `warn_after` and/or `error_after` instead, which carry their own level",
+            ));
+        }
+        if let Err(problems) = crate::source_freshness::parse_levels(
+            raw.warn_after.as_deref(),
+            raw.error_after.as_deref(),
+        ) {
+            return Err(serde::de::Error::custom(format!(
+                "[checks.freshness]: {}",
+                crate::source_freshness::problems_message(&problems)
+            )));
+        }
+        Ok(FreshnessConfig::levels(
+            raw.warn_after.as_deref(),
+            raw.error_after.as_deref(),
+        ))
     }
 }
 
@@ -3022,17 +3251,17 @@ pub struct RockyConfig {
     ///
     /// ```toml
     /// [freshness]
-    /// expected_lag_seconds = 3600
+    /// warn_after = "1h"
     /// time_column = "updated_at"
-    /// severity = "warning"
     /// ```
     ///
     /// Precedence, first match wins: a model's own `[freshness]`
     /// sidecar table, then its directory `_defaults.toml`, then this
     /// block. Inheritance is **whole-block**: a model that declares its
     /// own table keeps exactly what it wrote and picks up nothing from
-    /// here. This block is inherited only when it carries an
-    /// `expected_lag_seconds`.
+    /// here. This block is inherited only when it carries a level
+    /// (`warn_after`, `error_after`, or the deprecated
+    /// `expected_lag_seconds`).
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
 
@@ -7917,7 +8146,65 @@ fn parse_rocky_config_str_with(
     }
     let mut config: RockyConfig = value.try_into().map_err(to_parse_err)?;
     apply_single_adapter_discovery_default(&mut config);
+    for deprecated in deprecated_freshness_spellings(&config) {
+        tracing::debug!(
+            field = %deprecated.field,
+            keys = %deprecated.keys.join(", "),
+            replacement = %deprecated.replacement,
+            "deprecated freshness spelling in rocky.toml (W058); it still works, write warn_after / error_after instead"
+        );
+    }
     Ok(config)
+}
+
+/// One freshness block written in a deprecated spelling.
+///
+/// `rocky validate` reports each as W058; loading the config logs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeprecatedFreshness {
+    /// Dotted path of the block, e.g. `pipeline.raw.checks.freshness`.
+    pub field: String,
+    /// The deprecated keys the block uses.
+    pub keys: Vec<&'static str>,
+    /// The `warn_after` / `error_after` text that replaces them.
+    pub replacement: String,
+    /// The key of a level that is zero seconds, which the new grammar
+    /// cannot spell.
+    pub zero_level: Option<&'static str>,
+}
+
+/// Every freshness block in `config` that uses a deprecated spelling: the
+/// project `[freshness]` and each pipeline's `checks.freshness`.
+///
+/// Model sidecars, `_defaults.toml` and product specs are checked where
+/// they load; this covers `rocky.toml` only.
+pub fn deprecated_freshness_spellings(config: &RockyConfig) -> Vec<DeprecatedFreshness> {
+    let mut out = Vec::new();
+    let project_keys = config.freshness.legacy_keys();
+    if !project_keys.is_empty() {
+        out.push(DeprecatedFreshness {
+            field: "freshness".to_string(),
+            keys: project_keys,
+            replacement: crate::source_freshness::replacement_for(&config.freshness.thresholds()),
+            zero_level: config.freshness.thresholds().zero_level(),
+        });
+    }
+    for (name, pipeline) in &config.pipelines {
+        let Some(freshness) = &pipeline.checks().freshness else {
+            continue;
+        };
+        let keys = freshness.legacy_keys();
+        if keys.is_empty() {
+            continue;
+        }
+        out.push(DeprecatedFreshness {
+            field: format!("pipeline.{name}.checks.freshness"),
+            keys,
+            replacement: crate::source_freshness::replacement_for(&freshness.thresholds()),
+            zero_level: freshness.thresholds().zero_level(),
+        });
+    }
+    out
 }
 
 /// When exactly one `[adapter]` is defined and a replication pipeline
@@ -9307,7 +9594,7 @@ threshold_seconds = 3600
                 .as_ref()
                 .unwrap()
                 .threshold_seconds,
-            3600
+            Some(3600)
         );
         assert_eq!(
             first.fingerprint,
@@ -10070,7 +10357,7 @@ threshold_seconds = 3600
             .freshness
             .as_ref()
             .expect("freshness block");
-        assert_eq!(freshness.threshold_seconds, 3600);
+        assert_eq!(freshness.threshold_seconds, Some(3600));
     }
 
     #[test]
@@ -12391,7 +12678,10 @@ fail_fast = true
         assert_eq!(t.target.adapter, "db");
         assert!(t.target.governance.auto_create_schemas);
         assert!(t.checks.enabled);
-        assert_eq!(t.checks.freshness.as_ref().unwrap().threshold_seconds, 3600);
+        assert_eq!(
+            t.checks.freshness.as_ref().unwrap().threshold_seconds,
+            Some(3600)
+        );
         assert_eq!(t.execution.concurrency, ConcurrencyMode::Fixed(4));
         assert!(t.execution.fail_fast);
     }

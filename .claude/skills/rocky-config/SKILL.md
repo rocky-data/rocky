@@ -194,7 +194,7 @@ SQL identifiers (catalog, schema, table, tenant, region, source names) must matc
 
 ## What NOT to write (pre-Phase-2 legacy)
 
-The following keys **do not work** anymore — they were the pre-Phase-2 config shape and will be rejected by the parser:
+The following keys **do not work** anymore (the pre-Phase-2 config shape; the parser rejects them), except the freshness row, which is a deprecated alias that still parses:
 
 | ❌ Legacy | ✅ Current |
 |---|---|
@@ -203,6 +203,7 @@ The following keys **do not work** anymore — they were the pre-Phase-2 config 
 | `[replication]` top-level | `[pipeline.<name>]` with `strategy = "incremental"` |
 | `[checks]` top-level | `[pipeline.<name>.checks]` |
 | `[target]` top-level | `[pipeline.<name>.target]` |
+| `threshold_seconds` / `max_lag_seconds` / `expected_lag_seconds` / `max_lag` + freshness `severity` (deprecated, still parse; `rocky validate` warns `W058`) | `warn_after` / `error_after` (`"12h"`, `"7d"`) |
 
 If you see any of these in a config you're editing, the config is stale — migrate it.
 
