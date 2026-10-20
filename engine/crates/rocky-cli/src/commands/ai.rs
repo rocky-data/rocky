@@ -939,6 +939,65 @@ mod tests {
         server.verify().await;
     }
 
+    /// V062 for a SOURCE table from the schema cache. `discover
+    /// --with-schemas` caches a replication's source tables under
+    /// `schema_cache_key(source_catalog, schema, table)`, and `rocky ai`
+    /// puts every cached table in its prompt. An EU source table must be
+    /// refused for a US endpoint, without `enforce`. Before the fix it had no
+    /// known region and went.
+    ///
+    /// Also pins the name form that reaches the residency check: the cache
+    /// key lowercased, its catalog part dropped, and no quotes.
+    #[test]
+    fn ai_client_refuses_an_eu_replication_source_table_from_the_schema_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        ai_sync_project(tmp.path(), "SELECT 1 AS id");
+        let setup = residency_setup(
+            tmp.path(),
+            "us",
+            "\n[pipeline.bronze]\ntype = \"replication\"\n\n\
+             [pipeline.bronze.source]\nregion = \"eu\"\n\n\
+             [pipeline.bronze.source.schema_pattern]\nprefix = \"src__\"\n\
+             separator = \"__\"\ncomponents = [\"tenant\", \"regions...\", \"source\"]\n\n\
+             [pipeline.bronze.target]\ncatalog_template = \"wh\"\n\
+             schema_template = \"raw__{source}\"\nregion = \"eu\"\n",
+            "http://127.0.0.1:9".to_string(),
+        );
+        {
+            let store =
+                rocky_core::state::StateStore::open(&tmp.path().join("state.redb")).unwrap();
+            let key = rocky_core::schema_cache::schema_cache_key(
+                "Src_Cat",
+                "Src__Acme__EU__Shopify",
+                "Orders",
+            );
+            let entry = rocky_core::schema_cache::SchemaCacheEntry {
+                columns: vec![rocky_core::schema_cache::StoredColumn {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: false,
+                }],
+                cached_at: chrono::Utc::now(),
+            };
+            store.write_schema_cache_entry(&key, &entry).unwrap();
+        }
+
+        let result = ai_sync_compile(tmp.path());
+        let (models, tables) = build_schema_context(&result);
+        let tables: Vec<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(tables, vec!["src__acme__eu__shopify.orders"]);
+        let models: Vec<&str> = models.iter().map(|(n, _)| n.as_str()).collect();
+
+        let Err(err) = setup.client(&models, &tables) else {
+            panic!("an EU source table to a US endpoint must be refused");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("V062") && rendered.contains("src__acme__eu__shopify.orders"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn proposed_source_format_detects_rocky_and_sql() {
         assert_eq!(
