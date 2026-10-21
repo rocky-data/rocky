@@ -278,11 +278,13 @@ fn is_row_count_range(test: &TomlTable) -> bool {
     matches!(test.get("type"), Some(TomlValue::String(kind)) if kind == "row_count_range")
 }
 
-/// True when the lowering wrote this test from a spec field (it carries
-/// [`GENERATED_BY_KEY`]). The merge rebuilds such tests from the spec, so
-/// the copy in the file is never kept.
+/// True when the lowering wrote this test from a spec field: a
+/// `row_count_range` whose [`GENERATED_BY_KEY`] is the volume field. The
+/// merge rebuilds such tests from the spec, so the copy in the file is never
+/// kept. Any other `generated_by` value is a worker's and survives.
 fn is_spec_generated(test: &TomlTable) -> bool {
-    test.contains_key(GENERATED_BY_KEY)
+    is_row_count_range(test)
+        && matches!(test.get(GENERATED_BY_KEY), Some(TomlValue::String(by)) if by == VOLUME_FIELD)
 }
 
 /// True when a `row_count_range` counts the whole table: no `filter`, or
@@ -304,8 +306,9 @@ fn is_unscoped_row_count_range(test: &TomlTable) -> bool {
 /// `[tags].product` — other tag keys survive. Preserved: `name` and
 /// `intent` (`intent` is filled from the spec only when the file has
 /// none), every worker-appended test the lowering did not generate, and
-/// every other key verbatim. Two exceptions: a test carrying
-/// [`GENERATED_BY_KEY`] is spec-owned and is rebuilt from the spec, so it
+/// every other key verbatim. Two exceptions: a `row_count_range` whose
+/// [`GENERATED_BY_KEY`] names the volume field is spec-owned and is
+/// rebuilt from the spec, so it
 /// is dropped when its field is gone; and when the spec declares a
 /// `volume`, a worker `row_count_range` over the whole table (no
 /// `filter`) is dropped, so the spec's range is the model's only
@@ -1967,6 +1970,15 @@ agent = "propose_only"
         assert_eq!(ranges.len(), 1, "{ranges:?}");
         assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(1)));
         assert!(ranges[0].get(GENERATED_BY_KEY).is_none(), "{ranges:?}");
+        // A worker test with some other `generated_by` value is not the
+        // spec's either, so it survives too.
+        let foreign = draft_check_append(
+            &lowered,
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 2\ngenerated_by = \"my-tool\"\n",
+        );
+        let ranges = row_count_ranges(&merged_document(&parsed_d3(), &foreign));
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(2)));
         // Re-lowering is still byte-identical.
         let once = merged_text(&parsed_d3(), &with_worker);
         assert_eq!(merged_text(&parsed_d3(), &once), once);

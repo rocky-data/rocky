@@ -14404,7 +14404,11 @@ async fn execute_models_phase(
                         // after its write, exactly as a failed build does:
                         // contained (downstream withheld) or the layer's
                         // first error (no later layer starts).
-                        if let Some(e) = volume_failure {
+                        // As in the build-failure arm, `model_error` fires
+                        // only for a failure the run records.
+                        if let Some(e) = volume_failure
+                            && (resilience.contain_failures || first_error.is_none())
+                        {
                             if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                                 let _ = reg
                                     .fire(&HookContext::model_error(
@@ -14417,7 +14421,7 @@ async fn execute_models_phase(
                             }
                             if resilience.contain_failures {
                                 record_contained_cause(output, &mut containment, name, &e);
-                            } else if first_error.is_none() {
+                            } else {
                                 first_error = Some(e);
                             }
                         }
