@@ -35,6 +35,8 @@ The parser checks `deliver_by` with the scheduler's own cron parser (`deliver-by
 
 Each production `rocky run` that builds the product's output model records the deadline that build served. A build covers the first deadline at or after it finished. If an earlier deadline was still open when it finished, the build serves that one instead, and it is late. A late build also covers every deadline that passed before it finished, so it reports one lateness, not one per missed deadline. A previous build with no recorded deadline is no baseline, so the first build after a spec gains `deliver_by` is judged like a first delivery. Lateness is wall-clock time from the deadline to the moment the model finished. Shadow and branch runs record no deadline. `rocky run` reads `products/` under the directory of the `rocky.toml` it runs.
 
+The scheduler status (`GET /api/v1/schedule`) derives a `latest_start` from each deadline for every scheduled pipeline that feeds it. It warns when a cron starts too late. See [the scheduler status](/guides/running-without-an-orchestrator/#the-resident-scheduler-rocky-serve---scheduler-experimental).
+
 ---
 
 ## `rocky product verify`

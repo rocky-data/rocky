@@ -65,6 +65,10 @@ export type {
   DurationEstimateStatus,
   EstimateBasis,
   EstimateState,
+  CronCheck,
+  LatestStartState,
+  LatestStartStatus,
+  LatestStartUnknownReason,
 } from "./schedule_status";
 export type {
   ScheduleSpoolOutput,

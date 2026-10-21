@@ -1,6 +1,53 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "CronCheck": {
+      "description": "How a pipeline's cron compares with its latest start.\n\nChecked in this order; the first that applies wins.",
+      "oneOf": [
+        {
+          "description": "The schedule is disabled or cannot be resolved, so the scheduler never starts the pipeline: neither its cron nor its `after` trigger will meet the deadline. `warning` says so.",
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`next_fire_at` is earlier than `now`: a cron slot was missed and has not run. The same strict test as `counts.overdue`. Reported whether or not the latest start is known. `warning` says so. When `at` is known and `now` is later than it, `cron_too_late` is `true` too.",
+          "enum": [
+            "overdue"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Nothing to compare: the latest start is `unknown` (unless the pipeline has no cron and an `after` upstream is known late: then `too_late`); or the pipeline has a cron with no next fire (no fire anchor yet, or no next occurrence); or the pipeline has neither a cron nor an `after` trigger (it runs by hand or by freshness only); or it has no cron, no `after` upstream is known late, and some `after` upstream cannot be judged (an unknown latest start, or a `cron_check` of `not_judged`). In that last case there is no warning, and `note` names the upstreams that cannot be judged.",
+          "enum": [
+            "not_judged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The next cron fire is at or before `at`.",
+          "enum": [
+            "on_time"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The pipeline may start too late. Two cases. It has a cron whose next fire is later than `at`, and it has no `after` trigger, or some `after` upstream is not judged in time (see `relies_on_after`), late or not judged: `cron_too_late` is `true`. Or it has no cron, runs only `after` other pipelines, and some of them are known late (a `cron_check` of `too_late`, `overdue` or `disabled`): `cron_too_late` is `false`, as it has no cron. This holds even when its own latest start is `unknown`. `warning` says so in both cases and names the upstreams not judged in time.",
+          "enum": [
+            "too_late"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The `after` trigger starts the pipeline in time: it runs `after` other pipelines, and every one of them has a known latest start and a `cron_check` of `on_time` or `relies_on_after`. Either the pipeline has a cron whose next fire is later than `at` (`note` says the cron alone would be late), or it has no cron at all (`note` says the `after` trigger alone starts it). `cron_too_late` is `false`.",
+          "enum": [
+            "relies_on_after"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "DeliveryStatus": {
       "description": "Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.\n\nReported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.",
       "properties": {
@@ -186,6 +233,147 @@
         }
       ]
     },
+    "LatestStartState": {
+      "description": "Whether a latest start could be derived.",
+      "oneOf": [
+        {
+          "description": "Every term on the way is known: `at` is reported.",
+          "enum": [
+            "known"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Some term on the way is unknown: no answer. `reasons` says which.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "LatestStartStatus": {
+      "description": "The latest start of a scheduled pipeline, derived from the product deadlines it feeds.\n\n`latest_start(P) = min(next_due_at of a deadline P serves, latest_start of each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the pipeline's run time over its last 20 successful production runs. Any unknown term on the way makes the answer `unknown`, with `reasons`.",
+      "properties": {
+        "at": {
+          "description": "The latest start, when `known`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cron_check": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CronCheck"
+            }
+          ],
+          "description": "How the pipeline's own cron compares with `at`. See [`CronCheck`]."
+        },
+        "cron_too_late": {
+          "description": "True in two cases, both about the pipeline's own cron. `cron_check` is `too_late` and the pipeline has a cron: the next cron fire (`next_fire_at`) is later than `at`. Or `cron_check` is `overdue`, `at` is known, and `now` is already later than `at`. False otherwise: also when `state` is `unknown`, and always for a pipeline with no cron, even when its `cron_check` is `too_late` (it has no cron to be late; its `after` trigger is what may start it late). So alert on `warning`, not on this field alone. A fire exactly at `at` is in time. Rocky warns only; it never changes the cron.",
+          "type": "boolean"
+        },
+        "due_at": {
+          "description": "That product's next deadline, when `known`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "missing_estimate": {
+          "description": "The pipelines on the way whose p90 is unknown (fewer than 5 successful production runs). Present only with the reason `missing_estimate`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "note": {
+          "description": "When `cron_check` is `relies_on_after`: the `after` trigger is what starts the pipeline in time. For a pipeline with a cron, the cron alone would start it too late; for one with no cron, the `after` trigger is its only trigger. Also when a pipeline with no cron reads `not_judged` because no `after` upstream is known late but some cannot be judged: the note names those upstreams.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "product": {
+          "description": "The product whose deadline gives the minimum, when `known`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "description": "Why the latest start is `unknown`: every reason found on the way, sorted, each once. Empty (and omitted) when `known`.",
+          "items": {
+            "$ref": "#/definitions/LatestStartUnknownReason"
+          },
+          "type": "array"
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LatestStartState"
+            }
+          ],
+          "description": "`known` when every term on every chain to a deadline is known; `unknown` otherwise, and then `at` is absent and `reasons` says why."
+        },
+        "warning": {
+          "description": "Why the schedule may miss the deadline: when `cron_check` is `too_late`, `overdue` or `disabled`, or when the pipeline's models cannot all be read (reason `models_unreadable`). That warning names the products whose output model config or run history shows it building, when there are any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cron_check",
+        "cron_too_late",
+        "state"
+      ],
+      "type": "object"
+    },
+    "LatestStartUnknownReason": {
+      "description": "Why a latest start is `unknown`.",
+      "oneOf": [
+        {
+          "description": "A pipeline on the way has fewer than 5 successful production runs, so it has no p90. `missing_estimate` names it.",
+          "enum": [
+            "missing_estimate"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A product's `deliver_by` cron finds no next occurrence.",
+          "enum": [
+            "no_next_deadline"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A transformation pipeline on the way has an absent or unlocatable models directory, or a model that fails to load, so `rocky run` builds nothing for it. Reported for every such pipeline whenever any product declares `deliver_by`: neither config nor run history can show that it builds no deadlined output model.",
+          "enum": [
+            "models_unreadable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The `[schedule] after` graph has a cycle on the way to a deadline.",
+          "enum": [
+            "cycle"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Subtracting a p90 leaves the representable date range.",
+          "enum": [
+            "overflow"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ScheduleClaimStatus": {
       "description": "One claim recorded against a pipeline.",
       "properties": {
@@ -311,7 +499,7 @@
               "type": "null"
             }
           ],
-          "description": "Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline's newest production run that built any such model built. The estimate times the whole pipeline run. Absent when no production run of the pipeline built a product with a deadline."
+          "description": "Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline builds. For a transformation pipeline, that is a non-ephemeral model its `models` glob selects, with the same root, models directory and glob as `rocky run`. The models are loaded, not compiled, so a compile error is not seen. When its models directory is absent or cannot be located, or a model fails to load, `rocky run` builds nothing, so the pipeline has no `delivery` (see `latest_start`); `rocky product status` still shows that product's last delivery. For any other pipeline type, it is any such model the pipeline's newest production run that built one built, within the newest 500 runs. The estimate times the whole pipeline run. Absent when no source shows the pipeline building a product with a deadline."
         },
         "enabled": {
           "description": "False when the schedule declares `enabled = false`.",
@@ -356,6 +544,17 @@
             "string",
             "null"
           ]
+        },
+        "latest_start": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LatestStartStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Present on each pipeline that has a `delivery`; on each transformation pipeline whose models cannot all be read, whenever any product declares `deliver_by` (then `unknown`, reason `models_unreadable`, with a `warning`: neither config nor run history can show that it builds no deadlined output model); and on every pipeline any of those runs `after`, directly or through others. Absent otherwise. A deadline only derives this value: it never adds an `after` edge and never moves a cron."
         },
         "next_fire_at": {
           "description": "When the cron is next expected to fire.\n\n**A timestamp in the past means overdue.** The projection is anchored on the stored cursor, not on the clock, so a stalled timer reports the slot it missed rather than a healthy-looking future one. Null for `after`/`freshness` schedules, which have no projectable instant.",

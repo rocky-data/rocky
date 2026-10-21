@@ -7378,11 +7378,401 @@ pub struct SchedulePipelineStatus {
     pub config_error: Option<String>,
     /// Delivery state of the most urgent product deadline this pipeline
     /// delivers: a product whose spec declares `deliver_by` and whose output
-    /// model the pipeline's newest production run that built any such model
-    /// built. The estimate times the whole pipeline run. Absent when no
-    /// production run of the pipeline built a product with a deadline.
+    /// model the pipeline builds. For a transformation pipeline, that is a
+    /// non-ephemeral model its `models` glob selects, with the same root,
+    /// models directory and glob as `rocky run`. The models are loaded, not
+    /// compiled, so a compile error is not seen. When its models directory
+    /// is absent or cannot be located, or a model fails to load, `rocky run`
+    /// builds nothing, so the pipeline has no `delivery` (see
+    /// `latest_start`); `rocky product status` still shows that product's
+    /// last delivery. For any other pipeline type, it is any such model
+    /// the pipeline's newest production run that built one built, within the
+    /// newest 500 runs. The estimate times the whole pipeline run. Absent
+    /// when no source shows the pipeline building a product with a deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryStatus>,
+    /// The latest time this pipeline can start and still meet every product
+    /// deadline it feeds, directly or through pipelines that run `after` it.
+    /// Present on each pipeline that has a `delivery`; on each
+    /// transformation pipeline whose models cannot all be read, whenever any
+    /// product declares `deliver_by` (then `unknown`, reason
+    /// `models_unreadable`, with a `warning`: neither config nor run history
+    /// can show that it builds no deadlined output model); and on every
+    /// pipeline any of those runs `after`, directly or through others.
+    /// Absent otherwise. A deadline only derives this value: it never adds
+    /// an `after` edge and never moves a cron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_start: Option<LatestStartStatus>,
+}
+
+/// The latest start of a scheduled pipeline, derived from the product
+/// deadlines it feeds.
+///
+/// `latest_start(P) = min(next_due_at of a deadline P serves, latest_start of
+/// each pipeline that runs after P and feeds one) - p90(P)`. The p90 is the
+/// pipeline's run time over its last 20 successful production runs. Any
+/// unknown term on the way makes the answer `unknown`, with `reasons`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LatestStartStatus {
+    /// `known` when every term on every chain to a deadline is known;
+    /// `unknown` otherwise, and then `at` is absent and `reasons` says why.
+    pub state: LatestStartState,
+    /// Why the latest start is `unknown`: every reason found on the way,
+    /// sorted, each once. Empty (and omitted) when `known`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<LatestStartUnknownReason>,
+    /// The latest start, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+    /// The product whose deadline gives the minimum, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    /// That product's next deadline, when `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    /// The pipelines on the way whose p90 is unknown (fewer than 5
+    /// successful production runs). Present only with the reason
+    /// `missing_estimate`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_estimate: Vec<String>,
+    /// How the pipeline's own cron compares with `at`. See [`CronCheck`].
+    pub cron_check: CronCheck,
+    /// True in two cases, both about the pipeline's own cron. `cron_check`
+    /// is `too_late` and the pipeline has a cron: the next cron fire
+    /// (`next_fire_at`) is later than `at`. Or `cron_check` is `overdue`,
+    /// `at` is known, and `now` is already later than `at`. False otherwise:
+    /// also when `state` is `unknown`, and always for a pipeline with no
+    /// cron, even when its `cron_check` is `too_late` (it has no cron to be
+    /// late; its `after` trigger is what may start it late). So alert on
+    /// `warning`, not on this field alone. A fire exactly at `at` is in
+    /// time. Rocky warns only; it never changes the cron.
+    pub cron_too_late: bool,
+    /// Why the schedule may miss the deadline: when `cron_check` is
+    /// `too_late`, `overdue` or `disabled`, or when the pipeline's models
+    /// cannot all be read (reason `models_unreadable`). That warning names
+    /// the products whose output model config or run history shows it
+    /// building, when there are any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// When `cron_check` is `relies_on_after`: the `after` trigger is what
+    /// starts the pipeline in time. For a pipeline with a cron, the cron
+    /// alone would start it too late; for one with no cron, the `after`
+    /// trigger is its only trigger. Also when a pipeline with no cron reads
+    /// `not_judged` because no `after` upstream is known late but some
+    /// cannot be judged: the note names those upstreams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Whether a latest start could be derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LatestStartState {
+    /// Every term on the way is known: `at` is reported.
+    Known,
+    /// Some term on the way is unknown: no answer. `reasons` says which.
+    Unknown,
+}
+
+/// Why a latest start is `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LatestStartUnknownReason {
+    /// A pipeline on the way has fewer than 5 successful production runs, so
+    /// it has no p90. `missing_estimate` names it.
+    MissingEstimate,
+    /// A product's `deliver_by` cron finds no next occurrence.
+    NoNextDeadline,
+    /// A transformation pipeline on the way has an absent or unlocatable
+    /// models directory, or a model that fails to load, so `rocky run`
+    /// builds nothing for it. Reported for every such pipeline whenever any
+    /// product declares `deliver_by`: neither config nor run history can
+    /// show that it builds no deadlined output model.
+    ModelsUnreadable,
+    /// The `[schedule] after` graph has a cycle on the way to a deadline.
+    Cycle,
+    /// Subtracting a p90 leaves the representable date range.
+    Overflow,
+}
+
+impl From<rocky_core::delivery::UnknownReason> for LatestStartUnknownReason {
+    fn from(reason: rocky_core::delivery::UnknownReason) -> Self {
+        use rocky_core::delivery::UnknownReason;
+        match reason {
+            UnknownReason::MissingEstimate => Self::MissingEstimate,
+            UnknownReason::NoNextDeadline => Self::NoNextDeadline,
+            UnknownReason::ModelsUnreadable => Self::ModelsUnreadable,
+            UnknownReason::Cycle => Self::Cycle,
+            UnknownReason::Overflow => Self::Overflow,
+        }
+    }
+}
+
+/// How a pipeline's cron compares with its latest start.
+///
+/// Checked in this order; the first that applies wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CronCheck {
+    /// The schedule is disabled or cannot be resolved, so the scheduler
+    /// never starts the pipeline: neither its cron nor its `after` trigger
+    /// will meet the deadline. `warning` says so.
+    Disabled,
+    /// `next_fire_at` is earlier than `now`: a cron slot was missed and has
+    /// not run. The same strict test as `counts.overdue`. Reported whether
+    /// or not the latest start is known. `warning` says so. When `at` is
+    /// known and `now` is later than it, `cron_too_late` is `true` too.
+    Overdue,
+    /// Nothing to compare: the latest start is `unknown` (unless the
+    /// pipeline has no cron and an `after` upstream is known late: then
+    /// `too_late`); or the pipeline
+    /// has a cron with no next fire (no fire anchor yet, or no next
+    /// occurrence); or the pipeline has neither a cron nor an `after`
+    /// trigger (it runs by hand or by freshness only); or it has no cron,
+    /// no `after` upstream is known late, and some `after` upstream cannot
+    /// be judged (an unknown latest start, or a `cron_check` of
+    /// `not_judged`). In that last case there is no warning, and `note`
+    /// names the upstreams that cannot be judged.
+    NotJudged,
+    /// The next cron fire is at or before `at`.
+    OnTime,
+    /// The pipeline may start too late. Two cases. It has a cron whose next
+    /// fire is later than `at`, and it has no `after` trigger, or some
+    /// `after` upstream is not judged in time (see `relies_on_after`), late
+    /// or not judged: `cron_too_late` is `true`. Or it has no cron, runs
+    /// only `after` other pipelines, and some of them are known late (a
+    /// `cron_check` of `too_late`, `overdue` or `disabled`):
+    /// `cron_too_late` is `false`, as it has no cron. This holds even when
+    /// its own latest start is `unknown`. `warning` says so in
+    /// both cases and names the upstreams not judged in time.
+    TooLate,
+    /// The `after` trigger starts the pipeline in time: it runs `after`
+    /// other pipelines, and every one of them has a known latest start and a
+    /// `cron_check` of `on_time` or `relies_on_after`. Either the pipeline
+    /// has a cron whose next fire is later than `at` (`note` says the cron
+    /// alone would be late), or it has no cron at all (`note` says the
+    /// `after` trigger alone starts it). `cron_too_late` is `false`.
+    ReliesOnAfter,
+}
+
+/// What [`LatestStartStatus::from_latest_start`] judges a cron by.
+#[derive(Debug, Clone)]
+pub struct CronContext {
+    /// The status read's clock.
+    pub now: DateTime<Utc>,
+    /// Whether the pipeline has a cron at all. Kept apart from
+    /// `next_fire_at`: a cron with no next fire yet (no fire anchor) is not
+    /// judged, while a pipeline with no cron is judged by its `after`
+    /// trigger.
+    pub has_cron: bool,
+    /// The pipeline's projected next cron fire, if any.
+    pub next_fire_at: Option<DateTime<Utc>>,
+    /// Whether the schedule is enabled and resolves.
+    pub enabled: bool,
+    /// The pipeline's `after` trigger, and whether its upstreams are judged
+    /// in time.
+    pub after: AfterTrigger,
+}
+
+/// A pipeline's `after` trigger, as [`CronContext`] sees it.
+///
+/// Each `after` upstream is in time (a known latest start and a
+/// `cron_check` of `on_time` or `relies_on_after`), known late (a
+/// `cron_check` of `too_late`, `overdue` or `disabled`), or cannot be
+/// judged (anything else: an unknown latest start, or `not_judged`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterTrigger {
+    /// The pipeline has no `after` trigger.
+    Absent,
+    /// Every `after` upstream is in time.
+    UpstreamsInTime,
+    /// No `after` upstream is known late, but some cannot be judged. Holds
+    /// those upstreams, in `after` order. A pipeline with no cron then reads
+    /// `not_judged`; one with a late cron still reads `too_late`.
+    UpstreamsNotJudged(Vec<String>),
+    /// Some `after` upstream is known late. Holds every upstream not in
+    /// time, late or not judged, in `after` order. The pipeline reads
+    /// `too_late` when it has no cron or its cron is late.
+    UpstreamsLate(Vec<String>),
+}
+
+impl LatestStartStatus {
+    /// Project a core [`rocky_core::delivery::LatestStart`] onto the output
+    /// shape, and judge the cron against it.
+    pub fn from_latest_start(
+        latest: rocky_core::delivery::LatestStart,
+        cron: &CronContext,
+    ) -> Self {
+        let ts = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (state, reasons, at, product, due_at, missing_estimate) = match latest {
+            rocky_core::delivery::LatestStart::Known {
+                at,
+                product,
+                due_at,
+            } => (
+                LatestStartState::Known,
+                Vec::new(),
+                Some(at),
+                Some(product),
+                Some(due_at),
+                Vec::new(),
+            ),
+            rocky_core::delivery::LatestStart::Unknown {
+                reasons,
+                missing_estimate,
+            } => (
+                LatestStartState::Unknown,
+                reasons.into_iter().map(Into::into).collect(),
+                None,
+                None,
+                None,
+                missing_estimate,
+            ),
+        };
+
+        let cron_check = if !cron.enabled {
+            CronCheck::Disabled
+        } else if !cron.has_cron {
+            // No cron: only the `after` trigger starts the pipeline (the
+            // reconciler runs it once its upstreams succeed). Judge that
+            // trigger. With no `after` either, it runs by hand or by
+            // freshness: nothing to judge.
+            match (&cron.after, at) {
+                // An upstream known late cannot start this pipeline in time,
+                // whether or not this pipeline's own latest start is known.
+                (AfterTrigger::UpstreamsLate(_), _) => CronCheck::TooLate,
+                // An upstream that cannot be judged, with none known late:
+                // nothing is known to be late, so no verdict either.
+                (_, None) | (AfterTrigger::Absent | AfterTrigger::UpstreamsNotJudged(_), _) => {
+                    CronCheck::NotJudged
+                }
+                (AfterTrigger::UpstreamsInTime, Some(_)) => CronCheck::ReliesOnAfter,
+            }
+        } else {
+            // A cron with no next fire (awaiting its first anchor, or no next
+            // occurrence) is `NotJudged` below, whatever its `after`.
+            match (cron.next_fire_at, at) {
+                (Some(fire), _) if fire < cron.now => CronCheck::Overdue,
+                (Some(fire), Some(at)) if fire > at => match &cron.after {
+                    AfterTrigger::UpstreamsInTime => CronCheck::ReliesOnAfter,
+                    // The cron is known late, so an upstream that cannot be
+                    // judged leaves it `too_late`: `after` cannot be relied on.
+                    AfterTrigger::Absent
+                    | AfterTrigger::UpstreamsNotJudged(_)
+                    | AfterTrigger::UpstreamsLate(_) => CronCheck::TooLate,
+                },
+                (Some(_), Some(_)) => CronCheck::OnTime,
+                (None, _) | (Some(_), None) => CronCheck::NotJudged,
+            }
+        };
+        // The upstreams not judged in time, for the texts below.
+        let untimely = match &cron.after {
+            AfterTrigger::UpstreamsNotJudged(names) | AfterTrigger::UpstreamsLate(names) => names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            AfterTrigger::Absent | AfterTrigger::UpstreamsInTime => String::new(),
+        };
+
+        // What the deadline asks for, for the texts below.
+        let wanted = match (at, &product, due_at) {
+            (Some(at), Some(product), Some(due)) => format!(
+                "the latest start is {} for product `{product}`, due {}",
+                ts(at),
+                ts(due)
+            ),
+            _ => "the latest start is unknown".to_string(),
+        };
+        let (warning, note) = match (cron_check, cron.next_fire_at) {
+            (CronCheck::TooLate, _) if !cron.has_cron => (
+                Some(format!(
+                    "the pipeline has no cron and runs only `after` other pipelines, and the \
+                     `after` trigger cannot be relied on to start it in time: some upstream is \
+                     known late (too late, overdue or disabled); not in time: {untimely}; \
+                     {wanted}"
+                )),
+                None,
+            ),
+            (CronCheck::NotJudged, _)
+                if !cron.has_cron && matches!(cron.after, AfterTrigger::UpstreamsNotJudged(_)) =>
+            {
+                (
+                    None,
+                    Some(format!(
+                        "the pipeline has no cron and runs only `after` other pipelines; no \
+                     upstream is known late, but {untimely} cannot be judged (an unknown \
+                     latest start, or not judged), so this pipeline is not judged either; \
+                     {wanted}"
+                    )),
+                )
+            }
+            (CronCheck::ReliesOnAfter, _) if !cron.has_cron => (
+                None,
+                Some(format!(
+                    "the pipeline has no cron; the `after` trigger starts it, and every \
+                     upstream is judged in time; {wanted}"
+                )),
+            ),
+            (CronCheck::Disabled, _) => (
+                Some(format!(
+                    "the schedule is disabled or cannot be resolved, so the scheduler will not \
+                     start this pipeline for the deadline it feeds: {wanted}"
+                )),
+                None,
+            ),
+            (CronCheck::Overdue, Some(fire)) => (
+                Some(format!(
+                    "the cron is overdue: the fire at {} was missed and has not run; {wanted}",
+                    ts(fire)
+                )),
+                None,
+            ),
+            (CronCheck::TooLate, Some(fire)) => (
+                Some(format!(
+                    "the cron starts too late to meet the deadline: the next fire at {} is \
+                     after the latest start{}; {wanted}",
+                    ts(fire),
+                    if untimely.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", and the `after` trigger cannot be relied on: {untimely} has an \
+                             unknown latest start or is not judged in time"
+                        )
+                    }
+                )),
+                None,
+            ),
+            (CronCheck::ReliesOnAfter, Some(fire)) => (
+                None,
+                Some(format!(
+                    "the cron alone would start too late: the next fire at {} is after the \
+                     latest start; the `after` trigger is relied on to start it in time; {wanted}",
+                    ts(fire)
+                )),
+            ),
+            (CronCheck::Overdue | CronCheck::TooLate | CronCheck::ReliesOnAfter, None)
+            | (CronCheck::NotJudged | CronCheck::OnTime, _) => (None, None),
+        };
+
+        Self {
+            state,
+            reasons,
+            at,
+            product,
+            due_at,
+            missing_estimate,
+            cron_check,
+            // A pipeline with no cron has no cron to be late: its `too_late`
+            // is carried by `warning` alone.
+            cron_too_late: cron.has_cron
+                && (cron_check == CronCheck::TooLate
+                    || (cron_check == CronCheck::Overdue && at.is_some_and(|at| cron.now > at))),
+            warning,
+            note,
+        }
+    }
 }
 
 /// An active backoff window.
