@@ -600,6 +600,100 @@ mod tests {
             );
         }
 
+        /// `vol` writes table `vol_tbl`, so the materialization (named by
+        /// table) and the model differ; `down` reads `vol_tbl`.
+        fn renamed_models() -> Vec<(&'static str, &'static str, &'static str)> {
+            vec![
+                (
+                    "vol",
+                    VOL_SQL,
+                    "[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"vol_tbl\"\n",
+                ),
+                (
+                    "down",
+                    "SELECT x FROM main.vol_tbl\n",
+                    "depends_on = [\"vol\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+            ]
+        }
+
+        /// The one execution recorded for `vol` when its table is
+        /// `vol_tbl`: exactly one, failed, with the count, and no `due_at`.
+        fn assert_one_failed_renamed_execution(ran: &Ran) {
+            let executions = ran.executions("vol");
+            assert_eq!(
+                executions.len(),
+                1,
+                "one execution, not two: {:?}",
+                ran.record.models_executed
+            );
+            assert_eq!(executions[0].status, "failed");
+            assert_eq!(executions[0].model_name, "vol_tbl", "{executions:?}");
+            assert_eq!(executions[0].row_count, Some(3));
+            assert_eq!(
+                executions[0].due_at, None,
+                "a bad-volume build is no delivery"
+            );
+            assert_eq!(ran.volume("vol_tbl")["verdict"], "above_max");
+            assert!(
+                ran.executions("down").iter().all(|e| e.status != "success"),
+                "{:?}",
+                ran.record.models_executed
+            );
+        }
+
+        /// Control for the two tests below: the same renamed table, in
+        /// range, IS stamped as a delivery, so their `due_at = None` is the
+        /// breach's doing and not the rename's.
+        #[tokio::test]
+        async fn a_renamed_output_in_range_delivers() {
+            let ran = run_with(&spec("max_rows = 10"), &renamed_models(), None).await;
+            ran.result.as_ref().expect("the run succeeds");
+            let executions = ran.executions("vol");
+            assert_eq!(executions.len(), 1, "{executions:?}");
+            assert_eq!(executions[0].status, "success");
+            assert_eq!(executions[0].row_count, Some(3));
+            assert!(executions[0].due_at.is_some(), "{executions:?}");
+        }
+
+        #[tokio::test]
+        async fn a_renamed_output_error_breach_fails_once_on_fail_fast() {
+            let ran = run_with(
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &renamed_models(),
+                None,
+            )
+            .await;
+            assert!(ran.result.is_err(), "an error breach fails the run");
+            assert_one_failed_renamed_execution(&ran);
+        }
+
+        #[tokio::test]
+        async fn a_renamed_output_error_breach_fails_once_when_contained() {
+            let ran = run_with_config(
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &renamed_models(),
+                None,
+                "[resilience]\ncontain_failures = true\n",
+            )
+            .await;
+            assert_eq!(ran.record.status, RunStatus::PartialFailure);
+            assert_one_failed_renamed_execution(&ran);
+            // `rocky product status` finds the count under the model name.
+            let root = ran._tmp.path();
+            let status = super::super::super::product::product_status_in(
+                root,
+                Some(&root.join("state.redb")),
+                "vol_product",
+            )
+            .expect("status");
+            let volume = status.volume.expect("a volume status");
+            assert_eq!(volume.row_count, Some(3));
+            assert_eq!(volume.verdict, VolumeVerdict::AboveMax);
+        }
+
         #[tokio::test]
         async fn a_shadow_run_counts_nothing() {
             let shadow = rocky_core::shadow::ShadowConfig::default();
