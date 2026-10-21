@@ -164,7 +164,11 @@ it. That is the property to **preserve**, and it means the finding to look for i
   `anyhow::Result`. **Do not flag existing `anyhow` in a library crate.** Flag only a *new* public library
   error on the Dagster/JSON consumer boundary that should be a typed `thiserror` variant but isn't.
 - `unsafe` is near-zero and confined to known categories (mmap, `repr(transparent)` cast, serialized
-  test-env mutation). Any new `unsafe` without a `// SAFETY:` justification is a finding.
+  test-env mutation, and `rocky-adapter-sdk/src/child.rs`: process-group signals, `waitid`, and
+  `getrlimit`/`setrlimit` in a `pre_exec` closure). Any new `unsafe` without a `// SAFETY:`
+  justification is a finding. A `pre_exec` closure must not allocate or take a lock, and its SAFETY
+  comment must not call `setrlimit` async-signal-safe: it is not on POSIX's list. It is a direct syscall
+  wrapper on glibc, musl and macOS libSystem.
 - **`ModelIr::clone()` is a deep O(sql + Vec sizes) copy**, not a refcount bump. Flag a clone added inside
   a per-partition / per-row hot loop; do not assume cloning the IR is free.
 - **A path probe that answers "no" must not become a claim.** `Path::exists()` (and

@@ -30,10 +30,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+#[cfg(unix)]
+use crate::child::signal_group;
+use crate::child::{read_bounded_line, stop_child};
 use crate::child_stdin::ChildStdinWriter;
 use crate::manifest::AdapterManifest;
 use crate::traits::{
@@ -536,115 +539,6 @@ async fn bounded_exchange<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// Read one line of at most `max_bytes` bytes, newline excluded.
-///
-/// Returns `Ok(None)` when the line is longer, after reading `max_bytes + 1`
-/// bytes and no more. Returns an empty string at end of file.
-async fn read_bounded_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> std::io::Result<Option<String>> {
-    // `+ 1` leaves room for the newline that ends a line of exactly
-    // `max_bytes` bytes.
-    let limit = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut buf = Vec::new();
-    (&mut *reader)
-        .take(limit)
-        .read_until(b'\n', &mut buf)
-        .await?;
-    if buf.last() != Some(&b'\n') && buf.len() > max_bytes {
-        return Ok(None);
-    }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Stop the adapter and reap it.
-///
-/// On Unix: `SIGTERM` to the adapter's process group, up to `grace` for the
-/// adapter to exit, then `SIGKILL` to the group. The adapter stays unreaped
-/// until after the `SIGKILL`, so its id cannot name another process group
-/// when it is signalled. Elsewhere: kill the adapter alone.
-async fn stop_child(child: &mut Child, grace: Duration) {
-    #[cfg(unix)]
-    if let Some(pgid) = child.id() {
-        let _ = signal_group(pgid, libc::SIGTERM);
-        let deadline = tokio::time::Instant::now() + grace;
-        while tokio::time::Instant::now() < deadline && !leader_has_exited(pgid) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let _ = signal_group(pgid, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = grace;
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-/// Send `signal` to process group `pgid`. Refuses group 0 (the caller's own)
-/// and 1 (`init`).
-#[cfg(unix)]
-fn signal_group(pgid: u32, signal: libc::c_int) -> std::io::Result<()> {
-    let pgid = libc::pid_t::try_from(pgid).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "process group id out of range",
-        )
-    })?;
-    if pgid <= 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to signal process group 0 or 1",
-        ));
-    }
-    // SAFETY: `killpg` takes two integers and touches no memory of this
-    // process. `pgid` is above 1, so it never names this process's own group
-    // or `init`. Callers pass the id of a child that is not yet reaped and
-    // that leads its own group (`process_group(0)`), so the id cannot have
-    // been reused. A group that no longer exists returns `ESRCH`.
-    let rc = unsafe { libc::killpg(pgid, signal) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// Whether the child `pid` has exited, without reaping it (`WNOWAIT`).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn leader_has_exited(pid: u32) -> bool {
-    // `id_t` is `u32` on both Linux and macOS.
-    let id = libc::id_t::from(pid);
-    // SAFETY: `siginfo_t` is plain data, and all zeroes is a valid value.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a valid, writable `siginfo_t` that outlives the call.
-    // `WNOWAIT` leaves the child waitable, so tokio still reaps it later.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            id,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc != 0 {
-        // `ECHILD`: nothing left to wait for.
-        return true;
-    }
-    // SAFETY: `waitid` succeeded and wrote `info`. With `WNOHANG`, `si_pid`
-    // stays 0 when the child has not exited.
-    unsafe { info.si_pid() != 0 }
-}
-
-/// Without `waitid`, wait out the full grace before `SIGKILL`.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn leader_has_exited(_pid: u32) -> bool {
-    false
-}
-
 // ---------------------------------------------------------------------------
 // WarehouseAdapter implementation
 // ---------------------------------------------------------------------------
@@ -1127,26 +1021,6 @@ for line in sys.stdin:
         assert_ne!(ida, idb, "request ids must be distinct");
 
         let _ = adapter.close().await;
-    }
-
-    #[tokio::test]
-    async fn read_bounded_line_accepts_the_limit_and_refuses_one_byte_more() {
-        let line = format!("{}\n", "x".repeat(8));
-        let mut reader = tokio::io::BufReader::new(line.as_bytes());
-        assert_eq!(
-            read_bounded_line(&mut reader, 8).await.unwrap().as_deref(),
-            Some(line.as_str())
-        );
-
-        let line = format!("{}\n", "x".repeat(9));
-        let mut reader = tokio::io::BufReader::new(line.as_bytes());
-        assert_eq!(read_bounded_line(&mut reader, 8).await.unwrap(), None);
-
-        let mut reader = tokio::io::BufReader::new(&b""[..]);
-        assert_eq!(
-            read_bounded_line(&mut reader, 8).await.unwrap().as_deref(),
-            Some("")
-        );
     }
 
     /// A Python adapter for the limit tests.

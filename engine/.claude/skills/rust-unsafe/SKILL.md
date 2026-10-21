@@ -1,6 +1,6 @@
 ---
 name: rust-unsafe
-description: `unsafe` conventions in the Rocky engine — SAFETY comment rules, the legitimate unsafe categories (a memory-map, a repr(transparent) cast, and serialised test env-var mutation), and when to push back on new unsafe. Use when auditing, reviewing, or adding any `unsafe` block/function in the engine crates.
+description: `unsafe` conventions in the Rocky engine — SAFETY comment rules, the legitimate unsafe categories (a memory-map, a repr(transparent) cast, child-process signals and rlimits, and serialised test env-var mutation), and when to push back on new unsafe. Use when auditing, reviewing, or adding any `unsafe` block/function in the engine crates.
 ---
 
 # `unsafe` in the Rocky engine
@@ -18,7 +18,13 @@ Rocky keeps `unsafe` **minimal and boring** on purpose. It falls into two bucket
 
 **Test-only unsafe — the majority of sites:** `std::env::{set_var, remove_var}` inside `#[cfg(test)]` modules across many crates (`config.rs`, `models.rs`, `pipes.rs`, `object_store.rs`, `rocky-observe`, `rocky-server/src/lsp.rs`, several `rocky-cli` commands, and integration tests). Env mutation became `unsafe` in the 2024 edition because it races with concurrent reads; every one is serialised under a module `ENV_LOCK` (or a single-threaded test) and restores state before returning.
 
-**There is no FFI unsafe.** The `duckdb` crate, `jsonwebtoken`, and `rsa` all wrap their C / crypto surfaces in safe APIs — Rocky calls those and never reaches into `duckdb_sys` or similar. If you find yourself writing an FFI binding from scratch, **stop** and check whether the upstream crate already has a safe wrapper.
+**Child-process unsafe — `rocky-adapter-sdk/src/child.rs`:** `killpg` and `waitid` to stop a child's process group, and `getrlimit`/`setrlimit` inside a `pre_exec` closure (`apply_rlimits`) to cap a child connector's CPU, memory and output size. These are libc calls with no safe wrapper in the dependencies we use. The `pre_exec` rules:
+
+- The closure runs between `fork` and `exec`. It must capture only `Copy` values, allocate nothing and take no lock.
+- `setrlimit` is **not** on POSIX's async-signal-safe list. The SAFETY comment must say so, and say what it rests on instead: on glibc, musl and macOS libSystem it is a direct syscall wrapper with no allocation and no locks. Never write "async-signal-safe" for it.
+- A hard CPU limit above the soft one. A refused `RLIMIT_AS` is ignored on macOS only. Cast `RLIMIT_*` constants per platform (`__rlimit_resource_t` on glibc, `c_int` elsewhere).
+
+**There is no other FFI unsafe.** The `duckdb` crate, `jsonwebtoken`, and `rsa` all wrap their C / crypto surfaces in safe APIs — Rocky calls those and never reaches into `duckdb_sys` or similar. If you find yourself writing an FFI binding from scratch, **stop** and check whether the upstream crate already has a safe wrapper.
 
 Keep this list short. Every new `unsafe` site is a reviewer tax and a future soundness bug waiting to happen.
 
