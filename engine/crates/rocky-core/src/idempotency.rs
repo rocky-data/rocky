@@ -448,17 +448,7 @@ impl IdempotencyBackend {
                 prefix,
                 mirror_to_redb,
             } => {
-                valkey_finalize(
-                    url,
-                    prefix,
-                    key,
-                    run_id,
-                    outcome,
-                    retention_until,
-                    config,
-                    now,
-                )
-                .await?;
+                valkey_finalize(url, prefix, key, run_id, outcome, config, now).await?;
                 if *mirror_to_redb && let Some(store) = state_store {
                     // Mirror finalized state into local redb best-effort; see
                     // claim path for the race reasoning.
@@ -673,13 +663,13 @@ async fn valkey_finalize(
     key: &str,
     run_id: &str,
     outcome: FinalOutcome,
-    retention_until: DateTime<Utc>,
     config: &IdempotencyConfig,
     now: DateTime<Utc>,
 ) -> Result<(), IdempotencyError> {
     if url.is_empty() {
         return Ok(());
     }
+    let retention_until = now + chrono::Duration::days(config.retention_days as i64);
     let full_key = valkey_key(prefix, key);
     let should_keep = match (outcome, config.dedup_on) {
         (FinalOutcome::Succeeded, _) => true,
