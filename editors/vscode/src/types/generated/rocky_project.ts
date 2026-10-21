@@ -2688,7 +2688,7 @@ export interface IdempotencyConfig {
    */
   dedup_on?: DedupPolicy & string;
   /**
-   * Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them.
+   * Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them. Read when a run claims the key and stamped on that claim: changing it later does not change a claim already made.
    */
   in_flight_ttl_hours?: number;
   /**
