@@ -63,7 +63,8 @@
 //! `timeout` (safe, but slow). A 409 is taken as "the connector is busy": the
 //! connector is waited for and the request is sent again when it is idle.
 //! After a second 409 (counted over the whole run) no request is sent; the
-//! connector ends `trigger_failed` once a read shows it idle.
+//! connector ends `trigger_failed` after `SETTLE_POLLS` idle reads in a row,
+//! because the status can lag behind the sync the 409 announced.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -166,7 +167,7 @@ pub enum SourceSyncTriggerError {
     /// caller takes the safe side: it treats the connector as syncing, waits
     /// for it to be idle, does not count that sync as its own, and asks once
     /// more. After a second busy answer it sends nothing more and ends the
-    /// connector as `TriggerFailed` once a read shows it idle.
+    /// connector as `TriggerFailed` after several idle reads in a row.
     #[error("{0}")]
     Conflict(String),
     /// The request may have reached the source and its answer is unknown (a
@@ -509,6 +510,8 @@ struct TriggerTracked {
     detail: Option<String>,
     /// Busy (409) answers so far; see [`MAX_CONFLICTS`].
     conflicts: u32,
+    /// Idle reads in a row after the last busy answer that stopped requests.
+    idle_reads: u32,
 }
 
 impl TriggerTracked {
@@ -604,6 +607,7 @@ pub async fn trigger_and_wait_for_source_syncs(
             waited_secs: 0,
             detail: None,
             conflicts: 0,
+            idle_reads: 0,
         })
         .collect();
     for t in tracked
@@ -818,10 +822,19 @@ pub async fn trigger_and_wait_for_source_syncs(
                 TriggerPhase::AwaitIdle => {
                     if state.paused {
                         t.finish(SourceSyncOutcome::Paused, waited);
-                    } else if !state.syncing && t.conflicts >= MAX_CONFLICTS {
-                        // Busy twice: no more requests. The busy sync is over,
-                        // so the run may read what it landed.
-                        t.finish(SourceSyncOutcome::TriggerFailed, waited);
+                    } else if t.conflicts >= MAX_CONFLICTS {
+                        // Busy twice: no more requests. The 409 says a sync
+                        // probably runs, and the status can lag behind it, so
+                        // only `SETTLE_POLLS` idle reads in a row end the
+                        // connector; a syncing read starts the count again.
+                        if state.syncing {
+                            t.idle_reads = 0;
+                        } else {
+                            t.idle_reads += 1;
+                            if t.idle_reads >= SETTLE_POLLS {
+                                t.finish(SourceSyncOutcome::TriggerFailed, waited);
+                            }
+                        }
                     } else if !state.syncing {
                         t.detail = None;
                         t.phase = TriggerPhase::Ready(Identity::of(state));
@@ -1648,8 +1661,75 @@ mod tests {
         ]);
         let report = trigger_run(&a, 5000).await;
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert!(!report.syncs[0].triggered);
         assert_eq!(report.syncs[0].last_sync_at, at(35));
+        assert!(
+            report.syncs[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("busy answer 2 times")),
+            "{:?}",
+            report.syncs[0].detail
+        );
         assert_eq!(a.requests().len(), 2);
+    }
+
+    /// After a second busy answer, one idle read is not enough: the status
+    /// can lag behind the sync the 409 announced. A sync that shows up after
+    /// one idle read is still waited out.
+    #[tokio::test]
+    async fn after_a_second_busy_answer_one_idle_read_is_not_enough() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", false, at(-500), None, 10)],
+            // Idle once (lag), then the sync shows, then it ends.
+            vec![seen("a", false, at(-500), None, 20)],
+            vec![seen("a", true, at(-500), None, 30)],
+            vec![seen("a", false, at(35), None, 40)],
+        ])
+        .with_trigger_results(vec![
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+        ]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert_eq!(report.syncs[0].last_sync_at, at(35));
+    }
+
+    /// After a second busy answer, a paused read ends the connector `paused`,
+    /// and a deadline hit while it is still busy ends it `timeout`.
+    #[tokio::test]
+    async fn after_a_second_busy_answer_pause_and_deadline_end_the_connector() {
+        let busy = || {
+            vec![
+                Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+                Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            ]
+        };
+        let paused = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", false, at(-500), None, 10)],
+            vec![SourceSyncState {
+                paused: true,
+                ..seen("a", false, at(-500), None, 20)
+            }],
+        ])
+        .with_trigger_results(busy());
+        assert_eq!(
+            trigger_run(&paused, 5000).await.syncs[0].outcome,
+            SourceSyncOutcome::Paused
+        );
+
+        let stuck = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", false, at(-500), None, 10)],
+            vec![seen("a", true, at(-500), None, 20)],
+        ])
+        .with_trigger_results(busy());
+        let report = trigger_run(&stuck, 200).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(!report.syncs[0].triggered);
+        assert_eq!(stuck.requests().len(), 2);
     }
 
     /// A timestamp that moved but is not past `T_pre` plus the margin, with no
