@@ -22,7 +22,7 @@
 //!   idle -----------------------------------------------+
 //!                                                         v
 //!        baseline = succeeded_at / failed_at of that idle read
-//!        one POST (never `force`); its `Date` header is the new T_pre
+//!        one POST (never `force`); T_pre = the later of its `Date` and the idle read's
 //!        poll: syncing seen, then idle
 //!          succeeded_at moved past the baseline AND > T_pre + 5 s --> succeeded
 //!          failed_at    moved past the baseline AND > T_pre + 5 s --> failed
@@ -32,19 +32,31 @@
 //! Two tests must both pass before a timestamp counts as the end of the sync
 //! Rocky started. The first is that it moved past the baseline: both values
 //! come from the vendor API, so no clock takes part. The second is that it is
-//! later than `T_pre` plus 5 seconds. `T_pre` is the `Date` header of the
-//! answer to the POST, so a scheduled sync that began and ended before the
-//! POST (for example while the POST waited out a 429) is not counted. When the
-//! POST answer has no `Date`, the idle read's `Date` stands in, and when that
-//! is missing too this machine's clock does. The moved test still applies
-//! then, so a clock difference alone can never make a sync look like ours.
+//! later than `T_pre` plus 5 seconds. `T_pre` is the later of the `Date`
+//! header of the answer to the POST and the `Date` of the idle read, so a
+//! scheduled sync that began and ended before the POST (for example while the
+//! POST waited out a 429) is not counted. When neither has a `Date`, this
+//! machine's clock stands in. The moved test still applies then, so a clock
+//! difference alone can never make a sync look like ours.
 //!
 //! The 5 second margin covers the gap between the server clock behind `T_pre`
 //! and the clock behind `succeeded_at`. It can reject a real sync that ends
-//! within 5 seconds of the POST. Such a sync ends as `unknown` when a poll saw
-//! it syncing first, and as `timeout` after the full wait when no poll did.
-//! Both are failures: it fails closed. The one window left open is a scheduled
-//! sync that starts between the POST and its answer: it is accepted as ours.
+//! within 5 seconds of the POST. Such a sync ends as `unknown`, at once when
+//! its timestamp has moved, and after the settle polls when a poll saw it
+//! syncing first. A sync that never shows and never moves ends as `timeout`
+//! after the full wait. All of these are failures: it fails closed.
+//!
+//! One window stays open. A sync that starts after the idle read and before
+//! Rocky's POST is answered, and is still running then, is counted as
+//! Rocky's: with `force = false` Fivetran starts no second sync, so the POST
+//! joins the running one, and Rocky cannot tell the two apart. That window can
+//! last minutes when earlier connectors hit 429 backoff.
+//!
+//! A request whose answer is unknown (a timeout, a 5xx) is treated as sent:
+//! the row stays `triggered`, and the wait goes on like it does for a slow
+//! start, so a sync that starts later is still waited out. A 409 is taken as
+//! "the connector is busy": the connector is waited for and the request is
+//! sent again when it is idle.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -101,6 +113,11 @@ impl Identity {
         moved(now, base) && ends_after(now, self.t_pre)
     }
 
+    /// A timestamp moved past the baseline, whatever `t_pre` says.
+    fn moved_any(&self, state: &SourceSyncState) -> bool {
+        moved(state.succeeded_at, self.base_succeeded) || moved(state.failed_at, self.base_failed)
+    }
+
     fn succeeded(&self, state: &SourceSyncState) -> bool {
         self.ended(state.succeeded_at, self.base_succeeded)
     }
@@ -122,11 +139,17 @@ pub enum SourceSyncTriggerError {
     /// The source refused the key (HTTP 403). The text names the fix.
     #[error("{0}")]
     Forbidden(String),
-    /// The source refused the request, or it never went out (a 400, 404 or
-    /// 409, a 429 that outlasted the retries, a connect error). No sync
-    /// started because of it, so the caller does not read the connector again.
+    /// The source refused the request, or it never went out (a 400 or 404, a
+    /// 429 that outlasted the retries, a connect error). No sync started
+    /// because of it, so the caller does not read the connector again.
     #[error("{0}")]
     Failed(String),
+    /// The source answered that the connector is busy (HTTP 409). The vendor
+    /// docs do not say whether that means "a sync is already running", so the
+    /// caller takes the safe side: it treats the connector as syncing, waits
+    /// for it to be idle, and does not count that sync as its own.
+    #[error("{0}")]
+    Conflict(String),
     /// The request may have reached the source and its answer is unknown (a
     /// timeout, a server error, a connection lost mid-request). The caller
     /// reads the connector again to see whether a sync started.
@@ -488,17 +511,22 @@ fn idle_seen_at(state: &SourceSyncState) -> DateTime<Utc> {
     })
 }
 
-/// After a request whose answer is unknown, read the connector once more.
-/// `Some(syncing)` when a sync is running or ended after the request.
-async fn sync_started_anyway(
+/// After a request whose answer is unknown, read the connector once more and
+/// say whether it is syncing right now. A failed read, or a connector that is
+/// not in the answer, counts as "not seen syncing": the caller keeps waiting
+/// either way, because the request may have been sent.
+async fn syncing_after_unknown(
     adapter: &dyn DiscoveryAdapter,
     schema_prefix: &str,
     id: &str,
-    identity: &Identity,
-) -> Option<bool> {
-    let states = adapter.source_sync_states(schema_prefix).await.ok()??;
-    let state = states.iter().find(|s| s.id == id)?;
-    (state.syncing || identity.succeeded(state) || identity.failed(state)).then_some(state.syncing)
+) -> bool {
+    let Ok(Some(states)) = adapter.source_sync_states(schema_prefix).await else {
+        return false;
+    };
+    states
+        .iter()
+        .find(|s| s.id == id)
+        .is_some_and(|s| s.syncing)
 }
 
 /// Start a sync on every selected connector and wait until each has ended.
@@ -518,9 +546,11 @@ async fn sync_started_anyway(
 /// `TriggerFailed`. A request the source refused
 /// ([`SourceSyncTriggerError::Failed`]) ends as `TriggerFailed` and is never
 /// counted as started, whatever a later read shows. A request with an unknown
-/// answer ([`SourceSyncTriggerError::Unknown`]) is checked with one more read
-/// before it is called failed. `on_trigger` runs
-/// right after each request that was accepted or found to have started.
+/// answer ([`SourceSyncTriggerError::Unknown`]) may have been sent: the row
+/// stays `triggered` and the wait goes on, so it ends `timeout` or `unknown`,
+/// never `TriggerFailed`. A busy answer ([`SourceSyncTriggerError::Conflict`])
+/// sends the connector back to waiting for idle. `on_trigger` runs right after
+/// each request that was accepted or may have been sent.
 ///
 /// Returns `Ok(None)` when the adapter does not report sync state, and `Err`
 /// when the first read fails. Later read failures end the wait like
@@ -613,24 +643,35 @@ pub async fn trigger_and_wait_for_source_syncs(
                 interrupted = true;
                 break;
             };
-            // `Some((syncing, identity))` when a sync is ours.
+            // `Some((seen_syncing, identity))` when a sync may be ours.
             let started_sync = match result {
                 // The `Date` of the answer is the lower bound for the end of
                 // the sync: the sync cannot have started before the request.
+                // It never lowers the bound the idle read already set.
                 Ok(post_date) => Some((
                     false,
                     Identity {
-                        t_pre: post_date.unwrap_or(identity.t_pre),
+                        t_pre: post_date.map_or(identity.t_pre, |d| d.max(identity.t_pre)),
                         ..identity
                     },
                 )),
                 Err(SourceSyncTriggerError::Unknown(message)) => {
-                    // A timeout or a server error: the sync may have started.
-                    let found = sync_started_anyway(adapter, schema_prefix, &t.id, &identity).await;
-                    if found.is_none() {
-                        t.detail = Some(message);
-                    }
-                    found.map(|syncing| (syncing, identity))
+                    // A timeout or a server error: the request may have
+                    // reached the source. Treat it as sent, whatever one more
+                    // read shows, and keep waiting for a sync to start.
+                    let syncing = syncing_after_unknown(adapter, schema_prefix, &t.id).await;
+                    t.detail = Some(format!(
+                        "{message}; the request may have been sent and a sync may still start"
+                    ));
+                    Some((syncing, identity))
+                }
+                // The connector is busy: wait it out, do not count that sync.
+                Err(SourceSyncTriggerError::Conflict(message)) => {
+                    t.detail = Some(format!(
+                        "{message}; the connector is treated as syncing and is waited for"
+                    ));
+                    t.phase = TriggerPhase::AwaitIdle;
+                    continue;
                 }
                 // A refusal: no sync started because of it. A sync that
                 // Fivetran started on its own is not ours.
@@ -720,6 +761,7 @@ pub async fn trigger_and_wait_for_source_syncs(
                     if state.paused {
                         t.finish(SourceSyncOutcome::Paused, waited);
                     } else if !state.syncing {
+                        t.detail = None;
                         t.phase = TriggerPhase::Ready(Identity::of(state));
                     }
                 }
@@ -749,10 +791,19 @@ pub async fn trigger_and_wait_for_source_syncs(
                         (false, false) => None,
                     };
                     match outcome {
-                        Some(o) => t.finish(o, waited),
+                        Some(o) => {
+                            t.detail = None;
+                            t.finish(o, waited);
+                        }
                         // Idle with nothing past `t_pre`. Before any read has
                         // shown the sync, this is a slow start: keep waiting
-                        // until the deadline.
+                        // until the deadline. But a timestamp that already
+                        // moved yet is not past `t_pre` plus the margin is a
+                        // sync that ended too soon to count and will not move
+                        // again: end it now.
+                        None if !seen_syncing && id.moved_any(state) => {
+                            t.finish(SourceSyncOutcome::Unknown, waited);
+                        }
                         None if !seen_syncing => {}
                         None if settle >= SETTLE_POLLS => {
                             t.finish(SourceSyncOutcome::Unknown, waited);
@@ -1412,8 +1463,9 @@ mod tests {
         assert!(!report.syncs[0].triggered);
     }
 
-    /// A request with an unknown answer (timeout, 5xx) is not called failed
-    /// before one more read: if a sync started, it is accepted.
+    /// A request with an unknown answer (timeout, 5xx) is treated as sent:
+    /// a sync that the re-read shows is accepted, and one that never shows
+    /// ends as a timeout, not as a failed request.
     #[tokio::test]
     async fn an_unknown_request_answer_is_checked_with_one_more_read() {
         let started = TriggerScripted::new(vec![
@@ -1429,14 +1481,100 @@ mod tests {
         // One request only: an unknown answer is never retried.
         assert_eq!(started.requests().len(), 1);
 
+        // The re-read shows no sync and no sync ever shows: the request may
+        // have been sent, so the row stays triggered and waits out the deadline.
         let idle = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)]])
             .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown(
                 "HTTP 502".into(),
             ))]);
-        let report = trigger_run(&idle, 1000).await;
-        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
-        assert_eq!(report.syncs[0].detail.as_deref(), Some("HTTP 502"));
+        let report = trigger_run(&idle, 100).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(report.syncs[0].triggered);
+        let detail = report.syncs[0].detail.as_deref().unwrap();
+        assert!(
+            detail.contains("HTTP 502") && detail.contains("may have been sent"),
+            "{detail}"
+        );
         assert_eq!(idle.requests().len(), 1);
+    }
+
+    /// The re-read after an unknown answer finds the connector still idle
+    /// (`scheduled`); the sync starts a moment later and is waited out.
+    #[tokio::test]
+    async fn a_sync_that_starts_after_an_unknown_answer_is_waited_out() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            // The re-read right after the 502: nothing yet.
+            vec![seen("a", false, at(-500), None, 5)],
+            vec![seen("a", true, at(-500), None, 10)],
+            vec![seen("a", false, at(60), None, 70)],
+        ])
+        .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown(
+            "HTTP 502".into(),
+        ))]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert!(report.syncs[0].triggered);
+        assert_eq!(report.syncs[0].detail, None);
+        assert_eq!(a.requests().len(), 1);
+    }
+
+    /// A timestamp that moved but is not past `T_pre` plus the margin, with no
+    /// poll having seen the sync, ends at once. It must not wait the full
+    /// timeout.
+    #[tokio::test]
+    async fn a_moved_end_inside_the_margin_with_no_sync_seen_ends_promptly_as_unknown() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 100)],
+            // Moved past the baseline, 3 s after T_pre: inside the margin.
+            vec![seen("a", false, at(103), None, 110)],
+        ]);
+        let t = Instant::now();
+        let report = trigger_run(&a, 60_000).await;
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Unknown);
+        assert!(report.syncs[0].triggered);
+    }
+
+    /// An earlier POST `Date` never lowers `T_pre` below the idle read's.
+    #[tokio::test]
+    async fn an_earlier_post_date_does_not_lower_t_pre() {
+        let script = |ended: i64| {
+            TriggerScripted::new(vec![
+                vec![seen("a", false, at(-500), None, 100)],
+                vec![seen("a", true, at(-500), None, 110)],
+                vec![seen("a", false, at(ended), None, 120)],
+            ])
+            .with_trigger_results(vec![Ok(at(50))])
+        };
+        // Past the POST date plus the margin, but not past the idle read's.
+        let early = trigger_run(&script(103), 5000).await;
+        assert_eq!(early.syncs[0].outcome, SourceSyncOutcome::Unknown);
+        let late = trigger_run(&script(106), 5000).await;
+        assert_eq!(late.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+    }
+
+    /// A 409 means the connector is busy: it is waited for, not counted, and
+    /// the request is sent again once it is idle.
+    #[tokio::test]
+    async fn a_busy_answer_waits_the_sync_out_and_asks_again() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", true, at(-500), None, 10)],
+            // The busy sync ended at 90; idle read at 100.
+            vec![seen("a", false, at(90), None, 100)],
+            vec![seen("a", true, at(90), None, 110)],
+            vec![seen("a", false, at(160), None, 170)],
+        ])
+        .with_trigger_results(vec![
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            Ok(None),
+        ]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert_eq!(report.syncs[0].last_sync_at, at(160));
+        assert!(report.syncs[0].triggered);
+        assert_eq!(a.requests().len(), 2);
     }
 
     #[tokio::test]

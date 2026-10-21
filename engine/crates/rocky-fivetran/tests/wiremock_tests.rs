@@ -2178,6 +2178,67 @@ mod sync_trigger {
         assert_eq!(posts(&server).await.len(), 1, "a 5xx POST is never retried");
     }
 
+    /// A 5xx may mean the sync started. The read right after it can still show
+    /// `scheduled`; the sync that starts a moment later is waited out and the
+    /// row is a success, never `trigger_failed`.
+    #[tokio::test]
+    async fn a_5xx_followed_by_a_late_starting_sync_is_waited_out() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                // The read after the failed POST: still not syncing.
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:30:00Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(
+            &server,
+            ResponseTemplate::new(502).set_body_string("bad gateway"),
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let client = fr_b_client(&server, tmp.path(), "trigger-5xx-late-key");
+        let adapter = FivetranDiscoveryAdapter::new(client, "dest_abc".into())
+            .with_sync_trigger_allowed(true);
+        let report = run(&adapter, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert!(report.syncs[0].triggered);
+        assert_eq!(posts(&server).await.len(), 1, "a 5xx POST is never retried");
+    }
+
+    /// A 409 is taken as "the connector is busy": that sync is waited out and
+    /// not counted, then the request goes out again.
+    #[tokio::test]
+    async fn a_409_waits_the_running_sync_out_then_asks_again() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T09:30:00Z", None, false),
+                page("syncing", "2026-10-21T09:30:00Z", None, false),
+                page("scheduled", "2026-10-21T10:30:00Z", None, false),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/connections/conn_1/sync"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("busy"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        serve_post(&server, accepted()).await;
+        let report = run(&adapter(&server, true), 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert!(report.syncs[0].triggered);
+        assert_eq!(posts(&server).await.len(), 2);
+    }
+
     /// A 429 means the request was not taken, so it retries (once here).
     #[tokio::test]
     async fn a_429_is_retried_and_the_second_post_is_accepted() {
@@ -2259,11 +2320,11 @@ mod sync_trigger {
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
     }
 
-    /// A refused POST (409) started nothing. A sync Fivetran started itself,
-    /// seen on the next read, is not Rocky's: no `triggered`, no event.
+    /// A refused POST (400, 404) started nothing. A sync Fivetran started
+    /// itself, seen on the next read, is not Rocky's: no `triggered`, no event.
     #[tokio::test]
     async fn a_refused_post_is_never_reported_as_triggered_even_if_a_sync_is_running() {
-        for status in [400u16, 404, 409] {
+        for status in [400u16, 404] {
             let server = MockServer::start().await;
             serve(
                 &server,

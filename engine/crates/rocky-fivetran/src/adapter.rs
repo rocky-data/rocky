@@ -170,10 +170,11 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
     /// Start one sync: `POST /v1/connections/{id}/sync`, never `force`.
     ///
     /// Refuses without the owner's opt-in, before any request. A 403 names
-    /// the fix. A refusal (400, 404, 409, an exhausted 429, a connect error) is
+    /// the fix. A 409 is `Conflict`: the connector is busy, so the caller waits for
+    /// it. A refusal (400, 404, an exhausted 429, a connect error) is
     /// `Failed`: no sync started. A timeout, a 5xx or a connection lost
-    /// mid-request is `Unknown`: the caller reads the connector to see whether
-    /// a sync started, and never retries the request. `Ok` carries the `Date`
+    /// mid-request is `Unknown`: the caller treats the request as sent, and never
+    /// retries it. `Ok` carries the `Date`
     /// header of the answer.
     async fn trigger_source_sync(
         &self,
@@ -192,6 +193,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                      trigger = false. {body}"
                 )),
                 SyncRequestError::Failed(message) => SourceSyncTriggerError::Failed(message),
+                SyncRequestError::Conflict(message) => SourceSyncTriggerError::Conflict(message),
                 SyncRequestError::Unknown(message) => SourceSyncTriggerError::Unknown(message),
             })
     }

@@ -740,6 +740,7 @@ impl FivetranClient {
     ///   connector to see whether a sync is running.
     /// - A 403 returns [`SyncRequestError::Forbidden`]: the key's role cannot
     ///   start syncs.
+    /// - A 409 returns [`SyncRequestError::Conflict`]: the connector is busy.
     ///
     /// `Ok` carries the `Date` header of the accepting answer, the server's
     /// clock after the request was taken.
@@ -816,6 +817,12 @@ impl FivetranClient {
                     truncate_error_body(&body)
                 )));
             }
+            if status == 409 {
+                return Err(SyncRequestError::Conflict(format!(
+                    "HTTP 409 to the sync request: {}",
+                    truncate_error_body(&body)
+                )));
+            }
             if !status.is_success() {
                 return Err(SyncRequestError::Failed(format!(
                     "HTTP {status} to the sync request: {}",
@@ -887,6 +894,9 @@ pub enum SyncRequestError {
     Forbidden(String),
     /// The request was refused or could not be sent. No sync started.
     Failed(String),
+    /// HTTP 409: Fivetran says the connector is busy. The public docs do not
+    /// say more, so the caller treats it as "a sync is running".
+    Conflict(String),
     /// The request may have reached Fivetran (a timeout or a 5xx). A sync may
     /// have started.
     Unknown(String),
