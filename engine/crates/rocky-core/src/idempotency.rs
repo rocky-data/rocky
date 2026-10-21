@@ -201,6 +201,13 @@ pub enum IdempotencyError {
     )]
     Contended { path: String, attempts: usize },
 
+    #[error(
+        "the Valkey backend for idempotency needs server-side Lua scripting (`EVAL`), \
+         and this server refused it: {detail}. Use a Valkey or Redis server that allows \
+         `EVAL`, or switch the state backend to \"local\", \"s3\" or \"gcs\"."
+    )]
+    ScriptingUnavailable { detail: String },
+
     #[error("task join error: {0}")]
     TaskJoin(String),
 }
@@ -463,8 +470,13 @@ impl IdempotencyBackend {
                 prefix,
                 mirror_to_redb,
             } => {
-                valkey_finalize(url, prefix, key, run_id, outcome, config, now).await?;
-                if *mirror_to_redb && let Some(store) = state_store {
+                let wrote = valkey_finalize(url, prefix, key, run_id, outcome, config, now).await?;
+                // Mirror only what the script wrote. When another run owns the
+                // key, the local row belongs to that run.
+                if wrote
+                    && *mirror_to_redb
+                    && let Some(store) = state_store
+                {
                     // Mirror finalized state into local redb best-effort; see
                     // claim path for the race reasoning.
                     let should_keep = match (outcome, config.dedup_on) {
@@ -576,6 +588,65 @@ fn valkey_key(prefix: &str, user_key: &str) -> String {
     format!("{prefix}{sep}idempotency:{user_key}")
 }
 
+/// Compare-and-set for the take-over of a stale claim. `KEYS[1]` is the claim
+/// key; `ARGV[1]` is the exact raw value this run read, `ARGV[2]` the new
+/// `InFlight` value and `ARGV[3]` its TTL in seconds. Returns 1 when the key
+/// still holds exactly `ARGV[1]` and was replaced, and 0 otherwise.
+const VALKEY_ADOPT_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+"#;
+
+/// The idempotency claim and finalize run server-side Lua. Some managed
+/// Valkey / Redis services restrict scripting, and a claim made there could
+/// never be finalized, so it would stay `InFlight` for `in_flight_ttl_hours`.
+const VALKEY_PROBE_SCRIPT: &str = "return 1";
+
+/// Turn a failed `EVAL` probe into an error. A server reply (unknown command,
+/// no permission) means scripting is refused; a transport failure is an
+/// ordinary Valkey error.
+fn map_probe_error(e: &redis::RedisError) -> IdempotencyError {
+    if e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() {
+        IdempotencyError::Valkey(e.to_string())
+    } else {
+        IdempotencyError::ScriptingUnavailable {
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// Check, before any work, that the server runs `EVAL`.
+fn valkey_probe_eval(conn: &mut redis::Connection) -> Result<(), IdempotencyError> {
+    redis::cmd("EVAL")
+        .arg(VALKEY_PROBE_SCRIPT)
+        .arg(0)
+        .query::<i64>(conn)
+        .map(|_| ())
+        .map_err(|e| map_probe_error(&e))
+}
+
+/// Replace the value at `key` with `new_value` (TTL `ttl_secs`) only if the
+/// key still holds exactly `expected`. `true` when this call took the key.
+fn valkey_adopt_cas(
+    conn: &mut redis::Connection,
+    key: &str,
+    expected: &[u8],
+    new_value: &[u8],
+    ttl_secs: u64,
+) -> Result<bool, IdempotencyError> {
+    let swapped: i64 = redis::Script::new(VALKEY_ADOPT_SCRIPT)
+        .key(key)
+        .arg(expected)
+        .arg(new_value)
+        .arg(ttl_secs)
+        .invoke(conn)
+        .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+    Ok(swapped == 1)
+}
+
 async fn valkey_check_and_claim(
     url: &str,
     prefix: &str,
@@ -597,79 +668,69 @@ async fn valkey_check_and_claim(
 
     let url = url.to_string();
     let key_for_task = full_key.clone();
+    let entry_for_task = entry.clone();
 
-    let outcome: ValkeyClaimOutcome =
-        tokio::task::spawn_blocking(move || -> Result<ValkeyClaimOutcome, IdempotencyError> {
+    let verdict: IdempotencyCheck =
+        tokio::task::spawn_blocking(move || -> Result<IdempotencyCheck, IdempotencyError> {
             let client =
                 redis::Client::open(url).map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
             let mut conn = client
                 .get_connection()
                 .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
 
-            // Try to claim atomically: SET key value NX EX ttl
-            let reply: Option<String> = redis::cmd("SET")
-                .arg(&key_for_task)
-                .arg(&value)
-                .arg("NX")
-                .arg("EX")
-                .arg(ttl_secs)
-                .query(&mut conn)
-                .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+            // Scripting is needed by finalize and by a take-over. Fail now,
+            // before the run does any work.
+            valkey_probe_eval(&mut conn)?;
 
-            if reply.as_deref() == Some("OK") {
-                return Ok(ValkeyClaimOutcome::Claimed);
-            }
-
-            // Key exists — read existing entry to classify.
-            let existing: Option<Vec<u8>> = redis::cmd("GET")
-                .arg(&key_for_task)
-                .query(&mut conn)
-                .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
-
-            match existing {
-                Some(bytes) => {
-                    let prior: IdempotencyEntry = serde_json::from_slice(&bytes)?;
-                    Ok(ValkeyClaimOutcome::Existing(prior))
+            for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
+                // Try to claim atomically: SET key value NX EX ttl
+                let reply: Option<String> = redis::cmd("SET")
+                    .arg(&key_for_task)
+                    .arg(&value)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ttl_secs)
+                    .query(&mut conn)
+                    .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+                if reply.as_deref() == Some("OK") {
+                    return Ok(IdempotencyCheck::Proceed);
                 }
-                None => {
-                    // Race: key was TTL'd between SET NX failure and GET. Re-try once.
-                    let retry: Option<String> = redis::cmd("SET")
-                        .arg(&key_for_task)
-                        .arg(&value)
-                        .arg("NX")
-                        .arg("EX")
-                        .arg(ttl_secs)
-                        .query(&mut conn)
-                        .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
-                    if retry.as_deref() == Some("OK") {
-                        Ok(ValkeyClaimOutcome::Claimed)
-                    } else {
-                        // Another claimer won the retry race; re-read.
-                        let bytes: Option<Vec<u8>> = redis::cmd("GET")
-                            .arg(&key_for_task)
-                            .query(&mut conn)
-                            .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
-                        match bytes {
-                            Some(b) => {
-                                let prior: IdempotencyEntry = serde_json::from_slice(&b)?;
-                                Ok(ValkeyClaimOutcome::Existing(prior))
-                            }
-                            None => Ok(ValkeyClaimOutcome::Claimed),
+
+                // Key exists: keep the raw bytes, so the take-over below
+                // compares against exactly what this run classified.
+                let existing: Option<Vec<u8>> = redis::cmd("GET")
+                    .arg(&key_for_task)
+                    .query(&mut conn)
+                    .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+                let Some(raw) = existing else {
+                    // Expired between the failed SET NX and the GET.
+                    continue;
+                };
+                let prior: IdempotencyEntry = serde_json::from_slice(&raw)?;
+                let verdict = classify_existing(prior, now, &entry_for_task);
+                match &verdict {
+                    IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. } => {
+                        // Take the key only if it still holds what we read.
+                        // When two runs adopt at once, exactly one script
+                        // swaps; the other re-reads and re-classifies.
+                        if valkey_adopt_cas(&mut conn, &key_for_task, &raw, &value, ttl_secs)? {
+                            return Ok(verdict);
                         }
                     }
+                    IdempotencyCheck::SkipCompleted { .. }
+                    | IdempotencyCheck::SkipInFlight { .. } => return Ok(verdict),
                 }
             }
+            Err(IdempotencyError::Contended {
+                path: key_for_task,
+                attempts: MAX_CONDITIONAL_ATTEMPTS,
+            })
         })
         .await
         .map_err(|e| IdempotencyError::TaskJoin(e.to_string()))??;
 
-    match outcome {
-        ValkeyClaimOutcome::Claimed => {
-            debug!(key = %full_key, "claimed idempotency key via SET NX EX");
-            Ok(IdempotencyCheck::Proceed)
-        }
-        ValkeyClaimOutcome::Existing(prior) => Ok(classify_existing(prior, now, entry)),
-    }
+    debug!(key = %full_key, verdict = ?verdict, "idempotency claim on valkey");
+    Ok(verdict)
 }
 
 /// Compare-and-set for [`valkey_finalize`]. `KEYS[1]` is the claim key;
@@ -692,6 +753,8 @@ end
 return 1
 "#;
 
+/// Returns `true` when the script wrote (or deleted) the claim, and `false`
+/// when another run owns the key and nothing was changed.
 async fn valkey_finalize(
     url: &str,
     prefix: &str,
@@ -700,9 +763,9 @@ async fn valkey_finalize(
     outcome: FinalOutcome,
     config: &IdempotencyConfig,
     now: DateTime<Utc>,
-) -> Result<(), IdempotencyError> {
+) -> Result<bool, IdempotencyError> {
     if url.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let retention_until = now + chrono::Duration::days(config.retention_days as i64);
     let full_key = valkey_key(prefix, key);
@@ -722,7 +785,7 @@ async fn valkey_finalize(
         .num_seconds()
         .max(1) as u64;
 
-    tokio::task::spawn_blocking(move || -> Result<(), IdempotencyError> {
+    tokio::task::spawn_blocking(move || -> Result<bool, IdempotencyError> {
         let client =
             redis::Client::open(url).map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
         let mut conn = client
@@ -764,16 +827,10 @@ async fn valkey_finalize(
                 "idempotency claim is held by another run; not finalizing it"
             );
         }
-        Ok(())
+        Ok(owned != 0)
     })
     .await
     .map_err(|e| IdempotencyError::TaskJoin(e.to_string()))?
-}
-
-#[derive(Debug)]
-enum ValkeyClaimOutcome {
-    Claimed,
-    Existing(IdempotencyEntry),
 }
 
 // -----------------------------------------------------------------------
@@ -944,19 +1001,24 @@ async fn object_store_finalize(
     // Dedup-on-success + failure frees the key for a retry. The object-store
     // API has no conditional delete, so this writes a `Failed` entry that is
     // already expired instead: a retry classifies it as stale and takes it
-    // over with a conditional write, and it cannot erase a newer claim.
-    let updated = IdempotencyEntry {
-        key: key.to_string(),
-        run_id: run_id.to_string(),
-        state: match outcome {
-            FinalOutcome::Succeeded => IdempotencyState::Succeeded,
-            FinalOutcome::Failed => IdempotencyState::Failed,
-        },
-        stamped_at: now,
-        expires_at: if should_keep { retention_until } else { now },
-        dedup_on: config.dedup_on,
+    // over with a conditional write, and it cannot erase a newer claim. Its
+    // `expires_at` is the claim's own `stamped_at`, a time clearly in the past,
+    // not `now`: a pod whose clock runs slower than ours must not read it as
+    // live.
+    let encode = |expires_at: DateTime<Utc>| -> Result<Bytes, IdempotencyError> {
+        let updated = IdempotencyEntry {
+            key: key.to_string(),
+            run_id: run_id.to_string(),
+            state: match outcome {
+                FinalOutcome::Succeeded => IdempotencyState::Succeeded,
+                FinalOutcome::Failed => IdempotencyState::Failed,
+            },
+            stamped_at: now,
+            expires_at,
+            dedup_on: config.dedup_on,
+        };
+        Ok(Bytes::from(serde_json::to_vec(&updated)?))
     };
-    let encoded = Bytes::from(serde_json::to_vec(&updated)?);
 
     for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
         let Some(observed) = observe_claim_at_path(provider, &rel_path).await? else {
@@ -967,7 +1029,7 @@ async fn object_store_finalize(
                 return Ok(());
             }
             match provider
-                .put_if_match(&rel_path, encoded.clone(), None)
+                .put_if_match(&rel_path, encode(retention_until)?, None)
                 .await?
             {
                 PutIfMatchOutcome::Committed(_) => return Ok(()),
@@ -989,8 +1051,18 @@ async fn object_store_finalize(
             return Ok(());
         }
         let generation = require_generation(&observed)?;
+        let expires_at = if should_keep {
+            retention_until
+        } else {
+            // Owned, so the claim parsed: back-date to its own stamp.
+            observed
+                .entry
+                .as_ref()
+                .map_or(now, |prior| prior.stamped_at)
+                .min(now)
+        };
         match provider
-            .put_if_match(&rel_path, encoded.clone(), Some(generation))
+            .put_if_match(&rel_path, encode(expires_at)?, Some(generation))
             .await?
         {
             PutIfMatchOutcome::Committed(_) => return Ok(()),
@@ -1115,6 +1187,23 @@ pub(crate) fn classify_existing(
     now: DateTime<Utc>,
     new_entry: &IdempotencyEntry,
 ) -> IdempotencyCheck {
+    // One rule for every backend: an entry past its own `expires_at` is dead,
+    // whatever its state. This must come before the state match. Otherwise a
+    // `Failed` entry written already expired (the object-store finalize under
+    // `dedup_on = "success"`) would dedup a later `dedup_on = "any"` run as
+    // completed work that never succeeded.
+    if prior.expires_at <= now {
+        if prior.state == IdempotencyState::InFlight {
+            info!(
+                key = %prior.key,
+                prior_run_id = %prior.run_id,
+                "adopting stale InFlight idempotency entry past TTL"
+            );
+        }
+        return IdempotencyCheck::AdoptStale {
+            prior_run_id: prior.run_id,
+        };
+    }
     match prior.state {
         IdempotencyState::Succeeded => IdempotencyCheck::SkipCompleted {
             run_id: prior.run_id,
@@ -1123,31 +1212,16 @@ pub(crate) fn classify_existing(
             DedupPolicy::Any => IdempotencyCheck::SkipCompleted {
                 run_id: prior.run_id,
             },
-            DedupPolicy::Success => {
-                // Stale failure — sweep semantics will remove it; caller
-                // proceeds (AdoptStale surfaces the prior run_id for log
-                // cross-reference).
-                IdempotencyCheck::AdoptStale {
-                    prior_run_id: prior.run_id,
-                }
-            }
+            // A live failure under `dedup_on = "success"` does not block a
+            // retry; AdoptStale surfaces the prior run_id for log
+            // cross-reference.
+            DedupPolicy::Success => IdempotencyCheck::AdoptStale {
+                prior_run_id: prior.run_id,
+            },
         },
-        IdempotencyState::InFlight => {
-            if prior.expires_at > now {
-                IdempotencyCheck::SkipInFlight {
-                    run_id: prior.run_id,
-                }
-            } else {
-                info!(
-                    key = %prior.key,
-                    prior_run_id = %prior.run_id,
-                    "adopting stale InFlight idempotency entry past TTL"
-                );
-                IdempotencyCheck::AdoptStale {
-                    prior_run_id: prior.run_id,
-                }
-            }
-        }
+        IdempotencyState::InFlight => IdempotencyCheck::SkipInFlight {
+            run_id: prior.run_id,
+        },
     }
 }
 
@@ -1604,5 +1678,276 @@ mod tests {
             assert_eq!(get_raw(&mut conn, &full), Some(junk.to_vec()));
             del_raw(&mut conn, &full);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Expiry rule and probe mapping (no server needed)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn classify_succeeded_past_its_expiry_adopts() {
+        let now = Utc::now();
+        let prior = mk_entry(
+            "run-prior",
+            IdempotencyState::Succeeded,
+            now - chrono::Duration::hours(25),
+            24,
+        );
+        let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
+        match classify_existing(prior, now, &new) {
+            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            other => panic!("expected AdoptStale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_failed_past_its_expiry_adopts_under_dedup_on_any() {
+        let now = Utc::now();
+        let prior = mk_entry(
+            "run-prior",
+            IdempotencyState::Failed,
+            now - chrono::Duration::hours(25),
+            24,
+        );
+        let mut new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
+        new.dedup_on = DedupPolicy::Any;
+        match classify_existing(prior, now, &new) {
+            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            other => panic!("expected AdoptStale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_server_reply_to_the_eval_probe_means_scripting_is_refused() {
+        let refused = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "unknown command 'EVAL'",
+        ));
+        match map_probe_error(&refused) {
+            IdempotencyError::ScriptingUnavailable { detail } => {
+                assert!(detail.contains("EVAL"), "{detail}");
+            }
+            other => panic!("expected ScriptingUnavailable, got {other:?}"),
+        }
+        let text = IdempotencyError::ScriptingUnavailable { detail: "x".into() }.to_string();
+        assert!(text.contains("server-side Lua scripting"), "{text}");
+    }
+
+    #[test]
+    fn a_transport_failure_in_the_eval_probe_is_a_valkey_error() {
+        let io = redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(matches!(map_probe_error(&io), IdempotencyError::Valkey(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // Live Valkey tests for take-over, the EVAL probe and the tiered mirror
+    // -------------------------------------------------------------------
+
+    fn expired_entry_json(run_id: &str, state: IdempotencyState) -> Vec<u8> {
+        let now = Utc::now();
+        serde_json::to_vec(&IdempotencyEntry {
+            key: "k".into(),
+            run_id: run_id.into(),
+            state,
+            stamped_at: now - chrono::Duration::hours(30),
+            expires_at: now - chrono::Duration::hours(6),
+            dedup_on: DedupPolicy::Success,
+        })
+        .unwrap()
+    }
+
+    /// The compare-and-set takes the key once. A second take-over that read the
+    /// same old value must lose, because the key no longer holds it. This is
+    /// the deterministic form of the two-adopters race.
+    #[tokio::test]
+    async fn live_valkey_adopt_cas_lets_only_one_taker_of_the_same_read_win() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("cas");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        let old = expired_entry_json("run-old", IdempotencyState::InFlight);
+        put_raw(&mut conn, &full, &old);
+
+        let first = valkey_adopt_cas(&mut conn, &full, &old, b"first", 100).unwrap();
+        let second = valkey_adopt_cas(&mut conn, &full, &old, b"second", 100).unwrap();
+        assert!(first, "the first taker must win");
+        assert!(
+            !second,
+            "the second taker read the same value and must lose"
+        );
+        assert_eq!(get_raw(&mut conn, &full), Some(b"first".to_vec()));
+        del_raw(&mut conn, &full);
+    }
+
+    /// Two runs adopt one expired entry at once: exactly one proceeds, the
+    /// other skips as in-flight, and the winner's finalize records `Succeeded`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_valkey_two_adopters_of_an_expired_entry_have_one_winner() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("two-adopters");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &expired_entry_json("run-old", IdempotencyState::InFlight),
+        );
+        let cfg = live_cfg(DedupPolicy::Success);
+        let backend = live_backend(&url, &prefix);
+
+        let (a, b) = tokio::join!(
+            backend.check_and_claim(None, "k", "run-a", &cfg),
+            backend.check_and_claim(None, "k", "run-b", &cfg),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (winner, loser_verdict) = match (&a, &b) {
+            (IdempotencyCheck::AdoptStale { .. }, IdempotencyCheck::SkipInFlight { .. }) => {
+                ("run-a", &b)
+            }
+            (IdempotencyCheck::SkipInFlight { .. }, IdempotencyCheck::AdoptStale { .. }) => {
+                ("run-b", &a)
+            }
+            other => panic!("expected one adopter and one skip, got {other:?}"),
+        };
+        assert!(
+            matches!(loser_verdict, IdempotencyCheck::SkipInFlight { run_id } if run_id == winner),
+            "{loser_verdict:?}"
+        );
+
+        backend
+            .finalize(None, "k", winner, FinalOutcome::Succeeded, &cfg)
+            .await
+            .unwrap();
+        let raw = get_raw(&mut conn, &full).expect("entry kept");
+        let entry: IdempotencyEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(entry.state, IdempotencyState::Succeeded);
+        assert_eq!(entry.run_id, winner);
+        del_raw(&mut conn, &full);
+    }
+
+    /// An adopter takes the key, so its own finalize is not a no-op.
+    #[tokio::test]
+    async fn live_valkey_adopt_writes_the_claim_and_the_adopters_finalize_lands() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("adopt-writes");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &expired_entry_json("run-old", IdempotencyState::Succeeded),
+        );
+        let cfg = live_cfg(DedupPolicy::Success);
+        let backend = live_backend(&url, &prefix);
+
+        let verdict = backend
+            .check_and_claim(None, "k", "run-new", &cfg)
+            .await
+            .unwrap();
+        assert!(
+            matches!(verdict, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-old"),
+            "{verdict:?}"
+        );
+        let held: IdempotencyEntry =
+            serde_json::from_slice(&get_raw(&mut conn, &full).unwrap()).unwrap();
+        assert_eq!(held.run_id, "run-new");
+        assert_eq!(held.state, IdempotencyState::InFlight);
+
+        backend
+            .finalize(None, "k", "run-new", FinalOutcome::Succeeded, &cfg)
+            .await
+            .unwrap();
+        let held: IdempotencyEntry =
+            serde_json::from_slice(&get_raw(&mut conn, &full).unwrap()).unwrap();
+        assert_eq!(held.run_id, "run-new");
+        assert_eq!(held.state, IdempotencyState::Succeeded);
+        del_raw(&mut conn, &full);
+    }
+
+    /// A server that refuses `EVAL` fails the claim before any work. The
+    /// refusal is real: an ACL user without `eval` / `evalsha`.
+    #[tokio::test]
+    async fn live_valkey_claim_fails_when_the_server_refuses_eval() {
+        let Some(url) = live_valkey_url() else { return };
+        let user = format!("noscript{}", uuid::Uuid::new_v4().simple());
+        let mut admin = live_conn(&url);
+        let _: String = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg("on")
+            .arg(">pw")
+            .arg("~*")
+            .arg("+@all")
+            .arg("-eval")
+            .arg("-evalsha")
+            .query(&mut admin)
+            .unwrap();
+        let restricted = url.replacen("redis://", &format!("redis://{user}:pw@"), 1);
+        let prefix = live_prefix("no-eval");
+
+        let result = live_backend(&restricted, &prefix)
+            .check_and_claim(None, "k", "run-a", &live_cfg(DedupPolicy::Success))
+            .await;
+        let _: i64 = redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query(&mut admin)
+            .unwrap();
+        match result {
+            Err(IdempotencyError::ScriptingUnavailable { .. }) => {}
+            other => panic!("expected ScriptingUnavailable, got {other:?}"),
+        }
+        assert!(
+            get_raw(&mut admin, &valkey_key(&prefix, "k")).is_none(),
+            "no claim may be written when scripting is refused"
+        );
+    }
+
+    /// Tiered: when another run owns the key, the finalize script writes
+    /// nothing, so the local mirror row of the new owner stays as it is.
+    #[tokio::test]
+    async fn live_tiered_finalize_does_not_overwrite_the_new_owners_mirror() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("tiered-mirror");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &entry_json("run-b", IdempotencyState::InFlight),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let theirs = IdempotencyEntry {
+            key: "k".into(),
+            run_id: "run-b".into(),
+            state: IdempotencyState::InFlight,
+            stamped_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            dedup_on: DedupPolicy::Success,
+        };
+        store.idempotency_put(&theirs).unwrap();
+
+        let backend = IdempotencyBackend::Valkey {
+            url: url.clone(),
+            prefix,
+            mirror_to_redb: true,
+        };
+        backend
+            .finalize(
+                Some(&store),
+                "k",
+                "run-a",
+                FinalOutcome::Succeeded,
+                &live_cfg(DedupPolicy::Success),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.idempotency_get("k").unwrap(), Some(theirs));
+        del_raw(&mut conn, &full);
     }
 }

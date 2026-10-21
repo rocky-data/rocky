@@ -418,7 +418,9 @@ async fn a_failed_finalize_under_dedup_on_success_lets_the_next_run_adopt() {
 
     let held = read_entry(&bucket.provider, "k").await;
     assert_eq!(held.state, IdempotencyState::Failed);
-    assert_eq!(held.expires_at, failed_at);
+    // Back-dated to the claim's own stamp, not the finalize time, so a pod
+    // with a slower clock cannot read the entry as live.
+    assert_eq!(held.expires_at, t0());
 
     let retry = b
         .check_and_claim_at(None, "k", "run-b", &config, failed_at)
@@ -460,4 +462,112 @@ async fn a_failed_finalize_after_an_adopter_won_is_a_no_op() {
     let held = read_entry(&bucket.provider, "k").await;
     assert_eq!(held.run_id, "run-b");
     assert_eq!(held.state, IdempotencyState::InFlight);
+}
+
+fn cfg_any(in_flight_ttl_hours: u32) -> IdempotencyConfig {
+    IdempotencyConfig {
+        dedup_on: rocky_core::config::DedupPolicy::Any,
+        ..cfg(in_flight_ttl_hours)
+    }
+}
+
+/// A run fails under `dedup_on = "success"`, so the object store holds an
+/// already-expired `Failed` entry. A later run with `dedup_on = "any"` must
+/// adopt it, not skip it as completed work that never succeeded.
+#[tokio::test]
+async fn a_failed_under_success_entry_is_adopted_by_a_dedup_on_any_run() {
+    let bucket = bucket(2);
+    let b = backend();
+    b.check_and_claim_at(None, "k", "run-a", &cfg(24), t0())
+        .await
+        .unwrap();
+    let failed_at = t0() + Duration::minutes(5);
+    b.finalize_at(
+        None,
+        "k",
+        "run-a",
+        FinalOutcome::Failed,
+        &cfg(24),
+        failed_at,
+    )
+    .await
+    .unwrap();
+
+    let retry = b
+        .check_and_claim_at(None, "k", "run-b", &cfg_any(24), failed_at)
+        .await
+        .unwrap();
+    assert!(
+        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        "{retry:?}"
+    );
+    assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
+}
+
+/// A `Failed` entry that is still live under `dedup_on = "any"` keeps
+/// deduplicating: the new rule only adds the expiry check.
+#[tokio::test]
+async fn a_live_failed_entry_under_dedup_on_any_still_skips() {
+    let _bucket = bucket(2);
+    let b = backend();
+    b.check_and_claim_at(None, "k", "run-a", &cfg_any(24), t0())
+        .await
+        .unwrap();
+    let failed_at = t0() + Duration::minutes(5);
+    b.finalize_at(
+        None,
+        "k",
+        "run-a",
+        FinalOutcome::Failed,
+        &cfg_any(24),
+        failed_at,
+    )
+    .await
+    .unwrap();
+    let retry = b
+        .check_and_claim_at(
+            None,
+            "k",
+            "run-b",
+            &cfg_any(24),
+            failed_at + Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(retry, IdempotencyCheck::SkipCompleted { ref run_id } if run_id == "run-a"),
+        "{retry:?}"
+    );
+}
+
+/// A `Succeeded` entry past its own `expires_at` is dead: a later run adopts
+/// it, and one inside retention still skips.
+#[tokio::test]
+async fn a_succeeded_entry_past_its_expiry_is_adopted() {
+    let bucket = bucket(2);
+    let b = backend();
+    let config = cfg(24);
+    b.check_and_claim_at(None, "k", "run-a", &config, t0())
+        .await
+        .unwrap();
+    b.finalize_at(None, "k", "run-a", FinalOutcome::Succeeded, &config, t0())
+        .await
+        .unwrap();
+    let within = b
+        .check_and_claim_at(None, "k", "run-b", &config, t0() + Duration::days(29))
+        .await
+        .unwrap();
+    assert!(
+        matches!(within, IdempotencyCheck::SkipCompleted { .. }),
+        "{within:?}"
+    );
+    let past = b
+        .check_and_claim_at(None, "k", "run-b", &config, t0() + Duration::days(31))
+        .await
+        .unwrap();
+    assert!(
+        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        "{past:?}"
+    );
+    assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
 }

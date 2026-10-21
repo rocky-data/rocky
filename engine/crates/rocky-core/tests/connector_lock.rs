@@ -129,3 +129,53 @@ async fn the_sweep_keeps_a_claim_whose_own_expiry_is_ahead_after_the_config_ttl_
         .unwrap();
     assert_eq!(swept, 1, "past its own expiry the claim goes");
 }
+
+/// A `Succeeded` entry past its own `expires_at` is dead: a later run adopts
+/// it, and one inside retention still skips.
+#[tokio::test]
+async fn a_succeeded_entry_past_its_expiry_is_adopted() {
+    let (store, _dir) = open();
+    let b = IdempotencyBackend::Local;
+    let config = cfg(24);
+    b.check_and_claim_at(Some(&store), "k", "run-a", &config, t0())
+        .await
+        .unwrap();
+    b.finalize_at(
+        Some(&store),
+        "k",
+        "run-a",
+        rocky_core::idempotency::FinalOutcome::Succeeded,
+        &config,
+        t0(),
+    )
+    .await
+    .unwrap();
+    let within = b
+        .check_and_claim_at(
+            Some(&store),
+            "k",
+            "run-b",
+            &config,
+            t0() + Duration::days(29),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(within, IdempotencyCheck::SkipCompleted { .. }),
+        "{within:?}"
+    );
+    let past = b
+        .check_and_claim_at(
+            Some(&store),
+            "k",
+            "run-b",
+            &config,
+            t0() + Duration::days(31),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        "{past:?}"
+    );
+}
