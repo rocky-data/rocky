@@ -5075,6 +5075,7 @@ pub async fn run_with_explicit_contracts(
             output_json,
             cancel: &cancel,
             hooks: &hook_registry,
+            no_sync_trigger: skip_opts.no_sync_trigger,
         }
         .run(discovery_adapter.as_ref())
         .await?;

@@ -2266,6 +2266,7 @@ mod tests {
             path: None,
             extension_directory: None,
             offline: false,
+            allow_sync_trigger: false,
             schemas: Vec::new(),
             retry: rocky_core::config::RetryConfig::default(),
             cache: None,

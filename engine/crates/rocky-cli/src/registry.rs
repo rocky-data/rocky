@@ -627,10 +627,10 @@ impl AdapterRegistry {
                     })?;
                     client = client.with_circuit_breaker(breaker);
 
-                    let adapter = Arc::new(FivetranDiscoveryAdapter::new(
-                        client,
-                        destination_id.to_string(),
-                    ));
+                    let adapter = Arc::new(
+                        FivetranDiscoveryAdapter::new(client, destination_id.to_string())
+                            .with_sync_trigger_allowed(adapter_cfg.allow_sync_trigger),
+                    );
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "airbyte" => {

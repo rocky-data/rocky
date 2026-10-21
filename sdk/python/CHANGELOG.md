@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `RunResult` gains `source_syncs`: one loose `dict` row per source connector the run waited for or started a sync on (`id`, `schema`, `outcome`, `waited_secs`, `last_sync_at`, `triggered`, `detail`). The generated `RunOutput` carries the typed `SourceSyncOutput`.
+- `DiscoverResult` gains `sync_trigger` (default `False`): `True` when the pipeline starts its own source syncs. An orchestrator that reacts to `last_sync_at` should stand down for such a pipeline.
 - The generated `ProductSpec` output gains an optional `volume` (`VolumeSpec`: `min_rows`, `max_rows`, `severity`), the declared row range of a product's output.
 - `RunResult` and the generated run models gain `volume_warnings`, and `MaterializationInfo` and the generated materialization model an optional `volume` (`VolumeCheckOutput`: the row count, the range and the verdict). `VolumeCheckOutput` is exported from `rocky_sdk.types_generated`.
 - The generated `ProductStatusOutput` gains an optional `volume` (`ProductVolumeStatus`).

@@ -11,10 +11,10 @@ use tracing::warn;
 use rocky_core::source::{
     DiscoveredConnector, DiscoveredTable, DiscoveryResult, FailedSource, FailedSourceErrorClass,
 };
-use rocky_core::source_sync::SourceSyncState;
+use rocky_core::source_sync::{SourceSyncState, SourceSyncTriggerError};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
-use crate::client::{FivetranClient, FivetranError};
+use crate::client::{FivetranClient, FivetranError, SyncRequestError};
 use crate::connector::{self as ft_connector, Connector};
 use crate::schema as ft_schema;
 
@@ -25,6 +25,9 @@ use crate::schema as ft_schema;
 pub struct FivetranDiscoveryAdapter {
     client: FivetranClient,
     destination_id: String,
+    /// The credential owner's opt-in (`allow_sync_trigger`). Without it the
+    /// adapter sends no sync request, whatever a pipeline asks for.
+    allow_sync_trigger: bool,
 }
 
 /// `sync_state` values that mean a sync is running or about to resume.
@@ -39,7 +42,16 @@ impl FivetranDiscoveryAdapter {
         Self {
             client,
             destination_id,
+            allow_sync_trigger: false,
         }
+    }
+
+    /// Set the credential owner's opt-in to start syncs
+    /// (`[adapter.<name>] allow_sync_trigger`).
+    #[must_use]
+    pub fn with_sync_trigger_allowed(mut self, allowed: bool) -> Self {
+        self.allow_sync_trigger = allowed;
+        self
     }
 }
 
@@ -130,14 +142,18 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
         &self,
         schema_prefix: &str,
     ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
-        let connectors =
-            ft_connector::discover_connectors(&self.client, &self.destination_id, schema_prefix)
-                .await
-                .map_err(AdapterError::new)?;
+        let (connectors, observed_at) = ft_connector::discover_connectors_dated(
+            &self.client,
+            &self.destination_id,
+            schema_prefix,
+        )
+        .await
+        .map_err(AdapterError::new)?;
         Ok(Some(
             connectors
                 .into_iter()
                 .map(|c| SourceSyncState {
+                    observed_at,
                     syncing: is_syncing(&c.status.sync_state),
                     paused: c.paused || c.status.sync_state == "paused",
                     id: c.id,
@@ -148,6 +164,31 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                 })
                 .collect(),
         ))
+    }
+
+    /// Start one sync: `POST /v1/connections/{id}/sync`, never `force`.
+    ///
+    /// Refuses without the owner's opt-in, before any request. A 403 names
+    /// the fix. A timeout or a 5xx is reported as `Failed`: the caller reads
+    /// the connector to see whether a sync started, and never retries the
+    /// request.
+    async fn trigger_source_sync(&self, connector_id: &str) -> Result<(), SourceSyncTriggerError> {
+        if !self.allow_sync_trigger {
+            return Err(SourceSyncTriggerError::NotAllowed);
+        }
+        self.client
+            .post_sync(connector_id)
+            .await
+            .map_err(|e| match e {
+                SyncRequestError::Forbidden(body) => SourceSyncTriggerError::Forbidden(format!(
+                    "Fivetran refused the sync request for connector {connector_id} (HTTP 403): \
+                     this key cannot start syncs. Use a key whose role can run syncs, or set \
+                     trigger = false. {body}"
+                )),
+                SyncRequestError::Failed(message) | SyncRequestError::Unknown(message) => {
+                    SourceSyncTriggerError::Failed(message)
+                }
+            })
     }
 
     /// Populate each connector's `external_object_ids` from its DETAIL endpoint.

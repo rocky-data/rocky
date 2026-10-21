@@ -589,6 +589,19 @@ impl FivetranClient {
         &self,
         path: &str,
     ) -> Result<Vec<T>, FivetranError> {
+        Ok(self.get_all_pages_dated(path).await?.0)
+    }
+
+    /// [`Self::get_all_pages`], plus the server's clock: the `Date` header of
+    /// the LAST page fetched (`None` when absent or unparseable).
+    ///
+    /// The last page is the latest server time any item was read at. A caller
+    /// that treats "idle at this time" as a fact about every item gets a time
+    /// no earlier than any item's own read, which is the safe direction.
+    pub async fn get_all_pages_dated<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<T>, Option<chrono::DateTime<Utc>>), FivetranError> {
         let mut all_items = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -598,7 +611,7 @@ impl FivetranClient {
                 None => format!("{}{}?limit=100", self.base_url, path),
             };
 
-            let page: PaginatedData<T> =
+            let (page, date): (PaginatedData<T>, _) =
                 self.get_single_page(&url, path, cursor.as_deref()).await?;
 
             let has_next = page.next_cursor.is_some();
@@ -606,11 +619,9 @@ impl FivetranClient {
             all_items.extend(page.items);
 
             if !has_next {
-                break;
+                return Ok((all_items, date));
             }
         }
-
-        Ok(all_items)
     }
 
     /// Single paginated page fetch with retry logic.
@@ -619,7 +630,7 @@ impl FivetranClient {
         url: &str,
         path: &str,
         cursor: Option<&str>,
-    ) -> Result<PaginatedData<T>, FivetranError> {
+    ) -> Result<(PaginatedData<T>, Option<chrono::DateTime<Utc>>), FivetranError> {
         for attempt in 0..=self.retry.max_retries {
             debug!(path, cursor, attempt, "GET (paginated)");
 
@@ -693,6 +704,7 @@ impl FivetranClient {
                 });
             }
 
+            let server_date = parse_date_header(&resp);
             let envelope: ApiResponse<PaginatedData<T>> = resp.json().await.map_err(|e| {
                 FivetranError::UnexpectedResponse(format!("failed to parse response: {e}"))
             })?;
@@ -704,11 +716,112 @@ impl FivetranClient {
                 });
             }
 
-            return envelope.data.ok_or_else(|| {
-                FivetranError::UnexpectedResponse("paginated response has no data".into())
-            });
+            return envelope
+                .data
+                .map(|data| (data, server_date))
+                .ok_or_else(|| {
+                    FivetranError::UnexpectedResponse("paginated response has no data".into())
+                });
         }
 
+        unreachable!("retry loop should always return")
+    }
+
+    /// Ask Fivetran to start one sync on a connector:
+    /// `POST /v1/connections/{id}/sync` with `{"force": false}`.
+    ///
+    /// Never `force`, resync, unpause or cancel. At most one request reaches
+    /// Fivetran for each call:
+    ///
+    /// - A connect error or a 429 means the request was not taken, so those
+    ///   retry (within the retry budget).
+    /// - A timeout or a 5xx may mean the sync started, so those do not retry.
+    ///   They return [`SyncRequestError::Unknown`]; the caller reads the
+    ///   connector to see whether a sync is running.
+    /// - A 403 returns [`SyncRequestError::Forbidden`]: the key's role cannot
+    ///   start syncs.
+    pub async fn post_sync(&self, connector_id: &str) -> Result<(), SyncRequestError> {
+        let url = format!(
+            "{}/v1/connections/{}/sync",
+            self.base_url,
+            encode_path_segment(connector_id)
+        );
+        for attempt in 0..=self.retry.max_retries {
+            debug!(connector_id, attempt, "POST sync");
+            self.observe_shared_budget().await;
+
+            let resp = self
+                .client
+                .post(&url)
+                .basic_auth(self.api_key.expose(), Some(self.api_secret.expose()))
+                .json(&serde_json::json!({ "force": false }))
+                .send()
+                .await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) if e.is_connect() && attempt < self.retry.max_retries => {
+                    self.check_retry_budget()
+                        .map_err(|e| SyncRequestError::Failed(e.to_string()))?;
+                    self.emit_retry_event(attempt, &e.to_string(), ErrorClass::Transient);
+                    tokio::time::sleep(retry_backoff(&self.retry, attempt)).await;
+                    continue;
+                }
+                Err(e) if e.is_timeout() => {
+                    return Err(SyncRequestError::Unknown(format!(
+                        "no answer to the sync request: {e}"
+                    )));
+                }
+                Err(e) => return Err(SyncRequestError::Failed(FivetranError::from(e).to_string())),
+            };
+
+            let status = resp.status();
+            if status == 429 {
+                if attempt < self.retry.max_retries {
+                    self.check_retry_budget()
+                        .map_err(|e| SyncRequestError::Failed(e.to_string()))?;
+                    self.emit_retry_event(attempt, "HTTP 429", ErrorClass::RateLimit);
+                    let sleep_for = self.compute_throttle_sleep(&resp, attempt, 429).await;
+                    tokio::time::sleep(sleep_for).await;
+                    continue;
+                }
+                return Err(SyncRequestError::Failed(
+                    FivetranError::RateLimited.to_string(),
+                ));
+            }
+            let body = resp.text().await.unwrap_or_default();
+            if status == 403 {
+                return Err(SyncRequestError::Forbidden(truncate_error_body(&body)));
+            }
+            if status.is_server_error() {
+                return Err(SyncRequestError::Unknown(format!(
+                    "HTTP {status} to the sync request: {}",
+                    truncate_error_body(&body)
+                )));
+            }
+            if !status.is_success() {
+                return Err(SyncRequestError::Failed(format!(
+                    "HTTP {status} to the sync request: {}",
+                    truncate_error_body(&body)
+                )));
+            }
+            // A 2xx carries `{"code": "...", "message": "..."}`. Anything but
+            // `Success` in a parseable body is a refusal.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(code) = value.get("code").and_then(serde_json::Value::as_str)
+                && code != "Success"
+            {
+                return Err(SyncRequestError::Failed(format!(
+                    "the sync request was not accepted ({code}): {}",
+                    truncate_error_body(
+                        value
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                    )
+                )));
+            }
+            return Ok(());
+        }
         unreachable!("retry loop should always return")
     }
 
@@ -747,6 +860,29 @@ impl FivetranClient {
             }
         }
     }
+}
+
+/// Why [`FivetranClient::post_sync`] did not start a sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRequestError {
+    /// HTTP 403: the key's role cannot start syncs. Holds the response body.
+    Forbidden(String),
+    /// The request was refused or could not be sent. No sync started.
+    Failed(String),
+    /// The request may have reached Fivetran (a timeout or a 5xx). A sync may
+    /// have started.
+    Unknown(String),
+}
+
+/// The server's clock from a response's `Date` header.
+fn parse_date_header(resp: &Response) -> Option<chrono::DateTime<Utc>> {
+    let raw = resp.headers().get(reqwest::header::DATE)?.to_str().ok()?;
+    parse_date_value(raw)
+}
+
+/// Pure-string variant of [`parse_date_header`] for unit tests.
+fn parse_date_value(raw: &str) -> Option<chrono::DateTime<Utc>> {
+    httpdate::parse_http_date(raw.trim()).ok().map(Into::into)
 }
 
 /// Tag for the `source` field of the `fivetran.rate_limit_observed`
@@ -1391,6 +1527,14 @@ impl std::fmt::Debug for FivetranClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_date_header_parses_to_utc() {
+        let parsed = parse_date_value("Wed, 21 Oct 2026 10:00:00 GMT").unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-10-21T10:00:00+00:00");
+        assert!(parse_date_value("not a date").is_none());
+        assert!(parse_date_value("").is_none());
+    }
 
     #[test]
     fn test_debug_hides_secrets() {

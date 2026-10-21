@@ -1914,3 +1914,316 @@ mod sync_wait {
         assert_get_only(&server).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Source-sync trigger (`[...discovery.sync] trigger = true` with
+// `allow_sync_trigger = true`): one POST per connector, GET polling.
+// ---------------------------------------------------------------------------
+
+mod sync_trigger {
+    use std::time::Duration;
+
+    use rocky_core::source_sync::{
+        SourceSyncOutcome, SourceSyncReport, SourceSyncState, SourceSyncTriggered,
+        SourceSyncWaitOptions, trigger_and_wait_for_source_syncs,
+    };
+    use rocky_core::traits::DiscoveryAdapter;
+    use rocky_fivetran::adapter::FivetranDiscoveryAdapter;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{fr_b_client, test_client};
+
+    /// The server clock every GET answer carries, in HTTP-date form.
+    const SERVER_DATE: &str = "Wed, 21 Oct 2026 10:00:00 GMT";
+    const OLD: &str = "2026-10-21T09:00:00Z";
+
+    /// One group-list page holding `conn_1`, stamped with [`SERVER_DATE`].
+    fn page(
+        sync_state: &str,
+        succeeded_at: &str,
+        failed_at: Option<&str>,
+        paused: bool,
+    ) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("Date", SERVER_DATE)
+            .set_body_json(serde_json::json!({
+                "code": "Success",
+                "data": {
+                    "items": [{
+                        "id": "conn_1",
+                        "group_id": "dest_abc",
+                        "service": "shopify",
+                        "schema": "src__acme__shopify",
+                        "paused": paused,
+                        "status": { "setup_state": "connected", "sync_state": sync_state },
+                        "succeeded_at": succeeded_at,
+                        "failed_at": failed_at
+                    }],
+                    "next_cursor": null
+                }
+            }))
+    }
+
+    /// Serve GET answers in order, one per poll; the last repeats.
+    async fn serve(server: &MockServer, answers: Vec<ResponseTemplate>) {
+        let last = answers.len() - 1;
+        for (i, answer) in answers.into_iter().enumerate() {
+            let mock = Mock::given(method("GET"))
+                .and(path("/v1/groups/dest_abc/connectors"))
+                .respond_with(answer);
+            if i < last {
+                mock.up_to_n_times(1).mount(server).await;
+            } else {
+                mock.mount(server).await;
+            }
+        }
+    }
+
+    async fn serve_post(server: &MockServer, answer: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path("/v1/connections/conn_1/sync"))
+            .respond_with(answer)
+            .mount(server)
+            .await;
+    }
+
+    fn accepted() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "code": "Success", "message": "Sync has been successfully triggered" }))
+    }
+
+    fn adapter(server: &MockServer, allowed: bool) -> FivetranDiscoveryAdapter {
+        FivetranDiscoveryAdapter::new(test_client(server), "dest_abc".into())
+            .with_sync_trigger_allowed(allowed)
+    }
+
+    fn opts(timeout_ms: u64) -> SourceSyncWaitOptions {
+        SourceSyncWaitOptions {
+            timeout: Duration::from_millis(timeout_ms),
+            poll_interval: Duration::from_millis(20),
+        }
+    }
+
+    fn all(_: &SourceSyncState) -> bool {
+        true
+    }
+
+    fn no_event(_: &SourceSyncTriggered) {}
+
+    async fn run(adapter: &FivetranDiscoveryAdapter, timeout_ms: u64) -> SourceSyncReport {
+        trigger_and_wait_for_source_syncs(
+            adapter,
+            "src__",
+            &all,
+            opts(timeout_ms),
+            &no_event,
+            std::future::pending(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn posts(server: &MockServer) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_post_per_connector_never_forced_then_success() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:30:00Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&server, accepted()).await;
+        let report = run(&adapter(&server, true), 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert!(report.syncs[0].triggered);
+        let sent = posts(&server).await;
+        assert_eq!(sent.len(), 1, "exactly one POST for one connector");
+        assert_eq!(sent[0].url.path(), "/v1/connections/conn_1/sync");
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body, serde_json::json!({ "force": false }), "never force");
+    }
+
+    /// The identity rule through the real HTTP layer: `T_pre` is the `Date`
+    /// header of the idle read (10:00:00), and the end must be STRICTLY past
+    /// `T_pre + 5 s`.
+    #[tokio::test]
+    async fn the_date_header_of_the_idle_read_is_the_sync_identity_base() {
+        let edge = MockServer::start().await;
+        serve(
+            &edge,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:00:05Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&edge, accepted()).await;
+        let report = run(&adapter(&edge, true), 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Unknown);
+
+        let past = MockServer::start().await;
+        serve(
+            &past,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:00:06Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&past, accepted()).await;
+        let report = run(&adapter(&past, true), 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+    }
+
+    /// Opt-in check, adapter leg: without `allow_sync_trigger` not one POST
+    /// leaves, even when the pipeline asks for a trigger.
+    #[tokio::test]
+    async fn without_the_adapter_opt_in_no_post_is_sent() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("scheduled", OLD, None, false)]).await;
+        serve_post(&server, accepted()).await;
+        let report = run(&adapter(&server, false), 1000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert!(!report.syncs[0].triggered);
+        assert!(
+            posts(&server).await.is_empty(),
+            "no POST without the opt-in"
+        );
+        let direct = adapter(&server, false).trigger_source_sync("conn_1").await;
+        assert!(direct.is_err());
+        assert!(posts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_403_is_a_failure_with_a_clear_message_and_is_not_retried() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("scheduled", OLD, None, false)]).await;
+        serve_post(
+            &server,
+            ResponseTemplate::new(403).set_body_string("forbidden"),
+        )
+        .await;
+        let report = run(&adapter(&server, true), 1000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert!(!report.syncs[0].triggered);
+        let detail = report.syncs[0].detail.as_deref().unwrap();
+        assert!(
+            detail.contains("this key cannot start syncs") && detail.contains("trigger = false"),
+            "{detail}"
+        );
+        assert_eq!(posts(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_paused_connector_gets_no_post() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("paused", OLD, None, true)]).await;
+        serve_post(&server, accepted()).await;
+        let report = run(&adapter(&server, true), 1000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Paused);
+        assert!(posts(&server).await.is_empty());
+        assert!(report.bad().next().is_none());
+    }
+
+    /// A 5xx may mean the sync started. It is never retried; the connector is
+    /// read again, and a running sync is accepted.
+    #[tokio::test]
+    async fn a_5xx_is_not_retried_and_a_running_sync_is_accepted() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                // The read after the failed POST: it syncs.
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:30:00Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(
+            &server,
+            ResponseTemplate::new(502).set_body_string("bad gateway"),
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let client = fr_b_client(&server, tmp.path(), "trigger-5xx-key");
+        let adapter = FivetranDiscoveryAdapter::new(client, "dest_abc".into())
+            .with_sync_trigger_allowed(true);
+        let report = run(&adapter, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert!(report.syncs[0].triggered);
+        assert_eq!(posts(&server).await.len(), 1, "a 5xx POST is never retried");
+    }
+
+    /// A 429 means the request was not taken, so it retries (once here).
+    #[tokio::test]
+    async fn a_429_is_retried_and_the_second_post_is_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/connections/conn_1/sync"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        serve_post(&server, accepted()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let client = fr_b_client(&server, tmp.path(), "trigger-429-key");
+        let adapter = FivetranDiscoveryAdapter::new(client, "dest_abc".into())
+            .with_sync_trigger_allowed(true);
+        adapter.trigger_source_sync("conn_1").await.unwrap();
+        assert_eq!(posts(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_event_hook_sees_each_request_with_the_idle_read_time() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("syncing", OLD, None, false),
+                page("scheduled", "2026-10-21T10:30:00Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&server, accepted()).await;
+        let seen = std::sync::Mutex::new(Vec::new());
+        let hook = |t: &SourceSyncTriggered| seen.lock().unwrap().push(t.clone());
+        let adapter = adapter(&server, true);
+        trigger_and_wait_for_source_syncs(
+            &adapter,
+            "src__",
+            &all,
+            opts(5000),
+            &hook,
+            std::future::pending(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].id, "conn_1");
+        assert_eq!(
+            seen[0].idle_seen_at.to_rfc3339(),
+            "2026-10-21T10:00:00+00:00"
+        );
+    }
+}

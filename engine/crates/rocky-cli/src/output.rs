@@ -120,6 +120,15 @@ pub struct DiscoverOutput {
     /// omitted from the wire format) otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collision_candidates: Vec<CollisionCandidateOutput>,
+    /// `true` when the pipeline starts its own source syncs
+    /// (`[pipeline.<name>.source.discovery.sync] trigger = true`). Rocky then
+    /// advances each connector's `last_sync_at` itself, so an orchestrator
+    /// that runs the pipeline whenever `last_sync_at` moves (the Dagster
+    /// source sensor) would start a second run per sync, and should stand
+    /// down. Read from config, not from run state, so it does not change with
+    /// `rocky run --no-sync-trigger`. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sync_trigger: bool,
 }
 
 /// A cross-source collision: one external object id mapped to more than one
@@ -446,9 +455,11 @@ pub struct RunOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_match_counts: Vec<OverrideMatchCountOutput>,
     /// One row per source connector the run waited for under
-    /// `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that
-    /// was not syncing when the run began is not listed. Empty (and omitted)
-    /// when no `sync` table is configured or nothing was running.
+    /// `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per
+    /// connector it started a sync on or found paused under `trigger = true`.
+    /// A connector that was not syncing when a wait-only run began is not
+    /// listed. Empty (and omitted) when no `sync` table is configured or
+    /// nothing was running.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_syncs: Vec<SourceSyncOutput>,
     /// Problems in the project's `consumers/` records (`E060`): a file that
@@ -502,8 +513,9 @@ impl OverrideMatchCountOutput {
     }
 }
 
-/// What `rocky run` waited for on one source connector: a sync that was
-/// running when the run began.
+/// What `rocky run` did on one source connector: waited for a sync that was
+/// running when the run began, started a sync (`triggered`), or found the
+/// connector paused.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SourceSyncOutput {
     /// Source connector id.
@@ -512,17 +524,24 @@ pub struct SourceSyncOutput {
     pub schema: String,
     /// How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when
     /// `wait_timeout_secs` ran out), `unknown` (the sync ended but no
-    /// timestamp moved), `interrupted` (a shutdown signal) or `error` (the
-    /// status reads failed; `detail` names the error).
+    /// timestamp moved), `interrupted` (a shutdown signal), `error` (the
+    /// status reads failed; `detail` names the error), `paused` (the
+    /// connector is paused, so no sync was started) or `trigger_failed` (the
+    /// sync request failed; `detail` names the cause).
     pub outcome: rocky_core::source_sync::SourceSyncOutcome,
     /// Whole seconds from the start of the wait to this outcome.
     pub waited_secs: u64,
     /// The connector's last successful sync after the wait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<DateTime<Utc>>,
-    /// The error text behind an `error` outcome. Absent for every other outcome.
+    /// The error text behind an `error` or `trigger_failed` outcome. Absent
+    /// for every other outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Rocky started this sync (`[...discovery.sync] trigger = true`). Absent
+    /// when the row is a sync Rocky only waited for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub triggered: bool,
 }
 
 /// Soft warning surfaced on
@@ -6025,7 +6044,15 @@ impl DiscoverOutput {
             schemas_cached: 0,
             new_sources: vec![],
             collision_candidates: vec![],
+            sync_trigger: false,
         }
+    }
+
+    /// Set whether the pipeline starts its own source syncs and return self.
+    #[must_use]
+    pub fn with_sync_trigger(mut self, sync_trigger: bool) -> Self {
+        self.sync_trigger = sync_trigger;
+        self
     }
 
     /// Attach the projected pipeline checks config and return self.

@@ -131,6 +131,14 @@ class DiscoverResult(BaseModel):
     #: Count of source schemas served from the discovery cache this run.
     #: ``None`` for older binaries that don't emit it.
     schemas_cached: int | None = None
+    #: ``True`` when the pipeline starts its own source syncs
+    #: (``[...discovery.sync] trigger = true``). Rocky then advances each
+    #: connector's ``last_sync_at`` itself, so an orchestrator that runs the
+    #: pipeline when ``last_sync_at`` moves would start a second run per sync
+    #: and should stand down. Read from config; unaffected by
+    #: ``rocky run --no-sync-trigger``. ``False`` for older binaries that
+    #: don't emit it.
+    sync_trigger: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +564,8 @@ class RunResult(BaseModel):
     override_match_counts: list[dict] = Field(default_factory=list)
     #: One loose ``dict`` row per source connector the run waited for under
     #: ``[...discovery.sync] wait = true`` (``id``, ``schema``, ``outcome``,
-    #: ``waited_secs``, ``last_sync_at``, and ``detail`` on an ``error`` outcome); the typed shape lives on the
+    #: ``waited_secs``, ``last_sync_at``, ``triggered`` when Rocky started the
+    #: sync, and ``detail`` on an ``error`` or ``trigger_failed`` outcome); the typed shape lives on the
     #: generated ``RunOutput.source_syncs``. Empty when nothing was waited for.
     source_syncs: list[dict] = Field(default_factory=list)
     #: Problems in the project's ``consumers/`` records (``E060``). They never

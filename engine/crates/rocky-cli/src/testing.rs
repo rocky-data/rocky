@@ -623,6 +623,10 @@ pub(crate) struct ScriptedSyncSource {
     calls: std::sync::atomic::AtomicU32,
     /// Polls after this many calls fail. `u32::MAX` means never.
     fail_after: std::sync::atomic::AtomicU32,
+    /// Connector ids a sync request was made for, in order.
+    triggers: Mutex<Vec<String>>,
+    /// When set, every sync request is refused like an HTTP 403.
+    forbid_triggers: std::sync::atomic::AtomicBool,
 }
 
 impl ScriptedSyncSource {
@@ -632,6 +636,28 @@ impl ScriptedSyncSource {
         self.calls.store(0, std::sync::atomic::Ordering::SeqCst);
         self.fail_after
             .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        self.triggers
+            .lock()
+            .expect("sync trigger log mutex")
+            .clear();
+        self.forbid_triggers
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Connector ids a sync request was made for since the last
+    /// [`Self::script`].
+    pub(crate) fn triggered(&self) -> Vec<String> {
+        self.triggers
+            .lock()
+            .expect("sync trigger log mutex")
+            .clone()
+    }
+
+    /// Refuse every sync request like an HTTP 403. Call after
+    /// [`Self::script`], which resets it.
+    pub(crate) fn forbid_triggers(&self) {
+        self.forbid_triggers
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make every poll after the first `n` fail with `boom`. Call after
@@ -658,6 +684,8 @@ pub(crate) fn sync_source(key: &str) -> Arc<ScriptedSyncSource> {
             polls: Mutex::new(Default::default()),
             calls: std::sync::atomic::AtomicU32::new(0),
             fail_after: std::sync::atomic::AtomicU32::new(u32::MAX),
+            triggers: Mutex::new(Vec::new()),
+            forbid_triggers: std::sync::atomic::AtomicBool::new(false),
         })
     }))
 }
@@ -682,6 +710,26 @@ impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
                 external_object_ids: Vec::new(),
             },
         ]))
+    }
+
+    async fn trigger_source_sync(
+        &self,
+        connector_id: &str,
+    ) -> Result<(), rocky_core::source_sync::SourceSyncTriggerError> {
+        self.triggers
+            .lock()
+            .expect("sync trigger log mutex")
+            .push(connector_id.to_string());
+        if self
+            .forbid_triggers
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(rocky_core::source_sync::SourceSyncTriggerError::Forbidden(
+                "this key cannot start syncs; use a key with a role that can run syncs, or set trigger = false"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn source_sync_states(

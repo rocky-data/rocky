@@ -596,6 +596,10 @@ export interface AdapterConfig {
    * Snowflake account identifier (e.g., "xy12345.us-east-1").
    */
   account?: string | null;
+  /**
+   * The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+   */
+  allow_sync_trigger?: boolean;
   api_key?: RedactedString | null;
   api_secret?: RedactedString | null;
   /**
@@ -1659,9 +1663,9 @@ export interface DiscoveryConfig {
   sync?: DiscoverySyncConfig | null;
 }
 /**
- * `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source.
+ * `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.
  *
- * Rocky only reads the vendor API (GET). It never starts a sync. A connector that is not syncing when the run starts is not waited for.
+ * With `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.
  */
 export interface DiscoverySyncConfig {
   /**
@@ -1672,6 +1676,10 @@ export interface DiscoverySyncConfig {
    * Seconds between status polls. At least 10. Default 30.
    */
   poll_interval_secs?: number;
+  /**
+   * Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
+   */
+  trigger?: boolean;
   /**
    * Wait for a running sync to finish before the run starts. Default `false`.
    */

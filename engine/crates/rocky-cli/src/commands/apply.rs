@@ -7328,8 +7328,10 @@ mod tests {
     }
 
     /// Apply never runs a source-sync phase (neither wait nor trigger): the
-    /// reviewer of a plan did not see one. `rocky run` on the same config does
-    /// poll the source, so the zero below is not a source that never answers.
+    /// reviewer of a plan did not see one. The config asks for both, and the
+    /// source never finishes, so a phase would poll and request. `rocky run`
+    /// on the same shape does (see `run_source_sync`), so the zeros below are
+    /// not a source that never answers.
     ///
     /// Mutation check: dropping `skip_opts.no_source_sync` and the
     /// `run_id_override` term from the gate in `run_with_explicit_contracts`
@@ -7348,7 +7350,7 @@ mod tests {
                  [pipeline.ingest]\nstrategy = \"full_refresh\"\n\n\
                  [pipeline.ingest.source.discovery]\nadapter = \"src\"\n\n\
                  [pipeline.ingest.source.discovery.sync]\nwait = true\n\
-                 wait_timeout_secs = 1\npoll_interval_secs = 10\n\n\
+                 trigger = true\nwait_timeout_secs = 1\npoll_interval_secs = 10\n\n\
                  [pipeline.ingest.source.schema_pattern]\nprefix = \"raw__\"\n\
                  separator = \"__\"\ncomponents = [\"source\"]\n\n\
                  [pipeline.ingest.target]\nadapter = \"default\"\n\
@@ -7368,6 +7370,7 @@ mod tests {
             paused: false,
             succeeded_at: None,
             failed_at: None,
+            observed_at: None,
         }]]);
         let loaded = std::sync::Arc::new(
             rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
@@ -7397,6 +7400,10 @@ mod tests {
             source.polls(),
             0,
             "apply must not poll the source for sync state. result: {result:?}"
+        );
+        assert!(
+            source.triggered().is_empty(),
+            "apply must not start a sync. result: {result:?}"
         );
         assert!(
             !crate::testing::recorder(&key).statements().is_empty(),

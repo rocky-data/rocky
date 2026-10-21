@@ -10,7 +10,7 @@ Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-tim
 
 ## Key Concepts
 
-- **Adapter-based ELT** — source adapters discover what data is available (metadata only, no extraction); warehouse adapters execute SQL and manage governance. Rocky operates on data already in the warehouse — it does not extract from external systems
+- **Adapter-based ELT** — source adapters discover what data is available (metadata only, no extraction; the Fivetran adapter may start a vendor sync, but only when the key owner's `allow_sync_trigger` and the pipeline's `trigger = true` are both set, and it never moves data through Rocky); warehouse adapters execute SQL and manage governance. Rocky operates on data already in the warehouse — it does not extract from external systems
 - **No model files for raw layer** — Rocky discovers tables at runtime from source adapters (Fivetran, manual config), no SQL files needed
 - **Silver layer models** — either a `.sql` + `.toml` sidecar pair (pure SQL, no templating) or a `.rocky` DSL file; SQL stays first-class
 - **Config-driven** — `rocky.toml` defines source, warehouse, target patterns, checks, and contracts

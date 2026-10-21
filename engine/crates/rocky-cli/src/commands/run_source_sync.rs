@@ -30,10 +30,11 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::source::DiscoveredConnector;
 use rocky_core::source_sync::{
-    SourceSyncOutcome, SourceSyncReport, SourceSyncState, SourceSyncWaitOptions,
-    wait_for_source_syncs,
+    SourceSyncOutcome, SourceSyncReport, SourceSyncState, SourceSyncTriggered,
+    SourceSyncWaitOptions, trigger_and_wait_for_source_syncs, wait_for_source_syncs,
 };
 use rocky_core::traits::DiscoveryAdapter;
+use rocky_observe::events::{PipelineEvent, global_event_bus, record_span_event};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -56,26 +57,43 @@ pub(super) struct SyncPhase<'a> {
     pub output_json: bool,
     pub cancel: &'a CancellationToken,
     pub hooks: &'a HookRegistry,
+    /// `--no-sync-trigger`: wait only, even when the config sets `trigger`.
+    pub no_sync_trigger: bool,
 }
 
 impl SyncPhase<'_> {
-    /// Wait, then decide. `Ok` carries the rows for `RunOutput::source_syncs`
-    /// (empty when nothing was running or the adapter reports no sync state).
-    /// `Err` stops the run before any warehouse write.
+    /// Wait (and, with both opt-ins and no `--no-sync-trigger`, start syncs
+    /// first), then decide. `Ok` carries the rows for
+    /// `RunOutput::source_syncs` (empty when nothing was running or the
+    /// adapter reports no sync state). `Err` stops the run before any
+    /// warehouse write.
     pub(super) async fn run(self, adapter: &dyn DiscoveryAdapter) -> Result<Vec<SourceSyncOutput>> {
         let include = |s: &SourceSyncState| self.includes(s);
         let opts = SourceSyncWaitOptions {
             timeout: Duration::from_secs(self.sync.wait_timeout_secs),
             poll_interval: Duration::from_secs(self.sync.poll_interval_secs),
         };
-        let waited = wait_for_source_syncs(
-            adapter,
-            self.schema_prefix,
-            &include,
-            opts,
-            self.cancel.cancelled(),
-        )
-        .await;
+        let waited = if self.sync.trigger && !self.no_sync_trigger {
+            let announce = |t: &SourceSyncTriggered| self.announce_trigger(t);
+            trigger_and_wait_for_source_syncs(
+                adapter,
+                self.schema_prefix,
+                &include,
+                opts,
+                &announce,
+                self.cancel.cancelled(),
+            )
+            .await
+        } else {
+            wait_for_source_syncs(
+                adapter,
+                self.schema_prefix,
+                &include,
+                opts,
+                self.cancel.cancelled(),
+            )
+            .await
+        };
 
         let report = match waited {
             Ok(Some(report)) => report,
@@ -101,6 +119,7 @@ impl SyncPhase<'_> {
                     waited_secs: self.started.elapsed().as_secs(),
                     last_sync_at: None,
                     detail: Some(error.to_string()),
+                    triggered: false,
                 };
                 return self.phase_failed(&message, vec![row]).await;
             }
@@ -155,6 +174,25 @@ impl SyncPhase<'_> {
                 )
             }
         }
+    }
+
+    /// One request went out: log it and emit the `source_sync_triggered`
+    /// event, so a subscriber sees every vendor sync Rocky starts.
+    fn announce_trigger(&self, triggered: &SourceSyncTriggered) {
+        tracing::info!(
+            pipeline = self.pipeline_name,
+            connector = %triggered.id,
+            schema = %triggered.schema,
+            "started a source sync"
+        );
+        let event = PipelineEvent::new("source_sync_triggered")
+            .with_run_id(self.run_id)
+            .with_target(triggered.id.clone())
+            .with_metadata("pipeline", self.pipeline_name)
+            .with_metadata("schema", triggered.schema.clone())
+            .with_metadata("idle_seen_at", triggered.idle_seen_at.to_rfc3339());
+        record_span_event(&event);
+        global_event_bus().emit(event);
     }
 
     fn includes(&self, state: &SourceSyncState) -> bool {
@@ -230,6 +268,7 @@ fn rows_of(report: &SourceSyncReport) -> Vec<SourceSyncOutput> {
             waited_secs: r.waited_secs,
             last_sync_at: r.last_sync_at,
             detail: r.detail.clone(),
+            triggered: r.triggered,
         })
         .collect()
 }
@@ -266,6 +305,19 @@ mod tests {
             paused: false,
             succeeded_at: ok,
             failed_at: bad,
+            observed_at: None,
+        }
+    }
+
+    /// A state read at server time `at(0)`.
+    fn seen(
+        syncing: bool,
+        ok: Option<DateTime<Utc>>,
+        bad: Option<DateTime<Utc>>,
+    ) -> SourceSyncState {
+        SourceSyncState {
+            observed_at: at(0),
+            ..state(syncing, ok, bad)
         }
     }
 
@@ -288,8 +340,31 @@ mod tests {
         cancel: &CancellationToken,
         hook_log: Option<&Path>,
     ) -> Result<Vec<SourceSyncOutput>> {
+        phase_with(
+            key,
+            on_sync_failure,
+            timeout_secs,
+            cancel,
+            hook_log,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// [`phase`], with `trigger` from the config and `--no-sync-trigger`.
+    async fn phase_with(
+        key: &str,
+        on_sync_failure: OnSyncFailure,
+        timeout_secs: u64,
+        cancel: &CancellationToken,
+        hook_log: Option<&Path>,
+        trigger: bool,
+        no_sync_trigger: bool,
+    ) -> Result<Vec<SourceSyncOutput>> {
         let sync = DiscoverySyncConfig {
             wait: true,
+            trigger,
             wait_timeout_secs: timeout_secs,
             poll_interval_secs: 0,
             on_sync_failure,
@@ -319,6 +394,7 @@ mod tests {
             output_json: false,
             cancel,
             hooks: &hooks,
+            no_sync_trigger,
         }
         .run(sync_source(key).as_ref())
         .await
@@ -399,6 +475,121 @@ mod tests {
             .expect("warn mode does not stop the run");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, SourceSyncOutcome::Failed);
+    }
+
+    /// A started sync that ends past the margin: one row, `triggered`, one
+    /// request, and the `source_sync_triggered` event on the bus.
+    #[tokio::test]
+    async fn a_triggered_sync_reports_a_triggered_row_and_emits_an_event() {
+        let key = "phase-trigger-success";
+        let source = sync_source(key);
+        source.script(vec![
+            vec![seen(false, at(-500), None)],
+            vec![seen(true, at(-500), None)],
+            vec![seen(false, at(60), None)],
+        ]);
+        let mut events = rocky_observe::events::global_event_bus().subscribe();
+        let rows = phase_with(
+            key,
+            OnSyncFailure::Fail,
+            5,
+            &CancellationToken::new(),
+            None,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].triggered);
+        assert_eq!(rows[0].outcome, SourceSyncOutcome::Succeeded);
+        assert_eq!(source.triggered(), ["c1"]);
+        let mut found = None;
+        while let Ok(event) = events.try_recv() {
+            if event.event_type == "source_sync_triggered"
+                && event.run_id.as_deref() == Some("run-test")
+                && event.target.as_deref() == Some("c1")
+            {
+                found = Some(event);
+            }
+        }
+        let event = found.expect("a source_sync_triggered event for the request");
+        assert_eq!(event.metadata["pipeline"], "ingest");
+    }
+
+    /// `--no-sync-trigger` leaves the config alone but sends no request: the
+    /// phase only waits, so an idle connector costs one read and no row.
+    #[tokio::test]
+    async fn no_sync_trigger_waits_only() {
+        let key = "phase-no-sync-trigger";
+        let source = sync_source(key);
+        source.script(vec![vec![seen(false, at(-500), None)]]);
+        let rows = phase_with(
+            key,
+            OnSyncFailure::Fail,
+            5,
+            &CancellationToken::new(),
+            None,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+        assert!(source.triggered().is_empty());
+        assert_eq!(source.polls(), 1);
+    }
+
+    /// A refused key (403) fails the run with the fix in the message.
+    #[tokio::test]
+    async fn a_refused_key_fails_the_run_with_the_fix_named() {
+        let key = "phase-trigger-forbidden";
+        let source = sync_source(key);
+        source.script(vec![vec![seen(false, at(-500), None)]]);
+        source.forbid_triggers();
+        let error = phase_with(
+            key,
+            OnSyncFailure::Fail,
+            5,
+            &CancellationToken::new(),
+            None,
+            true,
+            false,
+        )
+        .await
+        .expect_err("a refused key stops the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("c1 (trigger_failed: this key cannot start syncs")
+                && text.contains("trigger = false"),
+            "{text}"
+        );
+        assert_eq!(source.triggered(), ["c1"]);
+    }
+
+    /// A paused connector gets no request and does not stop the run.
+    #[tokio::test]
+    async fn a_paused_connector_is_reported_and_does_not_stop_the_run() {
+        let key = "phase-trigger-paused";
+        let source = sync_source(key);
+        let mut paused = seen(false, at(-500), None);
+        paused.paused = true;
+        source.script(vec![vec![paused]]);
+        let rows = phase_with(
+            key,
+            OnSyncFailure::Fail,
+            5,
+            &CancellationToken::new(),
+            None,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, SourceSyncOutcome::Paused);
+        assert!(!rows[0].triggered);
+        assert!(source.triggered().is_empty());
     }
 
     /// The first status read fails: no connector is known. `warn` still
@@ -496,6 +687,7 @@ adapter = "src"
 
 [pipeline.ingest.source.discovery.sync]
 wait = true
+trigger = __TRIGGER__
 wait_timeout_secs = __TIMEOUT__
 poll_interval_secs = 10
 on_sync_failure = "__MODE__"
@@ -522,12 +714,35 @@ auto_create_schemas = true
         timeout_secs: u64,
         idempotency_key: Option<&str>,
     ) -> Result<RunTermination> {
+        drive_with(
+            dir,
+            key,
+            mode,
+            timeout_secs,
+            idempotency_key,
+            false,
+            &SkipRunOptions::default(),
+        )
+        .await
+    }
+
+    /// [`drive`], with the config's `trigger` and the run's skip overlay.
+    async fn drive_with(
+        dir: &Path,
+        key: &str,
+        mode: &str,
+        timeout_secs: u64,
+        idempotency_key: Option<&str>,
+        trigger: bool,
+        skip_opts: &SkipRunOptions,
+    ) -> Result<RunTermination> {
         let config_path = dir.join("rocky.toml");
         std::fs::write(
             &config_path,
             CONFIG
                 .replace("__KEY__", key)
                 .replace("__MODE__", mode)
+                .replace("__TRIGGER__", &trigger.to_string())
                 .replace("__TIMEOUT__", &timeout_secs.to_string()),
         )
         .unwrap();
@@ -552,7 +767,7 @@ auto_create_schemas = true
             idempotency_key,
             None,
             &DeferOptions::default(),
-            &SkipRunOptions::default(),
+            skip_opts,
             &rocky_core::run_vars::RunVars::new(),
             None,
             None,
@@ -642,6 +857,61 @@ auto_create_schemas = true
         );
         assert!(!is_sync_phase_error(&retry), "{retry:?}");
         assert!(!recorder(&key).statements().is_empty(), "the retry ran");
+    }
+
+    /// The run path carries the config's `trigger` to the phase: a refused
+    /// key (403) stops the run before the state store opens and before any
+    /// warehouse call, with the request logged once.
+    #[tokio::test]
+    async fn run_starts_a_sync_when_the_config_says_trigger_and_stops_on_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("calls").display().to_string();
+        let source = sync_source(&key);
+        source.script(vec![vec![seen(false, at(-500), None)]]);
+        source.forbid_triggers();
+        let error = drive_with(
+            dir.path(),
+            &key,
+            "fail",
+            5,
+            None,
+            true,
+            &SkipRunOptions::default(),
+        )
+        .await
+        .expect_err("a refused key fails the run");
+        assert!(
+            format!("{error:#}").contains("c1 (trigger_failed: this key cannot start syncs"),
+            "{error:#}"
+        );
+        assert_eq!(source.triggered(), ["c1"]);
+        assert!(recorder(&key).calls().is_empty());
+        assert!(!dir.path().join("state.redb").exists());
+    }
+
+    /// `--no-sync-trigger` reaches the phase through `SkipRunOptions`: the
+    /// same config sends no request and the run goes on to the warehouse.
+    #[tokio::test]
+    async fn no_sync_trigger_on_the_run_path_sends_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("calls").display().to_string();
+        let source = sync_source(&key);
+        source.script(vec![vec![seen(false, at(-500), None)]]);
+        source.forbid_triggers();
+        let skip = SkipRunOptions {
+            no_sync_trigger: true,
+            ..SkipRunOptions::default()
+        };
+        let result = drive_with(dir.path(), &key, "fail", 5, None, true, &skip).await;
+        assert!(
+            !is_sync_phase_error(&result),
+            "no request, no refusal: {result:?}"
+        );
+        assert!(source.triggered().is_empty());
+        assert!(
+            !recorder(&key).statements().is_empty(),
+            "the run reached the warehouse"
+        );
     }
 
     #[tokio::test]

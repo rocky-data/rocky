@@ -4791,8 +4791,12 @@ pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
 /// - `wait = true` needs a Fivetran discovery adapter. No other known adapter
 ///   reports sync state, so the key would do nothing.
 ///
-/// Only a table with `wait = true` is checked: with `wait = false` the other
-/// keys are inert.
+/// - `trigger = true` needs `wait = true` (Rocky starts a sync only to wait
+///   for it) and `allow_sync_trigger = true` on the discovery adapter (the
+///   credential owner's opt-in).
+///
+/// Apart from the `trigger` rules, only a table with `wait = true` is checked:
+/// with `wait = false` the other keys are inert.
 pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     let ttl_secs = u64::from(config.state.idempotency.in_flight_ttl_hours) * 3600;
@@ -4803,7 +4807,7 @@ pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
         let Some(disc) = &replication.source.discovery else {
             continue;
         };
-        let Some(sync) = disc.sync.as_ref().filter(|s| s.wait) else {
+        let Some(table) = disc.sync.as_ref() else {
             continue;
         };
         let mut refuse = |reason: String| {
@@ -4812,6 +4816,28 @@ pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
                 reason,
             });
         };
+        if table.trigger {
+            if !table.wait {
+                refuse(
+                    "trigger = true needs wait = true: Rocky starts a sync only to wait for it"
+                        .to_string(),
+                );
+            }
+            if let Some(adapter) = config.adapters.get(&disc.adapter)
+                && adapter.adapter_type == "fivetran"
+                && !adapter.allow_sync_trigger
+            {
+                refuse(format!(
+                    "trigger = true needs allow_sync_trigger = true on [adapter.{}]: the owner \
+                     of the Fivetran key has to allow Rocky to start syncs",
+                    disc.adapter
+                ));
+            }
+        }
+        if !table.wait {
+            continue;
+        }
+        let sync = table;
         if sync.poll_interval_secs < MIN_SYNC_POLL_INTERVAL_SECS {
             refuse(format!(
                 "poll_interval_secs = {} is too low: use {MIN_SYNC_POLL_INTERVAL_SECS} or more",
@@ -5751,6 +5777,19 @@ pub struct AdapterConfig {
     /// `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub offline: bool,
+
+    // -- Fivetran sync trigger --
+    /// The credential owner's opt-in to let Rocky start a Fivetran sync with
+    /// this adapter's key (`POST /v1/connections/{id}/sync`, never `force`).
+    /// A pipeline also has to ask for it with
+    /// `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this
+    /// key the adapter sends no `POST`, and `rocky validate` refuses a
+    /// pipeline that sets `trigger = true`. Ignored on every other adapter
+    /// type. Default `false`.
+    // Skipped when false, so the config digest a plan records stays the same
+    // for a project that does not use it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_sync_trigger: bool,
 
     // -- Manual discovery fields --
     /// The source schemas and tables a `type = "manual"` discovery adapter
@@ -8085,16 +8124,29 @@ fn default_sync_poll_interval_secs() -> u64 {
 }
 
 /// `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync
-/// to end before `rocky run` reads the source.
+/// to end before `rocky run` reads the source, and optionally start one.
 ///
-/// Rocky only reads the vendor API (GET). It never starts a sync. A connector
-/// that is not syncing when the run starts is not waited for.
+/// With `wait = true` alone Rocky only reads the vendor API (GET). A
+/// connector that is not syncing when the run starts is not waited for. With
+/// `trigger = true` as well, and `allow_sync_trigger = true` on the adapter,
+/// Rocky starts one sync per connector and waits for it. It never moves data
+/// itself.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoverySyncConfig {
     /// Wait for a running sync to finish before the run starts. Default `false`.
     #[serde(default)]
     pub wait: bool,
+
+    /// Start a sync on each selected connector before the run, then wait for
+    /// it. Needs `wait = true` and `allow_sync_trigger = true` on the
+    /// discovery adapter. One `POST` per connector, never `force`. A paused
+    /// connector is not started. `rocky run --no-sync-trigger` turns this off
+    /// for one run. Default `false`.
+    // Skipped when false, so the config digest stays the same for a project
+    // that waits but never triggers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trigger: bool,
 
     /// Longest wait for the whole phase, in seconds. Must be at most half of
     /// `[state.idempotency] in_flight_ttl_hours`. Default 3600.
@@ -8115,6 +8167,7 @@ impl Default for DiscoverySyncConfig {
     fn default() -> Self {
         Self {
             wait: false,
+            trigger: false,
             wait_timeout_secs: default_sync_wait_timeout_secs(),
             poll_interval_secs: default_sync_poll_interval_secs(),
             on_sync_failure: OnSyncFailure::default(),
@@ -14380,6 +14433,7 @@ table = "customers_history"
             path: None,
             extension_directory: None,
             offline: false,
+            allow_sync_trigger: false,
             schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
@@ -16626,8 +16680,22 @@ schema_template = "raw__{source}"
     // --- [pipeline.<name>.source.discovery.sync] ---
 
     fn sync_config(adapter_type: &str, ttl_hours: u32, sync: &str) -> RockyConfig {
+        sync_config_with(adapter_type, ttl_hours, sync, false)
+    }
+
+    fn sync_config_with(
+        adapter_type: &str,
+        ttl_hours: u32,
+        sync: &str,
+        allow_sync_trigger: bool,
+    ) -> RockyConfig {
         let adapter = if adapter_type == "fivetran" {
-            "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n"
+            if allow_sync_trigger {
+                "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n\
+                 allow_sync_trigger = true\n"
+            } else {
+                "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n"
+            }
         } else {
             "path = \"x.db\"\n"
         };
@@ -16710,9 +16778,9 @@ schema_template = "raw__{{source}}"
 
     #[test]
     fn discovery_sync_refuses_unknown_keys_and_values() {
-        // `trigger` belongs to a later slice; it must not parse today.
         for bad in [
-            "wait = true\ntrigger = true",
+            "wait = true\nforce = true",
+            "wait = true\ntrigger = \"yes\"",
             "wait = true\non_sync_failure = \"ignore\"",
             "wait = \"yes\"",
         ] {
@@ -16720,6 +16788,89 @@ schema_template = "raw__{{source}}"
             let result = std::panic::catch_unwind(|| sync_config("fivetran", 24, &sync));
             assert!(result.is_err(), "{bad} must not parse");
         }
+    }
+
+    #[test]
+    fn trigger_parses_and_is_off_by_default() {
+        let config = sync_config_with(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            true,
+        );
+        assert!(sync_of(&config).unwrap().trigger);
+        assert!(validate_source_sync(&config).is_empty());
+        let off = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        assert!(!sync_of(&off).unwrap().trigger);
+    }
+
+    /// The config digest feeds plan ids: a project that never sets the new
+    /// keys must serialize exactly as before.
+    #[test]
+    fn unset_trigger_keys_do_not_change_the_serialized_config() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("trigger"), "{json}");
+        assert!(!json.contains("allow_sync_trigger"), "{json}");
+    }
+
+    #[test]
+    fn validate_refuses_trigger_without_wait() {
+        let config = sync_config_with(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\ntrigger = true",
+            true,
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].to_string().contains("needs wait = true"));
+    }
+
+    /// Opt-in check, config leg: a pipeline cannot turn on a trigger the
+    /// credential owner did not allow.
+    #[test]
+    fn validate_refuses_trigger_without_the_adapter_opt_in() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("allow_sync_trigger = true on [adapter.src]"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            collect_loaded_config_errors(&config)
+                .iter()
+                .any(|e| matches!(e, ConfigError::SourceSyncInvalid { .. }))
+        );
+    }
+
+    #[test]
+    fn the_adapter_opt_in_alone_triggers_nothing() {
+        let config = sync_config_with(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+            true,
+        );
+        assert!(!sync_of(&config).unwrap().trigger);
+        assert!(config.adapters["src"].allow_sync_trigger);
+        assert!(validate_source_sync(&config).is_empty());
     }
 
     #[test]

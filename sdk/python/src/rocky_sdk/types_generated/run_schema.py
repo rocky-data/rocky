@@ -613,14 +613,30 @@ class SourceSyncOutcome6(StrEnum):
     error = "error"
 
 
+class SourceSyncOutcome7(StrEnum):
+    """
+    The connector is paused, so no sync was started. Not a failure: a person paused it on purpose, and Rocky never unpauses.
+    """
+
+    paused = "paused"
+
+
+class SourceSyncOutcome8(StrEnum):
+    """
+    Rocky could not start the sync. The result's `detail` names the cause.
+    """
+
+    trigger_failed = "trigger_failed"
+
+
 class SourceSyncOutput(BaseModel):
     """
-    What `rocky run` waited for on one source connector: a sync that was running when the run began.
+    What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.
     """
 
     detail: str | None = None
     """
-    The error text behind an `error` outcome. Absent for every other outcome.
+    The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.
     """
     id: str
     """
@@ -637,13 +653,19 @@ class SourceSyncOutput(BaseModel):
         | SourceSyncOutcome4
         | SourceSyncOutcome5
         | SourceSyncOutcome6
+        | SourceSyncOutcome7
+        | SourceSyncOutcome8
     )
     """
-    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal) or `error` (the status reads failed; `detail` names the error).
+    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause).
     """
     schema_: str = Field(..., alias="schema")
     """
     The connector's schema name in the source destination.
+    """
+    triggered: bool | None = None
+    """
+    Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.
     """
     waited_secs: conint(ge=0)
     """
@@ -1217,7 +1239,7 @@ class RunOutput(BaseModel):
     """
     source_syncs: list[SourceSyncOutput] | None = None
     """
-    One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
+    One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
     """
     status: RunStatus1 | RunStatus2 | RunStatus3
     """

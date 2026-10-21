@@ -180,4 +180,8 @@ class DiscoverOutput(BaseModel):
     Populated by `rocky discover --with-schemas` — the explicit warm-up path for the schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
     """
     sources: list[SourceOutput]
+    sync_trigger: bool | None = None
+    """
+    `true` when the pipeline starts its own source syncs (`[pipeline.<name>.source.discovery.sync] trigger = true`). Rocky then advances each connector's `last_sync_at` itself, so an orchestrator that runs the pipeline whenever `last_sync_at` moves (the Dagster source sensor) would start a second run per sync, and should stand down. Read from config, not from run state, so it does not change with `rocky run --no-sync-trigger`. Omitted when `false`.
+    """
     version: str

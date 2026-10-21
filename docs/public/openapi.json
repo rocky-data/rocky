@@ -12,6 +12,10 @@
               "null"
             ]
           },
+          "allow_sync_trigger": {
+            "description": "The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.",
+            "type": "boolean"
+          },
           "api_key": {
             "anyOf": [
               {
@@ -7469,6 +7473,10 @@
             },
             "type": "array"
           },
+          "sync_trigger": {
+            "description": "`true` when the pipeline starts its own source syncs (`[pipeline.<name>.source.discovery.sync] trigger = true`). Rocky then advances each connector's `last_sync_at` itself, so an orchestrator that runs the pipeline whenever `last_sync_at` moves (the Dagster source sensor) would start a second run per sync, and should stand down. Read from config, not from run state, so it does not change with `rocky run --no-sync-trigger`. Omitted when `false`.",
+            "type": "boolean"
+          },
           "version": {
             "type": "string"
           }
@@ -7519,7 +7527,7 @@
       },
       "DiscoverySyncConfig": {
         "additionalProperties": false,
-        "description": "`[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source.\n\nRocky only reads the vendor API (GET). It never starts a sync. A connector that is not syncing when the run starts is not waited for.",
+        "description": "`[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.\n\nWith `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.",
         "properties": {
           "on_sync_failure": {
             "allOf": [
@@ -7536,6 +7544,10 @@
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "trigger": {
+            "description": "Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.",
+            "type": "boolean"
           },
           "wait": {
             "default": false,
@@ -22284,7 +22296,7 @@
             ]
           },
           "source_syncs": {
-            "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
+            "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
             "items": {
               "$ref": "#/components/schemas/SourceSyncOutput"
             },
@@ -24111,14 +24123,28 @@
               "error"
             ],
             "type": "string"
+          },
+          {
+            "description": "The connector is paused, so no sync was started. Not a failure: a person paused it on purpose, and Rocky never unpauses.",
+            "enum": [
+              "paused"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Rocky could not start the sync. The result's `detail` names the cause.",
+            "enum": [
+              "trigger_failed"
+            ],
+            "type": "string"
           }
         ]
       },
       "SourceSyncOutput": {
-        "description": "What `rocky run` waited for on one source connector: a sync that was running when the run began.",
+        "description": "What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.",
         "properties": {
           "detail": {
-            "description": "The error text behind an `error` outcome. Absent for every other outcome.",
+            "description": "The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.",
             "type": [
               "string",
               "null"
@@ -24142,11 +24168,15 @@
                 "$ref": "#/components/schemas/SourceSyncOutcome"
               }
             ],
-            "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal) or `error` (the status reads failed; `detail` names the error)."
+            "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause)."
           },
           "schema": {
             "description": "The connector's schema name in the source destination.",
             "type": "string"
+          },
+          "triggered": {
+            "description": "Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.",
+            "type": "boolean"
           },
           "waited_secs": {
             "description": "Whole seconds from the start of the wait to this outcome.",

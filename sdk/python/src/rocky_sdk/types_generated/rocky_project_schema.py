@@ -2114,6 +2114,10 @@ class AdapterConfig(BaseModel):
     """
     Snowflake account identifier (e.g., "xy12345.us-east-1").
     """
+    allow_sync_trigger: bool | None = None
+    """
+    The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+    """
     api_key: str | None = None
     api_secret: str | None = None
     cache: FivetranCacheConfig | None = None
@@ -2359,9 +2363,9 @@ class CustomCheckConfig(BaseModel):
 
 class DiscoverySyncConfig(BaseModel):
     """
-    `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source.
+    `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.
 
-    Rocky only reads the vendor API (GET). It never starts a sync. A connector that is not syncing when the run starts is not waited for.
+    With `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.
     """
 
     model_config = ConfigDict(
@@ -2374,6 +2378,10 @@ class DiscoverySyncConfig(BaseModel):
     poll_interval_secs: conint(ge=0) | None = 30
     """
     Seconds between status polls. At least 10. Default 30.
+    """
+    trigger: bool | None = None
+    """
+    Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
     """
     wait: bool | None = False
     """

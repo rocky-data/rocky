@@ -1591,6 +1591,29 @@ fn validate_replication_pipeline(
         });
     }
 
+    // V063: a pipeline that starts a vendor sync (`trigger = true`) and also
+    // runs on a cron starts one sync, and pays the vendor for it, at every
+    // tick. A warning, not an error: it can be what the owner wants.
+    if let Some(ref disc) = pipeline.source.discovery
+        && disc.sync.as_ref().is_some_and(|s| s.trigger)
+        && pipeline
+            .schedule
+            .as_ref()
+            .is_some_and(|sched| sched.enabled && sched.cron.is_some())
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V063".into(),
+            message: format!(
+                "pipeline.{name}: sync.trigger = true with a [schedule] cron starts a vendor \
+                 sync, and spends vendor compute, at every cron tick. Check that the cron \
+                 interval is what you want to pay for, or use wait = true alone."
+            ),
+            file: None,
+            field: Some(format!("pipeline.{name}.source.discovery.sync.trigger")),
+        });
+    }
+
     // V058: a manual discovery adapter discovers only the schemas it lists,
     // and `plan` / `run` then keep only the ones `schema_pattern` parses:
     // the prefix must match (case-sensitively) and the rest must split into
@@ -2289,6 +2312,113 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    /// A replication pipeline on Fivetran with a sync table and an optional
+    /// `[schedule]`. The adapter opts in unless `opt_in` is empty.
+    fn trigger_toml(opt_in: &str, sync: &str, schedule: &str) -> String {
+        format!(
+            r#"
+[adapter.wh]
+type = "duckdb"
+path = "x.db"
+
+[adapter.ft]
+type = "fivetran"
+kind = "discovery"
+destination_id = "d"
+api_key = "k"
+api_secret = "s"
+{opt_in}
+
+[pipeline.raw]
+type = "replication"
+
+[pipeline.raw.source]
+adapter = "wh"
+
+[pipeline.raw.source.discovery]
+adapter = "ft"
+
+{sync}
+
+[pipeline.raw.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+adapter = "wh"
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+
+{schedule}
+"#
+        )
+    }
+
+    #[test]
+    fn trigger_with_a_cron_is_a_v063_warning_not_an_error() {
+        let out = validate_toml(&trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            "[pipeline.raw.schedule]\ncron = \"0 * * * *\"",
+        ));
+        assert!(out.valid, "{:?}", out.messages);
+        let hits: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V063" && m.severity == "warn")
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+    }
+
+    #[test]
+    fn trigger_without_a_cron_or_a_cron_without_trigger_has_no_v063() {
+        let no_cron = validate_toml(&trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            "",
+        ));
+        assert!(no_cron.valid, "{:?}", no_cron.messages);
+        assert!(!no_cron.messages.iter().any(|m| m.code == "V063"));
+        let no_trigger = validate_toml(&trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+            "[pipeline.raw.schedule]\ncron = \"0 * * * *\"",
+        ));
+        assert!(!no_trigger.messages.iter().any(|m| m.code == "V063"));
+    }
+
+    #[test]
+    fn trigger_without_the_adapter_opt_in_or_without_wait_is_invalid() {
+        let no_opt_in = validate_toml(&trigger_toml(
+            "",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            "",
+        ));
+        assert!(!no_opt_in.valid, "{:?}", no_opt_in.messages);
+        assert!(
+            no_opt_in.messages.iter().any(|m| m
+                .message
+                .contains("allow_sync_trigger = true on [adapter.ft]")),
+            "{:?}",
+            no_opt_in.messages
+        );
+        let no_wait = validate_toml(&trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\ntrigger = true",
+            "",
+        ));
+        assert!(!no_wait.valid, "{:?}", no_wait.messages);
+        assert!(
+            no_wait
+                .messages
+                .iter()
+                .any(|m| m.message.contains("needs wait = true")),
+            "{:?}",
+            no_wait.messages
+        );
     }
 
     /// #1919: `rocky validate --output json` prints a resolved pipeline

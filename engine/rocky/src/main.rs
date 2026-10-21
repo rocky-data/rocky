@@ -1309,6 +1309,14 @@ enum Command {
         #[arg(long)]
         no_prune: bool,
 
+        /// Do not start a source sync for this run, even when
+        /// `[pipeline.<name>.source.discovery.sync] trigger = true`. The run
+        /// still waits for a sync that is already running. Does not change
+        /// `sync_trigger` in `rocky discover`; set `trigger = false` in the
+        /// config for that. Default OFF.
+        #[arg(long)]
+        no_sync_trigger: bool,
+
         /// Rebuild transformation `incremental` models from scratch with
         /// `CREATE OR REPLACE TABLE ... AS`, resolving every
         /// `@incremental_filter` to `TRUE`. Other strategies are unaffected:
@@ -4587,6 +4595,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             force_rebuild,
             no_reuse,
             no_prune,
+            no_sync_trigger,
             full_refresh,
             refuse_hooks,
             var,
@@ -4807,7 +4816,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 no_reuse,
                 no_prune,
                 full_refresh,
-                no_sync_trigger: false,
+                no_sync_trigger,
                 no_source_sync: false,
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
