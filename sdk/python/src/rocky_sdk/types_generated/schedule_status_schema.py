@@ -26,7 +26,7 @@ class CronCheck2(StrEnum):
 
 class CronCheck3(StrEnum):
     """
-    Nothing to compare: the latest start is `unknown`; or the pipeline has a cron with no next fire (no fire anchor yet, or no next occurrence); or the pipeline has neither a cron nor an `after` trigger (it runs by hand or by freshness only); or it has no cron, no `after` upstream is known late, and some `after` upstream cannot be judged (an unknown latest start, or a `cron_check` of `not_judged`). In that last case there is no warning, and `note` names the upstreams that cannot be judged.
+    Nothing to compare: the latest start is `unknown` (unless the pipeline has no cron and an `after` upstream is known late: then `too_late`); or the pipeline has a cron with no next fire (no fire anchor yet, or no next occurrence); or the pipeline has neither a cron nor an `after` trigger (it runs by hand or by freshness only); or it has no cron, no `after` upstream is known late, and some `after` upstream cannot be judged (an unknown latest start, or a `cron_check` of `not_judged`). In that last case there is no warning, and `note` names the upstreams that cannot be judged.
     """
 
     not_judged = "not_judged"
@@ -42,7 +42,7 @@ class CronCheck4(StrEnum):
 
 class CronCheck5(StrEnum):
     """
-    The pipeline may start too late. Two cases. It has a cron whose next fire is later than `at`, and it has no `after` trigger, or some `after` upstream is not judged in time (see `relies_on_after`), late or not judged: `cron_too_late` is `true`. Or it has no cron, runs only `after` other pipelines, and some of them are known late (a `cron_check` of `too_late`, `overdue` or `disabled`): `cron_too_late` is `false`, as it has no cron. `warning` says so in both cases and names the upstreams not judged in time.
+    The pipeline may start too late. Two cases. It has a cron whose next fire is later than `at`, and it has no `after` trigger, or some `after` upstream is not judged in time (see `relies_on_after`), late or not judged: `cron_too_late` is `true`. Or it has no cron, runs only `after` other pipelines, and some of them are known late (a `cron_check` of `too_late`, `overdue` or `disabled`): `cron_too_late` is `false`, as it has no cron. This holds even when its own latest start is `unknown`. `warning` says so in both cases and names the upstreams not judged in time.
     """
 
     too_late = "too_late"

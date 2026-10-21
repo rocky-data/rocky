@@ -1732,6 +1732,7 @@ mod delivery_state_tests {
         raw_cron: &str,
         raw_slot: (u32, u32),
         revenue_anchored: bool,
+        raw_extra: &str,
     ) -> std::collections::BTreeMap<String, serde_json::Value> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1748,7 +1749,10 @@ mod delivery_state_tests {
         }
         let mut toml = String::from("[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n");
         for (name, schedule) in [
-            ("raw", format!("cron = \"{raw_cron}\"\ntimezone = \"UTC\"")),
+            (
+                "raw",
+                format!("cron = \"{raw_cron}\"\ntimezone = \"UTC\"{raw_extra}"),
+            ),
             ("mid", "after = [\"raw\"]".to_string()),
             (
                 "revenue",
@@ -1812,7 +1816,7 @@ mod delivery_state_tests {
     /// Before, `mid` read `not_judged`, so `revenue` read `too_late`.
     #[test]
     fn an_after_only_pipeline_below_an_in_time_root_relies_on_after() {
-        let status = line_status("0 3 * * *", (3, 0), true);
+        let status = line_status("0 3 * * *", (3, 0), true, "");
         assert_eq!(status["raw"]["latest_start"]["cron_check"], "on_time");
         for name in ["mid", "revenue"] {
             let latest = &status[name]["latest_start"];
@@ -1831,7 +1835,7 @@ mod delivery_state_tests {
     /// on `after`. Each warning names the upstream that is not in time.
     #[test]
     fn an_after_only_pipeline_below_a_late_root_is_too_late() {
-        let status = line_status("30 5 * * *", (5, 30), true);
+        let status = line_status("30 5 * * *", (5, 30), true, "");
         assert_eq!(status["raw"]["latest_start"]["cron_check"], "too_late");
 
         let mid = &status["mid"]["latest_start"];
@@ -1851,12 +1855,26 @@ mod delivery_state_tests {
         );
     }
 
+    /// A disabled `raw` will not start: `mid`, which runs only `after` it,
+    /// is `too_late`, and `revenue` cannot rely on `after` either.
+    #[test]
+    fn an_after_only_pipeline_below_a_disabled_root_is_too_late() {
+        let status = line_status("0 3 * * *", (3, 0), true, "\nenabled = false");
+        assert_eq!(status["raw"]["latest_start"]["cron_check"], "disabled");
+        let mid = &status["mid"]["latest_start"];
+        assert_eq!(mid["cron_check"], "too_late", "{mid}");
+        let warning = mid["warning"].as_str().expect("a warning");
+        assert!(warning.contains("`raw` is known late"), "{warning}");
+        let revenue = &status["revenue"]["latest_start"];
+        assert_eq!(revenue["cron_check"], "too_late", "{revenue}");
+    }
+
     /// `revenue` has a cron that has not fired yet: no fire anchor, so no
     /// `next_fire_at`. It is `not_judged`, not judged by its `after` as a
     /// pipeline with no cron would be, though its upstreams are in time.
     #[test]
     fn a_cron_awaiting_its_first_anchor_is_not_judged() {
-        let status = line_status("0 3 * * *", (3, 0), false);
+        let status = line_status("0 3 * * *", (3, 0), false, "");
         let revenue = &status["revenue"];
         assert_eq!(revenue["awaiting_first_anchor"], true, "{revenue}");
         assert!(revenue["next_fire_at"].is_null(), "{revenue}");
@@ -2035,6 +2053,41 @@ mod cron_check_tests {
         );
         assert_eq!(unjudged.cron_check, CronCheck::NotJudged);
         assert!(!unjudged.cron_too_late);
+        assert!(unjudged.warning.is_none());
+        let note = unjudged.note.expect("a note");
+        assert!(note.contains("`raw` cannot be judged"), "{note}");
+    }
+
+    /// A pipeline with no cron whose own latest start is unknown still reads
+    /// `too_late` below an upstream known late (a disabled one, say), and
+    /// still carries the note below an upstream that cannot be judged.
+    #[test]
+    fn an_after_only_pipeline_with_an_unknown_latest_start_keeps_its_upstream_verdict() {
+        let unknown = || LatestStart::Unknown {
+            reasons: vec![UnknownReason::MissingEstimate],
+            missing_estimate: vec!["mid".to_string()],
+        };
+        let no_cron = |after| CronContext {
+            now: t(1, 0, 0),
+            has_cron: false,
+            next_fire_at: None,
+            enabled: true,
+            after,
+        };
+        let late = LatestStartStatus::from_latest_start(
+            unknown(),
+            &no_cron(AfterTrigger::UpstreamsLate(vec!["raw".to_string()])),
+        );
+        assert_eq!(late.cron_check, CronCheck::TooLate);
+        assert!(!late.cron_too_late);
+        let warning = late.warning.expect("a warning");
+        assert!(warning.contains("`raw` is known late"), "{warning}");
+
+        let unjudged = LatestStartStatus::from_latest_start(
+            unknown(),
+            &no_cron(AfterTrigger::UpstreamsNotJudged(vec!["raw".to_string()])),
+        );
+        assert_eq!(unjudged.cron_check, CronCheck::NotJudged);
         assert!(unjudged.warning.is_none());
         let note = unjudged.note.expect("a note");
         assert!(note.contains("`raw` cannot be judged"), "{note}");
