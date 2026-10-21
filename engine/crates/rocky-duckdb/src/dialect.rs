@@ -93,7 +93,10 @@ impl SqlDialect for DuckDbSqlDialect {
     }
 
     fn insert_into(&self, target: &str, select_sql: &str) -> String {
-        format!("INSERT INTO {target}\n{select_sql}")
+        // `BY NAME` matches SELECT columns to target columns by name, so a
+        // projection ordered differently from the target cannot write values
+        // into the wrong columns (#2465).
+        format!("INSERT INTO {target} BY NAME\n{select_sql}")
     }
 
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
@@ -282,7 +285,7 @@ impl SqlDialect for DuckDbSqlDialect {
         Ok(vec![
             "BEGIN".into(),
             format!("DELETE FROM {target} WHERE {partition_filter}"),
-            format!("INSERT INTO {target}\n{select_sql}"),
+            format!("INSERT INTO {target} BY NAME\n{select_sql}"),
             "COMMIT".into(),
         ])
     }
@@ -1015,5 +1018,111 @@ mod tests {
         let target = vec![col("amount", "INT")];
         let result = detect_drift(&table, &source, &target, &d);
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
+    }
+
+    /// Target `(id, amount, note)`, SELECT ordered `amount, id, note`: a
+    /// positional INSERT swaps `id` and `amount` (#2465).
+    fn seed_reorder_fixture(conn: &crate::DuckDbConnector) {
+        conn.execute_sql(
+            "CREATE TABLE tgt (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO tgt VALUES (1, 10, 'old');\n\
+             CREATE TABLE src (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO src VALUES (2, 20, 'new');",
+        )
+        .expect("seed");
+    }
+
+    fn cell_i64(v: &serde_json::Value, what: &str) -> i64 {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("{what}: unexpected cell {v:?}"))
+    }
+
+    fn assert_reordered_rows(conn: &crate::DuckDbConnector) {
+        let after = conn
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
+            .expect("query");
+        let got: Vec<(i64, i64, String)> = after
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    cell_i64(&r[0], "id"),
+                    cell_i64(&r[1], "amount"),
+                    r[2].as_str().expect("note").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 10, "old".to_string()), (2, 20, "new".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_insert_into_by_name_with_reordered_select_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        seed_reorder_fixture(&conn);
+        // delete_insert shape: clear the incoming partition, then insert.
+        conn.execute_sql("DELETE FROM tgt WHERE id = 2")
+            .expect("delete");
+        let sql = dialect().insert_into("tgt", "SELECT amount, id, note FROM src");
+        conn.execute_sql(&sql).expect("insert must execute");
+        assert_reordered_rows(&conn);
+    }
+
+    #[test]
+    fn test_insert_overwrite_partition_by_name_with_reordered_select_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        seed_reorder_fixture(&conn);
+        let stmts = dialect()
+            .insert_overwrite_partition("tgt", "id = 2", "SELECT amount, id, note FROM src")
+            .expect("build statements");
+        for s in &stmts {
+            conn.execute_sql(s).expect("statement must execute");
+        }
+        assert_reordered_rows(&conn);
+    }
+
+    /// CTAS renames a repeated output name (`a.id, b.id`) to `id_1`. An
+    /// unaliased `INSERT ... BY NAME` of the same SELECT then fails (#2467).
+    #[test]
+    fn test_insert_into_by_name_duplicate_select_name_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_sql(
+            "CREATE TABLE a (id INTEGER);\n\
+             INSERT INTO a VALUES (1);\n\
+             CREATE TABLE b (id INTEGER);\n\
+             INSERT INTO b VALUES (2);\n\
+             CREATE TABLE tgt AS SELECT a.id, b.id FROM a JOIN b ON TRUE;",
+        )
+        .expect("seed");
+        let cols = conn
+            .execute_sql("SELECT column_name FROM information_schema.columns WHERE table_name = 'tgt' ORDER BY ordinal_position")
+            .expect("columns");
+        let names: Vec<&str> = cols.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["id", "id_1"]);
+
+        let unaliased = dialect().insert_into("tgt", "SELECT a.id, b.id FROM a JOIN b ON TRUE");
+        let err = conn
+            .execute_sql(&unaliased)
+            .expect_err("unaliased duplicate names must fail");
+        assert!(
+            err.to_string().contains("Duplicate column name"),
+            "unexpected error: {err}"
+        );
+
+        let aliased =
+            dialect().insert_into("tgt", "SELECT a.id, b.id AS id_1 FROM a JOIN b ON TRUE");
+        conn.execute_sql(&aliased)
+            .expect("aliased insert must execute");
+        let after = conn.execute_sql("SELECT id, id_1 FROM tgt").expect("query");
+        assert_eq!(after.rows.len(), 2);
+        for r in &after.rows {
+            assert_eq!((cell_i64(&r[0], "id"), cell_i64(&r[1], "id_1")), (1, 2));
+        }
     }
 }
