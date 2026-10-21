@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The generated `ProductSpec` output gains an optional `volume` (`VolumeSpec`: `min_rows`, `max_rows`, `severity`), the declared row range of a product's output.
+- `RunResult` and the generated run models gain `volume_warnings`, and `MaterializationInfo` and the generated materialization model an optional `volume` (`VolumeCheckOutput`: the row count, the range and the verdict). `VolumeCheckOutput` is exported from `rocky_sdk.types_generated`.
+- The generated `ProductStatusOutput` gains an optional `volume` (`ProductVolumeStatus`).
+
 ## [0.28.0] — 2026-10-21
 
 Pairs with engine 1.88.0.
