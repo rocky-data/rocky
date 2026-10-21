@@ -65,7 +65,7 @@ build ok ──▶ COUNT(*) ──▶ in range ───────────
 
 At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A non-full-refresh output reaching `rocky run` is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
-The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records `row_count` in its history, and `rocky product status` reports it.
+The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records `row_count` in its history, and `rocky product status` reports it. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
 
 ---
 
@@ -82,7 +82,7 @@ Four checks run in order, fail-closed:
 1. **Trust posture.** `rocky.toml` must carry the frozen `propose_only` posture: a `[policy]` block with `default_agent_effect = "require_review"`, an agent `propose` rule that resolves `allow` and is scoped to exactly this product's output model (no `any`, no glob, no extra predicates, no autonomy budget), and agent `apply` resolving `require_review` or `deny`. A policy that merely *happens* to resolve safely is rejected — authority that reaches past the product is global agent authority. The verdicts come from the engine's own policy evaluator, run against the attributes the lowering is *about to create* (the post-image), so the gate cannot be evaded by the change under review.
 2. **Classification tags.** Every tag in `output.classifications` must resolve to a `[mask]` strategy, a `[mask.<env>]` override, or `[classifications].allow_unmasked`. This is an error here; plain `rocky compile` only warns (W004). Resolution only: whether masking is applied is warehouse-dependent.
 3. **Identity collisions.** The product name must not be claimed by another spec file, and the output model must not be claimed by another product.
-4. **Volume strategy.** When the spec declares `[product.output.volume]` and `models/<model>.sql` and `models/<model>.toml` exist, the model must be a full-refresh table (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted there is nothing to check; the Phase-B compile runs this check again.
+4. **Volume strategy.** When the spec declares `[product.output.volume]` and the model exists (`models/<model>.sql` or `models/<model>.rocky`, plus `models/<model>.toml`), the model must be a full-refresh table (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted, verify cannot judge the strategy, so this check passes; the Phase-B compile runs it again. If a model that is not a full-refresh table still reaches `rocky run`, the run does not count it: the verdict is `not_evaluated` with reason `volume-strategy-unsupported`, never a failure.
 
 Exit codes: `0` pass · `1` needs input (a paste-ready `[policy]` block is printed) · `2` fail.
 
@@ -103,7 +103,7 @@ rocky product compile revenue_daily
 Lowering runs in two phases because the drafting tool rewrites the model sidecar wholesale — metadata lowered before drafting would be destroyed:
 
 - **Phase A** (before drafting) renders `models/<model>.contract.toml` — the spec-owned contract the draft must compile against.
-- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check, one `row_count_range` for a declared volume). The worker's `name`, `intent`, and appended tests survive, except a worker `row_count_range` when the spec declares a volume.
+- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check, one `row_count_range` for a declared volume). The worker's `name`, `intent`, and appended tests survive, except a worker `row_count_range` with no `filter` when the spec declares a volume. A filtered worker range survives. The generated range carries `generated_by = "product.output.volume"`, so removing the volume block removes that range on the next lowering; `rocky test` ignores the key.
 
 The command picks the phase itself: Phase A on a fresh product, Phase B once `models/<model>.toml` exists. Re-running is safe — the merge is idempotent.
 

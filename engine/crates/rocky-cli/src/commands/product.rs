@@ -1153,13 +1153,23 @@ pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecRes
         return Ok(());
     }
     let model_name = parsed.output_model();
-    if !root.join(sql_rel(parsed)).is_file() || !root.join(sidecar_rel(parsed)).is_file() {
+    // The model's source is a `.sql` file or a `.rocky` DSL file. The
+    // compiler's directory loader reads both; `rocky_core`'s reads only
+    // `.sql`, so a `.rocky` output would never be judged.
+    let sql = root.join(sql_rel(parsed));
+    let has_source = sql.is_file() || sql.with_extension("rocky").is_file();
+    if !has_source || !root.join(sidecar_rel(parsed)).is_file() {
         return Ok(());
     }
-    let wanted = std::ffi::OsStr::new(model_name);
-    let models = match rocky_core::models::load_models_from_dir_filtered(
-        &root.join("models"),
-        |path| path.file_stem() == Some(wanted),
+    let models_dir = root.join("models");
+    let only_this_model = format!(
+        "{}/{}.*",
+        glob::Pattern::escape(&models_dir.to_string_lossy()),
+        glob::Pattern::escape(model_name)
+    );
+    let models = match rocky_compiler::project::load_dir_models_matching(
+        &models_dir,
+        &only_this_model,
         None,
     ) {
         Ok(models) => models,

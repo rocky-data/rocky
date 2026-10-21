@@ -308,6 +308,25 @@ mod tests {
             "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
         );
         super::super::product::check_volume_strategy(root, &parsed).expect("full refresh");
+
+        // A `.rocky` DSL model is judged the same way as a `.sql` one.
+        std::fs::remove_file(root.join("models/vol.sql")).unwrap();
+        write(
+            "models/vol.rocky",
+            "from raw_orders\ngroup customer_id {\n    n: count()\n}\n",
+        );
+        write(
+            "models/_defaults.toml",
+            "[strategy]\ntype = \"view\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        );
+        let reject = super::super::product::check_volume_strategy(root, &parsed)
+            .expect_err("a .rocky view cannot carry a volume");
+        assert_eq!(reject.code, "volume-strategy-unsupported");
+        write(
+            "models/_defaults.toml",
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        );
+        super::super::product::check_volume_strategy(root, &parsed).expect("a .rocky full refresh");
     }
 
     /// `rocky run` end to end on DuckDB (no credentials): a product output
