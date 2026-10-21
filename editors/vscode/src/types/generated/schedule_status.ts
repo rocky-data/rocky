@@ -322,7 +322,7 @@ export interface LatestStartStatus {
    */
   missing_estimate?: string[];
   /**
-   * When `cron_check` is `relies_on_after`: the `after` trigger is what starts the pipeline in time. For a pipeline with a cron, the cron alone would start it too late; for one with no cron, the `after` trigger is its only trigger.
+   * When `cron_check` is `relies_on_after`: the `after` trigger is what starts the pipeline in time. For a pipeline with a cron, the cron alone would start it too late; for one with no cron, the `after` trigger is its only trigger. Also when a pipeline with no cron reads `not_judged` because no `after` upstream is known late but some cannot be judged: the note names those upstreams.
    */
   note?: string | null;
   /**

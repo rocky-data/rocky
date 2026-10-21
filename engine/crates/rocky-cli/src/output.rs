@@ -7457,7 +7457,9 @@ pub struct LatestStartStatus {
     /// When `cron_check` is `relies_on_after`: the `after` trigger is what
     /// starts the pipeline in time. For a pipeline with a cron, the cron
     /// alone would start it too late; for one with no cron, the `after`
-    /// trigger is its only trigger.
+    /// trigger is its only trigger. Also when a pipeline with no cron reads
+    /// `not_judged` because no `after` upstream is known late but some
+    /// cannot be judged: the note names those upstreams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -7524,15 +7526,20 @@ pub enum CronCheck {
     /// Nothing to compare: the latest start is `unknown`; or the pipeline
     /// has a cron with no next fire (no fire anchor yet, or no next
     /// occurrence); or the pipeline has neither a cron nor an `after`
-    /// trigger (it runs by hand or by freshness only).
+    /// trigger (it runs by hand or by freshness only); or it has no cron,
+    /// no `after` upstream is known late, and some `after` upstream cannot
+    /// be judged (an unknown latest start, or a `cron_check` of
+    /// `not_judged`). In that last case there is no warning, and `note`
+    /// names the upstreams that cannot be judged.
     NotJudged,
     /// The next cron fire is at or before `at`.
     OnTime,
     /// The pipeline may start too late. Two cases. It has a cron whose next
     /// fire is later than `at`, and it has no `after` trigger, or some
-    /// `after` upstream is not judged in time (see `relies_on_after`):
-    /// `cron_too_late` is `true`. Or it has no cron, runs only `after`
-    /// other pipelines, and some of them are not judged in time:
+    /// `after` upstream is not judged in time (see `relies_on_after`), late
+    /// or not judged: `cron_too_late` is `true`. Or it has no cron, runs
+    /// only `after` other pipelines, and some of them are known late (a
+    /// `cron_check` of `too_late`, `overdue` or `disabled`):
     /// `cron_too_late` is `false`, as it has no cron. `warning` says so in
     /// both cases and names the upstreams not judged in time.
     TooLate,
@@ -7565,17 +7572,25 @@ pub struct CronContext {
 }
 
 /// A pipeline's `after` trigger, as [`CronContext`] sees it.
+///
+/// Each `after` upstream is in time (a known latest start and a
+/// `cron_check` of `on_time` or `relies_on_after`), known late (a
+/// `cron_check` of `too_late`, `overdue` or `disabled`), or cannot be
+/// judged (anything else: an unknown latest start, or `not_judged`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AfterTrigger {
     /// The pipeline has no `after` trigger.
     Absent,
-    /// Every `after` upstream has a known latest start and a `cron_check`
-    /// of `on_time` or `relies_on_after`.
+    /// Every `after` upstream is in time.
     UpstreamsInTime,
-    /// Some `after` upstream has an unknown latest start, or a `cron_check`
-    /// other than `on_time` or `relies_on_after`. Holds those upstreams, in
-    /// `after` order.
-    UpstreamsNotInTime(Vec<String>),
+    /// No `after` upstream is known late, but some cannot be judged. Holds
+    /// those upstreams, in `after` order. A pipeline with no cron then reads
+    /// `not_judged`; one with a late cron still reads `too_late`.
+    UpstreamsNotJudged(Vec<String>),
+    /// Some `after` upstream is known late. Holds every upstream not in
+    /// time, late or not judged, in `after` order. The pipeline reads
+    /// `too_late` when it has no cron or its cron is late.
+    UpstreamsLate(Vec<String>),
 }
 
 impl LatestStartStatus {
@@ -7620,9 +7635,13 @@ impl LatestStartStatus {
             // trigger. With no `after` either, it runs by hand or by
             // freshness: nothing to judge.
             match (&cron.after, at) {
-                (_, None) | (AfterTrigger::Absent, _) => CronCheck::NotJudged,
+                // An upstream that cannot be judged, with none known late:
+                // nothing is known to be late, so no verdict either.
+                (_, None) | (AfterTrigger::Absent | AfterTrigger::UpstreamsNotJudged(_), _) => {
+                    CronCheck::NotJudged
+                }
                 (AfterTrigger::UpstreamsInTime, Some(_)) => CronCheck::ReliesOnAfter,
-                (AfterTrigger::UpstreamsNotInTime(_), Some(_)) => CronCheck::TooLate,
+                (AfterTrigger::UpstreamsLate(_), Some(_)) => CronCheck::TooLate,
             }
         } else {
             // A cron with no next fire (awaiting its first anchor, or no next
@@ -7631,9 +7650,11 @@ impl LatestStartStatus {
                 (Some(fire), _) if fire < cron.now => CronCheck::Overdue,
                 (Some(fire), Some(at)) if fire > at => match &cron.after {
                     AfterTrigger::UpstreamsInTime => CronCheck::ReliesOnAfter,
-                    AfterTrigger::Absent | AfterTrigger::UpstreamsNotInTime(_) => {
-                        CronCheck::TooLate
-                    }
+                    // The cron is known late, so an upstream that cannot be
+                    // judged leaves it `too_late`: `after` cannot be relied on.
+                    AfterTrigger::Absent
+                    | AfterTrigger::UpstreamsNotJudged(_)
+                    | AfterTrigger::UpstreamsLate(_) => CronCheck::TooLate,
                 },
                 (Some(_), Some(_)) => CronCheck::OnTime,
                 (None, _) | (Some(_), None) => CronCheck::NotJudged,
@@ -7641,7 +7662,7 @@ impl LatestStartStatus {
         };
         // The upstreams not judged in time, for the texts below.
         let untimely = match &cron.after {
-            AfterTrigger::UpstreamsNotInTime(names) => names
+            AfterTrigger::UpstreamsNotJudged(names) | AfterTrigger::UpstreamsLate(names) => names
                 .iter()
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
@@ -7667,6 +7688,21 @@ impl LatestStartStatus {
                 )),
                 None,
             ),
+            (CronCheck::NotJudged, _)
+                if !cron.has_cron
+                    && at.is_some()
+                    && matches!(cron.after, AfterTrigger::UpstreamsNotJudged(_)) =>
+            {
+                (
+                    None,
+                    Some(format!(
+                        "the pipeline has no cron and runs only `after` other pipelines; no \
+                     upstream is known late, but {untimely} cannot be judged (an unknown \
+                     latest start, or not judged), so this pipeline is not judged either; \
+                     {wanted}"
+                    )),
+                )
+            }
             (CronCheck::ReliesOnAfter, _) if !cron.has_cron => (
                 None,
                 Some(format!(
