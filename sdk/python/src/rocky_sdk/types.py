@@ -565,8 +565,9 @@ class RunResult(BaseModel):
     #: One loose ``dict`` row per source connector the run waited for under
     #: ``[...discovery.sync] wait = true`` (``id``, ``schema``, ``outcome``,
     #: ``waited_secs``, ``last_sync_at``, ``triggered`` when Rocky started the
-    #: sync, and ``detail`` on an ``error`` or ``trigger_failed`` outcome); the typed shape lives on the
-    #: generated ``RunOutput.source_syncs``. Empty when nothing was waited for.
+    #: sync, and ``detail`` on an ``error`` or ``trigger_failed`` outcome); the
+    #: typed shape lives on the generated ``RunOutput.source_syncs``. Empty when
+    #: nothing was waited for.
     source_syncs: list[dict] = Field(default_factory=list)
     #: Problems in the project's ``consumers/`` records (``E060``). They never
     #: stop a model from being written and are never counted as a failed
