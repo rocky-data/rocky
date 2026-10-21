@@ -54,9 +54,12 @@
 //!
 //! A request whose answer is unknown (a timeout, a 5xx) is treated as sent:
 //! the row stays `triggered`, and the wait goes on like it does for a slow
-//! start, so a sync that starts later is still waited out. A 409 is taken as
-//! "the connector is busy": the connector is waited for and the request is
-//! sent again when it is idle.
+//! start, so a sync that starts later is still waited out. One more read right
+//! after that answer moves the baseline and `T_pre`, so a sync that ended
+//! between the idle read and the request is not counted; if that read fails,
+//! the connector ends `unknown`. A 409 is taken as "the connector is busy":
+//! the connector is waited for and the request is sent again when it is idle.
+//! A second 409 ends the connector as `trigger_failed`.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -153,12 +156,15 @@ pub enum SourceSyncTriggerError {
     /// The source answered that the connector is busy (HTTP 409). The vendor
     /// docs do not say whether that means "a sync is already running", so the
     /// caller takes the safe side: it treats the connector as syncing, waits
-    /// for it to be idle, and does not count that sync as its own.
+    /// for it to be idle, does not count that sync as its own, and asks once
+    /// more. A second busy answer ends the connector as `TriggerFailed`.
     #[error("{0}")]
     Conflict(String),
     /// The request may have reached the source and its answer is unknown (a
     /// timeout, a server error, a connection lost mid-request). The caller
-    /// reads the connector again to see whether a sync started.
+    /// treats it as sent. It reads the connector once more and moves the
+    /// identity baseline and `t_pre` to that read, so a sync that ended before
+    /// it is not counted. If that read fails, the connector ends `unknown`.
     #[error("{0}")]
     Unknown(String),
 }
@@ -492,6 +498,8 @@ struct TriggerTracked {
     last_sync_at: Option<DateTime<Utc>>,
     waited_secs: u64,
     detail: Option<String>,
+    /// Busy (409) answers so far; a second one ends the connector.
+    conflicts: u32,
 }
 
 impl TriggerTracked {
@@ -517,22 +525,17 @@ fn idle_seen_at(state: &SourceSyncState) -> DateTime<Utc> {
     })
 }
 
-/// After a request whose answer is unknown, read the connector once more and
-/// say whether it is syncing right now. A failed read, or a connector that is
-/// not in the answer, counts as "not seen syncing": the caller keeps waiting
-/// either way, because the request may have been sent.
-async fn syncing_after_unknown(
+/// After a request whose answer is unknown, read the connector once more.
+/// `None` when the read fails or the connector is not in the answer.
+async fn read_after_unknown(
     adapter: &dyn DiscoveryAdapter,
     schema_prefix: &str,
     id: &str,
-) -> bool {
+) -> Option<SourceSyncState> {
     let Ok(Some(states)) = adapter.source_sync_states(schema_prefix).await else {
-        return false;
+        return None;
     };
-    states
-        .iter()
-        .find(|s| s.id == id)
-        .is_some_and(|s| s.syncing)
+    states.into_iter().find(|s| s.id == id)
 }
 
 /// Start a sync on every selected connector and wait until each has ended.
@@ -591,6 +594,7 @@ pub async fn trigger_and_wait_for_source_syncs(
             last_sync_at: s.succeeded_at,
             waited_secs: 0,
             detail: None,
+            conflicts: 0,
         })
         .collect();
     for t in tracked
@@ -663,16 +667,54 @@ pub async fn trigger_and_wait_for_source_syncs(
                 )),
                 Err(SourceSyncTriggerError::Unknown(message)) => {
                     // A timeout or a server error: the request may have
-                    // reached the source. Treat it as sent, whatever one more
-                    // read shows, and keep waiting for a sync to start.
-                    let syncing = syncing_after_unknown(adapter, schema_prefix, &t.id).await;
+                    // reached the source. Treat it as sent and keep waiting
+                    // for a sync to start. The request went out after the idle
+                    // read, so a sync may have ended in between (a scheduled
+                    // one, during backoff): move the baseline and `t_pre` to
+                    // one more read so that sync is not counted.
                     t.detail = Some(format!(
                         "{message}; the request may have been sent and a sync may still start"
                     ));
-                    Some((syncing, identity))
+                    match read_after_unknown(adapter, schema_prefix, &t.id).await {
+                        Some(state) => Some((
+                            state.syncing,
+                            Identity {
+                                t_pre: idle_seen_at(&state).max(identity.t_pre),
+                                base_succeeded: state.succeeded_at,
+                                base_failed: state.failed_at,
+                            },
+                        )),
+                        // Without that read nothing can tell Rocky's sync
+                        // from one that ended before it: stop here. The row
+                        // stays `triggered`, so the run does not read.
+                        None => {
+                            t.triggered = true;
+                            on_trigger(&SourceSyncTriggered {
+                                id: t.id.clone(),
+                                schema: t.schema.clone(),
+                                idle_seen_at: identity.t_pre,
+                            });
+                            t.detail = Some(format!(
+                                "{message}; the request may have been sent and the connector \
+                                 could not be read again"
+                            ));
+                            t.finish(SourceSyncOutcome::Unknown, waited);
+                            continue;
+                        }
+                    }
                 }
-                // The connector is busy: wait it out, do not count that sync.
+                // The connector is busy: wait it out, do not count that sync,
+                // and ask once more. A second busy answer ends the connector.
                 Err(SourceSyncTriggerError::Conflict(message)) => {
+                    t.conflicts += 1;
+                    if t.conflicts >= 2 {
+                        t.detail = Some(format!(
+                            "{message}; busy answer {} times, no sync started",
+                            t.conflicts
+                        ));
+                        t.finish(SourceSyncOutcome::TriggerFailed, waited);
+                        continue;
+                    }
                     t.detail = Some(format!(
                         "{message}; the connector is treated as syncing and is waited for"
                     ));
@@ -1523,6 +1565,54 @@ mod tests {
         assert!(report.syncs[0].triggered);
         assert_eq!(report.syncs[0].detail, None);
         assert_eq!(a.requests().len(), 1);
+    }
+
+    /// After an unknown answer, a sync that ended between the idle read and
+    /// the request (a scheduled one, during backoff) must not count as
+    /// Rocky's: the re-read moves the baseline and `t_pre`.
+    #[tokio::test]
+    async fn a_sync_that_ended_before_an_unknown_answer_is_not_counted() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            // The re-read after the 504: a scheduled sync ended at 60.
+            vec![seen("a", false, at(60), None, 70)],
+        ])
+        .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown(
+            "HTTP 504".into(),
+        ))]);
+        let report = trigger_run(&a, 200).await;
+        assert_ne!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(report.syncs[0].triggered);
+    }
+
+    /// After an unknown answer, a re-read that cannot find the connector ends
+    /// it as `unknown` at once, still marked as triggered.
+    #[tokio::test]
+    async fn an_unknown_answer_with_no_re_read_ends_unknown() {
+        let a = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)], vec![]])
+            .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown(
+                "HTTP 502".into(),
+            ))]);
+        let report = trigger_run(&a, 60_000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Unknown);
+        assert!(report.syncs[0].triggered);
+        assert_eq!(a.requests().len(), 1);
+    }
+
+    /// A second busy answer ends the connector: no request on every poll.
+    #[tokio::test]
+    async fn a_second_busy_answer_ends_the_connector() {
+        let a = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)]])
+            .with_trigger_results(vec![
+                Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+                Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+                Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            ]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert!(!report.syncs[0].triggered);
+        assert_eq!(a.requests().len(), 2);
     }
 
     /// A timestamp that moved but is not past `T_pre` plus the margin, with no
