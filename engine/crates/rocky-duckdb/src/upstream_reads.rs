@@ -225,8 +225,15 @@ impl DuckDbConnector {
             self.execute_statement(sql)?;
             return Ok(None);
         }
-        // Turn off any profiling a failed earlier statement left on.
+        // Turn off any profiling a failed earlier statement left on. If that
+        // still fails (the transaction is still aborted), profiling writes to
+        // the reserved file: run unmeasured so that file is never replaced.
         self.ensure_profiling_off();
+        if self.profile_file.borrow().is_some() {
+            debug!("profiling is still on from an earlier statement; upstream reads not measured");
+            self.execute_statement(sql)?;
+            return Ok(None);
+        }
         // DuckDB picks the profile format from the file extension.
         let file = match tempfile::Builder::new().suffix(".json").tempfile() {
             Ok(file) => file,
@@ -490,5 +497,39 @@ mod tests {
         );
         assert!(db.profile_file.borrow().is_none());
         assert!(!path.exists(), "the profile file must not linger");
+    }
+
+    /// A second measured statement in the same aborted transaction must not
+    /// replace the reserved profile file: profiling still writes to it.
+    #[test]
+    fn a_second_measured_statement_in_an_aborted_transaction_keeps_the_reserved_file() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        db.execute_statement("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+            .unwrap();
+        db.execute_statement("BEGIN").unwrap();
+        db.execute_statement_with_upstream_reads("INSERT INTO t SELECT 1 FROM range(2)")
+            .unwrap_err();
+        let path = db
+            .profile_file
+            .borrow()
+            .as_ref()
+            .expect("profiling stays flagged after a rejected disable")
+            .path()
+            .to_path_buf();
+        db.execute_statement_with_upstream_reads("INSERT INTO t SELECT 5")
+            .unwrap_err();
+        let kept = db
+            .profile_file
+            .borrow()
+            .as_ref()
+            .expect("still flagged")
+            .path()
+            .to_path_buf();
+        assert_eq!(kept, path, "the reserved file must not be replaced");
+        assert!(path.exists(), "the reserved file must not be deleted");
+        db.execute_statement("ROLLBACK").unwrap();
+        db.execute_statement("SELECT 1").unwrap();
+        assert!(db.profile_file.borrow().is_none());
+        assert!(!path.exists());
     }
 }
