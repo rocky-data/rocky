@@ -96,6 +96,10 @@ name = "state_sync_cross_pod"
 required-features = ["test-support"]
 
 [[test]]
+name = "connector_lock_cross_pod"
+required-features = ["test-support"]
+
+[[test]]
 name = "state_sync_live_store"
 required-features = ["test-support"]
 

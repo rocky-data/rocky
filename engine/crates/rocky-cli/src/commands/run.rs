@@ -2155,7 +2155,7 @@ async fn sweep_idempotency_best_effort(
     let Some(store) = state_store else {
         return;
     };
-    match store.idempotency_sweep_expired(Utc::now(), config.in_flight_ttl_hours) {
+    match store.idempotency_sweep_expired(Utc::now()) {
         Ok(count) if count > 0 => {
             info!(
                 swept_count = count,

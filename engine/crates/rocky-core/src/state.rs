@@ -6456,22 +6456,22 @@ impl StateStore {
 
     /// Sweep expired idempotency entries.
     ///
-    /// Removes:
-    /// - Entries whose `expires_at < now` (retention exhausted).
-    /// - Entries still in `InFlight` whose `stamped_at + in_flight_ttl_hours`
-    ///   is in the past (crashed-pod corpses missed by the `AdoptStale`
-    ///   reader path — e.g. a claim whose run crashed and no follow-up run
-    ///   ever tried the same key).
+    /// Removes every entry whose own `expires_at < now`. For a `Succeeded` or
+    /// `Failed` entry that is the retention end. For an `InFlight` claim it
+    /// is the expiry set when the run claimed the key (`in_flight_ttl_hours`
+    /// of THAT run), so a claim taken under a longer TTL is kept after the
+    /// config TTL is lowered. This catches crashed-pod corpses that no
+    /// follow-up run ever adopted.
+    ///
+    /// A row that does not parse is skipped with a warning, so one corrupt
+    /// row cannot stop the sweep of the others.
     ///
     /// Returns the count removed.
     pub fn idempotency_sweep_expired(
         &self,
         now: chrono::DateTime<chrono::Utc>,
-        in_flight_ttl_hours: u32,
     ) -> Result<usize, StateError> {
-        use crate::idempotency::{IdempotencyEntry, IdempotencyState};
-
-        let in_flight_cutoff = now - chrono::Duration::hours(in_flight_ttl_hours as i64);
+        use crate::idempotency::IdempotencyEntry;
 
         // Phase 1: collect keys to drop (can't mutate during iter).
         let to_drop: Vec<String> = {
@@ -6480,14 +6480,18 @@ impl StateStore {
             let mut drop = Vec::new();
             for entry in table.iter()? {
                 let (key, value) = entry?;
-                let parsed: IdempotencyEntry = serde_json::from_slice(value.value())?;
-                let stale = match parsed.state {
-                    IdempotencyState::InFlight => parsed.stamped_at < in_flight_cutoff,
-                    IdempotencyState::Succeeded | IdempotencyState::Failed => {
-                        parsed.expires_at < now
+                let parsed: IdempotencyEntry = match serde_json::from_slice(value.value()) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %key.value(),
+                            error = %e,
+                            "skipping an unreadable idempotency row in the sweep"
+                        );
+                        continue;
                     }
                 };
-                if stale {
+                if parsed.expires_at < now {
                     drop.push(key.value().to_string());
                 }
             }
@@ -16328,11 +16332,58 @@ mod tests {
         store.idempotency_put(&expired).unwrap();
         store.idempotency_put(&corpse).unwrap();
 
-        let removed = store.idempotency_sweep_expired(now, 24).unwrap();
+        let removed = store.idempotency_sweep_expired(now).unwrap();
         assert_eq!(removed, 2);
         assert!(store.idempotency_get("fresh").unwrap().is_some());
         assert!(store.idempotency_get("expired").unwrap().is_none());
         assert!(store.idempotency_get("corpse").unwrap().is_none());
+    }
+
+    /// A claim is judged by its own `expires_at`, whatever the config says
+    /// now: a 30 h claim stamped 25 h ago is live.
+    #[test]
+    fn idempotency_sweep_keeps_an_in_flight_claim_whose_own_expiry_is_ahead() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let long_claim = crate::idempotency::IdempotencyEntry {
+            key: "long".into(),
+            run_id: "r-long".into(),
+            state: crate::idempotency::IdempotencyState::InFlight,
+            stamped_at: now - chrono::Duration::hours(25),
+            expires_at: now + chrono::Duration::hours(5),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        store.idempotency_put(&long_claim).unwrap();
+        assert_eq!(store.idempotency_sweep_expired(now).unwrap(), 0);
+        assert!(store.idempotency_get("long").unwrap().is_some());
+        // Past its own expiry it goes.
+        let later = now + chrono::Duration::hours(6);
+        assert_eq!(store.idempotency_sweep_expired(later).unwrap(), 1);
+    }
+
+    /// One unreadable row must not stop the sweep of the others.
+    #[test]
+    fn idempotency_sweep_skips_a_corrupt_row() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let expired = crate::idempotency::IdempotencyEntry {
+            key: "expired".into(),
+            run_id: "r".into(),
+            state: crate::idempotency::IdempotencyState::Succeeded,
+            stamped_at: now - chrono::Duration::days(60),
+            expires_at: now - chrono::Duration::days(30),
+            dedup_on: crate::config::DedupPolicy::Success,
+        };
+        store.idempotency_put(&expired).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(IDEMPOTENCY_KEYS).unwrap();
+            table.insert("a-corrupt", b"not json".as_slice()).unwrap();
+        }
+        store.commit_write(txn).unwrap();
+
+        assert_eq!(store.idempotency_sweep_expired(now).unwrap(), 1);
+        assert!(store.idempotency_get("expired").unwrap().is_none());
     }
 
     #[test]

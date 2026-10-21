@@ -328,6 +328,29 @@ impl ObjectStoreProvider {
         Ok(bytes)
     }
 
+    /// Read an object's bytes together with its [`Generation`], from ONE read.
+    ///
+    /// The version comes from the same GET that returned the bytes, never a
+    /// separate HEAD, so a writer that presents it to
+    /// [`put_if_match`](Self::put_if_match) CAS-es against exactly the bytes it
+    /// read. The generation is `None` when the backend surfaces no version
+    /// metadata; such a caller cannot compare-and-swap.
+    pub async fn get_with_generation(
+        &self,
+        relative_path: &str,
+    ) -> ObjectStoreResult<(Bytes, Option<Generation>)> {
+        let path = self.absolute_path(relative_path);
+        debug!(path = %path, "object_store get_with_generation");
+        let result = self.store.get(&path).await?;
+        let generation =
+            (result.meta.e_tag.is_some() || result.meta.version.is_some()).then(|| Generation {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            });
+        let bytes = result.bytes().await?;
+        Ok((bytes, generation))
+    }
+
     /// Write bytes to an object in the store, replacing any existing content.
     pub async fn put(&self, relative_path: &str, data: Bytes) -> ObjectStoreResult<()> {
         let path = self.absolute_path(relative_path);

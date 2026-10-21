@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each materialization gains an optional `volume` (`VolumeCheckOutput`). Each `ModelExecution` gains an optional `row_count`, separate from `rows_affected` (rows written). The state schema stays at v33.
   - `rocky product status` gains an optional `volume`: the range, the newest production count, and its verdict against the range.
 
+### Fixed
+
+- Two `rocky run --idempotency-key` runs could both take over the same expired claim when `[state] backend` is `s3` or `gcs`, so the key no longer stopped a double run (#2458). Taking over a stale claim, finishing a run and the expired-claim sweep are now conditional writes on the object's version. Exactly one of two runs that take over at once proceeds. A slow run whose claim was already taken over can no longer overwrite the new owner's claim. The sweep skips a claim that changed after it read it. The object store has no conditional delete, so a short window remains between the sweep's last read and its delete.
+- A stale in-flight idempotency claim is now judged by its own expiry, set when it was claimed. Before, the local sweep used the current `in_flight_ttl_hours`, so lowering it could remove a live claim taken under the old value. A claim made under a longer TTL now lasts its full time. Rows the sweep cannot read are skipped with a warning and no longer stop it.
+- Valkey and tiered backends were not affected by the double take-over: their take-over is already a single atomic `SET NX`.
+
+### Changed
+
+- `rocky-adapter-sdk` gains `child::apply_rlimits` and `RlimitPlan` to cap a child process's CPU time, address space and output file size, and moves its child-process helpers into `rocky_adapter_sdk::child`. Nothing in Rocky calls `apply_rlimits` yet.
+- `IdempotencyBackend` gains `check_and_claim_at`, `finalize_at` and `sweep_expired_at`, which take an explicit clock. `sweep_expired` no longer takes a config, and `StateStore::idempotency_sweep_expired` no longer takes `in_flight_ttl_hours`. `in_flight_stale_after` is removed.
+
 ## [1.88.0] — 2026-10-21
 
 ### Upgrade notes

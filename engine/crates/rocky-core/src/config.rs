@@ -1073,7 +1073,8 @@ pub struct IdempotencyConfig {
     /// corpse and adopted by a fresh caller. Default 24. Applies only to
     /// backends whose in-flight lock does not carry a server-side TTL —
     /// Valkey providers set `EX` directly on `SET NX`, so this field is
-    /// informational for them.
+    /// informational for them. Read when a run claims the key and stamped
+    /// on that claim: changing it later does not change a claim already made.
     #[serde(default = "default_idempotency_in_flight_ttl_hours")]
     pub in_flight_ttl_hours: u32,
 }

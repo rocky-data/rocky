@@ -43,12 +43,22 @@
 //! Expired stamps are swept during [`crate::state_sync::upload_state`] —
 //! reuses the existing post-run cadence, no new cron. For Valkey backends
 //! server-side `EX` handles TTL autonomously and `sweep_expired` is a
-//! no-op. For local, the sweep deletes entries whose `expires_at` has
-//! passed OR whose `state = InFlight` has aged past
-//! `in_flight_ttl_hours` (crashed-pod reaping).
+//! no-op. For local and object-store backends, the sweep deletes entries whose
+//! own `expires_at` has passed. An `InFlight` claim carries the `expires_at`
+//! set when it was claimed (`claim time + in_flight_ttl_hours` of that run), so
+//! lowering `in_flight_ttl_hours` later never makes a sweep remove a live claim.
+//!
+//! # Object-store writes are conditional
+//!
+//! On `s3` / `gcs` a take-over of a stale claim is `put_if_match` on the ETag
+//! (generation) read together with the claim, so exactly one of two concurrent
+//! adopters wins and the loser re-reads and re-classifies. Finalize is
+//! `put_if_match` on the claim this run owns, and refuses a claim another run
+//! holds. The sweep re-reads a claim right before deleting it and skips it if
+//! it changed. The object-store API has no conditional delete, so a window
+//! remains between that last read and the delete call.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -57,7 +67,9 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::config::{DedupPolicy, IdempotencyConfig, StateBackend, StateConfig};
-use crate::object_store::{ObjectStoreError, ObjectStoreProvider, PutIfNotExistsOutcome};
+use crate::object_store::{
+    Generation, ObjectStoreError, ObjectStoreProvider, PutIfMatchOutcome, PutIfNotExistsOutcome,
+};
 use crate::state::{StateError, StateStore};
 
 /// Default Valkey key prefix for idempotency entries (shares the top-level
@@ -331,7 +343,20 @@ impl IdempotencyBackend {
         run_id: &str,
         config: &IdempotencyConfig,
     ) -> Result<IdempotencyCheck, IdempotencyError> {
-        let now = Utc::now();
+        self.check_and_claim_at(state_store, key, run_id, config, Utc::now())
+            .await
+    }
+
+    /// [`check_and_claim`](Self::check_and_claim) with an explicit `now`, so a
+    /// test can inject the clock. The claim's `stamped_at` is `now`.
+    pub async fn check_and_claim_at(
+        &self,
+        state_store: Option<&StateStore>,
+        key: &str,
+        run_id: &str,
+        config: &IdempotencyConfig,
+        now: DateTime<Utc>,
+    ) -> Result<IdempotencyCheck, IdempotencyError> {
         let entry = IdempotencyEntry {
             key: key.to_string(),
             run_id: run_id.to_string(),
@@ -356,7 +381,7 @@ impl IdempotencyBackend {
                 prefix,
                 mirror_to_redb,
             } => {
-                let result = valkey_check_and_claim(url, prefix, &entry).await?;
+                let result = valkey_check_and_claim(url, prefix, &entry, now).await?;
                 if let (true, IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. }) =
                     (*mirror_to_redb, &result)
                     && let Some(store) = state_store
@@ -376,7 +401,8 @@ impl IdempotencyBackend {
                 Ok(result)
             }
             IdempotencyBackend::ObjectStore { uri, .. } => {
-                object_store_check_and_claim(uri, &entry).await
+                let provider = provider_for_uri(uri)?;
+                object_store_check_and_claim(&provider, &entry, now).await
             }
         }
     }
@@ -391,7 +417,20 @@ impl IdempotencyBackend {
         outcome: FinalOutcome,
         config: &IdempotencyConfig,
     ) -> Result<(), IdempotencyError> {
-        let now = Utc::now();
+        self.finalize_at(state_store, key, run_id, outcome, config, Utc::now())
+            .await
+    }
+
+    /// [`finalize`](Self::finalize) with an explicit `now`.
+    pub async fn finalize_at(
+        &self,
+        state_store: Option<&StateStore>,
+        key: &str,
+        run_id: &str,
+        outcome: FinalOutcome,
+        config: &IdempotencyConfig,
+        now: DateTime<Utc>,
+    ) -> Result<(), IdempotencyError> {
         let retention_until = now + chrono::Duration::days(config.retention_days as i64);
         match self {
             IdempotencyBackend::Local => {
@@ -409,7 +448,17 @@ impl IdempotencyBackend {
                 prefix,
                 mirror_to_redb,
             } => {
-                valkey_finalize(url, prefix, key, run_id, outcome, retention_until, config).await?;
+                valkey_finalize(
+                    url,
+                    prefix,
+                    key,
+                    run_id,
+                    outcome,
+                    retention_until,
+                    config,
+                    now,
+                )
+                .await?;
                 if *mirror_to_redb && let Some(store) = state_store {
                     // Mirror finalized state into local redb best-effort; see
                     // claim path for the race reasoning.
@@ -445,49 +494,65 @@ impl IdempotencyBackend {
                 Ok(())
             }
             IdempotencyBackend::ObjectStore { uri, .. } => {
-                object_store_finalize(uri, key, run_id, outcome, retention_until, config).await
+                let provider = provider_for_uri(uri)?;
+                object_store_finalize(
+                    &provider,
+                    key,
+                    run_id,
+                    outcome,
+                    retention_until,
+                    config,
+                    now,
+                )
+                .await
             }
         }
     }
 
     /// Sweep expired entries.
     ///
-    /// - Local: iterates the redb table and removes entries whose
-    ///   `expires_at < now`, plus any `InFlight` entries whose
-    ///   `stamped_at + in_flight_ttl_hours < now`.
-    /// - Valkey: no-op (server-side `EX` handles TTL).
-    /// - Unsupported: no-op (nothing stored yet).
+    /// - Local: iterates the redb table and removes entries whose own
+    ///   `expires_at < now`. An `InFlight` claim's `expires_at` was set when it
+    ///   was claimed, so the current `in_flight_ttl_hours` plays no part.
+    /// - Valkey: no-op (server-side `EX` handles TTL); Tiered sweeps the
+    ///   local mirror.
+    /// - Object store: lists, re-reads, and deletes expired claims; see the
+    ///   module docs for the residual window.
     ///
     /// Returns the number of entries swept.
     pub async fn sweep_expired(
         &self,
         state_store: Option<&StateStore>,
-        config: &IdempotencyConfig,
+    ) -> Result<usize, IdempotencyError> {
+        self.sweep_expired_at(state_store, Utc::now()).await
+    }
+
+    /// [`sweep_expired`](Self::sweep_expired) with an explicit `now`.
+    pub async fn sweep_expired_at(
+        &self,
+        state_store: Option<&StateStore>,
+        now: DateTime<Utc>,
     ) -> Result<usize, IdempotencyError> {
         match self {
             IdempotencyBackend::Local => match state_store {
-                Some(store) => {
-                    Ok(store.idempotency_sweep_expired(Utc::now(), config.in_flight_ttl_hours)?)
-                }
+                Some(store) => Ok(store.idempotency_sweep_expired(now)?),
                 None => Ok(0),
             },
             IdempotencyBackend::Valkey { mirror_to_redb, .. } => {
                 if *mirror_to_redb && let Some(store) = state_store {
                     // Tiered: sweep the local mirror too (Valkey handles its own).
-                    Ok(store.idempotency_sweep_expired(Utc::now(), config.in_flight_ttl_hours)?)
+                    Ok(store.idempotency_sweep_expired(now)?)
                 } else {
                     Ok(0)
                 }
             }
             IdempotencyBackend::ObjectStore { uri, .. } => {
                 // The recommended GC path for S3/GCS is a bucket lifecycle
-                // rule (Rocky writes objects with a path prefix operators
-                // target via `Lifecycle` / `bucket.lifecycle` policies). For
-                // operators who can't configure that, we also offer an
-                // active sweep: list → parse → delete-if-expired. Best-
-                // effort and non-authoritative — the bucket-lifecycle path
-                // is the durable one.
-                object_store_sweep_expired(uri, config).await
+                // rule. For operators who can't configure that, this is an
+                // active sweep: list, parse, re-check, delete-if-expired.
+                // Best-effort and non-authoritative.
+                let provider = provider_for_uri(uri)?;
+                object_store_sweep_expired(&provider, now).await
             }
         }
     }
@@ -510,6 +575,7 @@ async fn valkey_check_and_claim(
     url: &str,
     prefix: &str,
     entry: &IdempotencyEntry,
+    now: DateTime<Utc>,
 ) -> Result<IdempotencyCheck, IdempotencyError> {
     if url.is_empty() {
         return Err(IdempotencyError::Config(
@@ -597,7 +663,7 @@ async fn valkey_check_and_claim(
             debug!(key = %full_key, "claimed idempotency key via SET NX EX");
             Ok(IdempotencyCheck::Proceed)
         }
-        ValkeyClaimOutcome::Existing(prior) => Ok(classify_existing(prior, Utc::now(), entry)),
+        ValkeyClaimOutcome::Existing(prior) => Ok(classify_existing(prior, now, entry)),
     }
 }
 
@@ -609,6 +675,7 @@ async fn valkey_finalize(
     outcome: FinalOutcome,
     retention_until: DateTime<Utc>,
     config: &IdempotencyConfig,
+    now: DateTime<Utc>,
 ) -> Result<(), IdempotencyError> {
     if url.is_empty() {
         return Ok(());
@@ -626,7 +693,7 @@ async fn valkey_finalize(
     let user_key = key.to_string();
     let dedup_on = config.dedup_on;
     let ttl_secs = retention_until
-        .signed_duration_since(Utc::now())
+        .signed_duration_since(now)
         .num_seconds()
         .max(1) as u64;
 
@@ -645,7 +712,7 @@ async fn valkey_finalize(
                     FinalOutcome::Succeeded => IdempotencyState::Succeeded,
                     FinalOutcome::Failed => IdempotencyState::Failed,
                 },
-                stamped_at: Utc::now(),
+                stamped_at: now,
                 expires_at: retention_until,
                 dedup_on,
             };
@@ -692,72 +759,151 @@ fn object_store_relative_path(key: &str) -> String {
         .to_string()
 }
 
+/// How many times a conditional write is retried after losing a race, before
+/// the call gives up with an error. Each retry re-reads and re-classifies.
+const MAX_CONDITIONAL_ATTEMPTS: usize = 5;
+
+/// Build the provider for an object-store idempotency URI.
+///
+/// Test seam: under the `test-support` feature (or in this crate's own tests)
+/// an installed provider override wins, so tests run the real claim, finalize
+/// and sweep code over an in-memory store. The `rocky` binary never enables
+/// the feature.
+fn provider_for_uri(uri: &str) -> Result<ObjectStoreProvider, IdempotencyError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(provider) = crate::state_sync::test_provider_override() {
+        return Ok(provider);
+    }
+    Ok(ObjectStoreProvider::from_uri(uri)?)
+}
+
+/// A claim object as read from the store: its body, version and parse.
+///
+/// `entry` is `None` when the body is not a valid [`IdempotencyEntry`].
+#[derive(Debug, Clone)]
+pub struct ObservedClaim {
+    path: String,
+    body: Bytes,
+    generation: Option<Generation>,
+    entry: Option<IdempotencyEntry>,
+}
+
+/// The object was deleted between a listing and a read.
+fn is_gone(e: &ObjectStoreError) -> bool {
+    matches!(
+        e,
+        ObjectStoreError::Backend(object_store::Error::NotFound { .. })
+    )
+}
+
+/// Read the claim at `rel_path` with its version, from one read. `None` when
+/// the object does not exist.
+async fn observe_claim_at_path(
+    provider: &ObjectStoreProvider,
+    rel_path: &str,
+) -> Result<Option<ObservedClaim>, IdempotencyError> {
+    let (body, generation) = match provider.get_with_generation(rel_path).await {
+        Ok(read) => read,
+        Err(e) if is_gone(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let entry = serde_json::from_slice(&body).ok();
+    Ok(Some(ObservedClaim {
+        path: rel_path.to_string(),
+        body,
+        generation,
+        entry,
+    }))
+}
+
+/// A backend that reports no ETag or generation cannot compare-and-swap. Fail
+/// rather than fall back to a blind write, which is the race this code closes.
+fn require_generation(observed: &ObservedClaim) -> Result<&Generation, IdempotencyError> {
+    observed.generation.as_ref().ok_or_else(|| {
+        IdempotencyError::Config(format!(
+            "the object store returned no ETag or generation for `{}`, so the idempotency \
+             claim cannot be updated with a conditional write",
+            observed.path
+        ))
+    })
+}
+
+fn contended(path: &str) -> IdempotencyError {
+    IdempotencyError::Config(format!(
+        "idempotency claim `{path}` kept changing under concurrent writers; \
+         gave up after {MAX_CONDITIONAL_ATTEMPTS} attempts"
+    ))
+}
+
 async fn object_store_check_and_claim(
-    uri: &str,
+    provider: &ObjectStoreProvider,
     entry: &IdempotencyEntry,
+    now: DateTime<Utc>,
 ) -> Result<IdempotencyCheck, IdempotencyError> {
-    let provider = ObjectStoreProvider::from_uri(uri)?;
     let rel_path = object_store_relative_path(&entry.key);
-    let encoded = serde_json::to_vec(entry)?;
+    let encoded = Bytes::from(serde_json::to_vec(entry)?);
 
-    let outcome = provider
-        .put_if_not_exists(&rel_path, Bytes::from(encoded))
-        .await?;
-
-    match outcome {
-        PutIfNotExistsOutcome::Created => {
-            debug!(path = %rel_path, "claimed idempotency key via conditional PUT");
-            Ok(IdempotencyCheck::Proceed)
-        }
-        PutIfNotExistsOutcome::AlreadyExists => {
-            // Read the existing object to classify.
-            let body = provider.get(&rel_path).await?;
-            let prior: IdempotencyEntry = match serde_json::from_slice(&body) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        path = %rel_path,
-                        "idempotency entry is not deserializable — treating as stale and overwriting"
-                    );
-                    // Overwrite the corrupt object with a fresh InFlight claim.
-                    // Use plain put (not conditional) since we've already lost
-                    // the race atomicity once — best-effort recovery.
-                    let bytes = serde_json::to_vec(entry)?;
-                    provider.put(&rel_path, Bytes::from(bytes)).await?;
-                    return Ok(IdempotencyCheck::AdoptStale {
-                        prior_run_id: "<corrupt>".to_string(),
-                    });
-                }
-            };
-            let verdict = classify_existing(prior, Utc::now(), entry);
-            match &verdict {
-                IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. } => {
-                    // Stale / adoptable prior — overwrite with our InFlight.
-                    // Small race: another claimer might also have adopted. The
-                    // last-writer-wins overwrite is acceptable because either
-                    // claimant ultimately finalizes and the entry becomes
-                    // Succeeded regardless. For dedup-on-success+Failed
-                    // entries the sweep removes stale entries entirely.
-                    let bytes = serde_json::to_vec(entry)?;
-                    provider.put(&rel_path, Bytes::from(bytes)).await?;
-                }
-                IdempotencyCheck::SkipCompleted { .. } | IdempotencyCheck::SkipInFlight { .. } => {}
+    for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
+        match provider
+            .put_if_not_exists(&rel_path, encoded.clone())
+            .await?
+        {
+            PutIfNotExistsOutcome::Created => {
+                debug!(path = %rel_path, "claimed idempotency key via conditional PUT");
+                return Ok(IdempotencyCheck::Proceed);
             }
-            Ok(verdict)
+            PutIfNotExistsOutcome::AlreadyExists => {}
+        }
+
+        // Read the existing claim and its version in one call.
+        let Some(observed) = observe_claim_at_path(provider, &rel_path).await? else {
+            // Deleted between the failed create and the read: create again.
+            continue;
+        };
+        let verdict = match observed.entry.clone() {
+            Some(prior) => classify_existing(prior, now, entry),
+            None => {
+                warn!(
+                    path = %rel_path,
+                    "idempotency entry is not deserializable; treating it as stale"
+                );
+                IdempotencyCheck::AdoptStale {
+                    prior_run_id: "<corrupt>".to_string(),
+                }
+            }
+        };
+        match &verdict {
+            IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. } => {
+                // Take over only if the object is still the one we read. When
+                // two runs adopt at once, exactly one write commits; the
+                // other sees a conflict, re-reads the winner's fresh claim and
+                // skips as in-flight.
+                let generation = require_generation(&observed)?;
+                match provider
+                    .put_if_match(&rel_path, encoded.clone(), Some(generation))
+                    .await?
+                {
+                    PutIfMatchOutcome::Committed(_) => return Ok(verdict),
+                    PutIfMatchOutcome::Conflict => continue,
+                }
+            }
+            IdempotencyCheck::SkipCompleted { .. } | IdempotencyCheck::SkipInFlight { .. } => {
+                return Ok(verdict);
+            }
         }
     }
+    Err(contended(&rel_path))
 }
 
 async fn object_store_finalize(
-    uri: &str,
+    provider: &ObjectStoreProvider,
     key: &str,
     run_id: &str,
     outcome: FinalOutcome,
     retention_until: DateTime<Utc>,
     config: &IdempotencyConfig,
+    now: DateTime<Utc>,
 ) -> Result<(), IdempotencyError> {
-    let provider = ObjectStoreProvider::from_uri(uri)?;
     let rel_path = object_store_relative_path(key);
 
     let should_keep = match (outcome, config.dedup_on) {
@@ -765,25 +911,63 @@ async fn object_store_finalize(
         (FinalOutcome::Failed, DedupPolicy::Any) => true,
         (FinalOutcome::Failed, DedupPolicy::Success) => false,
     };
+    let updated = IdempotencyEntry {
+        key: key.to_string(),
+        run_id: run_id.to_string(),
+        state: match outcome {
+            FinalOutcome::Succeeded => IdempotencyState::Succeeded,
+            FinalOutcome::Failed => IdempotencyState::Failed,
+        },
+        stamped_at: now,
+        expires_at: retention_until,
+        dedup_on: config.dedup_on,
+    };
+    let encoded = Bytes::from(serde_json::to_vec(&updated)?);
 
-    if should_keep {
-        let updated = IdempotencyEntry {
-            key: key.to_string(),
-            run_id: run_id.to_string(),
-            state: match outcome {
-                FinalOutcome::Succeeded => IdempotencyState::Succeeded,
-                FinalOutcome::Failed => IdempotencyState::Failed,
-            },
-            stamped_at: Utc::now(),
-            expires_at: retention_until,
-            dedup_on: config.dedup_on,
+    for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
+        let Some(observed) = observe_claim_at_path(provider, &rel_path).await? else {
+            // The claim is gone (swept after it expired). Record the outcome
+            // only if nobody has claimed the key since.
+            if !should_keep {
+                return Ok(());
+            }
+            match provider
+                .put_if_match(&rel_path, encoded.clone(), None)
+                .await?
+            {
+                PutIfMatchOutcome::Committed(_) => return Ok(()),
+                PutIfMatchOutcome::Conflict => continue,
+            }
         };
-        let bytes = serde_json::to_vec(&updated)?;
-        provider.put(&rel_path, Bytes::from(bytes)).await?;
-    } else {
-        // Dedup-on-success + failure: delete the InFlight so retries can
-        // claim the key freshly. Tolerate already-absent (e.g. the sweep
-        // cleaned up while we were running).
+        let owned = observed
+            .entry
+            .as_ref()
+            .is_some_and(|prior| prior.run_id == run_id);
+        if !owned {
+            // Another run took over (or the object is unreadable). Leave it:
+            // overwriting would erase the new owner's claim.
+            warn!(
+                path = %rel_path,
+                run_id = %run_id,
+                "idempotency claim is held by another run; not finalizing it"
+            );
+            return Ok(());
+        }
+        if should_keep {
+            let generation = require_generation(&observed)?;
+            match provider
+                .put_if_match(&rel_path, encoded.clone(), Some(generation))
+                .await?
+            {
+                PutIfMatchOutcome::Committed(_) => return Ok(()),
+                PutIfMatchOutcome::Conflict => continue,
+            }
+        }
+        // Dedup-on-success + failure: delete our InFlight claim so retries can
+        // claim the key freshly. The object-store API has no conditional
+        // delete, so a take-over between the read above and this delete is
+        // not caught: that needs our claim to have expired first. Tolerate
+        // already-absent (the sweep may have cleaned up while we ran).
         if let Err(e) = provider.delete(&rel_path).await {
             debug!(
                 error = %e,
@@ -791,18 +975,18 @@ async fn object_store_finalize(
                 "idempotency finalize delete failed — entry may have been swept already"
             );
         }
+        return Ok(());
     }
-    Ok(())
+    Err(contended(&rel_path))
 }
 
 async fn object_store_sweep_expired(
-    uri: &str,
-    _config: &IdempotencyConfig,
+    provider: &ObjectStoreProvider,
+    now: DateTime<Utc>,
 ) -> Result<usize, IdempotencyError> {
-    // Active sweep for object-store backends: list `idempotency/*`, parse
-    // each object, delete any past `expires_at`. Intentionally conservative
-    // — errors are warn-swallowed so a flaky bucket doesn't fail the run.
-    let provider = ObjectStoreProvider::from_uri(uri)?;
+    // Active sweep for object-store backends: list `idempotency/*`, read each
+    // claim, delete any past its own `expires_at`. Errors are warn-swallowed
+    // so a flaky bucket doesn't fail the run.
     let paths = match provider.list("idempotency").await {
         Ok(p) => p,
         Err(e) => {
@@ -810,31 +994,78 @@ async fn object_store_sweep_expired(
             return Ok(0);
         }
     };
-    let now = Utc::now();
     let mut removed = 0;
     for path in paths {
-        let Some(rel) = path.strip_prefix("idempotency/").or(Some(&path)) else {
+        let rel_path = format!("idempotency/{}", path.trim_start_matches("idempotency/"));
+        let Ok(Some(observed)) = observe_claim_at_path(provider, &rel_path).await else {
             continue;
         };
-        // Read the object body so we can inspect `expires_at`. Skipping a
-        // HEAD-based shortcut because the object-store crate's metadata API
-        // doesn't surface custom timestamps.
-        let rel_path = format!("idempotency/{}", rel.trim_start_matches("idempotency/"));
-        let body = match provider.get(&rel_path).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let parsed: IdempotencyEntry = match serde_json::from_slice(&body) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if parsed.expires_at < now
-            && let Ok(()) = provider.delete(&rel_path).await
-        {
+        if let Ok(true) = sweep_observed_claim(provider, &observed, now).await {
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// Delete `observed` if it is expired and is still the object in the store.
+///
+/// Re-reads the claim immediately before the delete and skips it when its
+/// version or body changed (a run took it over after `observed` was read) or
+/// it is no longer expired. The object-store API has no conditional delete,
+/// so a take-over between that re-read and the delete call can still be
+/// removed. The window is one round trip, and the removed claim belongs to a
+/// run that read an expired claim: the same state `AdoptStale` handles.
+async fn sweep_observed_claim(
+    provider: &ObjectStoreProvider,
+    observed: &ObservedClaim,
+    now: DateTime<Utc>,
+) -> Result<bool, IdempotencyError> {
+    let expired = |claim: &ObservedClaim| {
+        claim
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.expires_at < now)
+    };
+    if !expired(observed) {
+        return Ok(false);
+    }
+    let Some(current) = observe_claim_at_path(provider, &observed.path).await? else {
+        return Ok(false);
+    };
+    let unchanged = match (&observed.generation, &current.generation) {
+        (Some(before), Some(after)) => before == after,
+        _ => observed.body == current.body,
+    };
+    if !unchanged || !expired(&current) {
+        return Ok(false);
+    }
+    provider.delete(&observed.path).await?;
+    Ok(true)
+}
+
+/// Seams for tests that need to interleave a sweep with another writer.
+/// Compiled only for this crate's tests or under `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing {
+    use super::*;
+
+    /// Read the claim for `key` the way the sweep does.
+    pub async fn observe_claim(
+        provider: &ObjectStoreProvider,
+        key: &str,
+    ) -> Result<Option<ObservedClaim>, IdempotencyError> {
+        observe_claim_at_path(provider, &object_store_relative_path(key)).await
+    }
+
+    /// Run the sweep's delete step on a claim read earlier. `Ok(true)` when
+    /// it deleted the object.
+    pub async fn sweep_observed(
+        provider: &ObjectStoreProvider,
+        observed: &ObservedClaim,
+        now: DateTime<Utc>,
+    ) -> Result<bool, IdempotencyError> {
+        sweep_observed_claim(provider, observed, now).await
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -914,11 +1145,6 @@ pub fn object_store_idempotency_path(key: &str) -> PathBuf {
     PathBuf::from(format!("idempotency/{hex}"))
 }
 
-/// Duration before an in-flight claim is treated as stale.
-pub fn in_flight_stale_after(config: &IdempotencyConfig) -> Duration {
-    Duration::from_secs(config.in_flight_ttl_hours as u64 * 3600)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,7 +1159,7 @@ mod tests {
         assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
         assert!(debug.contains("${RV_IDEM_DBG}"), "{debug}");
     }
-    use crate::config::{DedupPolicy, IdempotencyConfig};
+    use crate::config::DedupPolicy;
 
     fn mk_entry(
         run_id: &str,
@@ -1065,15 +1291,6 @@ mod tests {
         assert_eq!(a, b);
         let c = object_store_idempotency_path("other-key");
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn in_flight_stale_duration_matches_config() {
-        let cfg = IdempotencyConfig {
-            in_flight_ttl_hours: 6,
-            ..Default::default()
-        };
-        assert_eq!(in_flight_stale_after(&cfg), Duration::from_secs(6 * 3600));
     }
 
     #[test]

@@ -305,6 +305,14 @@ fn cloud_provider(
     Ok(ObjectStoreProvider::from_uri(&uri)?)
 }
 
+/// The test provider override (thread-local, then process-global), for other
+/// modules that build an [`ObjectStoreProvider`] from a state URI. `None`
+/// outside tests.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_provider_override() -> Option<ObjectStoreProvider> {
+    test_support::current_override().or_else(test_support::current_global_override)
+}
+
 /// Object-store handle for the **durable tier** of a remote `[state]`
 /// backend, or `None` when no durable object tier exists (`local`,
 /// `valkey`-only).
