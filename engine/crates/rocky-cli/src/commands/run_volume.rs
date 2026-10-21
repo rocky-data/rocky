@@ -687,10 +687,33 @@ mod tests {
             anyhow::Result<super::super::super::run::GovernanceSnapshot>,
             tempfile::TempDir,
         ) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, result) = run_layers(
+                tmp.path(),
+                4,
+                contain_failures,
+                "max_rows = 2\nseverity = \"error\"",
+                None,
+            )
+            .await;
+            (output, result, tmp)
+        }
+
+        /// `execute_models` over `vol`, `side` (layer 0) and `down` (reads
+        /// `vol`, layer 1), at `parallel` (1 is the serial path), with an
+        /// optional hook registry fired under pipeline `tx`.
+        async fn run_layers(
+            root: &std::path::Path,
+            parallel: usize,
+            contain_failures: bool,
+            volume: &str,
+            hooks: Option<&rocky_core::hooks::HookRegistry>,
+        ) -> (
+            crate::output::RunOutput,
+            anyhow::Result<super::super::super::run::GovernanceSnapshot>,
+        ) {
             use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-            let tmp = tempfile::TempDir::new().unwrap();
-            let root = tmp.path();
             let models_dir = root.join("models");
             std::fs::create_dir_all(&models_dir).unwrap();
             for (name, sql, toml) in [
@@ -707,19 +730,15 @@ mod tests {
                 std::fs::write(models_dir.join(format!("{name}.toml")), toml).unwrap();
             }
             std::fs::create_dir_all(root.join("products")).unwrap();
-            std::fs::write(
-                root.join("products/vol_product.toml"),
-                spec("max_rows = 2\nseverity = \"error\""),
-            )
-            .unwrap();
+            std::fs::write(root.join("products/vol_product.toml"), spec(volume)).unwrap();
             let adapter = DuckDbWarehouseAdapter::open(&root.join("w.duckdb"))
                 .expect("open duckdb")
                 .with_concurrent_for_test(true);
             let opts = PartitionRunOptions {
-                parallel: 4,
+                parallel: u32::try_from(parallel).expect("small"),
                 ..Default::default()
             };
-            let mut output = crate::output::RunOutput::new(String::new(), 0, 4);
+            let mut output = crate::output::RunOutput::new(String::new(), 0, parallel);
             let resilience = rocky_core::config::ResilienceConfig {
                 contain_failures,
                 ..Default::default()
@@ -741,8 +760,8 @@ mod tests {
                 None,
                 None,
                 &mut output,
-                None,
-                None,
+                hooks,
+                hooks.map(|_| "tx"),
                 &rocky_core::config::SchemaCacheConfig::default(),
                 false,
                 None,
@@ -760,7 +779,7 @@ mod tests {
                 false,
             )
             .await;
-            (output, result, tmp)
+            (output, result)
         }
 
         fn built(output: &crate::output::RunOutput, table: &str) -> bool {
@@ -801,6 +820,104 @@ mod tests {
             assert!(output.contained.iter().any(|c| c.model == "down"));
             assert!(built(&output, "side"), "a disjoint model still builds");
             assert!(!built(&output, "down"));
+        }
+
+        /// The models each hook event fired for, read from the JSON
+        /// context the command hooks appended (one JSON value per fire).
+        struct Fired {
+            after_model_run: Vec<String>,
+            model_error: Vec<String>,
+        }
+
+        /// Run the layers with command hooks on `on_after_model_run` and
+        /// `on_model_error` that append their stdin context to a file. A
+        /// command hook is the only way to observe a fire from here; an
+        /// empty registry would prove nothing.
+        async fn run_with_hooks(parallel: usize, volume: &str) -> Fired {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            let mut hooks_cfg = rocky_core::hooks::HooksConfig::default();
+            for event in ["on_after_model_run", "on_model_error"] {
+                let log = root.join(format!("{event}.jsonl"));
+                hooks_cfg.hooks.insert(
+                    event.to_string(),
+                    rocky_core::hooks::HookConfigOrList::Single(rocky_core::hooks::HookConfig {
+                        command: format!("cat >> '{0}'; echo >> '{0}'", log.display()),
+                        timeout_ms: 5_000,
+                        on_failure: Default::default(),
+                        env: Default::default(),
+                    }),
+                );
+            }
+            let registry = rocky_core::hooks::HookRegistry::from_config(&hooks_cfg);
+            let (_output, _result) =
+                run_layers(root, parallel, true, volume, Some(&registry)).await;
+            let models = |event: &str| -> Vec<String> {
+                let text = std::fs::read_to_string(root.join(format!("{event}.jsonl")))
+                    .unwrap_or_default();
+                serde_json::Deserializer::from_str(&text)
+                    .into_iter::<serde_json::Value>()
+                    .map(|ctx| {
+                        ctx.expect("hook context JSON")["model"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            };
+            Fired {
+                after_model_run: models("on_after_model_run"),
+                model_error: models("on_model_error"),
+            }
+        }
+
+        /// An error breach fires `model_error` and NOT the success hook, on
+        /// the serial path (`parallel = 1`) and the concurrent one. The
+        /// disjoint `side` model proves the success hook is wired.
+        #[tokio::test]
+        async fn an_error_breach_fires_only_model_error() {
+            for parallel in [1, 4] {
+                let fired = run_with_hooks(parallel, "max_rows = 2\nseverity = \"error\"").await;
+                assert!(
+                    fired.after_model_run.iter().any(|m| m == "side"),
+                    "parallel {parallel}: the success hook is wired: {:?}",
+                    fired.after_model_run
+                );
+                assert!(
+                    !fired.after_model_run.iter().any(|m| m == "vol"),
+                    "parallel {parallel}: a breached model is no success: {:?}",
+                    fired.after_model_run
+                );
+                assert_eq!(
+                    fired.model_error,
+                    vec!["vol".to_string()],
+                    "parallel {parallel}: model_error fires once, for vol"
+                );
+            }
+        }
+
+        /// A warning breach and an in-range count fire the success hook as
+        /// before, and no `model_error`.
+        #[tokio::test]
+        async fn a_warning_breach_or_in_range_fires_the_success_hook() {
+            for (parallel, volume) in [
+                (1, "max_rows = 2"),
+                (4, "max_rows = 2"),
+                (1, "max_rows = 10\nseverity = \"error\""),
+                (4, "max_rows = 10\nseverity = \"error\""),
+            ] {
+                let fired = run_with_hooks(parallel, volume).await;
+                assert!(
+                    fired.after_model_run.iter().any(|m| m == "vol"),
+                    "parallel {parallel}, {volume:?}: {:?}",
+                    fired.after_model_run
+                );
+                assert!(
+                    fired.model_error.is_empty(),
+                    "parallel {parallel}, {volume:?}: {:?}",
+                    fired.model_error
+                );
+            }
         }
     }
 }

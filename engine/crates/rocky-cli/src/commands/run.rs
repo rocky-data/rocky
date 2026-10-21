@@ -14385,7 +14385,11 @@ async fn execute_models_phase(
                         )
                         .await;
                         output.materializations.push(materialization);
-                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        // The success hook fires only when the volume check
+                        // passed: a breach fires `model_error` alone below.
+                        if volume_failure.is_none()
+                            && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
+                        {
                             let _ = reg
                                 .fire(&HookContext::after_model_run(
                                     run_id,
@@ -15093,7 +15097,11 @@ async fn execute_models_phase(
                     )
                     .await;
                     output.materializations.push(materialization);
-                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                    // The success hook fires only when the volume check
+                    // passed: a breach fires `model_error` alone below.
+                    if volume_failure.is_none()
+                        && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
+                    {
                         let _ = reg
                             .fire(&HookContext::after_model_run(
                                 run_id,
