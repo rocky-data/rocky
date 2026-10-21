@@ -132,7 +132,7 @@ export interface SchedulePipelineStatus {
    */
   cron?: string | null;
   /**
-   * Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline builds. For a transformation pipeline, that is a non-ephemeral model its `models` glob selects, with the same root, models directory and glob as `rocky run`. The models are loaded, not compiled, so a compile error is not seen. When its models directory is absent or cannot be located, or a model fails to load, `rocky run` builds nothing, so the pipeline has no `delivery` (see `latest_start`). For any other pipeline type, it is any such model the pipeline's newest production run that built one built, within the newest 500 runs. The estimate times the whole pipeline run. Absent when no source shows the pipeline building a product with a deadline.
+   * Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline builds. For a transformation pipeline, that is a non-ephemeral model its `models` glob selects, with the same root, models directory and glob as `rocky run`. The models are loaded, not compiled, so a compile error is not seen. When its models directory is absent or cannot be located, or a model fails to load, `rocky run` builds nothing, so the pipeline has no `delivery` (see `latest_start`); `rocky product status` still shows that product's last delivery. For any other pipeline type, it is any such model the pipeline's newest production run that built one built, within the newest 500 runs. The estimate times the whole pipeline run. Absent when no source shows the pipeline building a product with a deadline.
    */
   delivery?: DeliveryStatus | null;
   /**
@@ -160,7 +160,7 @@ export interface SchedulePipelineStatus {
    */
   last_fire_logical_ts?: string | null;
   /**
-   * The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Present on each pipeline that has a `delivery`; each transformation pipeline whose models cannot all be read (then `unknown`, reason `models_unreadable`, with a `warning`) when config or run history shows it building a deadlined output model, or some deadlined output model has no pipeline that builds it; and every pipeline any of those runs `after`, directly or through others. Absent otherwise. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
+   * The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Present on each pipeline that has a `delivery`; on each transformation pipeline whose models cannot all be read, whenever any product declares `deliver_by` (then `unknown`, reason `models_unreadable`, with a `warning`: neither config nor run history can show that it builds no deadlined output model); and on every pipeline any of those runs `after`, directly or through others. Absent otherwise. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
    */
   latest_start?: LatestStartStatus | null;
   /**
@@ -310,7 +310,7 @@ export interface LatestStartStatus {
    */
   cron_check: CronCheck;
   /**
-   * True in two cases. `cron_check` is `too_late`: the next cron fire (`next_fire_at`) is later than `at`. Or `cron_check` is `overdue`, `at` is known, and `now` is already later than `at`. False otherwise, also when `state` is `unknown`, so alert on `warning`, not on this field alone. A fire exactly at `at` is in time. Rocky warns only; it never changes the cron.
+   * True in two cases, both about the pipeline's own cron. `cron_check` is `too_late` and the pipeline has a cron: the next cron fire (`next_fire_at`) is later than `at`. Or `cron_check` is `overdue`, `at` is known, and `now` is already later than `at`. False otherwise: also when `state` is `unknown`, and always for a pipeline with no cron, even when its `cron_check` is `too_late` (it has no cron to be late; its `after` trigger is what may start it late). So alert on `warning`, not on this field alone. A fire exactly at `at` is in time. Rocky warns only; it never changes the cron.
    */
   cron_too_late: boolean;
   /**
@@ -322,7 +322,7 @@ export interface LatestStartStatus {
    */
   missing_estimate?: string[];
   /**
-   * When `cron_check` is `relies_on_after`: the cron alone would start the pipeline too late, and the `after` trigger is what starts it in time.
+   * When `cron_check` is `relies_on_after`: the `after` trigger is what starts the pipeline in time. For a pipeline with a cron, the cron alone would start it too late; for one with no cron, the `after` trigger is its only trigger.
    */
   note?: string | null;
   /**
@@ -338,7 +338,7 @@ export interface LatestStartStatus {
    */
   state: LatestStartState;
   /**
-   * Why the schedule may miss the deadline: when `cron_check` is `too_late`, `overdue` or `disabled`, or when the pipeline's models cannot all be read (reason `models_unreadable`) and config or run history shows it building a deadlined output model, or some deadlined output model has no pipeline that builds it.
+   * Why the schedule may miss the deadline: when `cron_check` is `too_late`, `overdue` or `disabled`, or when the pipeline's models cannot all be read (reason `models_unreadable`). That warning names the products whose output model config or run history shows it building, when there are any.
    */
   warning?: string | null;
   [k: string]: unknown;

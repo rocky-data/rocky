@@ -447,9 +447,7 @@ fn build_pipelines(
     let member_budgets = build_member_budgets(config, config_path, None);
     let scheduled = resolve_schedules_detailed(config, None, &member_budgets);
 
-    // Which deadlines each scheduled pipeline builds, before any status: an
-    // unreadable pipeline that no source ties to a deadline only matters
-    // when some deadline has no pipeline at all.
+    // Which deadlines each scheduled pipeline builds, before any status.
     let mut served: std::collections::BTreeMap<String, Served<'_>> =
         std::collections::BTreeMap::new();
     for name in scheduled.keys() {
@@ -458,15 +456,7 @@ fn build_pipelines(
             served_deadlines(config, config_path, name, store, deadlines)?,
         );
     }
-    let every_deadline_is_placed = deadlines.iter().all(|deadline| {
-        served.values().any(|s| {
-            s.deadlines
-                .iter()
-                .chain(s.unreadable.iter().flat_map(|u| u.claimed.iter()))
-                .any(|held| std::ptr::eq(*held, deadline))
-        })
-    });
-    // The warning of each unreadable pipeline that counts as feeding a
+    // The warning of each unreadable pipeline: each counts as feeding a
     // deadline.
     let mut unreadable_warnings: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -488,6 +478,11 @@ fn build_pipelines(
             unreadable: None,
         });
         let delivery = pipeline_delivery(&name, store, &served_here.deadlines, now)?;
+        // Fail closed: an unreadable pipeline always may serve a deadline.
+        // Neither its models (some failed to load, or none could be read)
+        // nor its history (a window, possibly empty) can show that it builds
+        // no deadlined model, and another pipeline's build of a deadlined
+        // model does not show it either.
         let serves_unknown = match &served_here.unreadable {
             None => false,
             Some(unreadable) if !unreadable.claimed.is_empty() => {
@@ -507,18 +502,18 @@ fn build_pipelines(
                 );
                 true
             }
-            Some(unreadable) if !every_deadline_is_placed => {
+            Some(unreadable) => {
                 unreadable_warnings.insert(
                     name.clone(),
                     format!(
-                        "{}, so `rocky run` builds nothing for this pipeline, and some \
-                         product's output model has no pipeline that builds it",
+                        "{}, so `rocky run` builds nothing for this pipeline; a product \
+                         declares `deliver_by`, and neither config nor run history can show \
+                         that this pipeline does not build its output model",
                         unreadable.cause
                     ),
                 );
                 true
             }
-            Some(_) => false,
         };
         chain.insert(
             name.clone(),
@@ -660,9 +655,18 @@ fn attach_latest_starts(
         }
     }
     let starts = latest_starts(&chain);
-    let fires: std::collections::BTreeMap<String, (Option<DateTime<Utc>>, bool)> = pipelines
+    let fires: std::collections::BTreeMap<String, Fire> = pipelines
         .iter()
-        .map(|p| (p.pipeline.clone(), (p.next_fire_at, p.enabled)))
+        .map(|p| {
+            (
+                p.pipeline.clone(),
+                Fire {
+                    has_cron: p.cron.is_some(),
+                    next_fire_at: p.next_fire_at,
+                    enabled: p.enabled,
+                },
+            )
+        })
         .collect();
     let mut judge = Judge {
         starts: &starts,
@@ -687,14 +691,26 @@ fn attach_latest_starts(
     Ok(())
 }
 
+/// A scheduled pipeline's cron, as [`Judge`] reads it.
+#[derive(Debug, Clone, Copy)]
+struct Fire {
+    /// Whether the pipeline has a cron at all. A cron awaiting its first
+    /// anchor has one, with no `next_fire_at`.
+    has_cron: bool,
+    /// The projected next cron fire.
+    next_fire_at: Option<DateTime<Utc>>,
+    /// Whether the schedule is enabled and resolves.
+    enabled: bool,
+}
+
 /// Judges each pipeline's cron against its latest start, upstreams first:
-/// a late cron relies on `after` only when every `after` upstream is itself
-/// judged in time.
+/// a late cron, or a pipeline with no cron and an `after` trigger, relies on
+/// `after` only when every `after` upstream is itself judged in time.
 struct Judge<'a> {
     starts: &'a std::collections::BTreeMap<String, rocky_core::delivery::LatestStart>,
     chain: &'a std::collections::BTreeMap<String, ChainNode>,
-    /// Each scheduled pipeline's next cron fire and whether it is enabled.
-    fires: &'a std::collections::BTreeMap<String, (Option<DateTime<Utc>>, bool)>,
+    /// Each scheduled pipeline's cron and whether it is enabled.
+    fires: &'a std::collections::BTreeMap<String, Fire>,
     now: DateTime<Utc>,
     memo: std::collections::BTreeMap<String, LatestStartStatus>,
     in_progress: std::collections::BTreeSet<String>,
@@ -720,30 +736,39 @@ impl Judge<'_> {
             AfterTrigger::Absent
         } else {
             // Every upstream must have a known latest start and a cron
-            // judged in time, itself or through its own `after`.
-            let all_in_time = upstreams.iter().all(|upstream| {
-                self.status(upstream).is_some_and(|status| {
-                    status.state == LatestStartState::Known
-                        && matches!(
-                            status.cron_check,
-                            CronCheck::OnTime | CronCheck::ReliesOnAfter
-                        )
+            // judged in time, itself or through its own `after`. Each one
+            // that does not is named in the warning.
+            let untimely: Vec<String> = upstreams
+                .into_iter()
+                .filter(|upstream| {
+                    !self.status(upstream).is_some_and(|status| {
+                        status.state == LatestStartState::Known
+                            && matches!(
+                                status.cron_check,
+                                CronCheck::OnTime | CronCheck::ReliesOnAfter
+                            )
+                    })
                 })
-            });
-            if all_in_time {
+                .collect();
+            if untimely.is_empty() {
                 AfterTrigger::UpstreamsInTime
             } else {
-                AfterTrigger::UpstreamsNotInTime
+                AfterTrigger::UpstreamsNotInTime(untimely)
             }
         };
         self.in_progress.remove(name);
-        let (next_fire_at, enabled) = self.fires.get(name).copied().unwrap_or((None, false));
+        let fire = self.fires.get(name).copied().unwrap_or(Fire {
+            has_cron: false,
+            next_fire_at: None,
+            enabled: false,
+        });
         let status = LatestStartStatus::from_latest_start(
             latest,
-            CronContext {
+            &CronContext {
                 now: self.now,
-                next_fire_at,
-                enabled,
+                has_cron: fire.has_cron,
+                next_fire_at: fire.next_fire_at,
+                enabled: fire.enabled,
                 after,
             },
         );
@@ -1231,8 +1256,14 @@ mod delivery_state_tests {
             status["costs"]["latest_start"]["at"],
             "2026-05-06T03:30:00Z"
         );
-        // `revenue` and `costs` have no cron, so nothing to judge.
-        assert_eq!(status["costs"]["latest_start"]["cron_too_late"], false);
+        // `revenue` and `costs` have no cron: only `after` starts them, and
+        // `raw` is on time, so they rely on it, with no warning.
+        for name in ["revenue", "costs"] {
+            let latest = &status[name]["latest_start"];
+            assert_eq!(latest["cron_check"], "relies_on_after", "{name}: {latest}");
+            assert_eq!(latest["cron_too_late"], false);
+            assert!(latest.get("warning").is_none(), "{name}: {latest}");
+        }
     }
 
     /// A 03:15 cron fires after the 03:10 latest start: warned, and the
@@ -1254,6 +1285,18 @@ mod delivery_state_tests {
             "{warning}"
         );
         assert!(warning.contains("costs_daily"), "{warning}");
+
+        // `revenue` and `costs` run only `after` `raw`, which is late, so
+        // they are late too: warned, naming `raw`. They have no cron, so
+        // `cron_too_late` stays false.
+        for name in ["revenue", "costs"] {
+            let latest = &status[name]["latest_start"];
+            assert_eq!(latest["cron_check"], "too_late", "{name}: {latest}");
+            assert_eq!(latest["cron_too_late"], false, "{name}: {latest}");
+            let warning = latest["warning"].as_str().expect("a warning");
+            assert!(warning.contains("has no cron"), "{warning}");
+            assert!(warning.contains("`raw`"), "{warning}");
+        }
     }
 
     /// `costs` ran once, so its p90 is unknown. `raw` feeds it, so `raw`'s
@@ -1637,6 +1680,221 @@ mod delivery_state_tests {
         assert_eq!(latest["cron_check"], "too_late");
         assert_eq!(latest["cron_too_late"], true);
     }
+
+    /// Three pipelines in a line: `raw` on cron `raw_cron` (20 min), `mid`
+    /// with no cron, `after = ["raw"]` (10 min), and `revenue` on cron
+    /// `55 5 * * *` and `after = ["mid"]` (10 min), which delivers
+    /// `revenue_daily`, due 06:00. Latest starts: `revenue` 05:50, `mid`
+    /// 05:40, `raw` 05:20. `revenue`'s 05:55 cron is late on its own. Its
+    /// fire anchor is set only when `revenue_anchored`.
+    fn line_status(
+        raw_cron: &str,
+        raw_slot: (u32, u32),
+        revenue_anchored: bool,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("products/revenue_daily.toml"),
+            &spec_with_deadline("0 6 * * *"),
+        );
+        for (sub, model) in [
+            ("raw", "raw_orders"),
+            ("mid", "mid_orders"),
+            ("revenue", "revenue_daily"),
+        ] {
+            write_model(&root.join("models").join(sub), model, "");
+        }
+        let mut toml = String::from("[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n");
+        for (name, schedule) in [
+            ("raw", format!("cron = \"{raw_cron}\"\ntimezone = \"UTC\"")),
+            ("mid", "after = [\"raw\"]".to_string()),
+            (
+                "revenue",
+                "after = [\"mid\"]\ncron = \"55 5 * * *\"\ntimezone = \"UTC\"".to_string(),
+            ),
+        ] {
+            toml.push_str(&format!(
+                "\n[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"models/{name}/**\"\n\n\
+                 [pipeline.{name}.target.governance]\nauto_create_schemas = true\n\n\
+                 [pipeline.{name}.schedule]\n{schedule}\n"
+            ));
+        }
+        let config_path = root.join("rocky.toml");
+        write(&config_path, &toml);
+        let state_path = root.join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        for day in 1..=5 {
+            for (pipeline, model, start, finish) in [
+                ("raw", "raw_orders", at(day, 3, 0), at(day, 3, 20)),
+                ("mid", "mid_orders", at(day, 3, 20), at(day, 3, 30)),
+                ("revenue", "revenue_daily", at(day, 5, 0), at(day, 5, 10)),
+            ] {
+                seed_run(&store, root, pipeline, model, start, finish);
+            }
+        }
+        let (hour, minute) = raw_slot;
+        let mut anchors = vec![("raw", at(5, hour, minute))];
+        if revenue_anchored {
+            anchors.push(("revenue", at(5, 5, 55)));
+        }
+        for (pipeline, anchor) in anchors {
+            store
+                .put_schedule_state(
+                    pipeline,
+                    &ScheduleStateRecord {
+                        last_fire_logical_ts: Some(anchor.to_rfc3339()),
+                        ..ScheduleStateRecord::default()
+                    },
+                )
+                .unwrap();
+        }
+        drop(store);
+        let status = chain_status(&config_path, &state_path);
+        for (name, at_) in [
+            ("raw", "2026-05-06T05:20:00Z"),
+            ("mid", "2026-05-06T05:40:00Z"),
+            ("revenue", "2026-05-06T05:50:00Z"),
+        ] {
+            assert_eq!(
+                status[name]["latest_start"]["at"], at_,
+                "{name}: {}",
+                status[name]
+            );
+        }
+        status
+    }
+
+    /// The scheduler starts an after-only pipeline once its upstreams
+    /// succeed. A 03:00 `raw` is on time, so `mid` relies on `after`, and so
+    /// does `revenue` below it, though its own cron is late: no warning.
+    /// Before, `mid` read `not_judged`, so `revenue` read `too_late`.
+    #[test]
+    fn an_after_only_pipeline_below_an_in_time_root_relies_on_after() {
+        let status = line_status("0 3 * * *", (3, 0), true);
+        assert_eq!(status["raw"]["latest_start"]["cron_check"], "on_time");
+        for name in ["mid", "revenue"] {
+            let latest = &status[name]["latest_start"];
+            assert_eq!(latest["cron_check"], "relies_on_after", "{name}: {latest}");
+            assert_eq!(latest["cron_too_late"], false, "{name}: {latest}");
+            assert!(latest.get("warning").is_none(), "{name}: {latest}");
+        }
+        let note = status["mid"]["latest_start"]["note"]
+            .as_str()
+            .expect("a note");
+        assert!(note.contains("has no cron"), "{note}");
+    }
+
+    /// A 05:30 `raw` fires after its 05:20 latest start: `mid`, which only
+    /// runs `after` it, is late too, and `revenue` below `mid` cannot rely
+    /// on `after`. Each warning names the upstream that is not in time.
+    #[test]
+    fn an_after_only_pipeline_below_a_late_root_is_too_late() {
+        let status = line_status("30 5 * * *", (5, 30), true);
+        assert_eq!(status["raw"]["latest_start"]["cron_check"], "too_late");
+
+        let mid = &status["mid"]["latest_start"];
+        assert_eq!(mid["cron_check"], "too_late", "{mid}");
+        assert_eq!(mid["cron_too_late"], false, "no cron to be late: {mid}");
+        let warning = mid["warning"].as_str().expect("a warning");
+        assert!(warning.contains("has no cron"), "{warning}");
+        assert!(warning.contains("`raw`"), "{warning}");
+
+        let revenue = &status["revenue"]["latest_start"];
+        assert_eq!(revenue["cron_check"], "too_late", "{revenue}");
+        assert_eq!(revenue["cron_too_late"], true, "{revenue}");
+        let warning = revenue["warning"].as_str().expect("a warning");
+        assert!(
+            warning.contains("the `after` trigger cannot be relied on: `mid`"),
+            "{warning}"
+        );
+    }
+
+    /// `revenue` has a cron that has not fired yet: no fire anchor, so no
+    /// `next_fire_at`. It is `not_judged`, not judged by its `after` as a
+    /// pipeline with no cron would be, though its upstreams are in time.
+    #[test]
+    fn a_cron_awaiting_its_first_anchor_is_not_judged() {
+        let status = line_status("0 3 * * *", (3, 0), false);
+        let revenue = &status["revenue"];
+        assert_eq!(revenue["awaiting_first_anchor"], true, "{revenue}");
+        assert!(revenue["next_fire_at"].is_null(), "{revenue}");
+        let latest = &revenue["latest_start"];
+        assert_eq!(latest["cron_check"], "not_judged", "{latest}");
+        assert_eq!(latest["cron_too_late"], false);
+        assert!(latest.get("warning").is_none() && latest.get("note").is_none());
+        assert_eq!(
+            status["mid"]["latest_start"]["cron_check"],
+            "relies_on_after"
+        );
+    }
+
+    /// A pipeline with neither a cron nor `after` runs by hand: nothing
+    /// starts it, so nothing to judge.
+    #[test]
+    fn a_manual_pipeline_is_not_judged() {
+        let (dir, config_path, state_path, store) = project();
+        seed_five_on_time(&store, dir.path());
+        drop(store);
+        let toml = std::fs::read_to_string(&config_path).unwrap();
+        let block = "cron = \"0 5 * * *\"\ntimezone = \"UTC\"\n";
+        assert!(toml.contains(block), "fixture layout changed");
+        write(&config_path, &toml.replacen(block, "enabled = true\n", 1));
+        let status = chain_status(&config_path, &state_path);
+        let revenue = &status["revenue"];
+        assert!(revenue["cron"].is_null(), "{revenue}");
+        assert!(
+            revenue["after"]
+                .as_array()
+                .is_none_or(std::vec::Vec::is_empty),
+            "{revenue}"
+        );
+        let latest = &revenue["latest_start"];
+        assert_eq!(latest["state"], "known", "{latest}");
+        assert_eq!(latest["cron_check"], "not_judged");
+        assert_eq!(latest["cron_too_late"], false);
+        assert!(latest.get("warning").is_none() && latest.get("note").is_none());
+    }
+
+    /// Two unreadable pipelines: `revenue`, whose history built
+    /// `revenue_daily`, and `other`, with no history at all. History alone
+    /// placed the deadline at `revenue`, which then counted as placed, so
+    /// `other` read clean. Neither can be ruled out: both are flagged.
+    #[test]
+    fn every_unreadable_pipeline_is_flagged() {
+        let (dir, config_path, state_path, store) = config_project(None);
+        seed_old_history(&store, dir.path());
+        drop(store);
+        std::fs::remove_dir_all(dir.path().join("models/revenue")).unwrap();
+        let mut toml = std::fs::read_to_string(&config_path).unwrap();
+        toml.push_str(
+            "\n[pipeline.other]\ntype = \"transformation\"\nmodels = \"models/other/**\"\n\n\
+             [pipeline.other.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.other.schedule]\ncron = \"0 4 * * *\"\ntimezone = \"UTC\"\n",
+        );
+        write(&config_path, &toml);
+        let status = chain_status(&config_path, &state_path);
+
+        assert_models_unreadable(&status, "the models directory does not exist");
+        let other = &status["other"];
+        assert!(other["delivery"].is_null(), "{other}");
+        let latest = &other["latest_start"];
+        assert_eq!(latest["state"], "unknown", "{other}");
+        // `other` has no runs either, so `missing_estimate` too.
+        assert!(
+            latest["reasons"]
+                .as_array()
+                .expect("reasons")
+                .contains(&serde_json::json!("models_unreadable")),
+            "{latest}"
+        );
+        let warning = latest["warning"].as_str().expect("a warning");
+        assert!(
+            warning.contains("the models directory does not exist"),
+            "{warning}"
+        );
+        assert!(warning.contains("`rocky run` builds nothing"), "{warning}");
+    }
 }
 
 /// The cron verdict against a latest start. Pure: no store, no clock.
@@ -1663,6 +1921,7 @@ mod cron_check_tests {
     fn ctx(fire: Option<DateTime<Utc>>, enabled: bool, after: AfterTrigger) -> CronContext {
         CronContext {
             now: t(1, 0, 0),
+            has_cron: true,
             next_fire_at: fire,
             enabled,
             after,
@@ -1675,8 +1934,9 @@ mod cron_check_tests {
     fn an_overdue_cron_past_its_latest_start_is_too_late() {
         let status = LatestStartStatus::from_latest_start(
             known(),
-            CronContext {
+            &CronContext {
                 now: t(3, 30, 0),
+                has_cron: true,
                 next_fire_at: Some(t(3, 0, 0)),
                 enabled: true,
                 after: AfterTrigger::Absent,
@@ -1693,8 +1953,9 @@ mod cron_check_tests {
     fn an_overdue_cron_before_its_latest_start_is_not_too_late() {
         let status = LatestStartStatus::from_latest_start(
             known(),
-            CronContext {
+            &CronContext {
                 now: t(3, 5, 0),
+                has_cron: true,
                 next_fire_at: Some(t(3, 0, 0)),
                 enabled: true,
                 after: AfterTrigger::Absent,
@@ -1711,13 +1972,17 @@ mod cron_check_tests {
     fn a_late_cron_with_an_untimely_upstream_is_too_late() {
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(t(3, 15, 0)), true, AfterTrigger::UpstreamsNotInTime),
+            &ctx(
+                Some(t(3, 15, 0)),
+                true,
+                AfterTrigger::UpstreamsNotInTime(vec!["raw".to_string()]),
+            ),
         );
         assert_eq!(status.cron_check, CronCheck::TooLate);
         assert!(status.cron_too_late);
         let warning = status.warning.expect("a warning");
         assert!(
-            warning.contains("the `after` trigger cannot be relied on"),
+            warning.contains("the `after` trigger cannot be relied on: `raw`"),
             "{warning}"
         );
         assert!(status.note.is_none());
@@ -1728,7 +1993,7 @@ mod cron_check_tests {
     fn a_fire_exactly_at_the_latest_start_is_on_time() {
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(t(3, 10, 0)), true, AfterTrigger::Absent),
+            &ctx(Some(t(3, 10, 0)), true, AfterTrigger::Absent),
         );
         assert_eq!(status.cron_check, CronCheck::OnTime);
         assert!(!status.cron_too_late);
@@ -1736,7 +2001,7 @@ mod cron_check_tests {
 
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(t(3, 10, 1)), true, AfterTrigger::Absent),
+            &ctx(Some(t(3, 10, 1)), true, AfterTrigger::Absent),
         );
         assert_eq!(status.cron_check, CronCheck::TooLate);
         assert!(status.cron_too_late);
@@ -1754,7 +2019,7 @@ mod cron_check_tests {
     fn a_late_cron_with_after_relies_on_after() {
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(t(3, 15, 0)), true, AfterTrigger::UpstreamsInTime),
+            &ctx(Some(t(3, 15, 0)), true, AfterTrigger::UpstreamsInTime),
         );
         assert_eq!(status.cron_check, CronCheck::ReliesOnAfter);
         assert!(!status.cron_too_late);
@@ -1769,7 +2034,7 @@ mod cron_check_tests {
         // An early cron with `after` is simply on time.
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(t(3, 0, 0)), true, AfterTrigger::UpstreamsInTime),
+            &ctx(Some(t(3, 0, 0)), true, AfterTrigger::UpstreamsInTime),
         );
         assert_eq!(status.cron_check, CronCheck::OnTime);
         assert!(status.note.is_none());
@@ -1783,7 +2048,7 @@ mod cron_check_tests {
         let now = t(1, 0, 0);
         let missed = Some(t(0, 59, 59));
         let status =
-            LatestStartStatus::from_latest_start(known(), ctx(missed, true, AfterTrigger::Absent));
+            LatestStartStatus::from_latest_start(known(), &ctx(missed, true, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Overdue);
         assert!(!status.cron_too_late);
         let warning = status.warning.expect("a warning");
@@ -1794,13 +2059,13 @@ mod cron_check_tests {
             missing_estimate: vec!["raw".to_string()],
         };
         let status =
-            LatestStartStatus::from_latest_start(unknown, ctx(missed, true, AfterTrigger::Absent));
+            LatestStartStatus::from_latest_start(unknown, &ctx(missed, true, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Overdue);
         assert!(status.warning.is_some());
 
         let status = LatestStartStatus::from_latest_start(
             known(),
-            ctx(Some(now), true, AfterTrigger::Absent),
+            &ctx(Some(now), true, AfterTrigger::Absent),
         );
         assert_eq!(status.cron_check, CronCheck::OnTime);
     }
@@ -1810,7 +2075,7 @@ mod cron_check_tests {
     #[test]
     fn a_disabled_schedule_is_reported_as_disabled() {
         let status =
-            LatestStartStatus::from_latest_start(known(), ctx(None, false, AfterTrigger::Absent));
+            LatestStartStatus::from_latest_start(known(), &ctx(None, false, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Disabled);
         assert!(!status.cron_too_late);
         let warning = status.warning.expect("a warning");
@@ -1826,7 +2091,7 @@ mod cron_check_tests {
         };
         let status = LatestStartStatus::from_latest_start(
             unknown,
-            ctx(Some(t(23, 0, 0)), true, AfterTrigger::Absent),
+            &ctx(Some(t(23, 0, 0)), true, AfterTrigger::Absent),
         );
         assert_eq!(status.cron_check, CronCheck::NotJudged);
         assert!(!status.cron_too_late);

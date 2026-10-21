@@ -402,8 +402,9 @@ pub struct ChainNode {
     pub deadline: Option<DirectDeadline>,
     /// True when the pipeline may serve a deadline but cannot build it: its
     /// models could not all be read, so the next run builds nothing, and
-    /// config or run history shows it building a deadlined model, or some
-    /// deadlined model has no builder. The node then counts as feeding a
+    /// some product declares a deadline: neither config nor run history can
+    /// show that it builds no deadlined model. The node then counts as
+    /// feeding a
     /// deadline whose start-by is unknown.
     pub serves_unknown: bool,
 }
