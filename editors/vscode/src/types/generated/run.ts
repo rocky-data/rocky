@@ -557,6 +557,12 @@ export interface MaterializationOutput {
    */
   tenant?: string | null;
   /**
+   * What this build read from each upstream table, measured from the DuckDB query profile. Each read carries the rows scanned, the columns read and an estimated byte count (`est_bytes`, fixed-width columns only). Scans that name no table (a file, a table function) are counted in `unattributed_scans`.
+   *
+   * Absent when nothing was measured: a non-DuckDB adapter, a shadow, branch or backfill run, a snapshot or time-interval model, or a profile that could not be read. Absent never means zero reads. [`RunOutput::to_run_record`] copies it onto the persisted [`rocky_core::state::ModelExecution::upstream_reads`].
+   */
+  upstream_reads?: UpstreamReads | null;
+  /**
    * The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
    */
   volume?: VolumeCheckOutput | null;
@@ -631,6 +637,44 @@ export interface PartitionInfo {
   end: string;
   key: string;
   start: string;
+  [k: string]: unknown;
+}
+/**
+ * The upstream reads of one model execution.
+ */
+export interface UpstreamReads {
+  /**
+   * One entry per upstream table, sorted by `table`. The model's own target is left out.
+   */
+  reads?: UpstreamRead[];
+  /**
+   * Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.
+   */
+  unattributed_scans?: number;
+  [k: string]: unknown;
+}
+/**
+ * What one model execution read from one upstream table.
+ *
+ * A measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.
+ */
+export interface UpstreamRead {
+  /**
+   * Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
+   */
+  est_bytes?: number | null;
+  /**
+   * The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.
+   */
+  projected_columns?: string[];
+  /**
+   * Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.
+   */
+  rows_scanned: number;
+  /**
+   * The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).
+   */
+  table: string;
   [k: string]: unknown;
 }
 /**

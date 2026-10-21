@@ -494,6 +494,7 @@ fn test_run_history_flow() {
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -521,6 +522,7 @@ fn test_run_history_flow() {
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -2182,6 +2184,7 @@ mod delivery_timing_e2e {
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: Some(RecordedTarget {
                     model: "revenue_daily".to_string(),
                     catalog: String::new(),

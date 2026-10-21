@@ -133,6 +133,17 @@
             "string",
             "null"
           ]
+        },
+        "upstream_reads": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UpstreamReads"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the execution read from each upstream table, read back from the persisted `rocky_core::state::ModelExecution::upstream_reads`. It is a measurement, not a cost: `est_bytes` is an estimate from fixed-width column types, and nothing here splits an upstream's cost.\n\nOmitted when not measured: a non-DuckDB adapter, a shadow, branch or backfill run, a failed profile read, or a run recorded before this field existed."
         }
       },
       "required": [
@@ -193,6 +204,64 @@
           "type": "string"
         }
       ]
+    },
+    "UpstreamRead": {
+      "description": "What one model execution read from one upstream table.\n\nA measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.",
+      "properties": {
+        "est_bytes": {
+          "description": "Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "projected_columns": {
+          "default": [],
+          "description": "The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows_scanned": {
+          "description": "Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rows_scanned",
+        "table"
+      ],
+      "type": "object"
+    },
+    "UpstreamReads": {
+      "description": "The upstream reads of one model execution.",
+      "properties": {
+        "reads": {
+          "default": [],
+          "description": "One entry per upstream table, sorted by `table`. The model's own target is left out.",
+          "items": {
+            "$ref": "#/definitions/UpstreamRead"
+          },
+          "type": "array"
+        },
+        "unattributed_scans": {
+          "default": 0,
+          "description": "Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky cost <run_id|latest>`.\n\nHistorical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the \"what did my last run cost?\" question answerable from the recorded run alone, without re-materialising tables.\n\n# Adapter type resolution\n\nThe `RunRecord` only carries `config_hash`, not the adapter type. The command loads `rocky.toml` to resolve the billed-warehouse type. When the config can't be loaded (working-dir mismatch, missing file, parse error), the output degrades gracefully: `adapter_type` stays `None` and `cost_usd` is `None` on every model, but durations and byte counts are still populated from the stored record.\n\n# BigQuery note\n\nBecause [`rocky_core::state::ModelExecution::bytes_scanned`] is persisted, this command can return a real cost figure for BigQuery runs even though the live `rocky run` path currently reports `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a follow-up).",

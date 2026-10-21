@@ -236,6 +236,10 @@ class MaterializationInfo(BaseModel):
     #: present only on a production build of a product output that declares
     #: one. ``None`` otherwise.
     volume: VolumeCheckOutput | None = None
+    #: What this build read from each upstream table, measured from the
+    #: DuckDB query profile. ``None`` when nothing was measured (another
+    #: adapter, a shadow, branch or backfill run); ``None`` never means zero.
+    upstream_reads: UpstreamReads | None = None
 
 
 class CheckResult(BaseModel):
@@ -1595,6 +1599,7 @@ from .types_generated.run_schema import (  # noqa: E402, F401
     OverrideWarningOutput,
     QuarantineOutput,
     RunCostSummary,
+    UpstreamReads,
     VolumeCheckOutput,
 )
 

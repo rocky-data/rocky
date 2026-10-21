@@ -352,6 +352,35 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
+    fn measures_upstream_reads(&self) -> bool {
+        true
+    }
+
+    /// Profiles the statement under the connection lock and reads its table
+    /// scans; see [`crate::upstream_reads`]. A profile that cannot be read
+    /// gives `None`, never a failed statement.
+    async fn execute_statement_with_upstream_reads(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<(
+        rocky_core::traits::ExecutionStats,
+        Option<rocky_core::state::UpstreamReads>,
+    )> {
+        let conn = Arc::clone(&self.connector);
+        let sql = sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let reads = conn
+                .execute_statement_with_upstream_reads(&sql)
+                .map_err(AdapterError::new)?;
+            Ok((rocky_core::traits::ExecutionStats::default(), reads))
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
     fn supports_object_kind_probe(&self) -> bool {
         true
     }

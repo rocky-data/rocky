@@ -374,6 +374,7 @@ mod tests {
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }

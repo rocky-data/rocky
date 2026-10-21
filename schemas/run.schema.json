@@ -830,6 +830,17 @@
             "null"
           ]
         },
+        "upstream_reads": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UpstreamReads"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this build read from each upstream table, measured from the DuckDB query profile. Each read carries the rows scanned, the columns read and an estimated byte count (`est_bytes`, fixed-width columns only). Scans that name no table (a file, a table function) are counted in `unattributed_scans`.\n\nAbsent when nothing was measured: a non-DuckDB adapter, a shadow, branch or backfill run, a snapshot or time-interval model, or a profile that could not be read. Absent never means zero reads. [`RunOutput::to_run_record`] copies it onto the persisted [`rocky_core::state::ModelExecution::upstream_reads`]."
+        },
         "volume": {
           "anyOf": [
             {
@@ -1496,6 +1507,64 @@
           "type": "string"
         }
       ]
+    },
+    "UpstreamRead": {
+      "description": "What one model execution read from one upstream table.\n\nA measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.",
+      "properties": {
+        "est_bytes": {
+          "description": "Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "projected_columns": {
+          "default": [],
+          "description": "The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows_scanned": {
+          "description": "Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rows_scanned",
+        "table"
+      ],
+      "type": "object"
+    },
+    "UpstreamReads": {
+      "description": "The upstream reads of one model execution.",
+      "properties": {
+        "reads": {
+          "default": [],
+          "description": "One entry per upstream table, sorted by `table`. The model's own target is left out.",
+          "items": {
+            "$ref": "#/definitions/UpstreamRead"
+          },
+          "type": "array"
+        },
+        "unattributed_scans": {
+          "default": 0,
+          "description": "Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "VolumeCheckOutput": {
       "description": "The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.\n\nThe count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.",

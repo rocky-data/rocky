@@ -220,6 +220,7 @@ fn build_output(
             cost_usd: cost,
             stored_bytes: exec.stored_bytes.map(|s| s.bytes),
             stored_bytes_basis: exec.stored_bytes.map(|s| s.basis),
+            upstream_reads: exec.upstream_reads.clone(),
         });
     }
 
@@ -573,6 +574,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
         ModelExecution {
             row_count: None,
+            upstream_reads: None,
             model_name: name.to_string(),
             started_at: now,
             finished_at: now + chrono::Duration::milliseconds(duration_ms as i64),
@@ -749,6 +751,33 @@ mod tests {
             "10"
         );
         assert_eq!(stored_bytes_cell(None, None), "-");
+    }
+
+    /// Recorded upstream reads reach the per-model row; an unmeasured model
+    /// has no `upstream_reads` key.
+    #[test]
+    fn per_model_reports_recorded_upstream_reads() {
+        let mut measured = sample_exec("orders", "success", 10, None, None);
+        measured.upstream_reads = Some(rocky_core::state::UpstreamReads {
+            reads: vec![rocky_core::state::UpstreamRead {
+                table: "memory.raw.events".into(),
+                rows_scanned: 5000,
+                projected_columns: vec!["id".into(), "amount".into()],
+                est_bytes: Some(80_000),
+            }],
+            unattributed_scans: 0,
+        });
+        let unknown = sample_exec("v", "success", 10, None, None);
+        let record = sample_run("run-ur", vec![measured, unknown]);
+
+        let out = build_output(&record, None, None, None);
+
+        let json = serde_json::to_value(&out).unwrap();
+        let read = &json["per_model"][0]["upstream_reads"]["reads"][0];
+        assert_eq!(read["table"], "memory.raw.events");
+        assert_eq!(read["rows_scanned"], 5000);
+        assert_eq!(read["est_bytes"], 80_000);
+        assert!(json["per_model"][1].get("upstream_reads").is_none());
     }
 
     #[test]

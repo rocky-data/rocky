@@ -1427,6 +1427,19 @@ pub struct MaterializationOutput {
     /// build. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
+    /// What this build read from each upstream table, measured from the
+    /// DuckDB query profile. Each read carries the rows scanned, the columns
+    /// read and an estimated byte count (`est_bytes`, fixed-width columns
+    /// only). Scans that name no table (a file, a table function) are counted
+    /// in `unattributed_scans`.
+    ///
+    /// Absent when nothing was measured: a non-DuckDB adapter, a shadow,
+    /// branch or backfill run, a snapshot or time-interval model, or a
+    /// profile that could not be read. Absent never means zero reads.
+    /// [`RunOutput::to_run_record`] copies it onto the persisted
+    /// [`rocky_core::state::ModelExecution::upstream_reads`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
 /// The row count `rocky run` took on a product output after its build,
@@ -6646,6 +6659,7 @@ impl RunOutput {
                 // site right after the write. `None` is unknown.
                 stored_bytes: mat.stored_bytes,
                 row_count: mat.volume.as_ref().and_then(|v| v.row_count),
+                upstream_reads: mat.upstream_reads.clone(),
             });
         }
 
@@ -6703,6 +6717,7 @@ impl RunOutput {
                 // recorded"); it may have written nothing at all.
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -8534,6 +8549,7 @@ mod cost_finalize_tests {
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }
@@ -8834,6 +8850,7 @@ mod run_record_tests {
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }
@@ -9110,6 +9127,53 @@ mod run_record_tests {
             Some("acme"),
             "tenant on the materialization must flow onto the persisted ModelExecution"
         );
+    }
+
+    /// The upstream reads ride from the materialization onto the persisted
+    /// execution, and a materialization without them has no `upstream_reads`
+    /// key in its JSON.
+    #[test]
+    fn to_run_record_carries_upstream_reads_and_the_key_is_omitted_when_none() {
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        out.tables_copied = 2;
+        let started = fixed_start();
+        let mut measured = mat(&["orders"], 1_000, Some("h"), started);
+        measured.upstream_reads = Some(rocky_core::state::UpstreamReads {
+            reads: vec![rocky_core::state::UpstreamRead {
+                table: "memory.raw.events".into(),
+                rows_scanned: 5000,
+                projected_columns: vec!["id".into()],
+                est_bytes: Some(40_000),
+            }],
+            unattributed_scans: 0,
+        });
+        out.materializations.push(measured);
+        out.materializations
+            .push(mat(&["customers"], 1_000, Some("h"), started));
+
+        let json = serde_json::to_value(&out.materializations).unwrap();
+        assert_eq!(json[0]["upstream_reads"]["reads"][0]["rows_scanned"], 5000);
+        assert!(json[1].get("upstream_reads").is_none());
+
+        let record = out.to_run_record(
+            "run-reads",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+        assert_eq!(
+            record.models_executed[0]
+                .upstream_reads
+                .as_ref()
+                .unwrap()
+                .reads[0]
+                .table,
+            "memory.raw.events"
+        );
+        assert_eq!(record.models_executed[1].upstream_reads, None);
     }
 
     #[test]
@@ -12340,6 +12404,16 @@ pub struct PerModelCostHistorical {
     /// overstates a small table). Present exactly when `stored_bytes` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_bytes_basis: Option<rocky_core::state::StoredBytesBasis>,
+    /// What the execution read from each upstream table, read back from the
+    /// persisted `rocky_core::state::ModelExecution::upstream_reads`. It is a
+    /// measurement, not a cost: `est_bytes` is an estimate from fixed-width
+    /// column types, and nothing here splits an upstream's cost.
+    ///
+    /// Omitted when not measured: a non-DuckDB adapter, a shadow, branch or
+    /// backfill run, a failed profile read, or a run recorded before this
+    /// field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ pub mod loader;
 pub mod seed;
 pub mod test_harness;
 pub mod types;
+pub mod upstream_reads;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

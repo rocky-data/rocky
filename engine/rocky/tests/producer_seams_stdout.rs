@@ -65,6 +65,7 @@ fn exec(name: &str, start: chrono::DateTime<Utc>, dur_ms: i64) -> ModelExecution
         attempts: Vec::new(),
         output_version: None,
         stored_bytes: None,
+        upstream_reads: None,
         output_target: None,
         due_at: None,
         wait_for_upstream_ms: None,

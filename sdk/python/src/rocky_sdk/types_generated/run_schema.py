@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, conint
+from pydantic import AwareDatetime, BaseModel, Field, conint
 
 
 class AnomalyEvaluationOutput(BaseModel):
@@ -633,6 +633,46 @@ class TestSeverity8(StrEnum):
     warning = "warning"
 
 
+class UpstreamRead(BaseModel):
+    """
+    What one model execution read from one upstream table.
+
+    A measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.
+    """
+
+    est_bytes: conint(ge=0) | None = None
+    """
+    Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
+    """
+    projected_columns: list[str] | None = []
+    """
+    The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.
+    """
+    rows_scanned: conint(ge=0)
+    """
+    Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.
+    """
+    table: str
+    """
+    The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).
+    """
+
+
+class UpstreamReads(BaseModel):
+    """
+    The upstream reads of one model execution.
+    """
+
+    reads: list[UpstreamRead] | None = Field([], validate_default=True)
+    """
+    One entry per upstream table, sorted by `table`. The model's own target is left out.
+    """
+    unattributed_scans: conint(ge=0) | None = 0
+    """
+    Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.
+    """
+
+
 class VolumeSeverity6(StrEnum):
     """
     The model is marked failed after its build, and the run is partial.
@@ -1017,6 +1057,12 @@ class MaterializationOutput(BaseModel):
     tenant: str | None = None
     """
     Tenant this materialization is attributed to, taken from the discover-time schema-pattern `{tenant}` component. Present only for replication pipelines whose schema pattern declares a `{tenant}` placeholder; transformation / `time_interval` models and non-tenant patterns leave it `None`. Carried onto the persisted `rocky_core::state::ModelExecution` by [`RunOutput::to_run_record`] so `rocky cost --by tenant` can roll per-model cost up to a tenant dimension. Omitted from JSON when `None` so non-tenant outputs stay byte-identical.
+    """
+    upstream_reads: UpstreamReads | None = None
+    """
+    What this build read from each upstream table, measured from the DuckDB query profile. Each read carries the rows scanned, the columns read and an estimated byte count (`est_bytes`, fixed-width columns only). Scans that name no table (a file, a table function) are counted in `unattributed_scans`.
+
+    Absent when nothing was measured: a non-DuckDB adapter, a shadow, branch or backfill run, a snapshot or time-interval model, or a profile that could not be read. Absent never means zero reads. [`RunOutput::to_run_record`] copies it onto the persisted [`rocky_core::state::ModelExecution::upstream_reads`].
     """
     volume: VolumeCheckOutput | None = None
     """

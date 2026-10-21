@@ -165,6 +165,7 @@ fn model_exec(name: &str) -> ModelExecution {
         attempts: Vec::new(),
         output_version: None,
         stored_bytes: None,
+        upstream_reads: None,
         output_target: None,
         due_at: None,
         wait_for_upstream_ms: None,

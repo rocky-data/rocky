@@ -5210,6 +5210,7 @@ pub(crate) mod delivery_tests {
             output_version: None,
             output_target: None,
             stored_bytes: None,
+            upstream_reads: None,
         });
         let audit = crate::commands::run::audit_to_record(
             &crate::commands::run_audit::AuditContext::detect(None, None, None),

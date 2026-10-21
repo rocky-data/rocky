@@ -508,6 +508,33 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|()| ExecutionStats::default())
     }
 
+    /// Whether [`Self::execute_statement_with_upstream_reads`] can measure.
+    /// The runner asks before it routes a model's statements through it, so
+    /// an adapter that cannot measure keeps its ordinary statement path.
+    /// Default: `false`. DuckDB: `true`.
+    fn measures_upstream_reads(&self) -> bool {
+        false
+    }
+
+    /// Run one statement like [`Self::execute_statement_with_stats`] and also
+    /// report what the statement read from each table.
+    ///
+    /// The second value is `None` when the adapter cannot say, or when its
+    /// measurement failed. It is never an empty-looking guess: `None` means
+    /// not measured. A failed measurement never fails the statement; only a
+    /// failed statement is an `Err`.
+    ///
+    /// - **DuckDB:** profiles the statement and reads its table scans.
+    /// - **Every other adapter:** the default, which measures nothing.
+    async fn execute_statement_with_upstream_reads(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<(ExecutionStats, Option<crate::state::UpstreamReads>)> {
+        self.execute_statement_with_stats(sql)
+            .await
+            .map(|stats| (stats, None))
+    }
+
     /// Execute a kind switch in one transaction when supported. `None` means
     /// unsupported; the caller must not drop the old object. If CREATE fails,
     /// the adapter rolls back the DROP before returning an error. A failed

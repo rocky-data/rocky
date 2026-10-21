@@ -141,5 +141,49 @@ export interface PerModelCostHistorical {
    * Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
    */
   tenant?: string | null;
+  /**
+   * What the execution read from each upstream table, read back from the persisted `rocky_core::state::ModelExecution::upstream_reads`. It is a measurement, not a cost: `est_bytes` is an estimate from fixed-width column types, and nothing here splits an upstream's cost.
+   *
+   * Omitted when not measured: a non-DuckDB adapter, a shadow, branch or backfill run, a failed profile read, or a run recorded before this field existed.
+   */
+  upstream_reads?: UpstreamReads | null;
+  [k: string]: unknown;
+}
+/**
+ * The upstream reads of one model execution.
+ */
+export interface UpstreamReads {
+  /**
+   * One entry per upstream table, sorted by `table`. The model's own target is left out.
+   */
+  reads?: UpstreamRead[];
+  /**
+   * Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.
+   */
+  unattributed_scans?: number;
+  [k: string]: unknown;
+}
+/**
+ * What one model execution read from one upstream table.
+ *
+ * A measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.
+ */
+export interface UpstreamRead {
+  /**
+   * Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
+   */
+  est_bytes?: number | null;
+  /**
+   * The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.
+   */
+  projected_columns?: string[];
+  /**
+   * Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.
+   */
+  rows_scanned: number;
+  /**
+   * The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).
+   */
+  table: string;
   [k: string]: unknown;
 }

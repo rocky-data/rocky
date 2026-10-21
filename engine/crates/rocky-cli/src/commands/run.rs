@@ -1687,6 +1687,10 @@ pub(crate) struct ExecutionContext<'a> {
     /// it recorded. A first-run fill of any other model refuses. `None` on
     /// every other run.
     pub reviewed_first_run_fills: Option<ReviewedFirstRunFills<'a>>,
+    /// Record what each model build reads from its upstream tables: true on
+    /// a production run, false on a shadow, branch or backfill run. See
+    /// [`super::run_upstream_reads`].
+    pub record_upstream_reads: bool,
 }
 
 /// The first-run fills a governed plan recorded; see
@@ -13893,6 +13897,10 @@ async fn execute_models_phase(
             plan_id: &gate.plan_id,
             models: &gate.reviewed_first_run_fills,
         }),
+        record_upstream_reads: super::run_upstream_reads::run_records_upstream_reads(
+            shadow_config,
+            model_set,
+        ),
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -14705,6 +14713,7 @@ async fn execute_models_phase(
                         );
                         output.materializations.push(MaterializationOutput {
                             volume: None,
+                            upstream_reads: None,
                             asset_key,
                             notes: vec![],
                             attempts: Vec::new(),
@@ -16401,6 +16410,14 @@ async fn execute_one_plain_model(
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
+    // What this build reads from each upstream table: recorded on a
+    // production run, on an adapter that can profile, for a strategy that
+    // reads data at build. Otherwise every statement below runs as before.
+    let mut reads_acc = super::run_upstream_reads::UpstreamReadsAcc::new(
+        exec_ctx.record_upstream_reads,
+        &model_ir.materialization,
+        warehouse,
+    );
 
     // First-run bootstrap. Strategies that mutate an existing target
     // (Merge, Incremental, DeleteInsert, Microbatch) all assume the target
@@ -16480,7 +16497,13 @@ async fn execute_one_plain_model(
                 if bootstrap_is_the_load {
                     // The CTAS loads the data, so capture its stats into the
                     // model's `bytes_scanned` / `bytes_written` output.
-                    match warehouse.execute_statement_with_stats(ddl).await {
+                    match super::run_upstream_reads::run_model_statement(
+                        warehouse,
+                        ddl,
+                        &mut reads_acc,
+                    )
+                    .await
+                    {
                         Ok(stats) => {
                             bytes_scanned_acc =
                                 accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
@@ -16499,8 +16522,21 @@ async fn execute_one_plain_model(
                 } else {
                     // Merge: the bootstrap only needs to materialize the
                     // table; the MERGE that follows does the load and reports
-                    // its own stats.
-                    warehouse.execute_statement(ddl).await.map_err(|e| {
+                    // its own stats. A recording build still profiles it:
+                    // the populating CTAS reads the upstream tables too.
+                    let bootstrap =
+                        if matches!(reads_acc, super::run_upstream_reads::UpstreamReadsAcc::Off) {
+                            warehouse.execute_statement(ddl).await
+                        } else {
+                            super::run_upstream_reads::run_model_statement(
+                                warehouse,
+                                ddl,
+                                &mut reads_acc,
+                            )
+                            .await
+                            .map(|_| ())
+                        };
+                    bootstrap.map_err(|e| {
                         anyhow::Error::from(e).context(format!(
                             "bootstrap of '{target_ref}' for model '{model_name}' failed"
                         ))
@@ -16577,7 +16613,13 @@ async fn execute_one_plain_model(
             if atomic_create_done && index == 0 {
                 continue;
             }
-            match warehouse.execute_statement_with_stats(exec_sql).await {
+            match super::run_upstream_reads::run_model_statement(
+                warehouse,
+                exec_sql,
+                &mut reads_acc,
+            )
+            .await
+            {
                 Ok(stats) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
@@ -16673,8 +16715,10 @@ async fn execute_one_plain_model(
         Utc::now(),
     )
     .await;
+    let upstream_reads = reads_acc.finish(&model_ir.target, warehouse.default_catalog().as_deref());
     Ok(MaterializationOutput {
         volume: None,
+        upstream_reads,
         asset_key,
         notes: pending_drop
             .as_ref()
@@ -16997,6 +17041,7 @@ async fn execute_snapshot_model(
         output_target: Some(recorded_output_target(model_ir)),
         // Measured once after the last model: `PendingStoredBytes`.
         stored_bytes: None,
+        upstream_reads: None,
     })
 }
 
@@ -17659,6 +17704,7 @@ async fn run_one_partition(
             output_target: Some(recorded_output_target(&tplan_ir)),
             // Not measured per partition: see `run_stored_bytes::measures_stored_bytes`.
             stored_bytes: None,
+            upstream_reads: None,
         })),
     }
 }
@@ -19280,6 +19326,7 @@ async fn process_table(
             // Replicated tables are not measured, so replication sends no
             // extra query.
             stored_bytes: None,
+            upstream_reads: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -25974,6 +26021,7 @@ auto_create_schemas = true
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }
@@ -26295,6 +26343,7 @@ auto_create_schemas = true
 
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -26319,6 +26368,7 @@ auto_create_schemas = true
         let model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -29863,6 +29913,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -29947,6 +29998,7 @@ email = "pii"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30115,6 +30167,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30246,6 +30299,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30325,6 +30379,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30486,6 +30541,7 @@ table = "orders_view"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30615,6 +30671,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30732,6 +30789,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30803,6 +30861,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30927,6 +30986,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31041,6 +31101,7 @@ table = "fct_daily"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31149,6 +31210,7 @@ table = "fct_daily"
         let not_recorded = std::collections::BTreeSet::new();
         let recorded = std::collections::BTreeSet::from(["fct_daily_orders".to_string()]);
         let ctx = |models| super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: Some(super::ReviewedFirstRunFills {
                 plan_id: "plan-x",
                 models,
@@ -31386,6 +31448,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31509,6 +31572,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31609,6 +31673,7 @@ table = "fct_events"
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -38498,6 +38563,219 @@ backend = "local"
         .expect("write model toml");
     }
 
+    /// Run every model of `models` through `execute_models` on `adapter`,
+    /// serial, with the run mode under test.
+    #[cfg(feature = "duckdb")]
+    async fn run_models_for_upstream_reads(
+        models: &std::path::Path,
+        adapter: &dyn rocky_core::traits::WarehouseAdapter,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+        model_set: Option<&std::collections::BTreeSet<String>>,
+    ) -> RunOutput {
+        let opts = PartitionRunOptions {
+            parallel: 1,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models,
+            None,
+            adapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            model_set,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            shadow_config,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("models run");
+        output
+    }
+
+    /// A file DuckDB database with `raw.events` (5000 rows, three BIGINT
+    /// columns) and a project of three models that read it.
+    #[cfg(feature = "duckdb")]
+    async fn upstream_reads_project(
+        dir: &std::path::Path,
+    ) -> (
+        rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        std::path::PathBuf,
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&dir.join("t.duckdb"))
+            .expect("open duckdb");
+        adapter
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE raw.events AS \
+                 SELECT i AS id, i * 2 AS amount, i * 3 AS score FROM range(5000) t(i)",
+            )
+            .await
+            .unwrap();
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(
+            &models,
+            "narrow",
+            "SELECT id, amount FROM raw.events",
+            "main",
+            "narrow",
+        );
+        write_model_with_target(
+            &models,
+            "wide",
+            "SELECT id, amount, score FROM raw.events",
+            "main",
+            "wide",
+        );
+        write_model_with_target(
+            &models,
+            "selfjoin",
+            "SELECT a.id FROM raw.events a JOIN raw.events b ON a.id = b.id",
+            "main",
+            "selfjoin",
+        );
+        (adapter, models)
+    }
+
+    fn upstream_reads_of<'o>(
+        output: &'o RunOutput,
+        table: &str,
+    ) -> Option<&'o rocky_core::state::UpstreamReads> {
+        output
+            .materializations
+            .iter()
+            .find(|m| m.asset_key.last().map(String::as_str) == Some(table))
+            .unwrap_or_else(|| panic!("no materialization for {table}"))
+            .upstream_reads
+            .as_ref()
+    }
+
+    /// Two models read one upstream: one projects two columns, one three. Both
+    /// record their reads, the projected columns differ and so do the
+    /// estimates. A self-join sums its two scans.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_production_run_records_each_models_upstream_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, models) = upstream_reads_project(dir.path()).await;
+        let output = run_models_for_upstream_reads(&models, &adapter, None, None).await;
+
+        let narrow = upstream_reads_of(&output, "narrow").expect("narrow measured");
+        let wide = upstream_reads_of(&output, "wide").expect("wide measured");
+        assert_eq!(narrow.reads.len(), 1);
+        assert_eq!(narrow.reads[0].table, "t.raw.events");
+        assert_eq!(narrow.reads[0].rows_scanned, 5000);
+        assert_eq!(narrow.reads[0].projected_columns, ["id", "amount"]);
+        assert_eq!(narrow.reads[0].est_bytes, Some(5000 * 16));
+        assert_eq!(wide.reads[0].table, "t.raw.events");
+        assert_eq!(wide.reads[0].projected_columns.len(), 3);
+        assert_eq!(wide.reads[0].est_bytes, Some(5000 * 24));
+        assert_eq!(narrow.unattributed_scans, 0);
+
+        let selfjoin = upstream_reads_of(&output, "selfjoin").expect("selfjoin measured");
+        assert_eq!(selfjoin.reads.len(), 1);
+        assert_eq!(selfjoin.reads[0].rows_scanned, 10_000);
+        assert_eq!(selfjoin.reads[0].est_bytes, Some(10_000 * 8));
+    }
+
+    /// A model that also reads a Parquet file counts that scan as
+    /// unattributed and still attributes its table scan.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_parquet_scan_is_counted_as_unattributed() {
+        use rocky_core::traits::WarehouseAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, models) = upstream_reads_project(dir.path()).await;
+        let parquet = dir.path().join("events.parquet");
+        adapter
+            .execute_statement(&format!(
+                "COPY raw.events TO '{}' (FORMAT PARQUET)",
+                parquet.display()
+            ))
+            .await
+            .unwrap();
+        write_model_with_target(
+            &models,
+            "withfile",
+            &format!(
+                "SELECT e.id FROM raw.events e JOIN read_parquet('{}') f ON e.id = f.id",
+                parquet.display()
+            ),
+            "main",
+            "withfile",
+        );
+        let output = run_models_for_upstream_reads(&models, &adapter, None, None).await;
+        let reads = upstream_reads_of(&output, "withfile").expect("measured");
+        assert_eq!(reads.unattributed_scans, 1);
+        assert_eq!(reads.reads.len(), 1);
+        assert_eq!(reads.reads[0].table, "t.raw.events");
+    }
+
+    /// A shadow run and a backfill run record nothing, and the models still
+    /// build.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn shadow_and_backfill_runs_record_no_upstream_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, models) = upstream_reads_project(dir.path()).await;
+
+        let shadow = rocky_core::shadow::ShadowConfig::default();
+        let output = run_models_for_upstream_reads(&models, &adapter, Some(&shadow), None).await;
+        assert_eq!(output.materializations.len(), 3);
+        assert!(
+            output
+                .materializations
+                .iter()
+                .all(|m| m.upstream_reads.is_none())
+        );
+
+        let set = std::collections::BTreeSet::from(["narrow".to_string()]);
+        let output = run_models_for_upstream_reads(&models, &adapter, None, Some(&set)).await;
+        assert_eq!(output.materializations.len(), 1);
+        assert!(output.materializations[0].upstream_reads.is_none());
+    }
+
+    /// An adapter that cannot profile records nothing: the reads are absent,
+    /// not zero.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_adapter_that_cannot_profile_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, models) = upstream_reads_project(dir.path()).await;
+        // The wrapper forwards statements but not `measures_upstream_reads`.
+        let wrapped = FailingKindProbe(&adapter);
+        let output = run_models_for_upstream_reads(&models, &wrapped, None, None).await;
+        assert_eq!(output.materializations.len(), 3);
+        assert!(
+            output
+                .materializations
+                .iter()
+                .all(|m| m.upstream_reads.is_none())
+        );
+    }
+
     /// Multi-model `--defer` (`--select` resolving to several models): an edge
     /// to another SELECTED model is never externalized or rewritten, an edge
     /// to an unselected model is, and E039 is kept on a model that still reads
@@ -42340,6 +42618,7 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -44757,6 +45036,7 @@ auto_create_schemas = true
             attempts: Vec::new(),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
             due_at: None,
             wait_for_upstream_ms: None,
@@ -44964,6 +45244,7 @@ auto_create_schemas = true
             attempts: Vec::new(),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
             due_at: None,
             wait_for_upstream_ms: None,
@@ -45102,6 +45383,7 @@ auto_create_schemas = true
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             attempts: Vec::new(),
             output_target: None,
             due_at: None,
@@ -45251,6 +45533,7 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -46240,6 +46523,7 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -46552,6 +46836,7 @@ auto_create_schemas = true
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -46741,6 +47026,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -46888,6 +47174,7 @@ auto_create_schemas = true
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,

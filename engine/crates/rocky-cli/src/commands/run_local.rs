@@ -1767,6 +1767,7 @@ pub async fn run_snapshot(
         .await;
         output.materializations.push(MaterializationOutput {
             volume: None,
+            upstream_reads: None,
             attempts: Vec::new(),
             notes: vec![],
             asset_key: vec![

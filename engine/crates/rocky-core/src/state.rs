@@ -3032,6 +3032,25 @@ pub struct ModelExecution {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
+
+    // --- Upstream reads (no schema bump) -----------------------------------
+    /// What this execution read from each upstream table, measured from the
+    /// DuckDB query profile of the build. See [`UpstreamReads`].
+    ///
+    /// `None` means not measured: a non-DuckDB adapter, a shadow, branch or
+    /// backfill run, a profile that could not be read, a failed execution, or
+    /// a record written before this field. Never zeros.
+    ///
+    /// Added without a schema bump, like [`Self::stored_bytes`]. Omitted when
+    /// `None`, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical. Read leniently: a value this binary cannot parse reads
+    /// as `None` instead of failing the whole run-history read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_upstream_reads_lenient"
+    )]
+    pub upstream_reads: Option<UpstreamReads>,
 }
 
 impl ModelExecution {
@@ -3100,6 +3119,88 @@ pub enum StoredBytesBasis {
 fn deserialize_stored_bytes_lenient<'de, D>(
     deserializer: D,
 ) -> Result<Option<StoredBytes>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// What one model execution read from one upstream table.
+///
+/// A measurement of the scan, not a price: a later step may use it to split
+/// the upstream's cost across its consumers.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct UpstreamRead {
+    /// The upstream table as `catalog.schema.table`, in the names the
+    /// warehouse reports. On DuckDB the catalog is the database name
+    /// (`memory` for an in-memory database).
+    pub table: String,
+    /// Rows the scan operators of this execution read from the table, summed
+    /// over every scan of it (a self-join counts both). Not rows returned.
+    pub rows_scanned: u64,
+    /// The columns the scans read, first seen first, with no repeats. Empty
+    /// when the profile did not name them.
+    #[serde(default)]
+    pub projected_columns: Vec<String>,
+    /// Estimate: `rows_scanned` times the summed fixed width of the projected
+    /// columns, per scan. `None` when a projected column is variable-width
+    /// (text, blob, list, struct), a column type could not be read, or no
+    /// columns were named. It is in-memory width, not bytes on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub est_bytes: Option<u64>,
+}
+
+/// The upstream reads of one model execution.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct UpstreamReads {
+    /// One entry per upstream table, sorted by `table`. The model's own
+    /// target is left out.
+    #[serde(default)]
+    pub reads: Vec<UpstreamRead>,
+    /// Scans that name no table: a file (Parquet, CSV, Iceberg) or a table
+    /// function such as `range`. They are counted, not attributed.
+    #[serde(default)]
+    pub unattributed_scans: u64,
+}
+
+impl UpstreamReads {
+    /// Fold `other` into `self`: the same table sums its rows, joins its
+    /// columns and sums its estimate (`None` if either side is `None`).
+    pub fn merge(&mut self, other: UpstreamReads) {
+        self.unattributed_scans = self
+            .unattributed_scans
+            .saturating_add(other.unattributed_scans);
+        for read in other.reads {
+            match self.reads.iter_mut().find(|r| r.table == read.table) {
+                Some(have) => {
+                    have.rows_scanned = have.rows_scanned.saturating_add(read.rows_scanned);
+                    for column in read.projected_columns {
+                        if !have.projected_columns.contains(&column) {
+                            have.projected_columns.push(column);
+                        }
+                    }
+                    have.est_bytes = match (have.est_bytes, read.est_bytes) {
+                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                        (Some(_) | None, None) | (None, Some(_)) => None,
+                    };
+                }
+                None => self.reads.push(read),
+            }
+        }
+        self.reads.sort_by(|a, b| a.table.cmp(&b.table));
+    }
+}
+
+/// Lenient reader for [`ModelExecution::upstream_reads`]: any value that does
+/// not parse reads as `None` ("not measured").
+fn deserialize_upstream_reads_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<UpstreamReads>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -9896,6 +9997,7 @@ pub fn run_with_output_versions(
                 due_at: None,
                 wait_for_upstream_ms: None,
                 stored_bytes: None,
+                upstream_reads: None,
             })
             .collect(),
         trigger: RunTrigger::Manual,
@@ -12056,6 +12158,7 @@ mod tests {
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -12260,6 +12363,7 @@ mod tests {
                 attempts: Vec::new(),
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -12563,6 +12667,7 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
             due_at: None,
             wait_for_upstream_ms: None,
@@ -12660,6 +12765,7 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     stored_bytes: None,
+                    upstream_reads: None,
                     output_target: None,
                     due_at: None,
                     wait_for_upstream_ms: None,
@@ -12687,6 +12793,7 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     stored_bytes: None,
+                    upstream_reads: None,
                     output_target: None,
                     due_at: None,
                     wait_for_upstream_ms: None,
@@ -12729,6 +12836,7 @@ mod tests {
                     attempts: Vec::new(),
                     output_version: None,
                     stored_bytes: None,
+                    upstream_reads: None,
                     output_target: None,
                     due_at: None,
                     wait_for_upstream_ms: None,
@@ -12990,6 +13098,93 @@ mod tests {
         assert_eq!(future.stored_bytes, None);
     }
 
+    /// `upstream_reads`: absent reads as `None` and `None` is omitted on write
+    /// (a run without it serializes byte-identically); a `Some` round-trips;
+    /// a value this binary cannot parse reads as `None`.
+    #[test]
+    fn test_model_execution_upstream_reads_omitted_round_trip_and_lenient_read() {
+        let blob = |extra: &str| {
+            format!(
+                r#"{{
+                "model_name": "orders",
+                "started_at": "2024-01-01T12:00:00Z",
+                "finished_at": "2024-01-01T12:00:02Z",
+                "duration_ms": 2000,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null{extra}
+            }}"#
+            )
+        };
+        let mut exec: ModelExecution =
+            serde_json::from_str(&blob("")).expect("pre-field record must read");
+        assert_eq!(exec.upstream_reads, None);
+        let before = serde_json::to_string(&exec).unwrap();
+        assert!(!before.contains("upstream_reads"), "{before}");
+
+        exec.upstream_reads = Some(UpstreamReads {
+            reads: vec![UpstreamRead {
+                table: "memory.main.src".into(),
+                rows_scanned: 5000,
+                projected_columns: vec!["id".into(), "amount".into()],
+                est_bytes: Some(80_000),
+            }],
+            unattributed_scans: 1,
+        });
+        let written = serde_json::to_string(&exec).unwrap();
+        assert!(
+            written.contains(
+                r#""upstream_reads":{"reads":[{"table":"memory.main.src","rows_scanned":5000,"projected_columns":["id","amount"],"est_bytes":80000}],"unattributed_scans":1}"#
+            ),
+            "{written}"
+        );
+        let back: ModelExecution = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.upstream_reads, exec.upstream_reads);
+
+        let future: ModelExecution =
+            serde_json::from_str(&blob(r#", "upstream_reads": {"reads": "not a list"}"#))
+                .expect("an unreadable value must not fail the record");
+        assert_eq!(future.upstream_reads, None);
+
+        exec.upstream_reads = None;
+        assert_eq!(serde_json::to_string(&exec).unwrap(), before);
+    }
+
+    #[test]
+    fn upstream_reads_merge_sums_the_same_table_and_keeps_others() {
+        let read = |table: &str, rows, cols: &[&str], est| UpstreamRead {
+            table: table.into(),
+            rows_scanned: rows,
+            projected_columns: cols.iter().map(|c| (*c).to_string()).collect(),
+            est_bytes: est,
+        };
+        let mut total = UpstreamReads {
+            reads: vec![read("c.s.b", 10, &["x"], Some(80))],
+            unattributed_scans: 1,
+        };
+        total.merge(UpstreamReads {
+            reads: vec![
+                read("c.s.b", 5, &["x", "y"], Some(40)),
+                read("c.s.a", 7, &[], None),
+            ],
+            unattributed_scans: 2,
+        });
+        assert_eq!(total.unattributed_scans, 3);
+        assert_eq!(total.reads.len(), 2);
+        assert_eq!(total.reads[0].table, "c.s.a");
+        assert_eq!(total.reads[1].rows_scanned, 15);
+        assert_eq!(total.reads[1].projected_columns, ["x", "y"]);
+        assert_eq!(total.reads[1].est_bytes, Some(120));
+
+        total.merge(UpstreamReads {
+            reads: vec![read("c.s.b", 1, &["x"], None)],
+            unattributed_scans: 0,
+        });
+        assert_eq!(total.reads[1].est_bytes, None);
+    }
+
     /// v10 → v11 forward-compat: a `ModelExecution` blob written before the
     /// recipe-identity triple existed (no `recipe_hash` / `input_hash` /
     /// `input_proof_class` / `env_hash` / `hash_scheme` keys) must
@@ -13200,6 +13395,7 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
             due_at: None,
             wait_for_upstream_ms: None,
@@ -13258,6 +13454,7 @@ mod tests {
             attempts: Vec::new(),
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
             due_at: None,
             wait_for_upstream_ms: None,

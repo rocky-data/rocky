@@ -1042,6 +1042,33 @@ Each `per_model` entry can carry `stored_bytes`: the bytes the model's output ta
 
 The field is omitted when the size is unknown: a view, a replicated table, a `time_interval` partition, an in-memory DuckDB database, or any other adapter. There is no run total, because the two bases do not add up to one figure. The table output marks an estimate `(est)`.
 
+### Upstream reads
+
+Each `per_model` entry can carry `upstream_reads`: what the model's build read from each upstream table. `rocky run` records it in the same form on each materialization. It is a measurement. It is not a cost, and Rocky does not split an upstream's cost across its consumers.
+
+```json
+"upstream_reads": {
+  "reads": [
+    {
+      "table": "main.raw.events",
+      "rows_scanned": 5000,
+      "projected_columns": ["id", "amount"],
+      "est_bytes": 80000
+    }
+  ],
+  "unattributed_scans": 0
+}
+```
+
+- `table` is `catalog.schema.table`, as DuckDB reports it. The catalog is the database name (`memory` for an in-memory database).
+- `rows_scanned` counts the rows the scan read, not the rows returned. A table scanned twice (a self-join) sums both scans.
+- `projected_columns` lists the columns read. It is empty when the query read none (`count(*)`).
+- `est_bytes` is an estimate: `rows_scanned` times the summed width of the projected columns, per scan. Rocky knows the width only for fixed-width types (integers, floats, decimals, dates, timestamps, UUID, booleans). If any projected column is text, a blob, a list or a struct, `est_bytes` is omitted. It is in-memory width, not bytes on disk.
+- `unattributed_scans` counts scans that name no table: a Parquet or CSV file, or a table function such as `range`. They are counted but not attributed.
+- The model's own target is left out. An incremental load that reads its target for the watermark does not list it.
+
+Rocky reads this from the DuckDB query profile of each statement of the build. The field is omitted when nothing was measured: any adapter other than DuckDB, a shadow, branch or backfill run, a view or other model that reads no data at build time, a snapshot or `time_interval` model, a statement batch, or a profile that could not be read. Omitted never means zero reads. A profile failure never fails the model.
+
 ### Related Commands
 
 - [`rocky replay`](#rocky-replay) -- same `RunRecord`, shown as a per-model execution dump

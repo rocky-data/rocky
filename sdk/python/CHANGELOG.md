@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MaterializationInfo` and the generated run and cost models gain an optional `upstream_reads` (`UpstreamReads`: per upstream table the rows scanned, the projected columns and an estimated byte count). `UpstreamReads` is exported from `rocky_sdk.types`.
 - The generated `ProductSpec` output gains an optional `volume` (`VolumeSpec`: `min_rows`, `max_rows`, `severity`), the declared row range of a product's output.
 - `RunResult` and the generated run models gain `volume_warnings`, and `MaterializationInfo` and the generated materialization model an optional `volume` (`VolumeCheckOutput`: the row count, the range and the verdict). `VolumeCheckOutput` is exported from `rocky_sdk.types_generated`.
 - The generated `ProductStatusOutput` gains an optional `volume` (`ProductVolumeStatus`).
