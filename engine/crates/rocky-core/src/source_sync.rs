@@ -1694,6 +1694,27 @@ mod tests {
         let report = trigger_run(&a, 5000).await;
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
         assert_eq!(report.syncs[0].last_sync_at, at(35));
+
+        // A syncing read starts the count again: two idle reads, a syncing
+        // one, then idle. Without the reset the connector would end on the
+        // first idle read after the sync, before the later end at 65.
+        let b = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", false, at(-500), None, 10)],
+            vec![seen("a", false, at(-500), None, 20)],
+            vec![seen("a", false, at(-500), None, 30)],
+            vec![seen("a", true, at(-500), None, 40)],
+            vec![seen("a", false, at(45), None, 50)],
+            vec![seen("a", true, at(45), None, 55)],
+            vec![seen("a", false, at(65), None, 70)],
+        ])
+        .with_trigger_results(vec![
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+        ]);
+        let report = trigger_run(&b, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert_eq!(report.syncs[0].last_sync_at, at(65));
     }
 
     /// After a second busy answer, a paused read ends the connector `paused`,
