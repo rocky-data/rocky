@@ -113,9 +113,8 @@ impl SqlDialect for DuckDbSqlDialect {
     ///    supported` for `t.col = s.col`. The target column stays unqualified
     ///    (`col = s.col`); the source side keeps its alias.
     ///
-    /// DuckDB *does* accept `INSERT *` shorthand in the `WHEN NOT MATCHED`
-    /// branch — the live regression test in this module exercises that path
-    /// end-to-end, so the wildcard insert is safe to keep.
+    /// `INSERT *` is positional in DuckDB. Use `INSERT BY NAME` so reordered
+    /// source columns cannot be written into the wrong target columns.
     fn merge_into(
         &self,
         target: &str,
@@ -168,7 +167,7 @@ impl SqlDialect for DuckDbSqlDialect {
              USING (\n{source_sql}\n) AS s\n\
              ON {on_clause}\n\
              WHEN MATCHED THEN {update_clause}\n\
-             WHEN NOT MATCHED THEN INSERT *"
+             WHEN NOT MATCHED THEN INSERT BY NAME"
         ))
     }
 
@@ -845,48 +844,62 @@ mod tests {
         assert!(result.is_err(), "injection in update_columns must error");
     }
 
-    /// Live regression: the MERGE SQL produced by `merge_into` must execute
-    /// successfully against a real DuckDB instance. The previous form
-    /// (`UPDATE SET t.<col> = s.<col>`) passed every string-content unit test
-    /// but failed at execute time with `Parser Error: Qualified column names
-    /// in UPDATE .. SET not supported`. This test catches that regression by
-    /// actually running the MERGE against an in-memory DuckDB.
+    /// Live regression: DuckDB's positional `INSERT *` corrupts values when
+    /// the source projection orders same-typed columns differently from the
+    /// target. `INSERT BY NAME` must preserve the column mapping and retries.
+    /// Executing the generated SQL also covers DuckDB's parser rejection of
+    /// qualified update assignments.
     #[test]
-    fn test_merge_executes_against_live_duckdb() {
+    fn test_merge_insert_by_name_executes_against_live_duckdb() {
         use crate::DuckDbConnector;
         let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
 
-        // Target seeded with 2 rows (id=1 'old', id=2 'unchanged').
-        // Source delta: id=1 update + id=3 insert.
         conn.execute_sql(
-            "CREATE TABLE tgt (id INTEGER, name VARCHAR, status VARCHAR);\n\
-             INSERT INTO tgt VALUES (1, 'old',  'active'), (2, 'keep', 'active');\n\
-             CREATE TABLE src (id INTEGER, name VARCHAR, status VARCHAR);\n\
-             INSERT INTO src VALUES (1, 'new', 'active'), (3, 'fresh', 'active');",
+            "CREATE TABLE tgt (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO tgt VALUES (1, 10, 'preserve this'), (2, 20, 'untouched');\n\
+             CREATE TABLE src (amount INTEGER, id INTEGER, note VARCHAR);\n\
+             INSERT INTO src VALUES (110, 1, 'source note'), (300, 3, 'inserted');",
         )
         .expect("seed target+source");
 
         let merge_sql = dialect()
             .merge_into(
                 "tgt",
-                "SELECT id, name, status FROM src",
+                "SELECT amount, id, note FROM src",
                 &["id".into()],
-                &ColumnSelection::Explicit(vec!["name".into(), "status".into()]),
+                &ColumnSelection::Explicit(vec!["amount".into()]),
             )
             .expect("build MERGE SQL");
 
-        // Pre-fix this fails with `Parser Error: Qualified column names in
-        // UPDATE .. SET not supported`. Post-fix it succeeds.
         conn.execute_sql(&merge_sql).expect("MERGE must execute");
 
         let after = conn
-            .execute_sql("SELECT id, name FROM tgt ORDER BY id")
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
             .expect("query post-MERGE");
-        // Expected: id=1 updated to 'new', id=2 unchanged, id=3 inserted.
         assert_eq!(after.rows.len(), 3, "MERGE should leave 3 rows in target");
-        assert_eq!(after.rows[0][1].as_str(), Some("new"));
-        assert_eq!(after.rows[1][1].as_str(), Some("keep"));
-        assert_eq!(after.rows[2][1].as_str(), Some("fresh"));
+        assert_eq!(after.rows[0][0].as_str(), Some("1"));
+        assert_eq!(after.rows[0][1].as_str(), Some("110"));
+        assert_eq!(after.rows[0][2].as_str(), Some("preserve this"));
+        assert_eq!(after.rows[1][0].as_str(), Some("2"));
+        assert_eq!(after.rows[1][1].as_str(), Some("20"));
+        assert_eq!(after.rows[1][2].as_str(), Some("untouched"));
+        assert_eq!(after.rows[2][0].as_str(), Some("3"));
+        assert_eq!(after.rows[2][1].as_str(), Some("300"));
+        assert_eq!(after.rows[2][2].as_str(), Some("inserted"));
+
+        conn.execute_sql(&merge_sql)
+            .expect("repeated MERGE must execute");
+        let repeated = conn
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
+            .expect("query after repeated MERGE");
+        assert_eq!(
+            repeated.rows, after.rows,
+            "repeated MERGE must be idempotent"
+        );
+        assert!(
+            merge_sql.ends_with("WHEN NOT MATCHED THEN INSERT BY NAME"),
+            "generated SQL must use DuckDB's name-based insert: {merge_sql}"
+        );
     }
 
     #[test]
