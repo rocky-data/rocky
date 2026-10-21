@@ -676,5 +676,131 @@ mod tests {
             assert_eq!(volume.severity, VolumeSeverity::Error);
             assert_eq!(volume.run_id.as_deref(), Some(ran.record.run_id.as_str()));
         }
+
+        /// The intra-layer concurrent path (`--parallel`) applies the same
+        /// rule: `vol` and `side` share layer 0, `down` reads `vol` in
+        /// layer 1. An error breach on `vol` is the layer's failure.
+        async fn run_concurrent(
+            contain_failures: bool,
+        ) -> (
+            crate::output::RunOutput,
+            anyhow::Result<super::super::super::run::GovernanceSnapshot>,
+            tempfile::TempDir,
+        ) {
+            use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            let models_dir = root.join("models");
+            std::fs::create_dir_all(&models_dir).unwrap();
+            for (name, sql, toml) in [
+                ("vol", VOL_SQL, FULL_REFRESH),
+                ("side", "SELECT 7 AS y\n", FULL_REFRESH),
+                (
+                    "down",
+                    "SELECT x FROM main.vol\n",
+                    "depends_on = [\"vol\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+            ] {
+                std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+                std::fs::write(models_dir.join(format!("{name}.toml")), toml).unwrap();
+            }
+            std::fs::create_dir_all(root.join("products")).unwrap();
+            std::fs::write(
+                root.join("products/vol_product.toml"),
+                spec("max_rows = 2\nseverity = \"error\""),
+            )
+            .unwrap();
+            let adapter = DuckDbWarehouseAdapter::open(&root.join("w.duckdb"))
+                .expect("open duckdb")
+                .with_concurrent_for_test(true);
+            let opts = PartitionRunOptions {
+                parallel: 4,
+                ..Default::default()
+            };
+            let mut output = crate::output::RunOutput::new(String::new(), 0, 4);
+            let resilience = rocky_core::config::ResilienceConfig {
+                contain_failures,
+                ..Default::default()
+            };
+            let defer = DeferOptions {
+                project: Some(rocky_compiler::compile::ProjectContext {
+                    root: root.to_path_buf(),
+                    model_names: Default::default(),
+                }),
+                ..DeferOptions::default()
+            };
+            let result = super::super::super::run::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                None,
+                &opts,
+                "volume-concurrent",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &defer,
+                super::super::super::run::SkipGateConfig::off(),
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                resilience,
+                false,
+                true,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await;
+            (output, result, tmp)
+        }
+
+        fn built(output: &crate::output::RunOutput, table: &str) -> bool {
+            output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some(table))
+        }
+
+        #[tokio::test]
+        async fn the_concurrent_path_fails_the_layer_on_an_error_breach() {
+            let (output, result, _tmp) = run_concurrent(false).await;
+            let error = result.expect_err("the breach is the layer's first error");
+            assert!(
+                format!("{error:#}").contains("3 row(s), above max_rows = 2"),
+                "{error:#}"
+            );
+            assert!(built(&output, "vol") && built(&output, "side"));
+            assert!(!built(&output, "down"), "no later layer starts");
+            let volume = output
+                .materializations
+                .iter()
+                .find_map(|m| m.volume.as_ref())
+                .expect("a volume check");
+            assert!(volume.fails_the_model(), "{volume:?}");
+        }
+
+        #[tokio::test]
+        async fn the_concurrent_path_contains_an_error_breach() {
+            let (output, result, _tmp) = run_concurrent(true).await;
+            result.expect("a contained failure returns Ok");
+            assert_eq!(output.tables_failed, 1);
+            assert!(
+                output.errors.iter().any(|e| e.asset_key == ["vol"]),
+                "{:?}",
+                output.errors
+            );
+            assert!(output.contained.iter().any(|c| c.model == "down"));
+            assert!(built(&output, "side"), "a disjoint model still builds");
+            assert!(!built(&output, "down"));
+        }
     }
 }
