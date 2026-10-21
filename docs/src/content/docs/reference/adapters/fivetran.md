@@ -136,6 +136,7 @@ Details:
 - A paused connector gets the outcome `paused`, no request, and does not stop the run: a person paused it on purpose.
 - A `403` means the key's role cannot start syncs. The connector ends as `trigger_failed`, no further request goes out on that key, and the message says: use a key whose role can run syncs, or set `trigger = false`.
 - A request is never retried after a timeout or a `5xx`, because the sync may have started. Rocky reads the connector once more. If a sync is running or ended past `T_pre`, it is accepted. Otherwise the connector ends as `trigger_failed`. A connect error or a `429` means Fivetran did not take the request, so those retry within the retry budget.
+- `rocky run --watch` never starts a sync, because every file save would start one. It still waits for a running sync.
 - `rocky run --no-sync-trigger` skips the request for one run. The run still waits for a sync that is already running. It does not change the config, so `rocky discover` still reports `sync_trigger: true`.
 - Every request appears in `source_syncs` (`triggered: true`) and as a `source_sync_triggered` event (run id, connector id, schema, `idle_seen_at`).
 - `rocky apply` never starts a sync, for any plan.

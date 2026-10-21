@@ -4842,7 +4842,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &partition_opts,
                     cli.cache_ttl,
                     env.as_deref(),
-                    &skip_opts,
+                    // Every file save re-runs the pipeline, so a trigger
+                    // would start a vendor sync per save. `--watch` waits for
+                    // a running sync but never starts one.
+                    &rocky_cli::commands::SkipRunOptions {
+                        no_sync_trigger: true,
+                        ..skip_opts
+                    },
                     &run_vars,
                     &actor,
                 )
