@@ -1864,7 +1864,7 @@ mod delivery_state_tests {
         let mid = &status["mid"]["latest_start"];
         assert_eq!(mid["cron_check"], "too_late", "{mid}");
         let warning = mid["warning"].as_str().expect("a warning");
-        assert!(warning.contains("`raw` is known late"), "{warning}");
+        assert!(warning.contains("not in time: `raw`;"), "{warning}");
         let revenue = &status["revenue"]["latest_start"];
         assert_eq!(revenue["cron_check"], "too_late", "{revenue}");
     }
@@ -2081,7 +2081,7 @@ mod cron_check_tests {
         assert_eq!(late.cron_check, CronCheck::TooLate);
         assert!(!late.cron_too_late);
         let warning = late.warning.expect("a warning");
-        assert!(warning.contains("`raw` is known late"), "{warning}");
+        assert!(warning.contains("not in time: `raw`;"), "{warning}");
 
         let unjudged = LatestStartStatus::from_latest_start(
             unknown(),

@@ -7688,8 +7688,9 @@ impl LatestStartStatus {
             (CronCheck::TooLate, _) if !cron.has_cron => (
                 Some(format!(
                     "the pipeline has no cron and runs only `after` other pipelines, and the \
-                     `after` trigger cannot be relied on to start it in time: {untimely} is \
-                     known late (too late, overdue or disabled); {wanted}"
+                     `after` trigger cannot be relied on to start it in time: some upstream is \
+                     known late (too late, overdue or disabled); not in time: {untimely}; \
+                     {wanted}"
                 )),
                 None,
             ),
