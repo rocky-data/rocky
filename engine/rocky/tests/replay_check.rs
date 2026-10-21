@@ -124,6 +124,7 @@ fn seed_model(
 fn model_exec(name: &str) -> ModelExecution {
     let now = Utc::now();
     ModelExecution {
+        row_count: None,
         model_name: name.to_string(),
         started_at: now,
         finished_at: now,

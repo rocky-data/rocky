@@ -215,6 +215,126 @@
         "spec_digest"
       ],
       "type": "object"
+    },
+    "ProductVolumeStatus": {
+      "description": "The declared volume range and the latest production count.",
+      "properties": {
+        "counted_at": {
+          "description": "When that build finished.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_rows": {
+          "description": "The declared `max_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "The declared `min_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "row_count": {
+          "description": "The newest production build that recorded a count. Absent when no build has been counted yet.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "The run that took the count.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeSeverity"
+            }
+          ],
+          "description": "The declared severity: `warning` (the default) or `error`."
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeVerdict"
+            }
+          ],
+          "description": "That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists."
+        }
+      },
+      "required": [
+        "severity",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "VolumeSeverity": {
+      "description": "What an out-of-range row count does to the run.",
+      "oneOf": [
+        {
+          "description": "The model is marked failed after its build, and the run is partial.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run reports a warning, and delivery is recorded as usual.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "VolumeVerdict": {
+      "description": "The outcome of one volume check.",
+      "oneOf": [
+        {
+          "description": "The count is inside the range.",
+          "enum": [
+            "in_range"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The count is below `min_rows`.",
+          "enum": [
+            "below_min"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The count is above `max_rows`.",
+          "enum": [
+            "above_max"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No count was taken, or it could not be read. Never a failure.",
+          "enum": [
+            "not_evaluated"
+          ],
+          "type": "string"
+        }
+      ]
     }
   },
   "description": "JSON output of `rocky product status`.",
@@ -335,6 +455,17 @@
     },
     "version": {
       "type": "string"
+    },
+    "volume": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProductVolumeStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Volume state, when the spec declares `[product.output.volume]`: the declared range and the latest production count judged against it."
     }
   },
   "required": [

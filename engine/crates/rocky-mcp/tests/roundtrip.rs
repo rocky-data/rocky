@@ -5643,6 +5643,7 @@ fn seed_run_history(models_dir: &Path) {
         finished_at: now + chrono::Duration::seconds(2),
         status: RunStatus::Success,
         models_executed: vec![ModelExecution {
+            row_count: None,
             model_name: "orders".to_string(),
             started_at: now,
             finished_at: now + chrono::Duration::seconds(2),

@@ -13009,6 +13009,18 @@ async fn execute_models_phase(
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
+    // The `[product.output.volume]` ranges this run checks after each build.
+    // Read from the project's `products/` (the `rocky.toml` directory, the
+    // one `rocky product` reads). A shadow or branch run counts nothing,
+    // and a caller with no project root (a backfill, tests) checks nothing.
+    let product_volumes = super::run_volume::ProductVolumes::load(
+        defer_opts
+            .project
+            .as_ref()
+            .map(|project| project.root.as_path()),
+        shadow_config.is_none(),
+    );
+
     // Build the run-scoped classified-retry plan once. The budget + breaker
     // carry interior atomics, so their caps are observed across the whole run
     // (serial or intra-layer concurrent). `circuit_breaker_threshold = 0`
@@ -14356,11 +14368,22 @@ async fn execute_models_phase(
                             materialization.skip_internal = Some(state);
                         }
                         gate.record(name, super::skip_gate::Verdict::Built);
+                        let strategy = matched[idx].2.to_model_ir().materialization;
                         stored_bytes.note(
-                            &matched[idx].2.to_model_ir().materialization,
+                            &strategy,
                             output.materializations.len(),
                             &materialization.asset_key,
                         );
+                        let volume_failure = super::run_volume::check_volume(
+                            &product_volumes,
+                            warehouse,
+                            name,
+                            &strategy,
+                            &mut materialization,
+                            output,
+                            cancel,
+                        )
+                        .await;
                         output.materializations.push(materialization);
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
@@ -14373,6 +14396,27 @@ async fn execute_models_phase(
                                 .await;
                         }
                         models_executed += 1;
+                        // An error-severity volume breach fails the model
+                        // after its write, exactly as a failed build does:
+                        // contained (downstream withheld) or the layer's
+                        // first error (no later layer starts).
+                        if let Some(e) = volume_failure {
+                            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                                let _ = reg
+                                    .fire(&HookContext::model_error(
+                                        run_id,
+                                        pipe,
+                                        name,
+                                        &format!("{e:#}"),
+                                    ))
+                                    .await;
+                            }
+                            if resilience.contain_failures {
+                                record_contained_cause(output, &mut containment, name, &e);
+                            } else if first_error.is_none() {
+                                first_error = Some(e);
+                            }
+                        }
                     }
                     Err(e) => {
                         // Containment: record + poison EVERY failure in the
@@ -14652,6 +14696,7 @@ async fn execute_models_phase(
                             &built_output_hashes,
                         );
                         output.materializations.push(MaterializationOutput {
+                            volume: None,
                             asset_key,
                             notes: vec![],
                             attempts: Vec::new(),
@@ -15031,11 +15076,22 @@ async fn execute_models_phase(
                     // output instead of having to infer them from check /
                     // drift records. Mirrors the time_interval and
                     // replication paths.
+                    let strategy = model.to_model_ir().materialization;
                     stored_bytes.note(
-                        &model.to_model_ir().materialization,
+                        &strategy,
                         output.materializations.len(),
                         &materialization.asset_key,
                     );
+                    let volume_failure = super::run_volume::check_volume(
+                        &product_volumes,
+                        warehouse,
+                        model_name,
+                        &strategy,
+                        &mut materialization,
+                        output,
+                        cancel,
+                    )
+                    .await;
                     output.materializations.push(materialization);
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
@@ -15048,6 +15104,25 @@ async fn execute_models_phase(
                             .await;
                     }
                     models_executed += 1;
+                    // An error-severity volume breach fails the model after
+                    // its write, through the same arms as a failed build.
+                    if let Some(e) = volume_failure {
+                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                            let _ = reg
+                                .fire(&HookContext::model_error(
+                                    run_id,
+                                    pipe,
+                                    model_name,
+                                    &format!("{e:#}"),
+                                ))
+                                .await;
+                        }
+                        if resilience.contain_failures {
+                            record_contained_cause(output, &mut containment, model_name, &e);
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) => {
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
@@ -16587,6 +16662,7 @@ async fn execute_one_plain_model(
     )
     .await;
     Ok(MaterializationOutput {
+        volume: None,
         asset_key,
         notes: pending_drop
             .as_ref()
@@ -16870,6 +16946,7 @@ async fn execute_snapshot_model(
     )
     .await;
     Ok(MaterializationOutput {
+        volume: None,
         asset_key: vec![
             model_ir.target.catalog.clone(),
             model_ir.target.schema.clone(),
@@ -17527,6 +17604,7 @@ async fn run_one_partition(
     PartitionExecutionResult {
         partition_key: key.clone(),
         outcome: Ok(Some(MaterializationOutput {
+            volume: None,
             asset_key: asset_key.to_vec(),
             notes: vec![],
             attempts: Vec::new(),
@@ -19146,6 +19224,7 @@ async fn process_table(
     Ok(TableOutcome::Materialized(Box::new(TableResult {
         probe_rate_limited,
         materialization: MaterializationOutput {
+            volume: None,
             asset_key: asset_key.clone(),
             notes,
             attempts: Vec::new(),
@@ -25856,6 +25935,7 @@ auto_create_schemas = true
         identity: Option<crate::output::RecipeIdentityInternal>,
     ) -> crate::output::MaterializationOutput {
         crate::output::MaterializationOutput {
+            volume: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -26424,6 +26504,7 @@ auto_create_schemas = true
         };
 
         let output = RunOutput {
+            volume_warnings: Vec::new(),
             version: "1.0.2".into(),
             command: "run".into(),
             scheduling_warnings: Vec::new(),
@@ -42225,6 +42306,7 @@ auto_create_schemas = true
             finished_at: now,
             status: rocky_core::state::RunStatus::Failure,
             models_executed: vec![rocky_core::state::ModelExecution {
+                row_count: None,
                 model_name: "agg".to_string(),
                 started_at: now,
                 finished_at: now,
@@ -44639,6 +44721,7 @@ auto_create_schemas = true
             compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
         let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let prior_exec = rocky_core::state::ModelExecution {
+            row_count: None,
             model_name: "fct".to_string(),
             started_at: now,
             finished_at: now,
@@ -44847,6 +44930,7 @@ auto_create_schemas = true
         let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
 
         let prior_exec = rocky_core::state::ModelExecution {
+            row_count: None,
             model_name: "fct".to_string(),
             started_at: now,
             finished_at: now,
@@ -44985,6 +45069,7 @@ auto_create_schemas = true
             compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
         let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let prior_exec = rocky_core::state::ModelExecution {
+            row_count: None,
             model_name: "fct".to_string(),
             started_at: now,
             finished_at: now,
@@ -45132,6 +45217,7 @@ auto_create_schemas = true
             finished_at: now,
             status: rocky_core::state::RunStatus::Success,
             models_executed: vec![rocky_core::state::ModelExecution {
+                row_count: None,
                 model_name: "fct".to_string(),
                 started_at: now,
                 finished_at: now,
@@ -46120,6 +46206,7 @@ auto_create_schemas = true
 
             let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
             let prior_exec = rocky_core::state::ModelExecution {
+                row_count: None,
                 model_name: "fct".to_string(),
                 started_at: now,
                 finished_at: now,
@@ -46431,6 +46518,7 @@ auto_create_schemas = true
             let store = rocky_core::state::StateStore::open(&tmp.path().join("state")).unwrap();
             let now = chrono::Utc::now();
             let prior_exec = rocky_core::state::ModelExecution {
+                row_count: None,
                 model_name: "live_d".to_string(),
                 started_at: now,
                 finished_at: now,

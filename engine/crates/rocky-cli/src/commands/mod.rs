@@ -84,6 +84,7 @@ mod run_incremental;
 mod run_local;
 pub(crate) mod run_output_version;
 pub(crate) mod run_stored_bytes;
+pub(crate) mod run_volume;
 mod run_watch;
 pub mod schedule_spool;
 pub mod schedule_status;

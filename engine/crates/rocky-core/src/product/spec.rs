@@ -446,6 +446,90 @@ pub struct OutputSpec {
     /// belongs with the merge that actually rewrites a human's file.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub classifications: IndexMap<String, String>,
+    /// Optional row-count range the output must hold after a load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeSpec>,
+}
+
+/// What an out-of-range row count does to the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeSeverity {
+    /// The model is marked failed after its build, and the run is partial.
+    Error,
+    /// The run reports a warning, and delivery is recorded as usual.
+    Warning,
+}
+
+impl VolumeSeverity {
+    /// The spelling the spec and the lowered test use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+/// The declared row-count range: the output table's total rows after a
+/// load, checked by `rocky run` on a full-refresh output.
+///
+/// At least one bound is present. `min_rows = 0` alone counts as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeSpec {
+    /// Fewest rows allowed (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// Most rows allowed (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// `warning` (the default when omitted) or `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<VolumeSeverity>,
+}
+
+impl VolumeSpec {
+    /// The severity, `warning` when the spec omits it.
+    pub fn severity(&self) -> VolumeSeverity {
+        self.severity.unwrap_or(VolumeSeverity::Warning)
+    }
+
+    /// Where `row_count` sits against the declared range. Both bounds are
+    /// inclusive.
+    pub fn judge(&self, row_count: u64) -> VolumeVerdict {
+        if self.min_rows.is_some_and(|min| row_count < min) {
+            return VolumeVerdict::BelowMin;
+        }
+        if self.max_rows.is_some_and(|max| row_count > max) {
+            return VolumeVerdict::AboveMax;
+        }
+        VolumeVerdict::InRange
+    }
+}
+
+/// The outcome of one volume check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeVerdict {
+    /// The count is inside the range.
+    InRange,
+    /// The count is below `min_rows`.
+    BelowMin,
+    /// The count is above `max_rows`.
+    AboveMax,
+    /// No count was taken, or it could not be read. Never a failure.
+    NotEvaluated,
+}
+
+impl VolumeVerdict {
+    /// True when the count is outside the range.
+    pub fn is_out_of_range(self) -> bool {
+        match self {
+            Self::BelowMin | Self::AboveMax => true,
+            Self::InRange | Self::NotEvaluated => false,
+        }
+    }
 }
 
 /// The trust dial. `propose_only` is the only v0 value.
@@ -847,6 +931,7 @@ fn parse_output(value: &toml::Value, path: &str) -> SpecResult<OutputSpec> {
             "checks",
             "freshness",
             "classifications",
+            "volume",
         ],
         path,
     )?;
@@ -900,6 +985,11 @@ fn parse_output(value: &toml::Value, path: &str) -> SpecResult<OutputSpec> {
         }
     };
 
+    let volume = match table.get("volume") {
+        Some(raw) => Some(parse_volume(raw, &path_join(path, "volume"))?),
+        None => None,
+    };
+
     let column_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     for (idx, name) in column_names.iter().enumerate() {
         if column_names[..idx].contains(name) {
@@ -942,6 +1032,78 @@ fn parse_output(value: &toml::Value, path: &str) -> SpecResult<OutputSpec> {
         checks,
         freshness,
         classifications,
+        volume,
+    })
+}
+
+/// Read `[product.output.volume]`.
+///
+/// Bounds are integers of 0 or more. At least one is required, and
+/// `min_rows = 0` alone counts. The spec does not name the output
+/// model's strategy, so whether that strategy can carry a total-row range
+/// is checked by `rocky product verify` against the model, not here.
+fn parse_volume(value: &toml::Value, path: &str) -> SpecResult<VolumeSpec> {
+    let table = as_table(value, path)?;
+    reject_unknown_keys(table, &["min_rows", "max_rows", "severity"], path)?;
+    let bound = |key: &str| -> SpecResult<Option<u64>> {
+        let Some(raw) = table.get(key) else {
+            return Ok(None);
+        };
+        let key_path = path_join(path, key);
+        let number = as_integer(raw, &key_path)?;
+        u64::try_from(number).map(Some).map_err(|_| {
+            SpecRejected::new(
+                "invalid-value",
+                format!(
+                    "invalid value at '{key_path}': expected a row count of 0 or more, \
+                     found {number}"
+                ),
+            )
+        })
+    };
+    let min_rows = bound("min_rows")?;
+    let max_rows = bound("max_rows")?;
+    let severity = match table.get("severity") {
+        None => None,
+        Some(raw) => {
+            let severity_path = path_join(path, "severity");
+            let text = as_string(raw, &severity_path)?;
+            match text.as_str() {
+                "warning" => Some(VolumeSeverity::Warning),
+                "error" => Some(VolumeSeverity::Error),
+                other => {
+                    return Err(SpecRejected::new(
+                        "volume-severity-unknown",
+                        format!(
+                            "{severity_path} = \"{other}\" is not a severity: write \
+                             \"warning\" (the default) or \"error\""
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+    if min_rows.is_none() && max_rows.is_none() {
+        return Err(SpecRejected::new(
+            "volume-missing-bound",
+            format!(
+                "{path} declares no bound: set min_rows, max_rows or both \
+                 (min_rows = 0 counts as a bound)"
+            ),
+        ));
+    }
+    if let (Some(min), Some(max)) = (min_rows, max_rows)
+        && min > max
+    {
+        return Err(SpecRejected::new(
+            "volume-min-above-max",
+            format!("{path}: min_rows = {min} is above max_rows = {max}, so no count can pass"),
+        ));
+    }
+    Ok(VolumeSpec {
+        min_rows,
+        max_rows,
+        severity,
     })
 }
 
@@ -1661,5 +1823,161 @@ include = ["stripe.*"]"#,
             &with_product_keys("timezone = \"UTC\""),
             "timezone-without-deliver-by",
         );
+    }
+
+    // ----- volume range -----
+
+    fn with_volume(body: &str) -> String {
+        VALID.replacen(
+            "\n[product.trust]",
+            &format!("\n[product.output.volume]\n{body}\n\n[product.trust]"),
+            1,
+        )
+    }
+
+    #[test]
+    fn volume_is_read_with_a_warning_default() {
+        let parsed = parse(&with_volume("min_rows = 1000\nmax_rows = 5000000")).expect("valid");
+        let volume = parsed.product().output.volume.clone().expect("a volume");
+        assert_eq!(volume.min_rows, Some(1_000));
+        assert_eq!(volume.max_rows, Some(5_000_000));
+        assert_eq!(
+            volume.severity, None,
+            "the parsed spec keeps the file's image"
+        );
+        assert_eq!(volume.severity(), VolumeSeverity::Warning);
+    }
+
+    #[test]
+    fn volume_severity_error_is_read() {
+        let parsed = parse(&with_volume("max_rows = 10\nseverity = \"error\"")).expect("valid");
+        let volume = parsed.product().output.volume.clone().expect("a volume");
+        assert_eq!(volume.min_rows, None);
+        assert_eq!(volume.severity(), VolumeSeverity::Error);
+    }
+
+    #[test]
+    fn min_rows_zero_alone_is_a_bound() {
+        let parsed = parse(&with_volume("min_rows = 0")).expect("valid");
+        assert_eq!(
+            parsed
+                .product()
+                .output
+                .volume
+                .as_ref()
+                .and_then(|v| v.min_rows),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn equal_bounds_are_accepted() {
+        parse(&with_volume("min_rows = 7\nmax_rows = 7")).expect("valid");
+    }
+
+    #[test]
+    fn reject_volume_without_a_bound() {
+        expect_reject(&with_volume(""), "volume-missing-bound");
+        expect_reject(&with_volume("severity = \"error\""), "volume-missing-bound");
+    }
+
+    #[test]
+    fn reject_volume_min_above_max() {
+        expect_reject(
+            &with_volume("min_rows = 11\nmax_rows = 10"),
+            "volume-min-above-max",
+        );
+    }
+
+    #[test]
+    fn reject_volume_unknown_severity() {
+        expect_reject(
+            &with_volume("min_rows = 1\nseverity = \"fatal\""),
+            "volume-severity-unknown",
+        );
+    }
+
+    #[test]
+    fn reject_volume_unknown_key() {
+        expect_reject(&with_volume("min_rows = 1\nrows = 3"), "unknown-key");
+    }
+
+    #[test]
+    fn reject_volume_invalid_values() {
+        for body in [
+            "min_rows = -1",
+            "max_rows = \"10\"",
+            "min_rows = 1.5",
+            "min_rows = 1\nseverity = 2",
+        ] {
+            expect_reject(&with_volume(body), "invalid-value");
+        }
+        // `volume` that is not a table.
+        let not_a_table = VALID.replacen(
+            "classifications = { client_id = \"pii\" }",
+            "classifications = { client_id = \"pii\" }\nvolume = 5",
+            1,
+        );
+        expect_reject(&not_a_table, "invalid-value");
+    }
+
+    #[test]
+    fn judge_is_inclusive_on_both_bounds() {
+        let volume = VolumeSpec {
+            min_rows: Some(10),
+            max_rows: Some(20),
+            severity: None,
+        };
+        assert_eq!(volume.judge(9), VolumeVerdict::BelowMin);
+        assert_eq!(volume.judge(10), VolumeVerdict::InRange);
+        assert_eq!(volume.judge(20), VolumeVerdict::InRange);
+        assert_eq!(volume.judge(21), VolumeVerdict::AboveMax);
+        let floor_only = VolumeSpec {
+            min_rows: Some(0),
+            max_rows: None,
+            severity: None,
+        };
+        assert_eq!(floor_only.judge(0), VolumeVerdict::InRange);
+        assert_eq!(floor_only.judge(u64::MAX), VolumeVerdict::InRange);
+    }
+
+    /// A spec with a volume serializes it back and parses to the same value.
+    #[test]
+    fn volume_round_trips_through_serde() {
+        let parsed = parse(&with_volume(
+            "min_rows = 0\nmax_rows = 9\nseverity = \"error\"",
+        ))
+        .expect("valid");
+        let json = serde_json::to_string(&parsed.spec).expect("serializes");
+        let back: SpecFile = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, parsed.spec);
+        assert!(
+            json.contains("\"volume\":{\"min_rows\":0,\"max_rows\":9,\"severity\":\"error\"}"),
+            "{json}"
+        );
+    }
+
+    /// A spec without a volume serializes exactly as before the key existed:
+    /// no `volume` key and no `null`, so any digest over the serialized
+    /// spec is unchanged. The raw-bytes digest is pinned too.
+    #[test]
+    fn a_spec_without_volume_serializes_as_before() {
+        let parsed = parse(VALID).expect("valid");
+        assert!(parsed.product().output.volume.is_none());
+        let json = serde_json::to_string(&parsed.spec).expect("serializes");
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"product":{"name":"revenue_daily","intent":"Daily gross revenue per client in EUR, refunds excluded","#,
+                r#""source":{"tables":["poc.raw.stripe_charges"]},"output":{"grain":["client_id","date"],"#,
+                r#""columns":[{"name":"client_id","type":"Int64","nullable":false},"#,
+                r#"{"name":"date","type":"Date","nullable":false},"#,
+                r#"{"name":"revenue_eur","type":"Decimal(18,2)","nullable":false}],"#,
+                r#""checks":["revenue_eur >= 0"],"#,
+                r#""freshness":{"max_lag":"24h","time_column":"date","severity":"error"},"#,
+                r#""classifications":{"client_id":"pii"}},"trust":{"agent":"propose_only"}}}"#
+            )
+        );
+        assert_eq!(parsed.digest, spec_digest(VALID.as_bytes()));
     }
 }

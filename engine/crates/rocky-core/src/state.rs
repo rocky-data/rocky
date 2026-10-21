@@ -3018,6 +3018,20 @@ pub struct ModelExecution {
         deserialize_with = "deserialize_stored_bytes_lenient"
     )]
     pub stored_bytes: Option<StoredBytes>,
+
+    // --- Volume count (no schema bump) -------------------------------------
+    /// The output table's total rows (`SELECT COUNT(*)`), counted right
+    /// after a production build of a product output that declares
+    /// `[product.output.volume]`. Not [`Self::rows_affected`], which is the
+    /// rows this execution wrote.
+    ///
+    /// `None` when nothing was counted: no volume declared, a shadow or
+    /// branch run, a count that failed, or a record written before this
+    /// field. Added without a schema bump, like [`Self::due_at`]. Omitted
+    /// when `None`, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
 }
 
 impl ModelExecution {
@@ -4830,6 +4844,35 @@ impl StateStore {
                 .filter(|m| m.status == "success" && m.rocky_model_name() == model_name)
                 .max_by_key(|m| m.finished_at)
                 .map(|m| (1, m))
+        })?;
+        Ok(found.into_iter().next())
+    }
+
+    /// The newest execution of `model_name` that recorded a volume count
+    /// ([`ModelExecution::row_count`]), in a run that counts as production
+    /// under `unrecorded`, with its run id.
+    ///
+    /// Any status: a build an `error`-severity breach marked failed still
+    /// carries its count, and that is the count a reader most needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn last_volume_count(
+        &self,
+        model_name: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<Option<(String, ModelExecution)>, StateError> {
+        let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            let run_id = run.run_id;
+            run.models_executed
+                .into_iter()
+                .filter(|m| m.row_count.is_some() && m.rocky_model_name() == model_name)
+                .max_by_key(|m| m.finished_at)
+                .map(|m| (1, (run_id, m)))
         })?;
         Ok(found.into_iter().next())
     }
@@ -9828,6 +9871,7 @@ pub fn run_with_output_versions(
         models_executed: models
             .iter()
             .map(|(model, version)| ModelExecution {
+                row_count: None,
                 model_name: (*model).to_string(),
                 started_at: now,
                 finished_at: now,
@@ -11990,6 +12034,7 @@ mod tests {
         let run = minimal_run_record(
             "run-001",
             vec![ModelExecution {
+                row_count: None,
                 model_name: "orders".to_string(),
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
@@ -12193,6 +12238,7 @@ mod tests {
         let base = Utc::now();
         let models: Vec<ModelExecution> = (0..40)
             .map(|i| ModelExecution {
+                row_count: None,
                 model_name: format!("model_{i:03}"),
                 started_at: base,
                 finished_at: base,
@@ -12495,6 +12541,7 @@ mod tests {
     /// A minimal `ModelExecution` for the named model.
     fn model_execution(model_name: &str) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: model_name.to_string(),
             started_at: Utc::now(),
             finished_at: Utc::now(),
@@ -12591,6 +12638,7 @@ mod tests {
             "run-001",
             vec![
                 ModelExecution {
+                    row_count: None,
                     model_name: "orders".to_string(),
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
@@ -12617,6 +12665,7 @@ mod tests {
                     wait_for_upstream_ms: None,
                 },
                 ModelExecution {
+                    row_count: None,
                     model_name: "customers".to_string(),
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
@@ -12658,6 +12707,7 @@ mod tests {
             let run = minimal_run_record(
                 &format!("run-{i}"),
                 vec![ModelExecution {
+                    row_count: None,
                     model_name: "orders".to_string(),
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
@@ -13125,6 +13175,7 @@ mod tests {
     #[test]
     fn test_v11_model_execution_round_trips_recipe_identity() {
         let exec = ModelExecution {
+            row_count: None,
             model_name: "fct_orders".to_string(),
             started_at: "2024-01-01T12:00:00Z".parse().unwrap(),
             finished_at: "2024-01-01T12:00:02Z".parse().unwrap(),
@@ -13185,6 +13236,7 @@ mod tests {
         let ts: chrono::DateTime<chrono::Utc> = "2024-01-01T12:00:00Z".parse().unwrap();
 
         let exec = ModelExecution {
+            row_count: None,
             model_name: "fct_orders".to_string(),
             started_at: ts,
             finished_at: ts,

@@ -52,7 +52,7 @@ use rocky_core::product::commit::{
     RecoveryAction, ReopenOutcome, committed_manifest, recover_generation, reopen_for_drafting,
     run_phase_a, run_phase_b,
 };
-use rocky_core::product::lowering::{manifest_rel, sidecar_rel, state_dir_rel};
+use rocky_core::product::lowering::{manifest_rel, sidecar_rel, sql_rel, state_dir_rel};
 use rocky_core::product::manifest::{
     MANIFEST_FILENAME, Manifest, ManifestPhase, content_digest, verify_artifact_hashes,
 };
@@ -126,6 +126,57 @@ pub(crate) fn product_command_root(config_path: &Path) -> std::path::PathBuf {
 /// cannot be read, contributes no deadline and logs a warning. `rocky
 /// validate` and `rocky product status` are where a broken spec is refused.
 pub(crate) fn product_deadlines_in(root: &Path) -> Vec<rocky_core::delivery::ProductDeadline> {
+    loadable_specs_in(root, "delivery deadline")
+        .into_iter()
+        .filter_map(|parsed| {
+            parsed
+                .product()
+                .deliver_by()
+                .map(|deliver_by| rocky_core::delivery::ProductDeadline {
+                    product: parsed.product().name.clone(),
+                    output_model: parsed.output_model().to_string(),
+                    deliver_by,
+                })
+        })
+        .collect()
+}
+
+/// One product's declared volume range, keyed for `rocky run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductVolume {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model.
+    pub output_model: String,
+    /// The declared range and severity.
+    pub volume: rocky_core::product::spec::VolumeSpec,
+}
+
+/// Every volume range the project's products declare.
+///
+/// Best effort, like [`product_deadlines_in`]: a spec that does not parse
+/// contributes no range and logs a warning.
+pub(crate) fn product_volumes_in(root: &Path) -> Vec<ProductVolume> {
+    loadable_specs_in(root, "volume range")
+        .into_iter()
+        .filter_map(|parsed| {
+            parsed
+                .product()
+                .output
+                .volume
+                .clone()
+                .map(|volume| ProductVolume {
+                    product: parsed.product().name.clone(),
+                    output_model: parsed.output_model().to_string(),
+                    volume,
+                })
+        })
+        .collect()
+}
+
+/// Every `products/*.toml` under `root` that parses, in file-name order.
+/// `what` names the declaration a skipped spec loses, for the warning.
+fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
     let dir = root.join("products");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -134,7 +185,7 @@ pub(crate) fn product_deadlines_in(root: &Path) -> Vec<rocky_core::delivery::Pro
             tracing::warn!(
                 error = %err,
                 dir = %dir.display(),
-                "cannot read the products directory; no delivery deadlines are recorded"
+                "cannot read the products directory; no product {what} is recorded"
             );
             return Vec::new();
         }
@@ -150,25 +201,17 @@ pub(crate) fn product_deadlines_in(root: &Path) -> Vec<rocky_core::delivery::Pro
         })
         .collect();
     stems.sort();
-    let mut deadlines = Vec::new();
+    let mut specs = Vec::new();
     for stem in stems {
         match load_spec(root, &stem) {
-            Ok(parsed) => {
-                if let Some(deliver_by) = parsed.product().deliver_by() {
-                    deadlines.push(rocky_core::delivery::ProductDeadline {
-                        product: parsed.product().name.clone(),
-                        output_model: parsed.output_model().to_string(),
-                        deliver_by,
-                    });
-                }
-            }
+            Ok(parsed) => specs.push(parsed),
             Err(reject) => tracing::warn!(
                 product = %stem,
-                "product spec does not load ({reject}); its delivery deadline is not recorded"
+                "product spec does not load ({reject}); its {what} is not recorded"
             ),
         }
     }
-    deadlines
+    specs
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +919,37 @@ pub struct ProductStatusOutput {
     /// model's finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<crate::output::DeliveryStatus>,
+    /// Volume state, when the spec declares `[product.output.volume]`: the
+    /// declared range and the latest production count judged against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<ProductVolumeStatus>,
+}
+
+/// The declared volume range and the latest production count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductVolumeStatus {
+    /// The declared `min_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity: `warning` (the default) or `error`.
+    pub severity: rocky_core::product::spec::VolumeSeverity,
+    /// The newest production build that recorded a count. Absent when no
+    /// build has been counted yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// When that build finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The run that took the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// That count judged against the range the spec declares now:
+    /// `in_range`, `below_min`, `above_max`, or `not_evaluated` when no
+    /// count exists.
+    pub verdict: rocky_core::product::spec::VolumeVerdict,
 }
 
 /// One product's row in `rocky product list`.
@@ -1040,7 +1114,9 @@ pub(crate) fn product_verify_outcome(
         };
         return Ok((parsed, posture));
     }
-    if let Err(reject) = check_product_collisions(root, &parsed, &spec_rel(product_name)) {
+    if let Err(reject) = check_product_collisions(root, &parsed, &spec_rel(product_name))
+        .and_then(|()| check_volume_strategy(root, &parsed))
+    {
         let posture = PostureResult {
             status: VerifyStatus::Fail,
             reason: format!("[{}] {}", reject.code, reject.message),
@@ -1051,6 +1127,67 @@ pub(crate) fn product_verify_outcome(
         return Ok((parsed, posture));
     }
     Ok((parsed, posture))
+}
+
+/// Refuse `[product.output.volume]` on an output model that is not a
+/// full-refresh table (`volume-strategy-unsupported`).
+///
+/// The range is the table's total rows after a load. On an incremental,
+/// merge or partitioned table the total only grows, so the range would
+/// break by itself; a view or ephemeral model stores no rows.
+///
+/// The check lives here, not in the spec parser or the lowering, because
+/// neither can know the strategy: the spec does not name it, and the
+/// sidecar the lowering merges into often omits it (it resolves from
+/// `_defaults.toml` or a config group). This loads the model the way the
+/// compiler does. Before the worker drafts the model there is nothing to
+/// check, so the check passes; the Phase-B compile runs this verification
+/// again once the model exists. `rocky run` also refuses to count a
+/// non-full-refresh output (`not_evaluated`), so a strategy changed after
+/// verification never yields a false verdict.
+///
+/// A model that exists but does not load passes here: the compile reports
+/// that problem with its own diagnostics.
+pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecResult<()> {
+    if parsed.product().output.volume.is_none() {
+        return Ok(());
+    }
+    let model_name = parsed.output_model();
+    if !root.join(sql_rel(parsed)).is_file() || !root.join(sidecar_rel(parsed)).is_file() {
+        return Ok(());
+    }
+    let wanted = std::ffi::OsStr::new(model_name);
+    let models = match rocky_core::models::load_models_from_dir_filtered(
+        &root.join("models"),
+        |path| path.file_stem() == Some(wanted),
+        None,
+    ) {
+        Ok(models) => models,
+        Err(err) => {
+            tracing::debug!(
+                model = model_name,
+                error = %err,
+                "the output model does not load; the volume strategy check is left to the compile"
+            );
+            return Ok(());
+        }
+    };
+    let Some(model) = models.iter().find(|model| model.config.name == model_name) else {
+        return Ok(());
+    };
+    if super::run_volume::counts_total_rows(&model.to_model_ir().materialization) {
+        return Ok(());
+    }
+    Err(SpecRejected::new(
+        "volume-strategy-unsupported",
+        format!(
+            "product.output.volume needs a full-refresh output, but model '{model_name}' \
+             is not one: the range is the table's total rows after a load, which an \
+             incremental, merge or partitioned table only grows, and a view or ephemeral \
+             model does not store. Remove [product.output.volume], or make the model \
+             `strategy = {{ type = \"full_refresh\" }}`"
+        ),
+    ))
 }
 
 pub(crate) fn verify_output_for(
@@ -1820,6 +1957,7 @@ pub(crate) fn product_status_at(
         fulfill_state: None,
         journal_rows: 0,
         delivery: None,
+        volume: None,
     };
 
     let parsed = match load_spec(root, product_name) {
@@ -1883,6 +2021,32 @@ pub(crate) fn product_status_at(
             crate::output::EstimateBasis::ModelDelivery,
             now,
         )?);
+    }
+    if let Some(parsed) = &parsed
+        && let Some(volume) = &parsed.product().output.volume
+    {
+        let latest = match &store {
+            Some(store) => store.last_volume_count(
+                parsed.output_model(),
+                rocky_core::state::UnrecordedScope::Exclude,
+            )?,
+            None => None,
+        };
+        let row_count = latest
+            .as_ref()
+            .and_then(|(_, execution)| execution.row_count);
+        output.volume = Some(ProductVolumeStatus {
+            min_rows: volume.min_rows,
+            max_rows: volume.max_rows,
+            severity: volume.severity(),
+            row_count,
+            counted_at: latest.as_ref().map(|(_, execution)| execution.finished_at),
+            run_id: latest.map(|(run_id, _)| run_id),
+            verdict: row_count.map_or(
+                rocky_core::product::spec::VolumeVerdict::NotEvaluated,
+                |count| volume.judge(count),
+            ),
+        });
     }
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
@@ -2173,8 +2337,35 @@ pub fn run_product_status(
         if let Some(delivery) = &output.delivery {
             print_delivery(delivery);
         }
+        if let Some(volume) = &output.volume {
+            print_volume(volume);
+        }
     }
     Ok(())
+}
+
+/// The human-readable volume lines of `rocky product status`.
+fn print_volume(volume: &ProductVolumeStatus) {
+    let bound = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
+    println!(
+        "  volume: min_rows {}, max_rows {} ({})",
+        bound(volume.min_rows),
+        bound(volume.max_rows),
+        volume.severity.as_str()
+    );
+    let verdict = match volume.verdict {
+        rocky_core::product::spec::VolumeVerdict::InRange => "in range",
+        rocky_core::product::spec::VolumeVerdict::BelowMin => "BELOW min_rows",
+        rocky_core::product::spec::VolumeVerdict::AboveMax => "ABOVE max_rows",
+        rocky_core::product::spec::VolumeVerdict::NotEvaluated => "not evaluated",
+    };
+    match (volume.row_count, volume.counted_at) {
+        (Some(count), Some(at)) => println!(
+            "    latest count: {count} row(s) at {} ({verdict})",
+            at.to_rfc3339()
+        ),
+        _ => println!("    latest count: none yet ({verdict})"),
+    }
 }
 
 /// The human-readable delivery lines of `rocky product status`.
@@ -4981,6 +5172,7 @@ pub(crate) mod delivery_tests {
 
         let mut output = RunOutput::new(String::new(), 1, 1);
         output.materializations.push(MaterializationOutput {
+            volume: None,
             asset_key: vec!["revenue_daily".to_string()],
             notes: vec![],
             attempts: Vec::new(),

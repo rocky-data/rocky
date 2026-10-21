@@ -108,6 +108,14 @@ export type FailureKind =
   | "compile-error"
   | "unknown";
 /**
+ * What an out-of-range row count does to the run.
+ */
+export type VolumeSeverity = "error" | "warning";
+/**
+ * The outcome of one volume check.
+ */
+export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evaluated";
+/**
  * The per-model build decision the engine made this run — what the skip-gate and content-addressed reuse machinery actually decided.
  *
  * Reporting-only: this never changes build behavior, it surfaces a decision that today only reaches the run log. Populated on [`RunOutput::model_decisions`] only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; a default run (both off) emits an empty list and the field is omitted.
@@ -255,6 +263,10 @@ export interface RunOutput {
    */
   verify_after_failed?: boolean;
   version: string;
+  /**
+   * One line per product output whose row count fell outside its declared `[product.output.volume]` range at `warning` severity. An `error`-severity breach is in `errors` instead. Empty (and omitted) when none.
+   */
+  volume_warnings?: string[];
   [k: string]: unknown;
 }
 /**
@@ -544,6 +556,10 @@ export interface MaterializationOutput {
    * Tenant this materialization is attributed to, taken from the discover-time schema-pattern `{tenant}` component. Present only for replication pipelines whose schema pattern declares a `{tenant}` placeholder; transformation / `time_interval` models and non-tenant patterns leave it `None`. Carried onto the persisted `rocky_core::state::ModelExecution` by [`RunOutput::to_run_record`] so `rocky cost --by tenant` can roll per-model cost up to a tenant dimension. Omitted from JSON when `None` so non-tenant outputs stay byte-identical.
    */
   tenant?: string | null;
+  /**
+   * The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
+   */
+  volume?: VolumeCheckOutput | null;
   [k: string]: unknown;
 }
 /**
@@ -615,6 +631,46 @@ export interface PartitionInfo {
   end: string;
   key: string;
   start: string;
+  [k: string]: unknown;
+}
+/**
+ * The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.
+ *
+ * The count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.
+ */
+export interface VolumeCheckOutput {
+  /**
+   * The declared `max_rows` (inclusive), when set.
+   */
+  max_rows?: number | null;
+  /**
+   * The declared `min_rows` (inclusive), when set.
+   */
+  min_rows?: number | null;
+  /**
+   * The Rocky model counted: the product's output model.
+   */
+  model: string;
+  /**
+   * The product that declares the range.
+   */
+  product: string;
+  /**
+   * Why the verdict is `not_evaluated`, or what an out-of-range count means for the run.
+   */
+  reason?: string | null;
+  /**
+   * The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+   */
+  row_count?: number | null;
+  /**
+   * The declared severity: `warning` (the default) or `error`.
+   */
+  severity: VolumeSeverity;
+  /**
+   * `in_range`, `below_min`, `above_max`, or `not_evaluated`. `not_evaluated` is never a failure.
+   */
+  verdict: VolumeVerdict;
   [k: string]: unknown;
 }
 /**

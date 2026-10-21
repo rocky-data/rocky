@@ -173,7 +173,14 @@ pub fn render_contract(parsed: &ParsedSpec) -> Vec<u8> {
 ///   data.
 /// - Every declared check becomes an `expression` test at error
 ///   severity.
-pub fn generated_tests(parsed: &ParsedSpec) -> Vec<TomlTable> {
+/// - A declared `volume` becomes one `row_count_range` test with the
+///   same bounds and severity.
+///
+/// # Errors
+///
+/// Returns `volume-unrepresentable` when a volume bound does not fit a
+/// TOML integer (unreachable from a parsed spec).
+pub fn generated_tests(parsed: &ParsedSpec) -> SpecResult<Vec<TomlTable>> {
     let product = parsed.product();
     let mut tests: Vec<TomlTable> = Vec::new();
 
@@ -209,7 +216,48 @@ pub fn generated_tests(parsed: &ParsedSpec) -> Vec<TomlTable> {
         test.insert("severity".to_string(), TomlValue::string("error"));
         tests.push(test);
     }
-    tests
+
+    if let Some(volume) = &product.output.volume {
+        tests.push(volume_test(volume)?);
+    }
+    Ok(tests)
+}
+
+/// The `row_count_range` test a declared volume lowers to, with the same
+/// bounds and severity, so `rocky test` and `rocky run` judge one range.
+///
+/// # Errors
+///
+/// Returns `volume-unrepresentable` when a bound exceeds what a TOML
+/// integer can hold. The parser reads bounds from TOML integers, so a
+/// parsed spec never reaches it.
+fn volume_test(volume: &crate::product::spec::VolumeSpec) -> SpecResult<TomlTable> {
+    let mut test = TomlTable::new();
+    test.insert("type".to_string(), TomlValue::string("row_count_range"));
+    for (key, bound) in [("min", volume.min_rows), ("max", volume.max_rows)] {
+        let Some(bound) = bound else {
+            continue;
+        };
+        let bound = i64::try_from(bound).map_err(|_| {
+            SpecRejected::new(
+                "volume-unrepresentable",
+                format!(
+                    "volume bound {bound} is larger than a TOML integer can hold — the \
+                     sidecar would not parse back"
+                ),
+            )
+        })?;
+        test.insert(key.to_string(), TomlValue::Integer(bound));
+    }
+    test.insert(
+        "severity".to_string(),
+        TomlValue::string(volume.severity().as_str()),
+    );
+    Ok(test)
+}
+
+fn is_row_count_range(test: &TomlTable) -> bool {
+    matches!(test.get("type"), Some(TomlValue::String(kind)) if kind == "row_count_range")
 }
 
 /// Merge spec-owned metadata into an existing sidecar document.
@@ -219,7 +267,9 @@ pub fn generated_tests(parsed: &ParsedSpec) -> Vec<TomlTable> {
 /// `[tags].product` — other tag keys survive. Preserved: `name` and
 /// `intent` (`intent` is filled from the spec only when the file has
 /// none), every worker-appended test the lowering did not generate, and
-/// every other key verbatim.
+/// every other key verbatim. One exception: when the spec declares a
+/// `volume`, a worker `row_count_range` test is dropped, so the spec's
+/// range is the model's only one.
 ///
 /// The output order is fixed, so merging twice is byte-identical: the
 /// header comment, `name`, `intent`, the remaining preserved scalars in
@@ -373,8 +423,13 @@ pub fn merge_sidecar_text(
         merged.insert("freshness".to_string(), TomlValue::Table(block));
     }
 
-    let owned_tests = generated_tests(parsed);
+    let owned_tests = generated_tests(parsed)?;
     let mut tests: Vec<TomlValue> = owned_tests.iter().cloned().map(TomlValue::Table).collect();
+    // A declared volume owns the model's row-count range outright: the
+    // spec's range is the only one, so a worker `row_count_range` is
+    // replaced, not kept beside it. Without a volume, a worker range
+    // survives like any other worker test.
+    let spec_owns_row_count = product.output.volume.is_some();
     if let Some(existing) = document.get("tests").and_then(TomlValue::as_array) {
         for test in existing {
             // A worker test identical to a generated one is absorbed, not
@@ -383,6 +438,9 @@ pub fn merge_sidecar_text(
             let Some(table) = test.as_table() else {
                 continue;
             };
+            if spec_owns_row_count && is_row_count_range(table) {
+                continue;
+            }
             if !owned_tests.contains(table) {
                 tests.push(test.clone());
             }
@@ -610,6 +668,21 @@ fn field_rows(parsed: &ParsedSpec, phase: Phase) -> BTreeMap<String, FieldRow> {
             },
         ),
     );
+    if product.output.volume.is_some() {
+        rows.insert(
+            "product.output.volume".to_string(),
+            row(
+                Vec::new(),
+                vec![Location::new(
+                    &sidecar,
+                    "[[tests]] type=row_count_range {min, max, severity}",
+                    LocationPhase::B,
+                )],
+                "replaces any worker row_count_range; `rocky run` also counts the rows after a \
+                 production build of a full-refresh output and applies the same severity",
+            ),
+        );
+    }
     rows.insert(
         "product.trust.agent".to_string(),
         FieldRow::new(Disposition::Verified).with_note(
@@ -931,7 +1004,7 @@ agent = "propose_only"
 
         let parsed = parse_spec_bytes(spec, "products/many_checks.toml").expect("parses");
         let checks = parsed.product().output.checks.clone();
-        let generated = generated_tests(&parsed);
+        let generated = generated_tests(&parsed).expect("lowers");
 
         // Tier 1: every `checks` entry, and nothing else, lowers to an
         // `expression` test.
@@ -1033,17 +1106,54 @@ agent = "propose_only"
              {rejected:?}"
         );
 
-        // Tier 3: everything else the engine's test vocabulary offers
-        // has NO spec route. `generated_tests` can emit exactly four
-        // type tags, so a `row_count_range`, an `accepted_values`, an
-        // `in_range`, a `regex_match`, or a `relationships` cannot come
-        // from a spec at all.
+        // Tier 3: the FIFTH route, on purpose. `output.volume` lowers to
+        // exactly one `row_count_range` test carrying the spec's bounds and
+        // severity. It is the only route that can carry a `warning`
+        // severity, and only for that shape. The custody remedy names it
+        // (`UnevaluableCause::CheckCustody` in `rocky-fulfill`).
+        let with_volume = std::str::from_utf8(spec).expect("utf-8").replacen(
+            "\n[product.trust]",
+            "\n[product.output.volume]\nmin_rows = 0\nmax_rows = 50\n\n[product.trust]",
+            1,
+        );
+        let volume_parsed =
+            parse_spec_bytes(with_volume.as_bytes(), "products/many_checks.toml").expect("parses");
+        let volume_generated = generated_tests(&volume_parsed).expect("lowers");
+        assert_eq!(
+            volume_generated.len(),
+            generated.len() + 1,
+            "a volume adds exactly one test: {volume_generated:?}"
+        );
+        let ranges: Vec<&TomlTable> = volume_generated
+            .iter()
+            .filter(|test| str_at(test, "type") == Some("row_count_range"))
+            .collect();
+        assert_eq!(ranges.len(), 1, "{volume_generated:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(0)));
+        assert_eq!(ranges[0].get("max"), Some(&TomlValue::Integer(50)));
+        assert_eq!(
+            str_at(ranges[0], "severity"),
+            Some("warning"),
+            "an omitted severity lowers as the spec default, warning"
+        );
+        assert_eq!(
+            ranges[0].keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["type", "min", "max", "severity"],
+            "four keys and no more — no filter, no column: {ranges:?}"
+        );
+
+        // Tier 4: everything else the engine's test vocabulary offers
+        // has NO spec route. `generated_tests` can emit exactly five
+        // type tags (`unique`, `composite`, `not_null`, `expression`,
+        // and `row_count_range` from `output.volume`), so an
+        // `accepted_values`, an `in_range`, a `regex_match`, or a
+        // `relationships` cannot come from a spec at all.
         let emitted: std::collections::BTreeSet<&str> = generated
             .iter()
+            .chain(volume_generated.iter())
             .filter_map(|test| str_at(test, "type"))
             .collect();
         for unreachable in [
-            "row_count_range",
             "accepted_values",
             "in_range",
             "regex_match",
@@ -1055,6 +1165,12 @@ agent = "propose_only"
                  is the whole answer for it"
             );
         }
+        assert!(
+            !generated
+                .iter()
+                .any(|test| str_at(test, "type") == Some("row_count_range")),
+            "without a volume, no row_count_range: {generated:?}"
+        );
     }
 
     // ----- goldens -----
@@ -1350,7 +1466,7 @@ agent = "propose_only"
                 r#"grain = ["client_id"]"#,
             );
         let parsed = parse_spec_bytes(single.as_bytes(), SPEC_PATH).expect("valid");
-        let tests = generated_tests(&parsed);
+        let tests = generated_tests(&parsed).expect("lowers");
         assert!(tests.contains(&test_entry(&[("type", "unique"), ("column", "client_id")])));
         assert!(
             !tests
@@ -1634,7 +1750,7 @@ agent = "propose_only"
                 r#"{ name = "revenue_eur", type = "Decimal(18,2)", nullable = true },"#,
             );
         let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid");
-        let tests = generated_tests(&parsed);
+        let tests = generated_tests(&parsed).expect("lowers");
         assert!(
             !tests.contains(&test_entry(&[
                 ("type", "not_null"),
@@ -1665,5 +1781,134 @@ agent = "propose_only"
         )
         .expect_err("unrepresentable");
         assert_eq!(error.code, "max-lag-unrepresentable");
+    }
+
+    // ----- volume -----
+
+    fn parsed_with_volume(body: &str) -> ParsedSpec {
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replacen(
+                "\n[product.trust]",
+                &format!("\n[product.output.volume]\n{body}\n\n[product.trust]"),
+                1,
+            );
+        parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid")
+    }
+
+    fn row_count_ranges(document: &TomlTable) -> Vec<TomlTable> {
+        tests_of(document)
+            .into_iter()
+            .filter(is_row_count_range)
+            .collect()
+    }
+
+    #[test]
+    fn a_volume_lowers_to_one_row_count_range_in_the_sidecar() {
+        let parsed =
+            parsed_with_volume("min_rows = 1000\nmax_rows = 5000000\nseverity = \"error\"");
+        let document = merged_document(&parsed, &drafted_sidecar_text());
+        let ranges = row_count_ranges(&document);
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(1_000)));
+        assert_eq!(ranges[0].get("max"), Some(&TomlValue::Integer(5_000_000)));
+        assert_eq!(ranges[0].get("severity"), Some(&TomlValue::string("error")));
+        // The lowered entry is a test the engine reads back as declared.
+        let rendered = merged_text(&parsed, &drafted_sidecar_text());
+        let raw: toml::Table = rendered.parse().expect("the merge output is TOML");
+        let decls: Vec<crate::tests::TestDecl> = raw["tests"]
+            .as_array()
+            .expect("tests")
+            .iter()
+            .map(|t| t.clone().try_into().expect("a test decl"))
+            .collect();
+        let range = decls
+            .iter()
+            .find(|d| matches!(d.test_type, crate::tests::TestType::RowCountRange { .. }))
+            .expect("a row_count_range decl");
+        assert_eq!(
+            range.test_type,
+            crate::tests::TestType::RowCountRange {
+                min: Some(1_000),
+                max: Some(5_000_000)
+            }
+        );
+        assert_eq!(range.severity, crate::tests::TestSeverity::Error);
+    }
+
+    #[test]
+    fn a_one_sided_volume_lowers_only_its_bound() {
+        let parsed = parsed_with_volume("max_rows = 10");
+        let ranges = row_count_ranges(&merged_document(&parsed, &drafted_sidecar_text()));
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].get("min").is_none(), "{ranges:?}");
+        assert_eq!(ranges[0].get("max"), Some(&TomlValue::Integer(10)));
+        assert_eq!(
+            ranges[0].get("severity"),
+            Some(&TomlValue::string("warning"))
+        );
+    }
+
+    #[test]
+    fn a_volume_replaces_a_worker_row_count_range() {
+        let parsed = parsed_with_volume("min_rows = 5");
+        let worker = draft_check_append(
+            &drafted_sidecar_text(),
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\nmax = 2\nseverity = \"error\"\n",
+        );
+        let document = merged_document(&parsed, &worker);
+        let ranges = row_count_ranges(&document);
+        assert_eq!(ranges.len(), 1, "one range, the spec's: {ranges:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(5)));
+        assert!(ranges[0].get("max").is_none());
+        // The worker's other test survives.
+        assert!(
+            tests_of(&document).contains(&test_entry(&[
+                ("type", "expression"),
+                ("expression", "client_id > 0"),
+            ])),
+            "{document:?}"
+        );
+        // Merging twice is byte-identical.
+        let once = merged_text(&parsed, &worker);
+        assert_eq!(merged_text(&parsed, &once), once);
+    }
+
+    #[test]
+    fn without_a_volume_a_worker_row_count_range_survives() {
+        let parsed = parsed_d3();
+        let worker = draft_check_append(
+            &drafted_sidecar_text(),
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n",
+        );
+        let ranges = row_count_ranges(&merged_document(&parsed, &worker));
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(1)));
+    }
+
+    #[test]
+    fn a_volume_gets_a_lowered_manifest_row_in_both_phases() {
+        let parsed = parsed_with_volume("min_rows = 0");
+        let phase_a = lower_phase_a(&parsed, SPEC_PATH).expect("phase A").manifest;
+        assert_eq!(
+            phase_a.fields["product.output.volume"].disposition,
+            Disposition::Pending
+        );
+        let phase_b = lower_phase_b(&parsed, SPEC_PATH, &drafted_sidecar_text(), &phase_a)
+            .expect("phase B")
+            .manifest;
+        let row = &phase_b.fields["product.output.volume"];
+        assert_eq!(row.disposition, Disposition::Artifact);
+        assert_eq!(row.locations.len(), 1);
+        assert_eq!(row.locations[0].path, "models/revenue_daily.toml");
+        assert!(
+            row.locations[0].detail.contains("row_count_range"),
+            "{row:?}"
+        );
+        // Without a volume there is no row, so totality still holds.
+        let plain = lower_phase_a(&parsed_d3(), SPEC_PATH)
+            .expect("phase A")
+            .manifest;
+        assert!(!plain.fields.contains_key("product.output.volume"));
     }
 }

@@ -572,6 +572,7 @@ mod tests {
     ) -> ModelExecution {
         let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
         ModelExecution {
+            row_count: None,
             model_name: name.to_string(),
             started_at: now,
             finished_at: now + chrono::Duration::milliseconds(duration_ms as i64),

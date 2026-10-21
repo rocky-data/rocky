@@ -737,6 +737,7 @@ mod tests {
             finished_at: Utc::now() + chrono::Duration::seconds(30),
             status: RunStatus::Success,
             models_executed: vec![ModelExecution {
+                row_count: None,
                 model_name: "orders".to_string(),
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
@@ -978,6 +979,7 @@ mod tests {
 
     fn make_exec(duration_ms: u64, rows_affected: Option<u64>, status: &str) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: "orders".to_string(),
             started_at: Utc::now(),
             finished_at: Utc::now(),

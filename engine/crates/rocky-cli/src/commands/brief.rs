@@ -1795,6 +1795,7 @@ mod tests {
 
     fn exec(name: &str, status: &str) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: name.to_string(),
             started_at: ts(1),
             finished_at: ts(1),

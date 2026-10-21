@@ -259,6 +259,7 @@ mod tests {
 
     fn exec(name: &str, start: chrono::DateTime<chrono::Utc>, dur_ms: i64) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: name.to_string(),
             started_at: start,
             finished_at: start + ChronoDuration::milliseconds(dur_ms),

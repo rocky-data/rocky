@@ -443,7 +443,7 @@ export type { RetentionStatusOutput } from "./retention_status";
 export type { ReviewOutput } from "./review";
 export type { ReviewQueueOutput } from "./review_queue";
 export type { ReviewStatusOutput } from "./review_status";
-export type { BudgetBreachOutput, CheckResult, ContainedModelOutput, ExcludedTableOutput, ModelDecisionOutput, OverrideMatchCountOutput, OverrideWarningOutput, QuarantineOutput } from "./run";
+export type { BudgetBreachOutput, CheckResult, ContainedModelOutput, ExcludedTableOutput, ModelDecisionOutput, OverrideMatchCountOutput, OverrideWarningOutput, QuarantineOutput, VolumeCheckOutput } from "./run";
 export type { SeedOutput, SeedTableOutput } from "./seed";
 export type { RetentionSweepOutput } from "./state_retention_sweep";
 export type { ScheduleHoldOutput } from "./state_schedule_hold";

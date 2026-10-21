@@ -1827,6 +1827,7 @@ mod tests {
                     finished_at: now,
                     status: RunStatus::Success,
                     models_executed: vec![ModelExecution {
+                        row_count: None,
                         model_name: model.to_string(),
                         started_at: now,
                         finished_at: now,
@@ -3189,6 +3190,7 @@ mod tests {
                         finished_at: now,
                         status: RunStatus::Success,
                         models_executed: vec![ModelExecution {
+                            row_count: None,
                             model_name: model_name.clone(),
                             started_at: now,
                             finished_at: now,

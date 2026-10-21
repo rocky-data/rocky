@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, conint
 
 
 class ColumnSpec(BaseModel):
@@ -78,6 +78,76 @@ class FreshnessSpec(BaseModel):
     """
 
 
+class SourceSpec(BaseModel):
+    """
+    Grounding sources: exact `catalog.schema.table` triples only.
+
+    v0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    tables: list[str]
+    """
+    One or more exact table references.
+    """
+
+
+class TrustSpec(BaseModel):
+    """
+    The trust dial. `propose_only` is the only v0 value.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    agent: str
+    """
+    How much the agent may do unattended.
+    """
+
+
+class VolumeSeverity(StrEnum):
+    """
+    The model is marked failed after its build, and the run is partial.
+    """
+
+    error = "error"
+
+
+class VolumeSeverity5(StrEnum):
+    """
+    The run reports a warning, and delivery is recorded as usual.
+    """
+
+    warning = "warning"
+
+
+class VolumeSpec(BaseModel):
+    """
+    The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.
+
+    At least one bound is present. `min_rows = 0` alone counts as one.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_rows: conint(ge=0) | None = None
+    """
+    Most rows allowed (inclusive).
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    Fewest rows allowed (inclusive).
+    """
+    severity: VolumeSeverity | VolumeSeverity5 | None = None
+    """
+    `warning` (the default when omitted) or `error`.
+    """
+
+
 class OutputSpec(BaseModel):
     """
     The one output model and the guarantees around it.
@@ -112,35 +182,9 @@ class OutputSpec(BaseModel):
     """
     Model name; defaults to the product name when omitted.
     """
-
-
-class SourceSpec(BaseModel):
+    volume: VolumeSpec | None = None
     """
-    Grounding sources: exact `catalog.schema.table` triples only.
-
-    v0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    tables: list[str]
-    """
-    One or more exact table references.
-    """
-
-
-class TrustSpec(BaseModel):
-    """
-    The trust dial. `propose_only` is the only v0 value.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    agent: str
-    """
-    How much the agent may do unattended.
+    Optional row-count range the output must hold after a load.
     """
 
 

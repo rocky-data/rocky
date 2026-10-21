@@ -9,6 +9,10 @@
  * Severity of the observation-phase staleness report.
  */
 export type FreshnessSeverity = "error" | "warning";
+/**
+ * What an out-of-range row count does to the run.
+ */
+export type VolumeSeverity = "error" | "warning";
 
 /**
  * The whole document: an optional version pin plus `[product]`.
@@ -88,6 +92,10 @@ export interface OutputSpec {
    * Model name; defaults to the product name when omitted.
    */
   model?: string | null;
+  /**
+   * Optional row-count range the output must hold after a load.
+   */
+  volume?: VolumeSpec | null;
 }
 /**
  * One declared output column.
@@ -132,6 +140,25 @@ export interface FreshnessSpec {
    * Age above which the output reports `warn` (`"12h"`).
    */
   warn_after?: string | null;
+}
+/**
+ * The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.
+ *
+ * At least one bound is present. `min_rows = 0` alone counts as one.
+ */
+export interface VolumeSpec {
+  /**
+   * Most rows allowed (inclusive).
+   */
+  max_rows?: number | null;
+  /**
+   * Fewest rows allowed (inclusive).
+   */
+  min_rows?: number | null;
+  /**
+   * `warning` (the default when omitted) or `error`.
+   */
+  severity?: VolumeSeverity | null;
 }
 /**
  * Grounding sources: exact `catalog.schema.table` triples only.

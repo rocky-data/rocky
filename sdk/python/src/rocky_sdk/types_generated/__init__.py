@@ -335,6 +335,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "PromoteTarget": ("branch_promote_schema", "PromoteTarget"),
     "PromoteTargetPlan": ("plan_promote_schema", "PromoteTargetPlan"),
     "QuarantineOutput": ("run_schema", "QuarantineOutput"),
+    "VolumeCheckOutput": ("run_schema", "VolumeCheckOutput"),
     "RecipeExecutionRecord": ("recipe_history_schema", "RecipeExecutionRecord"),
     "RecipeHistoryOutput": ("recipe_history_schema", "RecipeHistoryOutput"),
     "RejectedApproval": ("branch_promote_schema", "RejectedApproval"),
@@ -574,6 +575,7 @@ if TYPE_CHECKING:
         RunOutput,
         TableCheckOutput,
         TableErrorOutput,
+        VolumeCheckOutput,
     )
     from .state_schema import (
         StateOutput,
@@ -1161,6 +1163,7 @@ __all__ = [
     "OverrideMatchCountOutput",
     "OverrideWarningOutput",
     "QuarantineOutput",
+    "VolumeCheckOutput",
     "DeclarativeTestResult",
     "ModelTestResult",
     "UnitTestResult",

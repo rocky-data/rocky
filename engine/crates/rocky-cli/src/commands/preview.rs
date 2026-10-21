@@ -3763,6 +3763,7 @@ mod tests {
     fn exec(name: &str, duration_ms: u64, rows: Option<u64>, bytes: Option<u64>) -> ModelExecution {
         let now = chrono::Utc::now();
         ModelExecution {
+            row_count: None,
             model_name: name.to_string(),
             started_at: now,
             finished_at: now + chrono::Duration::milliseconds(duration_ms as i64),

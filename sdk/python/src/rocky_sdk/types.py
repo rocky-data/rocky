@@ -232,6 +232,10 @@ class MaterializationInfo(BaseModel):
     #: Warehouse-side job identifiers for the SQL statements rocky issued.
     #: Empty for adapters without a job concept (DuckDB).
     job_ids: list[str] = Field(default_factory=list)
+    #: The product volume check on this output (``[product.output.volume]``),
+    #: present only on a production build of a product output that declares
+    #: one. ``None`` otherwise.
+    volume: VolumeCheckOutput | None = None
 
 
 class CheckResult(BaseModel):
@@ -535,6 +539,10 @@ class RunResult(BaseModel):
     #: physical reads serialized by a deterministic order, models whose SQL
     #: could not be parsed for table references, and colliding targets.
     scheduling_warnings: list[str] = Field(default_factory=list)
+    #: One line per product output whose row count fell outside its
+    #: ``[product.output.volume]`` range at ``warning`` severity. Empty when
+    #: none.
+    volume_warnings: list[str] = Field(default_factory=list)
     #: Soft warnings from the per-table override resolver — one entry per
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
@@ -1587,6 +1595,7 @@ from .types_generated.run_schema import (  # noqa: E402, F401
     OverrideWarningOutput,
     QuarantineOutput,
     RunCostSummary,
+    VolumeCheckOutput,
 )
 
 # Python-flavored bridge aliases for the DAG output types.

@@ -43,6 +43,7 @@ macro_rules! reference_bytes {
 
 fn exec(name: &str, start: chrono::DateTime<Utc>, dur_ms: i64) -> ModelExecution {
     ModelExecution {
+        row_count: None,
         model_name: name.to_string(),
         started_at: start,
         finished_at: start + chrono::Duration::milliseconds(dur_ms),

@@ -1335,6 +1335,7 @@ mod tests {
             status: &str,
         ) -> ModelExecution {
             ModelExecution {
+                row_count: None,
                 model_name: name.to_string(),
                 started_at: started,
                 finished_at: finished,

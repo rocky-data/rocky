@@ -6773,6 +6773,7 @@ mod tests {
                 finished_at: started + chrono::Duration::minutes(1),
                 status: RunStatus::Success,
                 models_executed: vec![ModelExecution {
+                    row_count: None,
                     model_name: "orders".to_string(),
                     started_at: started,
                     finished_at: started + chrono::Duration::seconds(10),

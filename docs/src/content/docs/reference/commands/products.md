@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. The one exception is the delivery deadline (below): the engine reads it from the spec itself, and nothing is lowered for it.
+A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. Two fields are also read from the spec itself by `rocky run`. The delivery deadline (below) lowers to nothing. The volume range (below) lowers to a test and is also checked after each production build.
 
 The verbs on this page are the deterministic half of spec fulfillment. They parse, verify, lower, and approve. The agent loop that drafts SQL is [`rocky fulfill`](/reference/commands/fulfill/), and it is gated by the same policy plane as every other agent action.
 
@@ -37,6 +37,36 @@ Each production `rocky run` that builds the product's output model records the d
 
 The scheduler status (`GET /api/v1/schedule`) derives a `latest_start` from each deadline for every scheduled pipeline that feeds it. It warns when a cron starts too late. See [the scheduler status](/guides/running-without-an-orchestrator/#the-resident-scheduler-rocky-serve---scheduler-experimental).
 
+### Volume range
+
+A product can say how many rows its output table should hold after a load. Add an optional table to `[product.output]`:
+
+```toml
+[product.output.volume]
+min_rows = 1_000         # optional, inclusive
+max_rows = 5_000_000     # optional, inclusive; at least one bound is required
+severity = "warning"     # "warning" (the default) or "error"
+```
+
+The count is the table's total rows (`SELECT COUNT(*)`), not the rows one load wrote. So the output model must be a full-refresh table. A total on an incremental, merge or partitioned table only grows, and a view stores no rows.
+
+The parser refuses a block with no bound (`volume-missing-bound`). `min_rows = 0` alone counts as a bound. It also refuses `min_rows` above `max_rows` (`volume-min-above-max`), a severity other than `warning` or `error` (`volume-severity-unknown`), an unknown key (`unknown-key`), and a negative or non-integer bound (`invalid-value`). The spec does not name the model's strategy, so `rocky product verify` checks it (`volume-strategy-unsupported`, below).
+
+The range lowers to one `row_count_range` test in the model sidecar, with the same bounds and severity. It replaces any `row_count_range` test the worker wrote, so the model has one range: the spec's. `rocky test --declarative` and `rocky run` then judge the same range.
+
+After each successful production build of the output model, `rocky run` counts the rows once, on the same warehouse connection:
+
+```
+build ok ──▶ COUNT(*) ──▶ in range ────────────▶ in_range
+                │      ├─▶ out of range, warning ─▶ a `volume_warnings` line; delivery as usual
+                │      └─▶ out of range, error ───▶ the model is marked failed
+                └─ count failed or cancelled ──────▶ not_evaluated (never a failure)
+```
+
+At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A non-full-refresh output reaching `rocky run` is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
+
+The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records `row_count` in its history, and `rocky product status` reports it.
+
 ---
 
 ## `rocky product verify`
@@ -47,11 +77,12 @@ Check that a product may be fulfilled, without writing anything.
 rocky product verify revenue_daily
 ```
 
-Three checks run in order, fail-closed:
+Four checks run in order, fail-closed:
 
 1. **Trust posture.** `rocky.toml` must carry the frozen `propose_only` posture: a `[policy]` block with `default_agent_effect = "require_review"`, an agent `propose` rule that resolves `allow` and is scoped to exactly this product's output model (no `any`, no glob, no extra predicates, no autonomy budget), and agent `apply` resolving `require_review` or `deny`. A policy that merely *happens* to resolve safely is rejected — authority that reaches past the product is global agent authority. The verdicts come from the engine's own policy evaluator, run against the attributes the lowering is *about to create* (the post-image), so the gate cannot be evaded by the change under review.
 2. **Classification tags.** Every tag in `output.classifications` must resolve to a `[mask]` strategy, a `[mask.<env>]` override, or `[classifications].allow_unmasked`. This is an error here; plain `rocky compile` only warns (W004). Resolution only: whether masking is applied is warehouse-dependent.
 3. **Identity collisions.** The product name must not be claimed by another spec file, and the output model must not be claimed by another product.
+4. **Volume strategy.** When the spec declares `[product.output.volume]` and `models/<model>.sql` and `models/<model>.toml` exist, the model must be a full-refresh table (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted there is nothing to check; the Phase-B compile runs this check again.
 
 Exit codes: `0` pass · `1` needs input (a paste-ready `[policy]` block is printed) · `2` fail.
 
@@ -72,7 +103,7 @@ rocky product compile revenue_daily
 Lowering runs in two phases because the drafting tool rewrites the model sidecar wholesale — metadata lowered before drafting would be destroyed:
 
 - **Phase A** (before drafting) renders `models/<model>.contract.toml` — the spec-owned contract the draft must compile against.
-- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check). The worker's `name`, `intent`, and appended tests survive.
+- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check, one `row_count_range` for a declared volume). The worker's `name`, `intent`, and appended tests survive, except a worker `row_count_range` when the spec declares a volume.
 
 The command picks the phase itself: Phase A on a fresh product, Phase B once `models/<model>.toml` exists. Re-running is safe — the merge is idempotent.
 
@@ -148,6 +179,14 @@ When the spec declares `deliver_by`, status also reports `delivery`:
 | `estimate` | `state` (`known` or `unknown`), `n`, `window` (20), `p50_ms`, `p90_ms`, `growth`. |
 
 The estimate times each of the last 20 successful production deliveries from run start to the output model's finish. With fewer than 5, it is `unknown` and gives no verdict. From 10 runs on, when the newest 5 all ran slower than the p90 of the older ones, `growth` is `true` and `p90_ms` is the slowest of those 5.
+
+When the spec declares `[product.output.volume]`, status also reports `volume`:
+
+| Field | Meaning |
+|---|---|
+| `min_rows`, `max_rows`, `severity` | The declared range and severity. |
+| `row_count`, `counted_at`, `run_id` | The newest production build that recorded a count, whatever its status. A build an `error` breach marked failed still shows its count. Absent until a build is counted. |
+| `verdict` | That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when there is no count. |
 
 ### JSON output
 

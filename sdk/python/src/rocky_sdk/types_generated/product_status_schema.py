@@ -63,6 +63,54 @@ class ProductApprovalOutput(BaseModel):
     """
 
 
+class VolumeSeverity1(StrEnum):
+    """
+    The model is marked failed after its build, and the run is partial.
+    """
+
+    error = "error"
+
+
+class VolumeSeverity2(StrEnum):
+    """
+    The run reports a warning, and delivery is recorded as usual.
+    """
+
+    warning = "warning"
+
+
+class VolumeVerdict1(StrEnum):
+    """
+    The count is inside the range.
+    """
+
+    in_range = "in_range"
+
+
+class VolumeVerdict2(StrEnum):
+    """
+    The count is below `min_rows`.
+    """
+
+    below_min = "below_min"
+
+
+class VolumeVerdict3(StrEnum):
+    """
+    The count is above `max_rows`.
+    """
+
+    above_max = "above_max"
+
+
+class VolumeVerdict4(StrEnum):
+    """
+    No count was taken, or it could not be read. Never a failure.
+    """
+
+    not_evaluated = "not_evaluated"
+
+
 class DurationEstimateStatus(BaseModel):
     """
     A p50/p90 duration estimate and the sample behind it.
@@ -95,6 +143,41 @@ class DurationEstimateStatus(BaseModel):
     window: conint(ge=0)
     """
     The most runs it reads (the newest 20).
+    """
+
+
+class ProductVolumeStatus(BaseModel):
+    """
+    The declared volume range and the latest production count.
+    """
+
+    counted_at: AwareDatetime | None = None
+    """
+    When that build finished.
+    """
+    max_rows: conint(ge=0) | None = None
+    """
+    The declared `max_rows` (inclusive), when set.
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    The declared `min_rows` (inclusive), when set.
+    """
+    row_count: conint(ge=0) | None = None
+    """
+    The newest production build that recorded a count. Absent when no build has been counted yet.
+    """
+    run_id: str | None = None
+    """
+    The run that took the count.
+    """
+    severity: VolumeSeverity1 | VolumeSeverity2
+    """
+    The declared severity: `warning` (the default) or `error`.
+    """
+    verdict: VolumeVerdict1 | VolumeVerdict2 | VolumeVerdict3 | VolumeVerdict4
+    """
+    That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
     """
 
 
@@ -222,3 +305,7 @@ class ProductStatusOutput(BaseModel):
     Whether an uncommitted staging journal is pending. Status never mutates; the next compile resolves it.
     """
     version: str
+    volume: ProductVolumeStatus | None = None
+    """
+    Volume state, when the spec declares `[product.output.volume]`: the declared range and the latest production count judged against it.
+    """

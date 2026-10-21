@@ -423,6 +423,12 @@ pub struct RunOutput {
     /// targets. Empty (and omitted) when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduling_warnings: Vec<String>,
+    /// One line per product output whose row count fell outside its
+    /// declared `[product.output.volume]` range at `warning` severity.
+    /// An `error`-severity breach is in `errors` instead. Empty (and
+    /// omitted) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_warnings: Vec<String>,
     /// Soft warnings raised by the per-table override resolver — one
     /// entry per `[[table_overrides]]` rule that matched zero
     /// `(connector, table)` pairs this run, or whose connector half
@@ -1416,6 +1422,52 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub stored_bytes: Option<rocky_core::state::StoredBytes>,
+    /// The product volume check on this output, when a product declares
+    /// `[product.output.volume]` for the model and this was a production
+    /// build. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeCheckOutput>,
+}
+
+/// The row count `rocky run` took on a product output after its build,
+/// judged against the product's `[product.output.volume]`.
+///
+/// The count is the table's total rows (`SELECT COUNT(*)`), not the rows
+/// this load wrote. Only a full-refresh output is counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VolumeCheckOutput {
+    /// The product that declares the range.
+    pub product: String,
+    /// The Rocky model counted: the product's output model.
+    pub model: String,
+    /// The table's total rows after the build. Absent when no count was
+    /// taken or it could not be read (`verdict = "not_evaluated"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// The declared `min_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity: `warning` (the default) or `error`.
+    pub severity: rocky_core::product::spec::VolumeSeverity,
+    /// `in_range`, `below_min`, `above_max`, or `not_evaluated`.
+    /// `not_evaluated` is never a failure.
+    pub verdict: rocky_core::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`, or what an out-of-range count
+    /// means for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl VolumeCheckOutput {
+    /// True when this check marks its model failed: an out-of-range count
+    /// at `error` severity.
+    pub fn fails_the_model(&self) -> bool {
+        self.severity == rocky_core::product::spec::VolumeSeverity::Error
+            && self.verdict.is_out_of_range()
+    }
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -6251,6 +6303,7 @@ impl RunOutput {
             idempotency_key: None,
             pipeline_type: Some("replication".to_string()),
             scheduling_warnings: Vec::new(),
+            volume_warnings: Vec::new(),
             filter,
             duration_ms,
             tables_copied: 0,
@@ -6527,7 +6580,20 @@ impl RunOutput {
                 finished_at: model_finished,
                 duration_ms,
                 rows_affected: mat.rows_copied,
-                status: "success".to_string(),
+                // An error-severity volume breach marks the build failed
+                // after the fact: the table is written, but it is not a
+                // success, a delivery, or a skip baseline. This is the one
+                // execution for the model; its `errors` entry is not
+                // recorded again below.
+                status: if mat
+                    .volume
+                    .as_ref()
+                    .is_some_and(VolumeCheckOutput::fails_the_model)
+                {
+                    "failed".to_string()
+                } else {
+                    "success".to_string()
+                },
                 sql_hash: mat.metadata.sql_hash.clone().unwrap_or_default(),
                 // State-internal skip-gate inputs, populated on a successful
                 // build by the `--skip-unchanged` gate via `skip_internal`.
@@ -6579,8 +6645,19 @@ impl RunOutput {
                 // The output table's stored bytes, measured at the execution
                 // site right after the write. `None` is unknown.
                 stored_bytes: mat.stored_bytes,
+                row_count: mat.volume.as_ref().and_then(|v| v.row_count),
             });
         }
+
+        // Models whose materialization above already records the volume
+        // failure. Their `errors` entry would be a second execution.
+        let volume_failed: std::collections::BTreeSet<&str> = self
+            .materializations
+            .iter()
+            .filter_map(|mat| mat.volume.as_ref())
+            .filter(|volume| volume.fails_the_model())
+            .map(|volume| volume.model.as_str())
+            .collect();
 
         for err in &self.errors {
             let model_name = err
@@ -6588,7 +6665,11 @@ impl RunOutput {
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());
+            if volume_failed.contains(model_name.as_str()) {
+                continue;
+            }
             models.push(rocky_core::state::ModelExecution {
+                row_count: None,
                 model_name,
                 started_at,
                 finished_at,
@@ -8426,6 +8507,7 @@ mod cost_finalize_tests {
 
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
+            volume: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -8725,6 +8807,7 @@ mod run_record_tests {
         started_at: DateTime<Utc>,
     ) -> MaterializationOutput {
         MaterializationOutput {
+            volume: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),

@@ -472,6 +472,7 @@ fn test_run_history_flow() {
         status: RunStatus::Success,
         models_executed: vec![
             ModelExecution {
+                row_count: None,
                 model_name: "orders".to_string(),
                 started_at: now,
                 finished_at: now,
@@ -498,6 +499,7 @@ fn test_run_history_flow() {
                 wait_for_upstream_ms: None,
             },
             ModelExecution {
+                row_count: None,
                 model_name: "customers".to_string(),
                 started_at: now,
                 finished_at: now,
@@ -2157,6 +2159,7 @@ mod delivery_timing_e2e {
             finished_at: model_finished,
             status: RunStatus::Success,
             models_executed: vec![ModelExecution {
+                row_count: None,
                 model_name: "revenue_daily".to_string(),
                 started_at: model_started,
                 finished_at: model_finished,

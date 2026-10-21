@@ -633,6 +633,54 @@ class TestSeverity8(StrEnum):
     warning = "warning"
 
 
+class VolumeSeverity6(StrEnum):
+    """
+    The model is marked failed after its build, and the run is partial.
+    """
+
+    error = "error"
+
+
+class VolumeSeverity7(StrEnum):
+    """
+    The run reports a warning, and delivery is recorded as usual.
+    """
+
+    warning = "warning"
+
+
+class VolumeVerdict5(StrEnum):
+    """
+    The count is inside the range.
+    """
+
+    in_range = "in_range"
+
+
+class VolumeVerdict6(StrEnum):
+    """
+    The count is below `min_rows`.
+    """
+
+    below_min = "below_min"
+
+
+class VolumeVerdict7(StrEnum):
+    """
+    The count is above `max_rows`.
+    """
+
+    above_max = "above_max"
+
+
+class VolumeVerdict8(StrEnum):
+    """
+    No count was taken, or it could not be read. Never a failure.
+    """
+
+    not_evaluated = "not_evaluated"
+
+
 class CheckResult1(BaseModel):
     """
     Row count comparison between source and target tables.
@@ -871,6 +919,60 @@ class Diagnostic(BaseModel):
     """
 
 
+class TableCheckOutput(BaseModel):
+    asset_key: list[str]
+    checks: list[
+        CheckResult1
+        | CheckResult2
+        | CheckResult3
+        | CheckResult4
+        | CheckResult5
+        | CheckResult6
+        | CheckResult7
+    ]
+
+
+class VolumeCheckOutput(BaseModel):
+    """
+    The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.
+
+    The count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.
+    """
+
+    max_rows: conint(ge=0) | None = None
+    """
+    The declared `max_rows` (inclusive), when set.
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    The declared `min_rows` (inclusive), when set.
+    """
+    model: str
+    """
+    The Rocky model counted: the product's output model.
+    """
+    product: str
+    """
+    The product that declares the range.
+    """
+    reason: str | None = None
+    """
+    Why the verdict is `not_evaluated`, or what an out-of-range count means for the run.
+    """
+    row_count: conint(ge=0) | None = None
+    """
+    The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+    """
+    severity: VolumeSeverity6 | VolumeSeverity7
+    """
+    The declared severity: `warning` (the default) or `error`.
+    """
+    verdict: VolumeVerdict5 | VolumeVerdict6 | VolumeVerdict7 | VolumeVerdict8
+    """
+    `in_range`, `below_min`, `above_max`, or `not_evaluated`. `not_evaluated` is never a failure.
+    """
+
+
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
     attempts: list[AttemptRecord] | None = None
@@ -916,19 +1018,10 @@ class MaterializationOutput(BaseModel):
     """
     Tenant this materialization is attributed to, taken from the discover-time schema-pattern `{tenant}` component. Present only for replication pipelines whose schema pattern declares a `{tenant}` placeholder; transformation / `time_interval` models and non-tenant patterns leave it `None`. Carried onto the persisted `rocky_core::state::ModelExecution` by [`RunOutput::to_run_record`] so `rocky cost --by tenant` can roll per-model cost up to a tenant dimension. Omitted from JSON when `None` so non-tenant outputs stay byte-identical.
     """
-
-
-class TableCheckOutput(BaseModel):
-    asset_key: list[str]
-    checks: list[
-        CheckResult1
-        | CheckResult2
-        | CheckResult3
-        | CheckResult4
-        | CheckResult5
-        | CheckResult6
-        | CheckResult7
-    ]
+    volume: VolumeCheckOutput | None = None
+    """
+    The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
+    """
 
 
 class RunOutput(BaseModel):
@@ -1067,3 +1160,7 @@ class RunOutput(BaseModel):
     Like `check_gate_failed`, an admitted resume inherits it: the resume re-runs `verify_after` only for drift IT auto-applies, so an earlier unverified migration is never re-examined. Omitted from the JSON when `false`, so a run that verified cleanly is unchanged on the wire.
     """
     version: str
+    volume_warnings: list[str] | None = None
+    """
+    One line per product output whose row count fell outside its declared `[product.output.volume]` range at `warning` severity. An `error`-severity breach is in `errors` instead. Empty (and omitted) when none.
+    """

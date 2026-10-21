@@ -368,9 +368,11 @@ pub enum UnevaluableCause {
     /// lowering emits it in both arms. What has no spelling is
     /// uniqueness that is not the grain: a `unique` on some other
     /// column, a second one, or a `composite` whose `kind` is not
-    /// `unique`. Alongside it: another typed shape
-    /// (`row_count_range`, `accepted_values`, `in_range`,
-    /// `regex_match`, `relationships`), a `warning` severity, a
+    /// `unique`. A `row_count_range` is spellable through
+    /// `[product.output.volume]`, which also carries its severity.
+    /// Alongside the non-grain uniqueness: another typed shape
+    /// (`accepted_values`, `in_range`, `regex_match`,
+    /// `relationships`), a `warning` severity on any other test, a
     /// `filter`, or a `[[use_test]]` reference. For those the restore
     /// is the whole remedy. Pinned from the lowering side by
     /// `spec_checks_lower_only_to_error_severity_expression_tests` and
@@ -1963,9 +1965,10 @@ fn decide_observation_checks(
             // The spec route is also QUALIFIED, because it does not fit
             // every divergence. `output.checks` is a list of opaque SQL
             // boolean strings and the lowering turns each one into an
-            // `expression` test at `severity = "error"` — so a changed
-            // `row_count_range`, a `warning` severity, a `filter`, or a
-            // `[[use_test]]` reference has no spec spelling at all.
+            // `expression` test at `severity = "error"` — so a
+            // `warning` severity, a `filter`, or a `[[use_test]]`
+            // reference has no spec spelling through `checks`. (A
+            // `row_count_range` does: `[product.output.volume]`.)
             // Naming `checks` bare told an operator to carry a change
             // the field cannot hold, which is the same defect as naming
             // a command that cannot run. See `UnevaluableCause` for the
@@ -1998,11 +2001,14 @@ fn decide_observation_checks(
                      error-severity `expression` test, a not-null comes from an \
                      `output.columns` entry with `nullable = false`, and `output.grain` \
                      lowers to exactly one uniqueness check — `unique` on a single grain \
-                     column, or `composite` with `kind = \"unique\"` over several. Anything \
-                     else has no spec spelling: a uniqueness check that is not the declared \
-                     grain, another typed shape such as `row_count_range`, a `warning` \
-                     severity, a `filter`, or a `[[use_test]]` reference. For those the \
-                     restore is the whole remedy"
+                     column, or `composite` with `kind = \"unique\"` over several. A \
+                     `row_count_range` comes from `[product.output.volume]` (`min_rows`, \
+                     `max_rows`, `severity`), the only spec route that can carry a `warning` \
+                     severity, and only for that one range. Anything else has no spec \
+                     spelling: a uniqueness check that is not the declared grain, another \
+                     typed shape such as `accepted_values`, a `warning` severity on any other \
+                     test, a `filter`, or a `[[use_test]]` reference. For those the restore \
+                     is the whole remedy"
                         .to_string(),
                 ),
                 // Named, not folded in with the bare re-run. Re-running
@@ -4840,12 +4846,27 @@ mod tests {
             at("has no spec spelling") < at("the restore is the whole remedy"),
             "with the honest fallback stated right after them: {message}"
         );
-        for shape in ["row_count_range", "`warning` severity", "`filter`"] {
+        for shape in ["`accepted_values`", "`warning` severity", "`filter`"] {
             assert!(
                 message.contains(shape),
                 "each unrepresentable shape is named — {shape} is missing: {message}"
             );
         }
+        // `row_count_range` HAS a spec route now (`output.volume`, pinned
+        // in rocky-core's lowering test), so it is named as spellable,
+        // before the refusal, never inside the unspellable list.
+        assert!(
+            message.contains("A `row_count_range` comes from `[product.output.volume]`"),
+            "the volume route is named: {message}"
+        );
+        assert!(
+            at("`row_count_range` comes from") < at("has no spec spelling"),
+            "and stated as a route, not as a refusal: {message}"
+        );
+        assert!(
+            !message[at("has no spec spelling")..].contains("row_count_range"),
+            "row_count_range is not listed as unspellable: {message}"
+        );
 
         // AND THE QUALIFICATION IS ITSELF QUALIFIED — the same defect
         // with the sign flipped. Fixing the over-claim produced an

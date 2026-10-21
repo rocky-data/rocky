@@ -428,6 +428,10 @@ const COVERED_LEAF_FIELDS: &[(&str, &[&str])] = &[
             "warn_after",
         ],
     ),
+    (
+        "product.output.volume",
+        &["max_rows", "min_rows", "severity"],
+    ),
 ];
 
 /// The declared leaf coverage, as a map.
@@ -668,6 +672,9 @@ pub fn spec_field_paths(spec: &SpecFile) -> BTreeSet<String> {
         paths.insert("product.output.freshness".to_string());
     }
     paths.insert("product.output.classifications".to_string());
+    if spec.product.output.volume.is_some() {
+        paths.insert("product.output.volume".to_string());
+    }
     paths.insert("product.trust.agent".to_string());
     if spec.product.deliver_by.is_some() {
         paths.insert("product.deliver_by".to_string());
@@ -889,6 +896,7 @@ columns = [{ name = "id", type = "Int64", nullable = false }]
 checks = ["id > 0"]
 freshness = { max_lag = "24h", time_column = "id", severity = "error" }
 classifications = { id = "pii" }
+volume = { min_rows = 0, max_rows = 10, severity = "error" }
 
 [product.trust]
 agent = "propose_only"
@@ -924,6 +932,7 @@ agent = "propose_only"
         let parsed = parse(MINIMAL);
         let paths = spec_field_paths(&parsed.spec);
         assert!(!paths.contains("product.output.freshness"));
+        assert!(!paths.contains("product.output.volume"));
         assert!(!paths.contains("spec_version"));
         assert!(!paths.contains("product.output.model"));
         // An empty declaration is a disposition, not a silence.
@@ -935,6 +944,7 @@ agent = "propose_only"
     fn field_paths_include_present_optionals() {
         let paths = spec_field_paths(&parse(MAXIMAL).spec);
         assert!(paths.contains("product.output.freshness"));
+        assert!(paths.contains("product.output.volume"));
         assert!(paths.contains("spec_version"));
         assert!(paths.contains("product.output.model"));
     }

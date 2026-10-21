@@ -13,6 +13,14 @@ export type EstimateBasis = "model_delivery" | "pipeline_run";
  * Whether a duration estimate has enough runs to judge from.
  */
 export type EstimateState = "known" | "unknown";
+/**
+ * What an out-of-range row count does to the run.
+ */
+export type VolumeSeverity = "error" | "warning";
+/**
+ * The outcome of one volume check.
+ */
+export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evaluated";
 
 /**
  * JSON output of `rocky product status`.
@@ -84,6 +92,10 @@ export interface ProductStatusOutput {
    */
   staging_journal_present: boolean;
   version: string;
+  /**
+   * Volume state, when the spec declares `[product.output.volume]`: the declared range and the latest production count judged against it.
+   */
+  volume?: ProductVolumeStatus | null;
   [k: string]: unknown;
 }
 /**
@@ -192,5 +204,39 @@ export interface DurationEstimateStatus {
    * The most runs it reads (the newest 20).
    */
   window: number;
+  [k: string]: unknown;
+}
+/**
+ * The declared volume range and the latest production count.
+ */
+export interface ProductVolumeStatus {
+  /**
+   * When that build finished.
+   */
+  counted_at?: string | null;
+  /**
+   * The declared `max_rows` (inclusive), when set.
+   */
+  max_rows?: number | null;
+  /**
+   * The declared `min_rows` (inclusive), when set.
+   */
+  min_rows?: number | null;
+  /**
+   * The newest production build that recorded a count. Absent when no build has been counted yet.
+   */
+  row_count?: number | null;
+  /**
+   * The run that took the count.
+   */
+  run_id?: string | null;
+  /**
+   * The declared severity: `warning` (the default) or `error`.
+   */
+  severity: VolumeSeverity;
+  /**
+   * That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
+   */
+  verdict: VolumeVerdict;
   [k: string]: unknown;
 }

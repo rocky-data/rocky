@@ -829,6 +829,17 @@
             "string",
             "null"
           ]
+        },
+        "volume": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VolumeCheckOutput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise."
         }
       },
       "required": [
@@ -1485,6 +1496,128 @@
           "type": "string"
         }
       ]
+    },
+    "VolumeCheckOutput": {
+      "description": "The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.\n\nThe count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.",
+      "properties": {
+        "max_rows": {
+          "description": "The declared `max_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "The declared `min_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The Rocky model counted: the product's output model.",
+          "type": "string"
+        },
+        "product": {
+          "description": "The product that declares the range.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the verdict is `not_evaluated`, or what an out-of-range count means for the run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "row_count": {
+          "description": "The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = \"not_evaluated\"`).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeSeverity"
+            }
+          ],
+          "description": "The declared severity: `warning` (the default) or `error`."
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeVerdict"
+            }
+          ],
+          "description": "`in_range`, `below_min`, `above_max`, or `not_evaluated`. `not_evaluated` is never a failure."
+        }
+      },
+      "required": [
+        "model",
+        "product",
+        "severity",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "VolumeSeverity": {
+      "description": "What an out-of-range row count does to the run.",
+      "oneOf": [
+        {
+          "description": "The model is marked failed after its build, and the run is partial.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run reports a warning, and delivery is recorded as usual.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "VolumeVerdict": {
+      "description": "The outcome of one volume check.",
+      "oneOf": [
+        {
+          "description": "The count is inside the range.",
+          "enum": [
+            "in_range"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The count is below `min_rows`.",
+          "enum": [
+            "below_min"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The count is above `max_rows`.",
+          "enum": [
+            "above_max"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No count was taken, or it could not be read. Never a failure.",
+          "enum": [
+            "not_evaluated"
+          ],
+          "type": "string"
+        }
+      ]
     }
   },
   "description": "JSON output for `rocky run`.",
@@ -1711,6 +1844,13 @@
     },
     "version": {
       "type": "string"
+    },
+    "volume_warnings": {
+      "description": "One line per product output whose row count fell outside its declared `[product.output.volume]` range at `warning` severity. An `error`-severity breach is in `errors` instead. Empty (and omitted) when none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [

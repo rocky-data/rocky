@@ -287,6 +287,7 @@ pub(crate) mod tests {
 
     fn exec(name: &str, status: &str, target: Option<(&str, &str)>) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: name.to_string(),
             started_at: Utc.timestamp_opt(1, 0).unwrap(),
             finished_at: Utc.timestamp_opt(2, 0).unwrap(),

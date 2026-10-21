@@ -347,6 +347,7 @@ mod tests {
 
     fn sample_mat() -> MaterializationOutput {
         MaterializationOutput {
+            volume: None,
             asset_key: vec!["main".into(), "orders".into()],
             notes: vec![],
             rows_copied: None,

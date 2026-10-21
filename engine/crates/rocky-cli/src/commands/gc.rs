@@ -2523,6 +2523,7 @@ auto_create_schemas = true
     fn record_run(store: &StateStore, run_id: &str, model: &str) {
         let now = Utc::now();
         let exec = ModelExecution {
+            row_count: None,
             model_name: model.to_string(),
             started_at: now,
             finished_at: now,

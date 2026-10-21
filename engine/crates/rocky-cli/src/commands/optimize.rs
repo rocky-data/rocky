@@ -337,6 +337,7 @@ mod tests {
 
     fn make_exec(model_name: &str, duration_ms: u64, bytes_written: Option<u64>) -> ModelExecution {
         ModelExecution {
+            row_count: None,
             model_name: model_name.to_string(),
             started_at: Utc::now(),
             finished_at: Utc::now(),

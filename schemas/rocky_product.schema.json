@@ -140,6 +140,17 @@
             "string",
             "null"
           ]
+        },
+        "volume": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VolumeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional row-count range the output must hold after a load."
         }
       },
       "required": [
@@ -237,6 +248,61 @@
       "required": [
         "agent"
       ],
+      "type": "object"
+    },
+    "VolumeSeverity": {
+      "description": "What an out-of-range row count does to the run.",
+      "oneOf": [
+        {
+          "description": "The model is marked failed after its build, and the run is partial.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run reports a warning, and delivery is recorded as usual.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "VolumeSpec": {
+      "additionalProperties": false,
+      "description": "The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.\n\nAt least one bound is present. `min_rows = 0` alone counts as one.",
+      "properties": {
+        "max_rows": {
+          "description": "Most rows allowed (inclusive).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "Fewest rows allowed (inclusive).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VolumeSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`warning` (the default when omitted) or `error`."
+        }
+      },
       "type": "object"
     }
   },

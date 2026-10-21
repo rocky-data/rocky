@@ -2146,6 +2146,7 @@ mod tests {
         let models_executed: Vec<ModelExecution> = models
             .into_iter()
             .map(|(name, status)| ModelExecution {
+                row_count: None,
                 model_name: name.to_string(),
                 started_at: now,
                 finished_at: now,
@@ -2978,6 +2979,7 @@ mod tests {
                 finished_at: now,
                 status: RunStatus::Success,
                 models_executed: vec![ModelExecution {
+                    row_count: None,
                     model_name: model_ir.name.to_string(),
                     started_at: now,
                     finished_at: now,
