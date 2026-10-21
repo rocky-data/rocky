@@ -139,6 +139,7 @@ def rocky_source_sensor(
     tenant_component: str | None = None,
     tenant_partitions_name: str | None = None,
     sync_partitions_from_discover: bool = True,
+    include_rocky_triggered: bool = False,
 ) -> dg.SensorDefinition:
     """Build a Dagster sensor that watches Rocky sources for new syncs.
 
@@ -196,6 +197,19 @@ def rocky_source_sensor(
         on_skip: Optional best-effort callback fired when the tick has
             no advancing sources. Same exception-swallowing contract as
             ``on_run_request_emitted``.
+        include_rocky_triggered: When the Rocky pipeline starts its own
+            source syncs (``rocky discover`` reports ``sync_trigger: true``,
+            from ``[...discovery.sync] trigger = true``), the sensor stands
+            down by default: Rocky advances each connector's ``last_sync_at``
+            itself, so reacting to it would start a second run for every
+            sync. It still advances the cursor, emits no ``RunRequest`` and
+            skips the tick with a reason. Pass ``True`` to keep reacting.
+            The cost of standing down: a sync that Fivetran starts on its own
+            schedule no longer fires this sensor either; the next Rocky run
+            picks it up. To get the sensor back, set ``trigger = false`` in
+            ``rocky.toml``; ``rocky run --no-sync-trigger`` does not change
+            what ``rocky discover`` reports. An older ``rocky`` binary sends
+            no ``sync_trigger``, so the sensor behaves as before.
 
     Returns:
         A :class:`dagster.SensorDefinition` ready to add to a ``Definitions``
@@ -268,6 +282,12 @@ def rocky_source_sensor(
                 except Exception:
                     context.log.warning("on_failed_sources hook raised", exc_info=True)
 
+        # The pipeline starts its own syncs: its `last_sync_at` moves because
+        # Rocky ran a sync for a run that is already under way, so a
+        # RunRequest here would be a second run per sync. Advance the cursor,
+        # emit nothing.
+        stand_down = bool(getattr(result, "sync_trigger", False)) and not include_rocky_triggered
+
         triggered: list[SourceInfo] = []
         new_cursor = dict(cursor_data)
         for source in result.sources:
@@ -276,11 +296,16 @@ def rocky_source_sensor(
             sync_iso = source.last_sync_at.isoformat()
             last_seen_iso = cursor_data.get(source.id)
             if last_seen_iso is None or _iso_before(last_seen_iso, sync_iso):
-                triggered.append(source)
+                if not stand_down:
+                    triggered.append(source)
                 new_cursor[source.id] = sync_iso
 
         if not triggered:
-            skip_reason = "No Rocky sources have synced since the last tick"
+            skip_reason = (
+                "The Rocky pipeline starts its own syncs (sync_trigger); the sensor stands down"
+                if stand_down
+                else "No Rocky sources have synced since the last tick"
+            )
             # FR-016: best-effort observability hook for the no-advance skip.
             if on_skip is not None:
                 try:

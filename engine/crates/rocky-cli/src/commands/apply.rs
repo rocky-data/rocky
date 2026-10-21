@@ -1209,7 +1209,7 @@ async fn execute_run_plan(
             state_path,
             output_json,
             &partition_opts,
-            &crate::commands::run::SkipRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::for_apply(),
             // Shadow routing IS part of a persisted plan's contract: the plan
             // captures `shadow` / `shadow_suffix` / `shadow_schema` / `branch`,
             // and `shadow_config` above is reconstructed from them for exactly
@@ -1324,7 +1324,7 @@ async fn execute_run_plan(
         &crate::commands::run::DeferOptions::default(),
         // The skip gate is a runtime-only `rocky run` overlay, not persisted
         // on the plan; the two-step path builds every planned model.
-        &crate::commands::run::SkipRunOptions::default(),
+        &crate::commands::run::SkipRunOptions::for_apply(),
         // Per-run `--var` values are not persisted on the plan; an
         // `@var()` model would compile-error on a two-step apply.
         &rocky_core::run_vars::RunVars::new(),
@@ -6048,7 +6048,8 @@ async fn run_apply_replication_plan(
         // Replication apply never runs transformation models; defer is moot.
         &crate::commands::run::DeferOptions::default(),
         // The skip gate only applies to transformation models; inert here.
-        &crate::commands::run::SkipRunOptions::default(),
+        // The source-sync phase is off: apply never waits for or starts a sync.
+        &crate::commands::run::SkipRunOptions::for_apply(),
         // Replication apply runs no transformation models; vars are inert.
         &rocky_core::run_vars::RunVars::new(),
         Some(&apply_run_id),
@@ -7323,6 +7324,90 @@ mod tests {
         assert!(
             seeded.is_none(),
             "the apply must not have materialized the production seed table"
+        );
+    }
+
+    /// Apply never runs a source-sync phase (neither wait nor trigger): the
+    /// reviewer of a plan did not see one. The config asks for both, and the
+    /// source never finishes, so a phase would poll and request. `rocky run`
+    /// on the same shape does (see `run_source_sync`), so the zeros below are
+    /// not a source that never answers.
+    ///
+    /// Mutation check: dropping `skip_opts.no_source_sync` and the
+    /// `run_id_override` term from the gate in `run_with_explicit_contracts`
+    /// makes the apply poll the source, and the first assertion fails.
+    #[tokio::test]
+    async fn a_run_plan_apply_makes_no_source_sync_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = root.join("calls").display().to_string();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.default]\ntype = \"recording\"\npath = \"{key}\"\n\n\
+                 [adapter.src]\ntype = \"test-sync-source\"\npath = \"{key}\"\n\n\
+                 [pipeline.ingest]\nstrategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest.source.discovery]\nadapter = \"src\"\n\n\
+                 [pipeline.ingest.source.discovery.sync]\nwait = true\n\
+                 trigger = true\nwait_timeout_secs = 1\npoll_interval_secs = 10\n\n\
+                 [pipeline.ingest.source.schema_pattern]\nprefix = \"raw__\"\n\
+                 separator = \"__\"\ncomponents = [\"source\"]\n\n\
+                 [pipeline.ingest.target]\nadapter = \"default\"\n\
+                 catalog_template = \"fixture\"\nschema_template = \"staging\"\n\n\
+                 [pipeline.ingest.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n"
+            ),
+        )
+        .unwrap();
+        let source = crate::testing::sync_source(&key);
+        // A sync that never ends: a wait would run to its timeout and fail.
+        source.script(vec![vec![rocky_core::source_sync::SourceSyncState {
+            id: "c1".into(),
+            schema: "raw__acme".into(),
+            source_type: "shopify".into(),
+            syncing: true,
+            paused: false,
+            succeeded_at: None,
+            failed_at: None,
+            observed_at: None,
+        }]]);
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let run_plan = RunPlan {
+            pipeline: Some("ingest".to_string()),
+            models: vec![],
+            execution_layers: vec![],
+            ..minimal_run_plan()
+        };
+        let result = execute_run_plan(
+            &config_path,
+            loaded,
+            "plan-sync",
+            run_plan,
+            None,
+            &root.join("state.redb"),
+            false,
+            "apply-run-id",
+            // A human apply: no governed context, so only the apply markers
+            // (`for_apply`, the forced run id) can keep the phase off.
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await;
+        assert_eq!(
+            source.polls(),
+            0,
+            "apply must not poll the source for sync state. result: {result:?}"
+        );
+        assert!(
+            source.triggered().is_empty(),
+            "apply must not start a sync. result: {result:?}"
+        );
+        assert!(
+            !crate::testing::recorder(&key).statements().is_empty(),
+            "the apply must have reached the warehouse, or the zero proves nothing. result: {result:?}"
         );
     }
 

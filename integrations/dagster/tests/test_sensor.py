@@ -893,3 +893,74 @@ def test_instance_resource_form_still_works_for_back_compat():
         result = sensor(dg.build_sensor_context(cursor=None))
 
     assert len(result.run_requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# Pipelines that start their own syncs: the sensor stands down
+# ---------------------------------------------------------------------------
+
+
+def _triggering_discover(*sources: SourceInfo) -> DiscoverResult:
+    return DiscoverResult(
+        version="0.3.0",
+        command="discover",
+        sources=list(sources),
+        sync_trigger=True,
+    )
+
+
+def test_sensor_stands_down_when_the_pipeline_triggers_its_own_syncs():
+    rocky = RockyResource()
+    discover = _triggering_discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 11)),
+        _source("s2", "acme", ["invoices"], _ts(2026, 4, 8, 12)),
+    )
+    skips: list[SkipContext] = []
+    starting_cursor = json.dumps({"s1": "2026-04-08T10:00:00+00:00"})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            on_skip=skips.append,
+        )
+        result = sensor(dg.build_sensor_context(cursor=starting_cursor))
+
+    # No second run for a sync Rocky started itself.
+    assert not result.run_requests
+    assert result.skip_reason is not None
+    assert "stands down" in result.skip_reason.skip_message
+    # The cursor still moves, so the stand-down does not replay on the next tick.
+    cursor = json.loads(result.cursor)
+    assert cursor["s1"] == "2026-04-08T11:00:00+00:00"
+    assert cursor["s2"] == "2026-04-08T12:00:00+00:00"
+    assert len(skips) == 1
+    assert "stands down" in skips[0].reason
+
+
+def test_include_rocky_triggered_keeps_the_sensor_reacting():
+    rocky = RockyResource()
+    discover = _triggering_discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 11)))
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            include_rocky_triggered=True,
+        )
+        result = sensor(dg.build_sensor_context(cursor=None))
+
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+
+
+def test_a_discover_without_sync_trigger_reads_as_false():
+    # An older `rocky` binary sends no `sync_trigger`: the sensor reacts as before.
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 11)))
+    assert discover.sync_trigger is False
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _build_sensor(RockyResource())
+        result = sensor(dg.build_sensor_context(cursor=None))
+    assert len(result.run_requests) == 1

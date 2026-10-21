@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rocky_source_sensor` stands down when the Rocky pipeline starts its own Fivetran syncs (`rocky discover` reports `sync_trigger: true`). Rocky advances each connector's `last_sync_at` itself in that case, so reacting to it would start a second run for every sync. The sensor still advances its cursor, emits no `RunRequest` and skips the tick with a reason. Pass `include_rocky_triggered=True` to keep the old behaviour. A sync that Fivetran starts on its own schedule no longer fires the sensor for such a pipeline; the next Rocky run picks it up. `DiscoverResult.sync_trigger` needs `rocky-sdk` with the field; an older binary or SDK reads as `False` and the sensor is unchanged.
+
 ## [1.73.0] — 2026-10-21
 
 Pairs with engine 1.88.0. Needs `rocky-sdk>=0.28.0`, so the floor rises from `0.27.0`.

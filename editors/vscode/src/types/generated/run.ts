@@ -122,6 +122,11 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * How the wait for one connector ended.
+ */
+export type SourceSyncOutcome =
+  "succeeded" | "failed" | "timeout" | "unknown" | "interrupted" | "error" | "paused" | "trigger_failed";
+/**
  * Status of a pipeline run.
  *
  * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
@@ -232,6 +237,10 @@ export interface RunOutput {
    * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
    */
   skipped_by_run_id?: string | null;
+  /**
+   * One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
+   */
+  source_syncs?: SourceSyncOutput[];
   /**
    * Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
    */
@@ -911,5 +920,39 @@ export interface TableCompareResult {
   shadow_count?: number | null;
   shadow_table: string;
   verdict: string;
+  [k: string]: unknown;
+}
+/**
+ * What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.
+ */
+export interface SourceSyncOutput {
+  /**
+   * The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.
+   */
+  detail?: string | null;
+  /**
+   * Source connector id.
+   */
+  id: string;
+  /**
+   * The connector's last successful sync after the wait.
+   */
+  last_sync_at?: string | null;
+  /**
+   * How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause).
+   */
+  outcome: SourceSyncOutcome;
+  /**
+   * The connector's schema name in the source destination.
+   */
+  schema: string;
+  /**
+   * Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.
+   */
+  triggered?: boolean;
+  /**
+   * Whole seconds from the start of the wait to this outcome.
+   */
+  waited_secs: number;
   [k: string]: unknown;
 }

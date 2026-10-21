@@ -29,7 +29,9 @@ Base URL: `https://api.fivetran.com`
 | List all in group | GET | `/v1/groups/{groupId}/connectors` |
 | Get details | GET | `/v1/connectors/{connectorId}` |
 | Get state | GET | `/v1/connectors/{connectorId}/state` |
-| Sync now | POST | `/v1/connectors/{connectorId}/sync` |
+| Sync now | POST | `/v1/connections/{connectionId}/sync` |
+
+"Sync now" is the one write call Rocky makes, and only with both opt-ins (`allow_sync_trigger` on the adapter, `trigger = true` on the pipeline). The path is the `connections` form from `references/rest_api_collection.json` (the other rows still use the older `connectors` form). Body `{"force": false}`, never `true`. The answer is `{code, message}` only: no sync id and no start time, so Rocky identifies its sync from `succeeded_at` / `failed_at` against the response `Date` header (`rocky-core/src/source_sync.rs`).
 
 Key fields in connector response:
 - `id` — Connector ID
@@ -37,7 +39,7 @@ Key fields in connector response:
 - `service` — Connector type (e.g., "facebook_ads")
 - `schema` — Schema name (e.g., "src__acme__us_west__shopify")
 - `status.setup_state` — "connected", "incomplete", etc.
-- `status.sync_state` — "syncing", "scheduled", "paused"
+- `status.sync_state` — "syncing", "scheduled", "paused", "rescheduled" (a sync paused to resume later; Rocky treats it as still running)
 - `succeeded_at` — Last successful sync timestamp (ISO 8601)
 - `failed_at` — Last failed sync timestamp
 

@@ -341,6 +341,10 @@ export type ConcurrencyMode = "adaptive" | number;
  */
 export type OnCollision = "off" | "warn" | "error";
 /**
+ * What `rocky run` does when a source sync it waited for ends in failure, or does not end before `wait_timeout_secs`.
+ */
+export type OnSyncFailure = "fail" | "warn";
+/**
  * Workspace binding access level.
  */
 export type BindingType = "READ_WRITE" | "READ_ONLY";
@@ -592,6 +596,10 @@ export interface AdapterConfig {
    * Snowflake account identifier (e.g., "xy12345.us-east-1").
    */
   account?: string | null;
+  /**
+   * The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+   */
+  allow_sync_trigger?: boolean;
   api_key?: RedactedString | null;
   api_secret?: RedactedString | null;
   /**
@@ -1649,6 +1657,37 @@ export interface DiscoveryConfig {
    * When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
    */
   report_new_sources?: boolean;
+  /**
+   * Optional `[pipeline.<name>.source.discovery.sync]` table. When it sets `wait = true`, `rocky run` waits for a running source sync to finish before it reads the source. Absent means no wait and no extra requests.
+   */
+  sync?: DiscoverySyncConfig | null;
+}
+/**
+ * `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.
+ *
+ * With `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.
+ */
+export interface DiscoverySyncConfig {
+  /**
+   * `fail` (default) stops the run when a waited sync fails or does not end in time. `warn` logs it and runs on the last landed data.
+   */
+  on_sync_failure?: OnSyncFailure & string;
+  /**
+   * Seconds between status polls. At least 10. Default 30.
+   */
+  poll_interval_secs?: number;
+  /**
+   * Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
+   */
+  trigger?: boolean;
+  /**
+   * Wait for a running sync to finish before the run starts. Default `false`.
+   */
+  wait?: boolean;
+  /**
+   * Longest wait for the whole phase, in seconds. Must be at most half of `[state.idempotency] in_flight_ttl_hours`. Default 3600.
+   */
+  wait_timeout_secs?: number;
 }
 /**
  * Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.

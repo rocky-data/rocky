@@ -14,6 +14,10 @@
             "null"
           ]
         },
+        "allow_sync_trigger": {
+          "description": "The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.",
+          "type": "boolean"
+        },
         "api_key": {
           "anyOf": [
             {
@@ -991,6 +995,56 @@
           "default": false,
           "description": "When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.",
           "type": "boolean"
+        },
+        "sync": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiscoverySyncConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional `[pipeline.<name>.source.discovery.sync]` table. When it sets `wait = true`, `rocky run` waits for a running source sync to finish before it reads the source. Absent means no wait and no extra requests."
+        }
+      },
+      "type": "object"
+    },
+    "DiscoverySyncConfig": {
+      "additionalProperties": false,
+      "description": "`[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.\n\nWith `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.",
+      "properties": {
+        "on_sync_failure": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OnSyncFailure"
+            }
+          ],
+          "default": "fail",
+          "description": "`fail` (default) stops the run when a waited sync fails or does not end in time. `warn` logs it and runs on the last landed data."
+        },
+        "poll_interval_secs": {
+          "default": 30,
+          "description": "Seconds between status polls. At least 10. Default 30.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "trigger": {
+          "description": "Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.",
+          "type": "boolean"
+        },
+        "wait": {
+          "default": false,
+          "description": "Wait for a running sync to finish before the run starts. Default `false`.",
+          "type": "boolean"
+        },
+        "wait_timeout_secs": {
+          "default": 3600,
+          "description": "Longest wait for the whole phase, in seconds. Must be at most half of `[state.idempotency] in_flight_ttl_hours`. Default 3600.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -2123,6 +2177,25 @@
           "description": "Report collisions and fail the discover, so a colliding onboard cannot silently create a catalog/table.",
           "enum": [
             "error"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OnSyncFailure": {
+      "description": "What `rocky run` does when a source sync it waited for ends in failure, or does not end before `wait_timeout_secs`.",
+      "oneOf": [
+        {
+          "description": "Stop the run before any warehouse write (default).",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Log a warning and run on the data the source already landed.",
+          "enum": [
+            "warn"
           ],
           "type": "string"
         }

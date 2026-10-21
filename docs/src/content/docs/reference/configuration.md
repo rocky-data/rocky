@@ -349,8 +349,21 @@ Use a different adapter to list schemas and tables than the one that reads the r
 | `adapter` | string | Yes | — | Adapter name to use for discovery. |
 | `report_new_sources` | bool | No | `false` | Diff the discovered source inventory against the prior persisted snapshot and report first-seen schemas in the discover output's `new_sources`. The first discover of a pipeline records the baseline and reports nothing. Off by default — the diff and its state write only happen when opted in. |
 | `on_collision` | `"off"` \| `"warn"` \| `"error"` | No | `"off"` | Cross-source collision detection. When the same external object (e.g. an ad account) is onboarded under two schemas, its data lands in two target tables and silently doubles any downstream `UNION ALL`. `warn` reports the pairs in the discover output's `collision_candidates` and emits a `source_collision_detected` event; `error` additionally fails the discover so a colliding onboard can't silently create a catalog. `off` (default) skips detection entirely. Only adapters that resolve external object ids (e.g. Fivetran) participate; others contribute nothing. |
+| `sync` | table | No | absent | `[pipeline.NAME.source.discovery.sync]`. Wait for a running source sync before `rocky run` reads the source, and optionally start one. Fivetran only. See the keys below. |
 
 See [Cross-source duplicate detection](#cross-source-duplicate-detection) for the counterpart that runs during replication rather than at discovery.
+
+#### `[pipeline.NAME.source.discovery.sync]`
+
+Waits for a running source sync to finish before the run starts. With `wait` alone Rocky sends `GET` requests only. With `trigger` as well, and `allow_sync_trigger = true` on the adapter, it starts one sync per connector first. See [Fivetran adapter](/reference/adapters/fivetran/#wait-for-a-running-sync) for the full behaviour.
+
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `wait` | bool | No | `false` | Wait for a running sync to end. The other keys do nothing without it. |
+| `wait_timeout_secs` | integer | No | `3600` | Longest wait for the whole phase. A sync still running at the limit counts as a failure. `rocky validate` requires at most half of `[state.idempotency] in_flight_ttl_hours`. |
+| `poll_interval_secs` | integer | No | `30` | Seconds between polls. At least 10. |
+| `on_sync_failure` | `"fail"` \| `"warn"` | No | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data already landed. |
+| `trigger` | bool | No | `false` | Start a sync on each selected connector, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. `rocky run --no-sync-trigger` turns it off for one run. See [Start a sync](/reference/adapters/fivetran/#start-a-sync). |
 
 ### `[pipeline.NAME.source.schema_pattern]`
 

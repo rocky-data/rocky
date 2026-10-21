@@ -1,7 +1,7 @@
 //! Adapter traits for Rocky's pluggable architecture.
 //!
 //! Rocky separates concerns through adapter traits:
-//! - [`DiscoveryAdapter`] — finds what schemas/tables are available (metadata only)
+//! - [`DiscoveryAdapter`] — finds what schemas/tables are available (metadata only; may start a vendor sync when both opt-ins are set)
 //! - [`WarehouseAdapter`] — executes SQL against a warehouse
 //! - [`SqlDialect`] — generates warehouse-specific SQL syntax
 //! - [`GovernanceAdapter`] — manages catalog/schema lifecycle, tags, permissions, isolation
@@ -221,6 +221,35 @@ pub trait DiscoveryAdapter: Send + Sync {
         _connectors: &mut [DiscoveredConnector],
     ) -> AdapterResult<()> {
         Ok(())
+    }
+
+    /// Current sync state of every connector whose schema starts with the
+    /// prefix: one status read, no side effect on the source.
+    ///
+    /// Default: `Ok(None)`, meaning this adapter does not report sync state.
+    /// `rocky run` uses it for `[...discovery.sync] wait = true`. It warns and
+    /// runs without a wait when the adapter returns `None`, and `rocky
+    /// validate` refuses the key for a known adapter type that cannot report.
+    async fn source_sync_states(
+        &self,
+        _schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<crate::source_sync::SourceSyncState>>> {
+        Ok(None)
+    }
+
+    /// Ask the source to start one sync on one connector: a single request,
+    /// never forced, never a resync, unpause or cancel.
+    ///
+    /// Default: [`SourceSyncTriggerError::Unsupported`]. An adapter that
+    /// implements it must also refuse unless its owner opted in (the Fivetran
+    /// adapter checks `allow_sync_trigger`), because `rocky validate` is only
+    /// one funnel into this call. `rocky run` calls it for
+    /// `[...discovery.sync] trigger = true`.
+    async fn trigger_source_sync(
+        &self,
+        _connector_id: &str,
+    ) -> Result<(), crate::source_sync::SourceSyncTriggerError> {
+        Err(crate::source_sync::SourceSyncTriggerError::Unsupported)
     }
 
     /// Cheap connectivity check for the discovery API.

@@ -306,7 +306,15 @@ pub async fn discover(
         .with_failed_sources(failed_sources)
         .with_schemas_cached(schemas_cached)
         .with_new_sources(new_sources)
-        .with_collision_candidates(collision_candidates);
+        .with_collision_candidates(collision_candidates)
+        .with_sync_trigger(
+            pipeline
+                .source
+                .discovery
+                .as_ref()
+                .and_then(|d| d.sync.as_ref())
+                .is_some_and(|s| s.trigger),
+        );
     if output_json {
         print_json(&output)?;
     } else {

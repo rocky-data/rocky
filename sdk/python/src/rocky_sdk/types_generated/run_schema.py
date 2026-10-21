@@ -565,6 +565,114 @@ class SourceSpan(BaseModel):
     line: conint(ge=0)
 
 
+class SourceSyncOutcome1(StrEnum):
+    """
+    The sync ended and `succeeded_at` moved.
+    """
+
+    succeeded = "succeeded"
+
+
+class SourceSyncOutcome2(StrEnum):
+    """
+    The sync ended and `failed_at` moved.
+    """
+
+    failed = "failed"
+
+
+class SourceSyncOutcome3(StrEnum):
+    """
+    The connector was still syncing when the wait ran out.
+    """
+
+    timeout = "timeout"
+
+
+class SourceSyncOutcome4(StrEnum):
+    """
+    The sync ended but neither timestamp moved, or the connector vanished.
+    """
+
+    unknown = "unknown"
+
+
+class SourceSyncOutcome5(StrEnum):
+    """
+    A shutdown signal ended the wait first.
+    """
+
+    interrupted = "interrupted"
+
+
+class SourceSyncOutcome6(StrEnum):
+    """
+    The status reads failed, so the wait was abandoned. The result's `detail` names the error.
+    """
+
+    error = "error"
+
+
+class SourceSyncOutcome7(StrEnum):
+    """
+    The connector is paused, so no sync was started. Not a failure: a person paused it on purpose, and Rocky never unpauses.
+    """
+
+    paused = "paused"
+
+
+class SourceSyncOutcome8(StrEnum):
+    """
+    Rocky could not start the sync. The result's `detail` names the cause.
+    """
+
+    trigger_failed = "trigger_failed"
+
+
+class SourceSyncOutput(BaseModel):
+    """
+    What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.
+    """
+
+    detail: str | None = None
+    """
+    The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.
+    """
+    id: str
+    """
+    Source connector id.
+    """
+    last_sync_at: AwareDatetime | None = None
+    """
+    The connector's last successful sync after the wait.
+    """
+    outcome: (
+        SourceSyncOutcome1
+        | SourceSyncOutcome2
+        | SourceSyncOutcome3
+        | SourceSyncOutcome4
+        | SourceSyncOutcome5
+        | SourceSyncOutcome6
+        | SourceSyncOutcome7
+        | SourceSyncOutcome8
+    )
+    """
+    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause).
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    The connector's schema name in the source destination.
+    """
+    triggered: bool | None = None
+    """
+    Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.
+    """
+    waited_secs: conint(ge=0)
+    """
+    Whole seconds from the start of the wait to this outcome.
+    """
+
+
 class TableCompareResult(BaseModel):
     production_count: conint(ge=0) | None = None
     """
@@ -1174,6 +1282,10 @@ class RunOutput(BaseModel):
     skipped_by_run_id: str | None = None
     """
     Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
+    """
+    source_syncs: list[SourceSyncOutput] | None = None
+    """
+    One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
     """
     status: RunStatus1 | RunStatus2 | RunStatus3
     """

@@ -627,10 +627,10 @@ impl AdapterRegistry {
                     })?;
                     client = client.with_circuit_breaker(breaker);
 
-                    let adapter = Arc::new(FivetranDiscoveryAdapter::new(
-                        client,
-                        destination_id.to_string(),
-                    ));
+                    let adapter = Arc::new(
+                        FivetranDiscoveryAdapter::new(client, destination_id.to_string())
+                            .with_sync_trigger_allowed(adapter_cfg.allow_sync_trigger),
+                    );
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "airbyte" => {
@@ -876,6 +876,18 @@ impl AdapterRegistry {
                     let key = adapter_cfg.path.expose_opt().unwrap_or_default();
                     let adapter = Arc::new(crate::testing::RecordingWarehouseAdapter::new(key));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
+                // Test-only, same exemption as "recording" above. Registers a
+                // discovery adapter that reports one connector and answers
+                // sync-state polls from a script, keyed by `path`. See
+                // `crate::testing::ScriptedSyncSource`.
+                #[cfg(test)]
+                "test-sync-source" => {
+                    let key = adapter_cfg.path.expose_opt().unwrap_or_default();
+                    discovery.insert(
+                        name.clone(),
+                        crate::testing::sync_source(key) as Arc<dyn DiscoveryAdapter>,
+                    );
                 }
                 // Test-only, same exemption as "recording" above. Registers a
                 // `WarehouseAdapter` that wraps a real in-memory DuckDB

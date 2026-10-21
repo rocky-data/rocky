@@ -83,6 +83,7 @@ mod run_dag_exec;
 mod run_incremental;
 mod run_local;
 pub(crate) mod run_output_version;
+mod run_source_sync;
 pub(crate) mod run_stored_bytes;
 pub(crate) mod run_upstream_reads;
 pub(crate) mod run_volume;

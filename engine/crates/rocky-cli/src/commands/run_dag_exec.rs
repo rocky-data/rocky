@@ -1458,6 +1458,8 @@ mod run_opts_threading_tests {
             no_reuse: true,
             no_prune: false,
             full_refresh: false,
+            no_sync_trigger: false,
+            no_source_sync: false,
         };
         let partition_opts = PartitionRunOptions {
             partition: Some("2020-01-02".into()),

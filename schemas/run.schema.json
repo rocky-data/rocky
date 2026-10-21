@@ -1363,6 +1363,120 @@
       ],
       "type": "object"
     },
+    "SourceSyncOutcome": {
+      "description": "How the wait for one connector ended.",
+      "oneOf": [
+        {
+          "description": "The sync ended and `succeeded_at` moved.",
+          "enum": [
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended and `failed_at` moved.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The connector was still syncing when the wait ran out.",
+          "enum": [
+            "timeout"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended but neither timestamp moved, or the connector vanished.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A shutdown signal ended the wait first.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The status reads failed, so the wait was abandoned. The result's `detail` names the error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The connector is paused, so no sync was started. Not a failure: a person paused it on purpose, and Rocky never unpauses.",
+          "enum": [
+            "paused"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rocky could not start the sync. The result's `detail` names the cause.",
+          "enum": [
+            "trigger_failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SourceSyncOutput": {
+      "description": "What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.",
+      "properties": {
+        "detail": {
+          "description": "The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Source connector id.",
+          "type": "string"
+        },
+        "last_sync_at": {
+          "description": "The connector's last successful sync after the wait.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceSyncOutcome"
+            }
+          ],
+          "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause)."
+        },
+        "schema": {
+          "description": "The connector's schema name in the source destination.",
+          "type": "string"
+        },
+        "triggered": {
+          "description": "Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.",
+          "type": "boolean"
+        },
+        "waited_secs": {
+          "description": "Whole seconds from the start of the wait to this outcome.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "outcome",
+        "schema",
+        "waited_secs"
+      ],
+      "type": "object"
+    },
     "TableCheckOutput": {
       "properties": {
         "asset_key": {
@@ -1882,6 +1996,13 @@
         "string",
         "null"
       ]
+    },
+    "source_syncs": {
+      "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
+      "items": {
+        "$ref": "#/definitions/SourceSyncOutput"
+      },
+      "type": "array"
     },
     "status": {
       "allOf": [

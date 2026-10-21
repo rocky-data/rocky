@@ -45,6 +45,10 @@ export interface AdapterConfig {
    * Snowflake account identifier (e.g., "xy12345.us-east-1").
    */
   account?: string | null;
+  /**
+   * The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+   */
+  allow_sync_trigger?: boolean;
   api_key?: RedactedString | null;
   api_secret?: RedactedString | null;
   /**

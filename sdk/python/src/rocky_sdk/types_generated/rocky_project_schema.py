@@ -1024,6 +1024,22 @@ class OnCollision3(StrEnum):
     error = "error"
 
 
+class OnSyncFailure1(StrEnum):
+    """
+    Stop the run before any warehouse write (default).
+    """
+
+    fail = "fail"
+
+
+class OnSyncFailure2(StrEnum):
+    """
+    Log a warning and run on the data the source already landed.
+    """
+
+    warn = "warn"
+
+
 class Type26(StrEnum):
     replication = "replication"
 
@@ -2098,6 +2114,10 @@ class AdapterConfig(BaseModel):
     """
     Snowflake account identifier (e.g., "xy12345.us-east-1").
     """
+    allow_sync_trigger: bool | None = None
+    """
+    The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+    """
     api_key: str | None = None
     api_secret: str | None = None
     cache: FivetranCacheConfig | None = None
@@ -2341,25 +2361,35 @@ class CustomCheckConfig(BaseModel):
     threshold: conint(ge=0) | None = 0
 
 
-class DiscoveryConfig(BaseModel):
+class DiscoverySyncConfig(BaseModel):
     """
-    Discovery configuration within a pipeline source.
+    `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source, and optionally start one.
+
+    With `wait = true` alone Rocky only reads the vendor API (GET). A connector that is not syncing when the run starts is not waited for. With `trigger = true` as well, and `allow_sync_trigger = true` on the adapter, Rocky starts one sync per connector and waits for it. It never moves data itself.
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
-    adapter: str | None = "default"
+    on_sync_failure: OnSyncFailure1 | OnSyncFailure2 | None = "fail"
     """
-    Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
+    `fail` (default) stops the run when a waited sync fails or does not end in time. `warn` logs it and runs on the last landed data.
     """
-    on_collision: OnCollision1 | OnCollision2 | OnCollision3 | None = "off"
+    poll_interval_secs: conint(ge=0) | None = 30
     """
-    What to do when discover finds the same external object id mapped to more than one target path (likely the same object onboarded twice). `off` (default) skips detection entirely; `warn` reports `collision_candidates` + emits an event; `error` additionally fails the discover. Only adapters that supply `external_object_id` (e.g. Fivetran) participate; others are silently skipped.
+    Seconds between status polls. At least 10. Default 30.
     """
-    report_new_sources: bool | None = False
+    trigger: bool | None = None
     """
-    When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
+    Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
+    """
+    wait: bool | None = False
+    """
+    Wait for a running sync to finish before the run starts. Default `false`.
+    """
+    wait_timeout_secs: conint(ge=0) | None = 3600
+    """
+    Longest wait for the whole phase, in seconds. Must be at most half of `[state.idempotency] in_flight_ttl_hours`. Default 3600.
     """
 
 
@@ -2497,36 +2527,6 @@ class NullRateConfig(BaseModel):
     Severity reported when a column's null rate exceeds the threshold.
     """
     threshold: float
-
-
-class PipelineSourceConfig(BaseModel):
-    """
-    Pipeline source configuration.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    adapter: str | None = "default"
-    """
-    Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `"default"` — resolved against the adapter map in [`normalize_rocky_config`].
-    """
-    catalog: str | None = None
-    """
-    Source catalog name.
-    """
-    discovery: DiscoveryConfig | None = None
-    """
-    Optional discovery configuration.
-    """
-    region: str | None = None
-    """
-    Region label where the source data lives. See [`ResidencyConfig`].
-    """
-    schema_pattern: SchemaPatternConfig
-    """
-    Schema pattern for parsing source schema names.
-    """
 
 
 class PipelineSourceConfig2(BaseModel):
@@ -3333,6 +3333,32 @@ class ChecksConfig(BaseModel):
     """
 
 
+class DiscoveryConfig(BaseModel):
+    """
+    Discovery configuration within a pipeline source.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    adapter: str | None = "default"
+    """
+    Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
+    """
+    on_collision: OnCollision1 | OnCollision2 | OnCollision3 | None = "off"
+    """
+    What to do when discover finds the same external object id mapped to more than one target path (likely the same object onboarded twice). `off` (default) skips detection entirely; `warn` reports `collision_candidates` + emits an event; `error` additionally fails the discover. Only adapters that supply `external_object_id` (e.g. Fivetran) participate; others are silently skipped.
+    """
+    report_new_sources: bool | None = False
+    """
+    When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
+    """
+    sync: DiscoverySyncConfig | None = None
+    """
+    Optional `[pipeline.<name>.source.discovery.sync]` table. When it sets `wait = true`, `rocky run` waits for a running source sync to finish before it reads the source. Absent means no wait and no extra requests.
+    """
+
+
 class GovernanceConfig(BaseModel):
     """
     Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
@@ -3407,6 +3433,36 @@ class LoadTargetConfig(BaseModel):
     table: str | None = None
     """
     Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).
+    """
+
+
+class PipelineSourceConfig(BaseModel):
+    """
+    Pipeline source configuration.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    adapter: str | None = "default"
+    """
+    Name of the adapter to use (references a key in `[adapter.*]`). Defaults to `"default"` — resolved against the adapter map in [`normalize_rocky_config`].
+    """
+    catalog: str | None = None
+    """
+    Source catalog name.
+    """
+    discovery: DiscoveryConfig | None = None
+    """
+    Optional discovery configuration.
+    """
+    region: str | None = None
+    """
+    Region label where the source data lives. See [`ResidencyConfig`].
+    """
+    schema_pattern: SchemaPatternConfig
+    """
+    Schema pattern for parsing source schema names.
     """
 
 

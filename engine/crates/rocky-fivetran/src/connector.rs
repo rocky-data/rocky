@@ -71,6 +71,28 @@ pub async fn list_connectors(
     Ok(connectors)
 }
 
+/// [`discover_connectors`], plus the server's clock from the list response
+/// (see [`FivetranClient::get_all_pages_dated`]).
+pub async fn discover_connectors_dated(
+    client: &FivetranClient,
+    group_id: &str,
+    schema_prefix: &str,
+) -> Result<(Vec<Connector>, Option<DateTime<Utc>>), FivetranError> {
+    let path = format!("/v1/groups/{}/connectors", encode_path_segment(group_id));
+    let (all, server_date): (Vec<Connector>, _) = client.get_all_pages_dated(&path).await?;
+    let filtered: Vec<Connector> = all
+        .into_iter()
+        .filter(|c| c.is_connected() && c.matches_prefix(schema_prefix))
+        .collect();
+    debug!(
+        group_id,
+        prefix = schema_prefix,
+        count = filtered.len(),
+        "filtered connectors (dated)"
+    );
+    Ok((filtered, server_date))
+}
+
 /// Lists connectors filtered to only connected ones matching a schema prefix.
 pub async fn discover_connectors(
     client: &FivetranClient,

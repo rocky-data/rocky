@@ -200,7 +200,7 @@ The Databricks warehouse adapter. Implements the warehouse traits defined in roc
 
 ### rocky-fivetran
 
-The Fivetran source adapter. Discovers what schemas and tables exist in the Fivetran destination. This is a metadata-only operation; the actual data is already in the warehouse, landed by Fivetran's sync process.
+The Fivetran source adapter. Discovers what schemas and tables exist in the Fivetran destination. This is a metadata-only operation; the actual data is already in the warehouse, landed by Fivetran's sync process. With two opt-ins set (`allow_sync_trigger` on the adapter, `trigger = true` on the pipeline), `rocky run` can ask Fivetran to start a sync and wait for it. Rocky still moves no data itself.
 
 - **client.rs**: async REST client using reqwest with Basic Auth
 - **connector.rs**: connector discovery and filtering

@@ -533,6 +533,7 @@ mod tests {
             path: None,
             extension_directory: None,
             offline: false,
+            allow_sync_trigger: false,
             schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
