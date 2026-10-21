@@ -125,3 +125,20 @@ async fn a_batch_is_run_but_not_measured() {
         .unwrap();
     assert_eq!(rows.rows.len(), 1);
 }
+
+/// A pushed-down filter reads columns that `Projections` does not list, so
+/// the scan has no byte estimate.
+#[tokio::test]
+async fn a_filtered_scan_has_no_byte_estimate() {
+    let adapter = adapter().await;
+    let filtered = reads(
+        &adapter,
+        "CREATE TABLE f AS SELECT amount FROM src WHERE id % 7 = 0 AND note <> 'x'",
+    )
+    .await;
+    assert_eq!(filtered.reads.len(), 1);
+    assert_eq!(filtered.reads[0].projected_columns, ["amount"]);
+    assert_eq!(filtered.reads[0].est_bytes, None);
+    let plain = reads(&adapter, "CREATE TABLE p AS SELECT amount FROM src").await;
+    assert_eq!(plain.reads[0].est_bytes, Some(5000 * 8));
+}

@@ -642,15 +642,15 @@ class UpstreamRead(BaseModel):
 
     est_bytes: conint(ge=0) | None = None
     """
-    Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
+    Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a scan has pushed-down filters (their columns are unknown, so the width would be biased), a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
     """
     projected_columns: list[str] | None = []
     """
-    The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.
+    The output columns of the scans, first seen first, with no repeats. Columns used only in filters are not included: DuckDB lists those under the scan's pushed-down filters, not its projections. Empty when the profile did not name them.
     """
     rows_scanned: conint(ge=0)
     """
-    Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.
+    Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned. It can be far below the table's row count: DuckDB skips row groups its zone maps rule out. A read through a view is credited to the view's base table. On a first-run `merge`, the rows count twice: the populating CTAS reads them, then the MERGE reads them again.
     """
     table: str
     """

@@ -31,6 +31,9 @@ struct RawScan {
     table: String,
     rows_scanned: u64,
     projections: Vec<String>,
+    /// The scan has pushed-down filters. Their columns are not in
+    /// `projections`, so a width estimate would be biased.
+    filtered: bool,
 }
 
 /// The scans of one profile.
@@ -61,6 +64,7 @@ fn parse_profile(root: &Value) -> Option<RawScans> {
                     table: table.to_string(),
                     rows_scanned,
                     projections: projections(node),
+                    filtered: has_filters(node),
                 }),
                 // A file or a table function names no table. A table scan
                 // with no row count cannot be summed: count it as
@@ -91,6 +95,17 @@ fn projections(node: &Value) -> Vec<String> {
             .collect(),
         Some(Value::String(one)) if !one.is_empty() => vec![one.clone()],
         Some(_) | None => Vec::new(),
+    }
+}
+
+/// Whether the scan has a non-empty `Filters` entry (pushed-down predicates).
+/// DuckDB writes it as an array, a bare string, or an empty string.
+fn has_filters(node: &Value) -> bool {
+    match node.get("extra_info").and_then(|e| e.get("Filters")) {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::String(one)) => !one.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
     }
 }
 
@@ -161,7 +176,13 @@ fn summarize(
         let types = cache
             .entry(scan.table.clone())
             .or_insert_with(|| types_of(&scan.table));
-        let est_bytes = estimate_bytes(scan.rows_scanned, &scan.projections, types);
+        // A filtered scan reads columns that `Projections` does not list, so
+        // the estimate would be too low: leave it unknown.
+        let est_bytes = if scan.filtered {
+            None
+        } else {
+            estimate_bytes(scan.rows_scanned, &scan.projections, types)
+        };
         reads.merge(UpstreamReads {
             reads: vec![UpstreamRead {
                 table: scan.table,
@@ -174,6 +195,8 @@ fn summarize(
     }
     reads
 }
+
+const DISABLE_PROFILING: &str = "PRAGMA disable_profiling;";
 
 /// Escape a path for a single-quoted SQL string.
 fn sql_quote(text: &str) -> String {
@@ -202,6 +225,8 @@ impl DuckDbConnector {
             self.execute_statement(sql)?;
             return Ok(None);
         }
+        // Turn off any profiling a failed earlier statement left on.
+        self.ensure_profiling_off();
         // DuckDB picks the profile format from the file extension.
         let file = match tempfile::Builder::new().suffix(".json").tempfile() {
             Ok(file) => file,
@@ -218,18 +243,47 @@ impl DuckDbConnector {
         if let Err(e) = self.conn.execute_batch(&enable) {
             debug!(error = %e, "could not enable profiling; upstream reads not measured");
             // Whatever half-enabled, turn it off before the statement runs.
-            let _ = self.conn.execute_batch("PRAGMA disable_profiling;");
+            // If that fails too, keep the file: profiling may be on.
+            if self.conn.execute_batch(DISABLE_PROFILING).is_err() {
+                *self.profile_file.borrow_mut() = Some(file);
+            }
             self.execute_statement(sql)?;
             return Ok(None);
         }
-        let result = self.execute_statement(sql);
-        let disabled = self.conn.execute_batch("PRAGMA disable_profiling;");
-        result?;
-        if let Err(e) = disabled {
-            debug!(error = %e, "could not disable profiling; upstream reads not measured");
+        // Run the statement directly: `execute_statement` would turn the
+        // profiling we just enabled off again.
+        debug!(sql = sql, "executing DuckDB statement with profiling");
+        let result = self.conn.execute_batch(sql);
+        let disabled = self.conn.execute_batch(DISABLE_PROFILING);
+        if disabled.is_err() {
+            // An aborted transaction rejects the pragma. Profiling stays on
+            // and the output path must stay reserved until a later statement
+            // turns it off; dropping the file now would let DuckDB rewrite
+            // it after it is gone.
+            *self.profile_file.borrow_mut() = Some(file);
+            result?;
+            debug!("could not disable profiling; upstream reads not measured");
             return Ok(None);
         }
+        result?;
         Ok(self.read_profile(file.path()))
+    }
+
+    /// Turn profiling off if an earlier measured statement could not. Called
+    /// at the start of every statement path, measured or not. The state is
+    /// cleared (and the profile file deleted) only when the pragma worked; a
+    /// failure here is retried by the next statement and never blocks this
+    /// one (a ROLLBACK must still run).
+    pub(crate) fn ensure_profiling_off(&self) {
+        if self.profile_file.borrow().is_none() {
+            return;
+        }
+        match self.conn.execute_batch(DISABLE_PROFILING) {
+            Ok(()) => {
+                self.profile_file.borrow_mut().take();
+            }
+            Err(e) => debug!(error = %e, "profiling is still on; retrying at the next statement"),
+        }
     }
 
     fn read_profile(&self, path: &std::path::Path) -> Option<UpstreamReads> {
@@ -358,11 +412,13 @@ mod tests {
                     table: "m.main.t".into(),
                     rows_scanned: 10,
                     projections: vec!["a".into()],
+                    filtered: false,
                 },
                 RawScan {
                     table: "m.main.t".into(),
                     rows_scanned: 10,
                     projections: vec!["a".into(), "b".into()],
+                    filtered: false,
                 },
             ],
             unattributed: 0,
@@ -375,8 +431,64 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_scan_has_no_byte_estimate() {
+        let with_filters = |filters: Option<Value>| {
+            let mut node = scan_node(Some("m.main.t"), 100, json!(["a"]));
+            if let Some(filters) = filters {
+                node["extra_info"]["Filters"] = filters;
+            }
+            let raw =
+                parse_profile(&json!({"operator_type": "EXPLAIN", "children": [node]})).unwrap();
+            summarize(raw, |_| types(&[("a", "BIGINT")])).reads[0].est_bytes
+        };
+        assert_eq!(with_filters(None), Some(800));
+        assert_eq!(with_filters(Some(json!(""))), Some(800));
+        assert_eq!(with_filters(Some(json!([]))), Some(800));
+        assert_eq!(with_filters(Some(json!("id>5"))), None);
+        assert_eq!(with_filters(Some(json!(["id>5", "s<>'x'"]))), None);
+    }
+
+    #[test]
     fn a_batch_is_not_profiled() {
         assert!(is_single_statement("CREATE TABLE t AS SELECT 1;"));
         assert!(!is_single_statement("SELECT 1; SELECT 2"));
+    }
+
+    fn profiling_setting(db: &DuckDbConnector) -> String {
+        db.execute_sql("SELECT current_setting('enable_profiling')")
+            .unwrap()
+            .rows[0][0]
+            .to_string()
+    }
+
+    /// `delete_insert` runs BEGIN / DELETE / INSERT / COMMIT as separate
+    /// statements. A measured statement that fails inside the transaction
+    /// cannot run `PRAGMA disable_profiling`; profiling must still be off by
+    /// the time the next statement has run, and no profile file may linger.
+    #[test]
+    fn a_failed_measured_statement_in_a_transaction_does_not_leave_profiling_on() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        db.execute_statement("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+            .unwrap();
+        db.execute_statement("BEGIN").unwrap();
+        db.execute_statement_with_upstream_reads("INSERT INTO t SELECT 1 FROM range(2)")
+            .unwrap_err();
+        // The scenario holds: the pragma was rejected and profiling is on.
+        let path = db
+            .profile_file
+            .borrow()
+            .as_ref()
+            .expect("profiling stays flagged after a rejected disable")
+            .path()
+            .to_path_buf();
+        db.execute_statement("ROLLBACK").unwrap();
+        db.execute_statement("SELECT 1").unwrap();
+        assert!(
+            !profiling_setting(&db).contains("json"),
+            "{}",
+            profiling_setting(&db)
+        );
+        assert!(db.profile_file.borrow().is_none());
+        assert!(!path.exists(), "the profile file must not linger");
     }
 }

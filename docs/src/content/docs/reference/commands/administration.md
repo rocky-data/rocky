@@ -1061,13 +1061,15 @@ Each `per_model` entry can carry `upstream_reads`: what the model's build read f
 ```
 
 - `table` is `catalog.schema.table`, as DuckDB reports it. The catalog is the database name (`memory` for an in-memory database).
-- `rows_scanned` counts the rows the scan read, not the rows returned. A table scanned twice (a self-join) sums both scans.
-- `projected_columns` lists the columns read. It is empty when the query read none (`count(*)`).
-- `est_bytes` is an estimate: `rows_scanned` times the summed width of the projected columns, per scan. Rocky knows the width only for fixed-width types (integers, floats, decimals, dates, timestamps, UUID, booleans). If any projected column is text, a blob, a list or a struct, `est_bytes` is omitted. It is in-memory width, not bytes on disk.
+- `rows_scanned` counts the rows the scan read, not the rows returned. A table scanned twice (a self-join) sums both scans. It can be far below the table's row count, because DuckDB skips row groups its zone maps rule out.
+- A read through a view is credited to the view's base table, not the view.
+- On a first-run `merge`, rows are counted twice: the populating `CREATE TABLE AS` reads them, then the `MERGE` reads them again.
+- `projected_columns` lists the output columns of the scan. Columns used only in filters are not included. It is empty when the query read none (`count(*)`).
+- `est_bytes` is an estimate: `rows_scanned` times the summed width of the projected columns, per scan. Rocky knows the width only for fixed-width types (integers, floats, decimals, dates, timestamps, UUID, booleans). If any projected column is text, a blob, a list or a struct, `est_bytes` is omitted. It is also omitted for a scan with pushed-down filters, because the filter columns are unknown and the width would be biased. It is in-memory width, not bytes on disk.
 - `unattributed_scans` counts scans that name no table: a Parquet or CSV file, or a table function such as `range`. They are counted but not attributed.
 - The model's own target is left out. An incremental load that reads its target for the watermark does not list it.
 
-Rocky reads this from the DuckDB query profile of each statement of the build. The field is omitted when nothing was measured: any adapter other than DuckDB, a shadow, branch or backfill run, a view or other model that reads no data at build time, a snapshot or `time_interval` model, a statement batch, or a profile that could not be read. Omitted never means zero reads. A profile failure never fails the model.
+Rocky reads this from the DuckDB query profile of each statement of the build. The field is omitted when nothing was measured: any adapter other than DuckDB, a shadow, branch or backfill run, `rocky run --select` (it passes a model set), an ephemeral, content-addressed, snapshot or `time_interval` model, a view or other model that reads no data at build time, a build with a statement that was not measured (a kind switch from a view to a table, or any statement containing `;`, which is treated as a batch), or a profile that could not be read. `rocky run --model <name>` is recorded. `rocky replay` uses its own executor and records nothing. `--resume` is not supported for model-only runs; a resumed replication run records its models as usual. Omitted never means zero reads. A profile failure never fails the model.
 
 ### Related Commands
 

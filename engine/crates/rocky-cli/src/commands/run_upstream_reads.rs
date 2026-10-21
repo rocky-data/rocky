@@ -96,6 +96,16 @@ impl UpstreamReadsAcc {
         }
     }
 
+    /// A statement of this build ran outside [`run_model_statement`] (the
+    /// atomic DROP and CREATE of a kind switch), so the total is unknown.
+    /// Call this for every such statement: an unmeasured statement must never
+    /// look like "read nothing".
+    pub(crate) fn mark_unmeasured(&mut self) {
+        if !matches!(self, Self::Off) {
+            *self = Self::Lost;
+        }
+    }
+
     /// The model's reads without its own target (an incremental load reads
     /// its target for the watermark; that is not an upstream). `None` when
     /// not recording or when any statement was not measured.
@@ -207,6 +217,16 @@ mod tests {
         acc.absorb(None);
         acc.absorb(Some(read("memory.main.src")));
         assert_eq!(acc.finish(&target("", "main", "out"), None), None);
+    }
+
+    #[test]
+    fn an_unmeasured_statement_outside_the_measured_call_loses_the_model() {
+        let mut acc = UpstreamReadsAcc::Collecting(UpstreamReads::default());
+        acc.mark_unmeasured();
+        assert_eq!(acc.finish(&target("", "main", "out"), None), None);
+        let mut off = UpstreamReadsAcc::Off;
+        off.mark_unmeasured();
+        assert!(matches!(off, UpstreamReadsAcc::Off));
     }
 
     #[test]

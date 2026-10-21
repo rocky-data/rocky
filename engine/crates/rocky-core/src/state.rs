@@ -3038,7 +3038,9 @@ pub struct ModelExecution {
     /// DuckDB query profile of the build. See [`UpstreamReads`].
     ///
     /// `None` means not measured: a non-DuckDB adapter, a shadow, branch or
-    /// backfill run, a profile that could not be read, a failed execution, or
+    /// backfill run, `rocky run --select`, an ephemeral or content-addressed
+    /// model, a build with a statement that was not measured (a kind switch,
+    /// a statement containing `;`), a profile that could not be read, a failed execution, or
     /// a record written before this field. Never zeros.
     ///
     /// Added without a schema bump, like [`Self::stored_bytes`]. Omitted when
@@ -3140,14 +3142,22 @@ pub struct UpstreamRead {
     pub table: String,
     /// Rows the scan operators of this execution read from the table, summed
     /// over every scan of it (a self-join counts both). Not rows returned.
+    /// It can be far below the table's row count: DuckDB skips row groups its
+    /// zone maps rule out. A read through a view is credited to the view's
+    /// base table. On a first-run `merge`, the rows count twice: the
+    /// populating CTAS reads them, then the MERGE reads them again.
     pub rows_scanned: u64,
-    /// The columns the scans read, first seen first, with no repeats. Empty
-    /// when the profile did not name them.
+    /// The output columns of the scans, first seen first, with no repeats.
+    /// Columns used only in filters are not included: DuckDB lists those
+    /// under the scan's pushed-down filters, not its projections. Empty when
+    /// the profile did not name them.
     #[serde(default)]
     pub projected_columns: Vec<String>,
     /// Estimate: `rows_scanned` times the summed fixed width of the projected
-    /// columns, per scan. `None` when a projected column is variable-width
-    /// (text, blob, list, struct), a column type could not be read, or no
+    /// columns, per scan. `None` when a scan has pushed-down filters (their
+    /// columns are unknown, so the width would be biased), a projected column
+    /// is variable-width (text, blob, list, struct), a column type could not
+    /// be read, or no
     /// columns were named. It is in-memory width, not bytes on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub est_bytes: Option<u64>,

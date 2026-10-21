@@ -224,6 +224,11 @@ fn load_icu(conn: &Connection) {
 /// DuckDB local connector for testing and development.
 pub struct DuckDbConnector {
     conn: Connection,
+    /// The profile output file of a measured statement whose
+    /// `PRAGMA disable_profiling` did not succeed (an aborted transaction
+    /// rejects it). `Some` means profiling may still be on. Every entry point
+    /// turns it off first; the file is deleted only once that worked.
+    profile_file: std::cell::RefCell<Option<tempfile::NamedTempFile>>,
 }
 
 impl DuckDbConnector {
@@ -236,7 +241,10 @@ impl DuckDbConnector {
     pub fn in_memory_with(opts: &ExtensionOptions) -> Result<Self, DuckDbError> {
         let conn = Connection::open_in_memory()?;
         prepare_extensions(&conn, opts)?;
-        Ok(DuckDbConnector { conn })
+        Ok(DuckDbConnector {
+            conn,
+            profile_file: std::cell::RefCell::new(None),
+        })
     }
 
     /// Opens or creates a persistent DuckDB database file.
@@ -248,11 +256,15 @@ impl DuckDbConnector {
     pub fn open_with(path: &Path, opts: &ExtensionOptions) -> Result<Self, DuckDbError> {
         let conn = Connection::open(path)?;
         prepare_extensions(&conn, opts)?;
-        Ok(DuckDbConnector { conn })
+        Ok(DuckDbConnector {
+            conn,
+            profile_file: std::cell::RefCell::new(None),
+        })
     }
 
     /// Executes a SQL statement and returns results.
     pub fn execute_sql(&self, sql: &str) -> Result<QueryResult, DuckDbError> {
+        self.ensure_profiling_off();
         debug!(sql = sql, "executing DuckDB SQL");
 
         let mut stmt = self.conn.prepare(sql)?;
@@ -376,6 +388,7 @@ impl DuckDbConnector {
     /// Executes a SQL statement without returning results.
     pub fn execute_statement(&self, sql: &str) -> Result<(), DuckDbError> {
         debug!(sql = sql, "executing DuckDB statement");
+        self.ensure_profiling_off();
         self.conn.execute_batch(sql)?;
         Ok(())
     }
@@ -387,6 +400,7 @@ impl DuckDbConnector {
         drop_sql: &str,
         create_sql: &str,
     ) -> Result<(), DuckDbError> {
+        self.ensure_profiling_off();
         self.conn.execute_batch("BEGIN TRANSACTION")?;
         let result = self
             .conn
@@ -428,6 +442,7 @@ impl DuckDbConnector {
         use arrow::record_batch::RecordBatch;
 
         debug!(sql = sql, "executing DuckDB query_arrow");
+        self.ensure_profiling_off();
         let mut stmt = self.conn.prepare(sql)?;
         let batches: Vec<RecordBatch> = stmt.query_arrow(params![])?.collect();
 

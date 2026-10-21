@@ -16596,6 +16596,9 @@ async fn execute_one_plain_model(
                         job_ids_acc.push(jid);
                     }
                     atomic_create_done = true;
+                    // The CREATE ran outside the measured call: its reads
+                    // are unknown, not zero.
+                    reads_acc.mark_unmeasured();
                 }
                 Ok(None) => {
                     return Err(anyhow::anyhow!(
@@ -30343,6 +30346,67 @@ table = "orders_view"
         .expect("a failed probe must not block a permitted model either");
         assert!(output.notes[0].contains("injected kind probe failure"));
         assert!(output.notes[0].contains("drop_existing_kind was not used"));
+    }
+
+    /// A view becomes a `full_refresh` table through the atomic kind switch.
+    /// That CREATE runs outside the measured call, so the reads are absent
+    /// (None), not an empty list.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_kind_switch_records_unmeasured_not_zero_reads() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE tgt.src AS SELECT 1 AS id",
+            "CREATE VIEW tgt.orders AS SELECT 1 AS id",
+        ] {
+            warehouse.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id FROM tgt.src").unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "name = \"orders\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: true,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let output = super::execute_one_plain_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            "orders",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("the kind switch builds the table");
+        assert!(
+            output.notes.iter().any(|n| n.contains("created table")),
+            "the switch ran: {:?}",
+            output.notes
+        );
+        assert_eq!(output.upstream_reads, None);
     }
 
     #[cfg(feature = "duckdb")]

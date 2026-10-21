@@ -1512,7 +1512,7 @@
       "description": "What one model execution read from one upstream table.\n\nA measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.",
       "properties": {
         "est_bytes": {
-          "description": "Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.",
+          "description": "Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a scan has pushed-down filters (their columns are unknown, so the width would be biased), a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -1522,14 +1522,14 @@
         },
         "projected_columns": {
           "default": [],
-          "description": "The columns the scans read, first seen first, with no repeats. Empty when the profile did not name them.",
+          "description": "The output columns of the scans, first seen first, with no repeats. Columns used only in filters are not included: DuckDB lists those under the scan's pushed-down filters, not its projections. Empty when the profile did not name them.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "rows_scanned": {
-          "description": "Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned.",
+          "description": "Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned. It can be far below the table's row count: DuckDB skips row groups its zone maps rule out. A read through a view is credited to the view's base table. On a first-run `merge`, the rows count twice: the populating CTAS reads them, then the MERGE reads them again.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
