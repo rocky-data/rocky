@@ -1960,10 +1960,8 @@ agent = "propose_only"
 
         // A worker range beside the generated one is not the spec's, so it
         // survives the volume's removal.
-        let with_worker = draft_check_append(
-            &lowered,
-            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n",
-        );
+        let with_worker =
+            draft_check_append(&lowered, "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n");
         let without = merged_document(&parsed_d3(), &with_worker);
         let ranges = row_count_ranges(&without);
         assert_eq!(ranges.len(), 1, "{ranges:?}");
@@ -1995,8 +1993,10 @@ agent = "propose_only"
             "the spec's range and the filtered worker range: {ranges:?}"
         );
         assert!(
-            ranges.iter().any(|r| r.get("min") == Some(&TomlValue::Integer(5))
-                && r.get(GENERATED_BY_KEY).is_some()),
+            ranges
+                .iter()
+                .any(|r| r.get("min") == Some(&TomlValue::Integer(5))
+                    && r.get(GENERATED_BY_KEY).is_some()),
             "{ranges:?}"
         );
         assert!(
