@@ -18,7 +18,7 @@ class CronCheck1(StrEnum):
 
 class CronCheck2(StrEnum):
     """
-    `next_fire_at` is earlier than `now`: a cron slot was missed and has not run. The same strict test as `counts.overdue`. Reported whether or not the latest start is known. `warning` says so.
+    `next_fire_at` is earlier than `now`: a cron slot was missed and has not run. The same strict test as `counts.overdue`. Reported whether or not the latest start is known. `warning` says so. When `at` is known and `now` is later than it, `cron_too_late` is `true` too.
     """
 
     overdue = "overdue"
@@ -42,7 +42,7 @@ class CronCheck4(StrEnum):
 
 class CronCheck5(StrEnum):
     """
-    The next cron fire is later than `at` and the pipeline has no `after` trigger. `cron_too_late` is `true` and `warning` says so.
+    The next cron fire is later than `at`, and the pipeline has no `after` trigger, or some `after` upstream is not judged in time (see `relies_on_after`). `cron_too_late` is `true` and `warning` says so.
     """
 
     too_late = "too_late"
@@ -50,7 +50,7 @@ class CronCheck5(StrEnum):
 
 class CronCheck6(StrEnum):
     """
-    The next cron fire is later than `at`, but the pipeline also runs `after` other pipelines. Those upstreams feed this deadline, so each has its own, earlier latest start; when they meet theirs, `after` starts this one in time. `cron_too_late` is `false` and `note` says the cron alone would be late.
+    The next cron fire is later than `at`, but the pipeline also runs `after` other pipelines, and every one of them has a known latest start and a `cron_check` of `on_time` or `relies_on_after`. When they start in time, `after` starts this one in time. `cron_too_late` is `false` and `note` says the cron alone would be late.
     """
 
     relies_on_after = "relies_on_after"
@@ -122,7 +122,7 @@ class LatestStartUnknownReason2(StrEnum):
 
 class LatestStartUnknownReason3(StrEnum):
     """
-    A pipeline on the way could not have all its models read, and no source shows which deadlined model it builds, while some product's output model has no pipeline that builds it.
+    A transformation pipeline on the way has an absent or unlocatable models directory, or a model that fails to load, so `rocky run` builds nothing for it. Reported when config or run history shows it building a deadlined output model, or some deadlined output model has no pipeline that builds it.
     """
 
     models_unreadable = "models_unreadable"
@@ -323,7 +323,7 @@ class LatestStartStatus(BaseModel):
     """
     cron_too_late: bool
     """
-    True only when `cron_check` is `too_late`: the next cron fire (`next_fire_at`) is later than `at` and the pipeline has no `after` trigger. A fire exactly at `at` is in time. Rocky warns only; it never changes the cron.
+    True in two cases. `cron_check` is `too_late`: the next cron fire (`next_fire_at`) is later than `at`. Or `cron_check` is `overdue`, `at` is known, and `now` is already later than `at`. False otherwise, also when `state` is `unknown`, so alert on `warning`, not on this field alone. A fire exactly at `at` is in time. Rocky warns only; it never changes the cron.
     """
     due_at: AwareDatetime | None = None
     """
@@ -360,7 +360,7 @@ class LatestStartStatus(BaseModel):
     """
     warning: str | None = None
     """
-    Why the schedule may miss the deadline, when `cron_check` is `too_late`, `overdue` or `disabled`.
+    Why the schedule may miss the deadline: when `cron_check` is `too_late`, `overdue` or `disabled`, or when the pipeline's models cannot all be read (reason `models_unreadable`) and config or run history shows it building a deadlined output model, or some deadlined output model has no pipeline that builds it.
     """
 
 
@@ -467,7 +467,7 @@ class SchedulePipelineStatus(BaseModel):
     """
     delivery: DeliveryStatus | None = None
     """
-    Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline builds. For a transformation pipeline whose models all load, that is a model its `models` glob selects, as `rocky run` selects them. Otherwise (another pipeline type, an absent models directory, or a model that fails to load) it is also any such model the pipeline's newest production run that built one built, within the newest 500 runs. The estimate times the whole pipeline run. Absent when neither source shows the pipeline building a product with a deadline.
+    Delivery state of the most urgent product deadline this pipeline delivers: a product whose spec declares `deliver_by` and whose output model the pipeline builds. For a transformation pipeline, that is a non-ephemeral model its `models` glob selects, with the same root, models directory and glob as `rocky run`. The models are loaded, not compiled, so a compile error is not seen. When its models directory is absent or cannot be located, or a model fails to load, `rocky run` builds nothing, so the pipeline has no `delivery` (see `latest_start`). For any other pipeline type, it is any such model the pipeline's newest production run that built one built, within the newest 500 runs. The estimate times the whole pipeline run. Absent when no source shows the pipeline building a product with a deadline.
     """
     enabled: bool
     """
@@ -495,7 +495,7 @@ class SchedulePipelineStatus(BaseModel):
     """
     latest_start: LatestStartStatus | None = None
     """
-    The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Present on each pipeline that has a `delivery`, each pipeline whose models could not all be read and that no source shows building a deadlined model (then `unknown`, reason `models_unreadable`), and every pipeline any of those runs `after`, directly or through others. Absent otherwise. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
+    The latest time this pipeline can start and still meet every product deadline it feeds, directly or through pipelines that run `after` it. Present on each pipeline that has a `delivery`; each transformation pipeline whose models cannot all be read (then `unknown`, reason `models_unreadable`, with a `warning`) when config or run history shows it building a deadlined output model, or some deadlined output model has no pipeline that builds it; and every pipeline any of those runs `after`, directly or through others. Absent otherwise. A deadline only derives this value: it never adds an `after` edge and never moves a cron.
     """
     next_fire_at: AwareDatetime | None = None
     """

@@ -8,11 +8,13 @@
 //! It does read more for one thing: delivery state. When any product
 //! declares a `deliver_by` deadline, it finds which scheduled pipelines build
 //! each deadlined output model. For a transformation pipeline it loads the
-//! models its `models` glob selects, the way `rocky run` selects them: that
-//! parses model files on every request. When that answer is incomplete (not
-//! a transformation pipeline, an absent models directory, or a model that
-//! fails to load), it also reads the pipeline's newest production run that
-//! built a deadlined model. For a pipeline that delivers such a product it
+//! models its `models` glob selects, with the same root, models directory and
+//! glob as `rocky run`, leaving out ephemeral models: that parses model files
+//! on every request. It does not compile them. When the models directory is
+//! absent or cannot be located, or a model fails to load, `rocky run` builds
+//! nothing, so the pipeline serves no deadline; the newest production run
+//! that built a deadlined model is read only to flag it. For any other
+//! pipeline type, that run is what maps it. For a pipeline that delivers such a product it
 //! also reads the product's latest delivery and the pipeline's last 20
 //! production runs for the duration estimate. Each of those history reads
 //! walks the ordering key of every recorded run (cheap), and decodes full
@@ -43,9 +45,10 @@ use rocky_core::state::StateStore;
 
 use crate::commands::tick::build_member_budgets;
 use crate::output::{
-    CronContext, DeliveryStatus, EstimateBasis, LatestStartStatus, ScheduleClaimStatus,
-    ScheduleLockStatus, SchedulePipelineStatus, ScheduleStatusCounts, ScheduleStatusOutput,
-    ScheduleThrottleKind, ScheduleThrottleStatus, TickLockState,
+    AfterTrigger, CronCheck, CronContext, DeliveryStatus, EstimateBasis, LatestStartState,
+    LatestStartStatus, ScheduleClaimStatus, ScheduleLockStatus, SchedulePipelineStatus,
+    ScheduleStatusCounts, ScheduleStatusOutput, ScheduleThrottleKind, ScheduleThrottleStatus,
+    TickLockState,
 };
 
 /// Why a schedule-status read failed.
@@ -208,28 +211,45 @@ const DELIVERY_LOOKUP_WINDOW: usize = 500;
 struct Served<'a> {
     /// The deadlines whose output model the pipeline builds.
     deadlines: Vec<&'a rocky_core::delivery::ProductDeadline>,
-    /// Whether `deadlines` may be incomplete: the pipeline's models could
-    /// not all be read, and neither those read nor run history show it
-    /// building a deadlined model.
-    unreadable: bool,
+    /// `Some` when the pipeline is a transformation pipeline whose models
+    /// `rocky run` cannot build: then `deadlines` is empty.
+    unreadable: Option<Unreadable<'a>>,
+}
+
+/// A transformation pipeline whose next `rocky run` builds nothing: its
+/// models directory is absent or cannot be located, or a model fails to
+/// load.
+struct Unreadable<'a> {
+    /// Why, in a few words, for the warning.
+    cause: &'static str,
+    /// The deadlines whose output model the pipeline would build: matched
+    /// among the models that did load, or built by its newest production
+    /// run that built a deadlined model. Never served while unreadable.
+    claimed: Vec<&'a rocky_core::delivery::ProductDeadline>,
 }
 
 /// The deadlines `pipeline` builds.
 ///
-/// For a transformation pipeline whose models directory exists, the models
-/// come from its `models` glob, located and filtered exactly as `rocky run`
-/// does ([`crate::models_loader::locate_models_dir`],
-/// [`crate::models_loader::resolved_models_glob`]). That is what the next
-/// scheduled run builds, whether or not it has ever built it before, and
-/// however old its last build is. When every model loads, that answer is
-/// complete and no history is read.
+/// For a transformation pipeline, the models come from its `models` glob,
+/// with the same root, models directory and glob as `rocky run`
+/// ([`crate::models_loader::locate_models_dir`],
+/// [`crate::models_loader::resolved_models_glob`]). Ephemeral models are left
+/// out: `rocky run` never builds one. The models are loaded, not compiled,
+/// so a compile error is not seen here. When every model loads, that answer
+/// is complete and no history is read: it is what the next scheduled run
+/// builds, whether or not it built it before, and however old its last
+/// build is.
 ///
-/// Otherwise config alone cannot answer: another pipeline type, an absent
-/// models directory, a directory that cannot be located, or a model that
-/// fails to load. Then the deadlines found in config (if any) are joined with
-/// those the newest production run that built a deadlined model built, within
-/// the newest [`DELIVERY_LOOKUP_WINDOW`] runs. If both are empty and a model
-/// failed to load, `unreadable` is set.
+/// When the models directory is absent, cannot be located, or a model fails
+/// to load, `rocky run` builds nothing for the pipeline. Then it serves no
+/// deadline, and `unreadable` lists the deadlines it would build: those
+/// matched among the models that loaded, and those its newest production run
+/// that built a deadlined model built (within the newest
+/// [`DELIVERY_LOOKUP_WINDOW`] runs). History never makes it serve one.
+///
+/// For any other pipeline type, the deadlines are those its newest
+/// production run that built a deadlined model built, within the same
+/// window.
 ///
 /// # Errors
 ///
@@ -242,101 +262,133 @@ fn served_deadlines<'a>(
     store: Option<&StateStore>,
     deadlines: &'a [rocky_core::delivery::ProductDeadline],
 ) -> Result<Served<'a>, ScheduleStatusError> {
-    use rocky_core::state::UnrecordedScope;
-
     if deadlines.is_empty() {
         return Ok(Served {
             deadlines: Vec::new(),
-            unreadable: false,
+            unreadable: None,
         });
     }
-    // `Some(models, complete)` for a transformation pipeline whose models
-    // directory exists.
-    let from_config = match config.pipelines.get(pipeline) {
-        Some(rocky_core::config::PipelineConfig::Transformation(t)) => {
-            match crate::models_loader::locate_models_dir(&t.models, config_path) {
-                Ok(crate::models_loader::ModelsDir::Present(dir)) => {
-                    let glob = crate::models_loader::resolved_models_glob(&t.models, config_path);
-                    let (models, errors) =
-                        crate::models_loader::load_project_models_matching_partial(
-                            &dir, &glob, None,
-                        );
-                    for e in &errors {
-                        tracing::warn!(
-                            pipeline,
-                            error = %format!("{e:#}"),
-                            "schedule status: a model could not be loaded; its deadline may be missed"
-                        );
-                    }
-                    let names: std::collections::BTreeSet<String> =
-                        models.into_iter().map(|m| m.config.name).collect();
-                    Some((names, errors.is_empty()))
-                }
-                Ok(crate::models_loader::ModelsDir::Absent(_)) => None,
-                Err(e) => {
-                    tracing::warn!(
-                        pipeline,
-                        error = %format!("{e:#}"),
-                        "schedule status: the models directory could not be located"
-                    );
-                    Some((std::collections::BTreeSet::new(), false))
-                }
-            }
-        }
-        Some(_) | None => None,
-    };
-    let mut served: Vec<&rocky_core::delivery::ProductDeadline> = match &from_config {
-        Some((names, _)) => deadlines
-            .iter()
-            .filter(|deadline| names.contains(&deadline.output_model))
-            .collect(),
-        None => Vec::new(),
-    };
-    let complete = from_config.as_ref().is_some_and(|(_, complete)| *complete);
-    if complete {
+    let Some(rocky_core::config::PipelineConfig::Transformation(t)) =
+        config.pipelines.get(pipeline)
+    else {
         return Ok(Served {
-            deadlines: served,
-            unreadable: false,
+            deadlines: built_by_history(pipeline, store, deadlines)?,
+            unreadable: None,
         });
-    }
-    if let Some(store) = store {
-        // The newest production run of this pipeline that built any
-        // deadlined model. Not simply the newest run: a `--model` run, or a
-        // run that failed before the output model, would otherwise make the
-        // pipeline read as delivering nothing.
-        let latest = store
-            .list_runs_matching_within(1, DELIVERY_LOOKUP_WINDOW, |run| {
-                run.pipeline.as_deref() == Some(pipeline)
-                    && run.counts_as_production(UnrecordedScope::Exclude)
-                    && run.models_executed.iter().any(|execution| {
-                        deadlines
-                            .iter()
-                            .any(|deadline| deadline.output_model == execution.rocky_model_name())
-                    })
-            })
-            .map_err(anyhow::Error::from)?;
-        if let Some(run) = latest.first() {
-            let built: std::collections::BTreeSet<&str> = run
-                .models_executed
-                .iter()
-                .map(rocky_core::state::ModelExecution::rocky_model_name)
-                .collect();
-            for deadline in deadlines {
-                if built.contains(deadline.output_model.as_str())
-                    && !served.iter().any(|held| std::ptr::eq(*held, deadline))
-                {
-                    served.push(deadline);
-                }
+    };
+    // The models `rocky run` would build, and why it builds nothing when
+    // it would.
+    let (names, cause) = match crate::models_loader::locate_models_dir(&t.models, config_path) {
+        Ok(crate::models_loader::ModelsDir::Present(dir)) => {
+            let glob = crate::models_loader::resolved_models_glob(&t.models, config_path);
+            let (models, errors) =
+                crate::models_loader::load_project_models_matching_partial(&dir, &glob, None);
+            for e in &errors {
+                tracing::warn!(
+                    pipeline,
+                    error = %format!("{e:#}"),
+                    "schedule status: a model could not be loaded; rocky run builds nothing"
+                );
             }
+            let names: std::collections::BTreeSet<String> = models
+                .into_iter()
+                // `rocky run` never builds an ephemeral model: compile
+                // inlines it into each consumer.
+                .filter(|m| {
+                    !matches!(
+                        m.config.strategy,
+                        rocky_core::models::StrategyConfig::Ephemeral
+                    )
+                })
+                .map(|m| m.config.name)
+                .collect();
+            let cause = (!errors.is_empty()).then_some("a model fails to load");
+            (names, cause)
+        }
+        Ok(crate::models_loader::ModelsDir::Absent(_)) => (
+            std::collections::BTreeSet::new(),
+            Some("the models directory does not exist"),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                pipeline,
+                error = %format!("{e:#}"),
+                "schedule status: the models directory could not be located"
+            );
+            (
+                std::collections::BTreeSet::new(),
+                Some("the models directory cannot be located"),
+            )
+        }
+    };
+    let mut matched: Vec<&rocky_core::delivery::ProductDeadline> = deadlines
+        .iter()
+        .filter(|deadline| names.contains(&deadline.output_model))
+        .collect();
+    let Some(cause) = cause else {
+        return Ok(Served {
+            deadlines: matched,
+            unreadable: None,
+        });
+    };
+    for deadline in built_by_history(pipeline, store, deadlines)? {
+        if !matched.iter().any(|held| std::ptr::eq(*held, deadline)) {
+            matched.push(deadline);
         }
     }
-    // A transformation pipeline with a model that did not load, and nothing
-    // found: whether it builds a deadlined model is unknown.
-    let unreadable = served.is_empty() && from_config.is_some();
     Ok(Served {
-        deadlines: served,
-        unreadable,
+        deadlines: Vec::new(),
+        unreadable: Some(Unreadable {
+            cause,
+            claimed: matched,
+        }),
     })
+}
+
+/// The deadlines whose output model the newest production run of
+/// `pipeline` that built any deadlined model built, within the newest
+/// [`DELIVERY_LOOKUP_WINDOW`] runs. Empty without a store.
+///
+/// Not simply the newest run: a `--model` run, or a run that failed before
+/// the output model, would otherwise make the pipeline read as delivering
+/// nothing.
+///
+/// # Errors
+///
+/// A run-history read failure is an error.
+fn built_by_history<'a>(
+    pipeline: &str,
+    store: Option<&StateStore>,
+    deadlines: &'a [rocky_core::delivery::ProductDeadline],
+) -> Result<Vec<&'a rocky_core::delivery::ProductDeadline>, ScheduleStatusError> {
+    use rocky_core::state::UnrecordedScope;
+
+    let Some(store) = store else {
+        return Ok(Vec::new());
+    };
+    let latest = store
+        .list_runs_matching_within(1, DELIVERY_LOOKUP_WINDOW, |run| {
+            run.pipeline.as_deref() == Some(pipeline)
+                && run.counts_as_production(UnrecordedScope::Exclude)
+                && run.models_executed.iter().any(|execution| {
+                    deadlines
+                        .iter()
+                        .any(|deadline| deadline.output_model == execution.rocky_model_name())
+                })
+        })
+        .map_err(anyhow::Error::from)?;
+    let Some(run) = latest.first() else {
+        return Ok(Vec::new());
+    };
+    let built: std::collections::BTreeSet<&str> = run
+        .models_executed
+        .iter()
+        .map(rocky_core::state::ModelExecution::rocky_model_name)
+        .collect();
+    Ok(deadlines
+        .iter()
+        .filter(|deadline| built.contains(deadline.output_model.as_str()))
+        .collect())
 }
 
 /// The delivery state of the most urgent of `served`: the one whose next
@@ -396,7 +448,8 @@ fn build_pipelines(
     let scheduled = resolve_schedules_detailed(config, None, &member_budgets);
 
     // Which deadlines each scheduled pipeline builds, before any status: an
-    // unreadable pipeline only matters when some deadline has no builder.
+    // unreadable pipeline that no source ties to a deadline only matters
+    // when some deadline has no pipeline at all.
     let mut served: std::collections::BTreeMap<String, Served<'_>> =
         std::collections::BTreeMap::new();
     for name in scheduled.keys() {
@@ -405,11 +458,18 @@ fn build_pipelines(
             served_deadlines(config, config_path, name, store, deadlines)?,
         );
     }
-    let every_deadline_has_a_builder = deadlines.iter().all(|deadline| {
-        served
-            .values()
-            .any(|s| s.deadlines.iter().any(|held| std::ptr::eq(*held, deadline)))
+    let every_deadline_is_placed = deadlines.iter().all(|deadline| {
+        served.values().any(|s| {
+            s.deadlines
+                .iter()
+                .chain(s.unreadable.iter().flat_map(|u| u.claimed.iter()))
+                .any(|held| std::ptr::eq(*held, deadline))
+        })
     });
+    // The warning of each unreadable pipeline that counts as feeding a
+    // deadline.
+    let mut unreadable_warnings: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     let mut out = Vec::new();
     // The `after` graph and each pipeline's own deadline, for the latest
@@ -425,9 +485,41 @@ fn build_pipelines(
         let claims_here = claims.get(&name).cloned().unwrap_or_default();
         let served_here = served.remove(&name).unwrap_or(Served {
             deadlines: Vec::new(),
-            unreadable: false,
+            unreadable: None,
         });
         let delivery = pipeline_delivery(&name, store, &served_here.deadlines, now)?;
+        let serves_unknown = match &served_here.unreadable {
+            None => false,
+            Some(unreadable) if !unreadable.claimed.is_empty() => {
+                let products: Vec<String> = unreadable
+                    .claimed
+                    .iter()
+                    .map(|deadline| format!("`{}`", deadline.product))
+                    .collect();
+                unreadable_warnings.insert(
+                    name.clone(),
+                    format!(
+                        "{}, so `rocky run` builds nothing for this pipeline; config or run \
+                         history shows it building the output model of {}",
+                        unreadable.cause,
+                        products.join(", ")
+                    ),
+                );
+                true
+            }
+            Some(unreadable) if !every_deadline_is_placed => {
+                unreadable_warnings.insert(
+                    name.clone(),
+                    format!(
+                        "{}, so `rocky run` builds nothing for this pipeline, and some \
+                         product's output model has no pipeline that builds it",
+                        unreadable.cause
+                    ),
+                );
+                true
+            }
+            Some(_) => false,
+        };
         chain.insert(
             name.clone(),
             ChainNode {
@@ -440,7 +532,7 @@ fn build_pipelines(
                     product: d.product.clone(),
                     due_at: d.next_due_at,
                 }),
-                serves_unknown: served_here.unreadable && !every_deadline_has_a_builder,
+                serves_unknown,
             },
         );
 
@@ -518,7 +610,7 @@ fn build_pipelines(
             ),
         });
     }
-    attach_latest_starts(&mut out, chain, store, now)?;
+    attach_latest_starts(&mut out, chain, unreadable_warnings, store, now)?;
     Ok(out)
 }
 
@@ -532,6 +624,7 @@ fn build_pipelines(
 fn attach_latest_starts(
     pipelines: &mut [SchedulePipelineStatus],
     mut chain: std::collections::BTreeMap<String, ChainNode>,
+    mut unreadable_warnings: std::collections::BTreeMap<String, String>,
     store: Option<&StateStore>,
     now: DateTime<Utc>,
 ) -> Result<(), ScheduleStatusError> {
@@ -566,21 +659,97 @@ fn attach_latest_starts(
                 .map(|band| band.p90_ms);
         }
     }
-    let mut starts = latest_starts(&chain);
+    let starts = latest_starts(&chain);
+    let fires: std::collections::BTreeMap<String, (Option<DateTime<Utc>>, bool)> = pipelines
+        .iter()
+        .map(|p| (p.pipeline.clone(), (p.next_fire_at, p.enabled)))
+        .collect();
+    let mut judge = Judge {
+        starts: &starts,
+        chain: &chain,
+        fires: &fires,
+        now,
+        memo: std::collections::BTreeMap::new(),
+        in_progress: std::collections::BTreeSet::new(),
+    };
     for pipeline in pipelines {
-        if let Some(latest) = starts.remove(&pipeline.pipeline) {
-            pipeline.latest_start = Some(LatestStartStatus::from_latest_start(
-                latest,
-                CronContext {
-                    now,
-                    next_fire_at: pipeline.next_fire_at,
-                    enabled: pipeline.enabled,
-                    has_after: !pipeline.after.is_empty(),
-                },
-            ));
+        let Some(mut status) = judge.status(&pipeline.pipeline) else {
+            continue;
+        };
+        if let Some(text) = unreadable_warnings.remove(&pipeline.pipeline) {
+            status.warning = Some(match status.warning.take() {
+                Some(cron) => format!("{text}; {cron}"),
+                None => text,
+            });
         }
+        pipeline.latest_start = Some(status);
     }
     Ok(())
+}
+
+/// Judges each pipeline's cron against its latest start, upstreams first:
+/// a late cron relies on `after` only when every `after` upstream is itself
+/// judged in time.
+struct Judge<'a> {
+    starts: &'a std::collections::BTreeMap<String, rocky_core::delivery::LatestStart>,
+    chain: &'a std::collections::BTreeMap<String, ChainNode>,
+    /// Each scheduled pipeline's next cron fire and whether it is enabled.
+    fires: &'a std::collections::BTreeMap<String, (Option<DateTime<Utc>>, bool)>,
+    now: DateTime<Utc>,
+    memo: std::collections::BTreeMap<String, LatestStartStatus>,
+    in_progress: std::collections::BTreeSet<String>,
+}
+
+impl Judge<'_> {
+    /// The latest start of `name` with its cron judged. `None` when it feeds
+    /// no deadline, or on a cycle back to itself.
+    fn status(&mut self, name: &str) -> Option<LatestStartStatus> {
+        if let Some(done) = self.memo.get(name) {
+            return Some(done.clone());
+        }
+        let latest = self.starts.get(name)?.clone();
+        if !self.in_progress.insert(name.to_string()) {
+            return None;
+        }
+        let upstreams: Vec<String> = self
+            .chain
+            .get(name)
+            .map(|node| node.after.clone())
+            .unwrap_or_default();
+        let after = if upstreams.is_empty() {
+            AfterTrigger::Absent
+        } else {
+            // Every upstream must have a known latest start and a cron
+            // judged in time, itself or through its own `after`.
+            let all_in_time = upstreams.iter().all(|upstream| {
+                self.status(upstream).is_some_and(|status| {
+                    status.state == LatestStartState::Known
+                        && matches!(
+                            status.cron_check,
+                            CronCheck::OnTime | CronCheck::ReliesOnAfter
+                        )
+                })
+            });
+            if all_in_time {
+                AfterTrigger::UpstreamsInTime
+            } else {
+                AfterTrigger::UpstreamsNotInTime
+            }
+        };
+        self.in_progress.remove(name);
+        let (next_fire_at, enabled) = self.fires.get(name).copied().unwrap_or((None, false));
+        let status = LatestStartStatus::from_latest_start(
+            latest,
+            CronContext {
+                now: self.now,
+                next_fire_at,
+                enabled,
+                after,
+            },
+        );
+        self.memo.insert(name.to_string(), status.clone());
+        Some(status)
+    }
 }
 
 /// The throttle to report, matching only what the reconciler actually honors.
@@ -746,8 +915,22 @@ mod delivery_state_tests {
         at, seed_delivery, seed_five_on_time, spec_with_deadline, write,
     };
 
-    /// A project scheduling pipeline `revenue`, whose product declares a
-    /// 06:00 deadline, with the state store open for seeding.
+    /// Write model `name` (a `.sql` and a `.toml`) into `dir`. `extra_toml`
+    /// is appended to the sidecar.
+    fn write_model(dir: &Path, name: &str, extra_toml: &str) {
+        write(&dir.join(format!("{name}.sql")), "SELECT 1 AS id\n");
+        write(
+            &dir.join(format!("{name}.toml")),
+            &format!(
+                "depends_on = []\n{extra_toml}\n[target]\ncatalog = \"p\"\nschema = \"s\"\n\
+                 table = \"{name}\"\n"
+            ),
+        );
+    }
+
+    /// A project scheduling pipeline `revenue`, which builds model
+    /// `revenue_daily`, whose product declares a 06:00 deadline, with the
+    /// state store open for seeding.
     fn project() -> (
         tempfile::TempDir,
         std::path::PathBuf,
@@ -760,6 +943,7 @@ mod delivery_state_tests {
             &root.join("products/revenue_daily.toml"),
             &spec_with_deadline("0 6 * * *"),
         );
+        write_model(&root.join("models"), "revenue_daily", "");
         let config_path = root.join("rocky.toml");
         write(
             &config_path,
@@ -939,6 +1123,13 @@ mod delivery_state_tests {
             &root.join("products/costs_daily.toml"),
             &spec_with_deadline("0 4 * * *").replace("revenue_daily", "costs_daily"),
         );
+        for (sub, model) in [
+            ("raw", "raw_orders"),
+            ("revenue", "revenue_daily"),
+            ("costs", "costs_daily"),
+        ] {
+            write_model(&root.join("models").join(sub), model, "");
+        }
         let mut toml = String::from("[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n");
         for (name, schedule) in [
             ("raw", format!("cron = \"{raw_cron}\"\ntimezone = \"UTC\"")),
@@ -946,7 +1137,7 @@ mod delivery_state_tests {
             ("costs", "after = [\"raw\"]".to_string()),
         ] {
             toml.push_str(&format!(
-                "\n[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                "\n[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"models/{name}/**\"\n\n\
                  [pipeline.{name}.target.governance]\nauto_create_schemas = true\n\n\
                  [pipeline.{name}.schedule]\n{schedule}\n"
             ));
@@ -1087,10 +1278,16 @@ mod delivery_state_tests {
 
     #[test]
     fn a_pipeline_that_delivers_no_product_reports_no_delivery() {
-        let (_dir, config_path, state_path, store) = project();
+        let (dir, config_path, state_path, store) = project();
         drop(store);
+        let models = dir.path().join("models");
+        std::fs::remove_dir_all(&models).unwrap();
+        write_model(&models, "other", "");
         let delivery = delivery_json(&config_path, &state_path, at(2, 5, 55));
-        assert!(delivery.is_null(), "never ran: no delivery, got {delivery}");
+        assert!(
+            delivery.is_null(),
+            "builds no output model: no delivery, got {delivery}"
+        );
     }
 
     /// Two pipelines with their own model directories: `raw` (cron
@@ -1112,15 +1309,7 @@ mod delivery_state_tests {
             &spec_with_deadline("0 6 * * *"),
         );
         for (sub, model) in [("raw", "raw_orders"), ("revenue", "revenue_daily")] {
-            let base = root.join("models").join(sub);
-            write(&base.join(format!("{model}.sql")), "SELECT 1 AS id\n");
-            write(
-                &base.join(format!("{model}.toml")),
-                &format!(
-                    "depends_on = []\n\n[target]\ncatalog = \"p\"\nschema = \"s\"\n\
-                     table = \"{model}\"\n"
-                ),
-            );
+            write_model(&root.join("models").join(sub), model, "");
         }
         if let Some((file, text)) = extra_revenue_file {
             write(&root.join("models/revenue").join(file), text);
@@ -1276,12 +1465,184 @@ mod delivery_state_tests {
             );
         }
     }
+
+    /// Five production runs of `raw` (`raw_orders`, 03:00-03:20) and of
+    /// `revenue` (`revenue_daily`, 03:20-03:30), on days 1 to 5.
+    fn seed_old_history(store: &StateStore, root: &Path) {
+        for day in 1..=5 {
+            seed_run(
+                store,
+                root,
+                "raw",
+                "raw_orders",
+                at(day, 3, 0),
+                at(day, 3, 20),
+            );
+            seed_run(
+                store,
+                root,
+                "revenue",
+                "revenue_daily",
+                at(day, 3, 20),
+                at(day, 3, 30),
+            );
+        }
+    }
+
+    /// `revenue` built `revenue_daily` before, but `rocky run` builds
+    /// nothing for it now. History never makes it serve the deadline: it
+    /// has no `delivery`, and its latest start, and `raw`'s, are `unknown`
+    /// with `models_unreadable`, and it carries a warning naming the
+    /// product and `cause`.
+    fn assert_models_unreadable(
+        status: &std::collections::BTreeMap<String, serde_json::Value>,
+        cause: &str,
+    ) {
+        let revenue = &status["revenue"];
+        assert!(revenue["delivery"].is_null(), "{revenue}");
+        let latest = &revenue["latest_start"];
+        assert_eq!(latest["state"], "unknown", "{latest}");
+        assert_eq!(latest["reasons"], serde_json::json!(["models_unreadable"]));
+        assert!(latest.get("at").is_none(), "{latest}");
+        let warning = latest["warning"].as_str().expect("a warning");
+        assert!(warning.contains(cause), "{warning}");
+        assert!(warning.contains("`revenue_daily`"), "{warning}");
+        assert!(warning.contains("`rocky run` builds nothing"), "{warning}");
+        let raw = &status["raw"]["latest_start"];
+        assert_eq!(raw["state"], "unknown", "{raw}");
+        assert_eq!(raw["reasons"], serde_json::json!(["models_unreadable"]));
+    }
+
+    #[test]
+    fn an_absent_models_dir_with_old_history_reads_models_unreadable() {
+        let (dir, config_path, state_path, store) = config_project(None);
+        seed_old_history(&store, dir.path());
+        drop(store);
+        std::fs::remove_dir_all(dir.path().join("models/revenue")).unwrap();
+        let status = chain_status(&config_path, &state_path);
+        assert_models_unreadable(&status, "the models directory does not exist");
+    }
+
+    /// The output model still loads, but a sibling does not: `rocky run`
+    /// builds nothing, so the config match is not served either.
+    #[test]
+    fn one_unloadable_model_with_old_history_reads_models_unreadable() {
+        let (dir, config_path, state_path, store) =
+            config_project(Some(("broken.toml", "this is not = = toml")));
+        write(&dir.path().join("models/revenue/broken.sql"), "SELECT 1\n");
+        seed_old_history(&store, dir.path());
+        drop(store);
+        let status = chain_status(&config_path, &state_path);
+        assert_models_unreadable(&status, "a model fails to load");
+    }
+
+    /// The models directory is a link out of the project root: `rocky run`
+    /// refuses it, so status does too.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlocatable_models_dir_with_old_history_reads_models_unreadable() {
+        let (dir, config_path, state_path, store) = config_project(None);
+        seed_old_history(&store, dir.path());
+        drop(store);
+        let outside = tempfile::tempdir().unwrap();
+        write_model(outside.path(), "revenue_daily", "");
+        let linked = dir.path().join("models/revenue");
+        std::fs::remove_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let status = chain_status(&config_path, &state_path);
+        assert_models_unreadable(&status, "the models directory cannot be located");
+    }
+
+    /// `rocky run` never builds an ephemeral model, so a pipeline whose
+    /// output model is ephemeral does not serve its deadline.
+    #[test]
+    fn an_ephemeral_output_model_is_not_served() {
+        let (dir, config_path, state_path, store) = config_project(None);
+        write_model(
+            &dir.path().join("models/revenue"),
+            "revenue_daily",
+            "\n[strategy]\ntype = \"ephemeral\"\n",
+        );
+        drop(store);
+        let status = chain_status(&config_path, &state_path);
+        let revenue = &status["revenue"];
+        assert!(revenue["delivery"].is_null(), "{revenue}");
+        assert!(revenue["latest_start"].is_null(), "{revenue}");
+        assert!(status["raw"]["latest_start"].is_null(), "{}", status["raw"]);
+    }
+
+    /// `chain_project`, with a `55 5 * * *` cron on `revenue` as well as
+    /// `after = ["raw"]`. `revenue`'s latest start is 06:00 - 10m = 05:50,
+    /// so its next fire at 05:55 is late on its own.
+    fn revenue_cron_status(
+        raw_cron: &str,
+        raw_slot: (u32, u32),
+        costs_days: std::ops::RangeInclusive<u32>,
+    ) -> serde_json::Value {
+        let (_dir, config_path, state_path) = chain_project(raw_cron, raw_slot, costs_days);
+        let toml = std::fs::read_to_string(&config_path).unwrap();
+        let block = "[pipeline.revenue.schedule]\nafter = [\"raw\"]\n";
+        assert!(toml.contains(block), "fixture layout changed");
+        write(
+            &config_path,
+            &toml.replacen(
+                block,
+                &format!("{block}cron = \"55 5 * * *\"\ntimezone = \"UTC\"\n"),
+                1,
+            ),
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .put_schedule_state(
+                "revenue",
+                &ScheduleStateRecord {
+                    last_fire_logical_ts: Some(at(5, 5, 55).to_rfc3339()),
+                    ..ScheduleStateRecord::default()
+                },
+            )
+            .unwrap();
+        drop(store);
+        let status = chain_status(&config_path, &state_path);
+        assert_eq!(status["revenue"]["next_fire_at"], "2026-05-06T05:55:00Z");
+        status["revenue"]["latest_start"].clone()
+    }
+
+    /// `raw` fires at 03:00, before its 03:10 latest start: `after` is
+    /// relied on.
+    #[test]
+    fn a_late_cron_after_an_on_time_upstream_relies_on_after() {
+        let latest = revenue_cron_status("0 3 * * *", (3, 0), 1..=5);
+        assert_eq!(latest["at"], "2026-05-06T05:50:00Z", "{latest}");
+        assert_eq!(latest["cron_check"], "relies_on_after");
+        assert_eq!(latest["cron_too_late"], false);
+        assert!(latest.get("warning").is_none(), "{latest}");
+    }
+
+    /// `raw` fires at 03:15, after its 03:10 latest start: it is
+    /// `too_late`, so `after` cannot be relied on.
+    #[test]
+    fn a_late_cron_after_a_late_upstream_is_too_late() {
+        let latest = revenue_cron_status("15 3 * * *", (3, 15), 1..=5);
+        assert_eq!(latest["cron_check"], "too_late", "{latest}");
+        assert_eq!(latest["cron_too_late"], true);
+        assert!(latest["warning"].is_string(), "{latest}");
+    }
+
+    /// `raw`'s latest start is unknown (`costs` ran once), so `after`
+    /// cannot be relied on.
+    #[test]
+    fn a_late_cron_after_an_unknown_upstream_is_too_late() {
+        let latest = revenue_cron_status("0 3 * * *", (3, 0), 5..=5);
+        assert_eq!(latest["state"], "known", "{latest}");
+        assert_eq!(latest["cron_check"], "too_late");
+        assert_eq!(latest["cron_too_late"], true);
+    }
 }
 
 /// The cron verdict against a latest start. Pure: no store, no clock.
 #[cfg(test)]
 mod cron_check_tests {
-    use crate::output::{CronCheck, CronContext, LatestStartStatus};
+    use crate::output::{AfterTrigger, CronCheck, CronContext, LatestStartStatus};
     use chrono::{DateTime, TimeZone, Utc};
     use rocky_core::delivery::{LatestStart, UnknownReason};
 
@@ -1299,26 +1660,84 @@ mod cron_check_tests {
         }
     }
 
-    fn ctx(fire: Option<DateTime<Utc>>, enabled: bool, has_after: bool) -> CronContext {
+    fn ctx(fire: Option<DateTime<Utc>>, enabled: bool, after: AfterTrigger) -> CronContext {
         CronContext {
             now: t(1, 0, 0),
             next_fire_at: fire,
             enabled,
-            has_after,
+            after,
         }
+    }
+
+    /// An overdue cron whose latest start has already passed is too late as
+    /// well: the missed slot can no longer meet the deadline.
+    #[test]
+    fn an_overdue_cron_past_its_latest_start_is_too_late() {
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            CronContext {
+                now: t(3, 30, 0),
+                next_fire_at: Some(t(3, 0, 0)),
+                enabled: true,
+                after: AfterTrigger::Absent,
+            },
+        );
+        assert_eq!(status.cron_check, CronCheck::Overdue);
+        assert!(status.cron_too_late);
+        assert!(status.warning.is_some());
+    }
+
+    /// An overdue cron whose latest start is still ahead is not too late:
+    /// a catch-up fire now can still meet it.
+    #[test]
+    fn an_overdue_cron_before_its_latest_start_is_not_too_late() {
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            CronContext {
+                now: t(3, 5, 0),
+                next_fire_at: Some(t(3, 0, 0)),
+                enabled: true,
+                after: AfterTrigger::Absent,
+            },
+        );
+        assert_eq!(status.cron_check, CronCheck::Overdue);
+        assert!(!status.cron_too_late);
+        assert!(status.warning.is_some());
+    }
+
+    /// A late cron with `after` whose upstreams are not all judged in time
+    /// is `too_late`, not `relies_on_after`.
+    #[test]
+    fn a_late_cron_with_an_untimely_upstream_is_too_late() {
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(t(3, 15, 0)), true, AfterTrigger::UpstreamsNotInTime),
+        );
+        assert_eq!(status.cron_check, CronCheck::TooLate);
+        assert!(status.cron_too_late);
+        let warning = status.warning.expect("a warning");
+        assert!(
+            warning.contains("the `after` trigger cannot be relied on"),
+            "{warning}"
+        );
+        assert!(status.note.is_none());
     }
 
     /// The docs say "later than `at`": a fire exactly at `at` is in time.
     #[test]
     fn a_fire_exactly_at_the_latest_start_is_on_time() {
-        let status =
-            LatestStartStatus::from_latest_start(known(), ctx(Some(t(3, 10, 0)), true, false));
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(t(3, 10, 0)), true, AfterTrigger::Absent),
+        );
         assert_eq!(status.cron_check, CronCheck::OnTime);
         assert!(!status.cron_too_late);
         assert!(status.warning.is_none() && status.note.is_none());
 
-        let status =
-            LatestStartStatus::from_latest_start(known(), ctx(Some(t(3, 10, 1)), true, false));
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(t(3, 10, 1)), true, AfterTrigger::Absent),
+        );
         assert_eq!(status.cron_check, CronCheck::TooLate);
         assert!(status.cron_too_late);
         let warning = status.warning.expect("a warning");
@@ -1333,8 +1752,10 @@ mod cron_check_tests {
     /// the `after` trigger is relied on, and `note` says so.
     #[test]
     fn a_late_cron_with_after_relies_on_after() {
-        let status =
-            LatestStartStatus::from_latest_start(known(), ctx(Some(t(3, 15, 0)), true, true));
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(t(3, 15, 0)), true, AfterTrigger::UpstreamsInTime),
+        );
         assert_eq!(status.cron_check, CronCheck::ReliesOnAfter);
         assert!(!status.cron_too_late);
         assert!(status.warning.is_none());
@@ -1346,8 +1767,10 @@ mod cron_check_tests {
         assert!(note.contains("`after` trigger is relied on"), "{note}");
 
         // An early cron with `after` is simply on time.
-        let status =
-            LatestStartStatus::from_latest_start(known(), ctx(Some(t(3, 0, 0)), true, true));
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(t(3, 0, 0)), true, AfterTrigger::UpstreamsInTime),
+        );
         assert_eq!(status.cron_check, CronCheck::OnTime);
         assert!(status.note.is_none());
     }
@@ -1359,7 +1782,8 @@ mod cron_check_tests {
     fn a_missed_cron_slot_is_overdue() {
         let now = t(1, 0, 0);
         let missed = Some(t(0, 59, 59));
-        let status = LatestStartStatus::from_latest_start(known(), ctx(missed, true, false));
+        let status =
+            LatestStartStatus::from_latest_start(known(), ctx(missed, true, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Overdue);
         assert!(!status.cron_too_late);
         let warning = status.warning.expect("a warning");
@@ -1369,11 +1793,15 @@ mod cron_check_tests {
             reasons: vec![UnknownReason::MissingEstimate],
             missing_estimate: vec!["raw".to_string()],
         };
-        let status = LatestStartStatus::from_latest_start(unknown, ctx(missed, true, false));
+        let status =
+            LatestStartStatus::from_latest_start(unknown, ctx(missed, true, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Overdue);
         assert!(status.warning.is_some());
 
-        let status = LatestStartStatus::from_latest_start(known(), ctx(Some(now), true, false));
+        let status = LatestStartStatus::from_latest_start(
+            known(),
+            ctx(Some(now), true, AfterTrigger::Absent),
+        );
         assert_eq!(status.cron_check, CronCheck::OnTime);
     }
 
@@ -1381,7 +1809,8 @@ mod cron_check_tests {
     /// cron verdict.
     #[test]
     fn a_disabled_schedule_is_reported_as_disabled() {
-        let status = LatestStartStatus::from_latest_start(known(), ctx(None, false, false));
+        let status =
+            LatestStartStatus::from_latest_start(known(), ctx(None, false, AfterTrigger::Absent));
         assert_eq!(status.cron_check, CronCheck::Disabled);
         assert!(!status.cron_too_late);
         let warning = status.warning.expect("a warning");
@@ -1395,8 +1824,10 @@ mod cron_check_tests {
             reasons: vec![UnknownReason::Cycle, UnknownReason::Overflow],
             missing_estimate: Vec::new(),
         };
-        let status =
-            LatestStartStatus::from_latest_start(unknown, ctx(Some(t(23, 0, 0)), true, false));
+        let status = LatestStartStatus::from_latest_start(
+            unknown,
+            ctx(Some(t(23, 0, 0)), true, AfterTrigger::Absent),
+        );
         assert_eq!(status.cron_check, CronCheck::NotJudged);
         assert!(!status.cron_too_late);
         assert!(status.warning.is_none() && status.at.is_none());

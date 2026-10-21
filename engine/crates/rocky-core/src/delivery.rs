@@ -400,10 +400,11 @@ pub struct ChainNode {
     pub p90_ms: Option<u64>,
     /// The most urgent deadline the pipeline serves itself, if any.
     pub deadline: Option<DirectDeadline>,
-    /// True when it is not known whether the pipeline serves a deadline:
-    /// its models could not all be read, and neither those that were read
-    /// nor its run history show it building a deadlined model. The node then
-    /// counts as feeding a deadline whose start-by is unknown.
+    /// True when the pipeline may serve a deadline but cannot build it: its
+    /// models could not all be read, so the next run builds nothing, and
+    /// config or run history shows it building a deadlined model, or some
+    /// deadlined model has no builder. The node then counts as feeding a
+    /// deadline whose start-by is unknown.
     pub serves_unknown: bool,
 }
 
@@ -417,8 +418,8 @@ pub enum UnknownReason {
     MissingEstimate,
     /// A deadline's cron finds no next occurrence.
     NoNextDeadline,
-    /// A pipeline on the way could not have all its models read, so whether
-    /// it serves a deadline is unknown.
+    /// A pipeline on the way could not have all its models read, so it may
+    /// serve a deadline it cannot build. See [`ChainNode::serves_unknown`].
     ModelsUnreadable,
     /// The `after` graph has a cycle on the way to a deadline.
     Cycle,

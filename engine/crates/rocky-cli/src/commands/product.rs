@@ -4954,6 +4954,14 @@ pub(crate) mod delivery_tests {
             &proj.join("products/revenue_daily.toml"),
             &spec_with_deadline("0 6 * * *"),
         );
+        // The model `rocky run` builds, so the scheduler status maps the
+        // deadline to `revenue` from config.
+        write(&proj.join("models/revenue_daily.sql"), "SELECT 1 AS id\n");
+        write(
+            &proj.join("models/revenue_daily.toml"),
+            "depends_on = []\n\n[target]\ncatalog = \"p\"\nschema = \"s\"\n\
+             table = \"revenue_daily\"\n",
+        );
         let config_path = proj.join("rocky.toml");
         write(
             &config_path,
