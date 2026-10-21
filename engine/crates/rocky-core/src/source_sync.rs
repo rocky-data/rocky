@@ -57,9 +57,13 @@
 //! start, so a sync that starts later is still waited out. One more read right
 //! after that answer moves the baseline and `T_pre`, so a sync that ended
 //! between the idle read and the request is not counted; if that read fails,
-//! the connector ends `unknown`. A 409 is taken as "the connector is busy":
-//! the connector is waited for and the request is sent again when it is idle.
-//! A second 409 ends the connector as `trigger_failed`.
+//! the connector ends `unknown`. If that read shows a sync running, that sync
+//! is counted as Rocky's: the open window above, met on this path too. Rocky's
+//! own sync, if it ends before that read, is missed and the row ends
+//! `timeout` (safe, but slow). A 409 is taken as "the connector is busy": the
+//! connector is waited for and the request is sent again when it is idle.
+//! After a second 409 (counted over the whole run) no request is sent; the
+//! connector ends `trigger_failed` once a read shows it idle.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -79,6 +83,10 @@ const SETTLE_POLLS: u32 = 3;
 
 /// Consecutive failed status polls that end the wait with an error.
 const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
+
+/// Busy (409) answers after which a connector gets no more sync requests in
+/// one run. It counts across the whole run, not in a row.
+const MAX_CONFLICTS: u32 = 2;
 
 /// How far past `T_pre` a timestamp has to be before it counts as the end of
 /// the sync Rocky started. Covers the clock difference between the server time
@@ -157,7 +165,8 @@ pub enum SourceSyncTriggerError {
     /// docs do not say whether that means "a sync is already running", so the
     /// caller takes the safe side: it treats the connector as syncing, waits
     /// for it to be idle, does not count that sync as its own, and asks once
-    /// more. A second busy answer ends the connector as `TriggerFailed`.
+    /// more. After a second busy answer it sends nothing more and ends the
+    /// connector as `TriggerFailed` once a read shows it idle.
     #[error("{0}")]
     Conflict(String),
     /// The request may have reached the source and its answer is unknown (a
@@ -498,7 +507,7 @@ struct TriggerTracked {
     last_sync_at: Option<DateTime<Utc>>,
     waited_secs: u64,
     detail: Option<String>,
-    /// Busy (409) answers so far; a second one ends the connector.
+    /// Busy (409) answers so far; see [`MAX_CONFLICTS`].
     conflicts: u32,
 }
 
@@ -703,21 +712,22 @@ pub async fn trigger_and_wait_for_source_syncs(
                         }
                     }
                 }
-                // The connector is busy: wait it out, do not count that sync,
-                // and ask once more. A second busy answer ends the connector.
+                // The connector is busy: wait it out and do not count that
+                // sync. After the first busy answer Rocky asks once more;
+                // after the second it sends nothing more, and the connector
+                // ends `TriggerFailed` once a read shows it idle, so the run
+                // never reads while that sync writes.
                 Err(SourceSyncTriggerError::Conflict(message)) => {
                     t.conflicts += 1;
-                    if t.conflicts >= 2 {
-                        t.detail = Some(format!(
-                            "{message}; busy answer {} times, no sync started",
+                    t.detail = Some(if t.conflicts >= MAX_CONFLICTS {
+                        format!(
+                            "{message}; busy answer {} times, no sync started; waiting for the \
+                             connector to be idle",
                             t.conflicts
-                        ));
-                        t.finish(SourceSyncOutcome::TriggerFailed, waited);
-                        continue;
-                    }
-                    t.detail = Some(format!(
-                        "{message}; the connector is treated as syncing and is waited for"
-                    ));
+                        )
+                    } else {
+                        format!("{message}; the connector is treated as syncing and is waited for")
+                    });
                     t.phase = TriggerPhase::AwaitIdle;
                     continue;
                 }
@@ -808,6 +818,10 @@ pub async fn trigger_and_wait_for_source_syncs(
                 TriggerPhase::AwaitIdle => {
                     if state.paused {
                         t.finish(SourceSyncOutcome::Paused, waited);
+                    } else if !state.syncing && t.conflicts >= MAX_CONFLICTS {
+                        // Busy twice: no more requests. The busy sync is over,
+                        // so the run may read what it landed.
+                        t.finish(SourceSyncOutcome::TriggerFailed, waited);
                     } else if !state.syncing {
                         t.detail = None;
                         t.phase = TriggerPhase::Ready(Identity::of(state));
@@ -1600,7 +1614,7 @@ mod tests {
         assert_eq!(a.requests().len(), 1);
     }
 
-    /// A second busy answer ends the connector: no request on every poll.
+    /// A second busy answer stops the requests: no request on every poll.
     #[tokio::test]
     async fn a_second_busy_answer_ends_the_connector() {
         let a = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)]])
@@ -1612,6 +1626,29 @@ mod tests {
         let report = trigger_run(&a, 5000).await;
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
         assert!(!report.syncs[0].triggered);
+        assert_eq!(a.requests().len(), 2);
+    }
+
+    /// After a second busy answer, a sync that is running is waited out: the
+    /// connector ends only once a read shows it idle, so the run (even under
+    /// `warn`) never reads while that sync writes.
+    #[tokio::test]
+    async fn after_a_second_busy_answer_a_running_sync_is_waited_out() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", false, at(-500), None, 10)],
+            // After the second 409: a sync is running for two polls.
+            vec![seen("a", true, at(-500), None, 20)],
+            vec![seen("a", true, at(-500), None, 30)],
+            vec![seen("a", false, at(35), None, 40)],
+        ])
+        .with_trigger_results(vec![
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+            Err(SourceSyncTriggerError::Conflict("HTTP 409".into())),
+        ]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert_eq!(report.syncs[0].last_sync_at, at(35));
         assert_eq!(a.requests().len(), 2);
     }
 
