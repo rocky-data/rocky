@@ -205,6 +205,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 
         // Validate the schedule `after` graph is acyclic (mutual `after` hangs).
         validate_schedule_dag(&cfg, &mut out);
+
+        // V064: two pipelines that start syncs on the same connectors.
+        validate_shared_sync_triggers(&cfg, &mut out);
     }
 
     // Validate the models the transformation pipelines actually declare.
@@ -1381,6 +1384,55 @@ fn validate_schedule_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
     }
 }
 
+/// V064: two replication pipelines with `sync.trigger = true` on the same
+/// discovery adapter, with `schema_pattern` prefixes where one starts with the
+/// other, can select the same connector. `rocky run --dag` runs each pipeline
+/// as its own sub-run, so each one sends its own request for that connector.
+/// Rocky keeps no per-DAG record of the requests, so the second request finds
+/// the first sync running, waits it out, and then starts one more. A warning:
+/// the owner may want both, but it costs vendor compute twice.
+fn validate_shared_sync_triggers(cfg: &rocky_core::config::RockyConfig, out: &mut ValidateOutput) {
+    let triggering: Vec<(&String, &str, &str)> = cfg
+        .pipelines
+        .iter()
+        .filter_map(|(name, pc)| {
+            let rocky_core::config::PipelineConfig::Replication(p) = pc else {
+                return None;
+            };
+            let disc = p.source.discovery.as_ref()?;
+            disc.sync.as_ref().is_some_and(|s| s.trigger).then_some((
+                name,
+                disc.adapter.as_str(),
+                p.source.schema_pattern.prefix.as_str(),
+            ))
+        })
+        .collect();
+    for (i, (first, adapter, first_prefix)) in triggering.iter().enumerate() {
+        for (second, other_adapter, second_prefix) in &triggering[i + 1..] {
+            if adapter != other_adapter
+                || !(first_prefix.starts_with(second_prefix)
+                    || second_prefix.starts_with(first_prefix))
+            {
+                continue;
+            }
+            out.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V064".into(),
+                message: format!(
+                    "pipeline.{first} and pipeline.{second} both set sync.trigger = true on \
+                     discovery adapter '{adapter}' with overlapping schema_pattern prefixes \
+                     ('{first_prefix}', '{second_prefix}'). A connector both select gets one \
+                     sync request from each pipeline in `rocky run --dag`, and pays the vendor \
+                     for two syncs. Set trigger = true on one of them, or keep the prefixes \
+                     apart."
+                ),
+                file: None,
+                field: Some(format!("pipeline.{second}.source.discovery.sync.trigger")),
+            });
+        }
+    }
+}
+
 /// The `[checks]` sub-field name for a [`CheckKind`], used to point the
 /// inert-config warning at the offending key.
 fn check_kind_field(kind: rocky_core::checks::CheckKind) -> &'static str {
@@ -2371,6 +2423,60 @@ schema_template = "raw__{{source}}"
             .filter(|m| m.code == "V063" && m.severity == "warn")
             .collect();
         assert_eq!(hits.len(), 1, "{:?}", out.messages);
+    }
+
+    /// A second replication pipeline on the same `ft` adapter.
+    fn second_pipeline(name: &str, prefix: &str, trigger: bool) -> String {
+        format!(
+            r#"
+[pipeline.{name}]
+type = "replication"
+
+[pipeline.{name}.source]
+adapter = "wh"
+
+[pipeline.{name}.source.discovery]
+adapter = "ft"
+
+[pipeline.{name}.source.discovery.sync]
+wait = true
+trigger = {trigger}
+
+[pipeline.{name}.source.schema_pattern]
+prefix = "{prefix}"
+separator = "__"
+components = ["source"]
+
+[pipeline.{name}.target]
+adapter = "wh"
+catalog_template = "wh"
+schema_template = "{name}__{{source}}"
+"#
+        )
+    }
+
+    #[test]
+    fn two_triggering_pipelines_on_overlapping_prefixes_are_a_v064_warning() {
+        let base = trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            "",
+        );
+        let shared = validate_toml(&format!("{base}{}", second_pipeline("more", "src__", true)));
+        assert!(shared.valid, "{:?}", shared.messages);
+        let hits = shared.messages.iter().filter(|m| m.code == "V064").count();
+        assert_eq!(hits, 1, "{:?}", shared.messages);
+
+        let apart = validate_toml(&format!(
+            "{base}{}",
+            second_pipeline("more", "other__", true)
+        ));
+        assert!(!apart.messages.iter().any(|m| m.code == "V064"));
+        let one_waits = validate_toml(&format!(
+            "{base}{}",
+            second_pipeline("more", "src__", false)
+        ));
+        assert!(!one_waits.messages.iter().any(|m| m.code == "V064"));
     }
 
     #[test]

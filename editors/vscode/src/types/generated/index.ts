@@ -193,6 +193,7 @@ export type { IntentCheckOutput, PlanOutput, PlannedStatement } from "./plan";
 // Run (canonical source for all run-only nested types)
 export type {
   RunOutput,
+  SourceSyncOutput,
   MaterializationOutput,
   MaterializationMetadata,
   TableCheckOutput,

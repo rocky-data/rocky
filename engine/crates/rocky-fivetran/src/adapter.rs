@@ -4,6 +4,7 @@
 //! in a destination. This is a metadata-only operation.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use tracing::warn;
@@ -169,10 +170,15 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
     /// Start one sync: `POST /v1/connections/{id}/sync`, never `force`.
     ///
     /// Refuses without the owner's opt-in, before any request. A 403 names
-    /// the fix. A timeout or a 5xx is reported as `Failed`: the caller reads
-    /// the connector to see whether a sync started, and never retries the
-    /// request.
-    async fn trigger_source_sync(&self, connector_id: &str) -> Result<(), SourceSyncTriggerError> {
+    /// the fix. A refusal (400, 404, 409, an exhausted 429, a connect error) is
+    /// `Failed`: no sync started. A timeout, a 5xx or a connection lost
+    /// mid-request is `Unknown`: the caller reads the connector to see whether
+    /// a sync started, and never retries the request. `Ok` carries the `Date`
+    /// header of the answer.
+    async fn trigger_source_sync(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, SourceSyncTriggerError> {
         if !self.allow_sync_trigger {
             return Err(SourceSyncTriggerError::NotAllowed);
         }
@@ -185,9 +191,8 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                      this key cannot start syncs. Use a key whose role can run syncs, or set \
                      trigger = false. {body}"
                 )),
-                SyncRequestError::Failed(message) | SyncRequestError::Unknown(message) => {
-                    SourceSyncTriggerError::Failed(message)
-                }
+                SyncRequestError::Failed(message) => SourceSyncTriggerError::Failed(message),
+                SyncRequestError::Unknown(message) => SourceSyncTriggerError::Unknown(message),
             })
     }
 

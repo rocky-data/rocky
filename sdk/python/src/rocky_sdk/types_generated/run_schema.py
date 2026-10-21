@@ -636,7 +636,7 @@ class SourceSyncOutput(BaseModel):
 
     detail: str | None = None
     """
-    The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.
+    The error text behind an `error` or `trigger_failed` outcome, or the note on an `interrupted` row whose sync request may have been sent. Absent for every other outcome.
     """
     id: str
     """
@@ -665,7 +665,7 @@ class SourceSyncOutput(BaseModel):
     """
     triggered: bool | None = None
     """
-    Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.
+    Rocky started this sync (`[...discovery.sync] trigger = true`): the source took the request, or a signal came while it was in flight and it may have been sent (the `detail` says so). Absent when the row is a sync Rocky only waited for, and when the source refused the request.
     """
     waited_secs: conint(ge=0)
     """

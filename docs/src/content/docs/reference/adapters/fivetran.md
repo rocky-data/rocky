@@ -73,7 +73,7 @@ How Rocky decides how a sync ended: Fivetran gives no sync id. Rocky notes each 
 | `wait` | `false` | Turn the wait on. The other keys do nothing without it. |
 | `wait_timeout_secs` | `3600` | Longest wait for the whole phase. A sync still running at the limit counts as a failure (`timeout`). `rocky validate` requires at most half of `[state.idempotency] in_flight_ttl_hours`, so another run cannot reap this run's idempotency claim while it waits. |
 | `poll_interval_secs` | `30` | Seconds between polls. At least 10. |
-| `on_sync_failure` | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data Fivetran already landed. |
+| `on_sync_failure` | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data Fivetran already landed, except after a sync that Rocky started and cannot call finished: see [Start a sync](#start-a-sync). |
 | `trigger` | `false` | Start a sync first. Needs `wait = true` and `allow_sync_trigger = true` on the adapter. See [Start a sync](#start-a-sync). |
 
 The wait runs before the run takes its state session, so a long wait holds no state lock. Because no state store is open yet:
@@ -121,26 +121,34 @@ for each connector the run selects (--filter limits it)
    |
    |-- paused ---------------------------> no request, outcome `paused`
    |-- a sync is running now -> wait for it to end (not counted)
-   |-- idle  -> T_pre = Fivetran's own clock (the `Date` header) at that read
-   |             one POST
+   |-- idle  -> note succeeded_at and failed_at at that read (the baseline)
+   |             one POST; T_pre = Fivetran's own clock (the `Date` header of
+   |             the answer to the POST)
    |             poll until:
-   |               succeeded_at > T_pre + 5 s -> succeeded
-   |               failed_at    > T_pre + 5 s -> failed (the later one wins)
+   |               succeeded_at moved AND > T_pre + 5 s -> succeeded
+   |               failed_at    moved AND > T_pre + 5 s -> failed (the later one wins)
 ```
 
-Fivetran answers a sync request with no sync id and no start time. So Rocky decides which sync is its own from timestamps. The connector was idle at `T_pre`, so a sync that ends after `T_pre` began after it. The 5 second margin covers the gap between the clock behind the `Date` header and the clock behind `succeeded_at`. The margin can reject a real sync that ends within 5 seconds of the idle read, for example an empty incremental sync. That ends as `unknown`, which counts as a failure. It fails closed. One window stays open: a sync that Fivetran schedules itself between the idle read and the `POST` is taken as the one Rocky started, and its data can predate the request by that gap.
+Fivetran answers a sync request with no sync id and no start time. So Rocky decides which sync is its own from timestamps, and a timestamp counts as the end of Rocky's sync only if two tests pass:
+
+1. It moved past the value the connector had at the idle read. Both values come from Fivetran, so no clock takes part.
+2. It is later than `T_pre` plus 5 seconds. `T_pre` is the `Date` header of Fivetran's answer to the `POST`, so a sync that Fivetran scheduled itself and that ended before the `POST` is not counted, for example while the `POST` waited out a `429`. If the answer to the `POST` has no `Date`, the `Date` of the idle read is used, and if that is missing too, the clock of your machine. Test 1 still applies then, so a clock difference alone cannot make a sync look like Rocky's.
+
+The 5 second margin covers the gap between the clock behind the `Date` header and the clock behind `succeeded_at`. It can reject a real sync that ends within 5 seconds of the `POST`, for example an empty incremental sync. If a poll saw the connector syncing first, that ends as `unknown`. If no poll did, Rocky keeps waiting and it ends as `timeout` after the full `wait_timeout_secs`. Both count as a failure. It fails closed. One window stays open: a sync that Fivetran schedules itself between the `POST` and its answer is taken as the one Rocky started.
 
 Details:
 
 - A sync that is running when the run begins is waited out first and is not counted. The request goes out only after a read shows the connector idle.
 - A paused connector gets the outcome `paused`, no request, and does not stop the run: a person paused it on purpose.
 - A `403` means the key's role cannot start syncs. The connector ends as `trigger_failed`, no further request goes out on that key, and the message says: use a key whose role can run syncs, or set `trigger = false`.
-- A request is never retried after a timeout or a `5xx`, because the sync may have started. Rocky reads the connector once more. If a sync is running or ended past `T_pre`, it is accepted. Otherwise the connector ends as `trigger_failed`. A connect error or a `429` means Fivetran did not take the request, so those retry within the retry budget.
+- A request is never retried after a timeout or a `5xx`, because the sync may have started. Rocky reads the connector once more. If a sync is running or ended past `T_pre`, it is accepted. Otherwise the connector ends as `trigger_failed`. A connect error or a `429` means Fivetran did not take the request, so those retry within the retry budget. When the retries run out, or Fivetran answers `400`, `404` or `409`, the request was refused: the connector ends as `trigger_failed` with `triggered: false`, no `source_sync_triggered` event fires, and Rocky does not read the connector again, because a sync that Fivetran started itself is not Rocky's.
 - `rocky run --watch` never starts a sync, because every file save would start one. It still waits for a running sync.
+- `rocky run --resume <run-id>` and `--resume-latest` never start a sync, the same as `--no-sync-trigger`. They still wait for a sync that is already running.
 - `rocky run --no-sync-trigger` skips the request for one run. The run still waits for a sync that is already running. It does not change the config, so `rocky discover` still reports `sync_trigger: true`.
-- Every request appears in `source_syncs` (`triggered: true`) and as a `source_sync_triggered` event (run id, connector id, schema, `idle_seen_at`).
+- Every request that Fivetran took appears in `source_syncs` (`triggered: true`) and as a `source_sync_triggered` event (run id, connector id, schema, `idle_seen_at`, which is `T_pre`). A refused request (`403`, `400`, `404`, `409`, an exhausted `429`) does not: its row has `triggered: false`. If a signal arrives while the request is in flight, the row is `interrupted` with `triggered: true` and a `detail` saying the request may have been sent.
+- `on_sync_failure = "warn"` does not cover a sync that Rocky started and cannot call finished (`timeout`, `error` or `unknown` on a row with `triggered: true`). That sync may still be writing the tables the run would read, so the run stops as with `fail`. `warn` keeps its meaning for rows where Rocky started nothing, and for a sync that finished as `failed`.
 - `rocky apply` never starts a sync, for any plan.
-- `rocky validate` refuses `trigger = true` without `wait = true`, and without `allow_sync_trigger = true` on the adapter. It warns (`V063`) when the pipeline also has a `[schedule]` cron, because every tick then starts a vendor sync and spends vendor compute.
+- `rocky validate` refuses `trigger = true` without `wait = true`, and without `allow_sync_trigger = true` on the adapter. It warns (`V063`) when the pipeline also has a `[schedule]` cron, because every tick then starts a vendor sync and spends vendor compute. It warns (`V064`) when two pipelines set `trigger = true` on the same discovery adapter with overlapping `schema_pattern` prefixes: in one `rocky run --dag` each pipeline sends its own request for a connector both select, and the vendor runs two syncs. Rocky keeps no record of requests across the sub-runs of a DAG, so set `trigger = true` on one of them.
 
 ### Dagster
 

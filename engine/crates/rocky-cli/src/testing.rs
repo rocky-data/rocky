@@ -715,7 +715,10 @@ impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
     async fn trigger_source_sync(
         &self,
         connector_id: &str,
-    ) -> Result<(), rocky_core::source_sync::SourceSyncTriggerError> {
+    ) -> Result<
+        Option<chrono::DateTime<chrono::Utc>>,
+        rocky_core::source_sync::SourceSyncTriggerError,
+    > {
         self.triggers
             .lock()
             .expect("sync trigger log mutex")
@@ -729,7 +732,7 @@ impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
                     .into(),
             ));
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn source_sync_states(

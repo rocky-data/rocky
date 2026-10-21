@@ -14,7 +14,10 @@
 //!                |-- all succeeded ----------> carry on (rows in run JSON)
 //!                |-- failed / timeout / error -> on_sync_failure
 //!                |        fail: stop, no warehouse write, no RunRecord
-//!                |        warn: log, carry on
+//!                |        warn: log, carry on, EXCEPT a sync Rocky started
+//!                |              that is not known to be finished (timeout,
+//!                |              error, unknown): it may still be writing, so
+//!                |              the run stops as with fail
 //!                '-- signal -----------------> Interrupted (exit 130), no RunRecord
 //! ```
 //!
@@ -57,7 +60,8 @@ pub(super) struct SyncPhase<'a> {
     pub output_json: bool,
     pub cancel: &'a CancellationToken,
     pub hooks: &'a HookRegistry,
-    /// `--no-sync-trigger`: wait only, even when the config sets `trigger`.
+    /// `--no-sync-trigger`, or a resume (`--resume`, `--resume-latest`): wait
+    /// only, even when the config sets `trigger`.
     pub no_sync_trigger: bool,
 }
 
@@ -147,7 +151,19 @@ impl SyncPhase<'_> {
             "source sync did not finish cleanly for pipeline '{}': {detail}",
             self.pipeline_name
         );
-        self.phase_failed(&message, rows).await
+        // A sync Rocky started and cannot call finished may still be writing
+        // the tables the run would read. `warn` never covers that.
+        let may_still_write = report.bad().any(|r| {
+            r.triggered
+                && matches!(
+                    r.outcome,
+                    SourceSyncOutcome::Timeout
+                        | SourceSyncOutcome::Error
+                        | SourceSyncOutcome::Unknown
+                )
+        });
+        self.phase_failed_with(&message, rows, may_still_write)
+            .await
     }
 
     /// Apply `on_sync_failure` to a failed phase. `rows` are the connector
@@ -157,7 +173,23 @@ impl SyncPhase<'_> {
         message: &str,
         rows: Vec<SourceSyncOutput>,
     ) -> Result<Vec<SourceSyncOutput>> {
-        match self.sync.on_sync_failure {
+        self.phase_failed_with(message, rows, false).await
+    }
+
+    /// [`Self::phase_failed`], with `may_still_write` to stop the run whatever
+    /// `on_sync_failure` says.
+    async fn phase_failed_with(
+        &self,
+        message: &str,
+        rows: Vec<SourceSyncOutput>,
+        may_still_write: bool,
+    ) -> Result<Vec<SourceSyncOutput>> {
+        let mode = if may_still_write {
+            OnSyncFailure::Fail
+        } else {
+            self.sync.on_sync_failure
+        };
+        match mode {
             OnSyncFailure::Warn => {
                 warn!(
                     pipeline = self.pipeline_name,
@@ -168,6 +200,13 @@ impl SyncPhase<'_> {
             OnSyncFailure::Fail => {
                 self.fire_failure_hooks(message).await;
                 self.emit_json(&rows, false);
+                if may_still_write {
+                    anyhow::bail!(
+                        "{message}. Nothing was written. A sync Rocky started may still be \
+                         writing, so `on_sync_failure = \"warn\"` does not apply. Run again \
+                         once the sync has finished"
+                    )
+                }
                 anyhow::bail!(
                     "{message}. Nothing was written. Set `on_sync_failure = \"warn\"` to run \
                      on the last landed data instead"
@@ -722,11 +761,13 @@ auto_create_schemas = true
             idempotency_key,
             false,
             &SkipRunOptions::default(),
+            (None, false),
         )
         .await
     }
 
     /// [`drive`], with the config's `trigger` and the run's skip overlay.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_with(
         dir: &Path,
         key: &str,
@@ -735,6 +776,7 @@ auto_create_schemas = true
         idempotency_key: Option<&str>,
         trigger: bool,
         skip_opts: &SkipRunOptions,
+        resume: (Option<&str>, bool),
     ) -> Result<RunTermination> {
         let config_path = dir.join("rocky.toml");
         std::fs::write(
@@ -758,8 +800,8 @@ auto_create_schemas = true
             false,
             None,
             false,
-            None,
-            false,
+            resume.0,
+            resume.1,
             None,
             &PartitionRunOptions::default(),
             None,
@@ -877,6 +919,7 @@ auto_create_schemas = true
             None,
             true,
             &SkipRunOptions::default(),
+            (None, false),
         )
         .await
         .expect_err("a refused key fails the run");
@@ -902,7 +945,17 @@ auto_create_schemas = true
             no_sync_trigger: true,
             ..SkipRunOptions::default()
         };
-        let result = drive_with(dir.path(), &key, "fail", 5, None, true, &skip).await;
+        let result = drive_with(
+            dir.path(),
+            &key,
+            "fail",
+            5,
+            None,
+            true,
+            &skip,
+            (None, false),
+        )
+        .await;
         assert!(
             !is_sync_phase_error(&result),
             "no request, no refusal: {result:?}"
@@ -912,6 +965,78 @@ auto_create_schemas = true
             !recorder(&key).statements().is_empty(),
             "the run reached the warehouse"
         );
+    }
+
+    /// A resume never starts a vendor sync, whatever the config says: the same
+    /// idle source and the same `trigger = true` that start a sync on a fresh
+    /// run send no request under `--resume-latest` or `--resume <id>`. (The
+    /// resume itself fails later, with no earlier run to resume; the phase
+    /// comes first.)
+    #[tokio::test]
+    async fn a_resume_sends_no_sync_request() {
+        for resume in [(None, true), (Some("run-earlier"), false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = dir.path().join("calls").display().to_string();
+            let source = sync_source(&key);
+            source.script(vec![vec![seen(false, at(-500), None)]]);
+            source.forbid_triggers();
+            let result = drive_with(
+                dir.path(),
+                &key,
+                "fail",
+                5,
+                None,
+                true,
+                &SkipRunOptions::default(),
+                resume,
+            )
+            .await;
+            assert!(
+                !is_sync_phase_error(&result),
+                "a resume must not reach the trigger: {result:?}"
+            );
+            assert!(
+                source.triggered().is_empty(),
+                "a resume sent a sync request: {:?}",
+                source.triggered()
+            );
+        }
+    }
+
+    /// `on_sync_failure = "warn"` does not cover a sync Rocky started and
+    /// cannot call finished: the request went out, no read ever shows the sync
+    /// end (`timeout`), and the run stops before the warehouse. The control is
+    /// a wait-only run with the same script, which `warn` lets through.
+    #[tokio::test]
+    async fn warn_does_not_cover_a_triggered_sync_that_may_still_be_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("calls").display().to_string();
+        let source = sync_source(&key);
+        source.script(vec![vec![seen(false, at(-500), None)]]);
+        let error = drive_with(
+            dir.path(),
+            &key,
+            "warn",
+            1,
+            None,
+            true,
+            &SkipRunOptions::default(),
+            (None, false),
+        )
+        .await
+        .expect_err("a triggered sync that timed out stops the run despite warn");
+        let text = format!("{error:#}");
+        assert!(text.contains("c1 (timeout)"), "{text}");
+        assert!(text.contains("may still be writing"), "{text}");
+        assert_eq!(source.triggered(), ["c1"]);
+        assert!(recorder(&key).calls().is_empty(), "nothing was written");
+
+        // Control: the same timeout on a wait-only row is what `warn` is for.
+        let control = tempfile::tempdir().unwrap();
+        let control_key = control.path().join("calls").display().to_string();
+        sync_source(&control_key).script(still_syncing());
+        let result = drive(control.path(), &control_key, "warn", 1, None).await;
+        assert!(!is_sync_phase_error(&result), "{result:?}");
     }
 
     #[tokio::test]

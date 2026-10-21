@@ -21,19 +21,30 @@
 //!   syncing now --> wait for it to end (not counted) --+
 //!   idle -----------------------------------------------+
 //!                                                         v
-//!        T_pre = server time of the poll that saw it idle
-//!        one POST (never `force`)
+//!        baseline = succeeded_at / failed_at of that idle read
+//!        one POST (never `force`); its `Date` header is the new T_pre
 //!        poll: syncing seen, then idle
-//!          succeeded_at > T_pre + 5 s --> succeeded
-//!          failed_at    > T_pre + 5 s --> failed (the later of the two wins)
+//!          succeeded_at moved past the baseline AND > T_pre + 5 s --> succeeded
+//!          failed_at    moved past the baseline AND > T_pre + 5 s --> failed
+//!                                              (the later of the two wins)
 //! ```
 //!
-//! The connector was idle at `T_pre`, so a sync that ends after `T_pre` began
-//! after it. The 5 second margin covers the gap between the server clock
-//! behind `T_pre` and the clock behind `succeeded_at`. It can reject a real
-//! sync that ends within 5 seconds of the idle poll: that ends as `unknown`,
-//! a failure. It fails closed. The one window left open is a scheduled sync
-//! that starts between the idle poll and the POST: it is accepted as ours.
+//! Two tests must both pass before a timestamp counts as the end of the sync
+//! Rocky started. The first is that it moved past the baseline: both values
+//! come from the vendor API, so no clock takes part. The second is that it is
+//! later than `T_pre` plus 5 seconds. `T_pre` is the `Date` header of the
+//! answer to the POST, so a scheduled sync that began and ended before the
+//! POST (for example while the POST waited out a 429) is not counted. When the
+//! POST answer has no `Date`, the idle read's `Date` stands in, and when that
+//! is missing too this machine's clock does. The moved test still applies
+//! then, so a clock difference alone can never make a sync look like ours.
+//!
+//! The 5 second margin covers the gap between the server clock behind `T_pre`
+//! and the clock behind `succeeded_at`. It can reject a real sync that ends
+//! within 5 seconds of the POST. Such a sync ends as `unknown` when a poll saw
+//! it syncing first, and as `timeout` after the full wait when no poll did.
+//! Both are failures: it fails closed. The one window left open is a scheduled
+//! sync that starts between the POST and its answer: it is accepted as ours.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -60,9 +71,43 @@ const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
 const IDENTITY_MARGIN_SECS: i64 = 5;
 
 /// Whether a vendor timestamp shows an end after `t_pre`, with the margin.
-/// The single place the sync identity is decided.
 fn ends_after(timestamp: Option<DateTime<Utc>>, t_pre: DateTime<Utc>) -> bool {
     timestamp.is_some_and(|t| t > t_pre + ChronoDuration::seconds(IDENTITY_MARGIN_SECS))
+}
+
+/// What the trigger path knows when it sends the request: the lower bound for
+/// the end of the sync, and the timestamps of the read that showed the
+/// connector idle.
+#[derive(Debug, Clone, Copy)]
+struct Identity {
+    t_pre: DateTime<Utc>,
+    base_succeeded: Option<DateTime<Utc>>,
+    base_failed: Option<DateTime<Utc>>,
+}
+
+impl Identity {
+    fn of(state: &SourceSyncState) -> Self {
+        Self {
+            t_pre: idle_seen_at(state),
+            base_succeeded: state.succeeded_at,
+            base_failed: state.failed_at,
+        }
+    }
+
+    /// The single place the sync identity is decided: a timestamp is the end
+    /// of the sync Rocky started only if it moved past the baseline (no clock
+    /// involved) and is later than `t_pre` plus the margin.
+    fn ended(&self, now: Option<DateTime<Utc>>, base: Option<DateTime<Utc>>) -> bool {
+        moved(now, base) && ends_after(now, self.t_pre)
+    }
+
+    fn succeeded(&self, state: &SourceSyncState) -> bool {
+        self.ended(state.succeeded_at, self.base_succeeded)
+    }
+
+    fn failed(&self, state: &SourceSyncState) -> bool {
+        self.ended(state.failed_at, self.base_failed)
+    }
 }
 
 /// Why the source refused or could not take a sync request.
@@ -77,11 +122,16 @@ pub enum SourceSyncTriggerError {
     /// The source refused the key (HTTP 403). The text names the fix.
     #[error("{0}")]
     Forbidden(String),
-    /// The request failed or its answer is unknown (a timeout or a server
-    /// error). The caller reads the connector again to see whether a sync
-    /// started.
+    /// The source refused the request, or it never went out (a 400, 404 or
+    /// 409, a 429 that outlasted the retries, a connect error). No sync
+    /// started because of it, so the caller does not read the connector again.
     #[error("{0}")]
     Failed(String),
+    /// The request may have reached the source and its answer is unknown (a
+    /// timeout, a server error, a connection lost mid-request). The caller
+    /// reads the connector again to see whether a sync started.
+    #[error("{0}")]
+    Unknown(String),
 }
 
 /// Sync state of one source connector at one poll.
@@ -391,16 +441,15 @@ enum TriggerPhase {
     /// A sync was running at the first read. Wait for it to end; it is not
     /// counted as the sync Rocky asked for.
     AwaitIdle,
-    /// Seen idle at this server time. The request goes out next.
-    Ready {
-        t_pre: DateTime<Utc>,
-    },
+    /// Seen idle (see [`Identity`]). The request goes out next.
+    Ready(Identity),
     /// The request went out.
     Running {
-        t_pre: DateTime<Utc>,
+        id: Identity,
         /// A read has shown the connector syncing since the request.
         seen_syncing: bool,
-        /// Idle reads with no timestamp past `t_pre` since a sync was seen.
+        /// Idle reads with no new end past the identity test since a sync was
+        /// seen.
         settle: u32,
     },
     Done(SourceSyncOutcome),
@@ -440,17 +489,16 @@ fn idle_seen_at(state: &SourceSyncState) -> DateTime<Utc> {
 }
 
 /// After a request whose answer is unknown, read the connector once more.
-/// `Some(syncing)` when a sync started or ended after `t_pre`.
+/// `Some(syncing)` when a sync is running or ended after the request.
 async fn sync_started_anyway(
     adapter: &dyn DiscoveryAdapter,
     schema_prefix: &str,
     id: &str,
-    t_pre: DateTime<Utc>,
+    identity: &Identity,
 ) -> Option<bool> {
     let states = adapter.source_sync_states(schema_prefix).await.ok()??;
     let state = states.iter().find(|s| s.id == id)?;
-    (state.syncing || ends_after(state.succeeded_at, t_pre) || ends_after(state.failed_at, t_pre))
-        .then_some(state.syncing)
+    (state.syncing || identity.succeeded(state) || identity.failed(state)).then_some(state.syncing)
 }
 
 /// Start a sync on every selected connector and wait until each has ended.
@@ -462,13 +510,16 @@ async fn sync_started_anyway(
 /// - a paused connector gets the `Paused` outcome and no request;
 /// - a connector that is syncing now is waited for first, and that sync is
 ///   not counted;
-/// - once a read shows the connector idle, its server time is `T_pre`, one
-///   request starts a sync, and the sync ends when a timestamp moves past
+/// - once a read shows the connector idle, one request starts a sync, and the
+///   sync ends when a timestamp moves past the idle read's value and past
 ///   `T_pre` plus the margin (see the module docs).
 ///
 /// A refused key (403) stops further requests; the rest end as
-/// `TriggerFailed`. A request with an unknown answer (timeout, server error)
-/// is checked with one more read before it is called failed. `on_trigger` runs
+/// `TriggerFailed`. A request the source refused
+/// ([`SourceSyncTriggerError::Failed`]) ends as `TriggerFailed` and is never
+/// counted as started, whatever a later read shows. A request with an unknown
+/// answer ([`SourceSyncTriggerError::Unknown`]) is checked with one more read
+/// before it is called failed. `on_trigger` runs
 /// right after each request that was accepted or found to have started.
 ///
 /// Returns `Ok(None)` when the adapter does not report sync state, and `Err`
@@ -498,9 +549,7 @@ pub async fn trigger_and_wait_for_source_syncs(
             } else if s.syncing {
                 TriggerPhase::AwaitIdle
             } else {
-                TriggerPhase::Ready {
-                    t_pre: idle_seen_at(s),
-                }
+                TriggerPhase::Ready(Identity::of(s))
             },
             triggered: false,
             last_sync_at: s.succeeded_at,
@@ -537,7 +586,7 @@ pub async fn trigger_and_wait_for_source_syncs(
 
         // Start the syncs that are ready.
         for t in &mut tracked {
-            let TriggerPhase::Ready { t_pre } = t.phase else {
+            let TriggerPhase::Ready(identity) = t.phase else {
                 continue;
             };
             let waited = started.elapsed().as_secs();
@@ -552,19 +601,39 @@ pub async fn trigger_and_wait_for_source_syncs(
                 result = adapter.trigger_source_sync(&t.id) => Some(result),
             };
             let Some(result) = sent else {
+                // The request was in flight when the signal came. It may have
+                // reached the source, so the row says so and does not claim
+                // that nothing was sent.
+                t.triggered = true;
+                t.detail = Some(
+                    "interrupted while the sync request was in flight; the request may have \
+                     been sent and a sync may be running"
+                        .to_string(),
+                );
                 interrupted = true;
                 break;
             };
+            // `Some((syncing, identity))` when a sync is ours.
             let started_sync = match result {
-                Ok(()) => Some(false),
-                Err(SourceSyncTriggerError::Failed(message)) => {
+                // The `Date` of the answer is the lower bound for the end of
+                // the sync: the sync cannot have started before the request.
+                Ok(post_date) => Some((
+                    false,
+                    Identity {
+                        t_pre: post_date.unwrap_or(identity.t_pre),
+                        ..identity
+                    },
+                )),
+                Err(SourceSyncTriggerError::Unknown(message)) => {
                     // A timeout or a server error: the sync may have started.
-                    let found = sync_started_anyway(adapter, schema_prefix, &t.id, t_pre).await;
+                    let found = sync_started_anyway(adapter, schema_prefix, &t.id, &identity).await;
                     if found.is_none() {
                         t.detail = Some(message);
                     }
-                    found
+                    found.map(|syncing| (syncing, identity))
                 }
+                // A refusal: no sync started because of it. A sync that
+                // Fivetran started on its own is not ours.
                 Err(error) => {
                     if matches!(error, SourceSyncTriggerError::Forbidden(_)) {
                         refused = Some(error.to_string());
@@ -574,17 +643,17 @@ pub async fn trigger_and_wait_for_source_syncs(
                 }
             };
             match started_sync {
-                Some(seen_syncing) => {
+                Some((seen_syncing, id)) => {
                     t.triggered = true;
                     t.phase = TriggerPhase::Running {
-                        t_pre,
+                        id,
                         seen_syncing,
                         settle: 0,
                     };
                     on_trigger(&SourceSyncTriggered {
                         id: t.id.clone(),
                         schema: t.schema.clone(),
-                        idle_seen_at: t_pre,
+                        idle_seen_at: id.t_pre,
                     });
                 }
                 None => t.finish(SourceSyncOutcome::TriggerFailed, waited),
@@ -651,26 +720,24 @@ pub async fn trigger_and_wait_for_source_syncs(
                     if state.paused {
                         t.finish(SourceSyncOutcome::Paused, waited);
                     } else if !state.syncing {
-                        t.phase = TriggerPhase::Ready {
-                            t_pre: idle_seen_at(state),
-                        };
+                        t.phase = TriggerPhase::Ready(Identity::of(state));
                     }
                 }
                 TriggerPhase::Running {
-                    t_pre,
+                    id,
                     seen_syncing,
                     settle,
                 } => {
                     if state.syncing {
                         t.phase = TriggerPhase::Running {
-                            t_pre,
+                            id,
                             seen_syncing: true,
                             settle: 0,
                         };
                         continue;
                     }
-                    let ok = ends_after(state.succeeded_at, t_pre);
-                    let bad = ends_after(state.failed_at, t_pre);
+                    let ok = id.succeeded(state);
+                    let bad = id.failed(state);
                     let outcome = match (ok, bad) {
                         (true, false) => Some(SourceSyncOutcome::Succeeded),
                         (false, true) => Some(SourceSyncOutcome::Failed),
@@ -692,14 +759,14 @@ pub async fn trigger_and_wait_for_source_syncs(
                         }
                         None => {
                             t.phase = TriggerPhase::Running {
-                                t_pre,
+                                id,
                                 seen_syncing,
                                 settle: settle + 1,
                             };
                         }
                     }
                 }
-                TriggerPhase::Ready { .. } | TriggerPhase::Done(_) => {}
+                TriggerPhase::Ready(_) | TriggerPhase::Done(_) => {}
             }
         }
     }
@@ -711,9 +778,9 @@ pub async fn trigger_and_wait_for_source_syncs(
                 TriggerPhase::Done(o) => o,
                 // The loop leaves only through a `Done` marking, or through
                 // `Ok(None)`, where the adapter stopped answering.
-                TriggerPhase::AwaitIdle
-                | TriggerPhase::Ready { .. }
-                | TriggerPhase::Running { .. } => SourceSyncOutcome::Unknown,
+                TriggerPhase::AwaitIdle | TriggerPhase::Ready(_) | TriggerPhase::Running { .. } => {
+                    SourceSyncOutcome::Unknown
+                }
             },
             id: t.id,
             schema: t.schema,
@@ -1058,7 +1125,7 @@ mod tests {
     struct TriggerScripted {
         polls: Mutex<VecDeque<Vec<SourceSyncState>>>,
         log: Mutex<Vec<String>>,
-        trigger_results: Mutex<VecDeque<Result<(), SourceSyncTriggerError>>>,
+        trigger_results: Mutex<VecDeque<Result<Option<DateTime<Utc>>, SourceSyncTriggerError>>>,
     }
 
     impl TriggerScripted {
@@ -1069,7 +1136,10 @@ mod tests {
                 trigger_results: Mutex::new(VecDeque::new()),
             }
         }
-        fn with_trigger_results(self, results: Vec<Result<(), SourceSyncTriggerError>>) -> Self {
+        fn with_trigger_results(
+            self,
+            results: Vec<Result<Option<DateTime<Utc>>, SourceSyncTriggerError>>,
+        ) -> Self {
             *self.trigger_results.lock().unwrap() = results.into();
             self
         }
@@ -1101,13 +1171,16 @@ mod tests {
                 Ok(q.front().cloned())
             }
         }
-        async fn trigger_source_sync(&self, id: &str) -> Result<(), SourceSyncTriggerError> {
+        async fn trigger_source_sync(
+            &self,
+            id: &str,
+        ) -> Result<Option<DateTime<Utc>>, SourceSyncTriggerError> {
             self.log.lock().unwrap().push(format!("trigger {id}"));
             self.trigger_results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Ok(()))
+                .unwrap_or(Ok(None))
         }
     }
 
@@ -1349,7 +1422,7 @@ mod tests {
             vec![seen("a", true, at(-500), None, 5)],
             vec![seen("a", false, at(60), None, 70)],
         ])
-        .with_trigger_results(vec![Err(SourceSyncTriggerError::Failed("timeout".into()))]);
+        .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown("timeout".into()))]);
         let report = trigger_run(&started, 2000).await;
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
         assert!(report.syncs[0].triggered);
@@ -1357,7 +1430,9 @@ mod tests {
         assert_eq!(started.requests().len(), 1);
 
         let idle = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)]])
-            .with_trigger_results(vec![Err(SourceSyncTriggerError::Failed("HTTP 502".into()))]);
+            .with_trigger_results(vec![Err(SourceSyncTriggerError::Unknown(
+                "HTTP 502".into(),
+            ))]);
         let report = trigger_run(&idle, 1000).await;
         assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
         assert_eq!(report.syncs[0].detail.as_deref(), Some("HTTP 502"));
@@ -1394,6 +1469,82 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].0, "a");
         assert_eq!(Some(ids[0].1), at(0));
+    }
+
+    /// A signal while the request is in flight: it may have been sent, so the
+    /// row does not claim that nothing went out.
+    #[tokio::test]
+    async fn a_signal_during_the_request_does_not_claim_nothing_was_sent() {
+        let a = TriggerScripted::new(vec![vec![seen("a", false, at(-500), None, 0)]]);
+        let report = trigger_and_wait_for_source_syncs(
+            &a,
+            "",
+            &all,
+            opts(2000),
+            &no_event,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(report.interrupted);
+        let row = &report.syncs[0];
+        assert_eq!(row.outcome, SourceSyncOutcome::Interrupted);
+        assert!(row.triggered, "unknown is not false");
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("may have been sent")),
+            "{:?}",
+            row.detail
+        );
+    }
+
+    /// The POST answer's `Date` replaces the idle read's as `T_pre`: an end
+    /// before it is not ours, an end after it is.
+    #[tokio::test]
+    async fn the_post_date_is_the_lower_bound_for_the_end() {
+        let script = |ended: i64| {
+            TriggerScripted::new(vec![
+                vec![seen("a", false, at(-500), None, 0)],
+                vec![seen("a", true, at(-500), None, 10)],
+                vec![seen("a", false, at(ended), None, 120)],
+            ])
+            .with_trigger_results(vec![Ok(at(100))])
+        };
+        // Moved past the baseline and past the idle read, but before the POST.
+        let before = trigger_run(&script(50), 5000).await;
+        assert_eq!(before.syncs[0].outcome, SourceSyncOutcome::Unknown);
+        let after = trigger_run(&script(110), 5000).await;
+        assert_eq!(after.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+    }
+
+    /// An end that did not move past the baseline is never ours, whatever the
+    /// clocks say.
+    #[tokio::test]
+    async fn an_unmoved_timestamp_is_never_ours_even_past_the_margin() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(50), None, 0)],
+            vec![seen("a", true, at(50), None, 10)],
+            vec![seen("a", false, at(50), None, 20)],
+        ]);
+        let report = trigger_run(&a, 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Unknown);
+    }
+
+    /// A refused request (`Failed`) is not re-read: a sync that started on its
+    /// own is not ours.
+    #[tokio::test]
+    async fn a_refused_request_is_not_re_read_and_not_triggered() {
+        let a = TriggerScripted::new(vec![
+            vec![seen("a", false, at(-500), None, 0)],
+            vec![seen("a", true, at(-500), None, 5)],
+        ])
+        .with_trigger_results(vec![Err(SourceSyncTriggerError::Failed("HTTP 409".into()))]);
+        let report = trigger_run(&a, 1000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::TriggerFailed);
+        assert!(!report.syncs[0].triggered);
+        assert_eq!(a.log(), ["poll", "trigger a"], "no re-read after a refusal");
     }
 
     #[tokio::test]

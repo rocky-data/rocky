@@ -740,7 +740,13 @@ impl FivetranClient {
     ///   connector to see whether a sync is running.
     /// - A 403 returns [`SyncRequestError::Forbidden`]: the key's role cannot
     ///   start syncs.
-    pub async fn post_sync(&self, connector_id: &str) -> Result<(), SyncRequestError> {
+    ///
+    /// `Ok` carries the `Date` header of the accepting answer, the server's
+    /// clock after the request was taken.
+    pub async fn post_sync(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<chrono::DateTime<Utc>>, SyncRequestError> {
         let url = format!(
             "{}/v1/connections/{}/sync",
             self.base_url,
@@ -771,10 +777,22 @@ impl FivetranClient {
                         "no answer to the sync request: {e}"
                     )));
                 }
-                Err(e) => return Err(SyncRequestError::Failed(FivetranError::from(e).to_string())),
+                // A connect error means the request never went out. Any other
+                // send error (a connection lost mid-request) may have reached
+                // Fivetran.
+                Err(e) if e.is_connect() => {
+                    return Err(SyncRequestError::Failed(FivetranError::from(e).to_string()));
+                }
+                Err(e) => {
+                    return Err(SyncRequestError::Unknown(format!(
+                        "no answer to the sync request: {}",
+                        FivetranError::from(e)
+                    )));
+                }
             };
 
             let status = resp.status();
+            let server_date = parse_date_header(&resp);
             if status == 429 {
                 if attempt < self.retry.max_retries {
                     self.check_retry_budget()
@@ -820,7 +838,7 @@ impl FivetranClient {
                     )
                 )));
             }
-            return Ok(());
+            return Ok(server_date);
         }
         unreachable!("retry loop should always return")
     }

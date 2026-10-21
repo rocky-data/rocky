@@ -245,10 +245,15 @@ pub trait DiscoveryAdapter: Send + Sync {
     /// adapter checks `allow_sync_trigger`), because `rocky validate` is only
     /// one funnel into this call. `rocky run` calls it for
     /// `[...discovery.sync] trigger = true`.
+    ///
+    /// `Ok` carries the source server's clock from the answer (the HTTP `Date`
+    /// header) when it sent one. The sync cannot have started before that
+    /// time, so it is the lower bound for the sync's end.
     async fn trigger_source_sync(
         &self,
         _connector_id: &str,
-    ) -> Result<(), crate::source_sync::SourceSyncTriggerError> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::source_sync::SourceSyncTriggerError>
+    {
         Err(crate::source_sync::SourceSyncTriggerError::Unsupported)
     }
 

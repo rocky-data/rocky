@@ -24166,7 +24166,7 @@
         "description": "What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.",
         "properties": {
           "detail": {
-            "description": "The error text behind an `error` or `trigger_failed` outcome. Absent for every other outcome.",
+            "description": "The error text behind an `error` or `trigger_failed` outcome, or the note on an `interrupted` row whose sync request may have been sent. Absent for every other outcome.",
             "type": [
               "string",
               "null"
@@ -24197,7 +24197,7 @@
             "type": "string"
           },
           "triggered": {
-            "description": "Rocky started this sync (`[...discovery.sync] trigger = true`). Absent when the row is a sync Rocky only waited for.",
+            "description": "Rocky started this sync (`[...discovery.sync] trigger = true`): the source took the request, or a signal came while it was in flight and it may have been sent (the `detail` says so). Absent when the row is a sync Rocky only waited for, and when the source refused the request.",
             "type": "boolean"
           },
           "waited_secs": {

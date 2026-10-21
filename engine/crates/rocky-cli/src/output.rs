@@ -534,12 +534,15 @@ pub struct SourceSyncOutput {
     /// The connector's last successful sync after the wait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<DateTime<Utc>>,
-    /// The error text behind an `error` or `trigger_failed` outcome. Absent
-    /// for every other outcome.
+    /// The error text behind an `error` or `trigger_failed` outcome, or the
+    /// note on an `interrupted` row whose sync request may have been sent.
+    /// Absent for every other outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Rocky started this sync (`[...discovery.sync] trigger = true`). Absent
-    /// when the row is a sync Rocky only waited for.
+    /// Rocky started this sync (`[...discovery.sync] trigger = true`): the
+    /// source took the request, or a signal came while it was in flight and it
+    /// may have been sent (the `detail` says so). Absent when the row is a
+    /// sync Rocky only waited for, and when the source refused the request.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub triggered: bool,
 }

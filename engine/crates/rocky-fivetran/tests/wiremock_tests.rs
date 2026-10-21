@@ -1989,7 +1989,13 @@ mod sync_trigger {
     }
 
     fn accepted() -> ResponseTemplate {
+        accepted_at(SERVER_DATE)
+    }
+
+    /// An accepted POST whose answer carries the server clock `date`.
+    fn accepted_at(date: &str) -> ResponseTemplate {
         ResponseTemplate::new(200)
+            .insert_header("Date", date)
             .set_body_json(serde_json::json!({ "code": "Success", "message": "Sync has been successfully triggered" }))
     }
 
@@ -2189,6 +2195,108 @@ mod sync_trigger {
             .with_sync_trigger_allowed(true);
         adapter.trigger_source_sync("conn_1").await.unwrap();
         assert_eq!(posts(&server).await.len(), 2);
+    }
+
+    /// The Date clock is behind the `succeeded_at` clock: an OLD sync's
+    /// `succeeded_at` (10:00:30) is already past `T_pre + 5 s` (10:00:00 + 5)
+    /// at the idle read. With a slow start nothing moves after the POST, so
+    /// the time test alone would call the old sync ours. The moved test must
+    /// reject it: the run ends as `timeout`, never `succeeded`.
+    #[tokio::test]
+    async fn a_succeeded_at_that_never_moved_is_not_ours_even_when_the_clocks_disagree() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", "2026-10-21T10:00:30Z", None, false),
+                page("scheduled", "2026-10-21T10:00:30Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&server, accepted()).await;
+        let report = run(&adapter(&server, true), 400).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(report.syncs[0].triggered);
+        assert!(report.bad().next().is_some());
+    }
+
+    /// A scheduled sync that began and ended between the first read and
+    /// Rocky's POST (10:00:30, while the POST waited) moved `succeeded_at`,
+    /// but it ended before the POST answered (Date 10:01:00). It is not the
+    /// sync Rocky started.
+    #[tokio::test]
+    async fn a_scheduled_sync_that_ends_between_the_first_read_and_the_post_is_not_ours() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("scheduled", "2026-10-21T10:00:30Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&server, accepted_at("Wed, 21 Oct 2026 10:01:00 GMT")).await;
+        let report = run(&adapter(&server, true), 400).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(report.syncs[0].triggered);
+    }
+
+    /// The control for the two tests above: the same shape with an end after
+    /// the POST's Date is a success.
+    #[tokio::test]
+    async fn an_end_after_the_post_date_that_moved_is_a_success() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("scheduled", OLD, None, false),
+                page("scheduled", "2026-10-21T10:01:30Z", None, false),
+            ],
+        )
+        .await;
+        serve_post(&server, accepted_at("Wed, 21 Oct 2026 10:01:00 GMT")).await;
+        let report = run(&adapter(&server, true), 5000).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+    }
+
+    /// A refused POST (409) started nothing. A sync Fivetran started itself,
+    /// seen on the next read, is not Rocky's: no `triggered`, no event.
+    #[tokio::test]
+    async fn a_refused_post_is_never_reported_as_triggered_even_if_a_sync_is_running() {
+        for status in [400u16, 404, 409] {
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                vec![
+                    page("scheduled", OLD, None, false),
+                    page("syncing", OLD, None, false),
+                ],
+            )
+            .await;
+            serve_post(&server, ResponseTemplate::new(status).set_body_string("no")).await;
+            let events = std::sync::Mutex::new(0u32);
+            let hook = |_: &SourceSyncTriggered| *events.lock().unwrap() += 1;
+            let adapter = adapter(&server, true);
+            let report = trigger_and_wait_for_source_syncs(
+                &adapter,
+                "src__",
+                &all,
+                opts(1000),
+                &hook,
+                std::future::pending(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                report.syncs[0].outcome,
+                SourceSyncOutcome::TriggerFailed,
+                "HTTP {status}"
+            );
+            assert!(!report.syncs[0].triggered, "HTTP {status}");
+            assert_eq!(*events.lock().unwrap(), 0, "no event for HTTP {status}");
+            assert_eq!(posts(&server).await.len(), 1);
+        }
     }
 
     #[tokio::test]

@@ -5079,7 +5079,11 @@ pub async fn run_with_explicit_contracts(
             output_json,
             cancel: &cancel,
             hooks: &hook_registry,
-            no_sync_trigger: skip_opts.no_sync_trigger,
+            // A resume re-copies the tables of an earlier run. It never starts
+            // a vendor sync, whatever the config says; it may still wait.
+            no_sync_trigger: skip_opts.no_sync_trigger
+                || resume_run_id.is_some()
+                || resume_latest,
         }
         .run(discovery_adapter.as_ref())
         .await?;
