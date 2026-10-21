@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-10-21
+
+Pairs with engine 1.88.0.
+
 ### Added
 
 - The generated `ProductSpec` model gains `deliver_by` and `timezone`, the optional delivery deadline of a product spec.
 - The generated `ProductStatusOutput` and `SchedulePipelineStatus` models gain an optional `delivery` (`DeliveryStatus`, with a `DurationEstimateStatus` estimate). Both are exported from `rocky_sdk.types_generated`.
+- The generated `SchedulePipelineStatus` model gains an optional `latest_start` (`LatestStartStatus`), exported from `rocky_sdk.types_generated`.
+- The generated config models gain `region` on pipeline sources, targets and `[ai]`, a `residency` section (`ResidencyConfig`, `ResidencyAllow`), and the DuckDB adapter's `offline` and `extension_directory`.
 
 ## [0.27.0] — 2026-10-20
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.88.0] — 2026-10-21
+
+### Upgrade notes
+
+- `rocky product` commands now read `products/` under the directory of the `rocky.toml` that `--config` names, not under the working directory. If you pass `--config` with a path in another directory, move `products/` beside that `rocky.toml`. With the default `--config rocky.toml`, nothing changes.
+
 ### Added
 
 - DuckDB adapter: `extension_directory` and `offline` settings. `extension_directory` sets DuckDB's own `extension_directory`, so every extension Rocky loads (today `icu`; later `httpfs`, `postgres` and `iceberg`) reads from one directory. `offline = true` turns off DuckDB's auto-install, and Rocky never runs `INSTALL`: Rocky loads `icu` from the directory only. A model's own SQL can still run `INSTALL` or turn auto-install back on, so offline mode limits Rocky, not the SQL it executes. A relative `extension_directory` resolves against the working directory of the `rocky` process. The settings reach every DuckDB connection Rocky opens for the project: the adapter, and the local databases of `rocky test`, `rocky ci`, `rocky compile` (its seed run), `rocky publish-ir --with-seed` and `rocky replay --execute`. `rocky playground` seeds before a `rocky.toml` exists and stays on DuckDB's defaults. `rocky validate` warns with `V059` when either setting is on a non-DuckDB adapter. If `icu` is not there, the connect fails with an error that names the directory and says how to fill it, instead of continuing without time-zone functions. This is an error, not a warning, because you asked for offline mode and the adapter cannot do what you asked without `icu`; the same connect step already fails when the database file cannot be opened. With neither setting, behaviour is unchanged. Both are fields of `[adapter.NAME]`, so `schemas/adapter_config.schema.json` and the generated bindings gain them.

@@ -275,7 +275,7 @@ wheels = [
 
 [[package]]
 name = "dagster-rocky"
-version = "1.72.0"
+version = "1.73.0"
 source = { editable = "." }
 dependencies = [
     { name = "dagster" },
@@ -997,7 +997,7 @@ wheels = [
 
 [[package]]
 name = "rocky-sdk"
-version = "0.27.0"
+version = "0.28.0"
 source = { editable = "../../sdk/python" }
 dependencies = [
     { name = "pydantic" },
