@@ -21,7 +21,7 @@
 //! | Backend | Primitive |
 //! |---|---|
 //! | [`StateBackend::Local`] | redb write transaction inside the existing `state.redb.lock` file lock |
-//! | [`StateBackend::Valkey`] / [`StateBackend::Tiered`] | Valkey `SET NX EX` on `{prefix}idempotency:<key>` |
+//! | [`StateBackend::Valkey`] / [`StateBackend::Tiered`] | Valkey `SET NX EX` on `{prefix}idempotency:<key>`; a stale claim is taken over, and finalize written, by Lua `EVAL` scripts that compare the stored value first. The server must allow `EVAL` ([`IdempotencyError::ScriptingUnavailable`]) |
 //! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"` |
 //! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0` |
 //!
