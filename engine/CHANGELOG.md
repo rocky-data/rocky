@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.88.0] — 2026-10-21
+
+### Upgrade notes
+
+- `rocky product` commands now read `products/` under the directory of the `rocky.toml` that `--config` names, not under the working directory. If you pass `--config` with a path in another directory, move `products/` beside that `rocky.toml`. With the default `--config rocky.toml`, nothing changes.
+
 ### Added
 
 - A product spec can declare a volume range: `[product.output.volume]` with `min_rows`, `max_rows` (at least one; `min_rows = 0` alone counts) and `severity` (`warning` by default, or `error`). The range is the output table's total rows after a load, so the output model must be a full-refresh table.
