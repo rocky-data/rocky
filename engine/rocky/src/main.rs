@@ -4807,6 +4807,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 no_reuse,
                 no_prune,
                 full_refresh,
+                no_sync_trigger: false,
+                no_source_sync: false,
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.

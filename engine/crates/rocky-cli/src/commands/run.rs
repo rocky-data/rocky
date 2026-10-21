@@ -1589,6 +1589,28 @@ pub struct SkipRunOptions {
     /// models are rebuilt with `CREATE OR REPLACE TABLE ... AS`, every
     /// `@incremental_filter` resolved to `TRUE`.
     pub full_refresh: bool,
+    /// Whether `--no-sync-trigger` was passed. The source-sync phase then only
+    /// waits for a sync that is already running and never starts one, even
+    /// when `[...discovery.sync] trigger = true`. Does not change the
+    /// config, so `rocky discover` still reports `sync_trigger`.
+    pub no_sync_trigger: bool,
+    /// No source-sync phase at all (neither wait nor trigger). Set by every
+    /// `rocky apply` path through [`Self::for_apply`]; there is no CLI flag.
+    /// A plan's reviewer did not see a sync phase, so apply must not cause
+    /// one. The overlay travels to every `--dag` sub-run, which a forced run
+    /// id would not.
+    pub no_source_sync: bool,
+}
+
+impl SkipRunOptions {
+    /// The overlay for a run started by `rocky apply`: defaults, with the
+    /// source-sync phase off.
+    pub fn for_apply() -> Self {
+        Self {
+            no_source_sync: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Fully-resolved configuration for the model-skip gate, assembled in
@@ -5018,15 +5040,22 @@ pub async fn run_with_explicit_contracts(
         }
     };
 
-    // Source-sync wait (`[...discovery.sync] wait = true`). Runs before the
-    // state session is taken, so a long wait holds no state lock. It holds
-    // only the cancellation token and the idempotency claim. An exit from the
-    // phase persists no RunRecord (no state store is open) and skips the
-    // end-of-run retention sweep, which would otherwise open the state store
-    // with no session. Off under a reviewed apply: the reviewer did not see a
-    // wait, so apply must not cause one.
+    // Source-sync phase (`[...discovery.sync]`). Runs before the state
+    // session is taken, so a long wait holds no state lock. It holds the
+    // cancellation token, the opened adapter handles (registry, hooks) and the
+    // idempotency claim. An exit from the phase persists no RunRecord (no
+    // state store is open) and skips the end-of-run retention sweep, which
+    // would otherwise open the state store with no session. `rocky run` only:
+    // no `rocky apply` path runs it. Apply always forces its own run id
+    // (`run_id_override`), and the reviewer of a plan did not see a sync phase,
+    // so apply must not cause one (neither a wait nor a trigger). Every apply
+    // path sets `skip_opts.no_source_sync` (it reaches `--dag` sub-runs, which
+    // carry no run id); the other three conditions are belt and braces for
+    // the governed and reviewed replication entries.
     let mut source_syncs: Vec<SourceSyncOutput> = Vec::new();
-    if reviewed_source_state.is_none()
+    if !skip_opts.no_source_sync
+        && run_id_override.is_none()
+        && reviewed_source_state.is_none()
         && governed_ctx.is_none()
         && let Some(disc) = pipeline.source.discovery.as_ref()
         && let Some(sync) = disc.sync.as_ref().filter(|s| s.wait)
@@ -8586,7 +8615,8 @@ pub async fn run_with_explicit_contracts(
     // real run.
     if skip_end_of_run_sweep {
         tracing::debug!(
-            "auto-sweep: skipped — no-op transformation run (no models dir) mutates no state"
+            "auto-sweep: skipped — this exit opened no state session (no-op transformation \
+             run, or the source-sync phase), so the sweep must not open the store"
         );
     } else {
         auto_sweep_retention_at_end_of_run(state_path, &loaded.config.state.retention).await;

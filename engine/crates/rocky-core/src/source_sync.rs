@@ -57,6 +57,9 @@ pub enum SourceSyncOutcome {
     Unknown,
     /// A shutdown signal ended the wait first.
     Interrupted,
+    /// The status reads failed, so the wait was abandoned. The result's
+    /// `detail` names the error.
+    Error,
 }
 
 impl SourceSyncOutcome {
@@ -68,6 +71,7 @@ impl SourceSyncOutcome {
             SourceSyncOutcome::Timeout => "timeout",
             SourceSyncOutcome::Unknown => "unknown",
             SourceSyncOutcome::Interrupted => "interrupted",
+            SourceSyncOutcome::Error => "error",
         }
     }
 
@@ -88,6 +92,8 @@ pub struct SourceSyncResult {
     pub waited_secs: u64,
     /// The connector's `succeeded_at` after the wait.
     pub last_sync_at: Option<DateTime<Utc>>,
+    /// The error text behind an [`SourceSyncOutcome::Error`] outcome.
+    pub detail: Option<String>,
 }
 
 /// Timing for [`wait_for_source_syncs`].
@@ -131,6 +137,7 @@ struct Tracked {
     last_sync_at: Option<DateTime<Utc>>,
     phase: Phase,
     waited_secs: u64,
+    detail: Option<String>,
 }
 
 fn moved(now: Option<DateTime<Utc>>, base: Option<DateTime<Utc>>) -> bool {
@@ -147,8 +154,11 @@ fn moved(now: Option<DateTime<Utc>>, base: Option<DateTime<Utc>>) -> bool {
 /// `--filter`). Paused connectors are never waited for.
 ///
 /// Returns `Ok(None)` when the adapter does not report sync state. Returns
-/// `Err` when the first poll fails, or when status polls fail
-/// [`MAX_CONSECUTIVE_POLL_ERRORS`] times in a row.
+/// `Err` when the first poll fails (no connector is known yet). When status
+/// polls fail [`MAX_CONSECUTIVE_POLL_ERRORS`] times in a row the wait is
+/// abandoned, and every connector still open ends as
+/// [`SourceSyncOutcome::Error`] with the error text in its `detail`, so the
+/// report still names the connectors.
 ///
 /// `cancel` is polled together with the poll sleep. When it completes the
 /// loop stops at once and marks every open connector `Interrupted`.
@@ -174,6 +184,7 @@ pub async fn wait_for_source_syncs(
             last_sync_at: s.succeeded_at,
             phase: Phase::Waiting,
             waited_secs: 0,
+            detail: None,
         })
         .collect();
 
@@ -216,7 +227,14 @@ pub async fn wait_for_source_syncs(
             Err(e) => {
                 errors_in_a_row += 1;
                 if errors_in_a_row >= MAX_CONSECUTIVE_POLL_ERRORS {
-                    return Err(e);
+                    let elapsed = started.elapsed().as_secs();
+                    let text = e.to_string();
+                    for t in open(&mut tracked) {
+                        t.phase = Phase::Done(SourceSyncOutcome::Error);
+                        t.waited_secs = elapsed;
+                        t.detail = Some(text.clone());
+                    }
+                    break;
                 }
                 warn!(error = %e, "source sync status poll failed; will poll again");
                 continue;
@@ -280,6 +298,7 @@ pub async fn wait_for_source_syncs(
             schema: t.schema,
             waited_secs: t.waited_secs,
             last_sync_at: t.last_sync_at,
+            detail: t.detail,
         })
         .collect();
     Ok(Some(SourceSyncReport { syncs, interrupted }))
@@ -583,14 +602,29 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(ok.syncs[0].outcome, SourceSyncOutcome::Succeeded);
-        let err = wait_for_source_syncs(
+        // Three polls in a row fail: the wait is abandoned, and the report
+        // still names the connector, with the error text.
+        let abandoned = wait_for_source_syncs(
             &Flaky(Mutex::new(0), 3),
             "",
             &all,
             opts(2000),
             std::future::pending(),
         )
-        .await;
-        assert!(err.is_err());
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(abandoned.syncs.len(), 1);
+        assert_eq!(abandoned.syncs[0].id, "a");
+        assert_eq!(abandoned.syncs[0].outcome, SourceSyncOutcome::Error);
+        assert!(
+            abandoned.syncs[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("boom")),
+            "{:?}",
+            abandoned.syncs[0].detail
+        );
+        assert!(abandoned.bad().next().is_some());
     }
 }

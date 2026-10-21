@@ -605,11 +605,23 @@ class SourceSyncOutcome5(StrEnum):
     interrupted = "interrupted"
 
 
+class SourceSyncOutcome6(StrEnum):
+    """
+    The status reads failed, so the wait was abandoned. The result's `detail` names the error.
+    """
+
+    error = "error"
+
+
 class SourceSyncOutput(BaseModel):
     """
     What `rocky run` waited for on one source connector: a sync that was running when the run began.
     """
 
+    detail: str | None = None
+    """
+    The error text behind an `error` outcome. Absent for every other outcome.
+    """
     id: str
     """
     Source connector id.
@@ -624,9 +636,10 @@ class SourceSyncOutput(BaseModel):
         | SourceSyncOutcome3
         | SourceSyncOutcome4
         | SourceSyncOutcome5
+        | SourceSyncOutcome6
     )
     """
-    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal).
+    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal) or `error` (the status reads failed; `detail` names the error).
     """
     schema_: str = Field(..., alias="schema")
     """

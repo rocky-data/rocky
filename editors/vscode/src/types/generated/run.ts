@@ -124,7 +124,7 @@ export type ModelDecision = "build" | "skip" | "reused";
 /**
  * How the wait for one connector ended.
  */
-export type SourceSyncOutcome = "succeeded" | "failed" | "timeout" | "unknown" | "interrupted";
+export type SourceSyncOutcome = "succeeded" | "failed" | "timeout" | "unknown" | "interrupted" | "error";
 /**
  * Status of a pipeline run.
  *
@@ -882,6 +882,10 @@ export interface TableCompareResult {
  */
 export interface SourceSyncOutput {
   /**
+   * The error text behind an `error` outcome. Absent for every other outcome.
+   */
+  detail?: string | null;
+  /**
    * Source connector id.
    */
   id: string;
@@ -890,7 +894,7 @@ export interface SourceSyncOutput {
    */
   last_sync_at?: string | null;
   /**
-   * How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal).
+   * How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal) or `error` (the status reads failed; `detail` names the error).
    */
   outcome: SourceSyncOutcome;
   /**

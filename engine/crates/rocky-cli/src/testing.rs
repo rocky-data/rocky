@@ -621,6 +621,8 @@ impl rocky_core::traits::WarehouseAdapter for GovernedViewWarehouse {
 pub(crate) struct ScriptedSyncSource {
     polls: Mutex<std::collections::VecDeque<Vec<rocky_core::source_sync::SourceSyncState>>>,
     calls: std::sync::atomic::AtomicU32,
+    /// Polls after this many calls fail. `u32::MAX` means never.
+    fail_after: std::sync::atomic::AtomicU32,
 }
 
 impl ScriptedSyncSource {
@@ -628,6 +630,15 @@ impl ScriptedSyncSource {
     pub(crate) fn script(&self, polls: Vec<Vec<rocky_core::source_sync::SourceSyncState>>) {
         *self.polls.lock().expect("sync script mutex") = polls.into();
         self.calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.fail_after
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make every poll after the first `n` fail with `boom`. Call after
+    /// [`Self::script`], which resets it.
+    pub(crate) fn fail_after(&self, n: u32) {
+        self.fail_after
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How many sync-state polls the run made.
@@ -646,6 +657,7 @@ pub(crate) fn sync_source(key: &str) -> Arc<ScriptedSyncSource> {
         Arc::new(ScriptedSyncSource {
             polls: Mutex::new(Default::default()),
             calls: std::sync::atomic::AtomicU32::new(0),
+            fail_after: std::sync::atomic::AtomicU32::new(u32::MAX),
         })
     }))
 }
@@ -676,7 +688,10 @@ impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
         &self,
         _schema_prefix: &str,
     ) -> AdapterResult<Option<Vec<rocky_core::source_sync::SourceSyncState>>> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= self.fail_after.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AdapterError::msg("boom"));
+        }
         let mut polls = self.polls.lock().expect("sync script mutex");
         if polls.len() > 1 {
             Ok(polls.pop_front())

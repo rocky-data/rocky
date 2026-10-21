@@ -512,13 +512,17 @@ pub struct SourceSyncOutput {
     pub schema: String,
     /// How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when
     /// `wait_timeout_secs` ran out), `unknown` (the sync ended but no
-    /// timestamp moved) or `interrupted` (a shutdown signal).
+    /// timestamp moved), `interrupted` (a shutdown signal) or `error` (the
+    /// status reads failed; `detail` names the error).
     pub outcome: rocky_core::source_sync::SourceSyncOutcome,
     /// Whole seconds from the start of the wait to this outcome.
     pub waited_secs: u64,
     /// The connector's last successful sync after the wait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<DateTime<Utc>>,
+    /// The error text behind an `error` outcome. Absent for every other outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Soft warning surfaced on

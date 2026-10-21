@@ -1880,4 +1880,37 @@ mod sync_wait {
         let report = wait(&server, opts(5000), std::future::pending()).await;
         assert!(report.syncs.is_empty());
     }
+
+    /// `rescheduled` is a sync Fivetran paused and will resume. The connector
+    /// is still mid-sync, so a connector already `rescheduled` at the first
+    /// poll is waited for, and one that ends rescheduled ends as `timeout`.
+    #[tokio::test]
+    async fn a_rescheduled_connector_at_the_first_poll_is_waited_for_until_timeout() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("rescheduled", T0, None)]).await;
+        let report = wait(&server, opts(150), std::future::pending()).await;
+        assert_eq!(report.syncs.len(), 1);
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert_get_only(&server).await;
+    }
+
+    /// Mid-wait `rescheduled` keeps the wait going, not an `unknown` or a
+    /// premature success.
+    #[tokio::test]
+    async fn a_sync_that_is_rescheduled_mid_wait_keeps_waiting_and_then_succeeds() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("syncing", T0, None),
+                page("rescheduled", T0, None),
+                page("rescheduled", T0, None),
+                page("scheduled", T1, None),
+            ],
+        )
+        .await;
+        let report = wait(&server, opts(5000), std::future::pending()).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert_get_only(&server).await;
+    }
 }

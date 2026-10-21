@@ -76,14 +76,23 @@ How Rocky decides how a sync ended: Fivetran gives no sync id. Rocky notes each 
 
 The wait runs before the run takes its state session, so a long wait holds no state lock. Because no state store is open yet:
 
-- A run stopped by the wait writes no run record. `rocky history` does not show it. The `pipeline_start` then `pipeline_error` hooks fire, and the run JSON has `status: "failure"` with the `source_syncs` rows.
+- A run stopped by the wait writes no run record. `rocky history` does not show it. The `pipeline_start` then `pipeline_error` hooks fire, and the run JSON has `status: "Failure"` with the `source_syncs` rows.
 - A Ctrl-C during the wait exits with code 130 and releases the idempotency claim.
-- `rocky apply` of a reviewed plan does not wait. The reviewer did not see a wait, so apply must not cause one.
+- `rocky apply` never waits, for any plan. The reviewer did not see a wait, so apply must not cause one. Only `rocky run` does.
 - `--filter` limits which connectors the wait covers.
 
-The run JSON lists each connector that was waited for in `source_syncs`: `id`, `schema`, `outcome` (`succeeded`, `failed`, `timeout`, `unknown` or `interrupted`), `waited_secs` and `last_sync_at`. The array is absent when nothing was waited for.
+The run JSON lists each connector that was waited for in `source_syncs`: `id`, `schema`, `outcome` (`succeeded`, `failed`, `timeout`, `unknown`, `interrupted` or `error`), `waited_secs`, `last_sync_at` and, for `error`, `detail`. The array is absent when nothing was waited for.
 
-A short sync can end within one poll with no timestamp change Rocky can see. That ends as `unknown` and fails the run. This fails closed on purpose. Use `on_sync_failure = "warn"` if you prefer to run anyway.
+Fivetran reports `rescheduled` for a sync it paused and will resume. Rocky treats it as still running and keeps waiting. A connector that is `rescheduled` at the first poll is waited for. If it has not finished at `wait_timeout_secs`, the outcome is `timeout`.
+
+`unknown` has two causes:
+
+- Fivetran writes `succeeded_at` before it clears `sync_state`. If the first poll sees the connector mid-sync with the new `succeeded_at` already set, Rocky records that new value as the starting point. When the sync then ends, nothing moved past it.
+- The connector leaves `setup_state = "connected"` during the wait, so it drops out of the connector list.
+
+Both fail closed on purpose. Use `on_sync_failure = "warn"` if you prefer to run anyway.
+
+If the status reads fail, Rocky abandons the wait. After three failed polls in a row, every open connector ends as `error` with the error text in `detail`. With `on_sync_failure = "fail"`, a Fivetran API outage at the first poll stops every run that has `wait = true`: no run starts until the API answers or you set `wait = false`. With `"warn"` the run goes on, and `source_syncs` holds one row with `outcome: "error"` (`id: "*"` when the first poll failed, because no connector is known yet).
 
 ## Authentication
 

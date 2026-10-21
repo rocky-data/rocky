@@ -1,9 +1,10 @@
 //! The source-sync wait phase of `rocky run` (`[...discovery.sync] wait = true`).
 //!
 //! Runs on a replication pipeline before the run takes its state session. It
-//! holds only the run's cancellation token and, when the run has an
-//! idempotency key, the in-flight claim. No state download, remote lock, state
-//! store or ledger is open yet, so a long wait blocks no other run's state.
+//! holds the run's cancellation token, the adapter handles the run opened
+//! (the registry and the hook registry) and, when the run has an idempotency
+//! key, the in-flight claim. No state download, remote lock, state store or
+//! ledger is open yet, so a long wait blocks no other run's state.
 //!
 //! ```text
 //!   discover state (GET group list)
@@ -29,7 +30,8 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::source::DiscoveredConnector;
 use rocky_core::source_sync::{
-    SourceSyncReport, SourceSyncState, SourceSyncWaitOptions, wait_for_source_syncs,
+    SourceSyncOutcome, SourceSyncReport, SourceSyncState, SourceSyncWaitOptions,
+    wait_for_source_syncs,
 };
 use rocky_core::traits::DiscoveryAdapter;
 use tokio_util::sync::CancellationToken;
@@ -90,7 +92,17 @@ impl SyncPhase<'_> {
                     "could not read the source sync state for pipeline '{}': {error}",
                     self.pipeline_name
                 );
-                return self.phase_failed(&message, Vec::new()).await;
+                // No connector is known yet, so the row stands for the whole
+                // status read. `on_sync_failure = "warn"` still reports it.
+                let row = SourceSyncOutput {
+                    id: "*".to_string(),
+                    schema: String::new(),
+                    outcome: SourceSyncOutcome::Error,
+                    waited_secs: self.started.elapsed().as_secs(),
+                    last_sync_at: None,
+                    detail: Some(error.to_string()),
+                };
+                return self.phase_failed(&message, vec![row]).await;
             }
         };
         let rows = rows_of(&report);
@@ -106,7 +118,10 @@ impl SyncPhase<'_> {
         }
         let detail = report
             .bad()
-            .map(|r| format!("{} ({})", r.id, r.outcome.as_str()))
+            .map(|r| match &r.detail {
+                Some(text) => format!("{} ({}: {text})", r.id, r.outcome.as_str()),
+                None => format!("{} ({})", r.id, r.outcome.as_str()),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!(
@@ -214,6 +229,7 @@ fn rows_of(report: &SourceSyncReport) -> Vec<SourceSyncOutput> {
             outcome: r.outcome,
             waited_secs: r.waited_secs,
             last_sync_at: r.last_sync_at,
+            detail: r.detail.clone(),
         })
         .collect()
 }
@@ -383,6 +399,67 @@ mod tests {
             .expect("warn mode does not stop the run");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, SourceSyncOutcome::Failed);
+    }
+
+    /// The first status read fails: no connector is known. `warn` still
+    /// reports one row naming the error, not an empty list.
+    #[tokio::test]
+    async fn an_abandoned_first_poll_in_warn_mode_still_reports_a_row() {
+        let key = "phase-first-poll-error-warn";
+        let source = sync_source(key);
+        source.script(vec![vec![state(false, at(0), None)]]);
+        source.fail_after(0);
+        let rows = phase(key, OnSyncFailure::Warn, 5, &CancellationToken::new(), None)
+            .await
+            .expect("warn mode does not stop the run");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].outcome, SourceSyncOutcome::Error);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("boom")),
+            "{:?}",
+            rows[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_first_poll_in_fail_mode_stops_the_run() {
+        let key = "phase-first-poll-error-fail";
+        let source = sync_source(key);
+        source.script(vec![vec![state(false, at(0), None)]]);
+        source.fail_after(0);
+        let error = phase(key, OnSyncFailure::Fail, 5, &CancellationToken::new(), None)
+            .await
+            .expect_err("a status outage at the first poll stops a wait = true run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("could not read the source sync state") && text.contains("boom"),
+            "{text}"
+        );
+    }
+
+    /// Three failed polls in a row abandon the wait. The connector still gets
+    /// a row, with the error.
+    #[tokio::test]
+    async fn an_abandoned_wait_in_warn_mode_names_the_connector_and_the_error() {
+        let key = "phase-abandoned-warn";
+        let source = sync_source(key);
+        source.script(vec![vec![state(true, at(0), None)]]);
+        source.fail_after(1);
+        let rows = phase(key, OnSyncFailure::Warn, 5, &CancellationToken::new(), None)
+            .await
+            .expect("warn mode does not stop the run");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "c1");
+        assert_eq!(rows[0].outcome, SourceSyncOutcome::Error);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("boom"))
+        );
     }
 
     #[tokio::test]

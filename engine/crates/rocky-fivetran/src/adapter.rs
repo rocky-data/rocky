@@ -27,6 +27,13 @@ pub struct FivetranDiscoveryAdapter {
     destination_id: String,
 }
 
+/// `sync_state` values that mean a sync is running or about to resume.
+/// Fivetran reports `rescheduled` for a sync it paused and will pick up again
+/// (for example after a rate limit), so the connector is still mid-sync.
+fn is_syncing(sync_state: &str) -> bool {
+    matches!(sync_state, "syncing" | "rescheduled")
+}
+
 impl FivetranDiscoveryAdapter {
     pub fn new(client: FivetranClient, destination_id: String) -> Self {
         Self {
@@ -131,7 +138,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
             connectors
                 .into_iter()
                 .map(|c| SourceSyncState {
-                    syncing: c.status.sync_state == "syncing",
+                    syncing: is_syncing(&c.status.sync_state),
                     paused: c.paused || c.status.sync_state == "paused",
                     id: c.id,
                     schema: c.schema,
