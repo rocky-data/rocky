@@ -234,6 +234,10 @@ pub fn generated_tests(parsed: &ParsedSpec) -> SpecResult<Vec<TomlTable>> {
 fn volume_test(volume: &crate::product::spec::VolumeSpec) -> SpecResult<TomlTable> {
     let mut test = TomlTable::new();
     test.insert("type".to_string(), TomlValue::string("row_count_range"));
+    test.insert(
+        GENERATED_BY_KEY.to_string(),
+        TomlValue::string(VOLUME_FIELD),
+    );
     for (key, bound) in [("min", volume.min_rows), ("max", volume.max_rows)] {
         let Some(bound) = bound else {
             continue;
@@ -256,8 +260,41 @@ fn volume_test(volume: &crate::product::spec::VolumeSpec) -> SpecResult<TomlTabl
     Ok(test)
 }
 
+/// The key that marks a sidecar test as written by the lowering from a
+/// spec field, with that field's path as the value.
+///
+/// Every other generated test is recognised by equality with what the
+/// spec generates now. That cannot recognise a test whose spec field was
+/// removed: nothing generates it any more, so it would survive as a
+/// worker test and stay enforced. The volume range carries this marker so
+/// a re-lowering without `[product.output.volume]` drops it. The engine's
+/// test loader (`TestDecl`) ignores the key.
+pub const GENERATED_BY_KEY: &str = "generated_by";
+
+/// The `generated_by` value of the range `[product.output.volume]` lowers to.
+const VOLUME_FIELD: &str = "product.output.volume";
+
 fn is_row_count_range(test: &TomlTable) -> bool {
     matches!(test.get("type"), Some(TomlValue::String(kind)) if kind == "row_count_range")
+}
+
+/// True when the lowering wrote this test from a spec field (it carries
+/// [`GENERATED_BY_KEY`]). The merge rebuilds such tests from the spec, so
+/// the copy in the file is never kept.
+fn is_spec_generated(test: &TomlTable) -> bool {
+    test.contains_key(GENERATED_BY_KEY)
+}
+
+/// True when a `row_count_range` counts the whole table: no `filter`, or
+/// one that is empty after trimming (the engine treats that as none).
+/// `column` does not scope a range; the engine ignores it.
+fn is_unscoped_row_count_range(test: &TomlTable) -> bool {
+    is_row_count_range(test)
+        && match test.get("filter") {
+            None => true,
+            Some(TomlValue::String(filter)) => filter.trim().is_empty(),
+            Some(_) => false,
+        }
 }
 
 /// Merge spec-owned metadata into an existing sidecar document.
@@ -267,9 +304,12 @@ fn is_row_count_range(test: &TomlTable) -> bool {
 /// `[tags].product` — other tag keys survive. Preserved: `name` and
 /// `intent` (`intent` is filled from the spec only when the file has
 /// none), every worker-appended test the lowering did not generate, and
-/// every other key verbatim. One exception: when the spec declares a
-/// `volume`, a worker `row_count_range` test is dropped, so the spec's
-/// range is the model's only one.
+/// every other key verbatim. Two exceptions: a test carrying
+/// [`GENERATED_BY_KEY`] is spec-owned and is rebuilt from the spec, so it
+/// is dropped when its field is gone; and when the spec declares a
+/// `volume`, a worker `row_count_range` over the whole table (no
+/// `filter`) is dropped, so the spec's range is the model's only
+/// whole-table one. A filtered worker range survives.
 ///
 /// The output order is fixed, so merging twice is byte-identical: the
 /// header comment, `name`, `intent`, the remaining preserved scalars in
@@ -425,10 +465,11 @@ pub fn merge_sidecar_text(
 
     let owned_tests = generated_tests(parsed)?;
     let mut tests: Vec<TomlValue> = owned_tests.iter().cloned().map(TomlValue::Table).collect();
-    // A declared volume owns the model's row-count range outright: the
-    // spec's range is the only one, so a worker `row_count_range` is
-    // replaced, not kept beside it. Without a volume, a worker range
-    // survives like any other worker test.
+    // A declared volume owns the model's whole-table row-count range: a
+    // worker `row_count_range` with no `filter` is replaced, not kept
+    // beside it. A filtered range counts a subset, which the volume does
+    // not, so it survives. Without a volume, a worker range survives like
+    // any other worker test.
     let spec_owns_row_count = product.output.volume.is_some();
     if let Some(existing) = document.get("tests").and_then(TomlValue::as_array) {
         for test in existing {
@@ -438,7 +479,13 @@ pub fn merge_sidecar_text(
             let Some(table) = test.as_table() else {
                 continue;
             };
-            if spec_owns_row_count && is_row_count_range(table) {
+            // A spec-generated test is rebuilt above from the spec as it is
+            // now; the old copy is never kept, so removing its spec field
+            // removes the test.
+            if is_spec_generated(table) {
+                continue;
+            }
+            if spec_owns_row_count && is_unscoped_row_count_range(table) {
                 continue;
             }
             if !owned_tests.contains(table) {
@@ -1138,8 +1185,8 @@ agent = "propose_only"
         );
         assert_eq!(
             ranges[0].keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["type", "min", "max", "severity"],
-            "four keys and no more — no filter, no column: {ranges:?}"
+            vec!["type", GENERATED_BY_KEY, "min", "max", "severity"],
+            "the marker plus four keys and no more — no filter, no column: {ranges:?}"
         );
 
         // Tier 4: everything else the engine's test vocabulary offers
@@ -1884,6 +1931,86 @@ agent = "propose_only"
         let ranges = row_count_ranges(&merged_document(&parsed, &worker));
         assert_eq!(ranges.len(), 1, "{ranges:?}");
         assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(1)));
+    }
+
+    /// Removing `[product.output.volume]` from the spec removes its range
+    /// on the next lowering. The generated range carries the
+    /// `generated_by` marker; without it, nothing generates the old range
+    /// any more and it would survive as a worker test, still enforced by
+    /// `rocky test`. A worker range (no marker) survives the same merge.
+    #[test]
+    fn removing_the_volume_removes_its_range_but_keeps_a_worker_range() {
+        let with_volume = parsed_with_volume("min_rows = 5\nseverity = \"error\"");
+        let lowered = merged_text(&with_volume, &drafted_sidecar_text());
+        let ranges = row_count_ranges(&parse_ordered(&lowered).expect("toml"));
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(
+            ranges[0].get(GENERATED_BY_KEY),
+            Some(&TomlValue::string("product.output.volume")),
+            "the spec's range is marked: {ranges:?}"
+        );
+
+        // The volume block is removed from the spec; re-lower the file the
+        // first lowering wrote.
+        let without = merged_document(&parsed_d3(), &lowered);
+        assert!(
+            row_count_ranges(&without).is_empty(),
+            "the spec's old range is gone: {without:?}"
+        );
+
+        // A worker range beside the generated one is not the spec's, so it
+        // survives the volume's removal.
+        let with_worker = draft_check_append(
+            &lowered,
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n",
+        );
+        let without = merged_document(&parsed_d3(), &with_worker);
+        let ranges = row_count_ranges(&without);
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].get("min"), Some(&TomlValue::Integer(1)));
+        assert!(ranges[0].get(GENERATED_BY_KEY).is_none(), "{ranges:?}");
+        // Re-lowering is still byte-identical.
+        let once = merged_text(&parsed_d3(), &with_worker);
+        assert_eq!(merged_text(&parsed_d3(), &once), once);
+    }
+
+    /// A declared volume replaces only a worker range over the whole
+    /// table. A filtered range counts a subset, which the volume does not
+    /// judge, so it survives beside the spec's range. An empty filter is
+    /// no filter, as the engine reads it.
+    #[test]
+    fn a_volume_keeps_a_filtered_worker_range() {
+        let parsed = parsed_with_volume("min_rows = 5");
+        let worker = draft_check_append(
+            &drafted_sidecar_text(),
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\nfilter = \"x > 0\"\n\n\
+             [[tests]]\ntype = \"row_count_range\"\nmax = 9\nfilter = \"  \"\n\n\
+             [[tests]]\ntype = \"row_count_range\"\nmax = 8\n",
+        );
+        let document = merged_document(&parsed, &worker);
+        let ranges = row_count_ranges(&document);
+        assert_eq!(
+            ranges.len(),
+            2,
+            "the spec's range and the filtered worker range: {ranges:?}"
+        );
+        assert!(
+            ranges.iter().any(|r| r.get("min") == Some(&TomlValue::Integer(5))
+                && r.get(GENERATED_BY_KEY).is_some()),
+            "{ranges:?}"
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.get("filter") == Some(&TomlValue::string("x > 0"))),
+            "the filtered worker range survives: {ranges:?}"
+        );
+        assert!(
+            !ranges.iter().any(|r| r.get("max").is_some()),
+            "both whole-table worker ranges are replaced: {ranges:?}"
+        );
+        let once = merged_text(&parsed, &worker);
+        assert_eq!(merged_text(&parsed, &once), once);
     }
 
     #[test]
