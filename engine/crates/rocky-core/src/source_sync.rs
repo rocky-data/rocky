@@ -42,9 +42,9 @@
 //! The 5 second margin covers the gap between the server clock behind `T_pre`
 //! and the clock behind `succeeded_at`. It can reject a real sync that ends
 //! within 5 seconds of the POST. Such a sync ends as `unknown`, at once when
-//! its timestamp has moved, and after the settle polls when a poll saw it
-//! syncing first. A sync that never shows and never moves ends as `timeout`
-//! after the full wait. All of these are failures: it fails closed.
+//! its timestamp moved to a time after `T_pre` but inside the margin, and after
+//! the settle polls when a poll saw it syncing first. A sync that never shows
+//! and never moves ends as `timeout` after the full wait. All of these are failures: it fails closed.
 //!
 //! One window stays open. A sync that starts after the idle read and before
 //! Rocky's POST is answered, and is still running then, is counted as
@@ -113,9 +113,15 @@ impl Identity {
         moved(now, base) && ends_after(now, self.t_pre)
     }
 
-    /// A timestamp moved past the baseline, whatever `t_pre` says.
-    fn moved_any(&self, state: &SourceSyncState) -> bool {
-        moved(state.succeeded_at, self.base_succeeded) || moved(state.failed_at, self.base_failed)
+    /// A timestamp moved past the baseline and landed after `t_pre` but not
+    /// past the margin. The clocks cannot say whether that is the sync Rocky
+    /// started, and it will not move again. A timestamp from before `t_pre` is
+    /// a sync that ended before the request, so it does not count here.
+    fn inside_margin(&self, state: &SourceSyncState) -> bool {
+        let inside = |now: Option<DateTime<Utc>>, base: Option<DateTime<Utc>>| {
+            moved(now, base) && now.is_some_and(|t| t > self.t_pre) && !ends_after(now, self.t_pre)
+        };
+        inside(state.succeeded_at, self.base_succeeded) || inside(state.failed_at, self.base_failed)
     }
 
     fn succeeded(&self, state: &SourceSyncState) -> bool {
@@ -798,10 +804,10 @@ pub async fn trigger_and_wait_for_source_syncs(
                         // Idle with nothing past `t_pre`. Before any read has
                         // shown the sync, this is a slow start: keep waiting
                         // until the deadline. But a timestamp that already
-                        // moved yet is not past `t_pre` plus the margin is a
-                        // sync that ended too soon to count and will not move
-                        // again: end it now.
-                        None if !seen_syncing && id.moved_any(state) => {
+                        // moved to a time after `t_pre`, yet not past the
+                        // margin, is a sync that ended too soon to count and
+                        // will not move again: end it now.
+                        None if !seen_syncing && id.inside_margin(state) => {
                             t.finish(SourceSyncOutcome::Unknown, waited);
                         }
                         None if !seen_syncing => {}
