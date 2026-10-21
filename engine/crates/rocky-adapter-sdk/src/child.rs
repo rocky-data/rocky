@@ -127,6 +127,9 @@ pub fn leader_has_exited(_pid: u32) -> bool {
 /// `Drop` cannot wait, so there is no `SIGTERM` grace: use [`stop_child`]
 /// for a graceful stop. Disarm the guard once the child is reaped, because
 /// after the reap its id may name another process group.
+///
+/// Nothing in Rocky constructs this guard yet. It is kept for the next slice
+/// (1b), which wraps spawned children with it.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct GroupKillGuard {

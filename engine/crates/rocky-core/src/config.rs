@@ -1062,7 +1062,8 @@ pub enum DedupPolicy {
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyConfig {
     /// Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept
-    /// before GC. Default 30. GC runs during the state upload sweep.
+    /// before GC. Default 30. `rocky run` sweeps the local `state.redb` copy
+    /// after each run. Expired object-store entries are not swept today.
     #[serde(default = "default_idempotency_retention_days")]
     pub retention_days: u32,
     /// Which terminal statuses count as "already processed" for dedup. See

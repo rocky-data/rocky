@@ -207,10 +207,12 @@ async fn a_crashed_claim_is_adopted_only_after_it_expires() {
     assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
 }
 
-/// The sweep judges a claim by the expiry stamped on it, not by the
-/// `in_flight_ttl_hours` of the config it runs under.
+/// A claim is judged by the expiry stamped on it, not by the
+/// `in_flight_ttl_hours` of the config a later run uses. The object-store
+/// sweep never deletes an in-flight claim, expired or not: the delete is not
+/// conditional, so a run could take the claim over between its read and delete.
 #[tokio::test]
-async fn the_sweep_keeps_a_claim_whose_own_expiry_is_ahead_after_the_config_ttl_drops() {
+async fn a_claim_is_judged_by_its_own_expiry_and_the_sweep_leaves_it() {
     let bucket = bucket(2);
     let b = backend();
     b.check_and_claim_at(None, "k", "run-a", &cfg(30), t0())
@@ -228,8 +230,37 @@ async fn the_sweep_keeps_a_claim_whose_own_expiry_is_ahead_after_the_config_ttl_
         "{second:?}"
     );
 
+    // Past its own expiry the claim is stale, but the sweep still keeps it.
+    let late = t0() + Duration::hours(31);
+    assert_eq!(b.sweep_expired_at(None, late).await.unwrap(), 0);
+    assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-a");
+    let adopted = b
+        .check_and_claim_at(None, "k", "run-b", &cfg(6), late)
+        .await
+        .unwrap();
+    assert!(
+        matches!(adopted, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        "{adopted:?}"
+    );
+}
+
+/// The sweep removes a `Succeeded` entry once its retention has passed, and
+/// only then.
+#[tokio::test]
+async fn the_sweep_removes_a_succeeded_entry_only_after_its_retention() {
+    let bucket = bucket(2);
+    let b = backend();
+    b.check_and_claim_at(None, "k", "run-a", &cfg(24), t0())
+        .await
+        .unwrap();
+    b.finalize_at(None, "k", "run-a", FinalOutcome::Succeeded, &cfg(24), t0())
+        .await
+        .unwrap();
+
+    let within = t0() + Duration::days(29);
+    assert_eq!(b.sweep_expired_at(None, within).await.unwrap(), 0);
     let swept = b
-        .sweep_expired_at(None, t0() + Duration::hours(31))
+        .sweep_expired_at(None, t0() + Duration::days(31))
         .await
         .unwrap();
     assert_eq!(swept, 1);
@@ -368,4 +399,65 @@ async fn the_sweep_does_not_delete_a_claim_re_adopted_between_read_and_delete() 
         .unwrap();
     assert!(!deleted, "the sweep must skip a claim that changed");
     assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
+}
+
+/// Under `dedup_on = "success"`, a failed owner frees the key without a
+/// delete: the next run adopts the failed entry and proceeds.
+#[tokio::test]
+async fn a_failed_finalize_under_dedup_on_success_lets_the_next_run_adopt() {
+    let bucket = bucket(2);
+    let b = backend();
+    let config = cfg(24);
+    b.check_and_claim_at(None, "k", "run-a", &config, t0())
+        .await
+        .unwrap();
+    let failed_at = t0() + Duration::minutes(5);
+    b.finalize_at(None, "k", "run-a", FinalOutcome::Failed, &config, failed_at)
+        .await
+        .unwrap();
+
+    let held = read_entry(&bucket.provider, "k").await;
+    assert_eq!(held.state, IdempotencyState::Failed);
+    assert_eq!(held.expires_at, failed_at);
+
+    let retry = b
+        .check_and_claim_at(None, "k", "run-b", &config, failed_at)
+        .await
+        .unwrap();
+    assert!(
+        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        "{retry:?}"
+    );
+    let held = read_entry(&bucket.provider, "k").await;
+    assert_eq!(held.run_id, "run-b");
+    assert_eq!(held.state, IdempotencyState::InFlight);
+}
+
+/// An adopter wins first, then the old owner's failed finalize arrives. It
+/// must not touch the adopter's claim.
+#[tokio::test]
+async fn a_failed_finalize_after_an_adopter_won_is_a_no_op() {
+    let bucket = bucket(2);
+    let b = backend();
+    let config = cfg(24);
+    b.check_and_claim_at(None, "k", "run-a", &config, t0())
+        .await
+        .unwrap();
+    b.check_and_claim_at(None, "k", "run-b", &config, t0() + Duration::hours(25))
+        .await
+        .unwrap();
+
+    b.finalize_at(
+        None,
+        "k",
+        "run-a",
+        FinalOutcome::Failed,
+        &config,
+        t0() + Duration::hours(26),
+    )
+    .await
+    .unwrap();
+    let held = read_entry(&bucket.provider, "k").await;
+    assert_eq!(held.run_id, "run-b");
+    assert_eq!(held.state, IdempotencyState::InFlight);
 }

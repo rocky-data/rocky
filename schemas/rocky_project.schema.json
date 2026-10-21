@@ -1700,7 +1700,7 @@
         },
         "retention_days": {
           "default": 30,
-          "description": "Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.",
+          "description": "Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. `rocky run` sweeps the local `state.redb` copy after each run. Expired object-store entries are not swept today.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

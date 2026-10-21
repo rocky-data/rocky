@@ -6423,6 +6423,11 @@ impl StateStore {
                 }
                 Some(prior) if prior.run_id != run_id => {
                     // Another run owns the key now (AdoptStale path). Leave alone.
+                    tracing::warn!(
+                        key = %key,
+                        run_id = %run_id,
+                        "idempotency claim is held by another run; not finalizing it"
+                    );
                 }
                 Some(prior) => {
                     let should_keep = match (outcome, dedup_on) {

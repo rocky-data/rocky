@@ -40,13 +40,19 @@
 //!
 //! # GC
 //!
-//! Expired stamps are swept during [`crate::state_sync::upload_state`] —
-//! reuses the existing post-run cadence, no new cron. For Valkey backends
+//! `rocky run` sweeps the local `state.redb` table after each run (see
+//! `sweep_idempotency_best_effort` in `rocky-cli`). For Valkey backends
 //! server-side `EX` handles TTL autonomously and `sweep_expired` is a
-//! no-op. For local and object-store backends, the sweep deletes entries whose
-//! own `expires_at` has passed. An `InFlight` claim carries the `expires_at`
-//! set when it was claimed (`claim time + in_flight_ttl_hours` of that run), so
-//! lowering `in_flight_ttl_hours` later never makes a sweep remove a live claim.
+//! no-op; a tiered backend sweeps its local mirror. The local sweep deletes
+//! entries whose own `expires_at` has passed. An `InFlight` claim carries the
+//! `expires_at` set when it was claimed (`claim time + in_flight_ttl_hours` of
+//! that run), so lowering `in_flight_ttl_hours` later never makes a sweep
+//! remove a live claim.
+//!
+//! Expired object-store entries are **not swept today**: `rocky run` never
+//! calls the object-store sweep, so nothing removes them except a take-over by
+//! a later run or a bucket lifecycle rule. [`IdempotencyBackend::sweep_expired`]
+//! can sweep them, and removes only `Succeeded` entries past retention.
 //!
 //! # Object-store writes are conditional
 //!
@@ -55,8 +61,11 @@
 //! adopters wins and the loser re-reads and re-classifies. Finalize is
 //! `put_if_match` on the claim this run owns, and refuses a claim another run
 //! holds. The sweep re-reads a claim right before deleting it and skips it if
-//! it changed. The object-store API has no conditional delete, so a window
-//! remains between that last read and the delete call.
+//! it changed. The object-store API has no conditional delete, so the sweep
+//! deletes only `Succeeded` entries, which no run rewrites; `InFlight`,
+//! `Failed` and unreadable entries are left for a take-over. A `Failed`
+//! finalize under `dedup_on = "success"` writes an already-expired `Failed`
+//! entry instead of deleting, so a retry adopts it with a conditional write.
 
 use std::path::PathBuf;
 
@@ -185,6 +194,12 @@ pub enum IdempotencyError {
 
     #[error("idempotency backend misconfigured: {0}")]
     Config(String),
+
+    #[error(
+        "idempotency claim `{path}` kept changing under concurrent writers; \
+         gave up after {attempts} attempts"
+    )]
+    Contended { path: String, attempts: usize },
 
     #[error("task join error: {0}")]
     TaskJoin(String),
@@ -506,8 +521,8 @@ impl IdempotencyBackend {
     ///   was claimed, so the current `in_flight_ttl_hours` plays no part.
     /// - Valkey: no-op (server-side `EX` handles TTL); Tiered sweeps the
     ///   local mirror.
-    /// - Object store: lists, re-reads, and deletes expired claims; see the
-    ///   module docs for the residual window.
+    /// - Object store: lists, re-reads, and deletes `Succeeded` entries past
+    ///   retention; see the module docs. `rocky run` does not call this today.
     ///
     /// Returns the number of entries swept.
     pub async fn sweep_expired(
@@ -657,6 +672,26 @@ async fn valkey_check_and_claim(
     }
 }
 
+/// Compare-and-set for [`valkey_finalize`]. `KEYS[1]` is the claim key;
+/// `ARGV` is our run id, "1" to keep (write `ARGV[3]` with `EX ARGV[4]`) or "0"
+/// to delete, then the value and the TTL. Returns 1 when the key is absent or
+/// holds our run id, and 0 when another run (or an unreadable value) holds it.
+const VALKEY_FINALIZE_SCRIPT: &str = r#"
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local ok, entry = pcall(cjson.decode, cur)
+  if not ok or type(entry) ~= 'table' or entry.run_id ~= ARGV[1] then
+    return 0
+  end
+end
+if ARGV[2] == '1' then
+  redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+else
+  redis.call('DEL', KEYS[1])
+end
+return 1
+"#;
+
 async fn valkey_finalize(
     url: &str,
     prefix: &str,
@@ -694,10 +729,10 @@ async fn valkey_finalize(
             .get_connection()
             .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
 
-        if should_keep {
+        let value = if should_keep {
             let entry = IdempotencyEntry {
                 key: user_key,
-                run_id,
+                run_id: run_id.clone(),
                 state: match outcome {
                     FinalOutcome::Succeeded => IdempotencyState::Succeeded,
                     FinalOutcome::Failed => IdempotencyState::Failed,
@@ -706,23 +741,28 @@ async fn valkey_finalize(
                 expires_at: retention_until,
                 dedup_on,
             };
-            let value = serde_json::to_vec(&entry)?;
-            // SET key value EX retention — overwrites the InFlight entry
-            // with the terminal state + retention TTL.
-            redis::cmd("SET")
-                .arg(&key_for_task)
-                .arg(value)
-                .arg("EX")
-                .arg(ttl_secs)
-                .query::<()>(&mut conn)
-                .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+            serde_json::to_vec(&entry)?
         } else {
-            // Dedup-on-success + failure: delete the InFlight so a retry
-            // can claim the key freely.
-            redis::cmd("DEL")
-                .arg(&key_for_task)
-                .query::<()>(&mut conn)
-                .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+            Vec::new()
+        };
+        // One atomic script: write the terminal state (or, for dedup-on-success
+        // + failure, delete the claim) only if the stored claim is ours. A
+        // blind SET / DEL would erase the claim of a run that took the key
+        // after ours expired.
+        let owned: i64 = redis::Script::new(VALKEY_FINALIZE_SCRIPT)
+            .key(&key_for_task)
+            .arg(&run_id)
+            .arg(if should_keep { "1" } else { "0" })
+            .arg(value)
+            .arg(ttl_secs)
+            .invoke(&mut conn)
+            .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+        if owned == 0 {
+            warn!(
+                key = %key_for_task,
+                run_id = %run_id,
+                "idempotency claim is held by another run; not finalizing it"
+            );
         }
         Ok(())
     })
@@ -819,10 +859,10 @@ fn require_generation(observed: &ObservedClaim) -> Result<&Generation, Idempoten
 }
 
 fn contended(path: &str) -> IdempotencyError {
-    IdempotencyError::Config(format!(
-        "idempotency claim `{path}` kept changing under concurrent writers; \
-         gave up after {MAX_CONDITIONAL_ATTEMPTS} attempts"
-    ))
+    IdempotencyError::Contended {
+        path: path.to_string(),
+        attempts: MAX_CONDITIONAL_ATTEMPTS,
+    }
 }
 
 async fn object_store_check_and_claim(
@@ -901,6 +941,10 @@ async fn object_store_finalize(
         (FinalOutcome::Failed, DedupPolicy::Any) => true,
         (FinalOutcome::Failed, DedupPolicy::Success) => false,
     };
+    // Dedup-on-success + failure frees the key for a retry. The object-store
+    // API has no conditional delete, so this writes a `Failed` entry that is
+    // already expired instead: a retry classifies it as stale and takes it
+    // over with a conditional write, and it cannot erase a newer claim.
     let updated = IdempotencyEntry {
         key: key.to_string(),
         run_id: run_id.to_string(),
@@ -909,15 +953,16 @@ async fn object_store_finalize(
             FinalOutcome::Failed => IdempotencyState::Failed,
         },
         stamped_at: now,
-        expires_at: retention_until,
+        expires_at: if should_keep { retention_until } else { now },
         dedup_on: config.dedup_on,
     };
     let encoded = Bytes::from(serde_json::to_vec(&updated)?);
 
     for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
         let Some(observed) = observe_claim_at_path(provider, &rel_path).await? else {
-            // The claim is gone (swept after it expired). Record the outcome
-            // only if nobody has claimed the key since.
+            // The claim is gone (an operator or a bucket lifecycle rule
+            // removed it). Record the outcome only if nobody has claimed the
+            // key since. A freed key needs no record.
             if !should_keep {
                 return Ok(());
             }
@@ -943,29 +988,16 @@ async fn object_store_finalize(
             );
             return Ok(());
         }
-        if should_keep {
-            let generation = require_generation(&observed)?;
-            match provider
-                .put_if_match(&rel_path, encoded.clone(), Some(generation))
-                .await?
-            {
-                PutIfMatchOutcome::Committed(_) => return Ok(()),
-                PutIfMatchOutcome::Conflict => continue,
-            }
+        let generation = require_generation(&observed)?;
+        match provider
+            .put_if_match(&rel_path, encoded.clone(), Some(generation))
+            .await?
+        {
+            PutIfMatchOutcome::Committed(_) => return Ok(()),
+            // Changed since the read: re-read, and the not-owned path above
+            // handles an adopter that won.
+            PutIfMatchOutcome::Conflict => continue,
         }
-        // Dedup-on-success + failure: delete our InFlight claim so retries can
-        // claim the key freshly. The object-store API has no conditional
-        // delete, so a take-over between the read above and this delete is
-        // not caught: that needs our claim to have expired first. Tolerate
-        // already-absent (the sweep may have cleaned up while we ran).
-        if let Err(e) = provider.delete(&rel_path).await {
-            debug!(
-                error = %e,
-                path = %rel_path,
-                "idempotency finalize delete failed — entry may have been swept already"
-            );
-        }
-        return Ok(());
     }
     Err(contended(&rel_path))
 }
@@ -975,8 +1007,8 @@ async fn object_store_sweep_expired(
     now: DateTime<Utc>,
 ) -> Result<usize, IdempotencyError> {
     // Active sweep for object-store backends: list `idempotency/*`, read each
-    // claim, delete any past its own `expires_at`. Errors are warn-swallowed
-    // so a flaky bucket doesn't fail the run.
+    // claim, delete a `Succeeded` entry past its retention. Errors are
+    // warn-swallowed so a flaky bucket doesn't fail the run.
     let paths = match provider.list("idempotency").await {
         Ok(p) => p,
         Err(e) => {
@@ -987,9 +1019,18 @@ async fn object_store_sweep_expired(
     let mut removed = 0;
     for path in paths {
         let rel_path = format!("idempotency/{}", path.trim_start_matches("idempotency/"));
-        let Ok(Some(observed)) = observe_claim_at_path(provider, &rel_path).await else {
-            continue;
+        let observed = match observe_claim_at_path(provider, &rel_path).await {
+            Ok(Some(observed)) => observed,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(error = %e, path = %rel_path, "idempotency sweep could not read an entry; skipping it");
+                continue;
+            }
         };
+        if observed.entry.is_none() {
+            warn!(path = %rel_path, "idempotency sweep skipped an entry that is not deserializable");
+            continue;
+        }
         if let Ok(true) = sweep_observed_claim(provider, &observed, now).await {
             removed += 1;
         }
@@ -997,26 +1038,27 @@ async fn object_store_sweep_expired(
     Ok(removed)
 }
 
-/// Delete `observed` if it is expired and is still the object in the store.
+/// Delete `observed` if it is a `Succeeded` entry past its retention and is
+/// still the object in the store.
 ///
-/// Re-reads the claim immediately before the delete and skips it when its
-/// version or body changed (a run took it over after `observed` was read) or
-/// it is no longer expired. The object-store API has no conditional delete,
-/// so a take-over between that re-read and the delete call can still be
-/// removed. The window is one round trip, and the removed claim belongs to a
-/// run that read an expired claim: the same state `AdoptStale` handles.
+/// Only `Succeeded` entries are swept. The object-store API has no
+/// conditional delete, so a read-then-delete can remove an object a run wrote
+/// in between. A `Succeeded` entry is never rewritten by a claim, finalize or
+/// take-over (a later run skips it as completed), so nothing can replace it
+/// in that window. `InFlight`, `Failed` and unreadable entries are all
+/// taken over with a conditional write, so the sweep leaves them: they stay
+/// until a run adopts them or a bucket lifecycle rule removes them.
 async fn sweep_observed_claim(
     provider: &ObjectStoreProvider,
     observed: &ObservedClaim,
     now: DateTime<Utc>,
 ) -> Result<bool, IdempotencyError> {
-    let expired = |claim: &ObservedClaim| {
-        claim
-            .entry
-            .as_ref()
-            .is_some_and(|entry| entry.expires_at < now)
+    let expired_success = |claim: &ObservedClaim| {
+        claim.entry.as_ref().is_some_and(|entry| {
+            entry.state == IdempotencyState::Succeeded && entry.expires_at < now
+        })
     };
-    if !expired(observed) {
+    if !expired_success(observed) {
         return Ok(false);
     }
     let Some(current) = observe_claim_at_path(provider, &observed.path).await? else {
@@ -1026,7 +1068,7 @@ async fn sweep_observed_claim(
         (Some(before), Some(after)) => before == after,
         _ => observed.body == current.body,
     };
-    if !unchanged || !expired(&current) {
+    if !unchanged || !expired_success(&current) {
         return Ok(false);
     }
     provider.delete(&observed.path).await?;

@@ -2692,7 +2692,7 @@ export interface IdempotencyConfig {
    */
   in_flight_ttl_hours?: number;
   /**
-   * Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. GC runs during the state upload sweep.
+   * Number of days a `Succeeded` (or `Failed`-under-`any`) stamp is kept before GC. Default 30. `rocky run` sweeps the local `state.redb` copy after each run. Expired object-store entries are not swept today.
    */
   retention_days?: number;
 }
