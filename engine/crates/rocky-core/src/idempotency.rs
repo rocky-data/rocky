@@ -1399,4 +1399,210 @@ mod tests {
         );
         assert_eq!(valkey_key("", "abc"), "idempotency:abc");
     }
+
+    // -------------------------------------------------------------------
+    // Live Valkey tests for the finalize script. Gated on
+    // `ROCKY_TEST_VALKEY_URL` (same convention as rocky-fivetran); the
+    // default CI run skips them.
+    // -------------------------------------------------------------------
+
+    fn live_valkey_url() -> Option<String> {
+        match std::env::var("ROCKY_TEST_VALKEY_URL") {
+            Ok(u) => Some(u),
+            Err(_) => {
+                eprintln!("skipping live Valkey test; set ROCKY_TEST_VALKEY_URL to enable");
+                None
+            }
+        }
+    }
+
+    fn live_conn(url: &str) -> redis::Connection {
+        redis::Client::open(url).unwrap().get_connection().unwrap()
+    }
+
+    fn live_backend(url: &str, prefix: &str) -> IdempotencyBackend {
+        IdempotencyBackend::Valkey {
+            url: url.to_string(),
+            prefix: prefix.to_string(),
+            mirror_to_redb: false,
+        }
+    }
+
+    fn live_prefix(tag: &str) -> String {
+        format!("rocky-test-{tag}-{}:", uuid::Uuid::new_v4())
+    }
+
+    fn live_cfg(dedup_on: DedupPolicy) -> IdempotencyConfig {
+        IdempotencyConfig {
+            retention_days: 2,
+            dedup_on,
+            ..IdempotencyConfig::default()
+        }
+    }
+
+    fn put_raw(conn: &mut redis::Connection, key: &str, value: &[u8]) {
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("EX")
+            .arg(1000)
+            .query(conn)
+            .unwrap();
+    }
+
+    fn get_raw(conn: &mut redis::Connection, key: &str) -> Option<Vec<u8>> {
+        redis::cmd("GET").arg(key).query(conn).unwrap()
+    }
+
+    fn del_raw(conn: &mut redis::Connection, key: &str) {
+        let _: i64 = redis::cmd("DEL").arg(key).query(conn).unwrap();
+    }
+
+    fn entry_json(run_id: &str, state: IdempotencyState) -> Vec<u8> {
+        let now = Utc::now();
+        serde_json::to_vec(&IdempotencyEntry {
+            key: "k".into(),
+            run_id: run_id.into(),
+            state,
+            stamped_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            dedup_on: DedupPolicy::Success,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_owner_succeeded_writes_entry_with_ttl() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("own-ok");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &entry_json("run-a", IdempotencyState::InFlight),
+        );
+
+        let cfg = live_cfg(DedupPolicy::Success);
+        live_backend(&url, &prefix)
+            .finalize(None, "k", "run-a", FinalOutcome::Succeeded, &cfg)
+            .await
+            .unwrap();
+
+        let raw = get_raw(&mut conn, &full).expect("entry kept");
+        let entry: IdempotencyEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(entry.state, IdempotencyState::Succeeded);
+        assert_eq!(entry.run_id, "run-a");
+        let ttl: i64 = redis::cmd("TTL").arg(&full).query(&mut conn).unwrap();
+        let two_days = 2 * 86_400;
+        assert!((two_days - 60..=two_days).contains(&ttl), "ttl {ttl}");
+        del_raw(&mut conn, &full);
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_owner_failed_dedup_success_deletes_key() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("own-fail");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &entry_json("run-a", IdempotencyState::InFlight),
+        );
+
+        let cfg = live_cfg(DedupPolicy::Success);
+        live_backend(&url, &prefix)
+            .finalize(None, "k", "run-a", FinalOutcome::Failed, &cfg)
+            .await
+            .unwrap();
+
+        assert!(get_raw(&mut conn, &full).is_none(), "claim must be deleted");
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_owner_failed_dedup_any_keeps_failed_entry() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("own-fail-any");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(
+            &mut conn,
+            &full,
+            &entry_json("run-a", IdempotencyState::InFlight),
+        );
+
+        let cfg = live_cfg(DedupPolicy::Any);
+        live_backend(&url, &prefix)
+            .finalize(None, "k", "run-a", FinalOutcome::Failed, &cfg)
+            .await
+            .unwrap();
+
+        let raw = get_raw(&mut conn, &full).expect("entry kept");
+        let entry: IdempotencyEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(entry.state, IdempotencyState::Failed);
+        del_raw(&mut conn, &full);
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_non_owner_leaves_key_untouched() {
+        let Some(url) = live_valkey_url() else { return };
+        let cfg = live_cfg(DedupPolicy::Success);
+        for outcome in [FinalOutcome::Succeeded, FinalOutcome::Failed] {
+            let prefix = live_prefix("non-owner");
+            let full = valkey_key(&prefix, "k");
+            let mut conn = live_conn(&url);
+            let theirs = entry_json("run-b", IdempotencyState::InFlight);
+            put_raw(&mut conn, &full, &theirs);
+
+            live_backend(&url, &prefix)
+                .finalize(None, "k", "run-a", outcome, &cfg)
+                .await
+                .unwrap();
+
+            assert_eq!(get_raw(&mut conn, &full), Some(theirs), "{outcome:?}");
+            del_raw(&mut conn, &full);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_absent_key_is_written() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("absent");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+
+        let cfg = live_cfg(DedupPolicy::Success);
+        live_backend(&url, &prefix)
+            .finalize(None, "k", "run-a", FinalOutcome::Succeeded, &cfg)
+            .await
+            .unwrap();
+
+        let raw = get_raw(&mut conn, &full).expect("entry written");
+        let entry: IdempotencyEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(entry.state, IdempotencyState::Succeeded);
+        assert_eq!(entry.run_id, "run-a");
+        del_raw(&mut conn, &full);
+    }
+
+    #[tokio::test]
+    async fn live_valkey_finalize_unreadable_value_is_untouched() {
+        let Some(url) = live_valkey_url() else { return };
+        let cfg = live_cfg(DedupPolicy::Success);
+        let junk_values: [&[u8]; 4] = [b"not json {", b"[1,2]", b"\"str\"", b"{\"no_run_id\":1}"];
+        for junk in junk_values {
+            let prefix = live_prefix("junk");
+            let full = valkey_key(&prefix, "k");
+            let mut conn = live_conn(&url);
+            put_raw(&mut conn, &full, junk);
+
+            live_backend(&url, &prefix)
+                .finalize(None, "k", "run-a", FinalOutcome::Succeeded, &cfg)
+                .await
+                .unwrap();
+
+            assert_eq!(get_raw(&mut conn, &full), Some(junk.to_vec()));
+            del_raw(&mut conn, &full);
+        }
+    }
 }
