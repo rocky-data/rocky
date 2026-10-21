@@ -122,6 +122,10 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * How the wait for one connector ended.
+ */
+export type SourceSyncOutcome = "succeeded" | "failed" | "timeout" | "unknown" | "interrupted";
+/**
  * Status of a pipeline run.
  *
  * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
@@ -232,6 +236,10 @@ export interface RunOutput {
    * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
    */
   skipped_by_run_id?: string | null;
+  /**
+   * One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
+   */
+  source_syncs?: SourceSyncOutput[];
   /**
    * Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
    */
@@ -867,5 +875,31 @@ export interface TableCompareResult {
   shadow_count?: number | null;
   shadow_table: string;
   verdict: string;
+  [k: string]: unknown;
+}
+/**
+ * What `rocky run` waited for on one source connector: a sync that was running when the run began.
+ */
+export interface SourceSyncOutput {
+  /**
+   * Source connector id.
+   */
+  id: string;
+  /**
+   * The connector's last successful sync after the wait.
+   */
+  last_sync_at?: string | null;
+  /**
+   * How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal).
+   */
+  outcome: SourceSyncOutcome;
+  /**
+   * The connector's schema name in the source destination.
+   */
+  schema: string;
+  /**
+   * Whole seconds from the start of the wait to this outcome.
+   */
+  waited_secs: number;
   [k: string]: unknown;
 }

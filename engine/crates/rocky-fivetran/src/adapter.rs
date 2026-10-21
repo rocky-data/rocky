@@ -11,6 +11,7 @@ use tracing::warn;
 use rocky_core::source::{
     DiscoveredConnector, DiscoveredTable, DiscoveryResult, FailedSource, FailedSourceErrorClass,
 };
+use rocky_core::source_sync::SourceSyncState;
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
 use crate::client::{FivetranClient, FivetranError};
@@ -113,6 +114,33 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
         }
 
         Ok(DiscoveryResult { connectors, failed })
+    }
+
+    /// One group-list read (`GET /v1/groups/{id}/connectors`, paged). Covers
+    /// every connected connector under the prefix, so a poll costs the page
+    /// count whatever the connector count.
+    async fn source_sync_states(
+        &self,
+        schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
+        let connectors =
+            ft_connector::discover_connectors(&self.client, &self.destination_id, schema_prefix)
+                .await
+                .map_err(AdapterError::new)?;
+        Ok(Some(
+            connectors
+                .into_iter()
+                .map(|c| SourceSyncState {
+                    syncing: c.status.sync_state == "syncing",
+                    paused: c.paused || c.status.sync_state == "paused",
+                    id: c.id,
+                    schema: c.schema,
+                    source_type: c.service,
+                    succeeded_at: c.succeeded_at,
+                    failed_at: c.failed_at,
+                })
+                .collect(),
+        ))
     }
 
     /// Populate each connector's `external_object_ids` from its DETAIL endpoint.

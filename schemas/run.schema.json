@@ -1352,6 +1352,88 @@
       ],
       "type": "object"
     },
+    "SourceSyncOutcome": {
+      "description": "How the wait for one connector ended.",
+      "oneOf": [
+        {
+          "description": "The sync ended and `succeeded_at` moved.",
+          "enum": [
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended and `failed_at` moved.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The connector was still syncing when the wait ran out.",
+          "enum": [
+            "timeout"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended but neither timestamp moved, or the connector vanished.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A shutdown signal ended the wait first.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SourceSyncOutput": {
+      "description": "What `rocky run` waited for on one source connector: a sync that was running when the run began.",
+      "properties": {
+        "id": {
+          "description": "Source connector id.",
+          "type": "string"
+        },
+        "last_sync_at": {
+          "description": "The connector's last successful sync after the wait.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceSyncOutcome"
+            }
+          ],
+          "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal)."
+        },
+        "schema": {
+          "description": "The connector's schema name in the source destination.",
+          "type": "string"
+        },
+        "waited_secs": {
+          "description": "Whole seconds from the start of the wait to this outcome.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "outcome",
+        "schema",
+        "waited_secs"
+      ],
+      "type": "object"
+    },
     "TableCheckOutput": {
       "properties": {
         "asset_key": {
@@ -1813,6 +1895,13 @@
         "string",
         "null"
       ]
+    },
+    "source_syncs": {
+      "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
+      "items": {
+        "$ref": "#/definitions/SourceSyncOutput"
+      },
+      "type": "array"
     },
     "status": {
       "allOf": [

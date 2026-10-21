@@ -78,6 +78,7 @@ pub mod snapshot_model;
 pub mod snapshots;
 pub mod source;
 pub mod source_freshness;
+pub mod source_sync;
 pub mod sql_gen;
 pub mod state;
 pub mod state_sync;

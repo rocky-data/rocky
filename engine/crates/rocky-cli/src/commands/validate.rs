@@ -767,6 +767,10 @@ fn config_error_diagnostic(
             ("V061", Some(format!("pipeline.{pipeline}.target.region")))
         }
         ConfigError::CostPriceInvalid { key, .. } => ("V046", Some(format!("cost.{key}"))),
+        ConfigError::SourceSyncInvalid { pipeline, .. } => (
+            "V046",
+            Some(format!("pipeline.{pipeline}.source.discovery.sync")),
+        ),
         _ => ("V046", None),
     };
 

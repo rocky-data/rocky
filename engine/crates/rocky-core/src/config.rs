@@ -391,6 +391,8 @@ pub enum ConfigError {
     },
     #[error("[cost] {key} = {value} is not a valid price: it must be a finite number, 0 or more")]
     CostPriceInvalid { key: &'static str, value: f64 },
+    #[error("[pipeline.{pipeline}.source.discovery.sync] {reason}")]
+    SourceSyncInvalid { pipeline: String, reason: String },
     #[error(
         "[checks] assertion name {name:?} on table {table:?} is reserved: it \
          collides with the engine's own {reserved:?} result. Dagster maps \
@@ -4780,6 +4782,73 @@ pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
         .collect()
 }
 
+/// Validate every `[pipeline.<name>.source.discovery.sync]` table.
+///
+/// - `poll_interval_secs` is at least [`MIN_SYNC_POLL_INTERVAL_SECS`].
+/// - `wait_timeout_secs` is above zero and at most half of
+///   `[state.idempotency] in_flight_ttl_hours`. Past that, another run's
+///   sweep could reap this run's idempotency claim while it still waits.
+/// - `wait = true` needs a Fivetran discovery adapter. No other known adapter
+///   reports sync state, so the key would do nothing.
+///
+/// Only a table with `wait = true` is checked: with `wait = false` the other
+/// keys are inert.
+pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    let ttl_secs = u64::from(config.state.idempotency.in_flight_ttl_hours) * 3600;
+    for (name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        let Some(disc) = &replication.source.discovery else {
+            continue;
+        };
+        let Some(sync) = disc.sync.as_ref().filter(|s| s.wait) else {
+            continue;
+        };
+        let mut refuse = |reason: String| {
+            errors.push(ConfigError::SourceSyncInvalid {
+                pipeline: name.clone(),
+                reason,
+            });
+        };
+        if sync.poll_interval_secs < MIN_SYNC_POLL_INTERVAL_SECS {
+            refuse(format!(
+                "poll_interval_secs = {} is too low: use {MIN_SYNC_POLL_INTERVAL_SECS} or more",
+                sync.poll_interval_secs
+            ));
+        }
+        if sync.wait_timeout_secs == 0 {
+            refuse("wait_timeout_secs = 0 would fail every run: use 1 or more".to_string());
+        }
+        if sync.wait_timeout_secs > ttl_secs / 2 {
+            refuse(format!(
+                "wait_timeout_secs = {} is more than half of [state.idempotency] \
+                 in_flight_ttl_hours = {} ({} s). Another run could reap this run's \
+                 idempotency claim while it waits. Lower wait_timeout_secs to {} or less, \
+                 or raise in_flight_ttl_hours",
+                sync.wait_timeout_secs,
+                config.state.idempotency.in_flight_ttl_hours,
+                ttl_secs,
+                ttl_secs / 2
+            ));
+        }
+        // A known adapter type other than fivetran never reports sync state, so
+        // the key would do nothing. An unknown type is left to
+        // `validate_adapter_kinds` and the registry, which refuse it already.
+        if let Some(adapter) = config.adapters.get(&disc.adapter)
+            && adapter.adapter_type != "fivetran"
+            && crate::adapter_capability::capability_for(&adapter.adapter_type).is_some()
+        {
+            refuse(format!(
+                "wait = true needs a fivetran discovery adapter, but adapter '{}' is type '{}'",
+                disc.adapter, adapter.adapter_type
+            ));
+        }
+    }
+    errors
+}
+
 /// Validate the `[state] freeze_marker_writes` flag against the backend.
 ///
 /// Enabling marker writes on a backend with no durable object tier (`local`,
@@ -7983,6 +8052,74 @@ pub struct DiscoveryConfig {
     /// participate; others are silently skipped.
     #[serde(default)]
     pub on_collision: OnCollision,
+
+    /// Optional `[pipeline.<name>.source.discovery.sync]` table. When it sets
+    /// `wait = true`, `rocky run` waits for a running source sync to finish
+    /// before it reads the source. Absent means no wait and no extra requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<DiscoverySyncConfig>,
+}
+
+/// What `rocky run` does when a source sync it waited for ends in failure,
+/// or does not end before `wait_timeout_secs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OnSyncFailure {
+    /// Stop the run before any warehouse write (default).
+    #[default]
+    Fail,
+    /// Log a warning and run on the data the source already landed.
+    Warn,
+}
+
+/// Smallest accepted `poll_interval_secs`. Each poll is one paged request to
+/// the source vendor, so a lower value spends rate limit for no gain.
+pub const MIN_SYNC_POLL_INTERVAL_SECS: u64 = 10;
+
+fn default_sync_wait_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_sync_poll_interval_secs() -> u64 {
+    30
+}
+
+/// `[pipeline.<name>.source.discovery.sync]`: wait for a running source sync
+/// to end before `rocky run` reads the source.
+///
+/// Rocky only reads the vendor API (GET). It never starts a sync. A connector
+/// that is not syncing when the run starts is not waited for.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverySyncConfig {
+    /// Wait for a running sync to finish before the run starts. Default `false`.
+    #[serde(default)]
+    pub wait: bool,
+
+    /// Longest wait for the whole phase, in seconds. Must be at most half of
+    /// `[state.idempotency] in_flight_ttl_hours`. Default 3600.
+    #[serde(default = "default_sync_wait_timeout_secs")]
+    pub wait_timeout_secs: u64,
+
+    /// Seconds between status polls. At least 10. Default 30.
+    #[serde(default = "default_sync_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// `fail` (default) stops the run when a waited sync fails or does not end
+    /// in time. `warn` logs it and runs on the last landed data.
+    #[serde(default)]
+    pub on_sync_failure: OnSyncFailure,
+}
+
+impl Default for DiscoverySyncConfig {
+    fn default() -> Self {
+        Self {
+            wait: false,
+            wait_timeout_secs: default_sync_wait_timeout_secs(),
+            poll_interval_secs: default_sync_poll_interval_secs(),
+            on_sync_failure: OnSyncFailure::default(),
+        }
+    }
 }
 
 /// Pipeline target configuration.
@@ -8708,6 +8845,7 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
                 adapter: sole_adapter.clone(),
                 report_new_sources: false,
                 on_collision: OnCollision::Off,
+                sync: None,
             });
         }
     }
@@ -8930,6 +9068,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_metadata_columns,
     validate_residency,
     validate_cost_prices,
+    validate_source_sync,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -16482,6 +16621,200 @@ catalog_template = "wh"
 schema_template = "raw__{source}"
 "#
         .to_string()
+    }
+
+    // --- [pipeline.<name>.source.discovery.sync] ---
+
+    fn sync_config(adapter_type: &str, ttl_hours: u32, sync: &str) -> RockyConfig {
+        let adapter = if adapter_type == "fivetran" {
+            "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n"
+        } else {
+            "path = \"x.db\"\n"
+        };
+        let toml_str = format!(
+            r#"
+[state.idempotency]
+in_flight_ttl_hours = {ttl_hours}
+
+[adapter.default]
+type = "duckdb"
+path = "x.db"
+
+[adapter.src]
+type = "{adapter_type}"
+{adapter}
+
+[pipeline.raw]
+strategy = "full_refresh"
+
+[pipeline.raw.source.discovery]
+adapter = "src"
+
+{sync}
+
+[pipeline.raw.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+"#
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    fn sync_of(config: &RockyConfig) -> Option<&DiscoverySyncConfig> {
+        let PipelineConfig::Replication(r) = &config.pipelines["raw"] else {
+            panic!("replication pipeline");
+        };
+        r.source.discovery.as_ref().unwrap().sync.as_ref()
+    }
+
+    #[test]
+    fn discovery_sync_defaults() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        let sync = sync_of(&config).unwrap();
+        assert!(sync.wait);
+        assert_eq!(sync.wait_timeout_secs, 3600);
+        assert_eq!(sync.poll_interval_secs, 30);
+        assert_eq!(sync.on_sync_failure, OnSyncFailure::Fail);
+        assert!(validate_source_sync(&config).is_empty());
+    }
+
+    #[test]
+    fn no_sync_table_is_todays_behaviour() {
+        let config = sync_config("fivetran", 24, "");
+        assert!(sync_of(&config).is_none());
+        assert!(validate_source_sync(&config).is_empty());
+    }
+
+    #[test]
+    fn discovery_sync_parses_every_key() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\nwait_timeout_secs = 600\n\
+             poll_interval_secs = 15\non_sync_failure = \"warn\"",
+        );
+        let sync = sync_of(&config).unwrap();
+        assert_eq!(sync.wait_timeout_secs, 600);
+        assert_eq!(sync.poll_interval_secs, 15);
+        assert_eq!(sync.on_sync_failure, OnSyncFailure::Warn);
+    }
+
+    #[test]
+    fn discovery_sync_refuses_unknown_keys_and_values() {
+        // `trigger` belongs to a later slice; it must not parse today.
+        for bad in [
+            "wait = true\ntrigger = true",
+            "wait = true\non_sync_failure = \"ignore\"",
+            "wait = \"yes\"",
+        ] {
+            let sync = format!("[pipeline.raw.source.discovery.sync]\n{bad}");
+            let result = std::panic::catch_unwind(|| sync_config("fivetran", 24, &sync));
+            assert!(result.is_err(), "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_poll_interval_below_the_floor() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\npoll_interval_secs = 9",
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].to_string().contains("poll_interval_secs = 9"));
+        let ok = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\npoll_interval_secs = 10",
+        );
+        assert!(validate_source_sync(&ok).is_empty());
+    }
+
+    /// The boundary is inclusive: exactly half of the TTL passes, one second
+    /// more is refused.
+    #[test]
+    fn validate_caps_the_timeout_at_half_the_in_flight_ttl() {
+        let at_half = sync_config(
+            "fivetran",
+            2,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\nwait_timeout_secs = 3600",
+        );
+        assert!(validate_source_sync(&at_half).is_empty());
+        let over = sync_config(
+            "fivetran",
+            2,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\nwait_timeout_secs = 3601",
+        );
+        let errors = validate_source_sync(&over);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let text = errors[0].to_string();
+        assert!(text.contains("in_flight_ttl_hours = 2"), "{text}");
+        assert!(text.contains("3600 or less"), "{text}");
+        // The default timeout (3600) needs a TTL of 2 hours or more.
+        let default_timeout = sync_config(
+            "fivetran",
+            1,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        assert_eq!(validate_source_sync(&default_timeout).len(), 1);
+    }
+
+    #[test]
+    fn validate_refuses_a_zero_timeout() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\nwait_timeout_secs = 0",
+        );
+        assert_eq!(validate_source_sync(&config).len(), 1);
+    }
+
+    #[test]
+    fn validate_refuses_wait_on_an_adapter_that_cannot_report_sync_state() {
+        let config = sync_config(
+            "duckdb",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].to_string().contains("needs a fivetran"));
+    }
+
+    #[test]
+    fn inert_sync_tables_are_not_judged() {
+        // wait = false: the other keys do nothing, so nothing is checked.
+        let config = sync_config(
+            "duckdb",
+            1,
+            "[pipeline.raw.source.discovery.sync]\nwait = false\npoll_interval_secs = 1\n\
+             wait_timeout_secs = 999999",
+        );
+        assert!(validate_source_sync(&config).is_empty());
+    }
+
+    #[test]
+    fn the_sync_validator_is_part_of_the_shared_chain() {
+        let config = sync_config(
+            "fivetran",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\npoll_interval_secs = 1",
+        );
+        assert!(
+            collect_loaded_config_errors(&config)
+                .iter()
+                .any(|e| matches!(e, ConfigError::SourceSyncInvalid { .. }))
+        );
     }
 
     #[test]

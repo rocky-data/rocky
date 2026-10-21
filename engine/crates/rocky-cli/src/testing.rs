@@ -610,6 +610,82 @@ impl rocky_core::traits::WarehouseAdapter for GovernedViewWarehouse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted source with sync state (`[...discovery.sync] wait = true`)
+// ---------------------------------------------------------------------------
+
+/// A discovery adapter that reports one connector (`raw__acme`, table
+/// `orders`) and answers each sync-state poll from a script. The last answer
+/// repeats. Registered by the `"test-sync-source"` arm in the registry, keyed
+/// by the adapter's `path`.
+pub(crate) struct ScriptedSyncSource {
+    polls: Mutex<std::collections::VecDeque<Vec<rocky_core::source_sync::SourceSyncState>>>,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl ScriptedSyncSource {
+    /// Replace the script. The next poll gets the first entry.
+    pub(crate) fn script(&self, polls: Vec<Vec<rocky_core::source_sync::SourceSyncState>>) {
+        *self.polls.lock().expect("sync script mutex") = polls.into();
+        self.calls.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many sync-state polls the run made.
+    pub(crate) fn polls(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+static SYNC_SOURCES: LazyLock<Mutex<HashMap<String, Arc<ScriptedSyncSource>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The shared [`ScriptedSyncSource`] for `key`, creating it on first ask.
+pub(crate) fn sync_source(key: &str) -> Arc<ScriptedSyncSource> {
+    let mut map = SYNC_SOURCES.lock().expect("sync source registry mutex");
+    Arc::clone(map.entry(key.to_string()).or_insert_with(|| {
+        Arc::new(ScriptedSyncSource {
+            polls: Mutex::new(Default::default()),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        })
+    }))
+}
+
+#[async_trait::async_trait]
+impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
+    async fn discover(
+        &self,
+        _schema_prefix: &str,
+    ) -> AdapterResult<rocky_core::source::DiscoveryResult> {
+        Ok(rocky_core::source::DiscoveryResult::ok(vec![
+            rocky_core::source::DiscoveredConnector {
+                id: "c1".into(),
+                schema: "raw__acme".into(),
+                source_type: "shopify".into(),
+                last_sync_at: None,
+                tables: vec![rocky_core::source::DiscoveredTable {
+                    name: "orders".into(),
+                    row_count: None,
+                }],
+                metadata: Default::default(),
+                external_object_ids: Vec::new(),
+            },
+        ]))
+    }
+
+    async fn source_sync_states(
+        &self,
+        _schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<rocky_core::source_sync::SourceSyncState>>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut polls = self.polls.lock().expect("sync script mutex");
+        if polls.len() > 1 {
+            Ok(polls.pop_front())
+        } else {
+            Ok(polls.front().cloned())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

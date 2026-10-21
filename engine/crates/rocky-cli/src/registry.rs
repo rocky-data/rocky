@@ -878,6 +878,18 @@ impl AdapterRegistry {
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
                 // Test-only, same exemption as "recording" above. Registers a
+                // discovery adapter that reports one connector and answers
+                // sync-state polls from a script, keyed by `path`. See
+                // `crate::testing::ScriptedSyncSource`.
+                #[cfg(test)]
+                "test-sync-source" => {
+                    let key = adapter_cfg.path.expose_opt().unwrap_or_default();
+                    discovery.insert(
+                        name.clone(),
+                        crate::testing::sync_source(key) as Arc<dyn DiscoveryAdapter>,
+                    );
+                }
+                // Test-only, same exemption as "recording" above. Registers a
                 // `WarehouseAdapter` that wraps a real in-memory DuckDB
                 // adapter but fails the selected warehouse call with a typed
                 // Databricks `ConnectorError`, wrapped exactly the way

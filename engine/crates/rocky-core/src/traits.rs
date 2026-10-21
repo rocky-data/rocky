@@ -223,6 +223,20 @@ pub trait DiscoveryAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Current sync state of every connector whose schema starts with the
+    /// prefix: one status read, no side effect on the source.
+    ///
+    /// Default: `Ok(None)`, meaning this adapter does not report sync state.
+    /// `rocky run` uses it for `[...discovery.sync] wait = true`. It warns and
+    /// runs without a wait when the adapter returns `None`, and `rocky
+    /// validate` refuses the key for a known adapter type that cannot report.
+    async fn source_sync_states(
+        &self,
+        _schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<crate::source_sync::SourceSyncState>>> {
+        Ok(None)
+    }
+
     /// Cheap connectivity check for the discovery API.
     ///
     /// Used by `rocky doctor --check auth`. Default: calls `discover("")`

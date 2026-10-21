@@ -1703,3 +1703,181 @@ async fn fetch_envelope_errors_when_all_schemas_404() {
 
     drop(server);
 }
+
+// ---------------------------------------------------------------------------
+// Source-sync wait (`[...discovery.sync] wait = true`): GET-only polling of
+// the group connector list.
+// ---------------------------------------------------------------------------
+
+mod sync_wait {
+    use std::time::{Duration, Instant};
+
+    use rocky_core::source_sync::{
+        SourceSyncOutcome, SourceSyncReport, SourceSyncState, SourceSyncWaitOptions,
+        wait_for_source_syncs,
+    };
+    use rocky_fivetran::adapter::FivetranDiscoveryAdapter;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::test_client;
+
+    /// One group-list page holding connector `conn_1`.
+    fn page(sync_state: &str, succeeded_at: &str, failed_at: Option<&str>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "Success",
+            "data": {
+                "items": [{
+                    "id": "conn_1",
+                    "group_id": "dest_abc",
+                    "service": "shopify",
+                    "schema": "src__acme__shopify",
+                    "status": { "setup_state": "connected", "sync_state": sync_state },
+                    "succeeded_at": succeeded_at,
+                    "failed_at": failed_at
+                }],
+                "next_cursor": null
+            }
+        }))
+    }
+
+    const T0: &str = "2026-10-21T10:00:00Z";
+    const T1: &str = "2026-10-21T10:05:00Z";
+
+    /// Serve `answers` in order, one per poll; the last repeats.
+    async fn serve(server: &MockServer, answers: Vec<ResponseTemplate>) {
+        let last = answers.len() - 1;
+        for (i, answer) in answers.into_iter().enumerate() {
+            let mock = Mock::given(method("GET"))
+                .and(path("/v1/groups/dest_abc/connectors"))
+                .respond_with(answer);
+            if i < last {
+                mock.up_to_n_times(1).mount(server).await;
+            } else {
+                mock.mount(server).await;
+            }
+        }
+    }
+
+    fn opts(timeout_ms: u64) -> SourceSyncWaitOptions {
+        SourceSyncWaitOptions {
+            timeout: Duration::from_millis(timeout_ms),
+            poll_interval: Duration::from_millis(20),
+        }
+    }
+
+    fn all(_: &SourceSyncState) -> bool {
+        true
+    }
+
+    async fn wait(
+        server: &MockServer,
+        o: SourceSyncWaitOptions,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> SourceSyncReport {
+        let adapter = FivetranDiscoveryAdapter::new(test_client(server), "dest_abc".into());
+        wait_for_source_syncs(&adapter, "src__", &all, o, cancel)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Rocky asks the vendor only for the connector list. Never a POST.
+    async fn assert_get_only(server: &MockServer) {
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method == wiremock::http::Method::GET),
+            "{:?}",
+            requests
+                .iter()
+                .map(|r| r.method.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn succeeded() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                page("syncing", T0, None),
+                page("syncing", T0, None),
+                page("scheduled", T1, None),
+            ],
+        )
+        .await;
+        let report = wait(&server, opts(5000), std::future::pending()).await;
+        assert_eq!(report.syncs.len(), 1);
+        assert_eq!(report.syncs[0].id, "conn_1");
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Succeeded);
+        assert_eq!(
+            report.syncs[0].last_sync_at.unwrap().to_rfc3339(),
+            "2026-10-21T10:05:00+00:00"
+        );
+        assert!(!report.interrupted);
+        assert_get_only(&server).await;
+    }
+
+    #[tokio::test]
+    async fn failed() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![page("syncing", T0, None), page("scheduled", T0, Some(T1))],
+        )
+        .await;
+        let report = wait(&server, opts(5000), std::future::pending()).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Failed);
+        assert_get_only(&server).await;
+    }
+
+    #[tokio::test]
+    async fn timeout() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("syncing", T0, None)]).await;
+        let started = Instant::now();
+        let report = wait(&server, opts(150), std::future::pending()).await;
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Timeout);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_get_only(&server).await;
+    }
+
+    #[tokio::test]
+    async fn cancel() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("syncing", T0, None)]).await;
+        let o = SourceSyncWaitOptions {
+            timeout: Duration::from_secs(3600),
+            poll_interval: Duration::from_secs(30),
+        };
+        let started = Instant::now();
+        let report = wait(&server, o, tokio::time::sleep(Duration::from_millis(100))).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(report.interrupted);
+        assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Interrupted);
+        // Only the first poll went out: the signal beat the 30 s sleep.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_get_only(&server).await;
+    }
+
+    #[tokio::test]
+    async fn an_idle_connector_costs_one_request() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("scheduled", T0, None)]).await;
+        let report = wait(&server, opts(5000), std::future::pending()).await;
+        assert!(report.syncs.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_paused_connector_is_not_waited_for() {
+        let server = MockServer::start().await;
+        serve(&server, vec![page("paused", T0, None)]).await;
+        let report = wait(&server, opts(5000), std::future::pending()).await;
+        assert!(report.syncs.is_empty());
+    }
+}

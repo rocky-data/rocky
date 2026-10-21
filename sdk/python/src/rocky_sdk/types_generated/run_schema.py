@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, conint
+from pydantic import AwareDatetime, BaseModel, Field, conint
 
 
 class AnomalyEvaluationOutput(BaseModel):
@@ -563,6 +563,79 @@ class SourceSpan(BaseModel):
     col: conint(ge=0)
     file: str
     line: conint(ge=0)
+
+
+class SourceSyncOutcome1(StrEnum):
+    """
+    The sync ended and `succeeded_at` moved.
+    """
+
+    succeeded = "succeeded"
+
+
+class SourceSyncOutcome2(StrEnum):
+    """
+    The sync ended and `failed_at` moved.
+    """
+
+    failed = "failed"
+
+
+class SourceSyncOutcome3(StrEnum):
+    """
+    The connector was still syncing when the wait ran out.
+    """
+
+    timeout = "timeout"
+
+
+class SourceSyncOutcome4(StrEnum):
+    """
+    The sync ended but neither timestamp moved, or the connector vanished.
+    """
+
+    unknown = "unknown"
+
+
+class SourceSyncOutcome5(StrEnum):
+    """
+    A shutdown signal ended the wait first.
+    """
+
+    interrupted = "interrupted"
+
+
+class SourceSyncOutput(BaseModel):
+    """
+    What `rocky run` waited for on one source connector: a sync that was running when the run began.
+    """
+
+    id: str
+    """
+    Source connector id.
+    """
+    last_sync_at: AwareDatetime | None = None
+    """
+    The connector's last successful sync after the wait.
+    """
+    outcome: (
+        SourceSyncOutcome1
+        | SourceSyncOutcome2
+        | SourceSyncOutcome3
+        | SourceSyncOutcome4
+        | SourceSyncOutcome5
+    )
+    """
+    How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal).
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    The connector's schema name in the source destination.
+    """
+    waited_secs: conint(ge=0)
+    """
+    Whole seconds from the start of the wait to this outcome.
+    """
 
 
 class TableCompareResult(BaseModel):
@@ -1128,6 +1201,10 @@ class RunOutput(BaseModel):
     skipped_by_run_id: str | None = None
     """
     Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
+    """
+    source_syncs: list[SourceSyncOutput] | None = None
+    """
+    One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
     """
     status: RunStatus1 | RunStatus2 | RunStatus3
     """

@@ -388,6 +388,13 @@ struct TableError {
 /// pipeline uploads it when the record landed (#2442). A second SIGINT bypasses this path entirely and calls
 /// `std::process::exit(130)` directly from the signal listener.
 ///
+/// One phase settles with nothing to settle: the source-sync wait of a
+/// replication pipeline (`[...discovery.sync] wait = true`). It runs before the
+/// run takes its state session, so no claim on a state store, session or
+/// ledger exists. It persists no record and returns `custody: Lost`. It still
+/// prints the run JSON (`interrupted: true`, `source_syncs`) and releases the
+/// idempotency claim through the run's error path.
+///
 /// `custody` says whether the interrupted run's record landed (#2442). A
 /// dispatcher arm still holding a remote-state session reads it through
 /// [`session_disposition`]: a persisted record finalizes, so the record and
@@ -4999,6 +5006,52 @@ pub async fn run_with_explicit_contracts(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
+    // Build adapter registry and resolve adapters. Built before the state
+    // session so the source-sync wait below can use the discovery adapter
+    // without holding a state session.
+    let built_registry;
+    let adapter_registry = match registry_override {
+        Some(registry) => registry,
+        None => {
+            built_registry = AdapterRegistry::from_config(rocky_cfg)?;
+            &built_registry
+        }
+    };
+
+    // Source-sync wait (`[...discovery.sync] wait = true`). Runs before the
+    // state session is taken, so a long wait holds no state lock. It holds
+    // only the cancellation token and the idempotency claim. An exit from the
+    // phase persists no RunRecord (no state store is open) and skips the
+    // end-of-run retention sweep, which would otherwise open the state store
+    // with no session. Off under a reviewed apply: the reviewer did not see a
+    // wait, so apply must not cause one.
+    let mut source_syncs: Vec<SourceSyncOutput> = Vec::new();
+    if reviewed_source_state.is_none()
+        && governed_ctx.is_none()
+        && let Some(disc) = pipeline.source.discovery.as_ref()
+        && let Some(sync) = disc.sync.as_ref().filter(|s| s.wait)
+    {
+        skip_end_of_run_sweep = true;
+        let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
+        source_syncs = super::run_source_sync::SyncPhase {
+            sync,
+            pipeline_name,
+            run_id: &run_id,
+            schema_prefix: &pattern.prefix,
+            pattern: &pattern,
+            filter: parsed_filter.as_ref(),
+            filter_text: filter.unwrap_or(""),
+            concurrency: pipeline.execution.concurrency.max_concurrency(),
+            started: start,
+            output_json,
+            cancel: &cancel,
+            hooks: &hook_registry,
+        }
+        .run(discovery_adapter.as_ref())
+        .await?;
+        skip_end_of_run_sweep = false;
+    }
+
     // Download state from remote storage (S3/GCS/Valkey) if configured, via
     // the run-scoped [`RemoteStateSession`] (WP-01 PR-B). `acquire` performs
     // the download-before-read and records the typed [`StateAuthority`] that
@@ -5097,15 +5150,6 @@ pub async fn run_with_explicit_contracts(
     )?;
     let entry_marker_freezes = freeze_fence.active_snapshot().await?;
 
-    // Build adapter registry and resolve adapters
-    let built_registry;
-    let adapter_registry = match registry_override {
-        Some(registry) => registry,
-        None => {
-            built_registry = AdapterRegistry::from_config(rocky_cfg)?;
-            &built_registry
-        }
-    };
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     // Batch check adapter (optional): present when the warehouse has any
@@ -5301,6 +5345,7 @@ pub async fn run_with_explicit_contracts(
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
+    output.source_syncs = source_syncs;
     // Stamp an inherited gate HERE, not at the check-gate stamp far below
     // (#1720). Several exit paths persist a `RunRecord` before that point —
     // the SIGINT/SIGTERM path is the reachable one — and `derive_run_status`
@@ -21822,6 +21867,7 @@ schema_template = "staging"
                 adapter: "default".to_string(),
                 report_new_sources: false,
                 on_collision: rocky_core::config::OnCollision::Off,
+                sync: None,
             }),
         }
     }
@@ -26575,6 +26621,7 @@ auto_create_schemas = true
             budget_breaches: vec![],
             override_warnings: vec![],
             override_match_counts: vec![],
+            source_syncs: vec![],
             consumer_diagnostics: vec![],
         };
 

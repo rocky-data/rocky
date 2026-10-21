@@ -554,6 +554,11 @@ class RunResult(BaseModel):
     #: ``matched_tables``); the nested shape lives on the generated
     #: ``RunOutput.override_match_counts``. Empty when no rules are declared.
     override_match_counts: list[dict] = Field(default_factory=list)
+    #: One loose ``dict`` row per source connector the run waited for under
+    #: ``[...discovery.sync] wait = true`` (``id``, ``schema``, ``outcome``,
+    #: ``waited_secs``, ``last_sync_at``); the typed shape lives on the
+    #: generated ``RunOutput.source_syncs``. Empty when nothing was waited for.
+    source_syncs: list[dict] = Field(default_factory=list)
     #: Problems in the project's ``consumers/`` records (``E060``). They never
     #: stop a model from being written and are never counted as a failed
     #: table. Empty when the records are sound.

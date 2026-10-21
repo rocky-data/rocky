@@ -7502,6 +7502,52 @@
             "default": false,
             "description": "When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.",
             "type": "boolean"
+          },
+          "sync": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DiscoverySyncConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional `[pipeline.<name>.source.discovery.sync]` table. When it sets `wait = true`, `rocky run` waits for a running source sync to finish before it reads the source. Absent means no wait and no extra requests."
+          }
+        },
+        "type": "object"
+      },
+      "DiscoverySyncConfig": {
+        "additionalProperties": false,
+        "description": "`[pipeline.<name>.source.discovery.sync]`: wait for a running source sync to end before `rocky run` reads the source.\n\nRocky only reads the vendor API (GET). It never starts a sync. A connector that is not syncing when the run starts is not waited for.",
+        "properties": {
+          "on_sync_failure": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OnSyncFailure"
+              }
+            ],
+            "default": "fail",
+            "description": "`fail` (default) stops the run when a waited sync fails or does not end in time. `warn` logs it and runs on the last landed data."
+          },
+          "poll_interval_secs": {
+            "default": 30,
+            "description": "Seconds between status polls. At least 10. Default 30.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "wait": {
+            "default": false,
+            "description": "Wait for a running sync to finish before the run starts. Default `false`.",
+            "type": "boolean"
+          },
+          "wait_timeout_secs": {
+            "default": 3600,
+            "description": "Longest wait for the whole phase, in seconds. Must be at most half of `[state.idempotency] in_flight_ttl_hours`. Default 3600.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           }
         },
         "type": "object"
@@ -13953,6 +13999,25 @@
             "description": "Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.",
             "enum": [
               "append_new_columns"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "OnSyncFailure": {
+        "description": "What `rocky run` does when a source sync it waited for ends in failure, or does not end before `wait_timeout_secs`.",
+        "oneOf": [
+          {
+            "description": "Stop the run before any warehouse write (default).",
+            "enum": [
+              "fail"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Log a warning and run on the data the source already landed.",
+            "enum": [
+              "warn"
             ],
             "type": "string"
           }
@@ -22218,6 +22283,13 @@
               "null"
             ]
           },
+          "source_syncs": {
+            "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`. A connector that was not syncing when the run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
+            "items": {
+              "$ref": "#/components/schemas/SourceSyncOutput"
+            },
+            "type": "array"
+          },
           "status": {
             "allOf": [
               {
@@ -23992,6 +24064,88 @@
         },
         "required": [
           "tables"
+        ],
+        "type": "object"
+      },
+      "SourceSyncOutcome": {
+        "description": "How the wait for one connector ended.",
+        "oneOf": [
+          {
+            "description": "The sync ended and `succeeded_at` moved.",
+            "enum": [
+              "succeeded"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The sync ended and `failed_at` moved.",
+            "enum": [
+              "failed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The connector was still syncing when the wait ran out.",
+            "enum": [
+              "timeout"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The sync ended but neither timestamp moved, or the connector vanished.",
+            "enum": [
+              "unknown"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A shutdown signal ended the wait first.",
+            "enum": [
+              "interrupted"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "SourceSyncOutput": {
+        "description": "What `rocky run` waited for on one source connector: a sync that was running when the run began.",
+        "properties": {
+          "id": {
+            "description": "Source connector id.",
+            "type": "string"
+          },
+          "last_sync_at": {
+            "description": "The connector's last successful sync after the wait.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SourceSyncOutcome"
+              }
+            ],
+            "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved) or `interrupted` (a shutdown signal)."
+          },
+          "schema": {
+            "description": "The connector's schema name in the source destination.",
+            "type": "string"
+          },
+          "waited_secs": {
+            "description": "Whole seconds from the start of the wait to this outcome.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "outcome",
+          "schema",
+          "waited_secs"
         ],
         "type": "object"
       },
