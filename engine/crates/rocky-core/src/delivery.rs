@@ -400,6 +400,30 @@ pub struct ChainNode {
     pub p90_ms: Option<u64>,
     /// The most urgent deadline the pipeline serves itself, if any.
     pub deadline: Option<DirectDeadline>,
+    /// True when it is not known whether the pipeline serves a deadline:
+    /// its models could not all be read, and neither those that were read
+    /// nor its run history show it building a deadlined model. The node then
+    /// counts as feeding a deadline whose start-by is unknown.
+    pub serves_unknown: bool,
+}
+
+/// Why a latest start is unknown.
+///
+/// Ordered by declaration so a sorted list reads the same every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnknownReason {
+    /// A pipeline on the way has no p90: fewer than 5 successful production
+    /// runs. Its name is in `missing_estimate`.
+    MissingEstimate,
+    /// A deadline's cron finds no next occurrence.
+    NoNextDeadline,
+    /// A pipeline on the way could not have all its models read, so whether
+    /// it serves a deadline is unknown.
+    ModelsUnreadable,
+    /// The `after` graph has a cycle on the way to a deadline.
+    Cycle,
+    /// Subtracting a p90 from the start-by time leaves the date range.
+    Overflow,
 }
 
 /// The latest time a pipeline can start and still meet every deadline it
@@ -415,9 +439,13 @@ pub enum LatestStart {
         /// That product's next deadline.
         due_at: DateTime<Utc>,
     },
-    /// Some node on a chain has no p90, so there is no answer. Never a guess.
+    /// Some term on a chain is unknown, so there is no answer. Never a guess.
     Unknown {
-        /// The pipelines on the chains whose p90 is unknown, sorted.
+        /// Every reason found on the chains, sorted, without repeats. Never
+        /// empty.
+        reasons: Vec<UnknownReason>,
+        /// The pipelines on the chains whose p90 is unknown, sorted. Empty
+        /// unless `reasons` holds [`UnknownReason::MissingEstimate`].
         missing_estimate: Vec<String>,
     },
 }
@@ -434,11 +462,16 @@ pub enum LatestStart {
 ///                     - p90(P)
 /// ```
 ///
-/// A pipeline that feeds no deadline, directly or downstream, is absent from
-/// the result. One unknown term makes the result unknown: a p90 missing on
-/// any node of any chain, an unknown consumer, or a deadline with no next
-/// occurrence. Taking the minimum over the known terms only would be a guess.
-/// A cycle in `after` (the reconciler refuses one) also reads as unknown.
+/// A pipeline feeds a deadline when it serves one, has
+/// [`ChainNode::serves_unknown`] set, or some pipeline that runs after it,
+/// directly or through others, does. Every other pipeline is absent from the
+/// result, so a cycle in `after` with no deadline downstream gives no entry.
+///
+/// One unknown term makes the result unknown, with every reason found (see
+/// [`UnknownReason`]): a p90 missing on any node of any chain, a deadline
+/// with no next occurrence, a node with unreadable models, a cycle in `after`
+/// (the reconciler refuses one), or a subtraction that leaves the date range.
+/// Taking the minimum over the known terms only would be a guess.
 ///
 /// A deadline only derives this value. It never adds an `after` edge and
 /// never moves a cron.
@@ -448,8 +481,28 @@ pub fn latest_starts(
 ) -> std::collections::BTreeMap<String, LatestStart> {
     use std::collections::{BTreeMap, BTreeSet};
 
+    // Every node that feeds a deadline: the deadline nodes and everything
+    // upstream of them along `after`.
+    let mut feeding: BTreeSet<&str> = BTreeSet::new();
+    let mut stack: Vec<&str> = nodes
+        .iter()
+        .filter(|(_, node)| node.deadline.is_some() || node.serves_unknown)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    while let Some(name) = stack.pop() {
+        if !feeding.insert(name) {
+            continue;
+        }
+        if let Some(node) = nodes.get(name) {
+            stack.extend(node.after.iter().map(String::as_str));
+        }
+    }
+
     let mut consumers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (name, node) in nodes {
+        if !feeding.contains(name.as_str()) {
+            continue;
+        }
         for upstream in &node.after {
             consumers
                 .entry(upstream.as_str())
@@ -458,25 +511,30 @@ pub fn latest_starts(
         }
     }
 
-    // `None` in the memo: the node feeds no deadline.
+    fn unknown(reason: UnknownReason) -> LatestStart {
+        LatestStart::Unknown {
+            reasons: vec![reason],
+            missing_estimate: Vec::new(),
+        }
+    }
+
+    // Only called on a node in `feeding`, and only walks consumers that are
+    // in it, so every call has a deadline downstream and returns an answer.
     fn walk<'a>(
         name: &'a str,
         nodes: &'a BTreeMap<String, ChainNode>,
         consumers: &BTreeMap<&'a str, Vec<&'a str>>,
-        memo: &mut BTreeMap<&'a str, Option<LatestStart>>,
+        memo: &mut BTreeMap<&'a str, LatestStart>,
         in_progress: &mut BTreeSet<&'a str>,
-    ) -> Option<LatestStart> {
+    ) -> LatestStart {
         if let Some(done) = memo.get(name) {
             return done.clone();
         }
         if !in_progress.insert(name) {
-            return Some(LatestStart::Unknown {
-                missing_estimate: Vec::new(),
-            });
+            return unknown(UnknownReason::Cycle);
         }
         let node = nodes.get(name);
-        let mut feeds = false;
-        let mut unknown = false;
+        let mut reasons: BTreeSet<UnknownReason> = BTreeSet::new();
         let mut missing: BTreeSet<String> = BTreeSet::new();
         // The earliest start-by of everything this node feeds.
         let mut earliest: Option<(DateTime<Utc>, String, DateTime<Utc>)> = None;
@@ -487,68 +545,75 @@ pub fn latest_starts(
         };
 
         if let Some(deadline) = node.and_then(|node| node.deadline.as_ref()) {
-            feeds = true;
             match deadline.due_at {
                 Some(due) => consider(due, &deadline.product, due),
-                None => unknown = true,
+                None => {
+                    reasons.insert(UnknownReason::NoNextDeadline);
+                }
             }
+        }
+        if node.is_some_and(|node| node.serves_unknown) {
+            reasons.insert(UnknownReason::ModelsUnreadable);
         }
         for consumer in consumers.get(name).into_iter().flatten() {
             match walk(consumer, nodes, consumers, memo, in_progress) {
-                None => {}
-                Some(LatestStart::Known {
+                LatestStart::Known {
                     at,
                     product,
                     due_at,
-                }) => {
-                    feeds = true;
-                    consider(at, &product, due_at);
-                }
-                Some(LatestStart::Unknown { missing_estimate }) => {
-                    feeds = true;
-                    unknown = true;
+                } => consider(at, &product, due_at),
+                LatestStart::Unknown {
+                    reasons: theirs,
+                    missing_estimate,
+                } => {
+                    reasons.extend(theirs);
                     missing.extend(missing_estimate);
                 }
             }
         }
-
         in_progress.remove(name);
-        let result = if !feeds {
-            None
-        } else {
-            let p90_ms = node.and_then(|node| node.p90_ms);
-            if p90_ms.is_none() {
-                missing.insert(name.to_string());
-            }
-            match (unknown, p90_ms, earliest) {
-                (false, Some(p90_ms), Some((at, product, due_at))) => {
-                    let p90 =
-                        chrono::Duration::milliseconds(i64::try_from(p90_ms).unwrap_or(i64::MAX));
-                    match at.checked_sub_signed(p90) {
-                        Some(at) => Some(LatestStart::Known {
-                            at,
-                            product,
-                            due_at,
-                        }),
-                        None => Some(LatestStart::Unknown {
-                            missing_estimate: Vec::new(),
-                        }),
-                    }
+
+        let p90_ms = node.and_then(|node| node.p90_ms);
+        if p90_ms.is_none() {
+            reasons.insert(UnknownReason::MissingEstimate);
+            missing.insert(name.to_string());
+        }
+        let result = match (p90_ms, earliest) {
+            (Some(p90_ms), Some((at, product, due_at))) if reasons.is_empty() => {
+                let p90 = chrono::Duration::milliseconds(i64::try_from(p90_ms).unwrap_or(i64::MAX));
+                match at.checked_sub_signed(p90) {
+                    Some(at) => LatestStart::Known {
+                        at,
+                        product,
+                        due_at,
+                    },
+                    None => unknown(UnknownReason::Overflow),
                 }
-                _ => Some(LatestStart::Unknown {
+            }
+            _ => {
+                // A node in `feeding` with no reason and no start-by cannot
+                // occur: it serves a deadline, has `serves_unknown`, or has a
+                // consumer that answered. Should it ever, it is unknown, not
+                // a time.
+                if reasons.is_empty() {
+                    reasons.insert(UnknownReason::NoNextDeadline);
+                }
+                LatestStart::Unknown {
+                    reasons: reasons.into_iter().collect(),
                     missing_estimate: missing.into_iter().collect(),
-                }),
+                }
             }
         };
         memo.insert(name, result.clone());
         result
     }
 
-    let mut memo: BTreeMap<&str, Option<LatestStart>> = BTreeMap::new();
+    let mut memo: BTreeMap<&str, LatestStart> = BTreeMap::new();
     let mut in_progress: BTreeSet<&str> = BTreeSet::new();
     let mut out = BTreeMap::new();
     for name in nodes.keys() {
-        if let Some(result) = walk(name, nodes, &consumers, &mut memo, &mut in_progress) {
+        if feeding.contains(name.as_str()) {
+            let result = walk(name, nodes, &consumers, &mut memo, &mut in_progress);
             out.insert(name.clone(), result);
         }
     }
@@ -1216,6 +1281,7 @@ mod tests {
                 product: product.to_string(),
                 due_at: Some(due),
             }),
+            serves_unknown: false,
         }
     }
 
@@ -1317,6 +1383,7 @@ mod tests {
         ]);
         let starts = latest_starts(&nodes);
         let unknown_costs = LatestStart::Unknown {
+            reasons: vec![UnknownReason::MissingEstimate],
             missing_estimate: vec!["costs".to_string()],
         };
         assert_eq!(starts.get("raw"), Some(&unknown_costs));
@@ -1341,13 +1408,14 @@ mod tests {
         assert_eq!(
             latest_starts(&nodes).get("raw"),
             Some(&LatestStart::Unknown {
+                reasons: vec![UnknownReason::MissingEstimate],
                 missing_estimate: vec!["raw".to_string()],
             })
         );
     }
 
-    /// A cycle cannot be walked to a deadline; it reads as unknown, not as
-    /// a number.
+    /// A cycle on the way to a deadline cannot be walked: it reads as
+    /// unknown with the reason `Cycle`, not as a number.
     #[test]
     fn a_cycle_reads_as_unknown() {
         let nodes = graph(vec![
@@ -1358,9 +1426,86 @@ mod tests {
             ("b", node(&["a"], Some(10), None)),
         ]);
         let starts = latest_starts(&nodes);
-        assert!(
-            matches!(starts.get("b"), Some(LatestStart::Unknown { .. })),
-            "{starts:?}"
+        for name in ["a", "b"] {
+            let Some(LatestStart::Unknown {
+                reasons,
+                missing_estimate,
+            }) = starts.get(name)
+            else {
+                panic!("{name}: {starts:?}");
+            };
+            assert_eq!(reasons, &vec![UnknownReason::Cycle], "{name}");
+            assert!(missing_estimate.is_empty(), "{name}");
+        }
+    }
+
+    /// A cycle with no deadline anywhere downstream feeds nothing: no entry,
+    /// not an unknown one.
+    #[test]
+    fn a_cycle_with_no_deadline_gives_no_entry() {
+        let nodes = graph(vec![
+            ("a", node(&["b"], Some(10), None)),
+            ("b", node(&["a"], Some(10), None)),
+            ("p", node(&[], Some(10), Some(("p", utc(2026, 5, 6, 6, 0))))),
+        ]);
+        let starts = latest_starts(&nodes);
+        assert!(!starts.contains_key("a"), "{starts:?}");
+        assert!(!starts.contains_key("b"), "{starts:?}");
+        assert!(matches!(starts.get("p"), Some(LatestStart::Known { .. })));
+    }
+
+    /// A p90 that pushes the start-by time out of the date range is
+    /// `Overflow`, never a wrapped time.
+    #[test]
+    fn a_subtraction_out_of_range_reads_as_overflow() {
+        let nodes = graph(vec![(
+            "p",
+            node(&[], Some(10), Some(("p", DateTime::<Utc>::MIN_UTC))),
+        )]);
+        assert_eq!(
+            latest_starts(&nodes).get("p"),
+            Some(&LatestStart::Unknown {
+                reasons: vec![UnknownReason::Overflow],
+                missing_estimate: Vec::new(),
+            })
+        );
+    }
+
+    /// A deadline with no next occurrence is `NoNextDeadline`; a node whose
+    /// models could not be read is `ModelsUnreadable`. Both carry upstream,
+    /// beside a missing p90, each reason listed once, sorted.
+    #[test]
+    fn every_unknown_reason_on_the_way_is_listed() {
+        let mut no_next = node(&["raw"], Some(10), None);
+        no_next.deadline = Some(DirectDeadline {
+            product: "p".to_string(),
+            due_at: None,
+        });
+        let mut unreadable = node(&["raw"], None, None);
+        unreadable.serves_unknown = true;
+        let nodes = graph(vec![
+            ("raw", node(&[], Some(20), None)),
+            ("no_next", no_next),
+            ("unreadable", unreadable),
+        ]);
+        let starts = latest_starts(&nodes);
+        assert_eq!(
+            starts.get("raw"),
+            Some(&LatestStart::Unknown {
+                reasons: vec![
+                    UnknownReason::MissingEstimate,
+                    UnknownReason::NoNextDeadline,
+                    UnknownReason::ModelsUnreadable,
+                ],
+                missing_estimate: vec!["unreadable".to_string()],
+            })
+        );
+        assert_eq!(
+            starts.get("no_next"),
+            Some(&LatestStart::Unknown {
+                reasons: vec![UnknownReason::NoNextDeadline],
+                missing_estimate: Vec::new(),
+            })
         );
     }
 }
