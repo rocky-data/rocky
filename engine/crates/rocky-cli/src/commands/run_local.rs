@@ -2355,6 +2355,7 @@ auto_create_schemas = true
     async fn stored_failed_model(
         pipeline: Option<&str>,
         model_filter: Option<&str>,
+        select: bool,
     ) -> rocky_core::state::ModelExecution {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2365,7 +2366,49 @@ auto_create_schemas = true
         write_model(&models_dir, "bad", SLOW_FAILING_SQL, &[]);
         write_config(dir, &db, "");
 
-        let _ = try_run(&dir.join("rocky.toml"), &state_path, pipeline, model_filter).await;
+        let config_path = dir.join("rocky.toml");
+        let _ = if select {
+            // `--select` (a multi-model selection) takes the model-only arm
+            // with no single target model, so the error entry is keyed
+            // `<selection>`: only the attribution can name the model.
+            let defer = DeferOptions {
+                selected_models: Some(std::collections::BTreeSet::from(["bad".to_string()])),
+                ..DeferOptions::default()
+            };
+            super::super::run::run(
+                &config_path,
+                std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                None,
+                &state_path,
+                None,
+                false,
+                Some(models_dir.as_path()),
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &defer,
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+                &rocky_core::config::PrincipalRef::unnamed(),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            try_run(&config_path, &state_path, pipeline, model_filter).await
+        };
 
         let store = StateStore::open_read_only(&state_path).expect("state store");
         let runs = store.list_runs(1).expect("list runs");
@@ -2384,15 +2427,16 @@ auto_create_schemas = true
     /// name, not the placeholder, so its measurement lands on that model.
     #[tokio::test]
     async fn transformation_pipeline_failure_is_recorded_under_the_models_name() {
-        let m = stored_failed_model(Some("t"), None).await;
+        let m = stored_failed_model(Some("t"), None, false).await;
         assert_eq!(m.status, "failed");
         assert_eq!(m.model_name, "bad");
     }
 
-    /// #2470: the same through the model-only entry point (`--model`).
+    /// #2470: the same through the model-only entry point with a selection
+    /// (`--select`), whose error entry is keyed `<selection>`.
     #[tokio::test]
-    async fn model_only_failure_is_recorded_under_the_models_name() {
-        let m = stored_failed_model(None, Some("bad")).await;
+    async fn selection_failure_is_recorded_under_the_models_name() {
+        let m = stored_failed_model(None, None, true).await;
         assert_eq!(m.status, "failed");
         assert_eq!(m.model_name, "bad");
     }
