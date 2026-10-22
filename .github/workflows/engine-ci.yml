@@ -218,7 +218,7 @@ jobs:
       - name: Run live Valkey idempotency tests
         env:
           ROCKY_TEST_VALKEY_URL: redis://localhost:6379
-        run: cargo nextest run -p rocky-core --all-features --no-fail-fast -E 'test(/idempotency::tests::live_/)'
+        run: cargo nextest run -p rocky-core --all-features --no-fail-fast --no-tests=fail -E 'test(/idempotency::tests::live_/)'
 
   clippy:
     name: Clippy

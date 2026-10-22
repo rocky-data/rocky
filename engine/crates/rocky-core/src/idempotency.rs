@@ -684,13 +684,25 @@ fn valkey_adopt_cas(
 }
 
 /// Classify the raw value found at a Valkey claim key. A value that does not
-/// parse as an entry is treated as stale, as on `s3` and `gcs`; the caller
+/// parse as an entry, and names no owner either, is treated as stale, as on `s3` and `gcs`; the caller
 /// takes it with the raw-bytes compare-and-set, so a bad value cannot block
 /// every run until its TTL.
 fn classify_valkey_raw(raw: &[u8], key: &str, new_entry: &IdempotencyEntry) -> IdempotencyCheck {
     match serde_json::from_slice::<IdempotencyEntry>(raw) {
         Ok(prior) => classify_live(prior, new_entry),
         Err(_) => {
+            // An entry from a newer Rocky (an unknown state or policy) fails
+            // the strict parse but still names its owner. Treat it as live:
+            // the server TTL frees it. Taking it would steal a live claim.
+            #[derive(Deserialize)]
+            struct OwnerOnly {
+                run_id: String,
+            }
+            if let Ok(owner) = serde_json::from_slice::<OwnerOnly>(raw) {
+                return IdempotencyCheck::SkipInFlight {
+                    run_id: owner.run_id,
+                };
+            }
             warn!(
                 key = %key,
                 "idempotency entry is not deserializable; treating it as stale"
@@ -1888,6 +1900,22 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_rockys_entry_is_live_not_junk() {
+        let now = Utc::now();
+        let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
+        let future = br#"{"key":"k","run_id":"run-x","state":"Paused","dedup_on":"Never"}"#;
+        match classify_valkey_raw(future, "k", &new) {
+            IdempotencyCheck::SkipInFlight { run_id } => assert_eq!(run_id, "run-x"),
+            other => panic!("expected SkipInFlight, got {other:?}"),
+        }
+        // A run_id that is not a string is junk.
+        assert!(matches!(
+            classify_valkey_raw(br#"{"run_id":5}"#, "k", &new),
+            IdempotencyCheck::AdoptStale { .. }
+        ));
+    }
+
+    #[test]
     fn a_key_that_still_exists_is_live_whatever_the_clock_says() {
         let now = Utc::now();
         let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
@@ -2064,6 +2092,28 @@ mod tests {
             serde_json::from_slice(&get_raw(&mut conn, &full).unwrap()).unwrap();
         assert_eq!(held.run_id, "run-new");
         assert_eq!(held.state, IdempotencyState::Succeeded);
+        del_raw(&mut conn, &full);
+    }
+
+    /// An entry with an unknown state names its owner, so it is left alone.
+    #[tokio::test]
+    async fn live_valkey_an_entry_from_a_newer_rocky_is_left_alone() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("newer");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        let theirs = br#"{"key":"k","run_id":"run-x","state":"Paused"}"#;
+        put_raw(&mut conn, &full, theirs);
+
+        let verdict = live_backend(&url, &prefix)
+            .check_and_claim(None, "k", "run-new", &live_cfg(DedupPolicy::Success))
+            .await
+            .unwrap();
+        assert!(
+            matches!(verdict, IdempotencyCheck::SkipInFlight { ref run_id } if run_id == "run-x"),
+            "{verdict:?}"
+        );
+        assert_eq!(get_raw(&mut conn, &full), Some(theirs.to_vec()));
         del_raw(&mut conn, &full);
     }
 
