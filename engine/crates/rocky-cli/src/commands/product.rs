@@ -177,17 +177,30 @@ pub(crate) fn product_volumes_in(root: &Path) -> Vec<ProductVolume> {
 /// Every `products/*.toml` under `root` that parses, in file-name order.
 /// `what` names the declaration a skipped spec loses, for the warning.
 fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
+    let (specs, problems) = scan_specs_in(root);
+    for problem in problems {
+        tracing::warn!("{problem}; its {what} is not recorded");
+    }
+    specs
+}
+
+/// Every `products/*.toml` under `root` that parses, in file-name order, and
+/// one sentence for each thing that stopped a spec from loading.
+fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<String>) {
     let dir = root.join("products");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
         Err(err) => {
-            tracing::warn!(
-                error = %err,
-                dir = %dir.display(),
-                "cannot read the products directory; no product {what} is recorded"
+            return (
+                Vec::new(),
+                vec![format!(
+                    "cannot read the products directory {}: {err}",
+                    dir.display()
+                )],
             );
-            return Vec::new();
         }
     };
     let mut stems: Vec<String> = entries
@@ -202,16 +215,35 @@ fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
         .collect();
     stems.sort();
     let mut specs = Vec::new();
+    let mut problems = Vec::new();
     for stem in stems {
         match load_spec(root, &stem) {
             Ok(parsed) => specs.push(parsed),
-            Err(reject) => tracing::warn!(
-                product = %stem,
-                "product spec does not load ({reject}); its {what} is not recorded"
-            ),
+            Err(reject) => problems.push(format!("product spec {stem} does not load ({reject})")),
         }
     }
-    specs
+    (specs, problems)
+}
+
+/// The product that owns each output model, and a sentence for every spec
+/// that could not be read (its model then has no owner).
+///
+/// Used by the monthly cost report, which must say so when a product's
+/// ownership is unknown rather than quietly leave its cost unowned.
+pub(crate) fn product_owners_in(
+    root: &Path,
+) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
+    let (specs, problems) = scan_specs_in(root);
+    let owners = specs
+        .iter()
+        .map(|parsed| {
+            (
+                parsed.output_model().to_string(),
+                parsed.product().name.clone(),
+            )
+        })
+        .collect();
+    (owners, problems)
 }
 
 // ---------------------------------------------------------------------------

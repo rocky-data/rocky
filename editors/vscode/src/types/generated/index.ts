@@ -420,6 +420,16 @@ export type { BackfillOutput } from "./backfill";
 export type { CompactApplyOutput, StatementResult } from "./compact_apply";
 export type { CompactDedupOutput } from "./compact_dedup";
 export type { CostOutput } from "./cost";
+export type {
+  AllocatedUpstreamCost,
+  CostAmount,
+  CostNotMeasured,
+  CostSplitBasis,
+  CostUnit,
+  ProductMonthCost,
+  ProductMonthCostOutput,
+  SharedNotChargedCost,
+} from "./cost_by_product";
 export type { DagEdgeOutput, DagNodeOutput, DagOutput, DagSummaryOutput, PartitionShapeOutput } from "./dag";
 export type { DagRunNodeOutput, DagRunOutput } from "./dag_run";
 export type { CollisionCandidateOutput, FailedSourceOutput, ResolvedCheckNameOutput } from "./discover";

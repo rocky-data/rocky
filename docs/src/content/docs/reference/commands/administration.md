@@ -937,20 +937,22 @@ The total includes only models with a dollar value. It is not a complete bill.
 
 ```bash
 rocky cost <target> [flags]
+rocky cost --month <YYYY-MM> --by product
 ```
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `target` | `string` | **(required)** | A specific `run_id`, or the literal `latest` for the most recent run. |
+| `target` | `string` | **(required** without `--month`**)** | A specific `run_id`, or the literal `latest` for the most recent run. Do not pass it with `--month`. |
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter to a single model within the run. |
-| `--by <DIMENSION>` | `tenant` \| `model` | | Roll the per-model cost up by a dimension and add a `groups` array to the output. `tenant` reads the discover-time schema-pattern `{tenant}` component. `per_model` is present either way. Any other value errors. |
+| `--by <DIMENSION>` | `tenant` \| `model` | | Roll the per-model cost up by a dimension and add a `groups` array to the output. `tenant` reads the discover-time schema-pattern `{tenant}` component. `per_model` is present either way. Any other value errors. With `--month`, the only value is `product`. |
+| `--month <YYYY-MM>` | `string` | | Report one calendar month instead of one run, split across data products. Needs `--by product`. See [One month, split by product](#one-month-split-by-product). |
 
 `--output` is a [global flag](/reference/cli/). Its default depends on stdout: `table` on an interactive terminal, `json` otherwise. Pass `--output json` or `--output table` to force one.
 
@@ -1018,6 +1020,57 @@ status: success   adapter: databricks   total: $0.101
   fct_revenue      10m  0s      8,900           60 MB  $0.067
 ```
 
+### One month, split by product
+
+`rocky cost --month 2026-10 --by product` answers one question: which data product paid for how much of last month. It reads run history only. It reports physical units, not money: model time in milliseconds, and stored data in byte-hours. Money needs a price you set, and this command does not read one.
+
+```bash
+rocky cost --month 2026-10 --by product
+```
+
+The month follows the project's `[schedule].timezone` (default `UTC`). An execution belongs to the month in which it started, even when its run started earlier. The current month is month-to-date. Storage counts up to now.
+
+**What counts.** Production runs only. Shadow and branch runs are real compute, so Rocky reports them in `shadow_branch`, outside the total. A model that failed records no time. Rocky counts those executions in `not_measured.failed_executions` and never reads them as free.
+
+**How a cost is split.** Each time a model builds a table, that build is one version of the table. The version's model time, and the storage it occupies until the next build, are split across the later executions that read it. The split follows what each reader scanned.
+
+```
+ raw table (no product) --> fct_orders (product A) --> fct_ltv (product B)
+        \--------------> fct_refunds (product C)
+
+ raw table:  split between A and C by what each read.
+ fct_orders: its build time is charged to B, because B reads it.
+```
+
+- A table that no product owns passes its cost, and what it received, to its readers. If no reader was measured, the cost goes to `unallocated`.
+- A table that a product owns keeps what it received. The charge stops at that product. Only the product's own build is split further.
+- The readers of an owned table pay for its build time. A reader that no product owns cannot pay. Its share comes back to the owner as `owner_residual` and is listed in `shared_not_charged`.
+- The owner pays for the storage of its own tables, whoever reads them.
+
+**The basis of a split.** Rocky uses the best measure that every reader has: `estimated_bytes`, then `rows_scanned_unweighted`, then `owner_pays`. Under `owner_pays` nothing usable was measured. A model that depends on the table, ran while the version was current, and recorded no reads, forces `owner_pays` for that version. Runs that record no reads are `--select` runs, backfills, shadow and branch runs, and every adapter except DuckDB. A split marked `low_confidence` rests on a very small scan. A split marked `provisional` can still change: the table has not been rebuilt since, in a month that is not over, so a later reader takes part of the share.
+
+**The check.** For every unit, the sum of each product's `charged` plus `unallocated` equals `measured_total`, exactly. Rocky rounds each split to whole units, with the largest remainder first, so the parts add up. If the sum is ever off, the command fails instead of printing it.
+
+Per product, the JSON carries:
+
+| Field | Meaning |
+|---|---|
+| `built` | The cost of the product's own executions. A memo for reading `kept` beside it. It is never summed. |
+| `kept` | The part of `built` the product still pays. |
+| `allocated_upstream` | What the product pays for tables it reads: table, unit, basis, amount, `of_total`, `low_confidence`, `provisional`. |
+| `charged` | `kept` plus `allocated_upstream`. This is the figure that adds up. |
+
+A product that builds a table for others can show a `kept` of `0` while `built` is large. Read `built` beside `charged`.
+
+**Limits.**
+
+- `history_complete: false` means state retention may have swept runs the month needs. The few rows that remain look like a quiet month. Every figure is then partial. Raise `[state.retention] max_age_days` to cover the month.
+- The command scans runs that started up to one day before the month. A run that started earlier, with executions inside the month, is missed.
+- Egress and AI tokens are not measured, so they do not appear.
+- A reader that ran on an adapter that records no reads (anything but DuckDB) is invisible. The cost of its tables goes to the owner, or to `unallocated`.
+- Storage is the size measured right after each build. A table that Rocky did not build this month still counts, from its last build before the month. Before the first build of a table, with enough history, its storage is zero.
+- Byte-hours are rounded down for each interval. Storage on the `allocated_blocks` basis (a DuckDB estimate) and on the `data_files` basis are separate units. Rocky does not add them.
+
 ### Adapter coverage
 
 - **Databricks / Snowflake**: derived from recorded duration, the configured warehouse size, and `[cost].compute_cost_per_dbu`. The adapter does not report a billed amount. An omitted `[cost]` block uses Rocky's defaults.
@@ -1044,7 +1097,7 @@ The field is omitted when the size is unknown: a view, a replicated table, a `ti
 
 ### Upstream reads
 
-Each `per_model` entry can carry `upstream_reads`: what the model's build read from each upstream table. `rocky run` records it in the same form on each materialization. It is a measurement. It is not a cost, and Rocky does not split an upstream's cost across its consumers.
+Each `per_model` entry can carry `upstream_reads`: what the model's build read from each upstream table. `rocky run` records it in the same form on each materialization. It is a measurement, not a cost. The [monthly view](#one-month-split-by-product) uses it to split an upstream table's cost across the models that read it.
 
 ```json
 "upstream_reads": {

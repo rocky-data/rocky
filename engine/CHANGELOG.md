@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each materialization gains an optional `volume` (`VolumeCheckOutput`). Each `ModelExecution` gains an optional `row_count`, separate from `rows_affected` (rows written). The state schema stays at v33.
   - `rocky product status` gains an optional `volume`: the range, the newest production count, and its verdict against the range.
 
+- `rocky cost --month YYYY-MM --by product` reports one month of production cost per data product, in physical units: model time in milliseconds and stored byte-hours. It reads run history only and prices nothing. The month is cut in `[schedule].timezone`, and an execution belongs to the month in which it started.
+  - Each build of a table is split across the later executions that read it, by estimated bytes, then rows scanned, then the owner. A table no product owns passes its cost on to its readers, or to `unallocated`. A product keeps what it received. Readers pay for a product's build time, and the owner pays for its own storage. Rounding is by largest remainder, so for every unit the sum of each product's `charged` plus `unallocated` equals `measured_total`. The command fails if it does not.
+  - Per product: `built` (a memo, never summed), `kept`, `owner_residual`, `allocated_upstream` (table, unit, basis, amount, `of_total`, `low_confidence`, `provisional`), `shared_not_charged` and `charged`. Shadow and branch compute are in `shadow_branch`, outside the total. Failed executions with no recorded time are counted in `not_measured`, never read as free. `history_complete` is `false` when `[state.retention]` may have swept runs the month needs. A product spec that does not load adds a `warnings` line.
+  - JSON: `cost_by_product` (`ProductMonthCostOutput`). `rocky cost` takes no run id with `--month`, and `--by product` needs `--month`. The SDK gains `RockyClient.cost_by_product`, and the Dagster resource a delegate. No state schema bump, and no money.
+  - New in `rocky-core`: `cost_split`, `StateStore::list_runs_matching_since` (a scan that stops at the first run older than a cutoff) and `StateStore::last_measured_builds_before`.
+
 ### Fixed
 
 - DuckDB `MERGE` inserts map source columns by name, preventing data corruption when the source column order differs from the target (#2460). For unmatched rows, omitted target columns receive their declared defaults, or `NULL` when no default exists, subject to target constraints.

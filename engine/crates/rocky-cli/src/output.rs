@@ -12397,6 +12397,173 @@ pub struct CostGroup {
     pub total_bytes_written: Option<u64>,
 }
 
+/// A unit a monthly cost figure is counted in. Units are never added to each
+/// other, and the two storage bases are never added together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CostUnit {
+    // Milliseconds of model wall-clock time.
+    ComputeMs,
+    // Byte-hours of stored data, measured as the summed size of data files.
+    StorageByteHoursDataFiles,
+    // Byte-hours of stored data, measured as allocated storage blocks (an
+    // estimate).
+    StorageByteHoursAllocatedBlocks,
+}
+
+impl From<rocky_core::cost_split::Unit> for CostUnit {
+    fn from(unit: rocky_core::cost_split::Unit) -> Self {
+        use rocky_core::cost_split::Unit;
+        match unit {
+            Unit::ComputeMs => Self::ComputeMs,
+            Unit::StorageDataFiles => Self::StorageByteHoursDataFiles,
+            Unit::StorageAllocatedBlocks => Self::StorageByteHoursAllocatedBlocks,
+        }
+    }
+}
+
+/// How a table version's cost was split across the models that read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSplitBasis {
+    // Exact bytes read. Reserved: nothing records it yet.
+    Bytes,
+    // Estimated bytes read: rows scanned times the width of the projected
+    // columns.
+    EstimatedBytes,
+    // Rows scanned, with no weight for how wide a row is.
+    RowsScannedUnweighted,
+    // Nothing usable was measured. The owner keeps the cost; an unowned
+    // table's cost goes to `unallocated`.
+    OwnerPays,
+}
+
+impl From<rocky_core::cost_split::SplitBasis> for CostSplitBasis {
+    fn from(basis: rocky_core::cost_split::SplitBasis) -> Self {
+        use rocky_core::cost_split::SplitBasis;
+        match basis {
+            SplitBasis::Bytes => Self::Bytes,
+            SplitBasis::EstimatedBytes => Self::EstimatedBytes,
+            SplitBasis::RowsScannedUnweighted => Self::RowsScannedUnweighted,
+            SplitBasis::OwnerPays => Self::OwnerPays,
+        }
+    }
+}
+
+/// A whole-number amount in one [`CostUnit`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CostAmount {
+    pub unit: CostUnit,
+    /// Whole units. Milliseconds, or byte-hours rounded down per interval.
+    pub amount: u64,
+}
+
+/// What a product paid for one table it reads, in one unit.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AllocatedUpstreamCost {
+    /// The model whose table was read.
+    pub table: String,
+    pub unit: CostUnit,
+    pub basis: CostSplitBasis,
+    /// What this product was charged.
+    pub amount: u64,
+    /// The whole cost that was split, so `amount / of_total` is the share.
+    pub of_total: u64,
+    /// The scan was so small that the proportions say little.
+    pub low_confidence: bool,
+    /// The table has not been rebuilt since, in a month that is not over:
+    /// a later reader can still change this share.
+    pub provisional: bool,
+}
+
+/// A share of an owned table's cost that a reader did not pay.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SharedNotChargedCost {
+    /// The owned model whose table was read.
+    pub table: String,
+    /// The model that read it.
+    pub reader: String,
+    pub unit: CostUnit,
+    pub basis: CostSplitBasis,
+    /// The reader's share. It stays with the table's owner.
+    pub amount: u64,
+}
+
+/// One product's month inside [`ProductMonthCostOutput`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProductMonthCost {
+    pub product: String,
+    /// The model the product owns.
+    pub output_model: String,
+    /// What the product's own executions cost, before any split. A memo for
+    /// reading `kept` beside it: it is never summed and is not part of the
+    /// invariant.
+    pub built: Vec<CostAmount>,
+    /// The part of `built` the product still pays after other products pay
+    /// for what they read.
+    pub kept: Vec<CostAmount>,
+    /// The part of `kept` that came back from readers outside every product.
+    pub owner_residual: Vec<CostAmount>,
+    /// What the product pays for tables it reads.
+    pub allocated_upstream: Vec<AllocatedUpstreamCost>,
+    /// Shares of the product's tables that readers did not pay.
+    pub shared_not_charged: Vec<SharedNotChargedCost>,
+    /// What the product is charged: `kept` plus `allocated_upstream`.
+    pub charged: Vec<CostAmount>,
+}
+
+/// Executions the monthly report could not measure. Counts, never amounts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CostNotMeasured {
+    /// Production executions that failed and recorded no time.
+    pub failed_executions: u64,
+    /// Tables whose storage before their first measurement this month is
+    /// unknown, because run history does not reach back far enough.
+    pub storage_unknown_tables: u64,
+}
+
+/// `rocky cost --month YYYY-MM --by product`: one month of production cost,
+/// split across data products, in physical units. No money.
+///
+/// For every unit, `sum(charged) + unallocated` equals `measured_total`,
+/// exactly. Shadow and branch spend (`shadow_branch`) and `not_measured`
+/// sit outside that equation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProductMonthCostOutput {
+    pub version: String,
+    /// `"cost_by_product"`.
+    pub command: String,
+    /// The month, `YYYY-MM`, in `timezone`.
+    pub month: String,
+    /// The IANA time zone the month is cut in: the project's
+    /// `[schedule].timezone`.
+    pub timezone: String,
+    /// First instant of the month, UTC (RFC 3339).
+    pub month_start: String,
+    /// First instant of the next month, UTC (RFC 3339).
+    pub month_end: String,
+    /// The instant the report was computed. Storage accrues to the earlier
+    /// of this and `month_end`.
+    pub as_of: String,
+    /// Whether run history reaches back far enough to cover the month. When
+    /// false, state retention may have swept runs the month needs, and
+    /// every figure is partial.
+    pub history_complete: bool,
+    /// One entry per product that owns a model, sorted by name.
+    pub products: Vec<ProductMonthCost>,
+    /// Cost of tables no product owns that no measured reader took.
+    pub unallocated: Vec<CostAmount>,
+    /// Shadow and branch compute. Real spend, but not production.
+    pub shadow_branch: Vec<CostAmount>,
+    /// Everything measured in production this month.
+    pub measured_total: Vec<CostAmount>,
+    pub not_measured: CostNotMeasured,
+    /// Things that make the report less complete than it looks: a product
+    /// spec that did not load, a model graph that could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// A single model's cost attribution inside [`CostOutput`].
 ///
 /// Distinct from [`ModelCostEntry`] (which lives on

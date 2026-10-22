@@ -70,6 +70,7 @@ from .types import (
     ProductCompileOutput,
     ProductJournalOutput,
     ProductListOutput,
+    ProductMonthCostOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     PromotePlan,
@@ -1449,6 +1450,16 @@ class RockyResource(dg.ConfigurableResource):
         """Run ``rocky cost <run_id>`` and return historical cost attribution."""
         with _translating():
             return self._get_client().cost(run_id)
+
+    def cost_by_product(self, month: str) -> ProductMonthCostOutput:
+        """Run ``rocky cost --month <month> --by product`` (``YYYY-MM``).
+
+        One month of production cost split across data products, in physical
+        units (model time in ms, stored byte-hours). Check ``history_complete``
+        before trusting a total.
+        """
+        with _translating():
+            return self._get_client().cost_by_product(month)
 
     # ------------------------------------------------------------------ #
     # AI Level 3 commands                                                #

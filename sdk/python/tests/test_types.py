@@ -544,3 +544,54 @@ def test_parse_rocky_output_dispatches_schedule_spool():
     # reason the engine parses it rather than carrying the stored text.
     assert result.pending[0].received_at.year == 2026
     assert result.skipped[0].reason == "malformed"
+
+
+def _month_cost_payload() -> dict:
+    return {
+        "version": "1.89.0",
+        "command": "cost_by_product",
+        "month": "2026-10",
+        "timezone": "UTC",
+        "month_start": "2026-10-01T00:00:00+00:00",
+        "month_end": "2026-11-01T00:00:00+00:00",
+        "as_of": "2026-11-02T00:00:00+00:00",
+        "history_complete": True,
+        "products": [
+            {
+                "product": "orders",
+                "output_model": "orders",
+                "built": [{"unit": "compute_ms", "amount": 400}],
+                "kept": [{"unit": "compute_ms", "amount": 400}],
+                "owner_residual": [],
+                "allocated_upstream": [
+                    {
+                        "table": "raw",
+                        "unit": "compute_ms",
+                        "basis": "estimated_bytes",
+                        "amount": 1000,
+                        "of_total": 1000,
+                        "low_confidence": False,
+                        "provisional": True,
+                    }
+                ],
+                "shared_not_charged": [],
+                "charged": [{"unit": "compute_ms", "amount": 1400}],
+            }
+        ],
+        "unallocated": [],
+        "shadow_branch": [],
+        "measured_total": [{"unit": "compute_ms", "amount": 1400}],
+        "not_measured": {"failed_executions": 0, "storage_unknown_tables": 0},
+    }
+
+
+def test_parse_rocky_output_dispatches_cost_by_product():
+    from rocky_sdk.types import ProductMonthCostOutput
+
+    result = parse_rocky_output(json.dumps(_month_cost_payload()))
+    assert isinstance(result, ProductMonthCostOutput)
+    assert result.history_complete is True
+    product = result.products[0]
+    assert product.allocated_upstream[0].provisional is True
+    assert product.charged[0].amount == 1400
+    assert result.warnings is None

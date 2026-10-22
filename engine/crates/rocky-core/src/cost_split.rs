@@ -243,6 +243,32 @@ pub fn month_bounds(year: i32, month: u32, tz: Tz) -> Option<MonthWindow> {
     })
 }
 
+/// Why [`month_bounds_in_zone`] gave no window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonthBoundsError {
+    /// The time zone name is not an IANA name.
+    UnknownTimeZone,
+    /// The month is not a calendar month Rocky can represent.
+    NoSuchMonth,
+}
+
+/// [`month_bounds`] with the time zone given by its IANA name.
+///
+/// # Errors
+///
+/// [`MonthBoundsError::UnknownTimeZone`] for a name that is not a time zone,
+/// [`MonthBoundsError::NoSuchMonth`] for a month outside the calendar.
+pub fn month_bounds_in_zone(
+    year: i32,
+    month: u32,
+    timezone: &str,
+) -> Result<MonthWindow, MonthBoundsError> {
+    let tz: Tz = timezone
+        .parse()
+        .map_err(|_| MonthBoundsError::UnknownTimeZone)?;
+    month_bounds(year, month, tz).ok_or(MonthBoundsError::NoSuchMonth)
+}
+
 fn local_midnight(date: NaiveDate, tz: Tz) -> Option<DateTime<Utc>> {
     let midnight = date.and_hms_opt(0, 0, 0)?;
     // A skipped midnight: walk forward in 30-minute steps to the first local

@@ -2189,6 +2189,39 @@ def test_cost_passes_explicit_run_id():
     assert result.run_id == "run-xyz789"
 
 
+def test_cost_by_product_forwards_the_month_and_parses_the_split():
+    """The month goes to the CLI as ``cost --month <m> --by product``."""
+    rocky = RockyResource()
+    captured: list[list[str]] = []
+
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
+        captured.append(args)
+        return json.dumps(
+            {
+                "version": "1.89.0",
+                "command": "cost_by_product",
+                "month": "2026-10",
+                "timezone": "UTC",
+                "month_start": "2026-10-01T00:00:00+00:00",
+                "month_end": "2026-11-01T00:00:00+00:00",
+                "as_of": "2026-11-02T00:00:00+00:00",
+                "history_complete": True,
+                "products": [],
+                "unallocated": [{"unit": "compute_ms", "amount": 5}],
+                "shadow_branch": [],
+                "measured_total": [{"unit": "compute_ms", "amount": 5}],
+                "not_measured": {"failed_executions": 0, "storage_unknown_tables": 0},
+            }
+        )
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        result = rocky.cost_by_product("2026-10")
+
+    assert captured[0] == ["cost", "--month", "2026-10", "--by", "product"]
+    assert result.history_complete is True
+    assert result.unallocated[0].amount == 5
+
+
 # ---------------------------------------------------------------------------
 # _http_get
 # ---------------------------------------------------------------------------
