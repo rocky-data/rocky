@@ -33,7 +33,7 @@ use rocky_core::state::{LoadedFileRecord, StateStore};
 use rocky_core::state_sync::LedgerSeamSession;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 
-use crate::connector::runner::{ChildSpec, DEFAULT_OUTPUT_POLL, run_with_retries};
+use crate::connector::runner::{ChildSpec, DEFAULT_OUTPUT_POLL, run_with_retries, was_interrupted};
 use crate::connector::verify::VerifiedBatch;
 use crate::output::{
     ConnectorLoadInfo, ConnectorLoadStatus, LoadFileOutput, LoadOutput, print_json,
@@ -471,6 +471,13 @@ async fn drive(
             return Err(failed.into());
         }
     };
+    // A signal that came after the child exited was swallowed by the signal
+    // listener. Stop here, before the batch reaches the warehouse.
+    if was_interrupted() {
+        progress.info.attempts = ran.attempts;
+        finalize_claim(&claim, params, &run_id, FinalOutcome::Failed).await;
+        bail!("interrupted by a signal before the batch was loaded; nothing was written");
+    }
     let batch = ran.batch;
     progress.info.attempts = ran.attempts;
     progress.info.files = batch.files.len();

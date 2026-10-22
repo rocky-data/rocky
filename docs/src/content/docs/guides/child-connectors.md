@@ -191,7 +191,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 - Staging tables from a crashed run stay in the warehouse. The name is `<table>__rocky_stg_<run id>`. Rocky does not clean up old staging tables yet. Drop them by hand.
 - Only `file://` output is supported.
-- A Ctrl-C or `SIGTERM` stops the program group and fails the run. The claim is freed when the run fails before the promote.
+- A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky loads the batch does not stop the load. Rocky finishes the promote and the state commit.
 
 ## JSON output
 

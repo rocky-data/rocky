@@ -13,6 +13,8 @@ use std::ffi::OsString;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -129,6 +131,7 @@ struct Request<'a> {
 /// [`RunFailed`] with the last attempt's error. A failed attempt's scratch
 /// directory is removed.
 pub async fn run_with_retries(spec: &ChildSpec<'_>) -> Result<RunSucceeded, RunFailed> {
+    watch_for_interrupt();
     let max_attempts = spec.retries.saturating_add(1);
     let mut attempt = 0;
     loop {
@@ -383,27 +386,53 @@ async fn supervise(
     }
 }
 
-/// Resolves when Rocky is asked to stop (`SIGINT`, or `SIGTERM` on Unix).
+/// Set once Rocky has been asked to stop (`SIGINT`, or `SIGTERM` on Unix).
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static LISTENER: Once = Once::new();
+
+/// Whether Rocky has been asked to stop since the listener started.
+pub fn was_interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Start listening for `SIGINT` and `SIGTERM`, once per process. Needs a
+/// running Tokio runtime.
+///
 /// The child runs in its own process group, so a Ctrl-C at the terminal
-/// reaches Rocky and not the child. Rocky has to stop the child itself.
-async fn interrupted() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            () = async {
-                match term.as_mut() {
-                    Some(term) => { term.recv().await; }
-                    None => std::future::pending::<()>().await,
+/// reaches Rocky and not the child: Rocky has to stop the child itself.
+/// Tokio keeps a signal handler installed for the rest of the process once it
+/// is registered, so a signal after the child has exited would be swallowed.
+/// The flag lets the caller see it and stop before it loads the batch.
+pub fn watch_for_interrupt() {
+    LISTENER.call_once(|| {
+        tokio::spawn(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut term = signal(SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    () = async {
+                        match term.as_mut() {
+                            Some(term) => { term.recv().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
                 }
-            } => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            INTERRUPTED.store(true, Ordering::SeqCst);
+        });
+    });
+}
+
+/// Resolves once [`was_interrupted`] is true.
+async fn interrupted() {
+    while !was_interrupted() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
