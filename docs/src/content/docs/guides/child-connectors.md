@@ -149,7 +149,7 @@ Each key is optional. Both the manifest and `[connector.<name>.limits]` can set 
 
 | Key | Default | Effect |
 |---|---|---|
-| `wall_time_secs` | 3600 | Rocky stops the program group after this many seconds. |
+| `wall_time_secs` | 3600 | Rocky stops the program group after this many seconds. At most 604800 (7 days). |
 | `cpu_time_secs` | none | Sets `RLIMIT_CPU`. The hard limit is 5 seconds above the soft one. |
 | `memory_bytes` | none | Sets `RLIMIT_AS`. Linux enforces it. macOS often refuses it, and the program then runs without it. |
 | `output_bytes` | 5 GiB | Sets `RLIMIT_FSIZE`. Rocky also adds up the file sizes in the scratch directory every 2 seconds and stops the program when the sum passes the cap. |
@@ -179,7 +179,10 @@ Delivery is at least once. It is not exactly once.
      │  loads nothing          │  loads the batch twice
 ```
 
-- If the run fails before the promote, the target table is not changed and the saved state is not changed. Rocky frees the claim. The next run starts the same batch again.
+- If the run fails before the promote, the rows of the target table are not changed and the saved state is not changed. Rocky frees the claim. The next run starts the same batch again. Schema drift `ALTER` statements that already ran, such as a new column, are not rolled back.
+- If the promote statement was sent and failed, the rows may be in the table. Rocky leaves the claim in flight, as for a failed state commit.
+- Rocky does not send the promote after the claim expires. That is a failure before the promote, so the claim is freed.
+- If a claim from a finished run exists but the saved state did not move, the run fails. The state may have been reset or restored.
 - The promote and the state commit are two writes. If Rocky crashes between them, the rows are in the table but the state did not move. The claim stays in flight on purpose. Until it expires, a new run with the same key skips. After it expires, the next run adopts the claim, logs a warning, and loads the batch again. The output field `adopted_prior_claim` is `true` in that case.
 - The state commit is refused if `commit_seq` moved since the claim. This fence is only as strong as the compare-and-swap of the remote state store. With `concurrency_control = "off"`, the run lock is the only guard.
 - The claim lives for `wall_time_secs` times `retries + 1`, plus one hour, rounded up to whole hours. The minimum is 1 hour.
@@ -189,6 +192,8 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 ## Known gaps in this release
 
+- Secret values shorter than 8 bytes are not replaced by `${NAME}` in the log. Use long secrets.
+- Rocky keeps the scratch directory of a successful run and never cleans it up. Remove old ones from `output_uri` by hand.
 - Staging tables from a crashed run stay in the warehouse. The name is `<table>__rocky_stg_<run id>`. Rocky does not clean up old staging tables yet. Drop them by hand.
 - Only `file://` output is supported.
 - A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky loads the batch does not stop the load. Rocky finishes the promote and the state commit.

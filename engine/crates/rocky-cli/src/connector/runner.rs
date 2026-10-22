@@ -361,7 +361,13 @@ async fn supervise(
     limits: &EffectiveLimits,
     poll: Duration,
 ) -> Finish {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(limits.wall_time_secs);
+    // A huge value must not overflow the clock: clamp it to the config limit.
+    let wall = Duration::from_secs(
+        limits
+            .wall_time_secs
+            .min(rocky_core::connector::MAX_WALL_TIME_SECS),
+    );
+    let deadline = tokio::time::Instant::now() + wall;
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + poll, poll);
     let exit = wait_for_exit(child);
     tokio::pin!(exit);

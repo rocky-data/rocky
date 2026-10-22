@@ -146,11 +146,13 @@ fn the_childs_stderr_is_logged_with_secret_values_replaced() {
 
 #[test]
 fn the_child_sees_only_the_variables_rocky_hands_it() {
+    // The probe needs python3. A missing interpreter is a failure, not a
+    // silent pass: this test is the only proof of the environment boundary.
     let probe = Command::new("python3").arg("--version").output();
-    if probe.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("python3 is not available; skipping the environment probe");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|o| o.status.success()),
+        "python3 is required on PATH to run the environment probe"
+    );
     let project = Project::new(
         "secrets = [\"STRIPE_API_KEY\"]",
         &manifest(GOOD_MANIFEST_EGRESS),

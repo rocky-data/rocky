@@ -62,6 +62,9 @@ pub struct ConnectorLoadParams<'a> {
     pub now: Option<DateTime<Utc>>,
     /// Gap between two checks of the bytes the child has written.
     pub output_poll: Duration,
+    /// The time the promote deadline is checked against. `None` is the real
+    /// time. A test moves it past the claim's expiry.
+    pub promote_now: Option<DateTime<Utc>>,
 }
 
 impl<'a> ConnectorLoadParams<'a> {
@@ -79,6 +82,7 @@ impl<'a> ConnectorLoadParams<'a> {
             name,
             now: None,
             output_poll: DEFAULT_OUTPUT_POLL,
+            promote_now: None,
         }
     }
 }
@@ -173,9 +177,11 @@ fn resolve_secrets(names: &[String]) -> Result<Vec<(String, String)>> {
 pub fn claim_ttl_hours(wall_time_secs: u64, retries: u32) -> u32 {
     let attempts = u64::from(retries) + 1;
     let secs = wall_time_secs
+        .min(rocky_core::connector::MAX_WALL_TIME_SECS)
         .saturating_mul(attempts)
         .saturating_add(CLAIM_HEADROOM_SECS);
-    let hours = secs.div_ceil(3600).max(1);
+    // At most a year, so a clock addition cannot overflow.
+    let hours = secs.div_ceil(3600).clamp(1, 24 * 366);
     u32::try_from(hours).unwrap_or(u32::MAX)
 }
 
@@ -209,7 +215,6 @@ pub async fn run_connector_load(
     loaded: &LoadedConfig,
     state_path: &Path,
     name: &str,
-    _durability: rocky_core::state_sync::FinalizeDurability,
     json: bool,
 ) -> Result<()> {
     let outcome = execute_connector_load(&ConnectorLoadParams::new(
@@ -339,6 +344,20 @@ async fn preflight<'a>(params: &ConnectorLoadParams<'a>) -> Result<Preflight<'a>
     // The saved state is read BEFORE the claim: the claim key names the
     // commit sequence this run will extend.
     let saved = read_saved_state(params.loaded, params.state_path, params.name).await?;
+    // Refuse a writer mode the commit would refuse, now. The commit comes
+    // after the promote; a refusal there would leave the batch loaded and the
+    // claim in flight, and every later run would load it again.
+    LedgerSeamSession::new(
+        &params.loaded.config.state,
+        params.state_path,
+        params.loaded.config.cache.schemas.replicate,
+    )
+    .preflight_writer()
+    .await
+    .context(
+        "the state backend refuses this writer before anything runs; fix [state] \
+         concurrency_control, or use the setting the other writers use",
+    )?;
     if let Some(saved) = &saved
         && saved.envelope.schema_version > prepared.manifest.state_schema_version
     {
@@ -413,6 +432,13 @@ async fn drive(
             .await
             .context("failed to claim the idempotency key for this batch")?
     };
+    // After this time another run may adopt the claim, so this run must not
+    // send the promote.
+    let deadline = now
+        .checked_add_signed(chrono::Duration::hours(i64::from(
+            claim_config.in_flight_ttl_hours,
+        )))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
     let claim = Claim {
         backend,
         key,
@@ -420,17 +446,31 @@ async fn drive(
     };
     match &verdict {
         IdempotencyCheck::Proceed => {}
-        IdempotencyCheck::AdoptStale { prior_run_id } => {
-            progress.info.adopted_prior_claim = true;
-            warn!(
-                connector = name,
-                prior_run_id = %prior_run_id,
-                "a prior run may have promoted its batch before crashing; \
-                 this run may load a duplicate batch"
-            );
+        IdempotencyCheck::AdoptStale {
+            prior_run_id,
+            prior_state,
+        } => {
+            // Only a prior entry that was still in flight can mean a run died
+            // holding the claim. A failed run on an object store leaves an
+            // already-expired `Failed` entry, which is adopted without
+            // doubt.
+            if *prior_state == rocky_core::idempotency::IdempotencyState::InFlight {
+                progress.info.adopted_prior_claim = true;
+                warn!(
+                    connector = name,
+                    prior_run_id = %prior_run_id,
+                    "a prior run may have promoted its batch before crashing; \
+                     this run may load a duplicate batch"
+                );
+            } else {
+                info!(
+                    connector = name,
+                    prior_run_id = %prior_run_id,
+                    "taking over the claim of a prior run that ended"
+                );
+            }
         }
-        IdempotencyCheck::SkipCompleted { run_id: prior }
-        | IdempotencyCheck::SkipInFlight { run_id: prior } => {
+        IdempotencyCheck::SkipInFlight { run_id: prior } => {
             info!(
                 connector = name,
                 held_by = %prior,
@@ -439,6 +479,34 @@ async fn drive(
             );
             progress.info.status = ConnectorLoadStatus::Skipped;
             return Ok(());
+        }
+        IdempotencyCheck::SkipCompleted { run_id: prior } => {
+            // A finished claim for the batch after `seq` means the state
+            // should have moved past `seq`. If it did (another run committed
+            // between our read and our claim), this is a skip. If it did not,
+            // the saved state is behind the claim: it was reset or restored.
+            // Loading again would duplicate the batch, and a skip would hide
+            // that the connector is stuck.
+            let now_saved = read_saved_state(loaded, params.state_path, name).await?;
+            let now_seq = now_saved.as_ref().map_or(0, |s| s.commit_seq);
+            if now_seq > seq {
+                info!(
+                    connector = name,
+                    held_by = %prior,
+                    key = %claim.key,
+                    "another run already loaded this batch; skipping"
+                );
+                progress.info.status = ConnectorLoadStatus::Skipped;
+                return Ok(());
+            }
+            bail!(
+                "the saved state is behind claim `{}`: the claim says run {prior} already \
+                 loaded this batch, but the connector's commit sequence is still {now_seq}. \
+                 The state may have been reset or restored. Restore the state that holds the \
+                 later sequence, or wait for the claim to expire (`[state.idempotency] \
+                 retention_days`)",
+                claim.key
+            );
         }
     }
 
@@ -502,17 +570,45 @@ async fn drive(
 
     // --- stage, drift, promote ------------------------------------------
     if !batch.files.is_empty() {
-        let staged = stage_and_promote(loaded, prepared.config, &batch, &run_id).await;
-        if let Err(e) = staged {
+        let staged = stage_and_promote(
+            loaded,
+            prepared.config,
+            &batch,
+            &run_id,
+            &PromoteGate {
+                deadline,
+                now: params.promote_now,
+            },
+        )
+        .await;
+        if let Err(failure) = staged {
             progress.files.iter_mut().for_each(|f| {
-                f.rows_loaded = 0;
-                f.bytes_read = 0;
-                f.error = Some(format!("{e:#}"));
+                f.error = Some(format!("{:#}", failure.error));
             });
-            progress.info.rows = 0;
-            progress.info.bytes = 0;
-            finalize_claim(&claim, params, &run_id, FinalOutcome::Failed).await;
-            return Err(e);
+            match failure.stage {
+                FailureStage::BeforePromote => {
+                    progress.files.iter_mut().for_each(|f| {
+                        f.rows_loaded = 0;
+                        f.bytes_read = 0;
+                    });
+                    progress.info.rows = 0;
+                    progress.info.bytes = 0;
+                    finalize_claim(&claim, params, &run_id, FinalOutcome::Failed).await;
+                    return Err(failure.error);
+                }
+                FailureStage::PromoteIssued => {
+                    // The promote statement was sent, so the rows may be in
+                    // the table. Like a failed commit, this leaves the claim
+                    // in flight: a retry would load the batch again.
+                    return Err(failure.error.context(format!(
+                        "connector `{name}` sent the promote into {target_display}, and it \
+                         failed, so the batch may or may not be in the table. The claim `{}` \
+                         is left in flight on purpose, so the batch is not loaded again until \
+                         the claim expires. Check the table before the claim expires",
+                        claim.key
+                    )));
+                }
+            }
         }
     }
 
@@ -598,7 +694,7 @@ async fn commit_state(
     );
     let name = params.name.to_string();
     let pipeline_key = format!("connector:{name}");
-    let loaded_at = Utc::now();
+    let loaded_at = params.now.unwrap_or_else(Utc::now);
     let files: Vec<(String, LoadedFileRecord)> = batch
         .files
         .iter()
@@ -630,6 +726,38 @@ async fn commit_state(
     Ok(new_seq)
 }
 
+/// When the promote may still be sent.
+struct PromoteGate {
+    /// The claim's expiry. Past it, another run may adopt the claim.
+    deadline: DateTime<Utc>,
+    /// The time to compare with `deadline`. `None` is the real time.
+    now: Option<DateTime<Utc>>,
+}
+
+/// Where a staging, drift or promote failure happened.
+#[derive(Debug, Clone, Copy)]
+enum FailureStage {
+    /// The promote was not sent. The target rows are unchanged, and the claim
+    /// is freed. Drift `ALTER`s may have run, and are not rolled back.
+    BeforePromote,
+    /// The promote statement was sent. The rows may be in the target.
+    PromoteIssued,
+}
+
+struct StageFailure {
+    stage: FailureStage,
+    error: anyhow::Error,
+}
+
+impl From<anyhow::Error> for StageFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            stage: FailureStage::BeforePromote,
+            error,
+        }
+    }
+}
+
 /// Load the batch into a staging table, deal with drift, and promote it to
 /// the target with one append. Drops the staging table when anything fails.
 async fn stage_and_promote(
@@ -637,7 +765,8 @@ async fn stage_and_promote(
     config: &ConnectorConfig,
     batch: &VerifiedBatch,
     run_id: &str,
-) -> Result<()> {
+    gate: &PromoteGate,
+) -> std::result::Result<(), StageFailure> {
     let registry = AdapterRegistry::from_config(&loaded.config)?;
     let adapter_name = config.target.adapter.as_str();
     let adapter_cfg = registry
@@ -680,6 +809,7 @@ async fn stage_and_promote(
         &target,
         &staging,
         &staging_ref,
+        gate,
     )
     .await;
     match outcome {
@@ -700,6 +830,7 @@ async fn stage_and_promote(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_and_promote_inner(
     warehouse: &dyn WarehouseAdapter,
     loader: &dyn LoaderAdapter,
@@ -708,7 +839,56 @@ async fn stage_and_promote_inner(
     target: &TableRef,
     staging: &TableRef,
     staging_ref: &str,
-) -> Result<()> {
+    gate: &PromoteGate,
+) -> std::result::Result<(), StageFailure> {
+    let promote = stage_and_prepare(
+        warehouse,
+        loader,
+        config,
+        batch,
+        target,
+        staging,
+        staging_ref,
+    )
+    .await?;
+
+    // Last checks before the one statement that changes the target.
+    if was_interrupted() {
+        return Err(
+            anyhow!("interrupted by a signal before the promote; the target is unchanged").into(),
+        );
+    }
+    let now = gate.now.unwrap_or_else(Utc::now);
+    if now >= gate.deadline {
+        return Err(anyhow!(
+            "the claim for this batch expired at {} and another run may have adopted it; \
+             refusing to promote",
+            gate.deadline
+        )
+        .into());
+    }
+    // From here on the promote is on its way. Any error means the rows may be
+    // in the target.
+    warehouse
+        .execute_statement(&promote)
+        .await
+        .map_err(|e| StageFailure {
+            stage: FailureStage::PromoteIssued,
+            error: anyhow!("the promote failed: {e}"),
+        })
+}
+
+/// Stage the files, check the contract, settle drift, and return the promote
+/// statement. Sends nothing that changes the target's rows.
+async fn stage_and_prepare(
+    warehouse: &dyn WarehouseAdapter,
+    loader: &dyn LoaderAdapter,
+    config: &ConnectorConfig,
+    batch: &VerifiedBatch,
+    target: &TableRef,
+    staging: &TableRef,
+    staging_ref: &str,
+) -> Result<String> {
     let dialect = warehouse.dialect();
     let target_ref = dialect
         .format_table_ref(&target.catalog, &target.schema, &target.table)
@@ -820,15 +1000,10 @@ async fn stage_and_promote_inner(
     }
 
     // --- promote: one append, columns named, never by position -----------
-    let promote = match &target_cols {
+    Ok(match &target_cols {
         None => dialect.create_table_as_new(&target_ref, &format!("SELECT * FROM {staging_ref}")),
         Some(_) => named_insert_sql(dialect, &target_ref, staging_ref, &staging_cols)?,
-    };
-    warehouse
-        .execute_statement(&promote)
-        .await
-        .map_err(|e| anyhow!("failed to promote the staging table into {target_ref}: {e}"))?;
-    Ok(())
+    })
 }
 
 /// `INSERT INTO target (c1, c2) SELECT c1, c2 FROM staging`, with every
@@ -854,8 +1029,12 @@ fn named_insert_sql(
         quoted.push(dialect.quote_identifier(&column.name));
     }
     let list = quoted.join(", ");
-    Ok(format!(
-        "INSERT INTO {target_ref} ({list})\nSELECT {list} FROM {staging_ref}"
+    // The dialect owns the shape of a named append (SQL Server lifts CTEs
+    // out of the derived table). The inner SELECT names every column too.
+    Ok(dialect.insert_into_columns(
+        target_ref,
+        &quoted,
+        &format!("SELECT {list} FROM {staging_ref}"),
     ))
 }
 

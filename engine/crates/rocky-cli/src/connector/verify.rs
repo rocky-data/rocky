@@ -144,14 +144,19 @@ pub fn verify_batch(
         });
     }
 
+    // Compared by resolved path, so `a.parquet`, `./a.parquet` and a symlink
+    // to it cannot load one file twice.
     let mut seen = std::collections::HashSet::new();
     let mut files = Vec::with_capacity(result.files.len());
     let mut total: u64 = 0;
     for entry in result.files {
-        if !seen.insert(entry.path.clone()) {
-            return Err(file_error(&entry.path, "is listed more than once"));
-        }
         let verified = verify_file(&scratch, &entry)?;
+        if !seen.insert(verified.path.clone()) {
+            return Err(file_error(
+                &entry.path,
+                "is listed more than once (or resolves to the same file as another entry)",
+            ));
+        }
         total = total.saturating_add(verified.bytes);
         files.push(verified);
     }
@@ -473,6 +478,29 @@ mod tests {
         let entry = serde_json::json!({"path": "a.parquet", "bytes": bytes, "rows": 1});
         write_result(dir.path(), serde_json::json!([entry.clone(), entry]), 1);
         assert!(refusal(dir.path(), 1, u64::MAX).contains("more than once"));
+    }
+
+    #[test]
+    fn two_spellings_of_one_file_are_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = write_parquet(&dir.path().join("a.parquet"), 1);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("a.parquet"), dir.path().join("b.parquet"))
+            .unwrap();
+        for second in ["./a.parquet", "b.parquet"] {
+            write_result(
+                dir.path(),
+                serde_json::json!([
+                    {"path": "a.parquet", "bytes": bytes, "rows": 1},
+                    {"path": second, "bytes": bytes, "rows": 1},
+                ]),
+                1,
+            );
+            assert!(
+                refusal(dir.path(), 1, u64::MAX).contains("more than once"),
+                "{second}"
+            );
+        }
     }
 
     #[test]

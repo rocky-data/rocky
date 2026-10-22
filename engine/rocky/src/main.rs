@@ -4991,7 +4991,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &loaded,
                     &state_path,
                     &connector,
-                    rocky_core::state_sync::FinalizeDurability::ConfigDefault,
                     json,
                 )
                 .await

@@ -2064,7 +2064,7 @@ async fn try_claim_idempotency(
                 _claim_backend_label: backend_label,
             }))
         }
-        IdempotencyCheck::AdoptStale { prior_run_id } => {
+        IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
             warn!(
                 idempotency_key = key,
                 run_id = run_id,

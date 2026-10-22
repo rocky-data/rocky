@@ -290,7 +290,8 @@ const PUBLISH_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("publ
 /// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]): every pod must see the
 /// same saved state and sequence. The `commit_seq` fence is only as strong as
 /// the state sync's snapshot compare-and-set. Under
-/// `concurrency_control = "off"` the run lock is the only guard.
+/// `concurrency_control = "off"` there is no such fence, and the
+/// idempotency claim on the batch key is the only guard against two runs.
 const CONNECTOR_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("connector_state");
 /// The schema version that added [`CONNECTOR_STATE`].
 const CONNECTOR_STATE_SINCE_SCHEMA_VERSION: u32 = 34;
@@ -16363,7 +16364,7 @@ mod tests {
         let new_entry = mk_idemp_entry("stale-key", "run-adopter");
         let verdict = store.idempotency_check_and_claim(&new_entry, now).unwrap();
         match verdict {
-            crate::idempotency::IdempotencyCheck::AdoptStale { prior_run_id } => {
+            crate::idempotency::IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
                 assert_eq!(prior_run_id, "run-crashed");
             }
             other => panic!("expected AdoptStale, got {other:?}"),

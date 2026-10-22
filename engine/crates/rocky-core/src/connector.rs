@@ -31,6 +31,11 @@ pub const DEFAULT_RETRIES: u32 = 1;
 /// Largest `retries` value the config accepts.
 pub const MAX_RETRIES: u32 = 10;
 
+/// Largest `wall_time_secs` the config or a manifest may set: 7 days. A
+/// larger value would make the claim outlive any useful time, and could
+/// overflow a clock.
+pub const MAX_WALL_TIME_SECS: u64 = 7 * 24 * 3600;
+
 /// Default wall-clock limit for one attempt, in seconds.
 pub const DEFAULT_WALL_TIME_SECS: u64 = 3600;
 
@@ -165,6 +170,12 @@ impl ConnectorLimitsConfig {
         }
     }
 
+    /// `wall_time_secs` over [`MAX_WALL_TIME_SECS`], if set so.
+    fn wall_time_too_long(&self) -> Option<u64> {
+        self.wall_time_secs
+            .filter(|secs| *secs > MAX_WALL_TIME_SECS)
+    }
+
     /// Names of keys set to zero. A zero limit would stop every attempt.
     fn zero_keys(&self) -> Vec<&'static str> {
         let mut keys = Vec::new();
@@ -279,6 +290,11 @@ impl ConnectorManifest {
                 zero.join(", ")
             ));
         }
+        if let Some(secs) = self.limits.wall_time_too_long() {
+            return Err(format!(
+                "[limits] wall_time_secs is {secs}, but the most allowed is {MAX_WALL_TIME_SECS} (7 days)"
+            ));
+        }
         Ok(())
     }
 
@@ -380,6 +396,11 @@ pub fn check_connector_block(
     let zero = connector.limits.zero_keys();
     if !zero.is_empty() {
         problems.push(format!("limits {} must be greater than 0", zero.join(", ")));
+    }
+    if let Some(secs) = connector.limits.wall_time_too_long() {
+        problems.push(format!(
+            "limits wall_time_secs is {secs}, but the most allowed is {MAX_WALL_TIME_SECS} (7 days)"
+        ));
     }
     for secret in &connector.secrets {
         if !is_env_name(secret) {
@@ -538,6 +559,24 @@ egress_hosts = []
         assert_eq!(defaults.cpu_time_secs, None);
         assert_eq!(defaults.memory_bytes, None);
         assert_eq!(defaults.output_bytes, DEFAULT_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn a_wall_time_over_seven_days_is_refused_in_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{GOOD}\n[limits]\nwall_time_secs = {}\n",
+            MAX_WALL_TIME_SECS + 1
+        );
+        let err = ConnectorManifest::load(&write_manifest(dir.path(), &body)).unwrap_err();
+        assert!(err.to_string().contains("wall_time_secs"), "{err}");
+        let body = format!(
+            "{GOOD}\n[limits]\nwall_time_secs = {}\n",
+            MAX_WALL_TIME_SECS
+        );
+        assert!(ConnectorManifest::load(&write_manifest(dir.path(), &body)).is_ok());
+        let huge = format!("{GOOD}\n[limits]\nwall_time_secs = {}\n", u64::MAX / 2);
+        assert!(ConnectorManifest::load(&write_manifest(dir.path(), &huge)).is_err());
     }
 
     #[test]

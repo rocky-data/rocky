@@ -19070,6 +19070,16 @@ target = { catalog = "raw", schema = "stripe", table = "charges" }
     }
 
     #[test]
+    fn a_wall_time_over_seven_days_is_refused() {
+        let body = GOOD.replace("target =", "limits = { wall_time_secs = 604801 }\ntarget =");
+        let errs = errors(&body);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("wall_time_secs"), "{errs:?}");
+        let ok = GOOD.replace("target =", "limits = { wall_time_secs = 604800 }\ntarget =");
+        assert!(errors(&ok).is_empty());
+    }
+
+    #[test]
     fn cloud_output_uris_are_refused_as_not_supported_yet() {
         for uri in ["s3://bucket/x", "gs://bucket/x"] {
             let body = GOOD.replace("file://./.rocky/landing/stripe", uri);

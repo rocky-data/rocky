@@ -201,7 +201,7 @@ async fn a_crashed_claim_is_adopted_only_after_it_expires() {
         .await
         .unwrap();
     assert!(
-        matches!(late, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(late, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{late:?}"
     );
     assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
@@ -239,7 +239,7 @@ async fn a_claim_is_judged_by_its_own_expiry_and_the_sweep_leaves_it() {
         .await
         .unwrap();
     assert!(
-        matches!(adopted, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(adopted, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{adopted:?}"
     );
 }
@@ -427,7 +427,7 @@ async fn a_failed_finalize_under_dedup_on_success_lets_the_next_run_adopt() {
         .await
         .unwrap();
     assert!(
-        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{retry:?}"
     );
     let held = read_entry(&bucket.provider, "k").await;
@@ -498,7 +498,7 @@ async fn a_failed_under_success_entry_is_adopted_by_a_dedup_on_any_run() {
         .await
         .unwrap();
     assert!(
-        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(retry, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{retry:?}"
     );
     assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
@@ -566,7 +566,7 @@ async fn a_succeeded_entry_past_its_expiry_is_adopted() {
         .await
         .unwrap();
     assert!(
-        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{past:?}"
     );
     assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");

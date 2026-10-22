@@ -175,6 +175,22 @@ target = {{ catalog = "", schema = "main", table = "events" }}
         self.run_at(None).await
     }
 
+    /// Claim at `now`, and check the promote deadline against `promote_now`.
+    async fn run_with_promote_clock(
+        &self,
+        now: DateTime<Utc>,
+        promote_now: DateTime<Utc>,
+    ) -> ConnectorLoadOutcome {
+        let loaded = self.loaded();
+        let config_path = self.config_path();
+        let state_path = self.state_path();
+        let mut params = ConnectorLoadParams::new(&config_path, &loaded, &state_path, "demo");
+        params.now = Some(now);
+        params.promote_now = Some(promote_now);
+        params.output_poll = Duration::from_millis(100);
+        execute_connector_load(&params).await
+    }
+
     fn state(&self) -> Option<rocky_core::connector::ConnectorStateRecord> {
         StateStore::open_read_only_or_empty(&self.state_path())
             .unwrap()
@@ -674,4 +690,146 @@ async fn an_empty_batch_still_advances_the_state() {
     assert_eq!(info(&outcome).files, 0);
     assert_eq!(project.row_count(), None, "no rows, so no table");
     assert_eq!(project.state().unwrap().envelope.value["cursor"], 5);
+}
+
+#[tokio::test]
+async fn a_finished_claim_with_a_state_that_did_not_move_is_a_failure_not_a_skip() {
+    let project = Project::new("");
+    standard_batches(&project);
+    // A run finished the batch after commit sequence 0, yet the saved state
+    // is still at 0: it was reset or restored.
+    let loaded = project.loaded();
+    let config = IdempotencyConfig {
+        in_flight_ttl_hours: claim_ttl_hours(3600, loaded.config.connectors["demo"].retries),
+        dedup_on: DedupPolicy::Success,
+        ..IdempotencyConfig::default()
+    };
+    {
+        let store = StateStore::open(&project.state_path()).unwrap();
+        let key = claim_key("demo", 0);
+        IdempotencyBackend::Local
+            .check_and_claim_at(Some(&store), &key, "other-run", &config, t0())
+            .await
+            .unwrap();
+        IdempotencyBackend::Local
+            .finalize_at(
+                Some(&store),
+                &key,
+                "other-run",
+                rocky_core::idempotency::FinalOutcome::Succeeded,
+                &config,
+                t0(),
+            )
+            .await
+            .unwrap();
+    }
+    let outcome = project
+        .run_at(Some(t0() + ChronoDuration::minutes(5)))
+        .await;
+    let error = format!("{:#}", outcome.result.as_ref().unwrap_err());
+    assert!(error.contains("saved state is behind claim"), "{error}");
+    assert!(
+        error.contains("retention_days"),
+        "the way out is named: {error}"
+    );
+    assert_eq!(info(&outcome).status, ConnectorLoadStatus::Failed);
+    assert!(!project.started(), "the child never started");
+    assert_eq!(project.row_count(), None);
+}
+
+/// The target has a NOT NULL column the batch does not carry, so the INSERT
+/// fails after the drift step added the batch's new column.
+fn target_that_rejects_the_batch(project: &Project) {
+    project.sql(|c| {
+        c.execute_batch("CREATE TABLE main.events (id BIGINT, name VARCHAR NOT NULL)")
+            .unwrap();
+    });
+    project.batch(
+        0,
+        1,
+        &[(
+            "a.parquet",
+            vec![("id", ids(&[1])), ("extra", names(&["x"]))],
+        )],
+    );
+}
+
+fn has_column(project: &Project, column: &str) -> bool {
+    project.sql(|c| {
+        c.query_row(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_name = 'events' AND column_name = ?",
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    })
+}
+
+/// Once the promote statement was sent, a failure leaves the claim in flight:
+/// the rows may be in the table, and a retry would load them again.
+#[tokio::test]
+async fn a_failed_promote_keeps_the_claim_and_does_not_roll_back_drift() {
+    let project = Project::new("");
+    target_that_rejects_the_batch(&project);
+
+    let failed = project.run_at(Some(t0())).await;
+    let error = format!("{:#}", failed.result.as_ref().unwrap_err());
+    assert!(error.contains("promote failed"), "{error}");
+    assert!(error.contains("left in flight"), "{error}");
+    assert_eq!(project.row_count(), Some(0), "no rows landed");
+    assert!(
+        has_column(&project, "extra"),
+        "the ADD COLUMN of the drift step is not rolled back"
+    );
+    assert_eq!(project.staging_tables(), 0);
+    assert!(project.state().is_none());
+
+    // The claim is still held, so the next run skips instead of loading again.
+    std::fs::remove_file(project.marker("started")).unwrap();
+    let next = project.run_at(Some(t0() + ChronoDuration::hours(1))).await;
+    assert_eq!(info(&next).status, ConnectorLoadStatus::Skipped);
+    assert!(!project.started());
+}
+
+/// A failure before the promote frees the claim and leaves the rows alone.
+#[tokio::test]
+async fn a_promote_past_the_claim_expiry_is_refused_and_frees_the_claim() {
+    let project = Project::new("");
+    target_that_rejects_the_batch(&project);
+
+    // Default limits and one retry: the claim lives 3 hours.
+    let late = project
+        .run_with_promote_clock(t0(), t0() + ChronoDuration::hours(4))
+        .await;
+    let error = format!("{:#}", late.result.as_ref().unwrap_err());
+    assert!(error.contains("refusing to promote"), "{error}");
+    assert_eq!(project.row_count(), Some(0));
+    assert_eq!(info(&late).status, ConnectorLoadStatus::Failed);
+
+    // The claim was freed: a run just after is not skipped.
+    std::fs::remove_file(project.marker("started")).unwrap();
+    let next = project
+        .run_at(Some(t0() + ChronoDuration::minutes(1)))
+        .await;
+    assert!(project.started(), "the child ran again");
+    assert_ne!(info(&next).status, ConnectorLoadStatus::Skipped);
+}
+
+#[tokio::test]
+async fn a_promote_inside_the_claim_lifetime_goes_ahead() {
+    let project = Project::new("");
+    standard_batches(&project);
+    let ok = project
+        .run_with_promote_clock(t0(), t0() + ChronoDuration::hours(2))
+        .await;
+    ok.result.as_ref().unwrap();
+    assert_eq!(project.row_count(), Some(2));
+}
+
+#[test]
+fn a_huge_wall_time_does_not_overflow_the_claim() {
+    assert_eq!(claim_ttl_hours(u64::MAX, u32::MAX), 24 * 366);
+    assert_eq!(claim_ttl_hours(0, 0), 1);
 }

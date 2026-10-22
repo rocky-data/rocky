@@ -1721,6 +1721,26 @@ impl LedgerSeamSession {
         unreachable!("ledger-seam attempt loop always returns within the for body")
     }
 
+    /// The refusals [`execute`][Self::execute] makes before it does any work,
+    /// run on their own: the mode resolution (an explicit `cas` on a store
+    /// that ignores conditional writes is refused) and the `cas-required`
+    /// marker check (an `off` writer is refused when other writers use CAS).
+    ///
+    /// A caller whose transition comes after an effect it cannot undo, such
+    /// as a warehouse write, calls this first. Otherwise the refusal would
+    /// arrive after the effect. Local state needs no check.
+    ///
+    /// # Errors
+    ///
+    /// [`StateSyncError::CasUnsupported`] and [`StateSyncError::CasRequired`].
+    pub async fn preflight_writer(&self) -> Result<(), StateSyncError> {
+        if matches!(self.cfg.backend, StateBackend::Local) {
+            return Ok(());
+        }
+        let cfg = resolved_state_config(&self.cfg).await?;
+        refuse_off_writer_at_start(&cfg, &self.state_path).await
+    }
+
     /// Run a read against the shared state, writing nothing. Local reads the
     /// ledger file, or an empty store when the file does not exist yet. A
     /// remote backend downloads the shared blob first, then reads it. Nothing
@@ -10846,6 +10866,33 @@ mod connector_commit_tests {
             .read_state(|store| store.connector_state_get("demo"))
             .await
             .unwrap()
+    }
+
+    /// An `off` writer is refused by the preflight when the `cas-required`
+    /// marker exists, before any caller effect. Mutation: make
+    /// `preflight_writer` return `Ok(())` and this passes through.
+    #[tokio::test]
+    async fn the_preflight_refuses_an_off_writer_when_the_marker_exists() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        // A CAS commit creates the marker.
+        commit(&h.pod_a.cfg, &h.pod_a.state_path, 0, 1)
+            .await
+            .unwrap();
+
+        let mut off = h.pod_b.cfg.clone();
+        off.concurrency_control = Some(ConcurrencyControl::Off);
+        let session = LedgerSeamSession::new(&off, &h.pod_b.state_path, false);
+        let err = session.preflight_writer().await.unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+
+        let session = LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false);
+        session
+            .preflight_writer()
+            .await
+            .expect("a CAS writer passes");
     }
 
     /// Two pods read commit sequence 0 and both try to commit batch 1. The
