@@ -306,7 +306,7 @@ pub async fn execute_connector_load(params: &ConnectorLoadParams<'_>) -> Connect
         progress.info.error = Some(format!("{e:#}"));
     }
     // Count like the directory loader: a file with an error is failed and adds
-    // no rows or bytes. A staging failure marks every file, so the batch
+    // no rows or bytes. A staging or promote failure marks every file, so the batch
     // reports `files_loaded = 0` and `files_failed = n`.
     let files_failed = progress.files.iter().filter(|f| f.error.is_some()).count();
     let files_loaded = progress.files.len() - files_failed;

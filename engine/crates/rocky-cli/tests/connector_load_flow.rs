@@ -795,6 +795,10 @@ async fn a_failed_promote_keeps_the_claim_and_does_not_roll_back_drift() {
     assert!(output.files_failed > 0);
     assert_eq!(output.total_rows, 0);
     assert_eq!(output.total_bytes, 0);
+    for file in &output.files {
+        assert_eq!(file.rows_loaded, 0, "{file:?}");
+        assert_eq!(file.bytes_read, 0, "{file:?}");
+    }
     assert_eq!(project.row_count(), Some(0), "no rows landed");
     assert!(
         has_column(&project, "extra"),
